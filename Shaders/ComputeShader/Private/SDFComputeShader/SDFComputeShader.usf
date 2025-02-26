@@ -1,0 +1,80 @@
+#include "/Engine/Public/Platform.ush"
+
+RWTexture2D<float3> RenderTarget;
+
+float3 RotateVector(float3 Pos, float3 Axis, float Angle)
+{
+    float rad = Angle * 3.14159265 / 180.0;
+    float s = sin(rad);
+    float c = cos(rad);
+    float3x3 rotMatrix = float3x3(
+        c + (1 - c) * Axis.x * Axis.x, (1 - c) * Axis.x * Axis.y - s * Axis.z, (1 - c) * Axis.x * Axis.z + s * Axis.y,
+        (1 - c) * Axis.y * Axis.x + s * Axis.z, c + (1 - c) * Axis.y * Axis.y, (1 - c) * Axis.y * Axis.z - s * Axis.x,
+        (1 - c) * Axis.z * Axis.x - s * Axis.y, (1 - c) * Axis.z * Axis.y + s * Axis.x, c + (1 - c) * Axis.z * Axis.z
+    );
+    return mul(rotMatrix, Pos);
+}
+
+[numthreads(THREADS_X, THREADS_Y, THREADS_Z)]
+void SDFComputeShader(
+	uint3 DispatchThreadId : SV_DispatchThreadID,
+	uint GroupIndex : SV_GroupIndex )
+{
+	//// Simple checkerboard
+    //int x = floor(DispatchThreadId.x / 16.f);
+    //int y = floor(DispatchThreadId.y / 16.f);
+    //int c = (x + y % 2) % 2;
+	
+    //RenderTarget[DispatchThreadId.xy] = float3(DispatchThreadId.x / 2048.f, DispatchThreadId.y / 2048.f, 1.0);
+	    // Get pixel coordinate
+    uint2 PixelCoord = DispatchThreadId.xy;
+
+    // Get texture dimensions (important for dynamic resolution handling)
+    uint Width, Height;
+    RenderTarget.GetDimensions(Width, Height);
+    float2 UV = PixelCoord / float2(Width, Height);
+
+    // Convert UV to world space (assuming a 100x100 unit space)
+    //float3 WorldPos = float3(UV, 0.333) * 100.0;
+        // Convert UV to world space (adjust scaling)
+    float3 WorldPos = float3(UV * 2.0 - 1.0, 0.5) * 150.0;
+    float3 RotationAxis = float3(1.0f, 1.0f, 0.0f);
+    float RotationAngle = 90.0f;
+    // Apply rotation
+    float Distance = 99999999.f;
+    const int SDFType = 0;
+    float3 SDFCenter = float3(50, 50, 25);
+    float SDFRadius = 25.f;
+    
+    WorldPos = RotateVector(WorldPos, RotationAxis, RotationAngle);
+    // Signed Distance Function Selection
+    //switch (SDFType)
+    //{
+    //    case 0: // Sphere SDF
+    //        Distance = length(WorldPos - SDFCenter) - SDFRadius;
+    //        break;
+    //    case 1: // Box SDF
+    //float3 q = abs(WorldPos - SDFCenter) - SDFRadius;
+    //Distance = length(max(q, 0.0)) + min(max(q.x, max(q.y, q.z)), 0.0);
+    //        break;
+    //    case 2: // Torus SDF
+    float2 q_torus = float2(length(WorldPos.xz - SDFCenter.xz) - SDFRadius, WorldPos.y - SDFCenter.y);
+    Distance = length(q_torus) - (SDFRadius * 0.25);
+    //        break;
+    //    case 3: // Cylinder SDF
+    //        float2 d_cyl = abs(float2(length(WorldPos.xz - SDFCenter.xz) - SDFRadius, WorldPos.y - SDFCenter.y));
+    //        Distance = min(max(d_cyl.x, d_cyl.y), 0.0) + length(max(d_cyl, 0.0));
+    //        break;
+    //    case 4: // Plane SDF
+    //        Distance = WorldPos.y - SDFCenter.y;
+    //        break;
+    //}
+    //Distance = length(WorldPos - SDFCenter) - SDFRadius;
+    //float2 q_torus = float2(length(WorldPos.xz - SDFCenter.xz) - SDFRadius, WorldPos.y - SDFCenter.y);
+    //Distance = length(q_torus) - (SDFRadius * 0.2);
+    //float2 d_cyl = abs(float2(length(WorldPos.xz - SDFCenter.xz) - SDFRadius, WorldPos.y - SDFCenter.y));
+    //Distance = min(max(d_cyl.x, d_cyl.y), 0.0) + length(max(d_cyl, 0.0));
+    //break;
+    // Store distance in UAV texture (Unreal requires a float4 format for UAVs)
+    RenderTarget[PixelCoord] = Distance.xxx/500.f;
+}

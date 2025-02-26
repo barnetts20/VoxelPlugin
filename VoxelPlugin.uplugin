@@ -1,0 +1,33 @@
+{
+	"FileVersion": 3,
+	"Version": 1,
+	"VersionName": "1.0",
+	"FriendlyName": "VoxelPlugin",
+	"Description": "",
+	"Category": "Other",
+	"CreatedBy": "snuzuns",
+	"CreatedByURL": "",
+	"DocsURL": "",
+	"MarketplaceURL": "",
+	"SupportURL": "",
+	"CanContainContent": true,
+	"IsBetaVersion": false,
+	"IsExperimentalVersion": false,
+	"Installed": false,
+	"LoadingPhase": "PostConfigInit",
+	"Modules": [
+		{
+			"Name": "VoxelPlugin",
+			"Type": "Runtime",
+			"LoadingPhase": "PostConfigInit",
+			"AdditionalDependencies": [
+				"RealtimeMeshComponent"
+			]
+		},
+		{
+			"Name": "ComputeShader",
+			"Type": "Runtime",
+			"LoadingPhase": "PostConfigInit"
+		}
+	]
+}

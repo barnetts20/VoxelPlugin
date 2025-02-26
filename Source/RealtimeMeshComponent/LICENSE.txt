@@ -1,0 +1,48 @@
+SOFTWARE LICENSE AGREEMENT
+
+1. Definitions
+
+    "Licensor" refers to TriAxis Games L.L.C., the provider of the "Realtime Mesh Component Pro" plugin.
+    "Licensee" refers to the individual or entity that has acquired a license to use the Plugin under this Agreement.
+    "Plugin" refers to the "Realtime Mesh Component Pro" software plugin developed by Licensor, including all related documentation, source code, and updates.
+    "Seat" refers to a single user license to use the Plugin.
+
+2. Grant of License
+
+    Subject to the terms of this Agreement, Licensor grants to Licensee a non-exclusive, non-transferable, non-sublicensable license to use the Plugin on a per-seat basis. Each Seat allows one designated individual to use the Plugin in accordance with this Agreement.
+
+3. Scope of Use
+
+    The Licensee may use the Plugin for developing commercial and non-commercial projects.
+    The Licensee may install and use the Plugin on multiple machines as long as the Plugin is accessed by no more users than the number of Seats purchased.
+
+4. Restrictions
+
+    Licensee shall not distribute, sell, lease, rent, lend, or sublicense the Plugin to any third party.
+    Licensee shall not make the Plugin available on a network where it could be used by multiple users unless a Seat has been purchased for each user.
+    Licensee shall not decompile, reverse-engineer, disassemble, or otherwise convert the Plugin to a human-perceivable form, except to the extent that such activity is expressly permitted by applicable law notwithstanding this limitation.
+    Redistribution of the Plugin's source code in any form is strictly prohibited.
+
+5. Intellectual Property
+
+    The Plugin and all copyrights, trademarks, and other intellectual property rights therein are owned by Licensor or its licensors and are protected by copyright and other intellectual property laws. This Agreement does not transfer any intellectual property rights to Licensee.
+
+6. Termination
+
+    This Agreement is effective until terminated. It will terminate automatically without notice from Licensor if Licensee fails to comply with any provision of this Agreement. Upon termination, Licensee must destroy all copies of the Plugin and all of its component parts.
+
+7. Warranty and Disclaimer
+
+    Licensor provides the Plugin "as is" without warranty of any kind, either expressed or implied, including, but not limited to, the implied warranties of merchantability and fitness for a particular purpose. No oral or written information or advice given by Licensor or its agents shall create a warranty.
+
+8. Limitation of Liability
+
+    In no event will Licensor be liable for any special, incidental, indirect, or consequential damages whatsoever (including, without limitation, damages for loss of business profits, business interruption, loss of business information, or any other pecuniary loss) arising out of the use of or inability to use the Plugin, even if Licensor has been advised of the possibility of such damages.
+
+9. General
+
+    This Agreement shall be governed by the laws of the State of North Carolina, without reference to conflict of laws principles. Any disputes arising from this Agreement shall be adjudicated in the courts of the State of North Carolina.
+
+10. Acknowledgment
+
+    By installing and using the Plugin, Licensee acknowledges that they have read this Agreement, understand it, and agree to be bound by its terms and conditions.
