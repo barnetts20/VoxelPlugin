@@ -165,45 +165,32 @@ struct VOXELPLUGIN_API FMeshChunk {
     {
         //If we dont have enough nodes to form a triangle bail out
         if (SampledNodes.Num() < 3) return false;
-        //I
-        if (IsEdgeOnChunkFace(Edge, 1)) return true;
-
-        // Now that base failure cases are checked for overlapping LOD edges and not enough verts,
-        // Now we can check against the negative chunk boundary. 
-        // If we are not on the boundary we can immediately process the node
-        if (!IsEdgeOnChunkFace(Edge, -1))
-            return true;
+        bool isOnNegChunkFace = IsEdgeOnChunkFace(Edge, -1);
+        if (!isOnNegChunkFace) return true;
 
         // If we are on the chunk boundary, we need a case to handle LOD differences between Chunks
         // Specifically, we can end up missing geometry in cases where there are only 3 connected nodes
-        if (SampledNodes.Num() == 3)
-        {
+        //if (SampledNodes.Num() == 3)
+        //{
             // Find which node is outside this chunk
             TSharedPtr<FAdaptiveOctreeNode> outsideNode = nullptr;
+            TArray<FNodeEdge> testEdges;
             for (auto& node : SampledNodes)
             {
                 // Check if node is outside chunk bounds
                 if (!IsNodeInChunk(node))
                 {
-                    outsideNode = node;
+
+                    testEdges.Append(node->GetSignChangeEdges());
                     break;
                 }
             }
-            //TODO:: if the edge is not "shared" with the outside node then it needs to be processed, otherwise it should be ignored
-            if (outsideNode->TreeIndex.Num() < Edge.LOD) {
-                auto testEdges = outsideNode->GetSignChangeEdges();
-                for (auto e : testEdges) {
-                    if (e == Edge) return false;
-                }
-            }
-            else {
-                return false;
-            }
-            return true;
-        }
 
-        // Default: skip edges on negative faces unless special conditions met
-        return false;
+            for (const FNodeEdge testEdge : testEdges) {
+                if (testEdge == Edge) return false;
+            }
+            //If we are on the outside edge, and we cannot find the edge in the neighbor chunk, it is a stitching node
+            return true;
     }
     //Update all chunk mesh data in async 2
     void UpdateMeshData() {
@@ -218,6 +205,7 @@ struct VOXELPLUGIN_API FMeshChunk {
         int triIdx = 0;
 
         for (auto currentEdge : ChunkEdges){
+            //Data only queries could return flat structs instead of recursive nodes perhaps
             TArray<TSharedPtr<FAdaptiveOctreeNode>> nodesToMesh = OwningOctree->SampleSurfaceNodesAroundEdge(currentEdge);
             if (!ShouldProcessEdge(currentEdge, nodesToMesh)) continue;
             //if (nodesToMesh.Num() < 3 
