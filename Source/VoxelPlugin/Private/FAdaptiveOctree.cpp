@@ -6,7 +6,10 @@ FAdaptiveOctree::FAdaptiveOctree(TFunction<double(FVector)> InDensityFunction, F
     DensityFunction = InDensityFunction;
     RootExtent = InRootExtent;
     Root = MakeShared<FAdaptiveOctreeNode>(InDensityFunction, InCenter, InRootExtent, InMinDepth, InMaxDepth);
-    SplitToDepth(Root, ChunkDepth);
+    {
+        FRWScopeLock WriteLock(OctreeLock, SLT_Write);
+        SplitToDepth(Root, ChunkDepth);
+    }
     Chunks = GetSurfaceNodes();
 }
 
@@ -25,7 +28,6 @@ void FAdaptiveOctree::InitializeMeshChunks(ARealtimeMeshActor* InParentActor, UM
 
 void FAdaptiveOctree::SplitToDepth(TSharedPtr<FAdaptiveOctreeNode> Node, int InMinDepth)
 {
-    FRWScopeLock WriteLock(OctreeLock, SLT_Write);
     if (!Node.IsValid()) return;
 
     if (Node->TreeIndex.Num() < InMinDepth)
@@ -73,9 +75,18 @@ void FAdaptiveOctree::UpdateMeshChunkStreamData(FMeshChunk& InChunk) {
     int idx = 0;
     int triIdx = 0;
 
-    FRWScopeLock ReadLock(OctreeLock, SLT_ReadOnly);
+    TArray<FNodeEdge> edgesToProcess;
+    {
+        FRWScopeLock ReadLock(OctreeLock, SLT_ReadOnly);
+        edgesToProcess = InChunk.ChunkEdges;
+    }
+
     for (FNodeEdge currentEdge : InChunk.ChunkEdges){
-        TArray<FAdaptiveOctreeFlatNode> nodesToMesh = SampleSurfaceNodesAroundEdge(currentEdge);
+        TArray<FAdaptiveOctreeFlatNode> nodesToMesh;
+        {
+            FRWScopeLock ReadLock(OctreeLock, SLT_ReadOnly);
+            nodesToMesh = SampleSurfaceNodesAroundEdge(currentEdge);
+        }
         if (!InChunk.ShouldProcessEdge(currentEdge, nodesToMesh)) continue;
         // Add first three vertices
         int32 IndexA = idx++;
@@ -135,21 +146,15 @@ void FAdaptiveOctree::UpdateMeshChunkStreamData(FMeshChunk& InChunk) {
     InChunk.UpdateMeshData(ChunkMeshData);
 }
 
-bool FAdaptiveOctree::UpdateLOD(FVector CameraPosition, double LodFactor)
+void FAdaptiveOctree::UpdateLOD(FVector CameraPosition, double LodFactor)
 {
     FRWScopeLock WriteLock(OctreeLock, SLT_Write);
-    bool wasUpdated = false;
     if(Root)
     ParallelFor(Chunks.Num(), [&](int32 idx)
     {
         TArray<FNodeEdge> tChunkEdges;
-        if (Chunks[idx]->UpdateLod(CameraPosition, LodFactor, tChunkEdges)) {
-            wasUpdated = true;
-            MeshChunks[idx].ChunkEdges = tChunkEdges;
-        }
+        if (Chunks[idx]->UpdateLod(CameraPosition, LodFactor, tChunkEdges)) MeshChunks[idx].ChunkEdges = tChunkEdges;
     });
-
-    return wasUpdated;
 }
 
 void FAdaptiveOctree::UpdateMesh()

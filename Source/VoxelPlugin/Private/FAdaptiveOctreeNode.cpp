@@ -1,5 +1,4 @@
 #include "FAdaptiveOctreeNode.h"
-#include "FSparseOctree.h"
 
 bool FAdaptiveOctreeNode::IsLeaf()
 {

@@ -58,6 +58,8 @@ struct VOXELPLUGIN_API FMeshChunk {
     TSharedPtr<FMeshStreamData> ChunkMeshData;
 
     //Mesh Stuff
+    bool IsDirty = false;
+    TSharedPtr<FRWLock> MeshDataLock = MakeShared<FRWLock>();
     URealtimeMeshSimple* ChunkRtMesh;
     URealtimeMeshComponent* ChunkRtComponent;
     FRealtimeMeshLODKey LODKey = FRealtimeMeshLODKey::FRealtimeMeshLODKey(0);
@@ -134,12 +136,17 @@ struct VOXELPLUGIN_API FMeshChunk {
     }
     //Update all chunk mesh data in async 2
     void UpdateMeshData(FMeshStreamData newMeshData) {
+        FRWScopeLock WriteLock(*MeshDataLock, SLT_Write);
         ChunkMeshData->MeshStream = FRealtimeMeshStreamSet(newMeshData.MeshStream);
+        IsDirty = true;
     }
 
     void UpdateComponent() {
+        FRWScopeLock ReadLock(*MeshDataLock, SLT_ReadOnly);
+        if (!IsDirty) return;
         if (ChunkMeshData) ChunkRtMesh->UpdateSectionGroup(ChunkMeshData->MeshGroupKey, ChunkMeshData->MeshStream).Then([this](TFuture<ERealtimeMeshProxyUpdateStatus> update) {
             ChunkRtMesh->UpdateSectionConfig(ChunkMeshData->MeshSectionKey, SecConfig, true);
         });
+        IsDirty = false;
     }
 };

@@ -1,4 +1,5 @@
 #pragma once
+
 #include "CoreMinimal.h"
 
 struct VOXELPLUGIN_API FNodeCorner {
@@ -140,7 +141,15 @@ struct VOXELPLUGIN_API FAdaptiveOctreeFlatNode {
         , IsValid(false)
     {};
 
-    FAdaptiveOctreeFlatNode(TSharedPtr<FAdaptiveOctreeNode> InNode) : IsValid(InNode.IsValid())
+    FAdaptiveOctreeFlatNode(TSharedPtr<FAdaptiveOctreeNode> InNode) 
+        : Center(FVector::ZeroVector)
+        , Extent(0)
+        , Density(0)
+        , DualContourPosition(FVector::ZeroVector)
+        , DualContourNormal(FVector::ZeroVector)
+        , IsSurfaceNode(false)
+        , IsLeaf(true)
+        , IsValid(InNode.IsValid())
     {
         if (IsValid) {
             TreeIndex = InNode->TreeIndex;

@@ -4,10 +4,8 @@
 #include "GameFramework/Actor.h"
 #include "FAdaptiveOctree.h"
 #include "FSparseOctree.h"
-#include "RealtimeMeshActor.h"
-#include <RealtimeMeshCore.h>
-#include <RealtimeMeshSimple.h>
 #include "FMeshingStructs.h"
+#include "RealtimeMeshActor.h"
 #include "AdaptiveVoxelActor.generated.h"
 
 using namespace RealtimeMesh;

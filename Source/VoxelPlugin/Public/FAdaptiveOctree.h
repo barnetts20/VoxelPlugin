@@ -28,7 +28,7 @@ public:
 
     void UpdateMeshChunkStreamData(FMeshChunk& InChunk);
 
-    bool UpdateLOD(FVector CameraPosition, double LodFactor);
+    void UpdateLOD(FVector CameraPosition, double LodFactor);
     void UpdateMesh();
 
     TArray<TSharedPtr<FAdaptiveOctreeNode>> GetLeaves();
