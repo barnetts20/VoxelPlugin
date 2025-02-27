@@ -117,6 +117,94 @@ struct VOXELPLUGIN_API FMeshChunk {
         return UV;
     };
 
+    // Improved helper to check if an edge is on a negative chunk face
+    bool IsEdgeOnChunkFace(const FNodeEdge& Edge, int Coef)
+    {
+        // Get negative face coordinates
+        FVector negFace = ChunkNode->Center + (Coef * FVector(ChunkNode->Extent));
+
+        // Tolerance scaled to chunk size
+        const float tolerance = 0.001f * ChunkNode->Extent;
+
+        // Check based on edge axis and position
+        if (Edge.Axis == 0) // X-aligned edge
+        {
+            // Check if Y or Z matches negative face
+            return FMath::Abs(Edge.ZeroCrossingPoint.Y - negFace.Y) < tolerance ||
+                FMath::Abs(Edge.ZeroCrossingPoint.Z - negFace.Z) < tolerance;
+        }
+        else if (Edge.Axis == 1) // Y-aligned edge
+        {
+            // Check if X or Z matches negative face
+            return FMath::Abs(Edge.ZeroCrossingPoint.X - negFace.X) < tolerance ||
+                FMath::Abs(Edge.ZeroCrossingPoint.Z - negFace.Z) < tolerance;
+        }
+        else if (Edge.Axis == 2) // Z-aligned edge
+        {
+            // Check if X or Y matches negative face
+            return FMath::Abs(Edge.ZeroCrossingPoint.X - negFace.X) < tolerance ||
+                FMath::Abs(Edge.ZeroCrossingPoint.Y - negFace.Y) < tolerance;
+        }
+
+        return false;
+    }
+
+    // Simplified helper to check if a node is within this chunk
+    bool IsNodeInChunk(TSharedPtr<FAdaptiveOctreeNode> Node)
+    {
+        FVector chunkMin = ChunkNode->Center - FVector(ChunkNode->Extent);
+        FVector chunkMax = ChunkNode->Center + FVector(ChunkNode->Extent);
+
+        // Use the node's center to determine if it's in the chunk
+        return (Node->Center.X >= chunkMin.X && Node->Center.X <= chunkMax.X &&
+            Node->Center.Y >= chunkMin.Y && Node->Center.Y <= chunkMax.Y &&
+            Node->Center.Z >= chunkMin.Z && Node->Center.Z <= chunkMax.Z);
+    }
+
+    bool ShouldProcessEdge(const FNodeEdge& Edge, const TArray<TSharedPtr<FAdaptiveOctreeNode>>& SampledNodes)
+    {
+        //If we dont have enough nodes to form a triangle bail out
+        if (SampledNodes.Num() < 3) return false;
+        //I
+        if (IsEdgeOnChunkFace(Edge, 1)) return true;
+
+        // Now that base failure cases are checked for overlapping LOD edges and not enough verts,
+        // Now we can check against the negative chunk boundary. 
+        // If we are not on the boundary we can immediately process the node
+        if (!IsEdgeOnChunkFace(Edge, -1))
+            return true;
+
+        // If we are on the chunk boundary, we need a case to handle LOD differences between Chunks
+        // Specifically, we can end up missing geometry in cases where there are only 3 connected nodes
+        if (SampledNodes.Num() == 3)
+        {
+            // Find which node is outside this chunk
+            TSharedPtr<FAdaptiveOctreeNode> outsideNode = nullptr;
+            for (auto& node : SampledNodes)
+            {
+                // Check if node is outside chunk bounds
+                if (!IsNodeInChunk(node))
+                {
+                    outsideNode = node;
+                    break;
+                }
+            }
+            //TODO:: if the edge is not "shared" with the outside node then it needs to be processed, otherwise it should be ignored
+            if (outsideNode->TreeIndex.Num() < Edge.LOD) {
+                auto testEdges = outsideNode->GetSignChangeEdges();
+                for (auto e : testEdges) {
+                    if (e == Edge) return false;
+                }
+            }
+            else {
+                return false;
+            }
+            return true;
+        }
+
+        // Default: skip edges on negative faces unless special conditions met
+        return false;
+    }
     //Update all chunk mesh data in async 2
     void UpdateMeshData() {
         ChunkMeshData->ResetStreams();
@@ -131,7 +219,17 @@ struct VOXELPLUGIN_API FMeshChunk {
 
         for (auto currentEdge : ChunkEdges){
             TArray<TSharedPtr<FAdaptiveOctreeNode>> nodesToMesh = OwningOctree->SampleSurfaceNodesAroundEdge(currentEdge);
-            if (nodesToMesh.Num() < 3) continue; // Need at least 3 nodes to form a triangle            
+            if (!ShouldProcessEdge(currentEdge, nodesToMesh)) continue;
+            //if (nodesToMesh.Num() < 3 
+            //    ||!ShouldProcessEdge(currentEdge, nodesToMesh)
+            //    ) continue; // Need at least 3 nodes to form a triangle       
+            //if (nodesToMesh.Num() == 4) {
+            //    int minLod = 9999;
+            //    for (auto node : nodesToMesh) {
+            //        minLod = FMath::Min(minLod, node->TreeIndex.Num());
+            //    }
+            //    if (currentEdge.LOD != minLod) continue;
+            //}
             // Add first three vertices
             int32 IndexA = idx++;
             int32 IndexB = idx++;

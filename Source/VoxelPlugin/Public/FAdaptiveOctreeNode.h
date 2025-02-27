@@ -16,10 +16,11 @@ struct VOXELPLUGIN_API FNodeEdge
     FVector EdgeDirection;      // Precomputed normalized edge direction
     int Axis;                   // Axis-aligned indicator (0 = X, 1 = Y, 2 = Z)
     FVector ZeroCrossingPoint;  // Position where sign flips
-
+    int LOD;  // Do we need this or just LOD?
     // Constructor
-    FNodeEdge(FNodeCorner InCorner1, FNodeCorner InCorner2)    
+    FNodeEdge(FNodeCorner InCorner1, FNodeCorner InCorner2, int InLOD)    
     {
+        LOD = InLOD;
         Corners[0] = InCorner1;
         Corners[1] = InCorner2;
         SignChange = (InCorner1.Density < 0) != (InCorner2.Density < 0);
@@ -37,8 +38,12 @@ struct VOXELPLUGIN_API FNodeEdge
     // Equality operator for ensuring uniqueness
     bool operator==(const FNodeEdge& Other) const
     {
-        return ZeroCrossingPoint.Equals(Other.ZeroCrossingPoint, KINDA_SMALL_NUMBER) &&
-            EdgeDirection.Equals(Other.EdgeDirection, KINDA_SMALL_NUMBER) &&
+        bool sharesCorner = 
+               Corners[0].Position.Equals(Other.Corners[0].Position, .01)
+            || Corners[0].Position.Equals(Other.Corners[1].Position, .01)
+            || Corners[1].Position.Equals(Other.Corners[0].Position, .01)
+            || Corners[1].Position.Equals(Other.Corners[1].Position, .01);
+        return sharesCorner &&
             Axis == Other.Axis &&
             SignChange == Other.SignChange;
     }
@@ -104,7 +109,7 @@ public:
 
     TArray<FNodeEdge> GetSurfaceEdges();
     TArray<TSharedPtr<FAdaptiveOctreeNode>> GetSurfaceNodes();
-
+    bool ContainsOverlappingEdge(FNodeEdge InEdgeToCheck);
     TArray<FNodeEdge>& GetSignChangeEdges();
     // Root Constructor
     FAdaptiveOctreeNode(TFunction<double(FVector)> InDensityFunction, FVector InCenter, double InExtent, int InMinDepth, int InMaxDepth);

@@ -29,7 +29,7 @@ FAdaptiveOctreeNode::FAdaptiveOctreeNode(TFunction<double(FVector)> InDensityFun
 
     for (int EdgeIndex = 0; EdgeIndex < 12; EdgeIndex++)
     {
-        FNodeEdge anEdge = FNodeEdge(Corners[EdgePairs[EdgeIndex][0]], Corners[EdgePairs[EdgeIndex][1]]);
+        FNodeEdge anEdge = FNodeEdge(Corners[EdgePairs[EdgeIndex][0]], Corners[EdgePairs[EdgeIndex][1]], 0);
         Edges.Add(anEdge);
         if (anEdge.SignChange) SignChangeEdges.Add(anEdge);
     }
@@ -47,6 +47,8 @@ FAdaptiveOctreeNode::FAdaptiveOctreeNode(TFunction<double(FVector)> InDensityFun
     Density = 0.0;
     DepthBounds[0] = InParent->DepthBounds[0];
     DepthBounds[1] = InParent->DepthBounds[1];
+    TreeIndex = InParent->TreeIndex;
+    TreeIndex.Add(ChildIndex);
 
     for (int i = 0; i < 8; i++) {
         FVector CornerPosition = Center + Offsets[i] * Extent;
@@ -56,13 +58,11 @@ FAdaptiveOctreeNode::FAdaptiveOctreeNode(TFunction<double(FVector)> InDensityFun
 
     for (int EdgeIndex = 0; EdgeIndex < 12; EdgeIndex++)
     {
-        FNodeEdge anEdge = FNodeEdge(Corners[EdgePairs[EdgeIndex][0]], Corners[EdgePairs[EdgeIndex][1]]);
+        FNodeEdge anEdge = FNodeEdge(Corners[EdgePairs[EdgeIndex][0]], Corners[EdgePairs[EdgeIndex][1]], TreeIndex.Num());
         Edges.Add(anEdge);
         if (anEdge.SignChange) SignChangeEdges.Add(anEdge);
     }
 
-    TreeIndex = InParent->TreeIndex;
-    TreeIndex.Add(ChildIndex);
     //Look up user density alterations in Sparse octree for this index? Would actually need to happen before all density evaluations.
     //Each node can calculate its own density alteration via the sparse octree stored values, as well as its composite density modification
     //By accumulating its parent node density alterations, this final value is applied to the density calculated by the density function before
@@ -220,6 +220,15 @@ TArray<TSharedPtr<FAdaptiveOctreeNode>> FAdaptiveOctreeNode::GetSurfaceNodes()
 
     return SurfaceNodes;
 }
+//bool FAdaptiveOctreeNode::ContainsOverlappingEdge(FNodeEdge InEdgeToCheck)
+//{
+//    for (auto edge : Edges) {
+//        if (edge.Axis != InEdgeToCheck.Axis) return false;
+//        
+//        if(edge.Axis == 0 && edge.ZeroCrossingPoint.Y == InEdgeToCheck.ZeroCrossingPoint.Y )
+//    }
+//    return true;
+//}
 //TODO: Lets try converting this lod method
 //void QuadTreeNode::TrySetLod() {
 //    if (this->IsInitialized && this->IsLeaf()) {
