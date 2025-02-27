@@ -25,11 +25,11 @@ private:
 
     FVector CameraPosition;
     FVector LastCameraPosition;
-    TArray<TSharedPtr<FMeshChunk>> Chunks;
+    //TArray<TSharedPtr<FMeshChunk>> Chunks;
     FRWLock OctreeLock;
 
-    URealtimeMeshSimple* RtMesh;
-    URealtimeMeshComponent* RtComponent;
+    //URealtimeMeshSimple* RtMesh;
+    //URealtimeMeshComponent* RtComponent;
 
     FRealtimeMeshSectionConfig SecConfig = FRealtimeMeshSectionConfig(0);
     int ChunkDepth = 3;

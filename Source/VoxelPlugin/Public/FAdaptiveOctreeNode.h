@@ -6,7 +6,7 @@ struct VOXELPLUGIN_API FNodeCorner {
     FVector Position;
     double Density;
     FNodeCorner(int InIndex, FVector InPosition, double InDensity) : CornerIndex(InIndex), Position(InPosition), Density(InDensity) {};
-    FNodeCorner() {};
+    FNodeCorner() : CornerIndex(0), Position(FVector::ZeroVector), Density(0) {};
 };
 
 struct VOXELPLUGIN_API FNodeEdge
@@ -49,6 +49,63 @@ struct VOXELPLUGIN_API FNodeEdge
     }
 };
 
+struct VOXELPLUGIN_API FAdaptiveOctreeFlatNode
+{
+public:
+    FAdaptiveOctreeFlatNode(TSharedPtr<FAdaptiveOctreeNode> InCopyNode) {
+        TreeIndex = InCopyNode->TreeIndex;
+        if (InCopyNode->Parent.IsValid()) ParentIndex = InCopyNode->Parent.Pin()->TreeIndex;
+        for (TSharedPtr<FAdaptiveOctreeNode> Child : InCopyNode->Children) {
+            ChildIndices->Add(Child->TreeIndex);
+        }
+        Center = InCopyNode->Center;
+        Extent = InCopyNode->Extent;
+        Density = InCopyNode->Density;
+        DualContourPosition = InCopyNode->DualContourPosition;
+        DualContourNormal = InCopyNode->DualContourNormal;
+
+        IsSurfaceNode = InCopyNode->IsSurfaceNode;
+        IsLeaf = InCopyNode->IsLeaf();
+        IsRoot = InCopyNode->IsRoot();
+        IsValid = true;
+
+        Corners = InCopyNode->Corners;
+        Edges = InCopyNode->Edges;
+        SurfaceEdges = InCopyNode->GetSurfaceEdges();
+        SignChangeEdges = InCopyNode->GetSignChangeEdges();
+
+        auto tSurfaceNodes = InCopyNode->GetSurfaceNodes();
+        for (auto node : tSurfaceNodes) {
+            SurfaceNodeIndices.Add(node->TreeIndex);
+        }
+    };
+    FAdaptiveOctreeFlatNode() {};
+    TArray<uint8> TreeIndex;
+    TArray<uint8> ParentIndex;
+    TArray<TArray<uint8>> ChildIndices[8];
+
+    FVector Center;
+    double Extent;
+    double Density;
+    FVector DualContourPosition;
+    FVector DualContourNormal;
+    
+    bool IsSurfaceNode;
+    bool IsLeaf;
+    bool IsRoot;
+    bool IsValid = false;
+
+    TArray<FNodeCorner> Corners;
+    TArray<FNodeEdge> Edges;
+    TArray<FNodeEdge> SurfaceEdges;
+    TArray<TArray<uint8>> SurfaceNodeIndices;
+    TArray<FNodeEdge> SignChangeEdges;
+
+    bool operator==(const FAdaptiveOctreeFlatNode& Other) const
+    {
+        return TreeIndex == Other.TreeIndex;
+    }
+};
 /**
  * Adaptive Octree Node struct for dynamic LOD-based meshing.
  */
@@ -105,12 +162,12 @@ public:
     void Merge();
     bool ShouldMerge(FVector InCameraPosition, double InLodDistanceFactor);
     
-    bool UpdateLod(FVector InCameraPosition, double InLodDistanceFactor);
+    bool UpdateLod(FVector InCameraPosition, double InLodDistanceFactor, TArray<FNodeEdge>& OutEdges);
 
+    TArray<FNodeEdge>& GetSignChangeEdges();
     TArray<FNodeEdge> GetSurfaceEdges();
     TArray<TSharedPtr<FAdaptiveOctreeNode>> GetSurfaceNodes();
-    bool ContainsOverlappingEdge(FNodeEdge InEdgeToCheck);
-    TArray<FNodeEdge>& GetSignChangeEdges();
+
     // Root Constructor
     FAdaptiveOctreeNode(TFunction<double(FVector)> InDensityFunction, FVector InCenter, double InExtent, int InMinDepth, int InMaxDepth);
 

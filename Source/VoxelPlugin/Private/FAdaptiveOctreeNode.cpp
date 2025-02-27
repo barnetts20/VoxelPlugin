@@ -127,19 +127,32 @@ bool FAdaptiveOctreeNode::ShouldMerge(FVector InCameraPosition, double InLodDist
     return CanMerge && (FVector::Dist(DualContourPosition, InCameraPosition) > Extent * (InLodDistanceFactor + TreeIndex.Num())) && TreeIndex.Num() >= DepthBounds[0];
 }
 
-bool FAdaptiveOctreeNode::UpdateLod(FVector InCameraPosition, double InLodDistanceFactor)
+void AppendUniqueEdges(TArray<FNodeEdge>& OutEdges, TArray<FNodeEdge> AppendEdges) {
+    for (FNodeEdge anEdge : AppendEdges) {
+        OutEdges.AddUnique(anEdge);
+    }
+}
+
+bool FAdaptiveOctreeNode::UpdateLod(FVector InCameraPosition, double InLodDistanceFactor, TArray<FNodeEdge>& OutEdges)
 {
     if (IsLeaf())
     {
         if (ShouldSplit(InCameraPosition, InLodDistanceFactor))
         {
-            Split();
+            Split(); //Push child sign change edges into return array
+            for (TSharedPtr<FAdaptiveOctreeNode> Child : Children) {
+                AppendUniqueEdges(OutEdges, Child->GetSignChangeEdges());
+            }
             return true; // A split occurred
         }
         else if (Parent.IsValid() && Parent.Pin()->ShouldMerge(InCameraPosition, InLodDistanceFactor) && TreeIndex.Last() == 7)
         {
-            Parent.Pin()->Merge();
+            Parent.Pin()->Merge(); //Push Parent sign change edges into return array
+            AppendUniqueEdges(OutEdges, Parent.Pin()->GetSignChangeEdges());
             return true; // A merge occurred
+        }
+        else {
+            AppendUniqueEdges(OutEdges, GetSignChangeEdges());
         }
     }
     else
@@ -147,14 +160,13 @@ bool FAdaptiveOctreeNode::UpdateLod(FVector InCameraPosition, double InLodDistan
         bool bAnyChanges = false;
         for (int i = 0; i < 8; i++)
         {
-            if (Children[i]->UpdateLod(InCameraPosition, InLodDistanceFactor))
+            if (Children[i]->UpdateLod(InCameraPosition, InLodDistanceFactor, OutEdges))
             {
                 bAnyChanges = true;
             }
         }
         return bAnyChanges; // Return true if any child changed
     }
-
     return false; // No changes occurred
 }
 

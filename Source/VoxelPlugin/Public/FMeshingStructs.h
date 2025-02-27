@@ -53,12 +53,15 @@ struct VOXELPLUGIN_API FMeshStreamData {
 
 struct VOXELPLUGIN_API FMeshChunk {
     FRWLock ChunkDataLock = FRWLock(0);
-
     TSharedPtr<FAdaptiveOctree> OwningOctree;
-    TSharedPtr<FAdaptiveOctreeNode> ChunkNode;
-    //TArray<TSharedPtr<FAdaptiveOctreeNode>> ChunkSurfaceNodes;
+    //TSharedPtr<FAdaptiveOctreeNode> ChunkNode;
+    FVector ChunkCenter;
+    double ChunkExtent;
     TArray<FNodeEdge> ChunkEdges;
     TSharedPtr<FMeshStreamData> ChunkMeshData;
+
+    //Mesh components
+    bool IsDirty = false;
     URealtimeMeshSimple* ChunkRtMesh;
     URealtimeMeshComponent* ChunkRtComponent;
     FRealtimeMeshLODKey LODKey = FRealtimeMeshLODKey::FRealtimeMeshLODKey(0);
@@ -72,7 +75,9 @@ struct VOXELPLUGIN_API FMeshChunk {
         cConfig.bUseAsyncCook = true;
 
         OwningOctree = InTree;
-        ChunkNode = InChunkNode;
+        FVector ChunkCenter = InChunkNode->Center;
+        double ChunkExtent = InChunkNode->Extent;
+        //ChunkNode = InChunkNode;
         ChunkMeshData = MakeShared<FMeshStreamData>();
         ChunkMeshData->MeshGroupKey = FRealtimeMeshSectionGroupKey::Create(LODKey, FName("MeshGroup"));
         ChunkMeshData->MeshSectionKey = FRealtimeMeshSectionKey::CreateForPolyGroup(ChunkMeshData->MeshGroupKey, 0);
@@ -121,10 +126,10 @@ struct VOXELPLUGIN_API FMeshChunk {
     bool IsEdgeOnChunkFace(const FNodeEdge& Edge, int Coef)
     {
         // Get negative face coordinates
-        FVector negFace = ChunkNode->Center + (Coef * FVector(ChunkNode->Extent));
+        FVector negFace = ChunkCenter + (Coef * FVector(ChunkExtent));
 
         // Tolerance scaled to chunk size
-        const float tolerance = 0.001f * ChunkNode->Extent;
+        const float tolerance = 0.001f * ChunkExtent;
 
         // Check based on edge axis and position
         if (Edge.Axis == 0) // X-aligned edge
@@ -150,48 +155,34 @@ struct VOXELPLUGIN_API FMeshChunk {
     }
 
     // Simplified helper to check if a node is within this chunk
-    bool IsNodeInChunk(TSharedPtr<FAdaptiveOctreeNode> Node)
+    bool IsNodeInChunk(FAdaptiveOctreeFlatNode Node)
     {
-        FVector chunkMin = ChunkNode->Center - FVector(ChunkNode->Extent);
-        FVector chunkMax = ChunkNode->Center + FVector(ChunkNode->Extent);
+        FVector chunkMin = ChunkCenter - FVector(ChunkExtent);
+        FVector chunkMax = ChunkCenter + FVector(ChunkExtent);
 
         // Use the node's center to determine if it's in the chunk
-        return (Node->Center.X >= chunkMin.X && Node->Center.X <= chunkMax.X &&
-            Node->Center.Y >= chunkMin.Y && Node->Center.Y <= chunkMax.Y &&
-            Node->Center.Z >= chunkMin.Z && Node->Center.Z <= chunkMax.Z);
+        return (Node.Center.X >= chunkMin.X && Node.Center.X <= chunkMax.X &&
+            Node.Center.Y >= chunkMin.Y && Node.Center.Y <= chunkMax.Y &&
+            Node.Center.Z >= chunkMin.Z && Node.Center.Z <= chunkMax.Z);
     }
 
-    bool ShouldProcessEdge(const FNodeEdge& Edge, const TArray<TSharedPtr<FAdaptiveOctreeNode>>& SampledNodes)
+    bool ShouldProcessEdge(const FNodeEdge& Edge, const TArray<FAdaptiveOctreeFlatNode>& SampledNodes)
     {
         //If we dont have enough nodes to form a triangle bail out
         if (SampledNodes.Num() < 3) return false;
-        bool isOnNegChunkFace = IsEdgeOnChunkFace(Edge, -1);
-        if (!isOnNegChunkFace) return true;
-
-        // If we are on the chunk boundary, we need a case to handle LOD differences between Chunks
-        // Specifically, we can end up missing geometry in cases where there are only 3 connected nodes
-        //if (SampledNodes.Num() == 3)
-        //{
-            // Find which node is outside this chunk
-            TSharedPtr<FAdaptiveOctreeNode> outsideNode = nullptr;
-            TArray<FNodeEdge> testEdges;
-            for (auto& node : SampledNodes)
-            {
-                // Check if node is outside chunk bounds
-                if (!IsNodeInChunk(node))
-                {
-
-                    testEdges.Append(node->GetSignChangeEdges());
-                    break;
-                }
-            }
-
-            for (const FNodeEdge testEdge : testEdges) {
-                if (testEdge == Edge) return false;
-            }
-            //If we are on the outside edge, and we cannot find the edge in the neighbor chunk, it is a stitching node
-            return true;
+        //If its not on a stitching face, mesh it
+        if (!IsEdgeOnChunkFace(Edge, -1)) return true; 
+        //For each node that is outside the chunk bounds, add its edges to test against
+        TArray<FNodeEdge> testEdges;
+        for (auto& node : SampledNodes)
+        {
+            if (!IsNodeInChunk(node)) testEdges.Append(node.SignChangeEdges);
+        }
+        //If the other chunks edges do not contain the edge, mesh it
+        //Otherwise it will be handled by the external chunk
+        return (!testEdges.Contains(Edge) ? true : false);
     }
+
     //Update all chunk mesh data in async 2
     void UpdateMeshData() {
         ChunkMeshData->ResetStreams();
@@ -206,19 +197,9 @@ struct VOXELPLUGIN_API FMeshChunk {
 
         for (auto currentEdge : ChunkEdges){
             //Data only queries could return flat structs instead of recursive nodes perhaps
-            TArray<TSharedPtr<FAdaptiveOctreeNode>> nodesToMesh = OwningOctree->SampleSurfaceNodesAroundEdge(currentEdge);
+            TArray<FAdaptiveOctreeFlatNode> nodesToMesh = OwningOctree->SampleSurfaceNodesAroundEdge(currentEdge);
             if (!ShouldProcessEdge(currentEdge, nodesToMesh)) continue;
-            //if (nodesToMesh.Num() < 3 
-            //    ||!ShouldProcessEdge(currentEdge, nodesToMesh)
-            //    ) continue; // Need at least 3 nodes to form a triangle       
-            //if (nodesToMesh.Num() == 4) {
-            //    int minLod = 9999;
-            //    for (auto node : nodesToMesh) {
-            //        minLod = FMath::Min(minLod, node->TreeIndex.Num());
-            //    }
-            //    if (currentEdge.LOD != minLod) continue;
-            //}
-            // Add first three vertices
+
             int32 IndexA = idx++;
             int32 IndexB = idx++;
             int32 IndexC = idx++;
@@ -276,16 +257,16 @@ struct VOXELPLUGIN_API FMeshChunk {
 
     //Iterate all chunks data updates in async 1
     //This should perform update to LOD, recalculation of implicit data and caching of the Edges for this chunk
-    bool UpdateData(FVector InCameraPosition, double InLodFactor) {
-        bool Updated = false;
-        {
-            if (ChunkNode && ChunkNode->UpdateLod(InCameraPosition, InLodFactor)) {
-                ChunkEdges = ChunkNode->GetSurfaceEdges();
-                Updated = true;
-            }
-        }
-        return Updated;
-    };
+    //bool UpdateData(FVector InCameraPosition, double InLodFactor) {
+    //    bool Updated = false;
+    //    {
+    //        if (ChunkNode && ChunkNode->UpdateLod(InCameraPosition, InLodFactor)) {
+    //            ChunkEdges = ChunkNode->GetSurfaceEdges();
+    //            Updated = true;
+    //        }
+    //    }
+    //    return Updated;
+    //};
 
     void UpdateComponent() {
         if (ChunkMeshData) ChunkRtMesh->UpdateSectionGroup(ChunkMeshData->MeshGroupKey, ChunkMeshData->MeshStream).Then([this](TFuture<ERealtimeMeshProxyUpdateStatus> update) {
