@@ -174,14 +174,6 @@ namespace RealtimeMesh
 		});
 	}
 
-
-
-
-
-
-
-
-
 	void FRealtimeMeshAccessor::Execute(const TSharedRef<const FRealtimeMesh>& Mesh)
 	{
 		FRealtimeMeshAccessContext LockContext(Mesh);

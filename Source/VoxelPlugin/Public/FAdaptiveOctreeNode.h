@@ -48,9 +48,6 @@ struct VOXELPLUGIN_API FNodeEdge
     }
 };
 
-/**
- * Adaptive Octree Node struct for dynamic LOD-based meshing.
- */
 struct VOXELPLUGIN_API FAdaptiveOctreeNode : public TSharedFromThis<FAdaptiveOctreeNode>
 {
 private:
@@ -58,21 +55,18 @@ private:
     void ComputeDualContourPosition();
     bool bIsLeaf = true;
     
-    // Static array for child offsets
+    // Static arrays
     inline static const FVector Offsets[8] = {
         FVector(-1, -1, -1), FVector(1, -1, -1),
         FVector(-1, 1, -1), FVector(1, 1, -1),
         FVector(-1, -1, 1), FVector(1, -1, 1),
         FVector(-1, 1, 1), FVector(1, 1, 1)
     };
-
-    // Maps face-aligned edges to their 4 corner indices
     inline static const int SharedCorners[3][4] = {
         {0, 2, 4, 6}, // +X or -X aligned
         {0, 1, 4, 5}, // +Y or -Y aligned
         {0, 1, 2, 3}  // +Z or -Z aligned
     };
-
     inline static const int EdgePairs[12][2] = {
         {0, 1}, {2, 3}, {4, 5}, {6, 7}, // X-axis edges
         {0, 2}, {1, 3}, {4, 6}, {5, 7}, // Y-axis edges
@@ -102,17 +96,70 @@ public:
     void Split();
     bool ShouldSplit(FVector InCameraPosition, double InLodDistanceFactor);
     void Merge();
-    bool ShouldMerge(FVector InCameraPosition, double InLodDistanceFactor);
-    
+    bool ShouldMerge(FVector InCameraPosition, double InLodDistanceFactor);    
     bool UpdateLod(FVector InCameraPosition, double InLodDistanceFactor);
 
     TArray<FNodeEdge> GetSurfaceEdges();
     TArray<TSharedPtr<FAdaptiveOctreeNode>> GetSurfaceNodes();
-
     TArray<FNodeEdge>& GetSignChangeEdges();
+
     // Root Constructor
     FAdaptiveOctreeNode(TFunction<double(FVector)> InDensityFunction, FVector InCenter, double InExtent, int InMinDepth, int InMaxDepth);
 
     // Child Constructor
     FAdaptiveOctreeNode(TFunction<double(FVector)> InDensityFunction, TSharedPtr<FAdaptiveOctreeNode> InParent, uint8 ChildIndex);
+};
+
+struct VOXELPLUGIN_API FAdaptiveOctreeFlatNode {
+    // Basic node data
+    TArray<uint8> TreeIndex;
+
+    FVector Center;
+    double Extent;
+    double Density;
+
+    FVector DualContourPosition;
+    FVector DualContourNormal;
+    TArray<FNodeCorner> Corners;
+    TArray<FNodeEdge> Edges;
+    TArray<FNodeEdge> SignChangeEdges;
+
+    bool IsSurfaceNode;
+    bool IsLeaf;
+    bool IsValid;
+
+    // Constructor - creates an empty/invalid flat node
+    FAdaptiveOctreeFlatNode()
+        : Center(FVector::ZeroVector)
+        , Extent(0)
+        , Density(0)
+        , DualContourPosition(FVector::ZeroVector)
+        , DualContourNormal(FVector::ZeroVector)
+        , IsSurfaceNode(false)
+        , IsLeaf(true)
+        , IsValid(false)
+    {};
+
+    FAdaptiveOctreeFlatNode(TSharedPtr<FAdaptiveOctreeNode> InNode) : IsValid(InNode.IsValid())
+    {
+        if (IsValid) {
+            TreeIndex = InNode->TreeIndex;
+            Center = InNode->Center;
+            Extent = InNode->Extent;
+            Density = InNode->Density;
+            DualContourPosition = InNode->DualContourPosition;
+            DualContourNormal = InNode->DualContourNormal;
+            Corners = InNode->Corners;
+            Edges = InNode->Edges;
+            SignChangeEdges = InNode->SignChangeEdges;
+            IsSurfaceNode = InNode->IsSurfaceNode;
+            IsLeaf = InNode->IsLeaf();
+        }
+    };
+
+    // Equality operators for collections
+    bool operator==(const FAdaptiveOctreeFlatNode& Other) const
+    {
+        return TreeIndex == Other.TreeIndex;
+    }
 };

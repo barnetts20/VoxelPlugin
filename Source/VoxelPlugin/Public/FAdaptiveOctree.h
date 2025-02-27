@@ -26,8 +26,9 @@ public:
     TArray<TSharedPtr<FAdaptiveOctreeNode>> GetLeaves();
     TArray<TSharedPtr<FAdaptiveOctreeNode>> GetSurfaceNodes();
     TArray<TSharedPtr<FAdaptiveOctreeNode>> GetChunks();
-    TSharedPtr<FAdaptiveOctreeNode> GetSurfaceNodeByPoint(FVector Position);
-    TArray<TSharedPtr<FAdaptiveOctreeNode>> SampleSurfaceNodesAroundEdge(const FNodeEdge& Edge);
+
+    FAdaptiveOctreeFlatNode GetSurfaceNodeByPoint(FVector Position);
+    TArray<FAdaptiveOctreeFlatNode> SampleSurfaceNodesAroundEdge(const FNodeEdge& Edge);
     void Clear(); //TODO: Need to test this
     //TODO: Need to make a destructor that safely disposes references/pointers and locks
 };

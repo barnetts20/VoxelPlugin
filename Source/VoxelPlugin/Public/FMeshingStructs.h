@@ -135,16 +135,16 @@ struct VOXELPLUGIN_API FMeshChunk {
             FMath::Abs(Edge.ZeroCrossingPoint[axis2] - facePos[axis2]) < tolerance;
     }
 
-    bool IsNodeInChunk(const TSharedPtr<FAdaptiveOctreeNode>& Node) {
+    bool IsNodeInChunk(const FAdaptiveOctreeFlatNode& Node) {
         // Calculate extents once
         const FVector extentVec(ChunkExtent);
-        FVector distFromCenter = (Node->Center - ChunkCenter).GetAbs();
+        FVector distFromCenter = (Node.Center - ChunkCenter).GetAbs();
         return distFromCenter.X <= ChunkExtent &&
             distFromCenter.Y <= ChunkExtent &&
             distFromCenter.Z <= ChunkExtent;
     }
 
-    bool ShouldProcessEdge(const FNodeEdge& Edge, const TArray<TSharedPtr<FAdaptiveOctreeNode>>& SampledNodes) {
+    bool ShouldProcessEdge(const FNodeEdge& Edge, const TArray<FAdaptiveOctreeFlatNode>& SampledNodes) {
         // If we don't have enough nodes to form a triangle bail out
         if (SampledNodes.Num() < 3) return false;
         // If it's not on a stitching face, mesh it
@@ -152,7 +152,7 @@ struct VOXELPLUGIN_API FMeshChunk {
         // For each node that is outside the chunk bounds, add its edges to test against
         TArray<FNodeEdge> testEdges;
         for (auto& node : SampledNodes) {
-            if (!IsNodeInChunk(node)) testEdges.Append(node->SignChangeEdges);
+            if (!IsNodeInChunk(node)) testEdges.Append(node.SignChangeEdges);
         }
         // If the other chunks edges do not contain the edge, mesh it
         // Otherwise it will be handled by the external chunk
@@ -170,34 +170,34 @@ struct VOXELPLUGIN_API FMeshChunk {
         int idx = 0;
         int triIdx = 0;
 
-        for (auto currentEdge : ChunkEdges){
-            TArray<TSharedPtr<FAdaptiveOctreeNode>> nodesToMesh = OwningOctree->SampleSurfaceNodesAroundEdge(currentEdge);
+        for (FNodeEdge currentEdge : ChunkEdges){
+            TArray<FAdaptiveOctreeFlatNode> nodesToMesh = OwningOctree->SampleSurfaceNodesAroundEdge(currentEdge);
             if (!ShouldProcessEdge(currentEdge, nodesToMesh)) continue;
             // Add first three vertices
             int32 IndexA = idx++;
             int32 IndexB = idx++;
             int32 IndexC = idx++;
 
-            PositionStream.Add(nodesToMesh[0]->DualContourPosition);
+            PositionStream.Add(nodesToMesh[0].DualContourPosition);
             FRealtimeMeshTangentsHighPrecision tan0;
-            tan0.SetNormal(FVector3f(nodesToMesh[0]->DualContourNormal));
+            tan0.SetNormal(FVector3f(nodesToMesh[0].DualContourNormal));
             TangentStream.Add(tan0);
             ColorStream.Add(FColor::Green);
-            TexCoordStream.Add(ComputeTriplanarUV(nodesToMesh[0]->DualContourPosition, nodesToMesh[0]->DualContourNormal));
+            TexCoordStream.Add(ComputeTriplanarUV(nodesToMesh[0].DualContourPosition, nodesToMesh[0].DualContourNormal));
 
-            PositionStream.Add(nodesToMesh[1]->DualContourPosition);
+            PositionStream.Add(nodesToMesh[1].DualContourPosition);
             FRealtimeMeshTangentsHighPrecision tan1;
-            tan1.SetNormal(FVector3f(nodesToMesh[1]->DualContourNormal));
+            tan1.SetNormal(FVector3f(nodesToMesh[1].DualContourNormal));
             TangentStream.Add(tan1);
             ColorStream.Add(FColor::Green);
-            TexCoordStream.Add(ComputeTriplanarUV(nodesToMesh[1]->DualContourPosition, nodesToMesh[1]->DualContourNormal));
+            TexCoordStream.Add(ComputeTriplanarUV(nodesToMesh[1].DualContourPosition, nodesToMesh[1].DualContourNormal));
 
-            PositionStream.Add(nodesToMesh[2]->DualContourPosition);
+            PositionStream.Add(nodesToMesh[2].DualContourPosition);
             FRealtimeMeshTangentsHighPrecision tan2;
-            tan2.SetNormal(FVector3f(nodesToMesh[2]->DualContourNormal));
+            tan2.SetNormal(FVector3f(nodesToMesh[2].DualContourNormal));
             TangentStream.Add(tan2);
             ColorStream.Add(FColor::Green);
-            TexCoordStream.Add(ComputeTriplanarUV(nodesToMesh[2]->DualContourPosition, nodesToMesh[2]->DualContourNormal));
+            TexCoordStream.Add(ComputeTriplanarUV(nodesToMesh[2].DualContourPosition, nodesToMesh[2].DualContourNormal));
 
             TriangleStream.Add(FIndex3UI(IndexA, IndexB, IndexC));
             PolygroupStream.Add(0);
@@ -209,12 +209,12 @@ struct VOXELPLUGIN_API FMeshChunk {
             {
                 int32 IndexD = idx++;
 
-                PositionStream.Add(nodesToMesh[3]->DualContourPosition);
+                PositionStream.Add(nodesToMesh[3].DualContourPosition);
                 FRealtimeMeshTangentsHighPrecision tan3;
-                tan3.SetNormal(FVector3f(nodesToMesh[3]->DualContourNormal));
+                tan3.SetNormal(FVector3f(nodesToMesh[3].DualContourNormal));
                 TangentStream.Add(tan3);
                 ColorStream.Add(FColor::Green);
-                TexCoordStream.Add(ComputeTriplanarUV(nodesToMesh[3]->DualContourPosition, nodesToMesh[3]->DualContourNormal));
+                TexCoordStream.Add(ComputeTriplanarUV(nodesToMesh[3].DualContourPosition, nodesToMesh[3].DualContourNormal));
 
                 TriangleStream.Add(FIndex3UI(IndexA, IndexC, IndexD));
                 PolygroupStream.Add(0);

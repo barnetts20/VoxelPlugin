@@ -88,9 +88,9 @@ TArray<TSharedPtr<FAdaptiveOctreeNode>> FAdaptiveOctree::GetChunks()
     return Chunks;
 }
 
-TArray<TSharedPtr<FAdaptiveOctreeNode>> FAdaptiveOctree::SampleSurfaceNodesAroundEdge(const FNodeEdge& Edge)
+TArray<FAdaptiveOctreeFlatNode> FAdaptiveOctree::SampleSurfaceNodesAroundEdge(const FNodeEdge& Edge)
 {
-    TArray<TSharedPtr<FAdaptiveOctreeNode>> SurfaceNodes;
+    TArray<FAdaptiveOctreeFlatNode> SurfaceNodes;
     double SmallOffset = 0.001;// *(Edge.Corners[0].Position - Edge.Corners[1].Position).Size();
 
     // Compute perpendicular vectors
@@ -105,22 +105,22 @@ TArray<TSharedPtr<FAdaptiveOctreeNode>> FAdaptiveOctree::SampleSurfaceNodesAroun
     FVector OffsetD = Edge.ZeroCrossingPoint + (Perp1 * SmallOffset) - (Perp2 * SmallOffset);
 
     // Query octree for valid surface nodes
-    TSharedPtr<FAdaptiveOctreeNode> NodeA = GetSurfaceNodeByPoint(OffsetA);
-    TSharedPtr<FAdaptiveOctreeNode> NodeB = GetSurfaceNodeByPoint(OffsetB);
-    TSharedPtr<FAdaptiveOctreeNode> NodeC = GetSurfaceNodeByPoint(OffsetC);
-    TSharedPtr<FAdaptiveOctreeNode> NodeD = GetSurfaceNodeByPoint(OffsetD);
+    FAdaptiveOctreeFlatNode NodeA = GetSurfaceNodeByPoint(OffsetA);
+    FAdaptiveOctreeFlatNode NodeB = GetSurfaceNodeByPoint(OffsetB);
+    FAdaptiveOctreeFlatNode NodeC = GetSurfaceNodeByPoint(OffsetC);
+    FAdaptiveOctreeFlatNode NodeD = GetSurfaceNodeByPoint(OffsetD);
 
-    if (NodeA.IsValid()) SurfaceNodes.AddUnique(NodeA);
-    if (NodeB.IsValid()) SurfaceNodes.AddUnique(NodeB);
-    if (NodeC.IsValid()) SurfaceNodes.AddUnique(NodeC);
-    if (NodeD.IsValid()) SurfaceNodes.AddUnique(NodeD);
+    if (NodeA.IsValid) SurfaceNodes.AddUnique(NodeA);
+    if (NodeB.IsValid) SurfaceNodes.AddUnique(NodeB);
+    if (NodeC.IsValid) SurfaceNodes.AddUnique(NodeC);
+    if (NodeD.IsValid) SurfaceNodes.AddUnique(NodeD);
 
     return SurfaceNodes;
 }
 
 
 
-TSharedPtr<FAdaptiveOctreeNode> FAdaptiveOctree::GetSurfaceNodeByPoint(FVector Position)
+FAdaptiveOctreeFlatNode FAdaptiveOctree::GetSurfaceNodeByPoint(FVector Position)
 {
     TSharedPtr<FAdaptiveOctreeNode> CurrentNode = Root;
 
@@ -128,7 +128,7 @@ TSharedPtr<FAdaptiveOctreeNode> FAdaptiveOctree::GetSurfaceNodeByPoint(FVector P
     {
         if (CurrentNode->IsLeaf())
         {
-            return CurrentNode->IsSurfaceNode ? CurrentNode : nullptr;
+            return CurrentNode->IsSurfaceNode ? FAdaptiveOctreeFlatNode(CurrentNode) : FAdaptiveOctreeFlatNode();
         }
 
         int ChildIndex = 0;
@@ -146,7 +146,7 @@ TSharedPtr<FAdaptiveOctreeNode> FAdaptiveOctree::GetSurfaceNodeByPoint(FVector P
         }
     }
 
-    return nullptr;
+    return FAdaptiveOctreeFlatNode();
 }
 
 // Clears the entire octree
