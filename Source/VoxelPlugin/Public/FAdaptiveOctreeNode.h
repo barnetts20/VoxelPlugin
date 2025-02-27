@@ -6,7 +6,7 @@ struct VOXELPLUGIN_API FNodeCorner {
     FVector Position;
     double Density;
     FNodeCorner(int InIndex, FVector InPosition, double InDensity) : CornerIndex(InIndex), Position(InPosition), Density(InDensity) {};
-    FNodeCorner() {};
+    FNodeCorner() : CornerIndex(0), Position(FVector::ZeroVector), Density(0) {};
 };
 
 struct VOXELPLUGIN_API FNodeEdge
@@ -16,10 +16,11 @@ struct VOXELPLUGIN_API FNodeEdge
     FVector EdgeDirection;      // Precomputed normalized edge direction
     int Axis;                   // Axis-aligned indicator (0 = X, 1 = Y, 2 = Z)
     FVector ZeroCrossingPoint;  // Position where sign flips
-
+    int LOD;  // Do we need this or just LOD?
     // Constructor
-    FNodeEdge(FNodeCorner InCorner1, FNodeCorner InCorner2)    
+    FNodeEdge(FNodeCorner InCorner1, FNodeCorner InCorner2, int InLOD)    
     {
+        LOD = InLOD;
         Corners[0] = InCorner1;
         Corners[1] = InCorner2;
         SignChange = (InCorner1.Density < 0) != (InCorner2.Density < 0);
@@ -37,8 +38,12 @@ struct VOXELPLUGIN_API FNodeEdge
     // Equality operator for ensuring uniqueness
     bool operator==(const FNodeEdge& Other) const
     {
-        return ZeroCrossingPoint.Equals(Other.ZeroCrossingPoint, KINDA_SMALL_NUMBER) &&
-            EdgeDirection.Equals(Other.EdgeDirection, KINDA_SMALL_NUMBER) &&
+        bool sharesCorner = 
+               Corners[0].Position.Equals(Other.Corners[0].Position, .01)
+            || Corners[0].Position.Equals(Other.Corners[1].Position, .01)
+            || Corners[1].Position.Equals(Other.Corners[0].Position, .01)
+            || Corners[1].Position.Equals(Other.Corners[1].Position, .01);
+        return sharesCorner &&
             Axis == Other.Axis &&
             SignChange == Other.SignChange;
     }
@@ -100,15 +105,73 @@ public:
     void Merge();
     bool ShouldMerge(FVector InCameraPosition, double InLodDistanceFactor);
     
-    bool UpdateLod(FVector InCameraPosition, double InLodDistanceFactor);
+    bool UpdateLod(FVector InCameraPosition, double InLodDistanceFactor, TArray<FNodeEdge>& OutEdges);
 
+    TArray<FNodeEdge>& GetSignChangeEdges();
     TArray<FNodeEdge> GetSurfaceEdges();
     TArray<TSharedPtr<FAdaptiveOctreeNode>> GetSurfaceNodes();
 
-    TArray<FNodeEdge>& GetSignChangeEdges();
     // Root Constructor
     FAdaptiveOctreeNode(TFunction<double(FVector)> InDensityFunction, FVector InCenter, double InExtent, int InMinDepth, int InMaxDepth);
 
     // Child Constructor
     FAdaptiveOctreeNode(TFunction<double(FVector)> InDensityFunction, TSharedPtr<FAdaptiveOctreeNode> InParent, uint8 ChildIndex);
+};
+
+struct VOXELPLUGIN_API FAdaptiveOctreeFlatNode
+{
+public:
+    FAdaptiveOctreeFlatNode(TSharedPtr<FAdaptiveOctreeNode> InCopyNode) {
+        TreeIndex = InCopyNode->TreeIndex;
+        if (InCopyNode->Parent.IsValid()) ParentIndex = InCopyNode->Parent.Pin()->TreeIndex;
+        for (TSharedPtr<FAdaptiveOctreeNode> Child : InCopyNode->Children) {
+            ChildIndices->Add(Child->TreeIndex);
+        }
+        Center = InCopyNode->Center;
+        Extent = InCopyNode->Extent;
+        Density = InCopyNode->Density;
+        DualContourPosition = InCopyNode->DualContourPosition;
+        DualContourNormal = InCopyNode->DualContourNormal;
+
+        IsSurfaceNode = InCopyNode->IsSurfaceNode;
+        IsLeaf = InCopyNode->IsLeaf();
+        IsRoot = InCopyNode->IsRoot();
+        IsValid = true;
+
+        Corners = InCopyNode->Corners;
+        Edges = InCopyNode->Edges;
+        SurfaceEdges = InCopyNode->GetSurfaceEdges();
+        SignChangeEdges = InCopyNode->GetSignChangeEdges();
+
+        auto tSurfaceNodes = InCopyNode->GetSurfaceNodes();
+        for (auto node : tSurfaceNodes) {
+            SurfaceNodeIndices.Add(node->TreeIndex);
+        }
+    };
+    FAdaptiveOctreeFlatNode() {};
+    TArray<uint8> TreeIndex;
+    TArray<uint8> ParentIndex;
+    TArray<TArray<uint8>> ChildIndices[8];
+
+    FVector Center;
+    double Extent;
+    double Density;
+    FVector DualContourPosition;
+    FVector DualContourNormal;
+
+    bool IsSurfaceNode;
+    bool IsLeaf;
+    bool IsRoot;
+    bool IsValid = false;
+
+    TArray<FNodeCorner> Corners;
+    TArray<FNodeEdge> Edges;
+    TArray<FNodeEdge> SurfaceEdges;
+    TArray<TArray<uint8>> SurfaceNodeIndices;
+    TArray<FNodeEdge> SignChangeEdges;
+
+    bool operator==(const FAdaptiveOctreeFlatNode& Other) const
+    {
+        return TreeIndex == Other.TreeIndex;
+    }
 };

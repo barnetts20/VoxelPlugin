@@ -29,7 +29,7 @@ FAdaptiveOctreeNode::FAdaptiveOctreeNode(TFunction<double(FVector)> InDensityFun
 
     for (int EdgeIndex = 0; EdgeIndex < 12; EdgeIndex++)
     {
-        FNodeEdge anEdge = FNodeEdge(Corners[EdgePairs[EdgeIndex][0]], Corners[EdgePairs[EdgeIndex][1]]);
+        FNodeEdge anEdge = FNodeEdge(Corners[EdgePairs[EdgeIndex][0]], Corners[EdgePairs[EdgeIndex][1]], 0);
         Edges.Add(anEdge);
         if (anEdge.SignChange) SignChangeEdges.Add(anEdge);
     }
@@ -47,6 +47,8 @@ FAdaptiveOctreeNode::FAdaptiveOctreeNode(TFunction<double(FVector)> InDensityFun
     Density = 0.0;
     DepthBounds[0] = InParent->DepthBounds[0];
     DepthBounds[1] = InParent->DepthBounds[1];
+    TreeIndex = InParent->TreeIndex;
+    TreeIndex.Add(ChildIndex);
 
     for (int i = 0; i < 8; i++) {
         FVector CornerPosition = Center + Offsets[i] * Extent;
@@ -56,13 +58,11 @@ FAdaptiveOctreeNode::FAdaptiveOctreeNode(TFunction<double(FVector)> InDensityFun
 
     for (int EdgeIndex = 0; EdgeIndex < 12; EdgeIndex++)
     {
-        FNodeEdge anEdge = FNodeEdge(Corners[EdgePairs[EdgeIndex][0]], Corners[EdgePairs[EdgeIndex][1]]);
+        FNodeEdge anEdge = FNodeEdge(Corners[EdgePairs[EdgeIndex][0]], Corners[EdgePairs[EdgeIndex][1]], TreeIndex.Num());
         Edges.Add(anEdge);
         if (anEdge.SignChange) SignChangeEdges.Add(anEdge);
     }
 
-    TreeIndex = InParent->TreeIndex;
-    TreeIndex.Add(ChildIndex);
     //Look up user density alterations in Sparse octree for this index? Would actually need to happen before all density evaluations.
     //Each node can calculate its own density alteration via the sparse octree stored values, as well as its composite density modification
     //By accumulating its parent node density alterations, this final value is applied to the density calculated by the density function before
@@ -127,19 +127,32 @@ bool FAdaptiveOctreeNode::ShouldMerge(FVector InCameraPosition, double InLodDist
     return CanMerge && (FVector::Dist(DualContourPosition, InCameraPosition) > Extent * (InLodDistanceFactor + TreeIndex.Num())) && TreeIndex.Num() >= DepthBounds[0];
 }
 
-bool FAdaptiveOctreeNode::UpdateLod(FVector InCameraPosition, double InLodDistanceFactor)
+void AppendUniqueEdges(TArray<FNodeEdge>& OutEdges, TArray<FNodeEdge> AppendEdges) {
+    for (FNodeEdge anEdge : AppendEdges) {
+        OutEdges.AddUnique(anEdge);
+    }
+}
+
+bool FAdaptiveOctreeNode::UpdateLod(FVector InCameraPosition, double InLodDistanceFactor, TArray<FNodeEdge>& OutEdges)
 {
     if (IsLeaf())
     {
         if (ShouldSplit(InCameraPosition, InLodDistanceFactor))
         {
-            Split();
+            Split(); //Push child sign change edges into return array
+            for (TSharedPtr<FAdaptiveOctreeNode> Child : Children) {
+                AppendUniqueEdges(OutEdges, Child->GetSignChangeEdges());
+            }
             return true; // A split occurred
         }
         else if (Parent.IsValid() && Parent.Pin()->ShouldMerge(InCameraPosition, InLodDistanceFactor) && TreeIndex.Last() == 7)
         {
-            Parent.Pin()->Merge();
+            Parent.Pin()->Merge(); //Push Parent sign change edges into return array
+            AppendUniqueEdges(OutEdges, Parent.Pin()->GetSignChangeEdges());
             return true; // A merge occurred
+        }
+        else {
+            AppendUniqueEdges(OutEdges, GetSignChangeEdges());
         }
     }
     else
@@ -147,14 +160,13 @@ bool FAdaptiveOctreeNode::UpdateLod(FVector InCameraPosition, double InLodDistan
         bool bAnyChanges = false;
         for (int i = 0; i < 8; i++)
         {
-            if (Children[i]->UpdateLod(InCameraPosition, InLodDistanceFactor))
+            if (Children[i]->UpdateLod(InCameraPosition, InLodDistanceFactor, OutEdges))
             {
                 bAnyChanges = true;
             }
         }
         return bAnyChanges; // Return true if any child changed
     }
-
     return false; // No changes occurred
 }
 
@@ -220,6 +232,15 @@ TArray<TSharedPtr<FAdaptiveOctreeNode>> FAdaptiveOctreeNode::GetSurfaceNodes()
 
     return SurfaceNodes;
 }
+//bool FAdaptiveOctreeNode::ContainsOverlappingEdge(FNodeEdge InEdgeToCheck)
+//{
+//    for (auto edge : Edges) {
+//        if (edge.Axis != InEdgeToCheck.Axis) return false;
+//        
+//        if(edge.Axis == 0 && edge.ZeroCrossingPoint.Y == InEdgeToCheck.ZeroCrossingPoint.Y )
+//    }
+//    return true;
+//}
 //TODO: Lets try converting this lod method
 //void QuadTreeNode::TrySetLod() {
 //    if (this->IsInitialized && this->IsLeaf()) {

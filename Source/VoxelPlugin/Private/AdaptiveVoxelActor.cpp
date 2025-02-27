@@ -22,14 +22,14 @@ AAdaptiveVoxelActor::AAdaptiveVoxelActor()
     //        return q.Size() - MinorRadius;
     //    };
     //Torus
-    //auto DensityFunction = [](FVector Position) -> double
-    //    {
-    //        double MajorRadius = 35000000.0; // Distance from the center to the ring
-    //        double MinorRadius = 3000000.0; // Tube radius
+    auto DensityFunction = [](FVector Position) -> double
+        {
+            double MajorRadius = 5999977; // Distance from the center to the ring
+            double MinorRadius = 1979999.0; // Tube radius
 
-    //        FVector2D q(FVector2D(Position.X, Position.Y).Size() - MajorRadius, Position.Z);
-    //        return q.Size() - MinorRadius;
-    //    };
+            FVector2D q(FVector2D(Position.X, Position.Y).Size() - MajorRadius, Position.Z);
+            return q.Size() - MinorRadius;
+        };
     //Cube
     //auto DensityFunction = [](FVector Position) -> double
     //    {
@@ -46,12 +46,12 @@ AAdaptiveVoxelActor::AAdaptiveVoxelActor()
     //        return Position.Size() - SphereRadius;
     //    };
     //SphereNoise
-    auto DensityFunction = [&](FVector Position) -> double
-        {
-            double SphereRadius = 9713713.0;
-            float NoiseValue = (FMath::PerlinNoise3D(Position / 5000000.0)) * 500000 + (FMath::PerlinNoise3D(Position / 100000.0)) * 100000;
-            return Position.Size() - (SphereRadius - NoiseValue);
-        };
+    //auto DensityFunction = [&](FVector Position) -> double
+    //    {
+    //        double SphereRadius = 9713713.0;
+    //        float NoiseValue = (FMath::PerlinNoise3D(Position / 5000000.0)) * 500000 + (FMath::PerlinNoise3D(Position / 100000.0)) * 100000;
+    //        return Position.Size() - (SphereRadius - NoiseValue);
+    //    };
     //Adaptive Octree Picks out the Implicit Structure
     AdaptiveOctree = MakeShared<FAdaptiveOctree>(DensityFunction, GetActorLocation(), 10400001.0, ChunkDepth, MinDepth, MaxDepth);
     //Sparsetree for user edits
@@ -59,8 +59,6 @@ AAdaptiveVoxelActor::AAdaptiveVoxelActor()
 }
 
 void AAdaptiveVoxelActor::BeginDestroy() {
-    FRWScopeLock WriteLock(OctreeLock, SLT_Write);
-    Chunks.Empty();
     Super::BeginDestroy();
 }
 
@@ -92,12 +90,7 @@ void AAdaptiveVoxelActor::CleanSceneRoot() {
 
 void AAdaptiveVoxelActor::InitializeChunks() {
     CleanSceneRoot();
-    auto ChunkNodes = AdaptiveOctree->GetChunks();
-    for (auto node : ChunkNodes) {
-        auto newChunk = MakeShared<FMeshChunk>();
-        newChunk->Initialize(this, Material, node, AdaptiveOctree);
-        Chunks.Add(newChunk);
-    }
+    AdaptiveOctree->InitializeChunks(this, Material);
     Initialized = true;
     double interval1 = .1;
     double interval2 = .2;
@@ -113,22 +106,10 @@ void AAdaptiveVoxelActor::ScheduleDataUpdate(float IntervalInSeconds)
         DataUpdateIsRunning = true;
         FGraphEventRef Task = FFunctionGraphTask::CreateAndDispatchWhenReady([this, IntervalInSeconds]()
         {
-            //**********BEGIN IMPLEMENTATION BLOCK***************
-            //**********BEGIN IMPLEMENTATION BLOCK***************
-            //**********BEGIN IMPLEMENTATION BLOCK***************
-            {
-                FRWScopeLock WriteLock(OctreeLock, SLT_Write);
-                //FCriticalSection CriticalSection;
-                //ChunksToUpdate.Empty();
-                //ChunksToUpdate.Reserve(Chunks.Num());
-                ParallelFor(Chunks.Num(), [&](int32 idx)
-                {
-                    if (Chunks[idx]->UpdateData(CameraPosition, LodFactor)) {
-                        //FScopeLock Lock(&CriticalSection);
-                        //ChunksToUpdate.Add(Chunks[idx]);
-                    }
-                });
-            }
+            //**********BEGIN IMPLEMENTATION BLOCK**************
+            //**********BEGIN IMPLEMENTATION BLOCK**************
+            //**********BEGIN IMPLEMENTATION BLOCK**************
+            AdaptiveOctree->UpdateLOD(CameraPosition, LodFactor);
             //***********END IMPLEMENTATION BLOCK***************
             //***********END IMPLEMENTATION BLOCK***************
             //***********END IMPLEMENTATION BLOCK***************
@@ -149,20 +130,10 @@ void AAdaptiveVoxelActor::ScheduleMeshUpdate(float IntervalInSeconds)
         MeshUpdateIsRunning = true;
         FGraphEventRef Task = FFunctionGraphTask::CreateAndDispatchWhenReady([this, IntervalInSeconds]()
         {
-            //**********BEGIN IMPLEMENTATION BLOCK***************
-            //**********BEGIN IMPLEMENTATION BLOCK***************
-            //**********BEGIN IMPLEMENTATION BLOCK***************
-            {
-                FRWScopeLock WriteLock(OctreeLock, SLT_Write);
-                ParallelFor(Chunks.Num(), [&](int32 idx)
-                {
-                    //if (ChunksToUpdate[idx].IsValid()) {
-                        Chunks[idx]->UpdateMeshData();
-                        Chunks[idx]->UpdateComponent();
-                    //}
-                });
-                //ChunksToUpdate.Empty();
-            }
+            //**********BEGIN IMPLEMENTATION BLOCK**************
+            //**********BEGIN IMPLEMENTATION BLOCK**************
+            //**********BEGIN IMPLEMENTATION BLOCK**************
+            AdaptiveOctree->UpdateMesh();
             //***********END IMPLEMENTATION BLOCK***************
             //***********END IMPLEMENTATION BLOCK***************
             //***********END IMPLEMENTATION BLOCK***************

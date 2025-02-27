@@ -7,13 +7,24 @@ FAdaptiveOctree::FAdaptiveOctree(TFunction<double(FVector)> InDensityFunction, F
     RootExtent = InRootExtent;
     Root = MakeShared<FAdaptiveOctreeNode>(InDensityFunction, InCenter, InRootExtent, InMinDepth, InMaxDepth);
     SplitToDepth(Root, ChunkDepth);
-    Chunks = GetSurfaceNodes();
+    ChunkNodes = GetSurfaceNodes();
+}
+
+void FAdaptiveOctree::InitializeChunks(ARealtimeMeshActor* InParentActor, UMaterialInterface* InMaterial) {
+    FRWScopeLock ReadLock(OctreeLock, SLT_ReadOnly);
+    Chunks.Empty();
+    for (auto aChunk : ChunkNodes) {
+        FMeshChunk NewChunk;
+        NewChunk.Initialize(InParentActor, InMaterial, aChunk, TSharedPtr<FAdaptiveOctree>(AsShared()));
+        Chunks.Add(NewChunk);
+    }
+    ChunksInitialized = true;
 }
 
 void FAdaptiveOctree::SplitToDepth(TSharedPtr<FAdaptiveOctreeNode> Node, int InMinDepth)
 {
+    FRWScopeLock WriteLock(OctreeLock, SLT_Write);
     if (!Node.IsValid()) return;
-
     if (Node->TreeIndex.Num() < InMinDepth)
     {
         Node->Split();
@@ -30,23 +41,36 @@ void FAdaptiveOctree::SplitToDepth(TSharedPtr<FAdaptiveOctreeNode> Node, int InM
 
 bool FAdaptiveOctree::UpdateLOD(FVector CameraPosition, double LodFactor)
 {
-    //if(Root)
-    //    return Root->UpdateLod(CameraPosition, LodFactor);
+    if (!ChunksInitialized) return false;
+    FRWScopeLock WriteLock(OctreeLock, SLT_Write);
     bool wasUpdated = false;
     if(Root)
-    ParallelFor(Chunks.Num(), [&](int32 idx)
+    ParallelFor(ChunkNodes.Num(), [&](int32 idx)
     {
-        if (Chunks[idx]->UpdateLod(CameraPosition, LodFactor)) {
+        TArray<FNodeEdge> OutChunkEdges;
+        if (ChunkNodes[idx]->UpdateLod(CameraPosition, LodFactor, OutChunkEdges)) {
             wasUpdated = true;
+            Chunks[idx].ChunkEdges = OutChunkEdges;
+            Chunks[idx].IsDirty = true;
         }
     });
-
     return wasUpdated;
 }
-
+void FAdaptiveOctree::UpdateMesh() {
+    if (!ChunksInitialized) return;
+    FRWScopeLock ReadLock(OctreeLock, SLT_ReadOnly);
+    ParallelFor(Chunks.Num(), [&](int32 idx)
+    {
+        if (Chunks[idx].IsDirty) {
+            Chunks[idx].UpdateMeshData();
+            Chunks[idx].UpdateComponent();
+        }
+    });
+}
 // Retrieves all leaf nodes
 TArray<TSharedPtr<FAdaptiveOctreeNode>> FAdaptiveOctree::GetLeaves()
 {
+    FRWScopeLock ReadLock(OctreeLock, SLT_ReadOnly);
     TArray<TSharedPtr<FAdaptiveOctreeNode>> Leaves;
     if (!Root.IsValid()) return Leaves;
 
@@ -79,18 +103,21 @@ TArray<TSharedPtr<FAdaptiveOctreeNode>> FAdaptiveOctree::GetLeaves()
 // Retrieves all surface nodes for meshing
 TArray<TSharedPtr<FAdaptiveOctreeNode>> FAdaptiveOctree::GetSurfaceNodes()
 {
+    FRWScopeLock ReadLock(OctreeLock, SLT_ReadOnly);
     if (!Root.IsValid()) return TArray<TSharedPtr<FAdaptiveOctreeNode>>();
     return Root->GetSurfaceNodes();
 }
 
-TArray<TSharedPtr<FAdaptiveOctreeNode>> FAdaptiveOctree::GetChunks()
+TArray<FMeshChunk> FAdaptiveOctree::GetChunks()
 {
+    FRWScopeLock ReadLock(OctreeLock, SLT_ReadOnly);
     return Chunks;
 }
 
-TArray<TSharedPtr<FAdaptiveOctreeNode>> FAdaptiveOctree::SampleSurfaceNodesAroundEdge(const FNodeEdge& Edge)
+TArray<FAdaptiveOctreeFlatNode> FAdaptiveOctree::SampleSurfaceNodesAroundEdge(const FNodeEdge& Edge)
 {
-    TArray<TSharedPtr<FAdaptiveOctreeNode>> SurfaceNodes;
+    FRWScopeLock ReadLock(OctreeLock, SLT_ReadOnly);
+    TArray<FAdaptiveOctreeFlatNode> SurfaceNodes;
     double SmallOffset = 0.001;// *(Edge.Corners[0].Position - Edge.Corners[1].Position).Size();
 
     // Compute perpendicular vectors
@@ -105,32 +132,31 @@ TArray<TSharedPtr<FAdaptiveOctreeNode>> FAdaptiveOctree::SampleSurfaceNodesAroun
     FVector OffsetD = Edge.ZeroCrossingPoint + (Perp1 * SmallOffset) - (Perp2 * SmallOffset);
 
     // Query octree for valid surface nodes
-    TSharedPtr<FAdaptiveOctreeNode> NodeA = GetSurfaceNodeByPoint(OffsetA);
-    TSharedPtr<FAdaptiveOctreeNode> NodeB = GetSurfaceNodeByPoint(OffsetB);
-    TSharedPtr<FAdaptiveOctreeNode> NodeC = GetSurfaceNodeByPoint(OffsetC);
-    TSharedPtr<FAdaptiveOctreeNode> NodeD = GetSurfaceNodeByPoint(OffsetD);
+    FAdaptiveOctreeFlatNode NodeA = GetSurfaceNodeByPoint(OffsetA);
+    FAdaptiveOctreeFlatNode NodeB = GetSurfaceNodeByPoint(OffsetB);
+    FAdaptiveOctreeFlatNode NodeC = GetSurfaceNodeByPoint(OffsetC);
+    FAdaptiveOctreeFlatNode NodeD = GetSurfaceNodeByPoint(OffsetD);
 
-    if (NodeA.IsValid()) SurfaceNodes.AddUnique(NodeA);
-    if (NodeB.IsValid()) SurfaceNodes.AddUnique(NodeB);
-    if (NodeC.IsValid()) SurfaceNodes.AddUnique(NodeC);
-    if (NodeD.IsValid()) SurfaceNodes.AddUnique(NodeD);
+    if (NodeA.IsValid) SurfaceNodes.AddUnique(NodeA);
+    if (NodeB.IsValid) SurfaceNodes.AddUnique(NodeB);
+    if (NodeC.IsValid) SurfaceNodes.AddUnique(NodeC);
+    if (NodeD.IsValid) SurfaceNodes.AddUnique(NodeD);
 
     return SurfaceNodes;
 }
 
 
 
-TSharedPtr<FAdaptiveOctreeNode> FAdaptiveOctree::GetSurfaceNodeByPoint(FVector Position)
+FAdaptiveOctreeFlatNode FAdaptiveOctree::GetSurfaceNodeByPoint(FVector Position)
 {
+    FRWScopeLock ReadLock(OctreeLock, SLT_ReadOnly);
     TSharedPtr<FAdaptiveOctreeNode> CurrentNode = Root;
-
     while (CurrentNode.IsValid())
     {
         if (CurrentNode->IsLeaf())
         {
-            return CurrentNode->IsSurfaceNode ? CurrentNode : nullptr;
+            return CurrentNode->IsSurfaceNode ? FAdaptiveOctreeFlatNode(CurrentNode) : FAdaptiveOctreeFlatNode();
         }
-
         int ChildIndex = 0;
         if (Position.X >= CurrentNode->Center.X) ChildIndex |= 1;
         if (Position.Y >= CurrentNode->Center.Y) ChildIndex |= 2;
@@ -146,11 +172,12 @@ TSharedPtr<FAdaptiveOctreeNode> FAdaptiveOctree::GetSurfaceNodeByPoint(FVector P
         }
     }
 
-    return nullptr;
+    return  FAdaptiveOctreeFlatNode();
 }
 
 // Clears the entire octree
 void FAdaptiveOctree::Clear()
 {
+    FRWScopeLock WriteLock(OctreeLock, SLT_Write);
     Root.Reset();
 }
