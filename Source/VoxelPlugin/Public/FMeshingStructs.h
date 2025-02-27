@@ -56,6 +56,8 @@ struct VOXELPLUGIN_API FMeshChunk {
 
     TSharedPtr<FAdaptiveOctree> OwningOctree;
     TSharedPtr<FAdaptiveOctreeNode> ChunkNode;
+    FVector ChunkCenter;
+    double ChunkExtent;
     //TArray<TSharedPtr<FAdaptiveOctreeNode>> ChunkSurfaceNodes;
     TArray<FNodeEdge> ChunkEdges;
     TSharedPtr<FMeshStreamData> ChunkMeshData;
@@ -73,6 +75,8 @@ struct VOXELPLUGIN_API FMeshChunk {
 
         OwningOctree = InTree;
         ChunkNode = InChunkNode;
+        ChunkCenter = InChunkNode->Center;
+        ChunkExtent = InChunkNode->Extent;
         ChunkMeshData = MakeShared<FMeshStreamData>();
         ChunkMeshData->MeshGroupKey = FRealtimeMeshSectionGroupKey::Create(LODKey, FName("MeshGroup"));
         ChunkMeshData->MeshSectionKey = FRealtimeMeshSectionKey::CreateForPolyGroup(ChunkMeshData->MeshGroupKey, 0);
@@ -117,6 +121,43 @@ struct VOXELPLUGIN_API FMeshChunk {
         return UV;
     };
 
+    bool IsEdgeOnChunkFace(const FNodeEdge& Edge, int Coef) {
+        // Pre-compute face position vector and tolerance once
+        const float tolerance = 0.001f * ChunkExtent;
+        const FVector facePos = ChunkCenter + (Coef * FVector(ChunkExtent));
+
+        // Calculate perpendicular axes using modular arithmetic
+        const int axis1 = (Edge.Axis + 1) % 3;  // First perpendicular axis
+        const int axis2 = (Edge.Axis + 2) % 3;  // Second perpendicular axis
+
+        // Check if edge's zero-crossing lies on the face for either perpendicular axis
+        return FMath::Abs(Edge.ZeroCrossingPoint[axis1] - facePos[axis1]) < tolerance ||
+            FMath::Abs(Edge.ZeroCrossingPoint[axis2] - facePos[axis2]) < tolerance;
+    }
+
+    bool IsNodeInChunk(const TSharedPtr<FAdaptiveOctreeNode>& Node) {
+        // Calculate extents once
+        const FVector extentVec(ChunkExtent);
+        FVector distFromCenter = (Node->Center - ChunkCenter).GetAbs();
+        return distFromCenter.X <= ChunkExtent &&
+            distFromCenter.Y <= ChunkExtent &&
+            distFromCenter.Z <= ChunkExtent;
+    }
+
+    bool ShouldProcessEdge(const FNodeEdge& Edge, const TArray<TSharedPtr<FAdaptiveOctreeNode>>& SampledNodes) {
+        // If we don't have enough nodes to form a triangle bail out
+        if (SampledNodes.Num() < 3) return false;
+        // If it's not on a stitching face, mesh it
+        if (!IsEdgeOnChunkFace(Edge, -1)) return true;
+        // For each node that is outside the chunk bounds, add its edges to test against
+        TArray<FNodeEdge> testEdges;
+        for (auto& node : SampledNodes) {
+            if (!IsNodeInChunk(node)) testEdges.Append(node->SignChangeEdges);
+        }
+        // If the other chunks edges do not contain the edge, mesh it
+        // Otherwise it will be handled by the external chunk
+        return !testEdges.Contains(Edge);
+    }
     //Update all chunk mesh data in async 2
     void UpdateMeshData() {
         ChunkMeshData->ResetStreams();
@@ -131,7 +172,7 @@ struct VOXELPLUGIN_API FMeshChunk {
 
         for (auto currentEdge : ChunkEdges){
             TArray<TSharedPtr<FAdaptiveOctreeNode>> nodesToMesh = OwningOctree->SampleSurfaceNodesAroundEdge(currentEdge);
-            if (nodesToMesh.Num() < 3) continue; // Need at least 3 nodes to form a triangle            
+            if (!ShouldProcessEdge(currentEdge, nodesToMesh)) continue;
             // Add first three vertices
             int32 IndexA = idx++;
             int32 IndexB = idx++;

@@ -6,7 +6,7 @@ struct VOXELPLUGIN_API FNodeCorner {
     FVector Position;
     double Density;
     FNodeCorner(int InIndex, FVector InPosition, double InDensity) : CornerIndex(InIndex), Position(InPosition), Density(InDensity) {};
-    FNodeCorner() {};
+    FNodeCorner() : CornerIndex(-1), Position(FVector::ZeroVector), Density(0) {};
 };
 
 struct VOXELPLUGIN_API FNodeEdge
