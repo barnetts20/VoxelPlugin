@@ -1,5 +1,8 @@
 #pragma once
 
+struct FAdaptiveOctree;
+struct FAdaptiveOctreeNode;
+
 #include "CoreMinimal.h"
 #include "GameFramework/Actor.h"
 #include "FAdaptiveOctree.h"
