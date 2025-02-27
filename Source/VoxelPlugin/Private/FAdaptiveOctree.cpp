@@ -15,7 +15,7 @@ void FAdaptiveOctree::InitializeChunks(ARealtimeMeshActor* InParentActor, UMater
     Chunks.Empty();
     for (auto aChunk : ChunkNodes) {
         FMeshChunk NewChunk;
-        NewChunk.Initialize(InParentActor, InMaterial, aChunk, AsShared());
+        NewChunk.Initialize(InParentActor, InMaterial, aChunk, TSharedPtr<FAdaptiveOctree>(AsShared()));
         Chunks.Add(NewChunk);
     }
     ChunksInitialized = true;

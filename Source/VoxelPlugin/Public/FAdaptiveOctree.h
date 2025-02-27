@@ -1,8 +1,11 @@
 #pragma once
+struct FMeshChunk;
 
 #include "CoreMinimal.h"
-#include <FMeshingStructs.h>
+#include <AdaptiveVoxelActor.h>
+#include "RealtimeMeshActor.h"
 #include "FAdaptiveOctreeNode.h"
+
 
 /**
  * Adaptive Octree for LOD-based voxel meshing.
