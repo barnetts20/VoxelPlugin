@@ -204,26 +204,26 @@ struct VOXELPLUGIN_API FMeshChunk {
             int32 IndexB = idx++;
             int32 IndexC = idx++;
 
-            PositionStream.Add(nodesToMesh[0]->DualContourPosition);
+            PositionStream.Add(nodesToMesh[0].DualContourPosition);
             FRealtimeMeshTangentsHighPrecision tan0;
-            tan0.SetNormal(FVector3f(nodesToMesh[0]->DualContourNormal));
+            tan0.SetNormal(FVector3f(nodesToMesh[0].DualContourNormal));
             TangentStream.Add(tan0);
             ColorStream.Add(FColor::Green);
-            TexCoordStream.Add(ComputeTriplanarUV(nodesToMesh[0]->DualContourPosition, nodesToMesh[0]->DualContourNormal));
+            TexCoordStream.Add(ComputeTriplanarUV(nodesToMesh[0].DualContourPosition, nodesToMesh[0].DualContourNormal));
 
-            PositionStream.Add(nodesToMesh[1]->DualContourPosition);
+            PositionStream.Add(nodesToMesh[1].DualContourPosition);
             FRealtimeMeshTangentsHighPrecision tan1;
-            tan1.SetNormal(FVector3f(nodesToMesh[1]->DualContourNormal));
+            tan1.SetNormal(FVector3f(nodesToMesh[1].DualContourNormal));
             TangentStream.Add(tan1);
             ColorStream.Add(FColor::Green);
-            TexCoordStream.Add(ComputeTriplanarUV(nodesToMesh[1]->DualContourPosition, nodesToMesh[1]->DualContourNormal));
+            TexCoordStream.Add(ComputeTriplanarUV(nodesToMesh[1].DualContourPosition, nodesToMesh[1].DualContourNormal));
 
-            PositionStream.Add(nodesToMesh[2]->DualContourPosition);
+            PositionStream.Add(nodesToMesh[2].DualContourPosition);
             FRealtimeMeshTangentsHighPrecision tan2;
-            tan2.SetNormal(FVector3f(nodesToMesh[2]->DualContourNormal));
+            tan2.SetNormal(FVector3f(nodesToMesh[2].DualContourNormal));
             TangentStream.Add(tan2);
             ColorStream.Add(FColor::Green);
-            TexCoordStream.Add(ComputeTriplanarUV(nodesToMesh[2]->DualContourPosition, nodesToMesh[2]->DualContourNormal));
+            TexCoordStream.Add(ComputeTriplanarUV(nodesToMesh[2].DualContourPosition, nodesToMesh[2].DualContourNormal));
 
             TriangleStream.Add(FIndex3UI(IndexA, IndexB, IndexC));
             PolygroupStream.Add(0);
@@ -235,12 +235,12 @@ struct VOXELPLUGIN_API FMeshChunk {
             {
                 int32 IndexD = idx++;
 
-                PositionStream.Add(nodesToMesh[3]->DualContourPosition);
+                PositionStream.Add(nodesToMesh[3].DualContourPosition);
                 FRealtimeMeshTangentsHighPrecision tan3;
-                tan3.SetNormal(FVector3f(nodesToMesh[3]->DualContourNormal));
+                tan3.SetNormal(FVector3f(nodesToMesh[3].DualContourNormal));
                 TangentStream.Add(tan3);
                 ColorStream.Add(FColor::Green);
-                TexCoordStream.Add(ComputeTriplanarUV(nodesToMesh[3]->DualContourPosition, nodesToMesh[3]->DualContourNormal));
+                TexCoordStream.Add(ComputeTriplanarUV(nodesToMesh[3].DualContourPosition, nodesToMesh[3].DualContourNormal));
 
                 TriangleStream.Add(FIndex3UI(IndexA, IndexC, IndexD));
                 PolygroupStream.Add(0);
