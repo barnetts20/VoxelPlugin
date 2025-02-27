@@ -37,8 +37,12 @@ struct VOXELPLUGIN_API FNodeEdge
     // Equality operator for ensuring uniqueness
     bool operator==(const FNodeEdge& Other) const
     {
-        return ZeroCrossingPoint.Equals(Other.ZeroCrossingPoint, KINDA_SMALL_NUMBER) &&
-            EdgeDirection.Equals(Other.EdgeDirection, KINDA_SMALL_NUMBER) &&
+        bool sharesCorner =
+            Corners[0].Position.Equals(Other.Corners[0].Position, .01)
+            || Corners[0].Position.Equals(Other.Corners[1].Position, .01)
+            || Corners[1].Position.Equals(Other.Corners[0].Position, .01)
+            || Corners[1].Position.Equals(Other.Corners[1].Position, .01);
+        return sharesCorner &&
             Axis == Other.Axis &&
             SignChange == Other.SignChange;
     }

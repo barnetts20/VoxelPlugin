@@ -22,14 +22,14 @@ AAdaptiveVoxelActor::AAdaptiveVoxelActor()
     //        return q.Size() - MinorRadius;
     //    };
     //Torus
-    //auto DensityFunction = [](FVector Position) -> double
-    //    {
-    //        double MajorRadius = 35000000.0; // Distance from the center to the ring
-    //        double MinorRadius = 3000000.0; // Tube radius
+    auto DensityFunction = [](FVector Position) -> double
+        {
+            double MajorRadius = 5000000.0; // Distance from the center to the ring
+            double MinorRadius = 2000000.0; // Tube radius
 
-    //        FVector2D q(FVector2D(Position.X, Position.Y).Size() - MajorRadius, Position.Z);
-    //        return q.Size() - MinorRadius;
-    //    };
+            FVector2D q(FVector2D(Position.X, Position.Y).Size() - MajorRadius, Position.Z);
+            return q.Size() - MinorRadius;
+        };
     //Cube
     //auto DensityFunction = [](FVector Position) -> double
     //    {
@@ -46,12 +46,12 @@ AAdaptiveVoxelActor::AAdaptiveVoxelActor()
     //        return Position.Size() - SphereRadius;
     //    };
     //SphereNoise
-    auto DensityFunction = [&](FVector Position) -> double
-        {
-            double SphereRadius = 9713713.0;
-            float NoiseValue = (FMath::PerlinNoise3D(Position / 5000000.0)) * 500000 + (FMath::PerlinNoise3D(Position / 100000.0)) * 100000;
-            return Position.Size() - (SphereRadius - NoiseValue);
-        };
+    //auto DensityFunction = [&](FVector Position) -> double
+    //    {
+    //        double SphereRadius = 9713713.0;
+    //        float NoiseValue = (FMath::PerlinNoise3D(Position / 5000000.0)) * 500000 + (FMath::PerlinNoise3D(Position / 100000.0)) * 100000;
+    //        return Position.Size() - (SphereRadius - NoiseValue);
+    //    };
     //Adaptive Octree Picks out the Implicit Structure
     AdaptiveOctree = MakeShared<FAdaptiveOctree>(DensityFunction, GetActorLocation(), 10400001.0, ChunkDepth, MinDepth, MaxDepth);
     //Sparsetree for user edits
