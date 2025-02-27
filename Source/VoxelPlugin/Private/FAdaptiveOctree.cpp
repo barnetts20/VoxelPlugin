@@ -10,8 +10,22 @@ FAdaptiveOctree::FAdaptiveOctree(TFunction<double(FVector)> InDensityFunction, F
     Chunks = GetSurfaceNodes();
 }
 
+void FAdaptiveOctree::InitializeMeshChunks(ARealtimeMeshActor* InParentActor, UMaterialInterface* InMaterial) {
+    FRWScopeLock ReadLock(OctreeLock, SLT_ReadOnly);
+    for (auto chunk : Chunks) {
+        FMeshChunk newChunk;
+        newChunk.Initialize(InParentActor, InMaterial, FAdaptiveOctreeFlatNode(chunk));
+        newChunk.ChunkEdges = chunk->GetSurfaceEdges();
+        UpdateMeshChunkStreamData(newChunk);
+        newChunk.UpdateComponent();
+        MeshChunks.Add(newChunk);
+    }
+    MeshChunksInitialized = true;
+}
+
 void FAdaptiveOctree::SplitToDepth(TSharedPtr<FAdaptiveOctreeNode> Node, int InMinDepth)
 {
+    FRWScopeLock WriteLock(OctreeLock, SLT_Write);
     if (!Node.IsValid()) return;
 
     if (Node->TreeIndex.Num() < InMinDepth)
@@ -27,26 +41,130 @@ void FAdaptiveOctree::SplitToDepth(TSharedPtr<FAdaptiveOctreeNode> Node, int InM
     }
 }
 
+FVector2f ComputeTriplanarUV(FVector Position, FVector Normal)
+{
+    FVector2f UV;
+    FVector AbsNormal = Normal.GetAbs();
+
+    if (AbsNormal.X > AbsNormal.Y && AbsNormal.X > AbsNormal.Z)
+    {
+        UV = FVector2f(Position.Y, Position.Z) * 0.0001f;
+    }
+    else if (AbsNormal.Y > AbsNormal.X && AbsNormal.Y > AbsNormal.Z)
+    {
+        UV = FVector2f(Position.X, Position.Z) * 0.0001f;
+    }
+    else
+    {
+        UV = FVector2f(Position.X, Position.Y) * 0.0001f;
+    }
+
+    return UV;
+};
+
+void FAdaptiveOctree::UpdateMeshChunkStreamData(FMeshChunk& InChunk) {
+    FMeshStreamData ChunkMeshData;
+    auto PositionStream = ChunkMeshData.GetPositionStream();
+    auto TangentStream = ChunkMeshData.GetTangentStream();
+    auto ColorStream = ChunkMeshData.GetColorStream();
+    auto TexCoordStream = ChunkMeshData.GetTexCoordStream();
+    auto TriangleStream = ChunkMeshData.GetTriangleStream();
+    auto PolygroupStream = ChunkMeshData.GetPolygroupStream();
+    int idx = 0;
+    int triIdx = 0;
+
+    FRWScopeLock ReadLock(OctreeLock, SLT_ReadOnly);
+    for (FNodeEdge currentEdge : InChunk.ChunkEdges){
+        TArray<FAdaptiveOctreeFlatNode> nodesToMesh = SampleSurfaceNodesAroundEdge(currentEdge);
+        if (!InChunk.ShouldProcessEdge(currentEdge, nodesToMesh)) continue;
+        // Add first three vertices
+        int32 IndexA = idx++;
+        int32 IndexB = idx++;
+        int32 IndexC = idx++;
+
+        PositionStream.Add(nodesToMesh[0].DualContourPosition);
+        FRealtimeMeshTangentsHighPrecision tan0;
+        tan0.SetNormal(FVector3f(nodesToMesh[0].DualContourNormal));
+        TangentStream.Add(tan0);
+        ColorStream.Add(FColor::Green);
+        TexCoordStream.Add(ComputeTriplanarUV(nodesToMesh[0].DualContourPosition, nodesToMesh[0].DualContourNormal));
+
+        PositionStream.Add(nodesToMesh[1].DualContourPosition);
+        FRealtimeMeshTangentsHighPrecision tan1;
+        tan1.SetNormal(FVector3f(nodesToMesh[1].DualContourNormal));
+        TangentStream.Add(tan1);
+        ColorStream.Add(FColor::Green);
+        TexCoordStream.Add(ComputeTriplanarUV(nodesToMesh[1].DualContourPosition, nodesToMesh[1].DualContourNormal));
+
+        PositionStream.Add(nodesToMesh[2].DualContourPosition);
+        FRealtimeMeshTangentsHighPrecision tan2;
+        tan2.SetNormal(FVector3f(nodesToMesh[2].DualContourNormal));
+        TangentStream.Add(tan2);
+        ColorStream.Add(FColor::Green);
+        TexCoordStream.Add(ComputeTriplanarUV(nodesToMesh[2].DualContourPosition, nodesToMesh[2].DualContourNormal));
+
+        TriangleStream.Add(FIndex3UI(IndexA, IndexB, IndexC));
+        PolygroupStream.Add(0);
+
+        triIdx++;
+
+        // Handle the fourth vertex if a quad exists
+        if (nodesToMesh.Num() == 4)
+        {
+            int32 IndexD = idx++;
+
+            PositionStream.Add(nodesToMesh[3].DualContourPosition);
+            FRealtimeMeshTangentsHighPrecision tan3;
+            tan3.SetNormal(FVector3f(nodesToMesh[3].DualContourNormal));
+            TangentStream.Add(tan3);
+            ColorStream.Add(FColor::Green);
+            TexCoordStream.Add(ComputeTriplanarUV(nodesToMesh[3].DualContourPosition, nodesToMesh[3].DualContourNormal));
+
+            TriangleStream.Add(FIndex3UI(IndexA, IndexC, IndexD));
+            PolygroupStream.Add(0);
+            triIdx++;
+        }
+    }
+    PositionStream.SetNumUninitialized(idx);
+    TangentStream.SetNumUninitialized(idx);
+    ColorStream.SetNumUninitialized(idx);
+    TexCoordStream.SetNumUninitialized(idx);
+    TriangleStream.SetNumUninitialized(triIdx);
+    PolygroupStream.SetNumUninitialized(triIdx);
+
+    InChunk.UpdateMeshData(ChunkMeshData);
+}
 
 bool FAdaptiveOctree::UpdateLOD(FVector CameraPosition, double LodFactor)
 {
-    //if(Root)
-    //    return Root->UpdateLod(CameraPosition, LodFactor);
+    FRWScopeLock WriteLock(OctreeLock, SLT_Write);
     bool wasUpdated = false;
     if(Root)
     ParallelFor(Chunks.Num(), [&](int32 idx)
     {
-        if (Chunks[idx]->UpdateLod(CameraPosition, LodFactor)) {
+        TArray<FNodeEdge> tChunkEdges;
+        if (Chunks[idx]->UpdateLod(CameraPosition, LodFactor, tChunkEdges)) {
             wasUpdated = true;
+            MeshChunks[idx].ChunkEdges = tChunkEdges;
         }
     });
 
     return wasUpdated;
 }
 
+void FAdaptiveOctree::UpdateMesh()
+{
+    FRWScopeLock ReadLock(OctreeLock, SLT_ReadOnly);
+    ParallelFor(MeshChunks.Num(), [&](int32 idx) {
+        UpdateMeshChunkStreamData(MeshChunks[idx]);
+        MeshChunks[idx].UpdateComponent();
+    });
+}
+
 // Retrieves all leaf nodes
 TArray<TSharedPtr<FAdaptiveOctreeNode>> FAdaptiveOctree::GetLeaves()
 {
+    FRWScopeLock ReadLock(OctreeLock, SLT_ReadOnly);
     TArray<TSharedPtr<FAdaptiveOctreeNode>> Leaves;
     if (!Root.IsValid()) return Leaves;
 
@@ -79,6 +197,7 @@ TArray<TSharedPtr<FAdaptiveOctreeNode>> FAdaptiveOctree::GetLeaves()
 // Retrieves all surface nodes for meshing
 TArray<TSharedPtr<FAdaptiveOctreeNode>> FAdaptiveOctree::GetSurfaceNodes()
 {
+    FRWScopeLock ReadLock(OctreeLock, SLT_ReadOnly);
     if (!Root.IsValid()) return TArray<TSharedPtr<FAdaptiveOctreeNode>>();
     return Root->GetSurfaceNodes();
 }
@@ -90,8 +209,9 @@ TArray<TSharedPtr<FAdaptiveOctreeNode>> FAdaptiveOctree::GetChunks()
 
 TArray<FAdaptiveOctreeFlatNode> FAdaptiveOctree::SampleSurfaceNodesAroundEdge(const FNodeEdge& Edge)
 {
+    FRWScopeLock ReadLock(OctreeLock, SLT_ReadOnly);
     TArray<FAdaptiveOctreeFlatNode> SurfaceNodes;
-    double SmallOffset = 0.001;// *(Edge.Corners[0].Position - Edge.Corners[1].Position).Size();
+    double SmallOffset = 0.001;
 
     // Compute perpendicular vectors
     FVector Perp1 = FVector::CrossProduct(Edge.EdgeDirection, FVector(1, 0, 0)).GetSafeNormal();
@@ -118,10 +238,9 @@ TArray<FAdaptiveOctreeFlatNode> FAdaptiveOctree::SampleSurfaceNodesAroundEdge(co
     return SurfaceNodes;
 }
 
-
-
 FAdaptiveOctreeFlatNode FAdaptiveOctree::GetSurfaceNodeByPoint(FVector Position)
 {
+    FRWScopeLock ReadLock(OctreeLock, SLT_ReadOnly);
     TSharedPtr<FAdaptiveOctreeNode> CurrentNode = Root;
 
     while (CurrentNode.IsValid())
@@ -152,5 +271,6 @@ FAdaptiveOctreeFlatNode FAdaptiveOctree::GetSurfaceNodeByPoint(FVector Position)
 // Clears the entire octree
 void FAdaptiveOctree::Clear()
 {
+    FRWScopeLock WriteLock(OctreeLock, SLT_Write);
     Root.Reset();
 }

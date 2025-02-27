@@ -127,19 +127,32 @@ bool FAdaptiveOctreeNode::ShouldMerge(FVector InCameraPosition, double InLodDist
     return CanMerge && (FVector::Dist(DualContourPosition, InCameraPosition) > Extent * (InLodDistanceFactor + TreeIndex.Num())) && TreeIndex.Num() >= DepthBounds[0];
 }
 
-bool FAdaptiveOctreeNode::UpdateLod(FVector InCameraPosition, double InLodDistanceFactor)
+void AppendUniqueEdges(TArray<FNodeEdge> InAppendEdges, TArray<FNodeEdge>& OutNodeEdges) {
+    for (FNodeEdge anEdge : InAppendEdges) {
+        OutNodeEdges.AddUnique(anEdge);
+    }
+}
+
+bool FAdaptiveOctreeNode::UpdateLod(FVector InCameraPosition, double InLodDistanceFactor, TArray<FNodeEdge>& OutNodeEdges)
 {
     if (IsLeaf())
     {
         if (ShouldSplit(InCameraPosition, InLodDistanceFactor))
         {
             Split();
+            for (TSharedPtr<FAdaptiveOctreeNode> aChild : Children) {
+                AppendUniqueEdges(aChild->SignChangeEdges, OutNodeEdges);
+            }
             return true; // A split occurred
         }
         else if (Parent.IsValid() && Parent.Pin()->ShouldMerge(InCameraPosition, InLodDistanceFactor) && TreeIndex.Last() == 7)
         {
             Parent.Pin()->Merge();
+            AppendUniqueEdges(Parent.Pin()->SignChangeEdges, OutNodeEdges);
             return true; // A merge occurred
+        }
+        else {
+            AppendUniqueEdges(SignChangeEdges, OutNodeEdges);
         }
     }
     else
@@ -147,7 +160,7 @@ bool FAdaptiveOctreeNode::UpdateLod(FVector InCameraPosition, double InLodDistan
         bool bAnyChanges = false;
         for (int i = 0; i < 8; i++)
         {
-            if (Children[i]->UpdateLod(InCameraPosition, InLodDistanceFactor))
+            if (Children[i]->UpdateLod(InCameraPosition, InLodDistanceFactor, OutNodeEdges))
             {
                 bAnyChanges = true;
             }
@@ -220,47 +233,6 @@ TArray<TSharedPtr<FAdaptiveOctreeNode>> FAdaptiveOctreeNode::GetSurfaceNodes()
 
     return SurfaceNodes;
 }
-//TODO: Lets try converting this lod method
-//void QuadTreeNode::TrySetLod() {
-//    if (this->IsInitialized && this->IsLeaf()) {
-//        double k = 8;
-//        double fov = this->ParentActor->GetCameraFOV();
-//        FVector lastCamPos = this->ParentActor->GetLastCameraPosition();
-//        auto lastCamRot = this->ParentActor->GetLastCameraRotation();
-//
-//        //Since we are doing origin rebasing frequently, the actors location can "change" arbitrarily and needs to be accounted for
-//        FVector planetCenter = this->ParentActor->GetActorLocation();
-//        FVector adjustedCentroid = this->NodeCentroid * this->ParentActor->GetActorScale().X + planetCenter;
-//        auto parentCenter = adjustedCentroid;
-//        auto parentSize = this->MaxNodeRadius * this->ParentActor->GetActorScale().X;
-//
-//        double planetRadius = FVector::Distance(this->ParentActor->GetActorLocation(), adjustedCentroid);
-//
-//        auto parent = this->Parent;
-//
-//        if (parent.IsValid()) {
-//            parentCenter = parent.Pin()->NodeCentroid * this->ParentActor->GetActorScale().X + planetCenter;
-//            parentSize = parent.Pin()->MaxNodeRadius * this->ParentActor->GetActorScale().X;
-//        }
-//
-//        double d1 = FVector::Distance(lastCamPos, adjustedCentroid);
-//        double d2 = FVector::Distance(lastCamPos, parentCenter);
-//        if (this->GetDepth() < this->MinDepth || (this->GetDepth() < this->MaxDepth && k * this->MaxNodeRadius * this->ParentActor->GetActorScale().X > s(d1, fov))) {
-//            this->CanMerge = false;
-//            if (this->LastRenderedState) {
-//                this->AsyncSplit(this->AsShared());
-//            }
-//        }
-//        else if ((parent.IsValid() && parent.Pin()->GetDepth() >= this->MinDepth) && k * parentSize < s(d2, fov)) {
-//            this->CanMerge = true;
-//            parent.Pin()->TryMerge();
-//        }
-//        else {
-//            this->CanMerge = false;
-//        }
-//
-//    }
-//}
 
 TArray<FNodeEdge>& FAdaptiveOctreeNode::GetSignChangeEdges()
 {

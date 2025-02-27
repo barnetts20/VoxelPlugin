@@ -97,7 +97,7 @@ public:
     bool ShouldSplit(FVector InCameraPosition, double InLodDistanceFactor);
     void Merge();
     bool ShouldMerge(FVector InCameraPosition, double InLodDistanceFactor);    
-    bool UpdateLod(FVector InCameraPosition, double InLodDistanceFactor);
+    bool UpdateLod(FVector InCameraPosition, double InLodDistanceFactor, TArray<FNodeEdge>& OutEdges);
 
     TArray<FNodeEdge> GetSurfaceEdges();
     TArray<TSharedPtr<FAdaptiveOctreeNode>> GetSurfaceNodes();

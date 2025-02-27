@@ -60,7 +60,6 @@ AAdaptiveVoxelActor::AAdaptiveVoxelActor()
 
 void AAdaptiveVoxelActor::BeginDestroy() {
     FRWScopeLock WriteLock(OctreeLock, SLT_Write);
-    Chunks.Empty();
     Super::BeginDestroy();
 }
 
@@ -92,12 +91,8 @@ void AAdaptiveVoxelActor::CleanSceneRoot() {
 
 void AAdaptiveVoxelActor::InitializeChunks() {
     CleanSceneRoot();
-    auto ChunkNodes = AdaptiveOctree->GetChunks();
-    for (auto node : ChunkNodes) {
-        auto newChunk = MakeShared<FMeshChunk>();
-        newChunk->Initialize(this, Material, node, AdaptiveOctree);
-        Chunks.Add(newChunk);
-    }
+    AdaptiveOctree->InitializeMeshChunks(this, Material);
+
     Initialized = true;
     double interval1 = .1;
     double interval2 = .2;
@@ -116,19 +111,20 @@ void AAdaptiveVoxelActor::ScheduleDataUpdate(float IntervalInSeconds)
             //**********BEGIN IMPLEMENTATION BLOCK***************
             //**********BEGIN IMPLEMENTATION BLOCK***************
             //**********BEGIN IMPLEMENTATION BLOCK***************
-            {
-                FRWScopeLock WriteLock(OctreeLock, SLT_Write);
-                //FCriticalSection CriticalSection;
-                //ChunksToUpdate.Empty();
-                //ChunksToUpdate.Reserve(Chunks.Num());
-                ParallelFor(Chunks.Num(), [&](int32 idx)
-                {
-                    if (Chunks[idx]->UpdateData(CameraPosition, LodFactor)) {
-                        //FScopeLock Lock(&CriticalSection);
-                        //ChunksToUpdate.Add(Chunks[idx]);
-                    }
-                });
-            }
+                AdaptiveOctree->UpdateLOD(CameraPosition, LodFactor);
+            //{
+            //    FRWScopeLock WriteLock(OctreeLock, SLT_Write);
+            //    //FCriticalSection CriticalSection;
+            //    //ChunksToUpdate.Empty();
+            //    //ChunksToUpdate.Reserve(Chunks.Num());
+            //    ParallelFor(Chunks.Num(), [&](int32 idx)
+            //    {
+            //        if (Chunks[idx]->UpdateData(CameraPosition, LodFactor)) {
+            //            //FScopeLock Lock(&CriticalSection);
+            //            //ChunksToUpdate.Add(Chunks[idx]);
+            //        }
+            //    });
+            //}
             //***********END IMPLEMENTATION BLOCK***************
             //***********END IMPLEMENTATION BLOCK***************
             //***********END IMPLEMENTATION BLOCK***************
@@ -152,17 +148,18 @@ void AAdaptiveVoxelActor::ScheduleMeshUpdate(float IntervalInSeconds)
             //**********BEGIN IMPLEMENTATION BLOCK***************
             //**********BEGIN IMPLEMENTATION BLOCK***************
             //**********BEGIN IMPLEMENTATION BLOCK***************
-            {
-                FRWScopeLock WriteLock(OctreeLock, SLT_Write);
-                ParallelFor(Chunks.Num(), [&](int32 idx)
-                {
-                    //if (ChunksToUpdate[idx].IsValid()) {
-                        Chunks[idx]->UpdateMeshData();
-                        Chunks[idx]->UpdateComponent();
-                    //}
-                });
-                //ChunksToUpdate.Empty();
-            }
+                AdaptiveOctree->UpdateMesh();
+            //{
+            //    FRWScopeLock WriteLock(OctreeLock, SLT_Write);
+            //    ParallelFor(Chunks.Num(), [&](int32 idx)
+            //    {
+            //        //if (ChunksToUpdate[idx].IsValid()) {
+            //            Chunks[idx]->UpdateMeshData();
+            //            Chunks[idx]->UpdateComponent();
+            //        //}
+            //    });
+            //    //ChunksToUpdate.Empty();
+            //}
             //***********END IMPLEMENTATION BLOCK***************
             //***********END IMPLEMENTATION BLOCK***************
             //***********END IMPLEMENTATION BLOCK***************
