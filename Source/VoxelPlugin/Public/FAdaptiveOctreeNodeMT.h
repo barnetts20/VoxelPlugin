@@ -8,13 +8,16 @@
 /**
  * 
  */
-class VOXELPLUGIN_API FAdaptiveOctreeNodeMT
+class VOXELPLUGIN_API FAdaptiveOctreeNodeMT : public TSharedFromThis<FAdaptiveOctreeNodeMT>
 {
 public:
 	// Root Constructor
 	FAdaptiveOctreeNodeMT(TFunction<double(FVector)> InDensityFunction, FVector InCenter, double InExtent, int InMinDepth, int InMaxDepth);
 	// Child Constructor
 	FAdaptiveOctreeNodeMT(TFunction<double(FVector)> InDensityFunction, TSharedPtr<FAdaptiveOctreeNodeMT> InParent, uint8 InChildIndex);
+
+	FVector Center;
+	double Extent;
 
 	bool IsLeaf() const;
 	bool IsRoot() const;
@@ -42,7 +45,6 @@ private:
 	TFunction<double(FVector)> DensityFunction;
 
 	FCameraInfo CameraData;
-
 	double LODFactor;
 
 	FSamplePosition Corners[8];
