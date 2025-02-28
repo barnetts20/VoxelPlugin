@@ -71,32 +71,26 @@ FAdaptiveOctreeNodeMT::FAdaptiveOctreeNodeMT(TFunction<double(FVector)> InDensit
 
 FAdaptiveOctreeNodeMT::FAdaptiveOctreeNodeMT(TFunction<double(FVector)> InDensityFunction, TSharedPtr<FAdaptiveOctreeNodeMT> InParent, uint8 InChildIndex)
 {
+    // Set parent relationship
+    Parent = InParent;
     // Initialize member variables
     bIsLeaf = true;
     bIsRoot = false;
     bIsSurface = false;
     bNeedsMeshUpdate = true;
     DensityFunction = InDensityFunction;
-
-    // Set parent relationship
-    Parent = InParent;
+    Extent = InParent->Extent * 0.5;
 
     // Initialize depth constraints (inherit from parent)
     MinMaxDepth[0] = InParent->MinMaxDepth[0];
     MinMaxDepth[1] = InParent->MinMaxDepth[1];
-
-    // Calculate center and extent
-    Extent = InParent->Extent * 0.5;
-
-    // Calculate offset based on child index
-    FVector Offset = FVoxelStructures::CornerOffsets[InChildIndex] * Extent;
 
     // Initialize tree index (append child index to parent's index)
     TreeIndex = InParent->TreeIndex;
     TreeIndex.Add(InChildIndex);
 
     // Initialize the center
-    FVector CenterPos = InParent->Center.Position + Offset;
+    FVector CenterPos = InParent->Center.Position + FVoxelStructures::CornerOffsets[InChildIndex] * Extent;
     Center = FSamplePosition(8, CenterPos, FVector::ZeroVector, DensityFunction(CenterPos));
 
     // Initialize corners with sample positions
@@ -340,8 +334,8 @@ TArray<TSharedPtr<FAdaptiveOctreeNodeMT>> FAdaptiveOctreeNodeMT::GetSurfaceLeafN
 }
 
 TSharedPtr<FAdaptiveOctreeNodeMT> FAdaptiveOctreeNodeMT::SampleSurfaceLeafByPosition(FVector SamplePosition) {
-    //TODO: crawl up parent heirarchy until we find a node containing the position
-    //TODO: crawl back down heirarchy until we either find a surface leaf contianing the position or nullptr
+    //TODO: crawl up parent heirarchy until we find a node containing the position, nullptr if not contained at root
+    //TODO: crawl back down heirarchy until we either find a surface leaf contianing the position or nullptr if none was found
 }
 
 void FAdaptiveOctreeNodeMT::UpdateNeighbors()
