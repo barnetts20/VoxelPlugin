@@ -1,6 +1,7 @@
+#include "AdaptiveVoxelActor.h"
 #include "DrawDebugHelpers.h"
 #include "Kismet/GameplayStatics.h"
-#include "AdaptiveVoxelActor.h"
+
 using namespace RealtimeMesh;
 
 // Sets default values
