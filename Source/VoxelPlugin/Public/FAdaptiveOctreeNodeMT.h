@@ -12,22 +12,30 @@ class VOXELPLUGIN_API FAdaptiveOctreeNodeMT : public TSharedFromThis<FAdaptiveOc
 {
 public:
 	// Root Constructor
-	FAdaptiveOctreeNodeMT(TFunction<double(FVector)> InDensityFunction, FVector InCenter, double InExtent, int InMinDepth, int InMaxDepth);
+	FAdaptiveOctreeNodeMT(TFunction<double(FVector)> InDensityFunction, FVector InCenter, double InExtent, int InMinMaxDepth[2]);
 	// Child Constructor
 	FAdaptiveOctreeNodeMT(TFunction<double(FVector)> InDensityFunction, TSharedPtr<FAdaptiveOctreeNodeMT> InParent, uint8 InChildIndex);
 
-	FVector Center;
+	FSamplePosition Center;
 	double Extent;
 
 	bool IsLeaf() const;
 	bool IsRoot() const;
 	bool IsSurface() const;
+	bool IsSurfaceLeaf() const;
 
 	//Return the set of surface+leaf nodes who are the InNode or its descendants
-	static TArray<TSharedPtr<FAdaptiveOctreeNodeMT>> GetSurfaceNodes(TSharedPtr<FAdaptiveOctreeNodeMT> InNode);
+	static TArray<TSharedPtr<FAdaptiveOctreeNodeMT>> GetSurfaceLeafNodes(TSharedPtr<FAdaptiveOctreeNodeMT> InNode);
 
+	//Sample a surface leaf node at a given position if one exists, used in neighbor population
+	TSharedPtr<FAdaptiveOctreeNodeMT> SampleSurfaceLeafByPosition(FVector SamplePosition);
+
+	//Split the passed node until it is at least the passed depth
+	static void SplitToDepth(TSharedPtr<FAdaptiveOctreeNodeMT> InNode, int InDepth);
+	
 	//Update LOD for every surface/leaf node who is the InNode or its descendant - if lod changes mark the node for mesh regeneration
-	static bool UpdateLOD(TSharedPtr<FAdaptiveOctreeNodeMT> InNode, FCameraInfo InCameraData);
+	static bool UpdateLOD(TSharedPtr<FAdaptiveOctreeNodeMT> InNode, FCameraInfo InCameraData, double InLODFactor);
+	
 	//After LOD update stage, update neighbor information for each surface/leaf node - if neighbors change mark the node for mesh regeneration
 	static void UpdateNeighborData(TSharedPtr<FAdaptiveOctreeNodeMT> InNode);
 	
@@ -36,34 +44,52 @@ public:
 	static void RegenerateMeshData(TSharedPtr<FAdaptiveOctreeNodeMT> InNode, FInternalMeshBuffer& OutMeshBuffer);
 
 private:
+	TArray<uint8> TreeIndex; //Path to the node in the tree
+	TFunction<double(FVector)> DensityFunction;
+
+	//State data
 	bool bIsLeaf = true;
 	bool bIsRoot = true;
 	bool bIsSurface = false;
 	bool bNeedsMeshUpdate = true;
+	int MinMaxDepth[2];
 
-	TArray<uint8> TreeIndex; //Path to the node in the tree
-	TFunction<double(FVector)> DensityFunction;
-
-	FCameraInfo CameraData;
-	double LODFactor;
-
+	//Structure Data
 	FSamplePosition Corners[8];
-	FEdge Edges[12];
+	FVoxelEdge Edges[12];
 	FQuadFace Faces[6];
 	FTetrahedron Tetra[6];
 
+	//Family & neighbor data
 	TWeakPtr<FAdaptiveOctreeNodeMT> Parent;
 	TSharedPtr<FAdaptiveOctreeNodeMT> Children[8];
-	TArray<TWeakPtr<FAdaptiveOctreeNodeMT>> Neighbors;
+	TMap<int, TArray<TWeakPtr<FAdaptiveOctreeNodeMT>>> FaceNeighborMap;
 
-	int MinMaxDepth[2];
-
+	//LOD data
+	FCameraInfo CameraData;
+	double LODFactor = 10;
+	
+	//Mesh Data
 	FInternalMeshBuffer MeshData;
-
-	void ShouldSplit();
+	
+	//Conditional for valid split case
+	bool ShouldSplit();
+	
+	//Split the node
 	void Split();
-	void ShouldMerge();
+	
+	//Conditional for valid merge case
+	bool ShouldMerge();
+	
+	//Merge the node
 	void Merge();
 
-	FInternalMeshBuffer ComputeGeometry(); //Populate and return node specific FInternalMeshBuffer
+	//Helper method to compute the normals for all sample points, must be invoked after densities are set and before edges are generated
+	void ComputeSampleNormals();
+
+	//Update the face id/neighbor pointer map for the individual node
+	void UpdateNeighbors();
+
+	//Update the mesh data for the individual node
+	FInternalMeshBuffer ComputeGeometry();
 };

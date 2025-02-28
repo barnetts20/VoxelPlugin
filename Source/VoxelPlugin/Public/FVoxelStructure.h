@@ -25,6 +25,7 @@ struct VOXELPLUGIN_API FVoxelEdge {
     double Length;
     FVector MidPoint;
     FVector ZeroCrossingPoint;
+    FVector Normal;
     bool SignChange;
 
     FVoxelEdge() {};
@@ -127,13 +128,6 @@ public:
     static const int FaceEdges[6][4];
 
     /// <summary>
-    /// Tetrahedron definition for the 6 tetrahedra in a cube
-    /// Each tetrahedron is defined as a tuple (face index, triangle index)
-    /// This gives us 6 tetrahedra (one for each face of the cube)
-    /// </summary>
-    static const int TetrahedraDefinitions[6][2];
-
-    /// <summary>
     /// Tetrahedron decomposition
     /// This array maps each of the 6 tetrahedra to its 4 corner indices
     /// Each tetrahedron is formed by 3 corners of a cube face plus the center point
@@ -196,16 +190,6 @@ inline const int FVoxelStructures::FaceEdges[6][4] = {
     {1, 11, 3, 10},  // +Y face (Y_POSITIVE)
     {0, 5, 1, 4},    // -Z face (Z_NEGATIVE)
     {2, 7, 3, 6}     // +Z face (Z_POSITIVE)
-};
-
-// Define the tetrahedra definitions (face index, triangle index)
-inline const int FVoxelStructures::TetrahedraDefinitions[6][2] = {
-    {0, 0}, // -X face (X_NEGATIVE), triangle 0
-    {1, 0}, // +X face (X_POSITIVE), triangle 0
-    {2, 0}, // -Y face (Y_NEGATIVE), triangle 0
-    {3, 0}, // +Y face (Y_POSITIVE), triangle 0
-    {4, 0}, // -Z face (Z_NEGATIVE), triangle 0
-    {5, 0}  // +Z face (Z_POSITIVE), triangle 0
 };
 
 // Define the tetrahedron corner indices

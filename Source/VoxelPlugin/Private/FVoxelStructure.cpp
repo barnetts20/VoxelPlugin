@@ -20,7 +20,10 @@ FVoxelEdge::FVoxelEdge(int InEdgeIndex, FSamplePosition InEndPoints[2])
     Length = FVector::Dist(EndPoints[0].Position, EndPoints[1].Position);
     MidPoint = (EndPoints[0].Position + EndPoints[1].Position) * 0.5f;
     SignChange = (EndPoints[0].Density < 0) != (EndPoints[1].Density < 0);
-    ZeroCrossingPoint = (SignChange ? EndPoints[0].Position + (FMath::Abs(EndPoints[0].Density) / (FMath::Abs(EndPoints[0].Density) + FMath::Abs(EndPoints[1].Density))) * (EndPoints[1].Position - EndPoints[0].Position) : MidPoint);
+    // Calculate interpolation factor based on density values
+    double t = FMath::Abs(EndPoints[0].Density) / (FMath::Abs(EndPoints[0].Density) + FMath::Abs(EndPoints[1].Density));
+    ZeroCrossingPoint = (SignChange ? FMath::Lerp(EndPoints[0].Position, EndPoints[1].Position, t) : MidPoint);
+    FVector InterpolatedNormal = FMath::Lerp(EndPoints[0].Normal, EndPoints[1].Normal, t).GetSafeNormal();
 }
 
 FQuadFace::FQuadFace(int InFaceIndex, FVoxelEdge InEdges[4])
@@ -69,4 +72,5 @@ FTetrahedron::FTetrahedron(int InTetraIndex, FQuadFace InBaseFace, FSamplePositi
         TriFaceEdges[2] = ConnectingEdges[(i + 1) % 4];
         TriFaces[i] = FTriFace(6 + i, TriFaceEdges); //Start face index after the initial 6 faces of the node, so 6-10
     }
+
 }
