@@ -81,6 +81,12 @@ struct VOXELPLUGIN_API FInternalMeshBuffer {
     TArray<int32> Triangles;
 };
 
+struct VOXELPLUGIN_API FCameraInfo {
+    FVector Position = FVector::ZeroVector;
+    FVector Direction = FVector(1,0,0);
+    double FOV = 0;
+};
+
 /// <summary>
 /// Static class for voxel-related constants, lookup tables, and generic functions
 /// </summary>
