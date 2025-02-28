@@ -17,9 +17,9 @@ public:
 	bool IsLeaf();
 	bool IsSurface();
 
-	void UpdateLOD(TSharedPtr<FAdaptiveOctreeNodeMT> InNode, FVector InCameraPosition, FVector InCameraDirection, double InLODFactor, double InFOV);
-	void UpdateNeighborData();
-	void UpdateMeshData();
+	bool UpdateLOD(TSharedPtr<FAdaptiveOctreeNodeMT> InNode, FVector InCameraPosition, FVector InCameraDirection, double InLODFactor, double InFOV);
+	void UpdateNeighborData(TSharedPtr<FAdaptiveOctreeNodeMT> InNode);
+	FInternalMeshBuffer RegenerateMeshData(TSharedPtr<FAdaptiveOctreeNodeMT> InNode);
 
 private:
 	bool bIsLeaf;
