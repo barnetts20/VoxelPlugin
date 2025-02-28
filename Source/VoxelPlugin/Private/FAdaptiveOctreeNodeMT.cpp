@@ -253,7 +253,7 @@ bool FAdaptiveOctreeNodeMT::ShouldSplit()
 
 void FAdaptiveOctreeNodeMT::Split()
 {
-    if (!bIsLeaf) return; // Already split
+    if (!bIsLeaf) return;
     for (uint8 i = 0; i < 8; i++)
     {
         Children[i] = MakeShared<FAdaptiveOctreeNodeMT>(DensityFunction, AsShared(), i);
@@ -277,9 +277,9 @@ bool FAdaptiveOctreeNodeMT::ShouldMerge()
 
 void FAdaptiveOctreeNodeMT::Merge()
 {
-    if (bIsLeaf) return; // Already merged
+    if (bIsLeaf) return;
     TArray<TSharedPtr<FAdaptiveOctreeNodeMT>> NodesToDelete;
-    NodesToDelete.Append(Children); // Add children to cleanup list
+    NodesToDelete.Append(Children);
     while (NodesToDelete.Num() > 0)
     {
         TSharedPtr<FAdaptiveOctreeNodeMT> Node = NodesToDelete.Pop();
@@ -342,7 +342,19 @@ void FAdaptiveOctreeNodeMT::UpdateNeighbors()
 {
     bool NeighborsChanged = false;
     //TODO: Sample neigbors update faceidx/neighbor map
-    
+    // Should iterate face map, for each face begin with a sample position just inside its outer edge on the node
+    // ____
+    //|x   |
+    //|    |
+    // ----
+    // Offset this position to be just barely outside the node along the same axis the face is on.
+    // Call SampleSurfaceLeafByPosition, if the resulting node is the same LOD level we can store it and finish for that face
+    // if the resulting node is a deeper lod level, add it and sample the other 3 corners, appending the rest of the nodes
+    // ____
+    //|x  x|
+    //|x  x|
+    // ----
+    // If the neighbors array for the face was altered, flag the node for mesh regeneration
     if (NeighborsChanged) bNeedsMeshUpdate = true;
 }
 
@@ -364,7 +376,7 @@ bool FAdaptiveOctreeNodeMT::UpdateLOD(TSharedPtr<FAdaptiveOctreeNodeMT> InNode, 
         if (InNode->ShouldSplit())
         {
             InNode->Split();
-            return true; // A split occurred
+            return true;
         }
         else if (InNode->Parent.IsValid() && InNode->TreeIndex.Last() == 7)
         {
@@ -388,18 +400,21 @@ bool FAdaptiveOctreeNodeMT::UpdateLOD(TSharedPtr<FAdaptiveOctreeNodeMT> InNode, 
                 bAnyChanges = true;
             }
         }
-        return bAnyChanges; // Return true if any child changed
+        return bAnyChanges;
     }
-
-    return false; // No changes occurred
+    return false;
 }
 
 void FAdaptiveOctreeNodeMT::UpdateNeighborData(TSharedPtr<FAdaptiveOctreeNodeMT> InNode)
 {
+    // TODO: For each surface/leaf available from InNode, invoke its update neighbors.
+    // Must be called after update lod stage has completed on entire tree.
 }
 
 void FAdaptiveOctreeNodeMT::RegenerateMeshData(TSharedPtr<FAdaptiveOctreeNodeMT> InNode, FInternalMeshBuffer& OutMeshBuffer)
 {
+    // TODO: For each surface/leaf node available from InNode, invoke its compute geometry, 
+    // append resulting geometry to OutMeshBuffer.
 }
 
 
