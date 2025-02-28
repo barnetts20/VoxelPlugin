@@ -92,8 +92,7 @@ struct VOXELPLUGIN_API FMeshChunk {
         ChunkRtComponent->SetRealtimeMesh(ChunkRtMesh);
         ChunkRtComponent->SetRenderCustomDepth(true);
 
-        ChunkRtMesh->CreateSectionGroup(ChunkMeshData->MeshGroupKey, ChunkMeshData->MeshStream).Wait();
-        ChunkRtMesh->UpdateSectionConfig(ChunkMeshData->MeshSectionKey, SecConfig, true).Wait();
+        ChunkRtMesh->CreateSectionGroup(ChunkMeshData->MeshGroupKey, ChunkMeshData->MeshStream);
         ChunkRtMesh->ClearInternalFlags(EInternalObjectFlags::Async);
     };
 
@@ -122,7 +121,11 @@ struct VOXELPLUGIN_API FMeshChunk {
 
     bool ShouldProcessEdge(const FNodeEdge& Edge, const TArray<FAdaptiveOctreeFlatNode>& SampledNodes) {
         // If we don't have enough nodes to form a triangle bail out
-        if (SampledNodes.Num() < 3) return false;
+        if (SampledNodes.Num() < 3) { 
+            UE_LOG(LogTemp, Log, TEXT("< 3 EDGE SURROUNDING NODES. NUM = %d"), SampledNodes.Num());
+            return false; 
+        }
+
         // If it's not on a stitching face, mesh it
         if (!IsEdgeOnChunkFace(Edge, -1)) return true;
         // For each node that is outside the chunk bounds, add its edges to test against
@@ -136,13 +139,11 @@ struct VOXELPLUGIN_API FMeshChunk {
     }
     //Update all chunk mesh data in async 2
     void UpdateMeshData(FMeshStreamData newMeshData) {
-        FRWScopeLock WriteLock(*MeshDataLock, SLT_Write);
         ChunkMeshData->MeshStream = FRealtimeMeshStreamSet(newMeshData.MeshStream);
         IsDirty = true;
     }
 
     void UpdateComponent() {
-        FRWScopeLock ReadLock(*MeshDataLock, SLT_ReadOnly);
         if (!IsDirty) return;
         if (ChunkMeshData) ChunkRtMesh->UpdateSectionGroup(ChunkMeshData->MeshGroupKey, ChunkMeshData->MeshStream).Then([this](TFuture<ERealtimeMeshProxyUpdateStatus> update) {
             ChunkRtMesh->UpdateSectionConfig(ChunkMeshData->MeshSectionKey, SecConfig, true);

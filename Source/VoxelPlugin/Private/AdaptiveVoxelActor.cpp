@@ -38,21 +38,21 @@ AAdaptiveVoxelActor::AAdaptiveVoxelActor()
     //        return FMath::Max(q.X, FMath::Max(q.Y, q.Z));
     //    };
 
-    //Sphere
-    //auto DensityFunction = [](FVector Position) -> double
+    //sphere
+    //auto densityfunction = [](fvector position) -> double
     //    {
-    //        double SphereRadius = 10000000.0;
-    //        return Position.Size() - SphereRadius;
+    //        double sphereradius = 10000000.0;
+    //        return position.size() - sphereradius;
     //    };
-    //SphereNoise
+    //spherenoise
     auto DensityFunction = [&](FVector Position) -> double
         {
             double SphereRadius = 9713713.0;
-            float NoiseValue = (FMath::PerlinNoise3D(Position / 5000000.0)) * 500000 + (FMath::PerlinNoise3D(Position / 100000.0)) * 100000;
+            float NoiseValue = (FMath::PerlinNoise3D(Position / 977999.0)) * 497997.0;// +(FMath::PerlinNoise3D(Position / 100000.0)) * 100000;
             return Position.Size() - (SphereRadius - NoiseValue);
         };
     //Adaptive Octree Picks out the Implicit Structure
-    AdaptiveOctree = MakeShared<FAdaptiveOctree>(DensityFunction, GetActorLocation(), 10400001.0, ChunkDepth, MinDepth, MaxDepth);
+    AdaptiveOctree = MakeShared<FAdaptiveOctree>(DensityFunction, GetActorLocation(), 15001357.0, ChunkDepth, MinDepth, MaxDepth);
     //Sparsetree for user edits
     SparseOctree = MakeShared<FSparseOctree>();
 }
@@ -93,11 +93,8 @@ void AAdaptiveVoxelActor::InitializeChunks() {
     AdaptiveOctree->InitializeMeshChunks(this, Material);
 
     Initialized = true;
-    double interval1 = .1;
-    double interval2 = .2;
-
-    ScheduleDataUpdate(.05);
-    ScheduleMeshUpdate(.2);
+    ScheduleDataUpdate(.1);
+    ScheduleMeshUpdate(.1);
 }
 
 void AAdaptiveVoxelActor::ScheduleDataUpdate(float IntervalInSeconds)

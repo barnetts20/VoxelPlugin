@@ -15,7 +15,7 @@ private:
     TSharedPtr<FAdaptiveOctreeNode> Root;
     TArray<TSharedPtr<FAdaptiveOctreeNode>> Chunks;
     bool MeshChunksInitialized = false;
-    TArray<FMeshChunk> MeshChunks;
+    TArray<TSharedPtr<FMeshChunk>> MeshChunks;
     double RootExtent;
 
 public:
@@ -26,7 +26,9 @@ public:
 
     void SplitToDepth(TSharedPtr<FAdaptiveOctreeNode> Node, int InMinDepth);
 
-    void UpdateMeshChunkStreamData(FMeshChunk& InChunk);
+    void UpdateMeshChunkStreamData(TSharedPtr<FMeshChunk> InChunk);
+
+    uint32 ComputePositionHash(const FVector& Position, float GridSize);
 
     void UpdateLOD(FVector CameraPosition, double LodFactor);
     void UpdateMesh();
@@ -35,7 +37,9 @@ public:
     TArray<TSharedPtr<FAdaptiveOctreeNode>> GetSurfaceNodes();
     TArray<TSharedPtr<FAdaptiveOctreeNode>> GetChunks();
 
-    FAdaptiveOctreeFlatNode GetSurfaceNodeByPoint(FVector Position);
+    FVector CalculateSurfaceNormal(const FVector& Position);
+
+    TSharedPtr<FAdaptiveOctreeNode> GetLeafNodeByPoint(FVector Position);
     TArray<FAdaptiveOctreeFlatNode> SampleSurfaceNodesAroundEdge(const FNodeEdge& Edge);
     void Clear(); //TODO: Need to test this
     //TODO: Need to make a destructor that safely disposes references/pointers and locks

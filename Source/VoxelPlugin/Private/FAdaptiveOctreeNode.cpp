@@ -69,6 +69,18 @@ FAdaptiveOctreeNode::FAdaptiveOctreeNode(TFunction<double(FVector)> InDensityFun
     ComputeDualContourPosition();
 }
 
+//In order to "fix" holes that may form when non manifold edges are found, we will guestimate a dual contouring point and work
+//backwards from it to compute new corner densities, after this is done we need to recalculate edges and the rest of the internal node data
+void FAdaptiveOctreeNode::RecomputeDualContouringData() {
+    for (int EdgeIndex = 0; EdgeIndex < 12; EdgeIndex++)
+    {
+        FNodeEdge anEdge = FNodeEdge(Corners[EdgePairs[EdgeIndex][0]], Corners[EdgePairs[EdgeIndex][1]]);
+        Edges.Add(anEdge);
+        if (anEdge.SignChange) SignChangeEdges.Add(anEdge);
+    }
+    ComputeDualContourPosition();
+}
+
 void FAdaptiveOctreeNode::Split()
 {
     if (!bIsLeaf) return; // Already split
@@ -122,6 +134,7 @@ bool FAdaptiveOctreeNode::ShouldMerge(FVector InCameraPosition, double InLodDist
             break; 
         }
     }
+    if (LodOverride) return false; //Do not allow nodes split to fill holes the ability to remerge
 
     return CanMerge && (FVector::Dist(DualContourPosition, InCameraPosition) > Extent * (InLodDistanceFactor + TreeIndex.Num())) && TreeIndex.Num() >= DepthBounds[0];
 }
@@ -236,6 +249,34 @@ TArray<TSharedPtr<FAdaptiveOctreeNode>> FAdaptiveOctreeNode::GetSurfaceNodes()
 TArray<FNodeEdge>& FAdaptiveOctreeNode::GetSignChangeEdges()
 {
     return SignChangeEdges;
+}
+
+TArray<FNodeEdge> FAdaptiveOctreeNode::GetArtificialSignChangeEdges(FNodeEdge InEdge) {
+    TArray<FNodeEdge> Results;
+    for (int i = 0; i < Edges.Num(); i++) {
+        if (Edges[i].IsCongruent(InEdge)) {
+            Results.Add(Edges[i]);
+        }
+    }
+    if (Results.Num() > 0) return Results;
+
+    double maxDistance = 99999999999999999999999999.0;
+    FVector InEdgeCenter = (InEdge.Corners[0].Position + InEdge.Corners[1].Position) * .5;
+    for (int i = 0; i < Edges.Num(); i++) {
+        if (Edges[i].Axis == InEdge.Axis) {
+            FVector cEdgeCenter = (Edges[i].Corners[0].Position + Edges[i].Corners[1].Position) * .5;
+            double eDist = cEdgeCenter.DistSquared(InEdgeCenter, cEdgeCenter);
+            if (eDist < maxDistance) {
+                maxDistance = eDist;
+                Results.Empty();
+                Results.Add(Edges[i]);
+            }
+            else if (eDist == maxDistance) {
+                Results.Add(Edges[i]);
+            }
+        }
+    }
+    return Results;
 }
 
 // Compute Dual Contour Position

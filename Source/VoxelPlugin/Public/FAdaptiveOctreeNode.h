@@ -35,6 +35,16 @@ struct VOXELPLUGIN_API FNodeEdge
         ZeroCrossingPoint = InCorner1.Position + FMath::Abs(InCorner1.Density) / (FMath::Abs(InCorner1.Density) + FMath::Abs(InCorner2.Density)) * (InCorner2.Position - InCorner1.Position);
     }
 
+    bool IsCongruent(const FNodeEdge& Other) const {
+        return
+            Corners[0].Position.Equals(Other.Corners[0].Position, .01)
+            || Corners[0].Position.Equals(Other.Corners[1].Position, .01)
+            || Corners[1].Position.Equals(Other.Corners[0].Position, .01)
+            || Corners[1].Position.Equals(Other.Corners[1].Position, .01)
+            &&
+            Axis == Other.Axis;
+    }
+
     // Equality operator for ensuring uniqueness
     bool operator==(const FNodeEdge& Other) const
     {
@@ -86,7 +96,7 @@ public:
     FVector DualContourPosition;
     FVector DualContourNormal;
     bool IsSurfaceNode;
-
+    bool LodOverride = false; //If true prevent merge ops
     TArray<FNodeCorner> Corners;
     TArray<FNodeEdge> Edges;
     TArray<FNodeEdge> SignChangeEdges;
@@ -104,11 +114,14 @@ public:
     TArray<TSharedPtr<FAdaptiveOctreeNode>> GetSurfaceNodes();
     TArray<FNodeEdge>& GetSignChangeEdges();
 
+    TArray<FNodeEdge> GetArtificialSignChangeEdges(FNodeEdge anEdge);
+
     // Root Constructor
     FAdaptiveOctreeNode(TFunction<double(FVector)> InDensityFunction, FVector InCenter, double InExtent, int InMinDepth, int InMaxDepth);
 
     // Child Constructor
     FAdaptiveOctreeNode(TFunction<double(FVector)> InDensityFunction, TSharedPtr<FAdaptiveOctreeNode> InParent, uint8 ChildIndex);
+    void RecomputeDualContouringData();
 };
 
 struct VOXELPLUGIN_API FAdaptiveOctreeFlatNode {
