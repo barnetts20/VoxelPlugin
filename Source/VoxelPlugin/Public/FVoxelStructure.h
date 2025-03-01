@@ -77,8 +77,8 @@ struct VOXELPLUGIN_API FTetrahedron {
 /// Structure to encapsulate cached mesh data for a node, will eventually be recombined into realtime mesh buffers
 /// </summary>
 struct VOXELPLUGIN_API FInternalMeshBuffer {
-    TArray<FVector3f> Positions;
-    TArray<FVector3f> Normals;
+    TArray<FVector> Positions;
+    TArray<FVector> Normals;
     TArray<int32> Triangles;
 };
 
@@ -87,6 +87,7 @@ struct VOXELPLUGIN_API FCameraInfo {
     FVector Direction = FVector(1,0,0);
     double FOV = 0;
 };
+
 
 /// <summary>
 /// Static class for voxel-related constants, lookup tables, and generic functions

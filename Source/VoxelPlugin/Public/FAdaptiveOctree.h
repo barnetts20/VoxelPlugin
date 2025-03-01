@@ -3,7 +3,6 @@
 #include "CoreMinimal.h"
 #include <FMeshingStructs.h>
 #include "FAdaptiveOctreeNode.h"
-
 /**
  * Adaptive Octree for LOD-based voxel meshing.
  */
@@ -14,8 +13,8 @@ private:
     TFunction<double(FVector)> DensityFunction;
     TSharedPtr<FAdaptiveOctreeNode> Root;
     TArray<TSharedPtr<FAdaptiveOctreeNode>> Chunks;
-    bool MeshChunksInitialized = false;
     TArray<TSharedPtr<FMeshChunk>> MeshChunks;
+    bool MeshChunksInitialized = false;
     double RootExtent;
 
 public:

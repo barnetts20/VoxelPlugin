@@ -53,7 +53,8 @@ struct VOXELPLUGIN_API FMeshStreamData {
 
 struct VOXELPLUGIN_API FMeshChunk {
     //Data Model Info
-    FAdaptiveOctreeFlatNode ChunkNode;
+    FVector ChunkCenter;
+    double ChunkExtent;
     TArray<FNodeEdge> ChunkEdges;
     TSharedPtr<FMeshStreamData> ChunkMeshData;
 
@@ -65,15 +66,15 @@ struct VOXELPLUGIN_API FMeshChunk {
     FRealtimeMeshLODKey LODKey = FRealtimeMeshLODKey::FRealtimeMeshLODKey(0);
     FRealtimeMeshSectionConfig SecConfig = FRealtimeMeshSectionConfig(0);
 
-    void Initialize(ARealtimeMeshActor* InParentActor, UMaterialInterface* Material, FAdaptiveOctreeFlatNode InChunkNode) {
+    void Initialize(ARealtimeMeshActor* InParentActor, UMaterialInterface* Material, FVector InCenter, double InExtent) {
         FRealtimeMeshCollisionConfiguration cConfig;
         cConfig.bShouldFastCookMeshes = false;
         cConfig.bUseComplexAsSimpleCollision = true;
         cConfig.bDeformableMesh = false;
         cConfig.bUseAsyncCook = true;
 
-        //OwningOctree = InTree;
-        ChunkNode = InChunkNode;
+        ChunkCenter = InCenter;
+        ChunkExtent = InExtent;
         ChunkMeshData = MakeShared<FMeshStreamData>();
         ChunkMeshData->MeshGroupKey = FRealtimeMeshSectionGroupKey::Create(LODKey, FName("MeshGroup"));
         ChunkMeshData->MeshSectionKey = FRealtimeMeshSectionKey::CreateForPolyGroup(ChunkMeshData->MeshGroupKey, 0);
@@ -98,8 +99,8 @@ struct VOXELPLUGIN_API FMeshChunk {
 
     bool IsEdgeOnChunkFace(const FNodeEdge& Edge, int Coef) {
         // Pre-compute face position vector and tolerance once
-        const float tolerance = 0.001f * ChunkNode.Extent;
-        const FVector facePos = ChunkNode.Center + (Coef * FVector(ChunkNode.Extent));
+        const float tolerance = 0.001f * ChunkExtent;
+        const FVector facePos = ChunkCenter + (Coef * FVector(ChunkExtent));
 
         // Calculate perpendicular axes using modular arithmetic
         const int axis1 = (Edge.Axis + 1) % 3;  // First perpendicular axis
@@ -112,11 +113,11 @@ struct VOXELPLUGIN_API FMeshChunk {
 
     bool IsNodeInChunk(const FAdaptiveOctreeFlatNode& Node) {
         // Calculate extents once
-        const FVector extentVec(ChunkNode.Extent);
-        FVector distFromCenter = (Node.Center - ChunkNode.Center).GetAbs();
-        return distFromCenter.X <= ChunkNode.Extent &&
-            distFromCenter.Y <= ChunkNode.Extent &&
-            distFromCenter.Z <= ChunkNode.Extent;
+        const FVector extentVec(ChunkExtent);
+        FVector distFromCenter = (Node.Center - ChunkCenter).GetAbs();
+        return distFromCenter.X <= ChunkExtent &&
+            distFromCenter.Y <= ChunkExtent &&
+            distFromCenter.Z <= ChunkExtent;
     }
 
     bool ShouldProcessEdge(const FNodeEdge& Edge, const TArray<FAdaptiveOctreeFlatNode>& SampledNodes) {

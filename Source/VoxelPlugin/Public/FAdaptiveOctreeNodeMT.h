@@ -98,4 +98,5 @@ private:
 
 	//Update the mesh data for the individual node
 	FInternalMeshBuffer ComputeGeometry();
+	void StitchLODTransition(int faceIdx, const FSamplePosition Corners[8], const TArray<FVoxelEdge>& CubeEdges, const FQuadFace& Face);
 };

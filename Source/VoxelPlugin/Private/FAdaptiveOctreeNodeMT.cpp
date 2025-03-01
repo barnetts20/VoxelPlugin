@@ -368,10 +368,233 @@ bool FAdaptiveOctreeNodeMT::UpdateNeighbors()
 FInternalMeshBuffer FAdaptiveOctreeNodeMT::ComputeGeometry()
 {
     if (bNeedsMeshUpdate) {
-        //TODO:: ACTUALLY COMPUTE MESH, INCLUDING ANY STITCHING NEEDED FOR LOD CHANGE FACES
+        // Clear any existing mesh data
+        MeshData.Positions.Empty();
+        MeshData.Normals.Empty();
+        MeshData.Triangles.Empty();
+
+        // We already have sample positions for all corners and center
+        // No need to recalculate densities
+
+        // Create all 12 edges of the cube
+        TArray<FVoxelEdge> CubeEdges;
+        CubeEdges.SetNum(12);
+
+        for (int i = 0; i < 12; i++) {
+            FSamplePosition EdgeCorners[2] = {
+                Corners[FVoxelStructures::EdgePairs[i][0]],
+                Corners[FVoxelStructures::EdgePairs[i][1]]
+            };
+
+            FVoxelEdge Edge(i, EdgeCorners);
+            CubeEdges[i] = Edge;
+        }
+
+        // Create the 6 faces of the cube
+        TArray<FQuadFace> CubeFaces;
+        CubeFaces.SetNum(6);
+
+        for (int i = 0; i < 6; i++) {
+            FVoxelEdge FaceEdges[4] = {
+                CubeEdges[FVoxelStructures::FaceEdges[i][0]],
+                CubeEdges[FVoxelStructures::FaceEdges[i][1]],
+                CubeEdges[FVoxelStructures::FaceEdges[i][2]],
+                CubeEdges[FVoxelStructures::FaceEdges[i][3]]
+            };
+
+            CubeFaces[i] = FQuadFace(i, FaceEdges);
+        }
+
+        // Process each tetrahedron (6 per cube)
+        for (int tetraIdx = 0; tetraIdx < 6; tetraIdx++) {
+            // Get corner indices for this tetrahedron
+            FSamplePosition TetraCorners[4] = {
+                Corners[FVoxelStructures::TetrahedronCorners[tetraIdx][0]],
+                Corners[FVoxelStructures::TetrahedronCorners[tetraIdx][1]],
+                Corners[FVoxelStructures::TetrahedronCorners[tetraIdx][2]],
+                Center // Using pre-calculated center
+            };
+
+            // Create the tetrahedron edges (6 per tetrahedron)
+            TArray<FVoxelEdge> TetraEdges;
+            TetraEdges.SetNum(6);
+
+            for (int edgeIdx = 0; edgeIdx < 6; edgeIdx++) {
+                int corner1Idx = FVoxelStructures::TetrahedronEdges[tetraIdx][edgeIdx][0];
+                int corner2Idx = FVoxelStructures::TetrahedronEdges[tetraIdx][edgeIdx][1];
+
+                // Handle both cube edges and edges to the center
+                FSamplePosition EdgeCorners[2];
+
+                // Map corner indices correctly
+                if (corner1Idx < 8) {
+                    EdgeCorners[0] = Corners[corner1Idx];
+                }
+                else {
+                    EdgeCorners[0] = Center;
+                }
+
+                if (corner2Idx < 8) {
+                    EdgeCorners[1] = Corners[corner2Idx];
+                }
+                else {
+                    EdgeCorners[1] = Center;
+                }
+
+                // Create the edge (this will calculate zero crossing if needed)
+                TetraEdges[edgeIdx] = FVoxelEdge(edgeIdx, EdgeCorners);
+            }
+
+            // Determine the case from the tetrahedron lookup table
+            uint8 caseIndex = 0;
+            for (int i = 0; i < 4; i++) {
+                if (TetraCorners[i].Density < 0.0)
+                    caseIndex |= (1 << i);
+            }
+
+            // Check if this case produces triangles
+            const int* triangleIndices = FVoxelStructures::TetrahedronTriTable[caseIndex];
+            if (triangleIndices[0] != -1) {
+                // This case produces triangles
+                int vertexOffset = MeshData.Positions.Num();
+                int numTriangleVertices = 0;
+
+                // Count how many triangle vertices we need to add
+                for (int i = 0; triangleIndices[i] != -1; i++) {
+                    numTriangleVertices++;
+                }
+
+                // For each edge in the triangulation
+                for (int i = 0; i < numTriangleVertices; i++) {
+                    int edgeIdx = triangleIndices[i];
+                    FVoxelEdge& edge = TetraEdges[edgeIdx];
+
+                    // Add vertex at zero crossing point
+                    MeshData.Positions.Add(edge.ZeroCrossingPoint);
+                    MeshData.Normals.Add(edge.Normal);
+                }
+
+                // Add triangles (every three vertices form a triangle)
+                for (int i = 0; i < numTriangleVertices / 3; i++) {
+                    // Add triangle indices in CCW order
+                    MeshData.Triangles.Add(vertexOffset + i * 3);
+                    MeshData.Triangles.Add(vertexOffset + i * 3 + 1);
+                    MeshData.Triangles.Add(vertexOffset + i * 3 + 2);
+                }
+            }
+        }
+
+        // Handle LOD transitions if needed TODO: SKIPPING FOR NOW I WANT TO SEE THE CRACKS BEFORE WE START MESSING WITH IT
+        //for (int faceIdx = 0; faceIdx < 6; faceIdx++) {
+        //    if (NeighborLODChanges[faceIdx]) {
+        //        // This face has an LOD transition
+        //        StitchLODTransition(faceIdx, Corners, CubeEdges, CubeFaces[faceIdx]);
+        //    }
+        //}
+
         bNeedsMeshUpdate = false;
     }
+
     return MeshData;
+}
+
+void FAdaptiveOctreeNodeMT::StitchLODTransition(int faceIdx, const FSamplePosition InCorners[8], const TArray<FVoxelEdge>& CubeEdges, const FQuadFace& Face)
+{
+    // Get the four corners of the face
+    const int* cornerIndices = FVoxelStructures::FaceCorners[faceIdx];
+
+    // Get mid-points of each edge of the face
+    FVector edgeMidPoints[4];
+    for (int i = 0; i < 4; i++) {
+        int edgeIdx = FVoxelStructures::FaceEdges[faceIdx][i];
+        edgeMidPoints[i] = CubeEdges[edgeIdx].MidPoint;
+    }
+
+    // Get face mid-point
+    FVector faceMidPoint = Face.MidPoint;
+
+    // For density at mid-points, interpolate from corner values
+    double edgeMidDensities[4];
+    for (int i = 0; i < 4; i++) {
+        int edgeIdx = FVoxelStructures::FaceEdges[faceIdx][i];
+        int cornerA = FVoxelStructures::EdgePairs[edgeIdx][0];
+        int cornerB = FVoxelStructures::EdgePairs[edgeIdx][1];
+        edgeMidDensities[i] = (InCorners[cornerA].Density + InCorners[cornerB].Density) * 0.5f;
+    }
+
+    // Density at face center (average of corner densities)
+    double faceCenterDensity = 0.0;
+    for (int i = 0; i < 4; i++) {
+        faceCenterDensity += InCorners[cornerIndices[i]].Density;
+    }
+    faceCenterDensity *= 0.25f;
+
+    // Create face center vertex
+    int faceCenterIdx = MeshData.Positions.Num();
+    MeshData.Positions.Add(faceMidPoint);
+
+    // Calculate normal at face center (average of corner normals)
+    FVector faceNormal = FVector::ZeroVector;
+    for (int i = 0; i < 4; i++) {
+        faceNormal += InCorners[cornerIndices[i]].Normal;
+    }
+    faceNormal = faceNormal.GetSafeNormal();
+    MeshData.Normals.Add(faceNormal);
+
+    // Process each edge of the face
+    int edgeMidIndices[4];
+    for (int i = 0; i < 4; i++) {
+        edgeMidIndices[i] = MeshData.Positions.Num();
+        MeshData.Positions.Add(edgeMidPoints[i]);
+
+        // Interpolate normal at edge midpoint
+        int edgeIdx = FVoxelStructures::FaceEdges[faceIdx][i];
+        int cornerA = FVoxelStructures::EdgePairs[edgeIdx][0];
+        int cornerB = FVoxelStructures::EdgePairs[edgeIdx][1];
+        FVector edgeNormal = (InCorners[cornerA].Normal + InCorners[cornerB].Normal).GetSafeNormal();
+        MeshData.Normals.Add(edgeNormal);
+    }
+
+    // Now create connecting triangles for the stitching pattern
+    // This is a simple pattern that connects each corner to adjacent edge midpoints and face center
+    for (int i = 0; i < 4; i++) {
+        int cornerVertexIdx = -1;
+        int cornerIdx = cornerIndices[i];
+
+        // First, check if we already have a vertex for this corner
+        bool cornerHasIsosurfaceIntersection = false;
+        for (int j = 0; j < MeshData.Positions.Num(); j++) {
+            // This would need a proper way to detect if the position matches the corner
+            // For simplicity, we'll add the corner anyway
+            if (InCorners[cornerIdx].Position.Equals(MeshData.Positions[j], 0.001f)) {
+                cornerVertexIdx = j;
+                cornerHasIsosurfaceIntersection = true;
+                break;
+            }
+        }
+
+        // If not already in the mesh, add it
+        if (cornerVertexIdx == -1) {
+            cornerVertexIdx = MeshData.Positions.Num();
+            MeshData.Positions.Add(InCorners[cornerIdx].Position);
+            MeshData.Normals.Add(InCorners[cornerIdx].Normal);
+        }
+
+        // Get indices of adjacent edge midpoints
+        int nextEdge = i;
+        int prevEdge = (i + 3) % 4; // "Previous" edge in the face loop
+
+        // Create triangles for this corner
+        // Triangle 1: corner -> edge midpoint -> face center
+        MeshData.Triangles.Add(cornerVertexIdx);
+        MeshData.Triangles.Add(edgeMidIndices[nextEdge]);
+        MeshData.Triangles.Add(faceCenterIdx);
+
+        // Triangle 2: corner -> face center -> previous edge midpoint
+        MeshData.Triangles.Add(cornerVertexIdx);
+        MeshData.Triangles.Add(faceCenterIdx);
+        MeshData.Triangles.Add(edgeMidIndices[prevEdge]);
+    }
 }
 
 bool FAdaptiveOctreeNodeMT::UpdateLOD(TSharedPtr<FAdaptiveOctreeNodeMT> InNode, FCameraInfo InCameraData, double InLODFactor)
@@ -423,6 +646,7 @@ void FAdaptiveOctreeNodeMT::RegenerateMeshData(TSharedPtr<FAdaptiveOctreeNodeMT>
 {
     TArray<TSharedPtr<FAdaptiveOctreeNodeMT>> SurfaceNodes = FAdaptiveOctreeNodeMT::GetSurfaceLeafNodes(InNode);
     
+    //TODO: PARALLEL FOR HERE
     for (TSharedPtr<FAdaptiveOctreeNodeMT> Node : SurfaceNodes) {
         if (Node->bNeedsMeshUpdate) Node->ComputeGeometry();
 
