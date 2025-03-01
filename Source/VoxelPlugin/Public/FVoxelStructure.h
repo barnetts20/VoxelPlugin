@@ -80,6 +80,12 @@ struct VOXELPLUGIN_API FInternalMeshBuffer {
     TArray<FVector> Positions;
     TArray<FVector> Normals;
     TArray<int32> Triangles;
+
+    void Append(FInternalMeshBuffer InBuffer) {
+        Positions.Append(InBuffer.Positions);
+        Normals.Append(InBuffer.Normals);
+        Triangles.Append(InBuffer.Triangles);
+    }
 };
 
 struct VOXELPLUGIN_API FCameraInfo {

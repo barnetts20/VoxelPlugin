@@ -24,8 +24,8 @@ private:
     FRWLock OctreeLock;
 
     int ChunkDepth = 4;
-    int MinDepth = 7;
-    int MaxDepth = 16;
+    int MinDepth = 5;
+    int MaxDepth = 14;
     int LodFactor = 12;
     int CollisionDepth = 14;
 

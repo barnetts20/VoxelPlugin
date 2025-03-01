@@ -646,13 +646,18 @@ void FAdaptiveOctreeNodeMT::RegenerateMeshData(TSharedPtr<FAdaptiveOctreeNodeMT>
 {
     TArray<TSharedPtr<FAdaptiveOctreeNodeMT>> SurfaceNodes = FAdaptiveOctreeNodeMT::GetSurfaceLeafNodes(InNode);
     
+    TArray<FInternalMeshBuffer> PerNodeMeshBuffers;
+    PerNodeMeshBuffers.SetNum(SurfaceNodes.Num());
     //TODO: PARALLEL FOR HERE
-    for (TSharedPtr<FAdaptiveOctreeNodeMT> Node : SurfaceNodes) {
-        if (Node->bNeedsMeshUpdate) Node->ComputeGeometry();
+    ParallelFor(SurfaceNodes.Num(), [&](int32 idx) {
+        if (SurfaceNodes[idx]->bNeedsMeshUpdate) SurfaceNodes[idx]->ComputeGeometry();
 
-        OutMeshBuffer.Positions.Append(Node->MeshData.Positions);
-        OutMeshBuffer.Normals.Append(Node->MeshData.Normals);
-        OutMeshBuffer.Triangles.Append(Node->MeshData.Triangles);
+        PerNodeMeshBuffers[idx].Positions.Append(SurfaceNodes[idx]->MeshData.Positions);
+        PerNodeMeshBuffers[idx].Normals.Append(SurfaceNodes[idx]->MeshData.Normals);
+        PerNodeMeshBuffers[idx].Triangles.Append(SurfaceNodes[idx]->MeshData.Triangles);
+    });
+    for (auto mb : PerNodeMeshBuffers) {
+        OutMeshBuffer.Append(mb);
     }
 }
 

@@ -5,7 +5,10 @@
 
 FAdaptiveOctreeMT::FAdaptiveOctreeMT(TFunction<double(FVector)> InDensityFunction, FVector InCenterPosition, double InExtent, int InChunkMinMaxDepths[3])
 {
-	Root = MakeShared<FAdaptiveOctreeNodeMT>(InDensityFunction, InCenterPosition, InExtent, InChunkMinMaxDepths);
+    int MinMaxDepths[2];
+    MinMaxDepths[0] = InChunkMinMaxDepths[1];
+    MinMaxDepths[1] = InChunkMinMaxDepths[2];
+	Root = MakeShared<FAdaptiveOctreeNodeMT>(InDensityFunction, InCenterPosition, InExtent, MinMaxDepths);
 	FAdaptiveOctreeNodeMT::SplitToDepth(Root, InChunkMinMaxDepths[0]);
 	ChunkNodes = FAdaptiveOctreeNodeMT::GetSurfaceLeafNodes(Root);
 }
