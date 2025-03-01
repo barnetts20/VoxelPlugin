@@ -66,10 +66,11 @@ FTetrahedron::FTetrahedron(int InTetraIndex, FQuadFace InBaseFace, FSamplePositi
         ConnectingEdges[i] = FVoxelEdge(12 + i, EdgeEnds); //Start edge idices after the initial 12 edges of the node boundaries, so 12 - 16
     }
     FVoxelEdge TriFaceEdges[3];
-    for (int i = 0; i < 4; i++) {
+    for (int i = 0; i < 3; i++) {
         TriFaceEdges[0] = BaseFace.Edges[i];
         TriFaceEdges[1] = ConnectingEdges[i];
-        TriFaceEdges[2] = ConnectingEdges[(i + 1) % 4];
+        TriFaceEdges[2] = ConnectingEdges[(i + 1) % 3];
+
         TriFaces[i] = FTriFace(6 + i, TriFaceEdges); //Start face index after the initial 6 faces of the node, so 6-10
     }
 

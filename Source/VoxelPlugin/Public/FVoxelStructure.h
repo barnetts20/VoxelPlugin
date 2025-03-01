@@ -192,6 +192,14 @@ inline const int FVoxelStructures::FaceEdges[6][4] = {
     {2, 7, 3, 6}     // +Z face (Z_POSITIVE)
 };
 
+inline const FVector FVoxelStructures::FaceAxes[6] = {
+    FVector(-1, 0, 0),
+    FVector( 1, 0, 0),
+    FVector( 0,-1, 0),
+    FVector( 0, 1, 0),
+    FVector( 0, 0,-1),
+    FVector( 0, 0, 1)
+};
 // Define the tetrahedron corner indices
 // For each of the 6 tetrahedra, lists the 4 corner indices
 // Format: [3 corners of the face, center point(8)]

@@ -47,7 +47,7 @@ FAdaptiveOctreeNodeMT::FAdaptiveOctreeNodeMT(TFunction<double(FVector)> InDensit
             Edges[FVoxelStructures::FaceEdges[i][3]]
         };
         Faces[i] = FQuadFace(i, FaceEdges);
-        FaceNeighborMap.Add(i);
+        NeighborCenters[i] = FVoxelStructures::FaceAxes[i] * 2 * Extent + Center.Position;
     }
 
     // Initialize base tetrahedra for all nodes
@@ -122,6 +122,7 @@ FAdaptiveOctreeNodeMT::FAdaptiveOctreeNodeMT(TFunction<double(FVector)> InDensit
             Edges[FVoxelStructures::FaceEdges[i][3]]
         };
         Faces[i] = FQuadFace(i, FaceEdges);
+        NeighborCenters[i] = FVoxelStructures::FaceAxes[i] * 2 * Extent + Center.Position;
     }
 
     // Initialize base tetrahedra for all nodes
@@ -251,6 +252,23 @@ bool FAdaptiveOctreeNodeMT::ShouldSplit()
     return TreeIndex.Num() < MinMaxDepth[0] || (FVector::Dist(Center.Position, CameraData.Position) < Extent * (LODFactor + TreeIndex.Num()) && TreeIndex.Num() < MinMaxDepth[1]);
 }
 
+bool FAdaptiveOctreeNodeMT::ShouldSplit(const FVector VirtualCenter)
+{
+    // Apply the same logic but for the virtual position
+
+    // Can't split if already at max depth
+    if (TreeIndex.Num() >= MinMaxDepth[1]) return false;
+
+    // Always split to reach minimum depth
+    if (TreeIndex.Num() < MinMaxDepth[0]) return true;
+
+    // Check distance to camera 
+    double DistanceToCamera = FVector::Dist(VirtualCenter, CameraData.Position);
+
+    // Return true if splitting would occur
+    return (DistanceToCamera < Extent * LODFactor * (1.0 + TreeIndex.Num() * 0.5));
+}
+
 void FAdaptiveOctreeNodeMT::Split()
 {
     if (!bIsLeaf) return;
@@ -336,26 +354,26 @@ TArray<TSharedPtr<FAdaptiveOctreeNodeMT>> FAdaptiveOctreeNodeMT::GetSurfaceLeafN
 TSharedPtr<FAdaptiveOctreeNodeMT> FAdaptiveOctreeNodeMT::SampleSurfaceLeafByPosition(FVector SamplePosition) {
     //TODO: crawl up parent heirarchy until we find a node containing the position, nullptr if not contained at root
     //TODO: crawl back down heirarchy until we either find a surface leaf contianing the position or nullptr if none was found
+
+    //We dont need this as much with the virtual lodding logic... but it will still be needed later if we want to terraform.
+    return nullptr;
 }
 
-void FAdaptiveOctreeNodeMT::UpdateNeighbors()
+bool FAdaptiveOctreeNodeMT::UpdateNeighbors()
 {
-    bool NeighborsChanged = false;
-    //TODO: Sample neigbors update faceidx/neighbor map
-    // Should iterate face map, for each face begin with a sample position just inside its outer edge on the node
-    // ____
-    //|x   |
-    //|    |
-    // ----
-    // Offset this position to be just barely outside the node along the same axis the face is on.
-    // Call SampleSurfaceLeafByPosition, if the resulting node is the same LOD level we can store it and finish for that face
-    // if the resulting node is a deeper lod level, add it and sample the other 3 corners, appending the rest of the nodes
-    // ____
-    //|x  x|
-    //|x  x|
-    // ----
-    // If the neighbors array for the face was altered, flag the node for mesh regeneration
-    if (NeighborsChanged) bNeedsMeshUpdate = true;
+    bool bNeighborChanged = false;
+    
+    for (int i = 0; i < 6; i++) {
+        bool bNeighborSplit = ShouldSplit(NeighborCenters[i]);
+        if (NeighborLODChanges[i] != bNeighborSplit) {
+            NeighborLODChanges[i] = bNeighborSplit;
+            bNeighborChanged = true;
+        }
+    }
+
+    if(bNeighborChanged) bNeedsMeshUpdate = true;
+
+    return bNeighborChanged;
 }
 
 FInternalMeshBuffer FAdaptiveOctreeNodeMT::ComputeGeometry()
@@ -376,6 +394,9 @@ bool FAdaptiveOctreeNodeMT::UpdateLOD(TSharedPtr<FAdaptiveOctreeNodeMT> InNode, 
         if (InNode->ShouldSplit())
         {
             InNode->Split();
+            for (TSharedPtr<FAdaptiveOctreeNodeMT> Child : InNode->Children) {
+                Child->UpdateNeighbors();
+            }
             return true;
         }
         else if (InNode->Parent.IsValid() && InNode->TreeIndex.Last() == 7)
@@ -386,8 +407,12 @@ bool FAdaptiveOctreeNodeMT::UpdateLOD(TSharedPtr<FAdaptiveOctreeNodeMT> InNode, 
 
             if (tParent->ShouldMerge()) {
                 tParent->Merge();
+                tParent->UpdateNeighbors();
                 return true;
             }
+        }
+        else {
+            InNode->UpdateNeighbors();
         }
     }
     else

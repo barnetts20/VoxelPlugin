@@ -59,11 +59,13 @@ private:
 	FVoxelEdge Edges[12];
 	FQuadFace Faces[6];
 	FTetrahedron Tetra[6];
+	FVector NeighborCenters[6];
+	bool NeighborLODChanges[6];
 
 	//Family & neighbor data
 	TWeakPtr<FAdaptiveOctreeNodeMT> Parent;
 	TSharedPtr<FAdaptiveOctreeNodeMT> Children[8];
-	TMap<int, TArray<TWeakPtr<FAdaptiveOctreeNodeMT>>> FaceNeighborMap;
+
 
 	//LOD data
 	FCameraInfo CameraData;
@@ -74,6 +76,8 @@ private:
 	
 	//Conditional for valid split case
 	bool ShouldSplit();
+
+	bool ShouldSplit(const FVector VirtualCenter);
 	
 	//Split the node
 	void Split();
@@ -88,7 +92,7 @@ private:
 	void ComputeSampleNormals();
 
 	//Update the face id/neighbor pointer map for the individual node
-	void UpdateNeighbors();
+	bool UpdateNeighbors();
 
 	//Update the mesh data for the individual node
 	FInternalMeshBuffer ComputeGeometry();
