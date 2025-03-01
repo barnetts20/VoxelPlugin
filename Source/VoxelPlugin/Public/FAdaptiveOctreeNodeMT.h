@@ -18,26 +18,28 @@ public:
 
 	FSamplePosition Center;
 	double Extent;
-
+	FVector NodeMinMax[2];
+	
 	bool IsLeaf() const;
 	bool IsRoot() const;
 	bool IsSurface() const;
 	bool IsSurfaceLeaf() const;
 
-	//Return the set of surface+leaf nodes who are the InNode or its descendants
-	static TArray<TSharedPtr<FAdaptiveOctreeNodeMT>> GetSurfaceLeafNodes(TSharedPtr<FAdaptiveOctreeNodeMT> InNode);
+	bool ContainsPosition(FVector Position);
 
 	//Sample a surface leaf node at a given position if one exists, used in neighbor population
-	TSharedPtr<FAdaptiveOctreeNodeMT> SampleSurfaceLeafByPosition(FVector SamplePosition);
+	TSharedPtr<FAdaptiveOctreeNodeMT> SampleLeafByPosition(FVector SamplePosition);
+
+	//Static Recursive Methods
+	
+	//Return the set of surface+leaf nodes who are the InNode or its descendants
+	static TArray<TSharedPtr<FAdaptiveOctreeNodeMT>> GetSurfaceLeafNodes(TSharedPtr<FAdaptiveOctreeNodeMT> InNode);
 
 	//Split the passed node until it is at least the passed depth
 	static void SplitToDepth(TSharedPtr<FAdaptiveOctreeNodeMT> InNode, int InDepth);
 	
 	//Update LOD for every surface/leaf node who is the InNode or its descendant - if lod changes mark the node for mesh regeneration
 	static bool UpdateLOD(TSharedPtr<FAdaptiveOctreeNodeMT> InNode, FCameraInfo InCameraData, double InLODFactor);
-	
-	//After LOD update stage, update neighbor information for each surface/leaf node - if neighbors change mark the node for mesh regeneration
-	static void UpdateNeighborData(TSharedPtr<FAdaptiveOctreeNodeMT> InNode);
 	
 	//Update all surface/leaf node mesh data that needs an update who are the passed in node or its children and are marked for regeneration. 
 	//Populate a composite mesh data buffer to return the composite of all visited suface/leaf node mesh data, including any updated mesh data

@@ -12,6 +12,7 @@ FAdaptiveOctreeNodeMT::FAdaptiveOctreeNodeMT(TFunction<double(FVector)> InDensit
     bNeedsMeshUpdate = true;
     DensityFunction = InDensityFunction;
     Extent = InExtent;
+
     // Initialize depth constraints
     MinMaxDepth[0] = InMinMaxDepth[0];
     MinMaxDepth[1] = InMinMaxDepth[1];
@@ -20,6 +21,8 @@ FAdaptiveOctreeNodeMT::FAdaptiveOctreeNodeMT(TFunction<double(FVector)> InDensit
     TreeIndex.Empty();
 
     Center = FSamplePosition(8, InCenter, FVector::ZeroVector, DensityFunction(InCenter));
+    NodeMinMax[0] = Center.Position - FVector(Extent);
+    NodeMinMax[1] = Center.Position + FVector(Extent);
     // Initialize corners with sample positions
     for (int i = 0; i < 8; i++) {
         FVector CornerPos = Center.Position + FVoxelStructures::CornerOffsets[i] * Extent;
@@ -92,7 +95,8 @@ FAdaptiveOctreeNodeMT::FAdaptiveOctreeNodeMT(TFunction<double(FVector)> InDensit
     // Initialize the center
     FVector CenterPos = InParent->Center.Position + FVoxelStructures::CornerOffsets[InChildIndex] * Extent;
     Center = FSamplePosition(8, CenterPos, FVector::ZeroVector, DensityFunction(CenterPos));
-
+    NodeMinMax[0] = Center.Position - FVector(Extent);
+    NodeMinMax[1] = Center.Position + FVector(Extent);
     // Initialize corners with sample positions
     for (int i = 0; i < 8; i++) {
         FVector CornerPos = Center.Position + FVoxelStructures::CornerOffsets[i] * Extent;
@@ -122,7 +126,7 @@ FAdaptiveOctreeNodeMT::FAdaptiveOctreeNodeMT(TFunction<double(FVector)> InDensit
             Edges[FVoxelStructures::FaceEdges[i][3]]
         };
         Faces[i] = FQuadFace(i, FaceEdges);
-        NeighborCenters[i] = FVoxelStructures::FaceAxes[i] * 2 * Extent + Center.Position;
+        NeighborCenters[i] = FVoxelStructures::FaceAxes[i] * 2 * Extent + Center.Position; 
     }
 
     // Initialize base tetrahedra for all nodes
@@ -247,6 +251,12 @@ bool FAdaptiveOctreeNodeMT::IsSurfaceLeaf() const
     return bIsSurface && bIsLeaf;
 }
 
+bool FAdaptiveOctreeNodeMT::ContainsPosition(FVector InPosition) {  
+    bool bContains = (InPosition.X >= NodeMinMax[0].X && InPosition.X <= NodeMinMax[1].X 
+                   && InPosition.Y >= NodeMinMax[0].Y && InPosition.Y <= NodeMinMax[1].Y 
+                   && InPosition.Z >= NodeMinMax[0].Z && InPosition.Z <= NodeMinMax[1].Z);
+}
+
 bool FAdaptiveOctreeNodeMT::ShouldSplit()
 {
     return TreeIndex.Num() < MinMaxDepth[0] || (FVector::Dist(Center.Position, CameraData.Position) < Extent * (LODFactor + TreeIndex.Num()) && TreeIndex.Num() < MinMaxDepth[1]);
@@ -254,19 +264,8 @@ bool FAdaptiveOctreeNodeMT::ShouldSplit()
 
 bool FAdaptiveOctreeNodeMT::ShouldSplit(const FVector VirtualCenter)
 {
-    // Apply the same logic but for the virtual position
-
-    // Can't split if already at max depth
-    if (TreeIndex.Num() >= MinMaxDepth[1]) return false;
-
-    // Always split to reach minimum depth
-    if (TreeIndex.Num() < MinMaxDepth[0]) return true;
-
-    // Check distance to camera 
-    double DistanceToCamera = FVector::Dist(VirtualCenter, CameraData.Position);
-
-    // Return true if splitting would occur
-    return (DistanceToCamera < Extent * LODFactor * (1.0 + TreeIndex.Num() * 0.5));
+    // Return true if splitting would occur at the Virtual Center
+    return TreeIndex.Num() < MinMaxDepth[0] || (FVector::Dist(VirtualCenter, CameraData.Position) < Extent * (LODFactor + TreeIndex.Num()) && TreeIndex.Num() < MinMaxDepth[1]);
 }
 
 void FAdaptiveOctreeNodeMT::Split()
@@ -330,33 +329,23 @@ void FAdaptiveOctreeNodeMT::SplitToDepth(TSharedPtr<FAdaptiveOctreeNodeMT> InNod
     }
 }
 
-TArray<TSharedPtr<FAdaptiveOctreeNodeMT>> FAdaptiveOctreeNodeMT::GetSurfaceLeafNodes(TSharedPtr<FAdaptiveOctreeNodeMT> InNode)
-{
-    TArray<TSharedPtr<FAdaptiveOctreeNodeMT>> SurfaceLeafNodes;
-    TQueue<TSharedPtr<FAdaptiveOctreeNodeMT>> NodeQueue;
-    NodeQueue.Enqueue(InNode);
-    while (!NodeQueue.IsEmpty()) {
-        TSharedPtr<FAdaptiveOctreeNodeMT> CurrentNode;
-        NodeQueue.Dequeue(CurrentNode);
-        if (!CurrentNode) continue;
-        if (CurrentNode->IsSurfaceLeaf()) {
-            SurfaceLeafNodes.Add(CurrentNode);
-        }
-        if (!CurrentNode->IsLeaf()) {
-            for (const TSharedPtr<FAdaptiveOctreeNodeMT>& child : CurrentNode->Children) {
-                NodeQueue.Enqueue(child);
-            }
-        }
+TSharedPtr<FAdaptiveOctreeNodeMT> FAdaptiveOctreeNodeMT::SampleLeafByPosition(FVector SamplePosition) {
+    TSharedPtr<FAdaptiveOctreeNodeMT> ContainingNode = AsShared();
+
+    while (ContainingNode.IsValid() && !ContainingNode->ContainsPosition(SamplePosition)) {
+        ContainingNode = ContainingNode->Parent.Pin();
     }
-    return SurfaceLeafNodes;
-}
 
-TSharedPtr<FAdaptiveOctreeNodeMT> FAdaptiveOctreeNodeMT::SampleSurfaceLeafByPosition(FVector SamplePosition) {
-    //TODO: crawl up parent heirarchy until we find a node containing the position, nullptr if not contained at root
-    //TODO: crawl back down heirarchy until we either find a surface leaf contianing the position or nullptr if none was found
+    while (ContainingNode.IsValid() && !ContainingNode->IsLeaf()) {
+        // Determine which child would contain the position
+        uint8 ChildIdx = 0;
+        if (SamplePosition.X >= ContainingNode->Center.Position.X) ChildIdx |= 1;
+        if (SamplePosition.Y >= ContainingNode->Center.Position.Y) ChildIdx |= 2;
+        if (SamplePosition.Z >= ContainingNode->Center.Position.Z) ChildIdx |= 4;
 
-    //We dont need this as much with the virtual lodding logic... but it will still be needed later if we want to terraform.
-    return nullptr;
+        ContainingNode = ContainingNode->Children[ChildIdx];
+    }
+    return ContainingNode;
 }
 
 bool FAdaptiveOctreeNodeMT::UpdateNeighbors()
@@ -379,7 +368,7 @@ bool FAdaptiveOctreeNodeMT::UpdateNeighbors()
 FInternalMeshBuffer FAdaptiveOctreeNodeMT::ComputeGeometry()
 {
     if (bNeedsMeshUpdate) {
-        //TODO: Update mesh data
+        //TODO:: ACTUALLY COMPUTE MESH, INCLUDING ANY STITCHING NEEDED FOR LOD CHANGE FACES
         bNeedsMeshUpdate = false;
     }
     return MeshData;
@@ -395,7 +384,7 @@ bool FAdaptiveOctreeNodeMT::UpdateLOD(TSharedPtr<FAdaptiveOctreeNodeMT> InNode, 
         {
             InNode->Split();
             for (TSharedPtr<FAdaptiveOctreeNodeMT> Child : InNode->Children) {
-                Child->UpdateNeighbors();
+                if(Child->IsSurfaceLeaf()) Child->UpdateNeighbors();
             }
             return true;
         }
@@ -407,12 +396,12 @@ bool FAdaptiveOctreeNodeMT::UpdateLOD(TSharedPtr<FAdaptiveOctreeNodeMT> InNode, 
 
             if (tParent->ShouldMerge()) {
                 tParent->Merge();
-                tParent->UpdateNeighbors();
+                if (tParent->IsSurfaceLeaf()) tParent->UpdateNeighbors();
                 return true;
             }
         }
         else {
-            InNode->UpdateNeighbors();
+            if(InNode->IsSurfaceLeaf()) InNode->UpdateNeighbors();
         }
     }
     else
@@ -420,7 +409,7 @@ bool FAdaptiveOctreeNodeMT::UpdateLOD(TSharedPtr<FAdaptiveOctreeNodeMT> InNode, 
         bool bAnyChanges = false;
         for (int i = 0; i < 8; i++)
         {
-            if (InNode->Children[i]->FAdaptiveOctreeNodeMT::UpdateLOD(InNode->Children[i], InCameraData, InLODFactor))
+            if (FAdaptiveOctreeNodeMT::UpdateLOD(InNode->Children[i], InCameraData, InLODFactor))
             {
                 bAnyChanges = true;
             }
@@ -430,16 +419,37 @@ bool FAdaptiveOctreeNodeMT::UpdateLOD(TSharedPtr<FAdaptiveOctreeNodeMT> InNode, 
     return false;
 }
 
-void FAdaptiveOctreeNodeMT::UpdateNeighborData(TSharedPtr<FAdaptiveOctreeNodeMT> InNode)
-{
-    // TODO: For each surface/leaf available from InNode, invoke its update neighbors.
-    // Must be called after update lod stage has completed on entire tree.
-}
-
 void FAdaptiveOctreeNodeMT::RegenerateMeshData(TSharedPtr<FAdaptiveOctreeNodeMT> InNode, FInternalMeshBuffer& OutMeshBuffer)
 {
-    // TODO: For each surface/leaf node available from InNode, invoke its compute geometry, 
-    // append resulting geometry to OutMeshBuffer.
+    TArray<TSharedPtr<FAdaptiveOctreeNodeMT>> SurfaceNodes = FAdaptiveOctreeNodeMT::GetSurfaceLeafNodes(InNode);
+    
+    for (TSharedPtr<FAdaptiveOctreeNodeMT> Node : SurfaceNodes) {
+        if (Node->bNeedsMeshUpdate) Node->ComputeGeometry();
+
+        OutMeshBuffer.Positions.Append(Node->MeshData.Positions);
+        OutMeshBuffer.Normals.Append(Node->MeshData.Normals);
+        OutMeshBuffer.Triangles.Append(Node->MeshData.Triangles);
+    }
 }
 
+TArray<TSharedPtr<FAdaptiveOctreeNodeMT>> FAdaptiveOctreeNodeMT::GetSurfaceLeafNodes(TSharedPtr<FAdaptiveOctreeNodeMT> InNode)
+{
+    TArray<TSharedPtr<FAdaptiveOctreeNodeMT>> SurfaceLeafNodes;
+    TQueue<TSharedPtr<FAdaptiveOctreeNodeMT>> NodeQueue;
+    NodeQueue.Enqueue(InNode);
+    while (!NodeQueue.IsEmpty()) {
+        TSharedPtr<FAdaptiveOctreeNodeMT> CurrentNode;
+        NodeQueue.Dequeue(CurrentNode);
+        if (!CurrentNode) continue;
+        if (CurrentNode->IsSurfaceLeaf()) {
+            SurfaceLeafNodes.Add(CurrentNode);
+        }
+        if (!CurrentNode->IsLeaf()) {
+            for (const TSharedPtr<FAdaptiveOctreeNodeMT>& child : CurrentNode->Children) {
+                NodeQueue.Enqueue(child);
+            }
+        }
+    }
+    return SurfaceLeafNodes;
+}
 
