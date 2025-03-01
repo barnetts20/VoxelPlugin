@@ -21,6 +21,7 @@ void FAdaptiveOctreeMT::InitializeChunks(ARealtimeMeshActor* InParentActor, UMat
         NewChunk->Initialize(InParentActor, InMaterial, Chunk->Center.Position, Chunk->Extent);
         MeshChunks.Add(NewChunk);
     }
+    MeshChunksInitialized = true;
 }
 
 bool FAdaptiveOctreeMT::UpdateLOD(FCameraInfo InCameraData, double InLODFactor)

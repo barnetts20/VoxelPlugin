@@ -99,7 +99,7 @@ void AAdaptiveVoxelActorMT::InitializeChunks() {
 
     Initialized = true;
     ScheduleDataUpdate(.1);
-    ScheduleMeshUpdate(.1);
+    //ScheduleMeshUpdate(.1);
 }
 
 void AAdaptiveVoxelActorMT::ScheduleDataUpdate(float IntervalInSeconds)
@@ -113,7 +113,7 @@ void AAdaptiveVoxelActorMT::ScheduleDataUpdate(float IntervalInSeconds)
                 //**********BEGIN IMPLEMENTATION BLOCK***************
                 //**********BEGIN IMPLEMENTATION BLOCK***************
                 {
-                    FRWScopeLock WriteLock(OctreeLock, SLT_Write);
+                    //FRWScopeLock WriteLock(OctreeLock, SLT_Write);
                     AdaptiveOctree->UpdateLOD(CameraData, LodFactor);
                 }
                 //{
