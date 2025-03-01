@@ -16,7 +16,8 @@ FAdaptiveOctree::FAdaptiveOctree(TFunction<double(FVector)> InDensityFunction, F
 void FAdaptiveOctree::InitializeMeshChunks(ARealtimeMeshActor* InParentActor, UMaterialInterface* InMaterial) {
     for (auto chunk : Chunks) {
         TSharedPtr<FMeshChunk> newChunk = MakeShared<FMeshChunk>();
-        newChunk->Initialize(InParentActor, InMaterial, FAdaptiveOctreeFlatNode(chunk));
+        auto flatNode = FAdaptiveOctreeFlatNode(chunk);
+        newChunk->Initialize(InParentActor, InMaterial, flatNode.Center, flatNode.Extent);
         newChunk->ChunkEdges = chunk->GetSurfaceEdges();
         MeshChunks.Add(newChunk);
         UpdateMeshChunkStreamData(newChunk);

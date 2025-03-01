@@ -1,31 +1,29 @@
+// Fill out your copyright notice in the Description page of Project Settings.
+
 #pragma once
 
 #include "CoreMinimal.h"
 #include "GameFramework/Actor.h"
-#include "FAdaptiveOctree.h"
-#include "FSparseOctree.h"
-#include "FMeshingStructs.h"
-#include "RealtimeMeshActor.h"
-#include "AdaptiveVoxelActor.generated.h"
-
-using namespace RealtimeMesh;
+#include "FAdaptiveOctreeMT.h"
+#include "AdaptiveVoxelActorMT.generated.h"
 
 UCLASS()
-class VOXELPLUGIN_API AAdaptiveVoxelActor : public ARealtimeMeshActor
+class VOXELPLUGIN_API AAdaptiveVoxelActorMT : public ARealtimeMeshActor
 {
-    GENERATED_BODY()
-    
+	GENERATED_BODY()
+	
 private:
-    TSharedPtr<FAdaptiveOctree> AdaptiveOctree;
+    TSharedPtr<FAdaptiveOctreeMT> AdaptiveOctree;
     TSharedPtr<FSparseOctree> SparseOctree;
 
-    FVector CameraPosition;
-    FVector LastCameraPosition;
+    FCameraInfo CameraData;
+    FCameraInfo LastCameraData;
+  
     FRWLock OctreeLock;
 
     int ChunkDepth = 4;
-    int MinDepth = 4;
-    int MaxDepth = 12;
+    int MinDepth = 7;
+    int MaxDepth = 16;
     int LodFactor = 12;
     int CollisionDepth = 14;
 
@@ -33,14 +31,14 @@ private:
     bool Initialized = false;
 
 public:
-    AAdaptiveVoxelActor();
+    AAdaptiveVoxelActorMT();
     virtual void OnConstruction(const FTransform& Transform) override;
     virtual void BeginPlay() override;
     virtual void BeginDestroy() override;
     virtual bool ShouldTickIfViewportsOnly() const override;
     virtual void Tick(float DeltaTime) override;
 
-    TSharedPtr<FAdaptiveOctree> GetOctree();
+    TSharedPtr<FAdaptiveOctreeMT> GetOctree();
 
     // Material properties
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Materials")
@@ -57,7 +55,4 @@ protected:
     bool MeshUpdateIsRunning = false;
     void ScheduleMeshUpdate(float IntervalInSeconds);
 
-    //Debug
-    //void DrawDebugSurfaceNodes();
 };
-
