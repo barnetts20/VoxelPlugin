@@ -252,14 +252,14 @@ bool FAdaptiveOctreeNodeMT::IsSurfaceLeaf() const
 }
 
 bool FAdaptiveOctreeNodeMT::ContainsPosition(FVector InPosition) {  
-    bool bContains = (InPosition.X >= NodeMinMax[0].X && InPosition.X <= NodeMinMax[1].X 
-                   && InPosition.Y >= NodeMinMax[0].Y && InPosition.Y <= NodeMinMax[1].Y 
-                   && InPosition.Z >= NodeMinMax[0].Z && InPosition.Z <= NodeMinMax[1].Z);
+    return (InPosition.X >= NodeMinMax[0].X && InPosition.X <= NodeMinMax[1].X 
+         && InPosition.Y >= NodeMinMax[0].Y && InPosition.Y <= NodeMinMax[1].Y 
+         && InPosition.Z >= NodeMinMax[0].Z && InPosition.Z <= NodeMinMax[1].Z);
 }
 
 bool FAdaptiveOctreeNodeMT::ShouldSplit()
 {
-    return TreeIndex.Num() < MinMaxDepth[0] || (FVector::Dist(Center.Position, CameraData.Position) < Extent * (LODFactor + TreeIndex.Num()) && TreeIndex.Num() < MinMaxDepth[1]);
+    return ShouldSplit(Center.Position);
 }
 
 bool FAdaptiveOctreeNodeMT::ShouldSplit(const FVector VirtualCenter)
