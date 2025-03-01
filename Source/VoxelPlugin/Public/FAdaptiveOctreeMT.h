@@ -53,18 +53,55 @@ struct VOXELPLUGIN_API FMeshChunkMT {
     };
 
     void UpdateMeshData(FInternalMeshBuffer InInternalBuffer) {
-        int NumVerts = InInternalBuffer.Positions.Num();
-        int NumTris = InInternalBuffer.Triangles.Num() / 3;
+        // DEDUPLICATE VERTICES
+        TMap<FVector, int32> UniqueVertices;
+        TArray<FVector> DedupPositions;
+        TArray<FVector> DedupNormals;
+        TArray<int32> DedupTriangles;
+
+        // First pass: Identify unique vertices and build mapping
+        for (int32 i = 0; i < InInternalBuffer.Positions.Num(); i++) {
+            FVector Position = InInternalBuffer.Positions[i];
+
+            // Use a small epsilon for floating point comparison
+            // Find or add unique vertex
+            int32* ExistingIndex = UniqueVertices.Find(Position);
+            if (!ExistingIndex) {
+                // New unique vertex
+                int32 NewIndex = DedupPositions.Num();
+                UniqueVertices.Add(Position, NewIndex);
+                DedupPositions.Add(Position);
+                DedupNormals.Add(InInternalBuffer.Normals[i]);
+            }
+        }
+
+        // Second pass: Remap triangle indices to unique vertices
+        for (int32 i = 0; i < InInternalBuffer.Triangles.Num(); i++) {
+            int32 OldIndex = InInternalBuffer.Triangles[i];
+            FVector Position = InInternalBuffer.Positions[OldIndex];
+            int32* NewIndex = UniqueVertices.Find(Position);
+
+            if (NewIndex) {
+                DedupTriangles.Add(*NewIndex);
+            }
+            else {
+                // Should never happen if our deduplication is working correctly
+                UE_LOG(LogTemp, Warning, TEXT("Vertex deduplication failed to find matching vertex!"));
+                DedupTriangles.Add(0); // Failsafe
+            }
+        }
+
+        // Use deduplicated data
+        int32 NumVerts = DedupPositions.Num();
+        int32 NumTris = DedupTriangles.Num() / 3;
+
         FMeshStreamData MeshStream;
         auto PositionStream = MeshStream.GetPositionStream();
-        auto TangentStream  = MeshStream.GetTangentStream();
+        auto TangentStream = MeshStream.GetTangentStream();
         auto TexCoordStream = MeshStream.GetTexCoordStream();
         auto ColorStream = MeshStream.GetColorStream();
         auto TriangleStream = MeshStream.GetTriangleStream();
         auto PolygroupStream = MeshStream.GetPolygroupStream();
-        
-        //TODO::DEDUPLICATE HERE FInternalMeshBuffer InInternalBuffer
-        //Update num verts
 
         // Now populate the streams with our unique vertices and triangles
         PositionStream.SetNumUninitialized(NumVerts);
@@ -74,21 +111,19 @@ struct VOXELPLUGIN_API FMeshChunkMT {
         TriangleStream.SetNumUninitialized(NumTris);
         PolygroupStream.SetNumUninitialized(NumTris);
 
-        for (int i = 0; i < NumVerts; i++) {
-            
-            PositionStream.Set(i, InInternalBuffer.Positions[i]);
+        for (int32 i = 0; i < NumVerts; i++) {
+            PositionStream.Set(i, DedupPositions[i]);
             FRealtimeMeshTangentsHighPrecision tan;
-            tan.SetNormal(FVector3f(InInternalBuffer.Normals[i]));
+            tan.SetNormal(FVector3f(DedupNormals[i]));
             TangentStream.Set(i, tan);
-            TexCoordStream.Set(i, FVector2f(0,0));//TODO: REPLACE WITH PROPER TRIPLANAR UV
-            ColorStream.Set(i, FColor::Green);//TODO::REPLACE WITH SAMPLE DENSITY... MAY BEED TO ADD TO INTERNAL BUFFER STRUCT
+            TexCoordStream.Set(i, FVector2f(0, 0)); //TODO: REPLACE WITH PROPER TRIPLANAR UV
+            ColorStream.Set(i, FColor::Green); //TODO::REPLACE WITH SAMPLE DENSITY
         }
 
-        for (int i = 0; i < NumTris; i++) {
-            int Idx0 = i * 3;
-            int Idx1 = Idx0 + 1;
-            int Idx2 = Idx1 + 1;
-
+        for (int32 i = 0; i < NumTris; i++) {
+            int32 Idx0 = DedupTriangles[i * 3];
+            int32 Idx1 = DedupTriangles[i * 3 + 1];
+            int32 Idx2 = DedupTriangles[i * 3 + 2];
             TriangleStream.Set(i, FIndex3UI(Idx0, Idx1, Idx2));
             PolygroupStream.Set(i, 0);
         }
