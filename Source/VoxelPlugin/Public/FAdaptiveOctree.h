@@ -9,6 +9,7 @@
 struct VOXELPLUGIN_API FAdaptiveOctree
 {
 private:
+    ARealtimeMeshActor* ParentActor;
     FRWLock OctreeLock;
     TFunction<double(FVector)> DensityFunction;
     TSharedPtr<FAdaptiveOctreeNode> Root;
@@ -39,7 +40,7 @@ public:
     FVector CalculateSurfaceNormal(const FVector& Position);
 
     TSharedPtr<FAdaptiveOctreeNode> GetLeafNodeByPoint(FVector Position);
-    TArray<FAdaptiveOctreeFlatNode> SampleSurfaceNodesAroundEdge(const FNodeEdge& Edge);
+    TArray<TSharedPtr<FAdaptiveOctreeNode>> SampleNodesAroundEdge(const FNodeEdge& Edge);
     void Clear(); //TODO: Need to test this
     //TODO: Need to make a destructor that safely disposes references/pointers and locks
 };

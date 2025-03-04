@@ -112,19 +112,6 @@ void AAdaptiveVoxelActor::ScheduleDataUpdate(float IntervalInSeconds)
                 FRWScopeLock WriteLock(OctreeLock, SLT_Write);
                 AdaptiveOctree->UpdateLOD(CameraPosition, LodFactor);
             }
-            //{
-            //    FRWScopeLock WriteLock(OctreeLock, SLT_Write);
-            //    //FCriticalSection CriticalSection;
-            //    //ChunksToUpdate.Empty();
-            //    //ChunksToUpdate.Reserve(Chunks.Num());
-            //    ParallelFor(Chunks.Num(), [&](int32 idx)
-            //    {
-            //        if (Chunks[idx]->UpdateData(CameraPosition, LodFactor)) {
-            //            //FScopeLock Lock(&CriticalSection);
-            //            //ChunksToUpdate.Add(Chunks[idx]);
-            //        }
-            //    });
-            //}
             //***********END IMPLEMENTATION BLOCK***************
             //***********END IMPLEMENTATION BLOCK***************
             //***********END IMPLEMENTATION BLOCK***************
@@ -152,17 +139,6 @@ void AAdaptiveVoxelActor::ScheduleMeshUpdate(float IntervalInSeconds)
                 FRWScopeLock ReadLock(OctreeLock, SLT_ReadOnly);
                 AdaptiveOctree->UpdateMesh();
             }
-            //{
-            //    FRWScopeLock WriteLock(OctreeLock, SLT_Write);
-            //    ParallelFor(Chunks.Num(), [&](int32 idx)
-            //    {
-            //        //if (ChunksToUpdate[idx].IsValid()) {
-            //            Chunks[idx]->UpdateMeshData();
-            //            Chunks[idx]->UpdateComponent();
-            //        //}
-            //    });
-            //    //ChunksToUpdate.Empty();
-            //}
             //***********END IMPLEMENTATION BLOCK***************
             //***********END IMPLEMENTATION BLOCK***************
             //***********END IMPLEMENTATION BLOCK***************
@@ -201,30 +177,3 @@ TSharedPtr<FAdaptiveOctree> AAdaptiveVoxelActor::GetOctree()
 {
     return AdaptiveOctree;
 }
-
-// Draws the Dual Contouring Points of Surface Nodes
-//void AAdaptiveVoxelActor::DrawDebugSurfaceNodes()
-//{
-//    const bool DrawNodeBounds = true;
-//    const bool DrawEdgeCrossings = false;
-//    const bool DrawNormalVector = false;
-//    const bool DrawDualContourPoint = false;
-//    if (!AdaptiveOctree) return;
-//
-//    for (TSharedPtr<FAdaptiveOctreeNode> Node : CachedSurfaceNodes)
-//    {
-//        if (!Node.IsValid()) continue;
-//        if(DrawNodeBounds) DrawDebugBox(GetWorld(), Node->Center, FVector(Node->Extent), FColor::Blue, false, .3f);
-//        if(DrawEdgeCrossings) {
-//            for (FNodeEdge& anEdge : Node->Edges) {
-//                if (anEdge.SignChange) {
-//                    DrawDebugPoint(GetWorld(), anEdge.Corners[0].Position, 8.0f, anEdge.Corners[0].Density > 0 ? FColor::Green : FColor::Red, false, .3f);
-//                    DrawDebugPoint(GetWorld(), anEdge.Corners[1].Position, 8.0f, anEdge.Corners[1].Density > 0 ? FColor::Green : FColor::Red, false, .3f);
-//                    DrawDebugPoint(GetWorld(), anEdge.ZeroCrossingPoint, 5.0f, FColor::Green, false, .3f);
-//                }
-//            }
-//        }
-//        if(DrawNormalVector) DrawDebugLine(GetWorld(), Node->DualContourPosition, Node->DualContourPosition + (Node->DualContourNormal * Node->Extent * .5), FColor(Node->DualContourNormal.X * 255, Node->DualContourNormal.Y * 255, Node->DualContourNormal.Z * 255), false, .3f);
-//        if(DrawDualContourPoint) DrawDebugPoint(GetWorld(), Node->DualContourPosition, 10.0f, FColor::Purple, false, .3f);
-//    }
-//}

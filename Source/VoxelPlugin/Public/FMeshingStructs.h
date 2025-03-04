@@ -52,6 +52,12 @@ struct VOXELPLUGIN_API FMeshStreamData {
 };
 
 struct VOXELPLUGIN_API FMeshChunk {
+    FMeshChunk() {
+        ChunkMeshData = MakeShared<FMeshStreamData>();
+        ChunkMeshData->MeshGroupKey = FRealtimeMeshSectionGroupKey::Create(LODKey, FName("MeshGroup"));
+        ChunkMeshData->MeshSectionKey = FRealtimeMeshSectionKey::CreateForPolyGroup(ChunkMeshData->MeshGroupKey, 0);
+    };
+
     //Data Model Info
     FVector ChunkCenter;
     double ChunkExtent;
@@ -75,9 +81,6 @@ struct VOXELPLUGIN_API FMeshChunk {
 
         ChunkCenter = InCenter;
         ChunkExtent = InExtent;
-        ChunkMeshData = MakeShared<FMeshStreamData>();
-        ChunkMeshData->MeshGroupKey = FRealtimeMeshSectionGroupKey::Create(LODKey, FName("MeshGroup"));
-        ChunkMeshData->MeshSectionKey = FRealtimeMeshSectionKey::CreateForPolyGroup(ChunkMeshData->MeshGroupKey, 0);
 
         ChunkRtMesh = NewObject<URealtimeMeshSimple>(InParentActor);
         ChunkRtMesh->SetCollisionConfig(cConfig);
@@ -92,8 +95,8 @@ struct VOXELPLUGIN_API FMeshChunk {
         ChunkRtComponent->SetCollisionResponseToAllChannels(ECollisionResponse::ECR_Block);
         ChunkRtComponent->SetRealtimeMesh(ChunkRtMesh);
         ChunkRtComponent->SetRenderCustomDepth(true);
-
-        ChunkRtMesh->CreateSectionGroup(ChunkMeshData->MeshGroupKey, ChunkMeshData->MeshStream);
+        
+        ChunkRtMesh->CreateSectionGroup(ChunkMeshData->MeshGroupKey, ChunkMeshData->MeshStream).Wait();
         ChunkRtMesh->ClearInternalFlags(EInternalObjectFlags::Async);
     };
 
@@ -120,10 +123,10 @@ struct VOXELPLUGIN_API FMeshChunk {
             distFromCenter.Z <= ChunkExtent;
     }
 
-    bool ShouldProcessEdge(const FNodeEdge& Edge, const TArray<FAdaptiveOctreeFlatNode>& SampledNodes) {
-        // If we don't have enough nodes to form a triangle bail out
+    bool ShouldProcessEdge(const FNodeEdge& Edge, const TArray<TSharedPtr<FAdaptiveOctreeNode>>& SampledNodes) {
+        // If we don't have enough nodes to form a triangle bail out (ACTUALLY WE NEED TO FIX HOLES)
         if (SampledNodes.Num() < 3) { 
-            UE_LOG(LogTemp, Log, TEXT("< 3 EDGE SURROUNDING NODES. NUM = %d"), SampledNodes.Num());
+            //UE_LOG(LogTemp, Log, TEXT("< 3 EDGE SURROUNDING NODES. NUM = %d"), SampledNodes.Num());
             return false; 
         }
 
@@ -132,7 +135,7 @@ struct VOXELPLUGIN_API FMeshChunk {
         // For each node that is outside the chunk bounds, add its edges to test against
         TArray<FNodeEdge> testEdges;
         for (auto& node : SampledNodes) {
-            if (!IsNodeInChunk(node)) testEdges.Append(node.SignChangeEdges);
+            if (!IsNodeInChunk(node)) testEdges.Append(node->SignChangeEdges);
         }
         // If the other chunks edges do not contain the edge, mesh it
         // Otherwise it will be handled by the external chunk
