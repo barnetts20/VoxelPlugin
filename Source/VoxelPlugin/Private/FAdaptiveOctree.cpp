@@ -234,7 +234,10 @@ double FAdaptiveOctree::UpdateLOD(FVector CameraPosition, double LodFactor)
         ParallelFor(Chunks.Num(), [&](int32 idx)
         {
             TArray<FNodeEdge> tChunkEdges;
-            if (Chunks[idx]->UpdateLod(CameraPosition, LodFactor, tChunkEdges)) {
+            bool tChanged = false;
+            Chunks[idx]->UpdateLod(CameraPosition, LodFactor, tChunkEdges, tChanged);
+            
+            if (tChanged) {
                 MeshChunks[idx]->ChunkEdges = tChunkEdges;
                 // Mark this chunk as modified (using 1 instead of true)
                 FPlatformAtomics::InterlockedExchange(&ChunksModified[idx], 1);

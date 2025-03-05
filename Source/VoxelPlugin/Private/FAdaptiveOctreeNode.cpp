@@ -164,40 +164,53 @@ void AppendUniqueEdges(TArray<FNodeEdge> InAppendEdges, TArray<FNodeEdge>& OutNo
 //    }
 //}
 
-bool FAdaptiveOctreeNode::UpdateLod(FVector InCameraPosition, double InLodDistanceFactor, TArray<FNodeEdge>& OutNodeEdges)
+void FAdaptiveOctreeNode::UpdateLod(FVector InCameraPosition, double InLodDistanceFactor, TArray<FNodeEdge>& OutNodeEdges, bool& OutChanged)
 {
     if (IsLeaf())
     {
         if (ShouldSplit(InCameraPosition, InLodDistanceFactor))
         {
+            OutChanged = true;
             Split();
-            for (TSharedPtr<FAdaptiveOctreeNode> aChild : Children) {
-                AppendUniqueEdges(aChild->GetSignChangeEdges(), OutNodeEdges);
+            if (fullUpdate) {
+                for (TSharedPtr<FAdaptiveOctreeNode> aChild : Children) {
+                    aChild->UpdateLod(InCameraPosition, InLodDistanceFactor, OutNodeEdges, OutChanged);
+                }
             }
-            return true; // A split occurred
+            else {
+                for (TSharedPtr<FAdaptiveOctreeNode> aChild : Children) {
+                    AppendUniqueEdges(aChild->GetSignChangeEdges(), OutNodeEdges);
+                }
+                return;
+            }
+
         }
         else if (Parent.IsValid() && Parent.Pin()->ShouldMerge(InCameraPosition, InLodDistanceFactor) && TreeIndex.Last() == 7)
         {
-            Parent.Pin()->Merge();
-            AppendUniqueEdges(Parent.Pin()->GetSignChangeEdges(), OutNodeEdges);
-            return true; // A merge occurred
+            OutChanged = true;
+            auto parentPtr = Parent.Pin();
+            parentPtr->Merge();
+            if (fullUpdate) {
+                parentPtr->UpdateLod(InCameraPosition, InLodDistanceFactor, OutNodeEdges, OutChanged);
+            }
+            else {
+                AppendUniqueEdges(parentPtr->GetSignChangeEdges(), OutNodeEdges);
+                return;
+            }
+            
         }
         else {
             AppendUniqueEdges(GetSignChangeEdges(), OutNodeEdges);
-            return false;
+            return;
         }
     }
     else
     {
-        bool bAnyChanges = false;
         for (int i = 0; i < 8; i++)
         {
-            if (Children[i]->UpdateLod(InCameraPosition, InLodDistanceFactor, OutNodeEdges))
-            {
-                bAnyChanges = true;
-            }
+            Children[i]->UpdateLod(InCameraPosition, InLodDistanceFactor, OutNodeEdges, OutChanged);
+
         }
-        return bAnyChanges; // Return true if any child changed
     }
 }
 

@@ -131,6 +131,13 @@ struct VOXELPLUGIN_API FMeshChunk {
             return false; 
         }
 
+        //for (auto& aNode : SampledNodes) {
+        //    if (aNode->Edges[0].Size > (2 * Edge.Size + .1)) {
+        //        aNode->Split();
+        //        return false;
+        //    }
+        //}
+
         // If it's not on a stitching face, mesh it
         if (!IsEdgeOnChunkFace(Edge, -1)) return true;
         // For each node that is outside the chunk bounds, add its edges to test against
