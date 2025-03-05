@@ -24,13 +24,17 @@ private:
     FRWLock OctreeLock;
 
     int ChunkDepth = 4;
-    int MinDepth = 6;
-    int MaxDepth = 12;
-    int LodFactor = 12;
+    int MinDepth = 8;
+    int MaxDepth = 18;
+    int LodFactor = 8;
     int CollisionDepth = 14;
 
+    double MinDataUpdateInterval = .05;
     bool TickInEditor = false;
     bool Initialized = false;
+    bool IsDestroyed = false;
+
+    double Size = 50000000.0;
 
 public:
     AAdaptiveVoxelActor();

@@ -98,8 +98,6 @@ void FAdaptiveOctree::UpdateMeshChunkStreamData(TSharedPtr<FMeshChunk> InChunk)
     auto TriangleStream = InChunk->ChunkMeshData->GetTriangleStream();
     auto PolygroupStream = InChunk->ChunkMeshData->GetPolygroupStream();
 
-    TArray<FNodeEdge> edgesToProcess = InChunk->ChunkEdges;
-
     // Reset all streams
     PositionStream.Empty();
     TangentStream.Empty();
@@ -121,10 +119,10 @@ void FAdaptiveOctree::UpdateMeshChunkStreamData(TSharedPtr<FMeshChunk> InChunk)
     };
 
     TArray<FEdgeVertexData> AllEdgeData;
-    AllEdgeData.SetNum(edgesToProcess.Num());
+    AllEdgeData.SetNum(InChunk->ChunkEdges.Num());
 
-    ParallelFor(edgesToProcess.Num(), [&](int32 edgeIdx) {
-        auto currentEdge = edgesToProcess[edgeIdx];
+    ParallelFor(InChunk->ChunkEdges.Num(), [&](int32 edgeIdx) {
+        auto currentEdge = InChunk->ChunkEdges[edgeIdx];
         TArray<TSharedPtr<FAdaptiveOctreeNode>> nodesToMesh = SampleNodesAroundEdge(currentEdge);
         if (!InChunk->ShouldProcessEdge(currentEdge, nodesToMesh)) {
             AllEdgeData[edgeIdx].IsValid = false;
@@ -221,20 +219,50 @@ uint32 FAdaptiveOctree::ComputePositionHash(const FVector& Position, float GridS
     return FCrc::MemCrc32(&SnappedPos, sizeof(FVector));
 }
 
-void FAdaptiveOctree::UpdateLOD(FVector CameraPosition, double LodFactor)
+double FAdaptiveOctree::UpdateLOD(FVector CameraPosition, double LodFactor)
 {
-    if (!MeshChunksInitialized) return;
+    if (!MeshChunksInitialized) return 0;
+
+    // Start timing
+    double StartTime = FPlatformTime::Seconds();
+
     {
+        // Array to track which chunks were modified
+        TArray<int32> ChunksModified;
+        ChunksModified.SetNumZeroed(Chunks.Num());
+
         ParallelFor(Chunks.Num(), [&](int32 idx)
         {
             TArray<FNodeEdge> tChunkEdges;
-            if (Chunks[idx]->UpdateLod(CameraPosition, LodFactor, tChunkEdges)) MeshChunks[idx]->ChunkEdges = tChunkEdges;
+            if (Chunks[idx]->UpdateLod(CameraPosition, LodFactor, tChunkEdges)) {
+                MeshChunks[idx]->ChunkEdges = tChunkEdges;
+                // Mark this chunk as modified (using 1 instead of true)
+                FPlatformAtomics::InterlockedExchange(&ChunksModified[idx], 1);
+            }
         });
-        ParallelFor(MeshChunks.Num(), [&](int32 idx)
+
+        // Create a list of indices for chunks that need updating
+        //TArray<int32> ChunksToUpdate;
+        //for (int32 i = 0; i < ChunksModified.Num(); i++) {
+        //    if (ChunksModified[i] != 0) {
+        //        ChunksToUpdate.Add(i);
+        //    }
+        //}
+
+        // Only update the chunks that were modified
+        ParallelFor(MeshChunks.Num(), [&](int32 i)
         {
-            UpdateMeshChunkStreamData(MeshChunks[idx]);
+            if (ChunksModified[i] != 0) {
+                UpdateMeshChunkStreamData(MeshChunks[i]);
+            }
         });
     }
+
+    // Calculate and log total execution time
+    double EndTime = FPlatformTime::Seconds();
+    double TotalDuration = (EndTime - StartTime) * 1000.0; // Convert to milliseconds
+
+    return TotalDuration;
 }
 
 void FAdaptiveOctree::UpdateMesh()
@@ -342,12 +370,12 @@ TArray<TSharedPtr<FAdaptiveOctreeNode>> FAdaptiveOctree::SampleNodesAroundEdge(c
     if (NodeC.IsValid()) returnNodes.AddUnique(NodeC);
     if (NodeD.IsValid()) returnNodes.AddUnique(NodeD);
 
-    for (auto aNode : returnNodes) {
-        if (!aNode->IsSurfaceNode) {
-            aNode->DualContourPosition = Edge.ZeroCrossingPoint + .2 * (aNode->Center - Edge.ZeroCrossingPoint);
-            aNode->IsSurfaceNode = true;
-        }
-    }
+    //for (auto aNode : returnNodes) {
+    //    if (!aNode->IsSurfaceNode) {
+    //        aNode->DualContourPosition = Edge.ZeroCrossingPoint + .2 * (aNode->Center - Edge.ZeroCrossingPoint);
+    //        aNode->IsSurfaceNode = true;
+    //    }
+    //}
 
     return returnNodes;
 }

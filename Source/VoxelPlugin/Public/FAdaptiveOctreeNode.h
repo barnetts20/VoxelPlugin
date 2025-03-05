@@ -15,6 +15,7 @@ struct VOXELPLUGIN_API FNodeEdge
     FNodeCorner Corners[2];     // The corners associated with this edge
     double Size;
     bool SignChange;            // Does this edge contain a sign change
+    double Distance;
     FVector EdgeDirection;      // Precomputed normalized edge direction
     int Axis;                   // Axis-aligned indicator (0 = X, 1 = Y, 2 = Z)
     FVector ZeroCrossingPoint;  // Position where sign flips
@@ -28,7 +29,7 @@ struct VOXELPLUGIN_API FNodeEdge
         // Determine which corner is positive and which is negative
         FNodeCorner PosCorner = (InCorner1.Density > InCorner2.Density) ? InCorner1 : InCorner2;
         FNodeCorner NegCorner = (InCorner1.Density > InCorner2.Density) ? InCorner2 : InCorner1;
-
+        Distance = FVector::Dist(InCorner1.Position, InCorner2.Position);
         // Compute edge direction: Always point from positive to negative
         EdgeDirection = (NegCorner.Position - PosCorner.Position).GetSafeNormal();
         Size = FVector::Dist(Corners[0].Position, Corners[1].Position);
@@ -49,8 +50,7 @@ struct VOXELPLUGIN_API FNodeEdge
     // Equality operator for ensuring uniqueness
     bool operator==(const FNodeEdge& Other) const
     {
-        return IsCongruent(Other) &&
-            SignChange == Other.SignChange;
+        return IsCongruent(Other) && Other.EdgeDirection == EdgeDirection;
     }
 };
 
@@ -107,7 +107,7 @@ public:
 
     TArray<FNodeEdge> GetSurfaceEdges();
     TArray<TSharedPtr<FAdaptiveOctreeNode>> GetSurfaceNodes();
-    TArray<FNodeEdge>& GetSignChangeEdges();
+    TArray<FNodeEdge> GetSignChangeEdges();
 
     FNodeEdge& GetSharedEdge(FNodeEdge anEdge);
 

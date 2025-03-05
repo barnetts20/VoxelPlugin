@@ -52,12 +52,6 @@ struct VOXELPLUGIN_API FMeshStreamData {
 };
 
 struct VOXELPLUGIN_API FMeshChunk {
-    FMeshChunk() {
-        ChunkMeshData = MakeShared<FMeshStreamData>();
-        ChunkMeshData->MeshGroupKey = FRealtimeMeshSectionGroupKey::Create(LODKey, FName("MeshGroup"));
-        ChunkMeshData->MeshSectionKey = FRealtimeMeshSectionKey::CreateForPolyGroup(ChunkMeshData->MeshGroupKey, 0);
-    };
-
     //Data Model Info
     FVector ChunkCenter;
     double ChunkExtent;
@@ -65,7 +59,9 @@ struct VOXELPLUGIN_API FMeshChunk {
     TSharedPtr<FMeshStreamData> ChunkMeshData;
 
     //Mesh Stuff
+    bool NeedsRebuild = true;
     bool IsDirty = false;
+    bool IsInitialized = false;
     TSharedPtr<FRWLock> MeshDataLock = MakeShared<FRWLock>();
     URealtimeMeshSimple* ChunkRtMesh;
     URealtimeMeshComponent* ChunkRtComponent;
@@ -78,6 +74,8 @@ struct VOXELPLUGIN_API FMeshChunk {
         cConfig.bUseComplexAsSimpleCollision = true;
         cConfig.bDeformableMesh = false;
         cConfig.bUseAsyncCook = true;
+
+        ChunkMeshData = MakeShared<FMeshStreamData>();
 
         ChunkCenter = InCenter;
         ChunkExtent = InExtent;
@@ -96,8 +94,11 @@ struct VOXELPLUGIN_API FMeshChunk {
         ChunkRtComponent->SetRealtimeMesh(ChunkRtMesh);
         ChunkRtComponent->SetRenderCustomDepth(true);
         
-        ChunkRtMesh->CreateSectionGroup(ChunkMeshData->MeshGroupKey, ChunkMeshData->MeshStream).Wait();
-        ChunkRtMesh->ClearInternalFlags(EInternalObjectFlags::Async);
+        ChunkMeshData->MeshGroupKey = FRealtimeMeshSectionGroupKey::Create(LODKey, FName(ChunkCenter.ToCompactString()));
+        ChunkRtMesh->CreateSectionGroup(ChunkMeshData->MeshGroupKey, ChunkMeshData->MeshStream);
+        ChunkMeshData->MeshSectionKey = FRealtimeMeshSectionKey::CreateForPolyGroup(ChunkMeshData->MeshGroupKey, 0);
+
+        IsInitialized = true;
     };
 
     bool IsEdgeOnChunkFace(const FNodeEdge& Edge, int Coef) {
@@ -114,10 +115,10 @@ struct VOXELPLUGIN_API FMeshChunk {
             FMath::Abs(Edge.ZeroCrossingPoint[axis2] - facePos[axis2]) < tolerance;
     }
 
-    bool IsNodeInChunk(const FAdaptiveOctreeFlatNode& Node) {
+    bool IsNodeInChunk(const TSharedPtr<FAdaptiveOctreeNode> Node) {
         // Calculate extents once
         const FVector extentVec(ChunkExtent);
-        FVector distFromCenter = (Node.Center - ChunkCenter).GetAbs();
+        FVector distFromCenter = (Node->Center - ChunkCenter).GetAbs();
         return distFromCenter.X <= ChunkExtent &&
             distFromCenter.Y <= ChunkExtent &&
             distFromCenter.Z <= ChunkExtent;
@@ -148,10 +149,12 @@ struct VOXELPLUGIN_API FMeshChunk {
     }
 
     void UpdateComponent() {
-        if (!IsDirty) return;
-        if (ChunkMeshData) ChunkRtMesh->UpdateSectionGroup(ChunkMeshData->MeshGroupKey, ChunkMeshData->MeshStream).Then([this](TFuture<ERealtimeMeshProxyUpdateStatus> update) {
+        AsyncTask(ENamedThreads::GameThread, [this]() {
+            if (!IsInitialized || !IsDirty) return;
+            IsDirty = false;
+            
+            ChunkRtMesh->UpdateSectionGroup(ChunkMeshData->MeshGroupKey, ChunkMeshData->MeshStream);
             ChunkRtMesh->UpdateSectionConfig(ChunkMeshData->MeshSectionKey, SecConfig, true);
         });
-        IsDirty = false;
     }
 };

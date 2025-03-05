@@ -127,19 +127,42 @@ bool FAdaptiveOctreeNode::ShouldMerge(FVector InCameraPosition, double InLodDist
 
 void AppendUniqueEdges(TArray<FNodeEdge> InAppendEdges, TArray<FNodeEdge>& OutNodeEdges) {
     for (FNodeEdge& anEdge : InAppendEdges) {
-        //int32 cEdge = OutNodeEdges.Find(anEdge);
-        //if (cEdge != INDEX_NONE) {
-        //    //Replace with smallest edge
-        //    if (OutNodeEdges[cEdge].Size > anEdge.Size) {
-        //        OutNodeEdges[cEdge] = anEdge;
-        //    }
-        //}
-        //else {
-        //    OutNodeEdges.Add(anEdge);
-        //}
-        OutNodeEdges.AddUnique(anEdge);
+        // Try to find existing edge with the same ID
+        bool found = false;
+        for (int i = 0; i < OutNodeEdges.Num(); i++) {
+            if (OutNodeEdges[i] == anEdge) {
+                // Replace if new edge has lower distance
+                if (anEdge.Distance < OutNodeEdges[i].Distance) {
+                    OutNodeEdges[i] = anEdge;
+                }
+                found = true;
+                break;
+            }
+        }
+
+        // If not found, add it to the array
+        if (!found) {
+            OutNodeEdges.Add(anEdge);
+        }
     }
 }
+
+
+//void AppendUniqueEdges(TArray<FNodeEdge> InAppendEdges, TArray<FNodeEdge>& OutNodeEdges) {
+//    for (FNodeEdge& anEdge : InAppendEdges) {
+//        //int32 cEdge = OutNodeEdges.Find(anEdge);
+//        //if (cEdge != INDEX_NONE) {
+//        //    //Replace with smallest edge
+//        //    if (OutNodeEdges[cEdge].Size > anEdge.Size) {
+//        //        OutNodeEdges[cEdge] = anEdge;
+//        //    }
+//        //}
+//        //else {
+//        //    OutNodeEdges.Add(anEdge);
+//        //}
+//        OutNodeEdges.AddUnique(anEdge);
+//    }
+//}
 
 bool FAdaptiveOctreeNode::UpdateLod(FVector InCameraPosition, double InLodDistanceFactor, TArray<FNodeEdge>& OutNodeEdges)
 {
@@ -149,18 +172,19 @@ bool FAdaptiveOctreeNode::UpdateLod(FVector InCameraPosition, double InLodDistan
         {
             Split();
             for (TSharedPtr<FAdaptiveOctreeNode> aChild : Children) {
-                AppendUniqueEdges(aChild->SignChangeEdges, OutNodeEdges);
+                AppendUniqueEdges(aChild->GetSignChangeEdges(), OutNodeEdges);
             }
             return true; // A split occurred
         }
         else if (Parent.IsValid() && Parent.Pin()->ShouldMerge(InCameraPosition, InLodDistanceFactor) && TreeIndex.Last() == 7)
         {
             Parent.Pin()->Merge();
-            AppendUniqueEdges(Parent.Pin()->SignChangeEdges, OutNodeEdges);
+            AppendUniqueEdges(Parent.Pin()->GetSignChangeEdges(), OutNodeEdges);
             return true; // A merge occurred
         }
         else {
-            AppendUniqueEdges(SignChangeEdges, OutNodeEdges);
+            AppendUniqueEdges(GetSignChangeEdges(), OutNodeEdges);
+            return false;
         }
     }
     else
@@ -175,8 +199,6 @@ bool FAdaptiveOctreeNode::UpdateLod(FVector InCameraPosition, double InLodDistan
         }
         return bAnyChanges; // Return true if any child changed
     }
-
-    return false; // No changes occurred
 }
 
 // Retrieves all surface nodes for meshing
@@ -239,8 +261,13 @@ TArray<TSharedPtr<FAdaptiveOctreeNode>> FAdaptiveOctreeNode::GetSurfaceNodes()
     return SurfaceNodes;
 }
 
-TArray<FNodeEdge>& FAdaptiveOctreeNode::GetSignChangeEdges()
+TArray<FNodeEdge> FAdaptiveOctreeNode::GetSignChangeEdges()
 {
+    //TArray<FNodeEdge> returnEdges;
+    //for (int i = 0; i < 6; i++) {
+    //    if (Edges[i].SignChange) returnEdges.Add(Edges[i]);
+    //}
+    //return returnEdges;
     return SignChangeEdges;
 }
 
@@ -263,11 +290,7 @@ void FAdaptiveOctreeNode::ComputeDualContourPosition()
         DualContourNormal.Z = (Corners[4].Density + Corners[5].Density + Corners[6].Density + Corners[7].Density) -
             (Corners[0].Density + Corners[1].Density + Corners[2].Density + Corners[3].Density);
 
-        if (!DualContourNormal.IsNearlyZero(KINDA_SMALL_NUMBER))
-        {
-            DualContourNormal.Normalize();
-        }
-
+        DualContourNormal.Normalize();
         IsSurfaceNode = true;
     }
     else {
