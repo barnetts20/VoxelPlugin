@@ -130,14 +130,7 @@ struct VOXELPLUGIN_API FMeshChunk {
             //UE_LOG(LogTemp, Log, TEXT("< 3 EDGE SURROUNDING NODES. NUM = %d"), SampledNodes.Num());
             return false; 
         }
-
-        //for (auto& aNode : SampledNodes) {
-        //    if (aNode->Edges[0].Size > (2 * Edge.Size + .1)) {
-        //        aNode->Split();
-        //        return false;
-        //    }
-        //}
-
+        if (true) return true;
         // If it's not on a stitching face, mesh it
         if (!IsEdgeOnChunkFace(Edge, -1)) return true;
         // For each node that is outside the chunk bounds, add its edges to test against

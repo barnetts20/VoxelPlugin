@@ -127,11 +127,9 @@ bool FAdaptiveOctreeNode::ShouldMerge(FVector InCameraPosition, double InLodDist
 
 void AppendUniqueEdges(TArray<FNodeEdge> InAppendEdges, TArray<FNodeEdge>& OutNodeEdges) {
     for (FNodeEdge& anEdge : InAppendEdges) {
-        // Try to find existing edge with the same ID
         bool found = false;
         for (int i = 0; i < OutNodeEdges.Num(); i++) {
             if (OutNodeEdges[i] == anEdge) {
-                // Replace if new edge has lower distance
                 if (anEdge.Distance < OutNodeEdges[i].Distance) {
                     OutNodeEdges[i] = anEdge;
                 }
@@ -139,7 +137,6 @@ void AppendUniqueEdges(TArray<FNodeEdge> InAppendEdges, TArray<FNodeEdge>& OutNo
                 break;
             }
         }
-
         // If not found, add it to the array
         if (!found) {
             OutNodeEdges.Add(anEdge);
@@ -287,14 +284,14 @@ TArray<FNodeEdge> FAdaptiveOctreeNode::GetSignChangeEdges()
 // Compute Dual Contour Position, currently just naive surface nets
 void FAdaptiveOctreeNode::ComputeDualContourPosition()
 {
-    TArray<FVector> SurfaceCrossings;
-    for (FNodeEdge& anEdge : SignChangeEdges) {
-        SurfaceCrossings.Add(anEdge.ZeroCrossingPoint);
-    }
 
-    if (SignChangeEdges.Num() > 0) {
-        DualContourPosition = Algo::Accumulate(SurfaceCrossings, FVector::ZeroVector) / SurfaceCrossings.Num();
-        
+    if (SignChangeEdges.Num() > 0){
+        DualContourPosition = FVector::ZeroVector;
+        for (FNodeEdge& anEdge : SignChangeEdges) {
+            DualContourPosition += anEdge.ZeroCrossingPoint;
+        }
+        DualContourPosition = DualContourPosition / (double)SignChangeEdges.Num();
+
         DualContourNormal = FVector(0, 0, 0);
         DualContourNormal.X = (Corners[1].Density + Corners[3].Density + Corners[5].Density + Corners[7].Density) -
             (Corners[0].Density + Corners[2].Density + Corners[4].Density + Corners[6].Density);
@@ -311,4 +308,171 @@ void FAdaptiveOctreeNode::ComputeDualContourPosition()
         DualContourPosition = Center;
         IsSurfaceNode = false;
     }
+}
+
+bool FAdaptiveOctreeNode::RefineDualContour(const FNodeEdge& RefEdge)
+{
+    // If already a surface node, no need to refine
+    if (IsSurfaceNode) {
+        return true;
+    }
+
+    // Get the midpoints of all edges and sample density there
+    TArray<FNodeCorner> MidpointSamples;
+    TArray<FNodeEdge> RefinedEdges;
+
+    // Iterate through all 12 edges of the cube
+    for (int i = 0; i < 12; i++) {
+        int v0Idx = EdgePairs[i][0];
+        int v1Idx = EdgePairs[i][1];
+
+        // Get the midpoint of this edge
+        FVector MidPoint = (Corners[v0Idx].Position + Corners[v1Idx].Position) * 0.5f;
+        double MidDensity = DensityFunction(MidPoint);
+
+        // Create a new corner sample for this midpoint
+        FNodeCorner MidCorner(12 + i, MidPoint, MidDensity); // Index starts at 12 for midpoints
+        MidpointSamples.Add(MidCorner);
+
+        // Create edges between midpoints and original corners
+        FNodeEdge Edge1(Corners[v0Idx], MidCorner);
+        FNodeEdge Edge2(MidCorner, Corners[v1Idx]);
+
+        // Add edges if they cross the surface
+        if (Edge1.SignChange) {
+            RefinedEdges.Add(Edge1);
+        }
+        if (Edge2.SignChange) {
+            RefinedEdges.Add(Edge2);
+        }
+    }
+
+    // If we have surface crossings in the refined edges
+    if (RefinedEdges.Num() > 0) {
+        // We need to handle the case where an original edge now has multiple crossings
+        TMap<int32, FNodeEdge> BestEdges;
+
+        for (const FNodeEdge& Edge : RefinedEdges) {
+            // Determine which original edge this refined edge belongs to
+            int32 OriginalEdgeIndex = -1;
+
+            // Check which original edge's corners match this refined edge's corners
+            for (int i = 0; i < 12; i++) {
+                int v0 = EdgePairs[i][0];
+                int v1 = EdgePairs[i][1];
+
+                // If this refined edge connects an original corner to a midpoint
+                if ((Edge.Corners[0].CornerIndex < 8 && Edge.Corners[1].CornerIndex >= 12) ||
+                    (Edge.Corners[1].CornerIndex < 8 && Edge.Corners[0].CornerIndex >= 12)) {
+
+                    // Get the original corner index
+                    int OrigCornerIdx = (Edge.Corners[0].CornerIndex < 8) ? Edge.Corners[0].CornerIndex : Edge.Corners[1].CornerIndex;
+
+                    // If this corner is part of the original edge
+                    if (OrigCornerIdx == v0 || OrigCornerIdx == v1) {
+                        OriginalEdgeIndex = i;
+                        break;
+                    }
+                }
+            }
+
+            // If we found which original edge this belongs to
+            if (OriginalEdgeIndex != -1) {
+                // Calculate distance to the reference edge's zero crossing
+                float DistToRefZero = FVector::Distance(Edge.ZeroCrossingPoint, RefEdge.ZeroCrossingPoint);
+
+                // If we haven't seen this original edge yet, or this crossing is closer to ref edge
+                if (!BestEdges.Contains(OriginalEdgeIndex) ||
+                    DistToRefZero < FVector::Distance(BestEdges[OriginalEdgeIndex].ZeroCrossingPoint, RefEdge.ZeroCrossingPoint)) {
+
+                    BestEdges.Add(OriginalEdgeIndex, Edge);
+                }
+            }
+        }
+
+        // Now use the best edges to compute a refined dual contour position
+        TArray<FVector> RefinedCrossings;
+        for (const auto& EdgePair : BestEdges) {
+            RefinedCrossings.Add(EdgePair.Value.ZeroCrossingPoint);
+        }
+
+        // If we have crossings, update the dual contour position
+        if (RefinedCrossings.Num() > 0) {
+            DualContourPosition = Algo::Accumulate(RefinedCrossings, FVector::ZeroVector) / RefinedCrossings.Num();
+
+            // Recompute normal using both original corners and midpoint samples
+            TArray<FNodeCorner> AllSamples = Corners;
+            AllSamples.Append(MidpointSamples);
+
+            // Calculate gradient using all samples
+            FVector Gradient = FVector::ZeroVector;
+            for (const FNodeCorner& Sample : AllSamples) {
+                // Weight by inverse distance from cell center
+                float Weight = 1.0f / FMath::Max(0.01f, FVector::Distance(Sample.Position, Center));
+                Gradient += (Sample.Position - Center) * Sample.Density * Weight;
+            }
+
+            // Normalize to get normal direction
+            DualContourNormal = -Gradient.GetSafeNormal();
+
+            // Mark as surface node
+            IsSurfaceNode = true;
+
+            // Keep track of the refined edges for future reference
+            SignChangeEdges.Empty();
+            for (const auto& EdgePair : BestEdges) {
+                SignChangeEdges.Add(EdgePair.Value);
+            }
+
+            return true;
+        }
+    }
+
+    // No valid dual contour point found
+    return false;
+}
+
+void FAdaptiveOctreeNode::DrawAndLogNode()
+{
+    // Capture necessary information for drawing
+    FVector NodeCenter = Center;
+    double NodeExtent = Extent;
+    FVector DCPosition = DualContourPosition;
+    TArray<FNodeCorner> NodeCorners = Corners;
+    int32 TreeDepth = TreeIndex.Num();
+
+    // Dispatch drawing task to the game thread
+    AsyncTask(ENamedThreads::GameThread, [NodeCenter, NodeExtent, DCPosition, NodeCorners, TreeDepth]() {
+        // Get world for drawing debug shapes
+        UWorld* World = GEngine->GetWorldContexts()[0].World();
+        if (!World) return;
+
+        // Set duration and color based on tree depth
+        float Duration = 1.0f; // 1 second display
+        FColor BoxColor = FColor::Green;
+
+        // Calculate the min/max corners of the box
+        FVector Min = NodeCenter - FVector(NodeExtent);
+        FVector Max = NodeCenter + FVector(NodeExtent);
+
+        // Draw the bounding box
+        DrawDebugBox(World, NodeCenter, FVector(NodeExtent), FQuat::Identity, BoxColor, true, Duration, 0, 5000.0f);
+
+        // Draw the dual contour position
+        DrawDebugPoint(World, DCPosition, 10.0, FColor::Red, true, Duration, 0);
+
+        // Log information about the node
+        UE_LOG(LogTemp, Display, TEXT("Node at depth %d:"), TreeDepth);
+        UE_LOG(LogTemp, Display, TEXT("  Center: (%f, %f, %f)"), NodeCenter.X, NodeCenter.Y, NodeCenter.Z);
+        UE_LOG(LogTemp, Display, TEXT("  Extent: %f"), NodeExtent);
+        UE_LOG(LogTemp, Display, TEXT("  Dual Contour Position: (%f, %f, %f)"),
+            DCPosition.X, DCPosition.Y, DCPosition.Z);
+
+        // Log corner information
+        for (int i = 0; i < NodeCorners.Num(); i++) {
+            UE_LOG(LogTemp, Display, TEXT("  Corner %d: Pos=(%f, %f, %f), Density=%f"),
+                i, NodeCorners[i].Position.X, NodeCorners[i].Position.Y, NodeCorners[i].Position.Z,
+                NodeCorners[i].Density);
+        }
+        });
 }

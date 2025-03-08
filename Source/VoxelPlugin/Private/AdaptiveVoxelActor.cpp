@@ -46,13 +46,12 @@ AAdaptiveVoxelActor::AAdaptiveVoxelActor()
     //        return position.size() - sphereradius;
     //    };
     //spherenoise
-    auto DensityFunction = [&](FVector Position) -> double
-        {
-            double SphereRadius = Size * .85;
-            float NoiseValue = (FMath::PerlinNoise3D(Position / (Size * .2))) * Size * .1;// +(FMath::PerlinNoise3D(Position / 100000.0)) * 100000;
-            return Position.Size() - (SphereRadius + NoiseValue);
-        };
-
+    //auto DensityFunction = [&](FVector Position) -> double
+    //    {
+    //        double SphereRadius = Size * .85;
+    //        float NoiseValue = (FMath::PerlinNoise3D(Position / (Size * .2))) * Size * .1;// +(FMath::PerlinNoise3D(Position / 100000.0)) * 100000;
+    //        return Position.Size() - (SphereRadius + NoiseValue);
+    //    };
     //Torus noise
     //auto DensityFunction = [this](FVector Position) -> double
     //{
@@ -62,7 +61,31 @@ AAdaptiveVoxelActor::AAdaptiveVoxelActor()
     //        FVector2D q(FVector2D(Position.X, Position.Y).Size() - MajorRadius + NoiseValue, Position.Z);
     //        return q.Size() - MinorRadius + NoiseValue;
     //};
+    auto DensityFunction = [&](FVector Position) -> double
+        {
+            double SphereRadius = Size * .85;
 
+            // Normalize the position to get the direction
+            FVector Direction = Position.GetSafeNormal();
+
+            // Create a wave pattern based on latitude and longitude
+            double latitude = FMath::Asin(Direction.Z);
+            double longitude = FMath::Atan2(Direction.Y, Direction.X);
+
+            // Create topographical variation using sin/cos
+            double frequency1 = 12.0;  // Controls how many waves around the sphere
+            double frequency2 = 8.0;  // Secondary wave pattern
+            double amplitude = Size * 0.1;  // Same scale as the Perlin noise was using
+
+            double variation = amplitude * (
+                0.5 * FMath::Sin(frequency1 * latitude) * FMath::Cos(frequency1 * longitude) +
+                0.3 * FMath::Sin(frequency2 * latitude * 2.0) * FMath::Cos(frequency2 * longitude * 0.5) +
+                0.2 * FMath::Sin(frequency1 * longitude * 0.7)
+                );
+
+            // Return signed distance
+            return Position.Size() - (SphereRadius + variation);
+        };
     //Adaptive Octree Picks out the Implicit Structure
     AdaptiveOctree = MakeShared<FAdaptiveOctree>(DensityFunction, GetActorLocation(), Size, ChunkDepth, MinDepth, MaxDepth);
     //Sparsetree for user edits
@@ -107,7 +130,28 @@ void AAdaptiveVoxelActor::InitializeChunks() {
 
     Initialized = true;
     ScheduleDataUpdate(.05);
-    ScheduleMeshUpdate(.05);
+    ScheduleMeshUpdate(.1);
+
+    FVector quadrants[8];
+    quadrants[0] = FVector(1, 1, 1);
+    quadrants[1] = FVector(-1, 1, 1);
+    quadrants[2] = FVector(1, -1, 1);
+    quadrants[3] = FVector(1, 1, -1);
+    quadrants[4] = FVector(-1, -1, 1);
+    quadrants[5] = FVector(1, -1, -1);
+    quadrants[6] = FVector(-1, 1, -1);
+    quadrants[7] = FVector(-1, -1, -1);
+
+    FVector oneVec = FVector(1, 1, 1);
+    double scl = 1000000000;
+    DrawDebugBox(GetWorld(), quadrants[0] * scl, scl * oneVec, FColor::Red, true, 1000);
+    DrawDebugBox(GetWorld(), quadrants[1] * scl, scl * oneVec, FColor::Green, true, 1000);
+    DrawDebugBox(GetWorld(), quadrants[2] * scl, scl * oneVec, FColor::Blue, true, 1000);
+    DrawDebugBox(GetWorld(), quadrants[3] * scl, scl * oneVec, FColor::Purple, true, 1000);
+    DrawDebugBox(GetWorld(), quadrants[4] * scl, scl * oneVec, FColor::Orange, true, 1000);
+    DrawDebugBox(GetWorld(), quadrants[5] * scl, scl * oneVec, FColor::Yellow, true, 1000);
+    DrawDebugBox(GetWorld(), quadrants[6] * scl, scl * oneVec, FColor::Magenta, true, 1000);
+    DrawDebugBox(GetWorld(), quadrants[7] * scl, scl * oneVec, FColor::Cyan, true, 1000);
 }
 
 void AAdaptiveVoxelActor::ScheduleDataUpdate(float IntervalInSeconds)
@@ -118,14 +162,13 @@ void AAdaptiveVoxelActor::ScheduleDataUpdate(float IntervalInSeconds)
 
         FGraphEventRef Task = FFunctionGraphTask::CreateAndDispatchWhenReady([this, IntervalInSeconds]()
         {
-             double LastExecutionTime = 0.0;
             //**********BEGIN IMPLEMENTATION BLOCK***************
             //**********BEGIN IMPLEMENTATION BLOCK***************
             //**********BEGIN IMPLEMENTATION BLOCK***************
             {
                 FRWScopeLock WriteLock(OctreeLock, SLT_Write);
                 if (IsDestroyed) return;
-                LastExecutionTime = AdaptiveOctree->UpdateLOD(CameraPosition, LodFactor);
+                AdaptiveOctree->UpdateLOD(CameraPosition, LodFactor);
             }
             //***********END IMPLEMENTATION BLOCK***************
             //***********END IMPLEMENTATION BLOCK***************

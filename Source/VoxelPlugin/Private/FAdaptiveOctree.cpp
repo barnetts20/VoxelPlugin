@@ -219,9 +219,9 @@ uint32 FAdaptiveOctree::ComputePositionHash(const FVector& Position, float GridS
     return FCrc::MemCrc32(&SnappedPos, sizeof(FVector));
 }
 
-double FAdaptiveOctree::UpdateLOD(FVector CameraPosition, double LodFactor)
+void FAdaptiveOctree::UpdateLOD(FVector CameraPosition, double LodFactor)
 {
-    if (!MeshChunksInitialized) return 0;
+    if (!MeshChunksInitialized) return;;
 
     // Start timing
     double StartTime = FPlatformTime::Seconds();
@@ -236,21 +236,12 @@ double FAdaptiveOctree::UpdateLOD(FVector CameraPosition, double LodFactor)
             TArray<FNodeEdge> tChunkEdges;
             bool tChanged = false;
             Chunks[idx]->UpdateLod(CameraPosition, LodFactor, tChunkEdges, tChanged);
-            
             if (tChanged) {
                 MeshChunks[idx]->ChunkEdges = tChunkEdges;
                 // Mark this chunk as modified (using 1 instead of true)
                 FPlatformAtomics::InterlockedExchange(&ChunksModified[idx], 1);
             }
         });
-
-        // Create a list of indices for chunks that need updating
-        //TArray<int32> ChunksToUpdate;
-        //for (int32 i = 0; i < ChunksModified.Num(); i++) {
-        //    if (ChunksModified[i] != 0) {
-        //        ChunksToUpdate.Add(i);
-        //    }
-        //}
 
         // Only update the chunks that were modified
         ParallelFor(MeshChunks.Num(), [&](int32 i)
@@ -260,12 +251,6 @@ double FAdaptiveOctree::UpdateLOD(FVector CameraPosition, double LodFactor)
             }
         });
     }
-
-    // Calculate and log total execution time
-    double EndTime = FPlatformTime::Seconds();
-    double TotalDuration = (EndTime - StartTime) * 1000.0; // Convert to milliseconds
-
-    return TotalDuration;
 }
 
 void FAdaptiveOctree::UpdateMesh()
@@ -373,10 +358,17 @@ TArray<TSharedPtr<FAdaptiveOctreeNode>> FAdaptiveOctree::SampleNodesAroundEdge(c
     if (NodeC.IsValid()) returnNodes.AddUnique(NodeC);
     if (NodeD.IsValid()) returnNodes.AddUnique(NodeD);
 
-    //for (auto aNode : returnNodes) {
-    //    if (!aNode->IsSurfaceNode) {
-    //        aNode->DualContourPosition = Edge.ZeroCrossingPoint + .2 * (aNode->Center - Edge.ZeroCrossingPoint);
-    //        aNode->IsSurfaceNode = true;
+    bool failedToCollectSurfaceNodes = false;
+    for (auto aNode : returnNodes) {
+        if (!aNode->IsSurfaceNode) {
+            aNode->RefineDualContour(Edge);
+            failedToCollectSurfaceNodes = true;
+        }
+    }
+
+    //if (failedToCollectSurfaceNodes) {
+    //    for (auto aNode : returnNodes) {
+    //        aNode->DrawAndLogNode();
     //    }
     //}
 

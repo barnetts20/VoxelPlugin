@@ -23,9 +23,9 @@ private:
     FVector LastCameraPosition;
     FRWLock OctreeLock;
 
-    int ChunkDepth = 4;
+    int ChunkDepth = 3;
     int MinDepth = 6;
-    int MaxDepth = 18;
+    int MaxDepth = 14;
     int LodFactor = 8;
     int CollisionDepth = 14;
 

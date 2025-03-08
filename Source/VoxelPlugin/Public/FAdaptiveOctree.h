@@ -30,7 +30,7 @@ public:
 
     uint32 ComputePositionHash(const FVector& Position, float GridSize);
 
-    double UpdateLOD(FVector CameraPosition, double LodFactor);
+    void UpdateLOD(FVector CameraPosition, double LodFactor);
     void UpdateMesh();
 
     TArray<TSharedPtr<FAdaptiveOctreeNode>> GetLeaves();

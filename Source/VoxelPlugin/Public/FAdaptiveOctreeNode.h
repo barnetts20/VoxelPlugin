@@ -34,7 +34,13 @@ struct VOXELPLUGIN_API FNodeEdge
         EdgeDirection = (NegCorner.Position - PosCorner.Position).GetSafeNormal();
         Size = FVector::Dist(Corners[0].Position, Corners[1].Position);
         Axis = FMath::Abs(InCorner1.Position.X - InCorner2.Position.X) > 0 ? 0 : (FMath::Abs(InCorner1.Position.Y - InCorner2.Position.Y) > 0 ? 1 : 2);
-        ZeroCrossingPoint = InCorner1.Position + FMath::Abs(InCorner1.Density) / (FMath::Abs(InCorner1.Density) + FMath::Abs(InCorner2.Density)) * (InCorner2.Position - InCorner1.Position);
+        if (SignChange) {
+            ZeroCrossingPoint = InCorner1.Position + FMath::Abs(InCorner1.Density) / (FMath::Abs(InCorner1.Density) + FMath::Abs(InCorner2.Density)) * (InCorner2.Position - InCorner1.Position);
+        }
+        else {
+            ZeroCrossingPoint = (InCorner1.Position + InCorner2.Position) / 2.0;
+        }
+
     }
 
     bool IsCongruent(const FNodeEdge& Other) const {
@@ -103,14 +109,15 @@ public:
     bool ShouldSplit(FVector InCameraPosition, double InLodDistanceFactor);
     void Merge();
     bool ShouldMerge(FVector InCameraPosition, double InLodDistanceFactor);    
-    bool fullUpdate = false;
+    bool fullUpdate = true; //Force recursion until all nodes match the lod 
     void UpdateLod(FVector InCameraPosition, double InLodDistanceFactor, TArray<FNodeEdge>& OutEdges, bool& OutChanged);
 
     TArray<FNodeEdge> GetSurfaceEdges();
     TArray<TSharedPtr<FAdaptiveOctreeNode>> GetSurfaceNodes();
     TArray<FNodeEdge> GetSignChangeEdges();
+    bool RefineDualContour(const FNodeEdge& InNeighborZeroCrossing);
 
-    FNodeEdge& GetSharedEdge(FNodeEdge anEdge);
+    void DrawAndLogNode();
 
     // Root Constructor
     FAdaptiveOctreeNode(TFunction<double(FVector)> InDensityFunction, FVector InCenter, double InExtent, int InMinDepth, int InMaxDepth);
