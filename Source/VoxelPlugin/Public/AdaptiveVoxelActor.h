@@ -23,14 +23,18 @@ private:
     FVector LastCameraPosition;
     FRWLock OctreeLock;
 
-    int ChunkDepth = 4;
-    int MinDepth = 4;
-    int MaxDepth = 12;
-    int LodFactor = 12;
+    int ChunkDepth = 3;
+    int MinDepth = 6;
+    int MaxDepth = 14;
+    int LodFactor = 8;
     int CollisionDepth = 14;
 
+    double MinDataUpdateInterval = .05;
     bool TickInEditor = false;
     bool Initialized = false;
+    bool IsDestroyed = false;
+
+    double Size = 10000000.0;
 
 public:
     AAdaptiveVoxelActor();

@@ -13,7 +13,9 @@ struct VOXELPLUGIN_API FNodeCorner {
 struct VOXELPLUGIN_API FNodeEdge
 {
     FNodeCorner Corners[2];     // The corners associated with this edge
+    double Size;
     bool SignChange;            // Does this edge contain a sign change
+    double Distance;
     FVector EdgeDirection;      // Precomputed normalized edge direction
     int Axis;                   // Axis-aligned indicator (0 = X, 1 = Y, 2 = Z)
     FVector ZeroCrossingPoint;  // Position where sign flips
@@ -27,12 +29,18 @@ struct VOXELPLUGIN_API FNodeEdge
         // Determine which corner is positive and which is negative
         FNodeCorner PosCorner = (InCorner1.Density > InCorner2.Density) ? InCorner1 : InCorner2;
         FNodeCorner NegCorner = (InCorner1.Density > InCorner2.Density) ? InCorner2 : InCorner1;
-
+        Distance = FVector::Dist(InCorner1.Position, InCorner2.Position);
         // Compute edge direction: Always point from positive to negative
         EdgeDirection = (NegCorner.Position - PosCorner.Position).GetSafeNormal();
-
+        Size = FVector::Dist(Corners[0].Position, Corners[1].Position);
         Axis = FMath::Abs(InCorner1.Position.X - InCorner2.Position.X) > 0 ? 0 : (FMath::Abs(InCorner1.Position.Y - InCorner2.Position.Y) > 0 ? 1 : 2);
-        ZeroCrossingPoint = InCorner1.Position + FMath::Abs(InCorner1.Density) / (FMath::Abs(InCorner1.Density) + FMath::Abs(InCorner2.Density)) * (InCorner2.Position - InCorner1.Position);
+        if (SignChange) {
+            ZeroCrossingPoint = InCorner1.Position + FMath::Abs(InCorner1.Density) / (FMath::Abs(InCorner1.Density) + FMath::Abs(InCorner2.Density)) * (InCorner2.Position - InCorner1.Position);
+        }
+        else {
+            ZeroCrossingPoint = (InCorner1.Position + InCorner2.Position) / 2.0;
+        }
+
     }
 
     bool IsCongruent(const FNodeEdge& Other) const {
@@ -48,14 +56,7 @@ struct VOXELPLUGIN_API FNodeEdge
     // Equality operator for ensuring uniqueness
     bool operator==(const FNodeEdge& Other) const
     {
-        bool sharesCorner =
-            Corners[0].Position.Equals(Other.Corners[0].Position, .01)
-            || Corners[0].Position.Equals(Other.Corners[1].Position, .01)
-            || Corners[1].Position.Equals(Other.Corners[0].Position, .01)
-            || Corners[1].Position.Equals(Other.Corners[1].Position, .01);
-        return sharesCorner &&
-            Axis == Other.Axis &&
-            SignChange == Other.SignChange;
+        return IsCongruent(Other) && Other.EdgeDirection == EdgeDirection;
     }
 };
 
@@ -108,20 +109,21 @@ public:
     bool ShouldSplit(FVector InCameraPosition, double InLodDistanceFactor);
     void Merge();
     bool ShouldMerge(FVector InCameraPosition, double InLodDistanceFactor);    
-    bool UpdateLod(FVector InCameraPosition, double InLodDistanceFactor, TArray<FNodeEdge>& OutEdges);
+    bool fullUpdate = true; //Force recursion until all nodes match the lod 
+    void UpdateLod(FVector InCameraPosition, double InLodDistanceFactor, TArray<FNodeEdge>& OutEdges, bool& OutChanged);
 
     TArray<FNodeEdge> GetSurfaceEdges();
     TArray<TSharedPtr<FAdaptiveOctreeNode>> GetSurfaceNodes();
-    TArray<FNodeEdge>& GetSignChangeEdges();
+    TArray<FNodeEdge> GetSignChangeEdges();
+    bool RefineDualContour(const FNodeEdge& InNeighborZeroCrossing);
 
-    TArray<FNodeEdge> GetArtificialSignChangeEdges(FNodeEdge anEdge);
+    void DrawAndLogNode();
 
     // Root Constructor
     FAdaptiveOctreeNode(TFunction<double(FVector)> InDensityFunction, FVector InCenter, double InExtent, int InMinDepth, int InMaxDepth);
 
     // Child Constructor
     FAdaptiveOctreeNode(TFunction<double(FVector)> InDensityFunction, TSharedPtr<FAdaptiveOctreeNode> InParent, uint8 ChildIndex);
-    void RecomputeDualContouringData();
 };
 
 struct VOXELPLUGIN_API FAdaptiveOctreeFlatNode {

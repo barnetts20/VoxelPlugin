@@ -308,7 +308,7 @@ namespace RealtimeMesh
 		if (!bAreSectionsContiguous)
 		{
 			// TODO: Implement ray tracing index buffer creation
-			UE_LOG(LogRealtimeMesh, Warning, TEXT("Unable to create ray tracing accelleration structures. Some triangles in buffer are unaccounted for in sections."));
+			//UE_LOG(LogRealtimeMesh, Warning, TEXT("Unable to create ray tracing accelleration structures. Some triangles in buffer are unaccounted for in sections."));
 			bShouldGenerateRayTracingGeometry = false;
 		}		
 

@@ -7,20 +7,19 @@ FAdaptiveOctree::FAdaptiveOctree(TFunction<double(FVector)> InDensityFunction, F
     RootExtent = InRootExtent;
     Root = MakeShared<FAdaptiveOctreeNode>(InDensityFunction, InCenter, InRootExtent, InMinDepth, InMaxDepth);
     {
-        FRWScopeLock WriteLock(OctreeLock, SLT_Write);
         SplitToDepth(Root, ChunkDepth);
     }
     Chunks = GetSurfaceNodes();
 }
 
 void FAdaptiveOctree::InitializeMeshChunks(ARealtimeMeshActor* InParentActor, UMaterialInterface* InMaterial) {
+    ParentActor = InParentActor;
     for (auto chunk : Chunks) {
         TSharedPtr<FMeshChunk> newChunk = MakeShared<FMeshChunk>();
-        auto flatNode = FAdaptiveOctreeFlatNode(chunk);
-        newChunk->Initialize(InParentActor, InMaterial, flatNode.Center, flatNode.Extent);
+        newChunk->Initialize(InParentActor, InMaterial, chunk->Center, chunk->Extent);
         newChunk->ChunkEdges = chunk->GetSurfaceEdges();
-        MeshChunks.Add(newChunk);
         UpdateMeshChunkStreamData(newChunk);
+        MeshChunks.Add(newChunk);
     }
     MeshChunksInitialized = true;
 }
@@ -99,8 +98,6 @@ void FAdaptiveOctree::UpdateMeshChunkStreamData(TSharedPtr<FMeshChunk> InChunk)
     auto TriangleStream = InChunk->ChunkMeshData->GetTriangleStream();
     auto PolygroupStream = InChunk->ChunkMeshData->GetPolygroupStream();
 
-    TArray<FNodeEdge> edgesToProcess = InChunk->ChunkEdges;
-
     // Reset all streams
     PositionStream.Empty();
     TangentStream.Empty();
@@ -114,11 +111,6 @@ void FAdaptiveOctree::UpdateMeshChunkStreamData(TSharedPtr<FMeshChunk> InChunk)
     TArray<FMeshVertex> UniqueVertices;
     TArray<FIndex3UI> Triangles;
 
-    // Process all edges and generate triangles in parallel
-    // Need critical sections for thread safety when modifying shared data structures
-    FCriticalSection VertexMapLock;
-    FCriticalSection TrianglesLock;
-
     // First, collect all valid edge data in parallel
     struct FEdgeVertexData
     {
@@ -127,12 +119,11 @@ void FAdaptiveOctree::UpdateMeshChunkStreamData(TSharedPtr<FMeshChunk> InChunk)
     };
 
     TArray<FEdgeVertexData> AllEdgeData;
-    AllEdgeData.SetNum(edgesToProcess.Num());
+    AllEdgeData.SetNum(InChunk->ChunkEdges.Num());
 
-    ParallelFor(edgesToProcess.Num(), [&](int32 edgeIdx) {
-        auto currentEdge = edgesToProcess[edgeIdx];
-        TArray<FAdaptiveOctreeFlatNode> nodesToMesh = SampleSurfaceNodesAroundEdge(currentEdge);
-
+    ParallelFor(InChunk->ChunkEdges.Num(), [&](int32 edgeIdx) {
+        auto currentEdge = InChunk->ChunkEdges[edgeIdx];
+        TArray<TSharedPtr<FAdaptiveOctreeNode>> nodesToMesh = SampleNodesAroundEdge(currentEdge);
         if (!InChunk->ShouldProcessEdge(currentEdge, nodesToMesh)) {
             AllEdgeData[edgeIdx].IsValid = false;
             return;
@@ -143,15 +134,14 @@ void FAdaptiveOctree::UpdateMeshChunkStreamData(TSharedPtr<FMeshChunk> InChunk)
 
         // Fill vertex data
         for (int i = 0; i < nodesToMesh.Num(); i++) {
-            AllEdgeData[edgeIdx].Vertices[i].Position = nodesToMesh[i].DualContourPosition;
-            AllEdgeData[edgeIdx].Vertices[i].Normal = nodesToMesh[i].DualContourNormal;
+            auto p = nodesToMesh[i]->DualContourPosition;
+            auto n = nodesToMesh[i]->DualContourNormal;
+            AllEdgeData[edgeIdx].Vertices[i].Position = p;
+            AllEdgeData[edgeIdx].Vertices[i].Normal = n;
             AllEdgeData[edgeIdx].Vertices[i].Color = FColor::Green; // Replace with encoded density function
-            AllEdgeData[edgeIdx].Vertices[i].UV = ComputeTriplanarUV(
-                nodesToMesh[i].DualContourPosition,
-                nodesToMesh[i].DualContourNormal
-            );
+            AllEdgeData[edgeIdx].Vertices[i].UV = ComputeTriplanarUV(p,n);
         }
-        });
+    });
 
     // Now process the collected data and build the mesh
     for (int32 edgeIdx = 0; edgeIdx < AllEdgeData.Num(); edgeIdx++) {
@@ -163,41 +153,32 @@ void FAdaptiveOctree::UpdateMeshChunkStreamData(TSharedPtr<FMeshChunk> InChunk)
         // Get or add indices for each vertex
         TArray<int32> VertexIndices;
         VertexIndices.SetNumZeroed(EdgeVertices.Num());
+        
+        for (int i = 0; i < EdgeVertices.Num(); i++) {
+            int32* ExistingIndex = VertexMap.Find(EdgeVertices[i]);
 
-        // Lock when accessing shared structures
-        {
-            FScopeLock Lock(&VertexMapLock);
-
-            for (int i = 0; i < EdgeVertices.Num(); i++) {
-                int32* ExistingIndex = VertexMap.Find(EdgeVertices[i]);
-
-                if (ExistingIndex) {
-                    // Use existing vertex index
-                    VertexIndices[i] = *ExistingIndex;
-                }
-                else {
-                    // Add new vertex
-                    int32 NewIndex = UniqueVertices.Num();
-                    UniqueVertices.Add(EdgeVertices[i]);
-                    VertexMap.Add(EdgeVertices[i], NewIndex);
-                    VertexIndices[i] = NewIndex;
-                }
+            if (ExistingIndex) {
+                // Use existing vertex index
+                VertexIndices[i] = *ExistingIndex;
+            }
+            else {
+                // Add new vertex
+                int32 NewIndex = UniqueVertices.Num();
+                UniqueVertices.Add(EdgeVertices[i]);
+                VertexMap.Add(EdgeVertices[i], NewIndex);
+                VertexIndices[i] = NewIndex;
             }
         }
 
         // Add triangles
         if (EdgeVertices.Num() >= 3) {
-            FScopeLock Lock(&TrianglesLock);
-
-            // First triangle
             Triangles.Add(FIndex3UI(VertexIndices[0], VertexIndices[1], VertexIndices[2]));
-
-            // Second triangle if we have 4 vertices
             if (EdgeVertices.Num() == 4) {
                 Triangles.Add(FIndex3UI(VertexIndices[0], VertexIndices[2], VertexIndices[3]));
             }
         }
     }
+
 
     // Now populate the streams with our unique vertices and triangles
     PositionStream.SetNumUninitialized(UniqueVertices.Num());
@@ -208,27 +189,19 @@ void FAdaptiveOctree::UpdateMeshChunkStreamData(TSharedPtr<FMeshChunk> InChunk)
     PolygroupStream.SetNumUninitialized(Triangles.Num());
 
     // Fill vertex data streams
-    for (int32 VertIdx = 0; VertIdx < UniqueVertices.Num(); VertIdx++) {
+    ParallelFor(UniqueVertices.Num(), [&](int32 VertIdx) {
         const FMeshVertex& Vertex = UniqueVertices[VertIdx];
-
         PositionStream.Set(VertIdx, Vertex.Position);
-
         FRealtimeMeshTangentsHighPrecision Tangent;
         Tangent.SetNormal(FVector3f(Vertex.Normal));
         TangentStream.Set(VertIdx, Tangent);
-
         ColorStream.Set(VertIdx, Vertex.Color);
         TexCoordStream.Set(VertIdx, Vertex.UV);
-    }
-
-    // Fill triangle data streams
-    for (int32 TriIdx = 0; TriIdx < Triangles.Num(); TriIdx++) {
+    });
+    ParallelFor(Triangles.Num(), [&](int32 TriIdx) {
         TriangleStream.Set(TriIdx, Triangles[TriIdx]);
         PolygroupStream.Set(TriIdx, 0); // All in the same polygroup
-    }
-
-    // Update the mesh with our new data
-    //InChunk->UpdateMeshData(*InChunk->ChunkMeshData);
+    });
     InChunk->IsDirty = true;
 }
 
@@ -248,17 +221,34 @@ uint32 FAdaptiveOctree::ComputePositionHash(const FVector& Position, float GridS
 
 void FAdaptiveOctree::UpdateLOD(FVector CameraPosition, double LodFactor)
 {
-    if (!MeshChunksInitialized) return;
+    if (!MeshChunksInitialized) return;;
+
+    // Start timing
+    double StartTime = FPlatformTime::Seconds();
+
     {
-        FRWScopeLock WriteLock(OctreeLock, SLT_Write);
+        // Array to track which chunks were modified
+        TArray<int32> ChunksModified;
+        ChunksModified.SetNumZeroed(Chunks.Num());
+
         ParallelFor(Chunks.Num(), [&](int32 idx)
         {
             TArray<FNodeEdge> tChunkEdges;
-            if (Chunks[idx]->UpdateLod(CameraPosition, LodFactor, tChunkEdges)) MeshChunks[idx]->ChunkEdges = tChunkEdges;
+            bool tChanged = false;
+            Chunks[idx]->UpdateLod(CameraPosition, LodFactor, tChunkEdges, tChanged);
+            if (tChanged) {
+                MeshChunks[idx]->ChunkEdges = tChunkEdges;
+                // Mark this chunk as modified (using 1 instead of true)
+                FPlatformAtomics::InterlockedExchange(&ChunksModified[idx], 1);
+            }
         });
-        ParallelFor(MeshChunks.Num(), [&](int32 idx)
+
+        // Only update the chunks that were modified
+        ParallelFor(MeshChunks.Num(), [&](int32 i)
         {
-            UpdateMeshChunkStreamData(MeshChunks[idx]);
+            if (ChunksModified[i] != 0) {
+                UpdateMeshChunkStreamData(MeshChunks[i]);
+            }
         });
     }
 }
@@ -267,7 +257,6 @@ void FAdaptiveOctree::UpdateMesh()
 {
     if (!MeshChunksInitialized) return;
     {
-        FRWScopeLock ReadLock(OctreeLock, SLT_ReadOnly);
         for (auto mChunk : MeshChunks) {
             mChunk->UpdateComponent();
         }
@@ -277,7 +266,6 @@ void FAdaptiveOctree::UpdateMesh()
 // Retrieves all leaf nodes
 TArray<TSharedPtr<FAdaptiveOctreeNode>> FAdaptiveOctree::GetLeaves()
 {
-    FRWScopeLock ReadLock(OctreeLock, SLT_ReadOnly);
     TArray<TSharedPtr<FAdaptiveOctreeNode>> Leaves;
     if (!Root.IsValid()) return Leaves;
 
@@ -310,7 +298,6 @@ TArray<TSharedPtr<FAdaptiveOctreeNode>> FAdaptiveOctree::GetLeaves()
 // Retrieves all surface nodes for meshing
 TArray<TSharedPtr<FAdaptiveOctreeNode>> FAdaptiveOctree::GetSurfaceNodes()
 {
-    FRWScopeLock ReadLock(OctreeLock, SLT_ReadOnly);
     if (!Root.IsValid()) return TArray<TSharedPtr<FAdaptiveOctreeNode>>();
     return Root->GetSurfaceNodes();
 }
@@ -343,9 +330,8 @@ FVector FAdaptiveOctree::CalculateSurfaceNormal(const FVector& Position)
     return Gradient.GetSafeNormal();
 }
 
-TArray<FAdaptiveOctreeFlatNode> FAdaptiveOctree::SampleSurfaceNodesAroundEdge(const FNodeEdge& Edge)
+TArray<TSharedPtr<FAdaptiveOctreeNode>> FAdaptiveOctree::SampleNodesAroundEdge(const FNodeEdge& Edge)
 {
-    //FRWScopeLock ReadLock(OctreeLock, SLT_ReadOnly); //May need to change to a write lock since it could potentially modify internal node data
     TArray<TSharedPtr<FAdaptiveOctreeNode>> SurfaceNodes;
     double SmallOffset = 0.001;
 
@@ -366,45 +352,32 @@ TArray<FAdaptiveOctreeFlatNode> FAdaptiveOctree::SampleSurfaceNodesAroundEdge(co
     TSharedPtr<FAdaptiveOctreeNode> NodeC = GetLeafNodeByPoint(OffsetC);
     TSharedPtr<FAdaptiveOctreeNode> NodeD = GetLeafNodeByPoint(OffsetD);
 
-    //if (NodeA.IsValid()) SurfaceNodes.AddUnique(NodeA);
-    //if (NodeB.IsValid()) SurfaceNodes.AddUnique(NodeB);
-    //if (NodeC.IsValid()) SurfaceNodes.AddUnique(NodeC);
-    //if (NodeD.IsValid()) SurfaceNodes.AddUnique(NodeD);
+    TArray<TSharedPtr<FAdaptiveOctreeNode>> returnNodes;
+    if (NodeA.IsValid()) returnNodes.AddUnique(NodeA);
+    if (NodeB.IsValid()) returnNodes.AddUnique(NodeB);
+    if (NodeC.IsValid()) returnNodes.AddUnique(NodeC);
+    if (NodeD.IsValid()) returnNodes.AddUnique(NodeD);
 
-    TArray<FAdaptiveOctreeFlatNode> returnNodes;
-    if (NodeA.IsValid()) returnNodes.AddUnique(FAdaptiveOctreeFlatNode(NodeA));
-    if (NodeB.IsValid()) returnNodes.AddUnique(FAdaptiveOctreeFlatNode(NodeB));
-    if (NodeC.IsValid()) returnNodes.AddUnique(FAdaptiveOctreeFlatNode(NodeC));
-    if (NodeD.IsValid()) returnNodes.AddUnique(FAdaptiveOctreeFlatNode(NodeD));
+    bool failedToCollectSurfaceNodes = false;
+    for (auto aNode : returnNodes) {
+        if (!aNode->IsSurfaceNode) {
+            aNode->RefineDualContour(Edge);
+            failedToCollectSurfaceNodes = true;
+        }
+    }
 
-    return returnNodes;
-    //for (auto node : SurfaceNodes) {
-    //    if (!node->IsSurfaceNode) {
-    //        node->LodOverride = true; 
-    //        node->Split();
+    //if (failedToCollectSurfaceNodes) {
+    //    for (auto aNode : returnNodes) {
+    //        aNode->DrawAndLogNode();
     //    }
     //}
 
-    //SurfaceNodes.Empty();
-
-    //NodeA = GetLeafNodeByPoint(OffsetA);
-    //NodeB = GetLeafNodeByPoint(OffsetB);
-    //NodeC = GetLeafNodeByPoint(OffsetC);
-    //NodeD = GetLeafNodeByPoint(OffsetD);
-
-    //if (NodeA.IsValid()) returnNodes.AddUnique(FAdaptiveOctreeFlatNode(NodeA));
-    //if (NodeB.IsValid()) returnNodes.AddUnique(FAdaptiveOctreeFlatNode(NodeB));
-    //if (NodeC.IsValid()) returnNodes.AddUnique(FAdaptiveOctreeFlatNode(NodeC));
-    //if (NodeD.IsValid()) returnNodes.AddUnique(FAdaptiveOctreeFlatNode(NodeD));
-
-    //return returnNodes;
+    return returnNodes;
 }
 
 TSharedPtr<FAdaptiveOctreeNode> FAdaptiveOctree::GetLeafNodeByPoint(FVector Position)
 {
-    //FRWScopeLock ReadLock(OctreeLock, SLT_ReadOnly);
     TSharedPtr<FAdaptiveOctreeNode> CurrentNode = Root;
-
     while (CurrentNode.IsValid())
     {
         if (CurrentNode->IsLeaf())
@@ -433,6 +406,5 @@ TSharedPtr<FAdaptiveOctreeNode> FAdaptiveOctree::GetLeafNodeByPoint(FVector Posi
 // Clears the entire octree
 void FAdaptiveOctree::Clear()
 {
-    FRWScopeLock WriteLock(OctreeLock, SLT_Write);
     Root.Reset();
 }

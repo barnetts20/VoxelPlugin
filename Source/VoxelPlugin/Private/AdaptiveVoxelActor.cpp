@@ -22,10 +22,10 @@ AAdaptiveVoxelActor::AAdaptiveVoxelActor()
     //        return q.Size() - MinorRadius;
     //    };
     //Torus
-    //auto DensityFunction = [](FVector Position) -> double
+    //auto DensityFunction = [this](FVector Position) -> double
     //    {
-    //        double MajorRadius = 5000000.0; // Distance from the center to the ring
-    //        double MinorRadius = 2000000.0; // Tube radius
+    //        double MajorRadius = Size * .5; // Distance from the center to the ring
+    //        double MinorRadius = Size * .2; // Tube radius
 
     //        FVector2D q(FVector2D(Position.X, Position.Y).Size() - MajorRadius, Position.Z);
     //        return q.Size() - MinorRadius;
@@ -46,19 +46,54 @@ AAdaptiveVoxelActor::AAdaptiveVoxelActor()
     //        return position.size() - sphereradius;
     //    };
     //spherenoise
-    auto DensityFunction = [&](FVector Position) -> double
-        {
-            double SphereRadius = 9713713.0;
-            float NoiseValue = (FMath::PerlinNoise3D(Position / 977999.0)) * 497997.0;// +(FMath::PerlinNoise3D(Position / 100000.0)) * 100000;
-            return Position.Size() - (SphereRadius - NoiseValue);
-        };
+    //auto DensityFunction = [&](FVector Position) -> double
+    //    {
+    //        double SphereRadius = Size * .85;
+    //        float NoiseValue = (FMath::PerlinNoise3D(Position / (Size * .2))) * Size * .1;// +(FMath::PerlinNoise3D(Position / 100000.0)) * 100000;
+    //        return Position.Size() - (SphereRadius + NoiseValue);
+    //    };
+    //Torus noise
+    auto DensityFunction = [this](FVector Position) -> double
+    {
+            double MajorRadius = Size * .4; // Distance from the center to the ring
+            double MinorRadius = Size * .2; // Tube radius
+            float NoiseValue = (FMath::PerlinNoise3D(Position / (Size * .2))) * Size * .1;// +(FMath::PerlinNoise3D(Position / 100000.0)) * 100000;
+            FVector2D q(FVector2D(Position.X, Position.Y).Size() - MajorRadius + NoiseValue, Position.Z);
+            return q.Size() - MinorRadius + NoiseValue;
+    };
+    //auto DensityFunction = [&](FVector Position) -> double
+    //    {
+    //        double SphereRadius = Size * .85;
+
+    //        // Normalize the position to get the direction
+    //        FVector Direction = Position.GetSafeNormal();
+
+    //        // Create a wave pattern based on latitude and longitude
+    //        double latitude = FMath::Asin(Direction.Z);
+    //        double longitude = FMath::Atan2(Direction.Y, Direction.X);
+
+    //        // Create topographical variation using sin/cos
+    //        double frequency1 = 12.0;  // Controls how many waves around the sphere
+    //        double frequency2 = 8.0;  // Secondary wave pattern
+    //        double amplitude = Size * 0.1;  // Same scale as the Perlin noise was using
+
+    //        double variation = amplitude * (
+    //            0.5 * FMath::Sin(frequency1 * latitude) * FMath::Cos(frequency1 * longitude) +
+    //            0.3 * FMath::Sin(frequency2 * latitude * 2.0) * FMath::Cos(frequency2 * longitude * 0.5) +
+    //            0.2 * FMath::Sin(frequency1 * longitude * 0.7)
+    //            );
+
+    //        // Return signed distance
+    //        return Position.Size() - (SphereRadius + variation);
+    //    };
     //Adaptive Octree Picks out the Implicit Structure
-    AdaptiveOctree = MakeShared<FAdaptiveOctree>(DensityFunction, GetActorLocation(), 15001357.0, ChunkDepth, MinDepth, MaxDepth);
+    AdaptiveOctree = MakeShared<FAdaptiveOctree>(DensityFunction, GetActorLocation(), Size, ChunkDepth, MinDepth, MaxDepth);
     //Sparsetree for user edits
     SparseOctree = MakeShared<FSparseOctree>();
 }
 
 void AAdaptiveVoxelActor::BeginDestroy() {
+    IsDestroyed = true;
     FRWScopeLock WriteLock(OctreeLock, SLT_Write);
     Super::BeginDestroy();
 }
@@ -94,15 +129,37 @@ void AAdaptiveVoxelActor::InitializeChunks() {
     AdaptiveOctree->InitializeMeshChunks(this, Material);
 
     Initialized = true;
-    ScheduleDataUpdate(.1);
+    ScheduleDataUpdate(.05);
     ScheduleMeshUpdate(.1);
+
+    FVector quadrants[8];
+    quadrants[0] = FVector(1, 1, 1);
+    quadrants[1] = FVector(-1, 1, 1);
+    quadrants[2] = FVector(1, -1, 1);
+    quadrants[3] = FVector(1, 1, -1);
+    quadrants[4] = FVector(-1, -1, 1);
+    quadrants[5] = FVector(1, -1, -1);
+    quadrants[6] = FVector(-1, 1, -1);
+    quadrants[7] = FVector(-1, -1, -1);
+
+    FVector oneVec = FVector(1, 1, 1);
+    double scl = 1000000000;
+    DrawDebugBox(GetWorld(), quadrants[0] * scl, scl * oneVec, FColor::Red, true, 1000);
+    DrawDebugBox(GetWorld(), quadrants[1] * scl, scl * oneVec, FColor::Green, true, 1000);
+    DrawDebugBox(GetWorld(), quadrants[2] * scl, scl * oneVec, FColor::Blue, true, 1000);
+    DrawDebugBox(GetWorld(), quadrants[3] * scl, scl * oneVec, FColor::Purple, true, 1000);
+    DrawDebugBox(GetWorld(), quadrants[4] * scl, scl * oneVec, FColor::Orange, true, 1000);
+    DrawDebugBox(GetWorld(), quadrants[5] * scl, scl * oneVec, FColor::Yellow, true, 1000);
+    DrawDebugBox(GetWorld(), quadrants[6] * scl, scl * oneVec, FColor::Magenta, true, 1000);
+    DrawDebugBox(GetWorld(), quadrants[7] * scl, scl * oneVec, FColor::Cyan, true, 1000);
 }
 
 void AAdaptiveVoxelActor::ScheduleDataUpdate(float IntervalInSeconds)
 {
-    if (!DataUpdateIsRunning)
+    if (!DataUpdateIsRunning && !IsDestroyed)
     {
         DataUpdateIsRunning = true;
+
         FGraphEventRef Task = FFunctionGraphTask::CreateAndDispatchWhenReady([this, IntervalInSeconds]()
         {
             //**********BEGIN IMPLEMENTATION BLOCK***************
@@ -110,21 +167,9 @@ void AAdaptiveVoxelActor::ScheduleDataUpdate(float IntervalInSeconds)
             //**********BEGIN IMPLEMENTATION BLOCK***************
             {
                 FRWScopeLock WriteLock(OctreeLock, SLT_Write);
+                if (IsDestroyed) return;
                 AdaptiveOctree->UpdateLOD(CameraPosition, LodFactor);
             }
-            //{
-            //    FRWScopeLock WriteLock(OctreeLock, SLT_Write);
-            //    //FCriticalSection CriticalSection;
-            //    //ChunksToUpdate.Empty();
-            //    //ChunksToUpdate.Reserve(Chunks.Num());
-            //    ParallelFor(Chunks.Num(), [&](int32 idx)
-            //    {
-            //        if (Chunks[idx]->UpdateData(CameraPosition, LodFactor)) {
-            //            //FScopeLock Lock(&CriticalSection);
-            //            //ChunksToUpdate.Add(Chunks[idx]);
-            //        }
-            //    });
-            //}
             //***********END IMPLEMENTATION BLOCK***************
             //***********END IMPLEMENTATION BLOCK***************
             //***********END IMPLEMENTATION BLOCK***************
@@ -140,7 +185,7 @@ void AAdaptiveVoxelActor::ScheduleDataUpdate(float IntervalInSeconds)
 }
 void AAdaptiveVoxelActor::ScheduleMeshUpdate(float IntervalInSeconds)
 {
-    if (!MeshUpdateIsRunning)
+    if (!MeshUpdateIsRunning && !IsDestroyed)
     {
         MeshUpdateIsRunning = true;
         FGraphEventRef Task = FFunctionGraphTask::CreateAndDispatchWhenReady([this, IntervalInSeconds]()
@@ -150,19 +195,9 @@ void AAdaptiveVoxelActor::ScheduleMeshUpdate(float IntervalInSeconds)
             //**********BEGIN IMPLEMENTATION BLOCK***************
             {
                 FRWScopeLock ReadLock(OctreeLock, SLT_ReadOnly);
+                if(IsDestroyed) return;
                 AdaptiveOctree->UpdateMesh();
             }
-            //{
-            //    FRWScopeLock WriteLock(OctreeLock, SLT_Write);
-            //    ParallelFor(Chunks.Num(), [&](int32 idx)
-            //    {
-            //        //if (ChunksToUpdate[idx].IsValid()) {
-            //            Chunks[idx]->UpdateMeshData();
-            //            Chunks[idx]->UpdateComponent();
-            //        //}
-            //    });
-            //    //ChunksToUpdate.Empty();
-            //}
             //***********END IMPLEMENTATION BLOCK***************
             //***********END IMPLEMENTATION BLOCK***************
             //***********END IMPLEMENTATION BLOCK***************
@@ -201,30 +236,3 @@ TSharedPtr<FAdaptiveOctree> AAdaptiveVoxelActor::GetOctree()
 {
     return AdaptiveOctree;
 }
-
-// Draws the Dual Contouring Points of Surface Nodes
-//void AAdaptiveVoxelActor::DrawDebugSurfaceNodes()
-//{
-//    const bool DrawNodeBounds = true;
-//    const bool DrawEdgeCrossings = false;
-//    const bool DrawNormalVector = false;
-//    const bool DrawDualContourPoint = false;
-//    if (!AdaptiveOctree) return;
-//
-//    for (TSharedPtr<FAdaptiveOctreeNode> Node : CachedSurfaceNodes)
-//    {
-//        if (!Node.IsValid()) continue;
-//        if(DrawNodeBounds) DrawDebugBox(GetWorld(), Node->Center, FVector(Node->Extent), FColor::Blue, false, .3f);
-//        if(DrawEdgeCrossings) {
-//            for (FNodeEdge& anEdge : Node->Edges) {
-//                if (anEdge.SignChange) {
-//                    DrawDebugPoint(GetWorld(), anEdge.Corners[0].Position, 8.0f, anEdge.Corners[0].Density > 0 ? FColor::Green : FColor::Red, false, .3f);
-//                    DrawDebugPoint(GetWorld(), anEdge.Corners[1].Position, 8.0f, anEdge.Corners[1].Density > 0 ? FColor::Green : FColor::Red, false, .3f);
-//                    DrawDebugPoint(GetWorld(), anEdge.ZeroCrossingPoint, 5.0f, FColor::Green, false, .3f);
-//                }
-//            }
-//        }
-//        if(DrawNormalVector) DrawDebugLine(GetWorld(), Node->DualContourPosition, Node->DualContourPosition + (Node->DualContourNormal * Node->Extent * .5), FColor(Node->DualContourNormal.X * 255, Node->DualContourNormal.Y * 255, Node->DualContourNormal.Z * 255), false, .3f);
-//        if(DrawDualContourPoint) DrawDebugPoint(GetWorld(), Node->DualContourPosition, 10.0f, FColor::Purple, false, .3f);
-//    }
-//}

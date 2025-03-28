@@ -59,7 +59,9 @@ struct VOXELPLUGIN_API FMeshChunk {
     TSharedPtr<FMeshStreamData> ChunkMeshData;
 
     //Mesh Stuff
+    bool NeedsRebuild = true;
     bool IsDirty = false;
+    bool IsInitialized = false;
     TSharedPtr<FRWLock> MeshDataLock = MakeShared<FRWLock>();
     URealtimeMeshSimple* ChunkRtMesh;
     URealtimeMeshComponent* ChunkRtComponent;
@@ -73,11 +75,10 @@ struct VOXELPLUGIN_API FMeshChunk {
         cConfig.bDeformableMesh = false;
         cConfig.bUseAsyncCook = true;
 
+        ChunkMeshData = MakeShared<FMeshStreamData>();
+
         ChunkCenter = InCenter;
         ChunkExtent = InExtent;
-        ChunkMeshData = MakeShared<FMeshStreamData>();
-        ChunkMeshData->MeshGroupKey = FRealtimeMeshSectionGroupKey::Create(LODKey, FName("MeshGroup"));
-        ChunkMeshData->MeshSectionKey = FRealtimeMeshSectionKey::CreateForPolyGroup(ChunkMeshData->MeshGroupKey, 0);
 
         ChunkRtMesh = NewObject<URealtimeMeshSimple>(InParentActor);
         ChunkRtMesh->SetCollisionConfig(cConfig);
@@ -92,9 +93,12 @@ struct VOXELPLUGIN_API FMeshChunk {
         ChunkRtComponent->SetCollisionResponseToAllChannels(ECollisionResponse::ECR_Block);
         ChunkRtComponent->SetRealtimeMesh(ChunkRtMesh);
         ChunkRtComponent->SetRenderCustomDepth(true);
-
+        
+        ChunkMeshData->MeshGroupKey = FRealtimeMeshSectionGroupKey::Create(LODKey, FName(ChunkCenter.ToCompactString()));
         ChunkRtMesh->CreateSectionGroup(ChunkMeshData->MeshGroupKey, ChunkMeshData->MeshStream);
-        ChunkRtMesh->ClearInternalFlags(EInternalObjectFlags::Async);
+        ChunkMeshData->MeshSectionKey = FRealtimeMeshSectionKey::CreateForPolyGroup(ChunkMeshData->MeshGroupKey, 0);
+
+        IsInitialized = true;
     };
 
     bool IsEdgeOnChunkFace(const FNodeEdge& Edge, int Coef) {
@@ -111,28 +115,28 @@ struct VOXELPLUGIN_API FMeshChunk {
             FMath::Abs(Edge.ZeroCrossingPoint[axis2] - facePos[axis2]) < tolerance;
     }
 
-    bool IsNodeInChunk(const FAdaptiveOctreeFlatNode& Node) {
+    bool IsNodeInChunk(const TSharedPtr<FAdaptiveOctreeNode> Node) {
         // Calculate extents once
         const FVector extentVec(ChunkExtent);
-        FVector distFromCenter = (Node.Center - ChunkCenter).GetAbs();
+        FVector distFromCenter = (Node->Center - ChunkCenter).GetAbs();
         return distFromCenter.X <= ChunkExtent &&
             distFromCenter.Y <= ChunkExtent &&
             distFromCenter.Z <= ChunkExtent;
     }
 
-    bool ShouldProcessEdge(const FNodeEdge& Edge, const TArray<FAdaptiveOctreeFlatNode>& SampledNodes) {
-        // If we don't have enough nodes to form a triangle bail out
+    bool ShouldProcessEdge(const FNodeEdge& Edge, const TArray<TSharedPtr<FAdaptiveOctreeNode>>& SampledNodes) {
+        // If we don't have enough nodes to form a triangle bail out (ACTUALLY WE NEED TO FIX HOLES)
         if (SampledNodes.Num() < 3) { 
-            UE_LOG(LogTemp, Log, TEXT("< 3 EDGE SURROUNDING NODES. NUM = %d"), SampledNodes.Num());
+            //UE_LOG(LogTemp, Log, TEXT("< 3 EDGE SURROUNDING NODES. NUM = %d"), SampledNodes.Num());
             return false; 
         }
-
+        if (true) return true;
         // If it's not on a stitching face, mesh it
         if (!IsEdgeOnChunkFace(Edge, -1)) return true;
         // For each node that is outside the chunk bounds, add its edges to test against
         TArray<FNodeEdge> testEdges;
         for (auto& node : SampledNodes) {
-            if (!IsNodeInChunk(node)) testEdges.Append(node.SignChangeEdges);
+            if (!IsNodeInChunk(node)) testEdges.Append(node->SignChangeEdges);
         }
         // If the other chunks edges do not contain the edge, mesh it
         // Otherwise it will be handled by the external chunk
@@ -145,10 +149,12 @@ struct VOXELPLUGIN_API FMeshChunk {
     }
 
     void UpdateComponent() {
-        if (!IsDirty) return;
-        if (ChunkMeshData) ChunkRtMesh->UpdateSectionGroup(ChunkMeshData->MeshGroupKey, ChunkMeshData->MeshStream).Then([this](TFuture<ERealtimeMeshProxyUpdateStatus> update) {
+        AsyncTask(ENamedThreads::GameThread, [this]() {
+            if (!IsInitialized || !IsDirty) return;
+            IsDirty = false;
+            
+            ChunkRtMesh->UpdateSectionGroup(ChunkMeshData->MeshGroupKey, ChunkMeshData->MeshStream);
             ChunkRtMesh->UpdateSectionConfig(ChunkMeshData->MeshSectionKey, SecConfig, true);
         });
-        IsDirty = false;
     }
 };
