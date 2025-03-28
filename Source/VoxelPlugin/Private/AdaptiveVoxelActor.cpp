@@ -53,39 +53,39 @@ AAdaptiveVoxelActor::AAdaptiveVoxelActor()
     //        return Position.Size() - (SphereRadius + NoiseValue);
     //    };
     //Torus noise
-    //auto DensityFunction = [this](FVector Position) -> double
-    //{
-    //        double MajorRadius = Size * .5; // Distance from the center to the ring
-    //        double MinorRadius = Size * .2; // Tube radius
-    //        float NoiseValue = (FMath::PerlinNoise3D(Position / (Size * .2))) * Size * .1;// +(FMath::PerlinNoise3D(Position / 100000.0)) * 100000;
-    //        FVector2D q(FVector2D(Position.X, Position.Y).Size() - MajorRadius + NoiseValue, Position.Z);
-    //        return q.Size() - MinorRadius + NoiseValue;
-    //};
-    auto DensityFunction = [&](FVector Position) -> double
-        {
-            double SphereRadius = Size * .85;
+    auto DensityFunction = [this](FVector Position) -> double
+    {
+            double MajorRadius = Size * .4; // Distance from the center to the ring
+            double MinorRadius = Size * .2; // Tube radius
+            float NoiseValue = (FMath::PerlinNoise3D(Position / (Size * .2))) * Size * .1;// +(FMath::PerlinNoise3D(Position / 100000.0)) * 100000;
+            FVector2D q(FVector2D(Position.X, Position.Y).Size() - MajorRadius + NoiseValue, Position.Z);
+            return q.Size() - MinorRadius + NoiseValue;
+    };
+    //auto DensityFunction = [&](FVector Position) -> double
+    //    {
+    //        double SphereRadius = Size * .85;
 
-            // Normalize the position to get the direction
-            FVector Direction = Position.GetSafeNormal();
+    //        // Normalize the position to get the direction
+    //        FVector Direction = Position.GetSafeNormal();
 
-            // Create a wave pattern based on latitude and longitude
-            double latitude = FMath::Asin(Direction.Z);
-            double longitude = FMath::Atan2(Direction.Y, Direction.X);
+    //        // Create a wave pattern based on latitude and longitude
+    //        double latitude = FMath::Asin(Direction.Z);
+    //        double longitude = FMath::Atan2(Direction.Y, Direction.X);
 
-            // Create topographical variation using sin/cos
-            double frequency1 = 12.0;  // Controls how many waves around the sphere
-            double frequency2 = 8.0;  // Secondary wave pattern
-            double amplitude = Size * 0.1;  // Same scale as the Perlin noise was using
+    //        // Create topographical variation using sin/cos
+    //        double frequency1 = 12.0;  // Controls how many waves around the sphere
+    //        double frequency2 = 8.0;  // Secondary wave pattern
+    //        double amplitude = Size * 0.1;  // Same scale as the Perlin noise was using
 
-            double variation = amplitude * (
-                0.5 * FMath::Sin(frequency1 * latitude) * FMath::Cos(frequency1 * longitude) +
-                0.3 * FMath::Sin(frequency2 * latitude * 2.0) * FMath::Cos(frequency2 * longitude * 0.5) +
-                0.2 * FMath::Sin(frequency1 * longitude * 0.7)
-                );
+    //        double variation = amplitude * (
+    //            0.5 * FMath::Sin(frequency1 * latitude) * FMath::Cos(frequency1 * longitude) +
+    //            0.3 * FMath::Sin(frequency2 * latitude * 2.0) * FMath::Cos(frequency2 * longitude * 0.5) +
+    //            0.2 * FMath::Sin(frequency1 * longitude * 0.7)
+    //            );
 
-            // Return signed distance
-            return Position.Size() - (SphereRadius + variation);
-        };
+    //        // Return signed distance
+    //        return Position.Size() - (SphereRadius + variation);
+    //    };
     //Adaptive Octree Picks out the Implicit Structure
     AdaptiveOctree = MakeShared<FAdaptiveOctree>(DensityFunction, GetActorLocation(), Size, ChunkDepth, MinDepth, MaxDepth);
     //Sparsetree for user edits
