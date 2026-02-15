@@ -71,10 +71,21 @@ FAdaptiveOctreeNode::FAdaptiveOctreeNode(TFunction<double(FVector)> InDensityFun
 
 void FAdaptiveOctreeNode::Split()
 {
-    if (!bIsLeaf) return; // Already split
+    if (!bIsLeaf) return;
     for (uint8 i = 0; i < 8; i++)
     {
         Children[i] = MakeShared<FAdaptiveOctreeNode>(DensityFunction, AsShared(), i);
+
+        // If any child is a surface node, propagate up to all ancestors
+        if (Children[i]->IsSurfaceNode)
+        {
+            TSharedPtr<FAdaptiveOctreeNode> Ancestor = AsShared();
+            while (Ancestor.IsValid() && !Ancestor->IsSurfaceNode)
+            {
+                Ancestor->IsSurfaceNode = true;
+                Ancestor = Ancestor->Parent.Pin();
+            }
+        }
     }
     bIsLeaf = false;
 }
@@ -143,7 +154,7 @@ void FAdaptiveOctreeNode::UpdateLod(FVector InCameraPosition, double InLodDistan
         if (ShouldSplit(InCameraPosition, InLodDistanceFactor))
         {
             OutChanged = true;
-            BalancedSplit();
+            Split();
             if (fullUpdate) {
                 for (TSharedPtr<FAdaptiveOctreeNode> aChild : Children) {
                     aChild->UpdateLod(InCameraPosition, InLodDistanceFactor, OutNodeEdges, OutChanged);
@@ -335,7 +346,7 @@ void FAdaptiveOctreeNode::DrawAndLogNode()
         if (!World) return;
 
         // Set duration and color based on tree depth
-        float Duration = 1.0f; // 1 second display
+        float Duration = 1000.0f; // 1 second display
         FColor BoxColor = FColor::Green;
 
         // Calculate the min/max corners of the box
@@ -343,25 +354,25 @@ void FAdaptiveOctreeNode::DrawAndLogNode()
         FVector Max = NodeCenter + FVector(NodeExtent);
 
         // Draw the bounding box
-        DrawDebugBox(World, NodeCenter, FVector(NodeExtent), FQuat::Identity, BoxColor, true, Duration, 0, 5000.0f);
+        DrawDebugBox(World, NodeCenter, FVector(NodeExtent), FQuat::Identity, BoxColor, true, Duration, 0, 50000.0f);
 
         // Draw the dual contour position
         DrawDebugPoint(World, DCPosition, 10.0, FColor::Red, true, Duration, 0);
 
-        // Log information about the node
-        UE_LOG(LogTemp, Display, TEXT("Node at depth %d:"), TreeDepth);
-        UE_LOG(LogTemp, Display, TEXT("  Center: (%f, %f, %f)"), NodeCenter.X, NodeCenter.Y, NodeCenter.Z);
-        UE_LOG(LogTemp, Display, TEXT("  Extent: %f"), NodeExtent);
-        UE_LOG(LogTemp, Display, TEXT("  Dual Contour Position: (%f, %f, %f)"),
-            DCPosition.X, DCPosition.Y, DCPosition.Z);
+        //// Log information about the node
+        //UE_LOG(LogTemp, Display, TEXT("Node at depth %d:"), TreeDepth);
+        //UE_LOG(LogTemp, Display, TEXT("  Center: (%f, %f, %f)"), NodeCenter.X, NodeCenter.Y, NodeCenter.Z);
+        //UE_LOG(LogTemp, Display, TEXT("  Extent: %f"), NodeExtent);
+        //UE_LOG(LogTemp, Display, TEXT("  Dual Contour Position: (%f, %f, %f)"),
+        //    DCPosition.X, DCPosition.Y, DCPosition.Z);
 
-        // Log corner information
-        for (int i = 0; i < NodeCorners.Num(); i++) {
-            UE_LOG(LogTemp, Display, TEXT("  Corner %d: Pos=(%f, %f, %f), Density=%f"),
-                i, NodeCorners[i].Position.X, NodeCorners[i].Position.Y, NodeCorners[i].Position.Z,
-                NodeCorners[i].Density);
-        }
-        });
+        //// Log corner information
+        //for (int i = 0; i < NodeCorners.Num(); i++) {
+        //    UE_LOG(LogTemp, Display, TEXT("  Corner %d: Pos=(%f, %f, %f), Density=%f"),
+        //        i, NodeCorners[i].Position.X, NodeCorners[i].Position.Y, NodeCorners[i].Position.Z,
+        //        NodeCorners[i].Density);
+        //}
+     });
 }
 
 TSharedPtr<FAdaptiveOctreeNode> FAdaptiveOctreeNode::FindNeighbor(int Direction)

@@ -40,6 +40,7 @@ public:
     FVector CalculateSurfaceNormal(const FVector& Position);
 
     TSharedPtr<FAdaptiveOctreeNode> GetLeafNodeByPoint(FVector Position);
+    TArray<TSharedPtr<FAdaptiveOctreeNode>> GetNodesAtDepth(int Depth);
     TArray<TSharedPtr<FAdaptiveOctreeNode>> SampleNodesAroundEdge(const FNodeEdge& Edge);
     void Clear(); //TODO: Need to test this
     //TODO: Need to make a destructor that safely disposes references/pointers and locks

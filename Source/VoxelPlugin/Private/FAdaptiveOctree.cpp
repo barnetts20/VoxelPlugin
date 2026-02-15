@@ -7,9 +7,10 @@ FAdaptiveOctree::FAdaptiveOctree(TFunction<double(FVector)> InDensityFunction, F
     RootExtent = InRootExtent;
     Root = MakeShared<FAdaptiveOctreeNode>(InDensityFunction, InCenter, InRootExtent, InMinDepth, InMaxDepth);
     {
-        SplitToDepth(Root, ChunkDepth);
+        SplitToDepth(Root, InMinDepth);
     }
-    Chunks = GetSurfaceNodes();
+    //Chunks = GetLeaves();
+    Chunks = GetNodesAtDepth(ChunkDepth);
 }
 
 void FAdaptiveOctree::InitializeMeshChunks(ARealtimeMeshActor* InParentActor, UMaterialInterface* InMaterial) {
@@ -454,6 +455,37 @@ TSharedPtr<FAdaptiveOctreeNode> FAdaptiveOctree::GetLeafNodeByPoint(FVector Posi
     return nullptr;
 }
 
+TArray<TSharedPtr<FAdaptiveOctreeNode>> FAdaptiveOctree::GetNodesAtDepth(int Depth)
+{
+    TArray<TSharedPtr<FAdaptiveOctreeNode>> Result;
+    TQueue<TSharedPtr<FAdaptiveOctreeNode>> Queue;
+    Queue.Enqueue(Root);
+
+    while (!Queue.IsEmpty())
+    {
+        TSharedPtr<FAdaptiveOctreeNode> Node;
+        Queue.Dequeue(Node);
+        if (!Node.IsValid()) continue;
+
+        if (Node->TreeIndex.Num() == Depth)
+        {
+            if (Node->IsSurfaceNode)
+            {
+                Result.Add(Node);
+            }
+        }
+        else if (Node->TreeIndex.Num() < Depth && !Node->IsLeaf())
+        {
+            for (int i = 0; i < 8; i++)
+            {
+                if (Node->Children[i].IsValid())
+                    Queue.Enqueue(Node->Children[i]);
+            }
+        }
+    }
+
+    return Result;
+}
 // Clears the entire octree
 void FAdaptiveOctree::Clear()
 {
