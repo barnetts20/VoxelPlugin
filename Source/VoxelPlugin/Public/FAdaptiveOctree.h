@@ -15,14 +15,19 @@ private:
     TSharedPtr<FAdaptiveOctreeNode> Root;
     TArray<TSharedPtr<FAdaptiveOctreeNode>> Chunks;
     TArray<TSharedPtr<FMeshChunk>> MeshChunks;
+    int ChunkDepth = 4;
+    UMaterialInterface* Material;
+    TMap<FAdaptiveOctreeNode*, int32> ChunkNodeToIndex;
     bool MeshChunksInitialized = false;
     double RootExtent;
 
 public:
     // Constructor
-    FAdaptiveOctree(TFunction<double(FVector)> InDensityFunction, FVector InCenter, double InRootExtent, int ChunkDepth, int InMinDepth, int InMaxDepth);
+    FAdaptiveOctree(TFunction<double(FVector)> InDensityFunction, FVector InCenter, double InRootExtent, int InChunkDepth, int InMinDepth, int InMaxDepth);
 
     void InitializeMeshChunks(ARealtimeMeshActor* InParentActor, UMaterialInterface* InMaterial);
+
+    bool HasReachedChunkDepth();
 
     void SplitToDepth(TSharedPtr<FAdaptiveOctreeNode> Node, int InMinDepth);
 

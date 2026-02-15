@@ -57,7 +57,7 @@ AAdaptiveVoxelActor::AAdaptiveVoxelActor()
         {
             double MajorRadius = Size * 0.3;
             double MinorRadius = Size * 0.1;
-            float NoiseValue = (FMath::PerlinNoise3D(Position / (Size * 0.1)) - .5) * Size * 0.075;
+            float NoiseValue = (FMath::PerlinNoise3D(Position / (Size * 0.1)) - .0) * Size * 0.1;
             FVector2D q(FVector2D(Position.X, Position.Y).Size() - MajorRadius + NoiseValue, Position.Z);
             return q.Size() - MinorRadius + NoiseValue;
         };

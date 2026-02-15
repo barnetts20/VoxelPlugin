@@ -1,67 +1,107 @@
 #include "FAdaptiveOctree.h"
 
-// Constructor
-FAdaptiveOctree::FAdaptiveOctree(TFunction<double(FVector)> InDensityFunction, FVector InCenter, double InRootExtent, int ChunkDepth, int InMinDepth, int InMaxDepth)
+// Constructor — lightweight, no splitting
+FAdaptiveOctree::FAdaptiveOctree(TFunction<double(FVector)> InDensityFunction, FVector InCenter, double InRootExtent, int InChunkDepth, int InMinDepth, int InMaxDepth)
 {
     DensityFunction = InDensityFunction;
     RootExtent = InRootExtent;
+    ChunkDepth = InChunkDepth;
     Root = MakeShared<FAdaptiveOctreeNode>(InDensityFunction, InCenter, InRootExtent, InMinDepth, InMaxDepth);
-    {
-        SplitToDepth(Root, InMinDepth);
-    }
-    //Chunks = GetLeaves();
-    Chunks = GetNodesAtDepth(ChunkDepth);
 }
 
-void FAdaptiveOctree::InitializeMeshChunks(ARealtimeMeshActor* InParentActor, UMaterialInterface* InMaterial) {
+void FAdaptiveOctree::InitializeMeshChunks(ARealtimeMeshActor* InParentActor, UMaterialInterface* InMaterial)
+{
     ParentActor = InParentActor;
-    for (auto chunk : Chunks) {
-        TSharedPtr<FMeshChunk> newChunk = MakeShared<FMeshChunk>();
-        newChunk->Initialize(InParentActor, InMaterial, chunk->Center, chunk->Extent);
-        newChunk->ChunkEdges = chunk->GetSurfaceEdges();
-        UpdateMeshChunkStreamData(newChunk);
-        MeshChunks.Add(newChunk);
-    }
+    Material = InMaterial;
     MeshChunksInitialized = true;
 }
 
-void FAdaptiveOctree::SplitToDepth(TSharedPtr<FAdaptiveOctreeNode> Node, int InMinDepth)
+bool FAdaptiveOctree::HasReachedChunkDepth()
 {
-    if (!Node.IsValid()) return;
-
-    if (Node->TreeIndex.Num() < InMinDepth)
+    TSharedPtr<FAdaptiveOctreeNode> Node = Root;
+    for (int d = 0; d < ChunkDepth; d++)
     {
-        Node->Split();
-        for (int i = 0; i < 8; i++)
-        {
-            if (Node->Children[i])
+        if (!Node.IsValid() || Node->IsLeaf()) return false;
+        Node = Node->Children[0];
+    }
+    return true;
+}
+
+void FAdaptiveOctree::UpdateLOD(FVector CameraPosition, double LodFactor)
+{
+    if (!MeshChunksInitialized) return;
+
+    // Phase 1: Split/merge
+    TArray<FNodeEdge> UnusedEdges;
+    bool TreeChanged = false;
+    Root->UpdateLod(CameraPosition, LodFactor, UnusedEdges, TreeChanged);
+
+    // Phase 2: Wait for chunk depth
+    if (!HasReachedChunkDepth()) return;
+
+    // Phase 3: Discover new surface chunks
+    TArray<TSharedPtr<FAdaptiveOctreeNode>> NewChunkNodes;
+    TArray<TSharedPtr<FAdaptiveOctreeNode>> CurrentChunkNodes = GetNodesAtDepth(ChunkDepth);
+    for (auto& ChunkNode : CurrentChunkNodes)
+    {
+        if (ChunkNodeToIndex.Contains(ChunkNode.Get())) continue;
+        NewChunkNodes.Add(ChunkNode);
+    }
+
+    if (NewChunkNodes.Num() > 0)
+    {
+        AsyncTask(ENamedThreads::GameThread, [this, NewChunkNodes]()
             {
-                SplitToDepth(Node->Children[i], InMinDepth);
-            }
-        }
+                for (auto& ChunkNode : NewChunkNodes)
+                {
+                    if (ChunkNodeToIndex.Contains(ChunkNode.Get())) continue;
+
+                    TSharedPtr<FMeshChunk> NewChunk = MakeShared<FMeshChunk>();
+                    NewChunk->Initialize(ParentActor, Material, ChunkNode->Center, ChunkNode->Extent);
+
+                    int32 Idx = Chunks.Num();
+                    Chunks.Add(ChunkNode);
+                    MeshChunks.Add(NewChunk);
+                    ChunkNodeToIndex.Add(ChunkNode.Get(), Idx);
+                }
+            });
+        return; // Wait for game thread to create components
+    }
+
+    // Phase 4: Re-mesh if tree changed
+    if (TreeChanged)
+    {
+        ParallelFor(MeshChunks.Num(), [&](int32 i)
+            {
+                MeshChunks[i]->ChunkEdges = Chunks[i]->GetSurfaceEdges();
+                UpdateMeshChunkStreamData(MeshChunks[i]);
+            });
     }
 }
 
+void FAdaptiveOctree::UpdateMesh()
+{
+    if (!MeshChunksInitialized) return;
+    for (auto& mChunk : MeshChunks)
+    {
+        mChunk->UpdateComponent();
+    }
+}
+
+// ============================================================
+// Mesh generation (existing edge-based pipeline)
+// ============================================================
+
 FVector2f ComputeTriplanarUV(FVector Position, FVector Normal)
 {
-    FVector2f UV;
     FVector AbsNormal = Normal.GetAbs();
-
     if (AbsNormal.X > AbsNormal.Y && AbsNormal.X > AbsNormal.Z)
-    {
-        UV = FVector2f(Position.Y, Position.Z) * 0.0001f;
-    }
+        return FVector2f(Position.Y, Position.Z) * 0.0001f;
     else if (AbsNormal.Y > AbsNormal.X && AbsNormal.Y > AbsNormal.Z)
-    {
-        UV = FVector2f(Position.X, Position.Z) * 0.0001f;
-    }
+        return FVector2f(Position.X, Position.Z) * 0.0001f;
     else
-    {
-        UV = FVector2f(Position.X, Position.Y) * 0.0001f;
-    }
-
-    return UV;
-};
+        return FVector2f(Position.X, Position.Y) * 0.0001f;
+}
 
 FORCEINLINE FVector QuantizePosition(const FVector& P, double GridSize = 1.0)
 {
@@ -74,22 +114,20 @@ FORCEINLINE FVector QuantizePosition(const FVector& P, double GridSize = 1.0)
 
 struct FMeshVertex
 {
-    FVector Position;       // Quantized position (chunk-local)
-    FVector OriginalPosition; // Unquantized for actual mesh output
+    FVector Position;
+    FVector OriginalPosition;
     FVector Normal;
     FColor Color;
     FVector2f UV;
 
     bool operator==(const FMeshVertex& Other) const
     {
-        // Exact comparison on quantized position — no epsilon needed
         return Position == Other.Position;
     }
 };
 
 uint32 GetTypeHash(const FMeshVertex& Vertex)
 {
-    // Hash the quantized position — guaranteed consistent with operator==
     return FCrc::MemCrc32(&Vertex.Position, sizeof(FVector));
 }
 
@@ -102,7 +140,6 @@ void FAdaptiveOctree::UpdateMeshChunkStreamData(TSharedPtr<FMeshChunk> InChunk)
     auto TriangleStream = InChunk->ChunkMeshData->GetTriangleStream();
     auto PolygroupStream = InChunk->ChunkMeshData->GetPolygroupStream();
 
-    // Reset all streams
     PositionStream.Empty();
     TangentStream.Empty();
     ColorStream.Empty();
@@ -110,12 +147,10 @@ void FAdaptiveOctree::UpdateMeshChunkStreamData(TSharedPtr<FMeshChunk> InChunk)
     TriangleStream.Empty();
     PolygroupStream.Empty();
 
-    // Map to store unique vertices and their indices
     TMap<FMeshVertex, int32> VertexMap;
     TArray<FMeshVertex> UniqueVertices;
     TArray<FIndex3UI> Triangles;
 
-    // Collect all valid edge data in parallel
     struct FEdgeVertexData
     {
         TArray<FMeshVertex> Vertices;
@@ -167,10 +202,8 @@ void FAdaptiveOctree::UpdateMeshChunkStreamData(TSharedPtr<FMeshChunk> InChunk)
         }
         });
 
-    // Build mesh from collected data (single-threaded for TMap)
     for (int32 edgeIdx = 0; edgeIdx < AllEdgeData.Num(); edgeIdx++) {
-        if (!AllEdgeData[edgeIdx].IsValid)
-            continue;
+        if (!AllEdgeData[edgeIdx].IsValid) continue;
 
         const auto& currentEdge = AllEdgeData[edgeIdx].Edge.GetValue();
         const TArray<FMeshVertex>& EdgeVertices = AllEdgeData[edgeIdx].Vertices;
@@ -180,7 +213,6 @@ void FAdaptiveOctree::UpdateMeshChunkStreamData(TSharedPtr<FMeshChunk> InChunk)
 
         for (int i = 0; i < EdgeVertices.Num(); i++) {
             int32* ExistingIndex = VertexMap.Find(EdgeVertices[i]);
-
             if (ExistingIndex) {
                 VertexIndices[i] = *ExistingIndex;
             }
@@ -220,7 +252,6 @@ void FAdaptiveOctree::UpdateMeshChunkStreamData(TSharedPtr<FMeshChunk> InChunk)
         }
     }
 
-    // Populate streams
     PositionStream.SetNumUninitialized(UniqueVertices.Num());
     TangentStream.SetNumUninitialized(UniqueVertices.Num());
     ColorStream.SetNumUninitialized(UniqueVertices.Num());
@@ -244,146 +275,20 @@ void FAdaptiveOctree::UpdateMeshChunkStreamData(TSharedPtr<FMeshChunk> InChunk)
     InChunk->IsDirty = true;
 }
 
-
-// Optional: Add a method to pre-compute a deterministic hash for a position to ensure consistent vertex ordering
-uint32 FAdaptiveOctree::ComputePositionHash(const FVector& Position, float GridSize)
-{
-    // Snap the position to a grid to ensure deterministic results
-    FVector SnappedPos = FVector(
-        FMath::RoundToFloat(Position.X / GridSize) * GridSize,
-        FMath::RoundToFloat(Position.Y / GridSize) * GridSize,
-        FMath::RoundToFloat(Position.Z / GridSize) * GridSize
-    );
-
-    // Compute a hash based on the snapped position
-    return FCrc::MemCrc32(&SnappedPos, sizeof(FVector));
-}
-
-void FAdaptiveOctree::UpdateLOD(FVector CameraPosition, double LodFactor)
-{
-    if (!MeshChunksInitialized) return;;
-
-    // Start timing
-    double StartTime = FPlatformTime::Seconds();
-
-    {
-        // Array to track which chunks were modified
-        TArray<int32> ChunksModified;
-        ChunksModified.SetNumZeroed(Chunks.Num());
-
-        ParallelFor(Chunks.Num(), [&](int32 idx)
-        {
-            TArray<FNodeEdge> tChunkEdges;
-            bool tChanged = false;
-            Chunks[idx]->UpdateLod(CameraPosition, LodFactor, tChunkEdges, tChanged);
-            if (tChanged) {
-                MeshChunks[idx]->ChunkEdges = tChunkEdges;
-                // Mark this chunk as modified (using 1 instead of true)
-                FPlatformAtomics::InterlockedExchange(&ChunksModified[idx], 1);
-            }
-        });
-
-        // Only update the chunks that were modified
-        ParallelFor(MeshChunks.Num(), [&](int32 i)
-        {
-            if (ChunksModified[i] != 0) {
-                UpdateMeshChunkStreamData(MeshChunks[i]);
-            }
-        });
-    }
-}
-
-void FAdaptiveOctree::UpdateMesh()
-{
-    if (!MeshChunksInitialized) return;
-    {
-        for (auto mChunk : MeshChunks) {
-            mChunk->UpdateComponent();
-        }
-    }
-}
-
-// Retrieves all leaf nodes
-TArray<TSharedPtr<FAdaptiveOctreeNode>> FAdaptiveOctree::GetLeaves()
-{
-    TArray<TSharedPtr<FAdaptiveOctreeNode>> Leaves;
-    if (!Root.IsValid()) return Leaves;
-
-    TQueue<TSharedPtr<FAdaptiveOctreeNode>> NodeQueue;
-    NodeQueue.Enqueue(Root->AsShared());
-
-    while (!NodeQueue.IsEmpty())
-    {
-        TSharedPtr<FAdaptiveOctreeNode> CurrentNode;
-        NodeQueue.Dequeue(CurrentNode);
-
-        if (!CurrentNode.IsValid()) continue;
-
-        if (CurrentNode->IsLeaf())
-        {
-            Leaves.Add(CurrentNode->AsShared());
-        }
-        else
-        {
-            for (int i = 0; i < 8; i++)
-            {
-                if (CurrentNode->Children[i]) NodeQueue.Enqueue(CurrentNode->Children[i]);
-            }
-        }
-    }
-
-    return Leaves;
-}
-
-// Retrieves all surface nodes for meshing
-TArray<TSharedPtr<FAdaptiveOctreeNode>> FAdaptiveOctree::GetSurfaceNodes()
-{
-    if (!Root.IsValid()) return TArray<TSharedPtr<FAdaptiveOctreeNode>>();
-    return Root->GetSurfaceNodes();
-}
-
-TArray<TSharedPtr<FAdaptiveOctreeNode>> FAdaptiveOctree::GetChunks()
-{
-    return Chunks;
-}
-
-FVector FAdaptiveOctree::CalculateSurfaceNormal(const FVector& Position)
-{
-    // Scale step size relative to the root extent for numerical stability
-    const double h = RootExtent * 1e-6;
-
-    double dx = (DensityFunction(Position + FVector(h, 0, 0)) -
-        DensityFunction(Position - FVector(h, 0, 0))) / (2.0 * h);
-    double dy = (DensityFunction(Position + FVector(0, h, 0)) -
-        DensityFunction(Position - FVector(0, h, 0))) / (2.0 * h);
-    double dz = (DensityFunction(Position + FVector(0, 0, h)) -
-        DensityFunction(Position - FVector(0, 0, h))) / (2.0 * h);
-
-    FVector Gradient(dx, dy, dz);
-    if (DensityFunction(Position) > 0)
-    {
-        Gradient = -Gradient;
-    }
-    return Gradient.GetSafeNormal();
-}
+// ============================================================
+// Edge sampling (existing implementation)
+// ============================================================
 
 TArray<TSharedPtr<FAdaptiveOctreeNode>> FAdaptiveOctree::SampleNodesAroundEdge(const FNodeEdge& Edge)
 {
     static const FVector AxisVectors[3] = {
-        FVector(1, 0, 0),
-        FVector(0, 1, 0),
-        FVector(0, 0, 1)
+        FVector(1, 0, 0), FVector(0, 1, 0), FVector(0, 0, 1)
     };
 
     FVector Perp1 = AxisVectors[(Edge.Axis + 1) % 3];
     FVector Perp2 = AxisVectors[(Edge.Axis + 2) % 3];
     FVector ZCP = Edge.ZeroCrossingPoint;
 
-    // Try multiple offset scales. Start with a reasonable default,
-    // then try smaller and larger if we don't get enough unique nodes.
-    // The offset needs to be:
-    //   - Large enough to cross into all 4 neighboring cells
-    //   - Small enough to not overshoot into non-adjacent cells
     static const double OffsetScales[] = { 0.1, 0.25, 0.01, 0.4 };
 
     for (double Scale : OffsetScales)
@@ -401,15 +306,9 @@ TArray<TSharedPtr<FAdaptiveOctreeNode>> FAdaptiveOctree::SampleNodesAroundEdge(c
         if (NodeC.IsValid()) Nodes.AddUnique(NodeC);
         if (NodeD.IsValid()) Nodes.AddUnique(NodeD);
 
-        if (Nodes.Num() >= 3)
-        {
-            return Nodes;
-        }
+        if (Nodes.Num() >= 3) return Nodes;
     }
 
-    // Last resort: sample at the midpoint of the edge instead of the
-    // zero-crossing point. The ZCP might be right on a cell boundary,
-    // but the edge midpoint is guaranteed to be at the center of a cell face.
     FVector EdgeMidpoint = (Edge.Corners[0].Position + Edge.Corners[1].Position) * 0.5;
     double Offset = Edge.Size * 0.1;
 
@@ -427,15 +326,16 @@ TArray<TSharedPtr<FAdaptiveOctreeNode>> FAdaptiveOctree::SampleNodesAroundEdge(c
     return Nodes;
 }
 
+// ============================================================
+// Tree queries
+// ============================================================
+
 TSharedPtr<FAdaptiveOctreeNode> FAdaptiveOctree::GetLeafNodeByPoint(FVector Position)
 {
     TSharedPtr<FAdaptiveOctreeNode> CurrentNode = Root;
     while (CurrentNode.IsValid())
     {
-        if (CurrentNode->IsLeaf())
-        {
-            return CurrentNode;
-        }
+        if (CurrentNode->IsLeaf()) return CurrentNode;
 
         int ChildIndex = 0;
         if (Position.X >= CurrentNode->Center.X) ChildIndex |= 1;
@@ -443,15 +343,10 @@ TSharedPtr<FAdaptiveOctreeNode> FAdaptiveOctree::GetLeafNodeByPoint(FVector Posi
         if (Position.Z >= CurrentNode->Center.Z) ChildIndex |= 4;
 
         if (CurrentNode->Children[ChildIndex].IsValid())
-        {
             CurrentNode = CurrentNode->Children[ChildIndex];
-        }
         else
-        {
             break;
-        }
     }
-
     return nullptr;
 }
 
@@ -470,9 +365,7 @@ TArray<TSharedPtr<FAdaptiveOctreeNode>> FAdaptiveOctree::GetNodesAtDepth(int Dep
         if (Node->TreeIndex.Num() == Depth)
         {
             if (Node->IsSurfaceNode)
-            {
                 Result.Add(Node);
-            }
         }
         else if (Node->TreeIndex.Num() < Depth && !Node->IsLeaf())
         {
@@ -486,7 +379,7 @@ TArray<TSharedPtr<FAdaptiveOctreeNode>> FAdaptiveOctree::GetNodesAtDepth(int Dep
 
     return Result;
 }
-// Clears the entire octree
+
 void FAdaptiveOctree::Clear()
 {
     Root.Reset();
