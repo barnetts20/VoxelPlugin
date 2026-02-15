@@ -62,30 +62,33 @@ FVector2f ComputeTriplanarUV(FVector Position, FVector Normal)
     return UV;
 };
 
+FORCEINLINE FVector QuantizePosition(const FVector& P, double GridSize = 1.0)
+{
+    return FVector(
+        FMath::RoundToDouble(P.X / GridSize) * GridSize,
+        FMath::RoundToDouble(P.Y / GridSize) * GridSize,
+        FMath::RoundToDouble(P.Z / GridSize) * GridSize
+    );
+}
+
 struct FMeshVertex
 {
-    FVector Position;
+    FVector Position;       // Quantized position (chunk-local)
+    FVector OriginalPosition; // Unquantized for actual mesh output
     FVector Normal;
     FColor Color;
     FVector2f UV;
 
     bool operator==(const FMeshVertex& Other) const
     {
-        // Ensure vertex equality comparison based on position and normal
-        // You might want to adjust epsilon values based on your needs
-        const float PositionEpsilon = 0.0001f;
-        const float NormalEpsilon = 0.001f;
-
-        return Position.Equals(Other.Position, PositionEpsilon) &&
-            Normal.Equals(Other.Normal, NormalEpsilon);
+        // Exact comparison on quantized position — no epsilon needed
+        return Position == Other.Position;
     }
 };
 
-// Hash function for our vertex structure
 uint32 GetTypeHash(const FMeshVertex& Vertex)
 {
-    // Create a hash based on the position components
-    // You can adjust this hashing method to be more or less sensitive
+    // Hash the quantized position — guaranteed consistent with operator==
     return FCrc::MemCrc32(&Vertex.Position, sizeof(FVector));
 }
 
@@ -111,58 +114,76 @@ void FAdaptiveOctree::UpdateMeshChunkStreamData(TSharedPtr<FMeshChunk> InChunk)
     TArray<FMeshVertex> UniqueVertices;
     TArray<FIndex3UI> Triangles;
 
-    // First, collect all valid edge data in parallel
+    // Collect all valid edge data in parallel
     struct FEdgeVertexData
     {
         TArray<FMeshVertex> Vertices;
+        TOptional<FNodeEdge> Edge;
         bool IsValid;
     };
 
     TArray<FEdgeVertexData> AllEdgeData;
     AllEdgeData.SetNum(InChunk->ChunkEdges.Num());
 
+    double QuantizationGrid = InChunk->ChunkExtent * 0.0001;
+
     ParallelFor(InChunk->ChunkEdges.Num(), [&](int32 edgeIdx) {
-        auto currentEdge = InChunk->ChunkEdges[edgeIdx];
+        auto& currentEdge = InChunk->ChunkEdges[edgeIdx];
         TArray<TSharedPtr<FAdaptiveOctreeNode>> nodesToMesh = SampleNodesAroundEdge(currentEdge);
         if (!InChunk->ShouldProcessEdge(currentEdge, nodesToMesh)) {
             AllEdgeData[edgeIdx].IsValid = false;
             return;
         }
 
-        AllEdgeData[edgeIdx].IsValid = true;
-        AllEdgeData[edgeIdx].Vertices.SetNumZeroed(nodesToMesh.Num());
-
-        // Fill vertex data
-        for (int i = 0; i < nodesToMesh.Num(); i++) {
-            auto p = nodesToMesh[i]->DualContourPosition;
-            auto n = nodesToMesh[i]->DualContourNormal;
-            AllEdgeData[edgeIdx].Vertices[i].Position = p;
-            AllEdgeData[edgeIdx].Vertices[i].Normal = n;
-            AllEdgeData[edgeIdx].Vertices[i].Color = FColor::Green; // Replace with encoded density function
-            AllEdgeData[edgeIdx].Vertices[i].UV = ComputeTriplanarUV(p,n);
+        double MaxVertexDistance = currentEdge.Size * 5.0;
+        TArray<TSharedPtr<FAdaptiveOctreeNode>> validNodes;
+        for (auto& node : nodesToMesh) {
+            double dist = FVector::Dist(node->DualContourPosition, currentEdge.ZeroCrossingPoint);
+            if (dist <= MaxVertexDistance) {
+                validNodes.Add(node);
+            }
         }
-    });
 
-    // Now process the collected data and build the mesh
+        if (validNodes.Num() < 3) {
+            AllEdgeData[edgeIdx].IsValid = false;
+            return;
+        }
+
+        AllEdgeData[edgeIdx].IsValid = true;
+        AllEdgeData[edgeIdx].Edge = currentEdge;
+        AllEdgeData[edgeIdx].Vertices.SetNumZeroed(validNodes.Num());
+
+        for (int i = 0; i < validNodes.Num(); i++) {
+            FVector WorldPos = validNodes[i]->DualContourPosition;
+            FVector LocalPos = WorldPos - InChunk->ChunkCenter;
+            FVector n = validNodes[i]->DualContourNormal;
+
+            AllEdgeData[edgeIdx].Vertices[i].Position = QuantizePosition(LocalPos, QuantizationGrid);
+            AllEdgeData[edgeIdx].Vertices[i].OriginalPosition = LocalPos;
+            AllEdgeData[edgeIdx].Vertices[i].Normal = n;
+            AllEdgeData[edgeIdx].Vertices[i].Color = FColor::Green;
+            AllEdgeData[edgeIdx].Vertices[i].UV = ComputeTriplanarUV(WorldPos, n);
+        }
+        });
+
+    // Build mesh from collected data (single-threaded for TMap)
     for (int32 edgeIdx = 0; edgeIdx < AllEdgeData.Num(); edgeIdx++) {
         if (!AllEdgeData[edgeIdx].IsValid)
             continue;
 
+        const auto& currentEdge = AllEdgeData[edgeIdx].Edge.GetValue();
         const TArray<FMeshVertex>& EdgeVertices = AllEdgeData[edgeIdx].Vertices;
 
-        // Get or add indices for each vertex
         TArray<int32> VertexIndices;
         VertexIndices.SetNumZeroed(EdgeVertices.Num());
-        
+
         for (int i = 0; i < EdgeVertices.Num(); i++) {
             int32* ExistingIndex = VertexMap.Find(EdgeVertices[i]);
 
             if (ExistingIndex) {
-                // Use existing vertex index
                 VertexIndices[i] = *ExistingIndex;
             }
             else {
-                // Add new vertex
                 int32 NewIndex = UniqueVertices.Num();
                 UniqueVertices.Add(EdgeVertices[i]);
                 VertexMap.Add(EdgeVertices[i], NewIndex);
@@ -170,17 +191,35 @@ void FAdaptiveOctree::UpdateMeshChunkStreamData(TSharedPtr<FMeshChunk> InChunk)
             }
         }
 
-        // Add triangles
-        if (EdgeVertices.Num() >= 3) {
-            Triangles.Add(FIndex3UI(VertexIndices[0], VertexIndices[1], VertexIndices[2]));
-            if (EdgeVertices.Num() == 4) {
-                Triangles.Add(FIndex3UI(VertexIndices[0], VertexIndices[2], VertexIndices[3]));
+        bool FlipWinding = (currentEdge.Corners[0].Density < 0);
+
+        if (EdgeVertices.Num() >= 3
+            && VertexIndices[0] != VertexIndices[1]
+            && VertexIndices[1] != VertexIndices[2]
+            && VertexIndices[0] != VertexIndices[2])
+        {
+            if (FlipWinding) {
+                Triangles.Add(FIndex3UI(VertexIndices[0], VertexIndices[2], VertexIndices[1]));
+            }
+            else {
+                Triangles.Add(FIndex3UI(VertexIndices[0], VertexIndices[1], VertexIndices[2]));
+            }
+
+            if (EdgeVertices.Num() == 4
+                && VertexIndices[0] != VertexIndices[3]
+                && VertexIndices[2] != VertexIndices[3])
+            {
+                if (FlipWinding) {
+                    Triangles.Add(FIndex3UI(VertexIndices[0], VertexIndices[3], VertexIndices[2]));
+                }
+                else {
+                    Triangles.Add(FIndex3UI(VertexIndices[0], VertexIndices[2], VertexIndices[3]));
+                }
             }
         }
     }
 
-
-    // Now populate the streams with our unique vertices and triangles
+    // Populate streams
     PositionStream.SetNumUninitialized(UniqueVertices.Num());
     TangentStream.SetNumUninitialized(UniqueVertices.Num());
     ColorStream.SetNumUninitialized(UniqueVertices.Num());
@@ -188,22 +227,22 @@ void FAdaptiveOctree::UpdateMeshChunkStreamData(TSharedPtr<FMeshChunk> InChunk)
     TriangleStream.SetNumUninitialized(Triangles.Num());
     PolygroupStream.SetNumUninitialized(Triangles.Num());
 
-    // Fill vertex data streams
     ParallelFor(UniqueVertices.Num(), [&](int32 VertIdx) {
         const FMeshVertex& Vertex = UniqueVertices[VertIdx];
-        PositionStream.Set(VertIdx, Vertex.Position);
+        PositionStream.Set(VertIdx, Vertex.OriginalPosition);
         FRealtimeMeshTangentsHighPrecision Tangent;
         Tangent.SetNormal(FVector3f(Vertex.Normal));
         TangentStream.Set(VertIdx, Tangent);
         ColorStream.Set(VertIdx, Vertex.Color);
         TexCoordStream.Set(VertIdx, Vertex.UV);
-    });
+        });
     ParallelFor(Triangles.Num(), [&](int32 TriIdx) {
         TriangleStream.Set(TriIdx, Triangles[TriIdx]);
-        PolygroupStream.Set(TriIdx, 0); // All in the same polygroup
-    });
+        PolygroupStream.Set(TriIdx, 0);
+        });
     InChunk->IsDirty = true;
 }
+
 
 // Optional: Add a method to pre-compute a deterministic hash for a position to ensure consistent vertex ordering
 uint32 FAdaptiveOctree::ComputePositionHash(const FVector& Position, float GridSize)
@@ -309,7 +348,8 @@ TArray<TSharedPtr<FAdaptiveOctreeNode>> FAdaptiveOctree::GetChunks()
 
 FVector FAdaptiveOctree::CalculateSurfaceNormal(const FVector& Position)
 {
-    const double h = 0.01; // Small step size
+    // Scale step size relative to the root extent for numerical stability
+    const double h = RootExtent * 1e-6;
 
     double dx = (DensityFunction(Position + FVector(h, 0, 0)) -
         DensityFunction(Position - FVector(h, 0, 0))) / (2.0 * h);
@@ -319,60 +359,71 @@ FVector FAdaptiveOctree::CalculateSurfaceNormal(const FVector& Position)
         DensityFunction(Position - FVector(0, 0, h))) / (2.0 * h);
 
     FVector Gradient(dx, dy, dz);
-
-    // Density functions typically return positive values outside and negative inside
-    // So the gradient points outward from the surface - negate if you want normal pointing out
     if (DensityFunction(Position) > 0)
     {
-        Gradient = -Gradient; // Flip direction if outside the surface
+        Gradient = -Gradient;
     }
-
     return Gradient.GetSafeNormal();
 }
 
 TArray<TSharedPtr<FAdaptiveOctreeNode>> FAdaptiveOctree::SampleNodesAroundEdge(const FNodeEdge& Edge)
 {
-    TArray<TSharedPtr<FAdaptiveOctreeNode>> SurfaceNodes;
-    double SmallOffset = 0.001;
+    static const FVector AxisVectors[3] = {
+        FVector(1, 0, 0),
+        FVector(0, 1, 0),
+        FVector(0, 0, 1)
+    };
 
-    // Compute perpendicular vectors
-    FVector Perp1 = FVector::CrossProduct(Edge.EdgeDirection, FVector(1, 0, 0)).GetSafeNormal();
-    if (Perp1.IsNearlyZero()) Perp1 = FVector::CrossProduct(Edge.EdgeDirection, FVector(0, 1, 0)).GetSafeNormal();
-    FVector Perp2 = FVector::CrossProduct(Edge.EdgeDirection, Perp1).GetSafeNormal();
+    FVector Perp1 = AxisVectors[(Edge.Axis + 1) % 3];
+    FVector Perp2 = AxisVectors[(Edge.Axis + 2) % 3];
+    FVector ZCP = Edge.ZeroCrossingPoint;
 
-    // Generate sample offsets
-    FVector OffsetA = Edge.ZeroCrossingPoint + (Perp1 * SmallOffset) + (Perp2 * SmallOffset);
-    FVector OffsetB = Edge.ZeroCrossingPoint - (Perp1 * SmallOffset) + (Perp2 * SmallOffset);
-    FVector OffsetC = Edge.ZeroCrossingPoint - (Perp1 * SmallOffset) - (Perp2 * SmallOffset);
-    FVector OffsetD = Edge.ZeroCrossingPoint + (Perp1 * SmallOffset) - (Perp2 * SmallOffset);
+    // Try multiple offset scales. Start with a reasonable default,
+    // then try smaller and larger if we don't get enough unique nodes.
+    // The offset needs to be:
+    //   - Large enough to cross into all 4 neighboring cells
+    //   - Small enough to not overshoot into non-adjacent cells
+    static const double OffsetScales[] = { 0.1, 0.25, 0.01, 0.4 };
 
-    // Query octree for valid surface nodes
-    TSharedPtr<FAdaptiveOctreeNode> NodeA = GetLeafNodeByPoint(OffsetA);
-    TSharedPtr<FAdaptiveOctreeNode> NodeB = GetLeafNodeByPoint(OffsetB);
-    TSharedPtr<FAdaptiveOctreeNode> NodeC = GetLeafNodeByPoint(OffsetC);
-    TSharedPtr<FAdaptiveOctreeNode> NodeD = GetLeafNodeByPoint(OffsetD);
+    for (double Scale : OffsetScales)
+    {
+        double Offset = Edge.Size * Scale;
 
-    TArray<TSharedPtr<FAdaptiveOctreeNode>> returnNodes;
-    if (NodeA.IsValid()) returnNodes.AddUnique(NodeA);
-    if (NodeB.IsValid()) returnNodes.AddUnique(NodeB);
-    if (NodeC.IsValid()) returnNodes.AddUnique(NodeC);
-    if (NodeD.IsValid()) returnNodes.AddUnique(NodeD);
+        TSharedPtr<FAdaptiveOctreeNode> NodeA = GetLeafNodeByPoint(ZCP + (Perp1 + Perp2) * Offset);
+        TSharedPtr<FAdaptiveOctreeNode> NodeB = GetLeafNodeByPoint(ZCP + (-Perp1 + Perp2) * Offset);
+        TSharedPtr<FAdaptiveOctreeNode> NodeC = GetLeafNodeByPoint(ZCP + (-Perp1 - Perp2) * Offset);
+        TSharedPtr<FAdaptiveOctreeNode> NodeD = GetLeafNodeByPoint(ZCP + (Perp1 - Perp2) * Offset);
 
-    bool failedToCollectSurfaceNodes = false;
-    for (auto aNode : returnNodes) {
-        if (!aNode->IsSurfaceNode) {
-            aNode->RefineDualContour(Edge);
-            failedToCollectSurfaceNodes = true;
+        TArray<TSharedPtr<FAdaptiveOctreeNode>> Nodes;
+        if (NodeA.IsValid()) Nodes.AddUnique(NodeA);
+        if (NodeB.IsValid()) Nodes.AddUnique(NodeB);
+        if (NodeC.IsValid()) Nodes.AddUnique(NodeC);
+        if (NodeD.IsValid()) Nodes.AddUnique(NodeD);
+
+        if (Nodes.Num() >= 3)
+        {
+            return Nodes;
         }
     }
 
-    //if (failedToCollectSurfaceNodes) {
-    //    for (auto aNode : returnNodes) {
-    //        aNode->DrawAndLogNode();
-    //    }
-    //}
+    // Last resort: sample at the midpoint of the edge instead of the
+    // zero-crossing point. The ZCP might be right on a cell boundary,
+    // but the edge midpoint is guaranteed to be at the center of a cell face.
+    FVector EdgeMidpoint = (Edge.Corners[0].Position + Edge.Corners[1].Position) * 0.5;
+    double Offset = Edge.Size * 0.1;
 
-    return returnNodes;
+    TSharedPtr<FAdaptiveOctreeNode> NodeA = GetLeafNodeByPoint(EdgeMidpoint + (Perp1 + Perp2) * Offset);
+    TSharedPtr<FAdaptiveOctreeNode> NodeB = GetLeafNodeByPoint(EdgeMidpoint + (-Perp1 + Perp2) * Offset);
+    TSharedPtr<FAdaptiveOctreeNode> NodeC = GetLeafNodeByPoint(EdgeMidpoint + (-Perp1 - Perp2) * Offset);
+    TSharedPtr<FAdaptiveOctreeNode> NodeD = GetLeafNodeByPoint(EdgeMidpoint + (Perp1 - Perp2) * Offset);
+
+    TArray<TSharedPtr<FAdaptiveOctreeNode>> Nodes;
+    if (NodeA.IsValid()) Nodes.AddUnique(NodeA);
+    if (NodeB.IsValid()) Nodes.AddUnique(NodeB);
+    if (NodeC.IsValid()) Nodes.AddUnique(NodeC);
+    if (NodeD.IsValid()) Nodes.AddUnique(NodeD);
+
+    return Nodes;
 }
 
 TSharedPtr<FAdaptiveOctreeNode> FAdaptiveOctree::GetLeafNodeByPoint(FVector Position)

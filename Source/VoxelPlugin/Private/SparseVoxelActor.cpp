@@ -45,7 +45,8 @@ void ASparseVoxelActor::InitializeOctree()
     TSharedPtr<FVoxelData> insertData = MakeShared<FVoxelData>();
     insertData->Density = 1;
     insertData->ObjectId = 1;
-    VoxelOctree->PopulateSphereInOctree(FVector(0, 0, 0), 36, 400.0, insertData);
+    //VoxelOctree->PopulateSphereInOctree(FVector(0, 0, 0), 36, 400.0, insertData);
+    VoxelOctree->PopulatePointsInOctree();
     bDebugNeedsRedraw = true;
 }
 
@@ -98,6 +99,6 @@ void ASparseVoxelActor::DebugDrawNode(TSharedPtr<FSparseOctreeNode> node) {
     float Size = static_cast<float>(node->GetHalfScale()) * VoxelOctree->GetPrecision();
 
 
-    DrawDebugBox(GetWorld(), VoxelOctree->ConvertToWorldPosition(node->GetCenter()), FVector(Size), FColor::Blue, false);
+    //DrawDebugBox(GetWorld(), VoxelOctree->ConvertToWorldPosition(node->GetCenter()), FVector(Size), FColor::Blue, false);
     DrawDebugPoint(GetWorld(), Center, 2, DebugColor);
 }

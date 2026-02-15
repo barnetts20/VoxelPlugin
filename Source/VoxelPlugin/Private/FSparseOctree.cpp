@@ -1,6 +1,6 @@
 #include "FSparseOctree.h"
 
-FSparseOctree::FSparseOctree() : Precision(.00000005), MaxDepth(62), MaxExtent(FInt64Coordinate::MaxCoord){
+FSparseOctree::FSparseOctree() : Precision(1), MaxDepth(62), MaxExtent(FInt64Coordinate::MaxCoord){
     Root = MakeShared<FSparseOctreeNode>();
 }
 
@@ -190,7 +190,22 @@ TArray<TSharedPtr<FSparseOctreeNode>> FSparseOctree::PopulateSphereInOctree(FVec
 
     return InsertedNodes; // Return all inserted nodes
 }
+TArray<TSharedPtr<FSparseOctreeNode>> FSparseOctree::PopulatePointsInOctree()
+{
+    TArray<TSharedPtr<FSparseOctreeNode>> InsertedNodes; // Store inserted nodes
+    TArray<FVector> Positions;
+    TArray<TSharedPtr<FVoxelData>> Data;
+    TArray<int32> Depths;
+    double scale = 100000000;
+    FRandomStream rStream = FRandomStream(1);
+    for (int i = 0; i < 1000; i++) {
+        Positions.Add(rStream.GetUnitVector() * rStream.FRand() * scale);
+        Depths.Add(MaxDepth);
+        Data.Add(MakeShared<FVoxelData>(1, 1));
+    }
 
+    return BulkInsertPointData(Positions,Depths,Data); // Return all inserted nodes
+}
 //Insert Methods
 TSharedPtr<FSparseOctreeNode> FSparseOctree::InsertData(TArray<uint8> TreeIndex, TSharedPtr<FVoxelData> Data)
 {

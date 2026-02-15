@@ -112,17 +112,10 @@ bool FAdaptiveOctreeNode::ShouldSplit(FVector InCameraPosition, double InLodDist
 
 bool FAdaptiveOctreeNode::ShouldMerge(FVector InCameraPosition, double InLodDistanceFactor)
 {
-    bool CanMerge = true;
-    for (const auto& Child : Children)
-    {
-        if (!Child.IsValid() || !Child->IsLeaf())
-        {
-            CanMerge = false;
-            break; 
-        }
-    }
     if (LodOverride) return false;
-    return CanMerge && (FVector::Dist(DualContourPosition, InCameraPosition) > Extent * (InLodDistanceFactor + TreeIndex.Num())) && TreeIndex.Num() >= DepthBounds[0];
+    //if (!CanMergeBalanced()) return false;  // <-- add this
+    return (FVector::Dist(DualContourPosition, InCameraPosition) > Extent * (InLodDistanceFactor + TreeIndex.Num()))
+        && TreeIndex.Num() >= DepthBounds[0];
 }
 
 void AppendUniqueEdges(TArray<FNodeEdge> InAppendEdges, TArray<FNodeEdge>& OutNodeEdges) {
@@ -137,29 +130,11 @@ void AppendUniqueEdges(TArray<FNodeEdge> InAppendEdges, TArray<FNodeEdge>& OutNo
                 break;
             }
         }
-        // If not found, add it to the array
         if (!found) {
             OutNodeEdges.Add(anEdge);
         }
     }
 }
-
-
-//void AppendUniqueEdges(TArray<FNodeEdge> InAppendEdges, TArray<FNodeEdge>& OutNodeEdges) {
-//    for (FNodeEdge& anEdge : InAppendEdges) {
-//        //int32 cEdge = OutNodeEdges.Find(anEdge);
-//        //if (cEdge != INDEX_NONE) {
-//        //    //Replace with smallest edge
-//        //    if (OutNodeEdges[cEdge].Size > anEdge.Size) {
-//        //        OutNodeEdges[cEdge] = anEdge;
-//        //    }
-//        //}
-//        //else {
-//        //    OutNodeEdges.Add(anEdge);
-//        //}
-//        OutNodeEdges.AddUnique(anEdge);
-//    }
-//}
 
 void FAdaptiveOctreeNode::UpdateLod(FVector InCameraPosition, double InLodDistanceFactor, TArray<FNodeEdge>& OutNodeEdges, bool& OutChanged)
 {
@@ -168,7 +143,7 @@ void FAdaptiveOctreeNode::UpdateLod(FVector InCameraPosition, double InLodDistan
         if (ShouldSplit(InCameraPosition, InLodDistanceFactor))
         {
             OutChanged = true;
-            Split();
+            BalancedSplit();
             if (fullUpdate) {
                 for (TSharedPtr<FAdaptiveOctreeNode> aChild : Children) {
                     aChild->UpdateLod(InCameraPosition, InLodDistanceFactor, OutNodeEdges, OutChanged);
@@ -281,155 +256,67 @@ TArray<FNodeEdge> FAdaptiveOctreeNode::GetSignChangeEdges()
     return SignChangeEdges;
 }
 
-// Compute Dual Contour Position, currently just naive surface nets
 void FAdaptiveOctreeNode::ComputeDualContourPosition()
 {
+    if (SignChangeEdges.Num() == 0)
+    {
+        DualContourNormal = FVector::ZeroVector;
+        DualContourPosition = Center;
+        IsSurfaceNode = false;
+        return;
+    }
 
-    if (SignChangeEdges.Num() > 0){
-        DualContourPosition = FVector::ZeroVector;
-        for (FNodeEdge& anEdge : SignChangeEdges) {
-            DualContourPosition += anEdge.ZeroCrossingPoint;
-        }
-        DualContourPosition = DualContourPosition / (double)SignChangeEdges.Num();
+    IsSurfaceNode = true;
 
-        DualContourNormal = FVector(0, 0, 0);
+    // Build QEF from sign-change edges.
+    // Each edge contributes a plane: (zero-crossing point, surface normal at that point).
+    FQEF Qef;
+
+    // Step size for finite-difference normal estimation — scales with cell size
+    double h = Extent * 0.01;
+
+    for (FNodeEdge& Edge : SignChangeEdges)
+    {
+        FVector P = Edge.ZeroCrossingPoint;
+
+        // Estimate surface normal at the zero-crossing via central differences
+        // on the density function. This gives much better normals than the 
+        // discrete corner gradient, especially for curved surfaces.
+        double dx = DensityFunction(P + FVector(h, 0, 0)) - DensityFunction(P - FVector(h, 0, 0));
+        double dy = DensityFunction(P + FVector(0, h, 0)) - DensityFunction(P - FVector(0, h, 0));
+        double dz = DensityFunction(P + FVector(0, 0, h)) - DensityFunction(P - FVector(0, 0, h));
+
+        FVector Normal = FVector(dx, dy, dz).GetSafeNormal();
+
+        // If normal estimation failed (e.g., density is constant), skip this plane
+        if (Normal.IsNearlyZero()) continue;
+
+        Qef.AddPlane(P, Normal);
+    }
+
+    // Solve QEF — result is clamped to cell bounds internally
+    double Error = 0.0;
+    DualContourPosition = Qef.Solve(Center, Extent, &Error);
+
+    // Compute the node normal as the average of the edge normals
+    // (or we could use the gradient at the DC position itself)
+    double ndx = DensityFunction(DualContourPosition + FVector(h, 0, 0)) - DensityFunction(DualContourPosition - FVector(h, 0, 0));
+    double ndy = DensityFunction(DualContourPosition + FVector(0, h, 0)) - DensityFunction(DualContourPosition - FVector(0, h, 0));
+    double ndz = DensityFunction(DualContourPosition + FVector(0, 0, h)) - DensityFunction(DualContourPosition - FVector(0, 0, h));
+
+    DualContourNormal = FVector(ndx, ndy, ndz).GetSafeNormal();
+
+    // Fallback: if normal is zero (flat region), use the discrete corner gradient
+    if (DualContourNormal.IsNearlyZero())
+    {
         DualContourNormal.X = (Corners[1].Density + Corners[3].Density + Corners[5].Density + Corners[7].Density) -
             (Corners[0].Density + Corners[2].Density + Corners[4].Density + Corners[6].Density);
         DualContourNormal.Y = (Corners[2].Density + Corners[3].Density + Corners[6].Density + Corners[7].Density) -
             (Corners[0].Density + Corners[1].Density + Corners[4].Density + Corners[5].Density);
         DualContourNormal.Z = (Corners[4].Density + Corners[5].Density + Corners[6].Density + Corners[7].Density) -
             (Corners[0].Density + Corners[1].Density + Corners[2].Density + Corners[3].Density);
-
         DualContourNormal.Normalize();
-        IsSurfaceNode = true;
     }
-    else {
-        DualContourNormal = FVector(0, 0, 0);
-        DualContourPosition = Center;
-        IsSurfaceNode = false;
-    }
-}
-
-bool FAdaptiveOctreeNode::RefineDualContour(const FNodeEdge& RefEdge)
-{
-    // If already a surface node, no need to refine
-    if (IsSurfaceNode) {
-        return true;
-    }
-
-    // Get the midpoints of all edges and sample density there
-    TArray<FNodeCorner> MidpointSamples;
-    TArray<FNodeEdge> RefinedEdges;
-
-    // Iterate through all 12 edges of the cube
-    for (int i = 0; i < 12; i++) {
-        int v0Idx = EdgePairs[i][0];
-        int v1Idx = EdgePairs[i][1];
-
-        // Get the midpoint of this edge
-        FVector MidPoint = (Corners[v0Idx].Position + Corners[v1Idx].Position) * 0.5f;
-        double MidDensity = DensityFunction(MidPoint);
-
-        // Create a new corner sample for this midpoint
-        FNodeCorner MidCorner(12 + i, MidPoint, MidDensity); // Index starts at 12 for midpoints
-        MidpointSamples.Add(MidCorner);
-
-        // Create edges between midpoints and original corners
-        FNodeEdge Edge1(Corners[v0Idx], MidCorner);
-        FNodeEdge Edge2(MidCorner, Corners[v1Idx]);
-
-        // Add edges if they cross the surface
-        if (Edge1.SignChange) {
-            RefinedEdges.Add(Edge1);
-        }
-        if (Edge2.SignChange) {
-            RefinedEdges.Add(Edge2);
-        }
-    }
-
-    // If we have surface crossings in the refined edges
-    if (RefinedEdges.Num() > 0) {
-        // We need to handle the case where an original edge now has multiple crossings
-        TMap<int32, FNodeEdge> BestEdges;
-
-        for (const FNodeEdge& Edge : RefinedEdges) {
-            // Determine which original edge this refined edge belongs to
-            int32 OriginalEdgeIndex = -1;
-
-            // Check which original edge's corners match this refined edge's corners
-            for (int i = 0; i < 12; i++) {
-                int v0 = EdgePairs[i][0];
-                int v1 = EdgePairs[i][1];
-
-                // If this refined edge connects an original corner to a midpoint
-                if ((Edge.Corners[0].CornerIndex < 8 && Edge.Corners[1].CornerIndex >= 12) ||
-                    (Edge.Corners[1].CornerIndex < 8 && Edge.Corners[0].CornerIndex >= 12)) {
-
-                    // Get the original corner index
-                    int OrigCornerIdx = (Edge.Corners[0].CornerIndex < 8) ? Edge.Corners[0].CornerIndex : Edge.Corners[1].CornerIndex;
-
-                    // If this corner is part of the original edge
-                    if (OrigCornerIdx == v0 || OrigCornerIdx == v1) {
-                        OriginalEdgeIndex = i;
-                        break;
-                    }
-                }
-            }
-
-            // If we found which original edge this belongs to
-            if (OriginalEdgeIndex != -1) {
-                // Calculate distance to the reference edge's zero crossing
-                float DistToRefZero = FVector::Distance(Edge.ZeroCrossingPoint, RefEdge.ZeroCrossingPoint);
-
-                // If we haven't seen this original edge yet, or this crossing is closer to ref edge
-                if (!BestEdges.Contains(OriginalEdgeIndex) ||
-                    DistToRefZero < FVector::Distance(BestEdges[OriginalEdgeIndex].ZeroCrossingPoint, RefEdge.ZeroCrossingPoint)) {
-
-                    BestEdges.Add(OriginalEdgeIndex, Edge);
-                }
-            }
-        }
-
-        // Now use the best edges to compute a refined dual contour position
-        TArray<FVector> RefinedCrossings;
-        for (const auto& EdgePair : BestEdges) {
-            RefinedCrossings.Add(EdgePair.Value.ZeroCrossingPoint);
-        }
-
-        // If we have crossings, update the dual contour position
-        if (RefinedCrossings.Num() > 0) {
-            DualContourPosition = Algo::Accumulate(RefinedCrossings, FVector::ZeroVector) / RefinedCrossings.Num();
-
-            // Recompute normal using both original corners and midpoint samples
-            TArray<FNodeCorner> AllSamples = Corners;
-            AllSamples.Append(MidpointSamples);
-
-            // Calculate gradient using all samples
-            FVector Gradient = FVector::ZeroVector;
-            for (const FNodeCorner& Sample : AllSamples) {
-                // Weight by inverse distance from cell center
-                float Weight = 1.0f / FMath::Max(0.01f, FVector::Distance(Sample.Position, Center));
-                Gradient += (Sample.Position - Center) * Sample.Density * Weight;
-            }
-
-            // Normalize to get normal direction
-            DualContourNormal = -Gradient.GetSafeNormal();
-
-            // Mark as surface node
-            IsSurfaceNode = true;
-
-            // Keep track of the refined edges for future reference
-            SignChangeEdges.Empty();
-            for (const auto& EdgePair : BestEdges) {
-                SignChangeEdges.Add(EdgePair.Value);
-            }
-
-            return true;
-        }
-    }
-
-    // No valid dual contour point found
-    return false;
 }
 
 void FAdaptiveOctreeNode::DrawAndLogNode()
@@ -475,4 +362,132 @@ void FAdaptiveOctreeNode::DrawAndLogNode()
                 NodeCorners[i].Density);
         }
         });
+}
+
+TSharedPtr<FAdaptiveOctreeNode> FAdaptiveOctreeNode::FindNeighbor(int Direction)
+{
+    // If we're root, no neighbor in this direction
+    if (!Parent.IsValid()) return nullptr;
+
+    auto ParentPtr = Parent.Pin();
+    if (!ParentPtr.IsValid()) return nullptr;
+
+    // What child index are we?
+    uint8 MyChildIndex = TreeIndex.Last();
+
+    // Check if the neighbor is a sibling (shares the same parent)
+    // A child is on the +X face if bit 0 is set, -X if bit 0 is clear, etc.
+    // Direction 0 (+X): we need bit 0 to be 0 (so mirror is within same parent)
+    // Direction 1 (-X): we need bit 0 to be 1
+
+    int AxisBit = Direction / 2;  // 0 for X, 1 for Y, 2 for Z
+    bool PositiveDir = (Direction % 2 == 0);
+    bool ChildOnPositiveSide = (MyChildIndex & (1 << AxisBit)) != 0;
+
+    if (PositiveDir != ChildOnPositiveSide) {
+        // Neighbor is a sibling — just flip the relevant bit
+        uint8 SiblingIndex = MyChildIndex ^ (1 << AxisBit);
+        return ParentPtr->Children[SiblingIndex];
+    }
+
+    // Neighbor is NOT a sibling — go up to parent and find parent's neighbor
+    TSharedPtr<FAdaptiveOctreeNode> ParentNeighbor = ParentPtr->FindNeighbor(Direction);
+
+    if (!ParentNeighbor.IsValid()) return nullptr;
+
+    // If parent's neighbor is a leaf, it IS the neighbor (larger cell)
+    if (ParentNeighbor->IsLeaf()) return ParentNeighbor;
+
+    // Otherwise, descend into parent's neighbor to find the adjacent child
+    // We want the child on the opposite face
+    uint8 MirroredChild = MirrorChild[Direction][MyChildIndex];
+    return ParentNeighbor->Children[MirroredChild];
+}
+
+TArray<TSharedPtr<FAdaptiveOctreeNode>> FAdaptiveOctreeNode::GetFaceNeighborLeaves(int Direction)
+{
+    TArray<TSharedPtr<FAdaptiveOctreeNode>> Result;
+
+    TSharedPtr<FAdaptiveOctreeNode> Neighbor = FindNeighbor(Direction);
+    if (!Neighbor.IsValid()) return Result;
+
+    // Collect all leaf descendants of Neighbor that touch our face
+    TArray<TSharedPtr<FAdaptiveOctreeNode>> Stack;
+    Stack.Push(Neighbor);
+
+    while (Stack.Num() > 0) {
+        auto Current = Stack.Pop();
+        if (!Current.IsValid()) continue;
+
+        if (Current->IsLeaf()) {
+            Result.Add(Current);
+        }
+        else {
+            // Only descend into children that are on the face adjacent to us
+            int OppDir = OppositeDir[Direction];
+            for (int i = 0; i < 4; i++) {
+                int ChildIdx = FaceChildren[OppDir][i];
+                if (Current->Children[ChildIdx].IsValid()) {
+                    Stack.Push(Current->Children[ChildIdx]);
+                }
+            }
+        }
+    }
+
+    return Result;
+}
+
+void FAdaptiveOctreeNode::BalancedSplit()
+{
+    if (!bIsLeaf) return;
+
+    // Split ourselves first
+    Split();
+
+    // Now check all 6 face neighbors
+    // If any neighbor is a leaf AND coarser than us (same depth = they'd be
+    // 1 level coarser than our new children), force-split them too
+    for (int Dir = 0; Dir < 6; Dir++) {
+        TSharedPtr<FAdaptiveOctreeNode> Neighbor = FindNeighbor(Dir);
+
+        if (Neighbor.IsValid() && Neighbor->IsLeaf()) {
+            // Neighbor is at our depth (same level as us pre-split).
+            // Our children are now 1 level deeper than neighbor — that's fine (diff = 1).
+            // But if our CHILDREN split later, they'd need neighbor to also be split.
+            // We don't need to do anything here — the constraint is checked when 
+            // children try to split.
+
+            // However, if neighbor is coarser than us (fewer TreeIndex entries),
+            // our children would be 2+ levels finer — must split neighbor.
+            if (Neighbor->TreeIndex.Num() < TreeIndex.Num()) {
+                // Recursive balanced split on the coarser neighbor
+                Neighbor->Split();
+            }
+        }
+    }
+}
+
+bool FAdaptiveOctreeNode::CanMergeBalanced()
+{
+    // Standard merge checks
+    if (bIsLeaf) return false;
+
+    for (const auto& Child : Children) {
+        if (!Child.IsValid() || !Child->IsLeaf()) return false;
+    }
+
+    // Balance check: after merging, we'd be a leaf at our depth.
+    // Check that no face-adjacent leaf is 2+ levels deeper than us.
+    for (int Dir = 0; Dir < 6; Dir++) {
+        TArray<TSharedPtr<FAdaptiveOctreeNode>> NeighborLeaves = GetFaceNeighborLeaves(Dir);
+        for (auto& NLeaf : NeighborLeaves) {
+            // If any neighbor leaf is 2+ levels deeper than we would be after merge,
+            // merging would violate the balance constraint
+            if (NLeaf->TreeIndex.Num() > TreeIndex.Num() + 1) {
+                return false;
+            }
+        }
+    }
+
+    return true;
 }

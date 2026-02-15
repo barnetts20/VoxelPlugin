@@ -54,13 +54,89 @@ AAdaptiveVoxelActor::AAdaptiveVoxelActor()
     //    };
     //Torus noise
     auto DensityFunction = [this](FVector Position) -> double
-    {
-            double MajorRadius = Size * .4; // Distance from the center to the ring
-            double MinorRadius = Size * .2; // Tube radius
-            float NoiseValue = (FMath::PerlinNoise3D(Position / (Size * .2))) * Size * .1;// +(FMath::PerlinNoise3D(Position / 100000.0)) * 100000;
+        {
+            double MajorRadius = Size * 0.3;
+            double MinorRadius = Size * 0.1;
+            float NoiseValue = (FMath::PerlinNoise3D(Position / (Size * 0.1)) - .5) * Size * 0.075;
             FVector2D q(FVector2D(Position.X, Position.Y).Size() - MajorRadius + NoiseValue, Position.Z);
             return q.Size() - MinorRadius + NoiseValue;
-    };
+        };
+    // 1. Multi-frequency sine wave perturbation
+//    Creates mountain/valley terrain on the torus surface
+//    using spherical coordinates on the torus tube
+    //auto DensityFunction = [this](FVector Position) -> double
+    //    {
+    //        double MajorRadius = Size * 0.4;
+    //        double MinorRadius = Size * 0.2;
+
+    //        // Angle around the torus ring (major angle)
+    //        double Theta = FMath::Atan2(Position.Y, Position.X);
+
+    //        // Vector from ring center to position (in the tube cross-section plane)
+    //        double RingDist = FVector2D(Position.X, Position.Y).Size();
+
+    //        // Angle around the tube (minor angle)  
+    //        double Phi = FMath::Atan2(Position.Z, RingDist - MajorRadius);
+
+    //        // Multi-frequency analytical displacement
+    //        // These create ridge/valley patterns along and around the torus
+    //        double Perturbation = Size * 0.05 * (
+    //            0.5 * FMath::Sin(7.0 * Theta) * FMath::Cos(5.0 * Phi) +
+    //            0.3 * FMath::Sin(13.0 * Theta + 1.7) * FMath::Sin(11.0 * Phi + 0.3) +
+    //            0.2 * FMath::Cos(23.0 * Theta - 0.5) * FMath::Cos(17.0 * Phi + 2.1)
+    //            );
+
+    //        // Standard torus SDF + perturbation
+    //        FVector2D q(RingDist - MajorRadius, Position.Z);
+    //        return q.Size() - (MinorRadius + Perturbation);
+    //    };
+
+    // 2. Sharper version — creates more abrupt features that stress
+    //    the mesher harder (closer to what real terrain noise would do)
+    auto DensityFunction2 = [this](FVector Position) -> double
+        {
+            double MajorRadius = Size * 0.4;
+            double MinorRadius = Size * 0.2;
+
+            double Theta = FMath::Atan2(Position.Y, Position.X);
+            double RingDist = FVector2D(Position.X, Position.Y).Size();
+            double Phi = FMath::Atan2(Position.Z, RingDist - MajorRadius);
+
+            // Layered frequencies — high frequency components create small 
+            // features that will only resolve at deep LOD levels, stressing
+            // LOD boundary handling
+            double Perturbation =
+                Size * 0.04 * FMath::Sin(5.0 * Theta) * FMath::Cos(3.0 * Phi) +
+                Size * 0.02 * FMath::Sin(17.0 * Theta + 1.0) * FMath::Sin(13.0 * Phi) +
+                Size * 0.01 * FMath::Sin(41.0 * Theta + 2.3) * FMath::Cos(37.0 * Phi + 1.1) +
+                Size * 0.005 * FMath::Sin(97.0 * Theta) * FMath::Sin(89.0 * Phi);
+
+            FVector2D q(RingDist - MajorRadius, Position.Z);
+            return q.Size() - (MinorRadius + Perturbation);
+        };
+
+    // 3. Position-based perturbation (not using angles)
+    //    This is closer to how noise would work — displacement based
+    //    on raw XYZ coordinates. Good for catching precision issues.
+    auto DensityFunction3 = [this](FVector Position) -> double
+        {
+            double MajorRadius = Size * 0.4;
+            double MinorRadius = Size * 0.2;
+
+            // Use position directly — scaled so the frequencies make sense
+            double Sx = Position.X / (Size * 0.15);
+            double Sy = Position.Y / (Size * 0.15);
+            double Sz = Position.Z / (Size * 0.15);
+
+            double Perturbation = Size * 0.05 * (
+                0.5 * FMath::Sin(Sx * 3.0 + Sy * 2.0) * FMath::Cos(Sz * 4.0) +
+                0.3 * FMath::Sin(Sx * 7.0 - Sz * 5.0) * FMath::Sin(Sy * 6.0 + 1.0) +
+                0.2 * FMath::Cos(Sy * 11.0 + Sz * 9.0 + Sx * 3.0)
+                );
+
+            FVector2D q(FVector2D(Position.X, Position.Y).Size() - MajorRadius, Position.Z);
+            return q.Size() - (MinorRadius + Perturbation);
+        };
     //auto DensityFunction = [&](FVector Position) -> double
     //    {
     //        double SphereRadius = Size * .85;

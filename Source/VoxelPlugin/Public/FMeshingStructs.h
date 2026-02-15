@@ -88,7 +88,10 @@ struct VOXELPLUGIN_API FMeshChunk {
         ChunkRtComponent->RegisterComponent();
 
         ChunkRtComponent->SetMaterial(0, Material);
-        ChunkRtComponent->AttachToComponent(InParentActor->GetRootComponent(), FAttachmentTransformRules::KeepRelativeTransform);
+        
+        ChunkRtComponent->AttachToComponent(InParentActor->GetRootComponent(),FAttachmentTransformRules::KeepRelativeTransform);
+        ChunkRtComponent->SetRelativeLocation(InCenter);
+
         ChunkRtComponent->SetCollisionEnabled(ECollisionEnabled::QueryAndPhysics);
         ChunkRtComponent->SetCollisionResponseToAllChannels(ECollisionResponse::ECR_Block);
         ChunkRtComponent->SetRealtimeMesh(ChunkRtMesh);

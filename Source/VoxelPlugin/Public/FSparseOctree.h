@@ -51,6 +51,8 @@ public:
 	//Complex Insertion Examples
 	TArray<TSharedPtr<FSparseOctreeNode>> PopulateSphereInOctree(FVector Center, int32 TargetDepth, double SphereRadius, TSharedPtr<FVoxelData> Data);
 
+	TArray<TSharedPtr<FSparseOctreeNode>> PopulatePointsInOctree();
+
 	//Basic Fetching
 	TSharedPtr<FSparseOctreeNode> GetRootNode();
 	TSharedPtr<FSparseOctreeNode> GetNode(TArray<uint8> TreeIndex); //Return the node at the given index, assuming it exists
