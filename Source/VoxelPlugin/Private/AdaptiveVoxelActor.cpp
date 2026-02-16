@@ -46,21 +46,21 @@ AAdaptiveVoxelActor::AAdaptiveVoxelActor()
     //        return position.size() - sphereradius;
     //    };
     //spherenoise
-    //auto DensityFunction = [&](FVector Position) -> double
-    //    {
-    //        double SphereRadius = Size * .85;
-    //        float NoiseValue = (FMath::PerlinNoise3D(Position / (Size * .2))) * Size * .1;// +(FMath::PerlinNoise3D(Position / 100000.0)) * 100000;
-    //        return Position.Size() - (SphereRadius + NoiseValue);
-    //    };
-    //Torus noise
-    auto DensityFunction = [this](FVector Position) -> double
+    auto DensityFunction = [&](FVector Position) -> double
         {
-            double MajorRadius = Size * 0.3;
-            double MinorRadius = Size * 0.1;
-            float NoiseValue = (FMath::PerlinNoise3D(Position / (Size * 0.1)) - .5) * Size * 0.075;
-            FVector2D q(FVector2D(Position.X, Position.Y).Size() - MajorRadius + NoiseValue, Position.Z);
-            return q.Size() - MinorRadius + NoiseValue;
+            double SphereRadius = Size * .85;
+            float NoiseValue = (FMath::PerlinNoise3D(Position / (Size * .1))) * Size * .1;// +(FMath::PerlinNoise3D(Position / 100000.0)) * 100000;
+            return Position.Size() - (SphereRadius + NoiseValue);
         };
+    //Torus noise
+    //auto DensityFunction = [this](FVector Position) -> double
+    //    {
+    //        double MajorRadius = Size * 0.5;
+    //        double MinorRadius = Size * 0.2;
+    //        float NoiseValue = (FMath::PerlinNoise3D(Position / (Size * 0.1)) - .5) * Size * 0.075;
+    //        FVector2D q(FVector2D(Position.X, Position.Y).Size() - MajorRadius + NoiseValue, Position.Z);
+    //        return q.Size() - MinorRadius + NoiseValue;
+    //    };
     // 1. Multi-frequency sine wave perturbation
 //    Creates mountain/valley terrain on the torus surface
 //    using spherical coordinates on the torus tube

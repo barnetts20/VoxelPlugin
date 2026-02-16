@@ -75,6 +75,16 @@ void FAdaptiveOctreeNode::Split()
     for (uint8 i = 0; i < 8; i++)
     {
         Children[i] = MakeShared<FAdaptiveOctreeNode>(DensityFunction, AsShared(), i);
+        // If any child is a surface node, propagate up to all ancestors
+        if (Children[i]->IsSurfaceNode)
+        {
+            TSharedPtr<FAdaptiveOctreeNode> Ancestor = AsShared();
+            while (Ancestor.IsValid() && !Ancestor->IsSurfaceNode)
+            {
+                Ancestor->IsSurfaceNode = true;
+                Ancestor = Ancestor->Parent.Pin();
+            }
+        }
     }
     bIsLeaf = false;
 }
@@ -143,7 +153,7 @@ void FAdaptiveOctreeNode::UpdateLod(FVector InCameraPosition, double InLodDistan
         if (ShouldSplit(InCameraPosition, InLodDistanceFactor))
         {
             OutChanged = true;
-            BalancedSplit();
+            Split();
             if (fullUpdate) {
                 for (TSharedPtr<FAdaptiveOctreeNode> aChild : Children) {
                     aChild->UpdateLod(InCameraPosition, InLodDistanceFactor, OutNodeEdges, OutChanged);
@@ -298,15 +308,12 @@ void FAdaptiveOctreeNode::ComputeDualContourPosition()
     double Error = 0.0;
     DualContourPosition = Qef.Solve(Center, Extent, &Error);
 
-    // Compute the node normal as the average of the edge normals
-    // (or we could use the gradient at the DC position itself)
-    double ndx = DensityFunction(DualContourPosition + FVector(h, 0, 0)) - DensityFunction(DualContourPosition - FVector(h, 0, 0));
-    double ndy = DensityFunction(DualContourPosition + FVector(0, h, 0)) - DensityFunction(DualContourPosition - FVector(0, h, 0));
-    double ndz = DensityFunction(DualContourPosition + FVector(0, 0, h)) - DensityFunction(DualContourPosition - FVector(0, 0, h));
+    // Use the average normal accumulated during QEF construction
+    // instead of recomputing via finite differences at the DC position.
+    // This saves 6 density evaluations per surface node.
+    DualContourNormal = Qef.GetAverageNormal();
 
-    DualContourNormal = FVector(ndx, ndy, ndz).GetSafeNormal();
-
-    // Fallback: if normal is zero (flat region), use the discrete corner gradient
+    // Fallback: if normal is zero (degenerate case), use the discrete corner gradient
     if (DualContourNormal.IsNearlyZero())
     {
         DualContourNormal.X = (Corners[1].Density + Corners[3].Density + Corners[5].Density + Corners[7].Density) -

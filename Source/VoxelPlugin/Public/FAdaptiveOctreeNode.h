@@ -116,6 +116,9 @@ struct VOXELPLUGIN_API FQEF
     // Mass point (average of intersection points — used as fallback and bias)
     FVector MassPoint;
 
+    // Accumulated normal (sum of normals passed to AddPlane — for average normal output)
+    FVector AccumulatedNormal;
+
     FQEF()
     {
         Reset();
@@ -130,6 +133,7 @@ struct VOXELPLUGIN_API FQEF
         BTB = 0.0;
         PlaneCount = 0;
         MassPoint = FVector::ZeroVector;
+        AccumulatedNormal = FVector::ZeroVector;
     }
 
     // Add a plane constraint: the solution should be close to InPoint
@@ -161,9 +165,18 @@ struct VOXELPLUGIN_API FQEF
         // Accumulate bTb
         BTB += d * d;
 
-        // Accumulate mass point
+        // Accumulate mass point and normal
         MassPoint += InPoint;
+        AccumulatedNormal += InNormal;
         PlaneCount++;
+    }
+
+    // Returns the average normal from all planes added to this QEF.
+    // Returns zero vector if no planes were added.
+    FVector GetAverageNormal() const
+    {
+        if (PlaneCount == 0) return FVector::ZeroVector;
+        return AccumulatedNormal.GetSafeNormal();
     }
 
     // Solve the QEF, returning the minimizing position.
@@ -408,7 +421,7 @@ public:
     bool ShouldSplit(FVector InCameraPosition, double InLodDistanceFactor);
     void Merge();
     bool ShouldMerge(FVector InCameraPosition, double InLodDistanceFactor);    
-    bool fullUpdate = true; //Force recursion until all nodes match the lod 
+    bool fullUpdate = false; //Force recursion until all nodes match the lod 
     void UpdateLod(FVector InCameraPosition, double InLodDistanceFactor, TArray<FNodeEdge>& OutEdges, bool& OutChanged);
 
     TArray<FNodeEdge> GetSurfaceEdges();

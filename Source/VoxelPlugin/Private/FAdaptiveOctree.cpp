@@ -9,7 +9,43 @@ FAdaptiveOctree::FAdaptiveOctree(TFunction<double(FVector)> InDensityFunction, F
     {
         SplitToDepth(Root, ChunkDepth);
     }
-    Chunks = GetSurfaceNodes();
+    Chunks = GetSurfaceNodes(); //Get the nodes containing surface
+    TArray<TSharedPtr<FAdaptiveOctreeNode>> NeighborChunks;
+
+    for (auto& ChunkNode : Chunks)
+    {
+        if (!ChunkNode.IsValid())
+            continue;
+
+        const double Offset = ChunkNode->Extent * 2.0;
+
+        static const FVector Directions[6] =
+        {
+            FVector(1, 0, 0),
+            FVector(-1, 0, 0),
+            FVector(0, 1, 0),
+            FVector(0, -1, 0),
+            FVector(0, 0, 1),
+            FVector(0, 0, -1)
+        };
+
+        for (int i = 0; i < 6; i++)
+        {
+            FVector NeighborPos = ChunkNode->Center + Directions[i] * Offset;
+
+            TSharedPtr<FAdaptiveOctreeNode> NeighborNode = GetLeafNodeByPoint(NeighborPos);
+
+            if (!NeighborNode.IsValid())
+                continue;
+
+            if (!NeighborNode->IsSurfaceNode)
+            {
+                NeighborChunks.AddUnique(NeighborNode);
+            }
+        }
+    }
+
+    Chunks.Append(NeighborChunks);
 }
 
 void FAdaptiveOctree::InitializeMeshChunks(ARealtimeMeshActor* InParentActor, UMaterialInterface* InMaterial) {
@@ -240,7 +276,7 @@ void FAdaptiveOctree::UpdateMeshChunkStreamData(TSharedPtr<FMeshChunk> InChunk)
         TriangleStream.Set(TriIdx, Triangles[TriIdx]);
         PolygroupStream.Set(TriIdx, 0);
         });
-    InChunk->IsDirty = true;
+    InChunk->IsDirty = (Triangles.Num() > 0);
 }
 
 
@@ -297,7 +333,7 @@ void FAdaptiveOctree::UpdateMesh()
     if (!MeshChunksInitialized) return;
     {
         for (auto mChunk : MeshChunks) {
-            mChunk->UpdateComponent();
+            if(mChunk->IsDirty) mChunk->UpdateComponent();
         }
     }
 }
