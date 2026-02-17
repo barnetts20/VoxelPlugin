@@ -16,6 +16,7 @@ class VOXELPLUGIN_API AAdaptiveVoxelActor : public ARealtimeMeshActor
     GENERATED_BODY()
     
 private:
+    const TFunction<double(FVector)>* DensityFunctionPtr;
     TSharedPtr<FAdaptiveOctree> AdaptiveOctree;
     TSharedPtr<FSparseOctree> SparseOctree;
 
@@ -23,8 +24,8 @@ private:
     FVector LastCameraPosition;
     FRWLock OctreeLock;
 
-    int ChunkDepth = 5;
-    int MinDepth = 8;
+    int ChunkDepth = 4;
+    int MinDepth = 7;
     int MaxDepth = 18;
     int LodFactor = 8;
     int CollisionDepth = 18;
@@ -34,7 +35,7 @@ private:
     bool Initialized = false;
     bool IsDestroyed = false;
 
-    double Size = 500000000.0;
+    double Size = 100000000.0;
 
 public:
     AAdaptiveVoxelActor();

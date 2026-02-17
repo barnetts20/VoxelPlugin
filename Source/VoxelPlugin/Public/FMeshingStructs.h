@@ -128,22 +128,15 @@ struct VOXELPLUGIN_API FMeshChunk {
     }
 
     bool ShouldProcessEdge(const FNodeEdge& Edge, const TArray<TSharedPtr<FAdaptiveOctreeNode>>& SampledNodes) {
-        // If we don't have enough nodes to form a triangle bail out (ACTUALLY WE NEED TO FIX HOLES)
-        if (SampledNodes.Num() < 3) { 
-            //UE_LOG(LogTemp, Log, TEXT("< 3 EDGE SURROUNDING NODES. NUM = %d"), SampledNodes.Num());
-            return false; 
+        if (SampledNodes.Num() < 3) return false;
+
+        double OwnerExtent = Edge.Size * 0.5;
+        for (auto& Node : SampledNodes)
+        {
+            if (Node->Extent < OwnerExtent * 0.9)
+                return false;
         }
-        if (true) return true;
-        // If it's not on a stitching face, mesh it
-        if (!IsEdgeOnChunkFace(Edge, -1)) return true;
-        // For each node that is outside the chunk bounds, add its edges to test against
-        TArray<FNodeEdge> testEdges;
-        for (auto& node : SampledNodes) {
-            if (!IsNodeInChunk(node)) testEdges.Append(node->SignChangeEdges);
-        }
-        // If the other chunks edges do not contain the edge, mesh it
-        // Otherwise it will be handled by the external chunk
-        return !testEdges.Contains(Edge);
+        return true;
     }
     //Update all chunk mesh data in async 2
     void UpdateMeshData(FMeshStreamData newMeshData) {

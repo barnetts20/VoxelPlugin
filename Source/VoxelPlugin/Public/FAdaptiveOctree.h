@@ -41,6 +41,7 @@ public:
 
     TSharedPtr<FAdaptiveOctreeNode> GetLeafNodeByPoint(FVector Position);
     TArray<TSharedPtr<FAdaptiveOctreeNode>> SampleNodesAroundEdge(const FNodeEdge& Edge);
+    TSharedPtr<FAdaptiveOctreeNode> FindNeighborLeafAtEdge(TSharedPtr<FAdaptiveOctreeNode> Node, int PerpendicularAxis, bool PositiveDirection, const FVector& ZeroCrossingPoint);
     void Clear(); //TODO: Need to test this
     //TODO: Need to make a destructor that safely disposes references/pointers and locks
 };

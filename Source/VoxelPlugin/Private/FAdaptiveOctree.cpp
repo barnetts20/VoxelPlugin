@@ -5,7 +5,7 @@ FAdaptiveOctree::FAdaptiveOctree(TFunction<double(FVector)> InDensityFunction, F
 {
     DensityFunction = InDensityFunction;
     RootExtent = InRootExtent;
-    Root = MakeShared<FAdaptiveOctreeNode>(InDensityFunction, InCenter, InRootExtent, InMinDepth, InMaxDepth);
+    Root = MakeShared<FAdaptiveOctreeNode>(&DensityFunction, InCenter, InRootExtent, InMinDepth, InMaxDepth);
     {
         SplitToDepth(Root, ChunkDepth);
     }
@@ -164,7 +164,7 @@ void FAdaptiveOctree::UpdateMeshChunkStreamData(TSharedPtr<FMeshChunk> InChunk)
     double QuantizationGrid = InChunk->ChunkExtent * 0.0001;
 
     ParallelFor(InChunk->ChunkEdges.Num(), [&](int32 edgeIdx) {
-        auto& currentEdge = InChunk->ChunkEdges[edgeIdx];
+        const FNodeEdge currentEdge = InChunk->ChunkEdges[edgeIdx];
         TArray<TSharedPtr<FAdaptiveOctreeNode>> nodesToMesh = SampleNodesAroundEdge(currentEdge);
         if (!InChunk->ShouldProcessEdge(currentEdge, nodesToMesh)) {
             AllEdgeData[edgeIdx].IsValid = false;
@@ -296,36 +296,29 @@ uint32 FAdaptiveOctree::ComputePositionHash(const FVector& Position, float GridS
 
 void FAdaptiveOctree::UpdateLOD(FVector CameraPosition, double LodFactor)
 {
-    if (!MeshChunksInitialized) return;;
+    if (!MeshChunksInitialized) return;
 
-    // Start timing
-    double StartTime = FPlatformTime::Seconds();
+    TArray<int32> ChunksModified;
+    ChunksModified.SetNumZeroed(Chunks.Num());
 
-    {
-        // Array to track which chunks were modified
-        TArray<int32> ChunksModified;
-        ChunksModified.SetNumZeroed(Chunks.Num());
-
-        ParallelFor(Chunks.Num(), [&](int32 idx)
+    ParallelFor(Chunks.Num(), [&](int32 idx)
         {
             TArray<FNodeEdge> tChunkEdges;
+            TMap<FEdgeKey, int32> tEdgeMap;
             bool tChanged = false;
-            Chunks[idx]->UpdateLod(CameraPosition, LodFactor, tChunkEdges, tChanged);
+            Chunks[idx]->UpdateLod(CameraPosition, LodFactor, tChunkEdges, tEdgeMap, tChanged);
             if (tChanged) {
                 MeshChunks[idx]->ChunkEdges = tChunkEdges;
-                // Mark this chunk as modified (using 1 instead of true)
                 FPlatformAtomics::InterlockedExchange(&ChunksModified[idx], 1);
             }
         });
 
-        // Only update the chunks that were modified
-        ParallelFor(MeshChunks.Num(), [&](int32 i)
+    ParallelFor(MeshChunks.Num(), [&](int32 i)
         {
             if (ChunksModified[i] != 0) {
                 UpdateMeshChunkStreamData(MeshChunks[i]);
             }
         });
-    }
 }
 
 void FAdaptiveOctree::UpdateMesh()
@@ -412,54 +405,77 @@ TArray<TSharedPtr<FAdaptiveOctreeNode>> FAdaptiveOctree::SampleNodesAroundEdge(c
 
     FVector Perp1 = AxisVectors[(Edge.Axis + 1) % 3];
     FVector Perp2 = AxisVectors[(Edge.Axis + 2) % 3];
-    FVector ZCP = Edge.ZeroCrossingPoint;
 
-    // Try multiple offset scales. Start with a reasonable default,
-    // then try smaller and larger if we don't get enough unique nodes.
-    // The offset needs to be:
-    //   - Large enough to cross into all 4 neighboring cells
-    //   - Small enough to not overshoot into non-adjacent cells
-    static const double OffsetScales[] = { 0.1, 0.25, 0.01, 0.4 };
+    FVector Origin = Edge.Corners[0].Position;
+    double Offset = Edge.Size * 0.24;
 
-    for (double Scale : OffsetScales)
-    {
-        double Offset = Edge.Size * Scale;
-
-        TSharedPtr<FAdaptiveOctreeNode> NodeA = GetLeafNodeByPoint(ZCP + (Perp1 + Perp2) * Offset);
-        TSharedPtr<FAdaptiveOctreeNode> NodeB = GetLeafNodeByPoint(ZCP + (-Perp1 + Perp2) * Offset);
-        TSharedPtr<FAdaptiveOctreeNode> NodeC = GetLeafNodeByPoint(ZCP + (-Perp1 - Perp2) * Offset);
-        TSharedPtr<FAdaptiveOctreeNode> NodeD = GetLeafNodeByPoint(ZCP + (Perp1 - Perp2) * Offset);
-
-        TArray<TSharedPtr<FAdaptiveOctreeNode>> Nodes;
-        if (NodeA.IsValid()) Nodes.AddUnique(NodeA);
-        if (NodeB.IsValid()) Nodes.AddUnique(NodeB);
-        if (NodeC.IsValid()) Nodes.AddUnique(NodeC);
-        if (NodeD.IsValid()) Nodes.AddUnique(NodeD);
-
-        if (Nodes.Num() >= 3)
-        {
-            return Nodes;
-        }
-    }
-
-    // Last resort: sample at the midpoint of the edge instead of the
-    // zero-crossing point. The ZCP might be right on a cell boundary,
-    // but the edge midpoint is guaranteed to be at the center of a cell face.
-    FVector EdgeMidpoint = (Edge.Corners[0].Position + Edge.Corners[1].Position) * 0.5;
-    double Offset = Edge.Size * 0.1;
-
-    TSharedPtr<FAdaptiveOctreeNode> NodeA = GetLeafNodeByPoint(EdgeMidpoint + (Perp1 + Perp2) * Offset);
-    TSharedPtr<FAdaptiveOctreeNode> NodeB = GetLeafNodeByPoint(EdgeMidpoint + (-Perp1 + Perp2) * Offset);
-    TSharedPtr<FAdaptiveOctreeNode> NodeC = GetLeafNodeByPoint(EdgeMidpoint + (-Perp1 - Perp2) * Offset);
-    TSharedPtr<FAdaptiveOctreeNode> NodeD = GetLeafNodeByPoint(EdgeMidpoint + (Perp1 - Perp2) * Offset);
+    TSharedPtr<FAdaptiveOctreeNode> N0 = GetLeafNodeByPoint(Origin + (Perp1 + Perp2) * Offset);
+    TSharedPtr<FAdaptiveOctreeNode> N1 = GetLeafNodeByPoint(Origin + (-Perp1 + Perp2) * Offset);
+    TSharedPtr<FAdaptiveOctreeNode> N2 = GetLeafNodeByPoint(Origin + (-Perp1 - Perp2) * Offset);
+    TSharedPtr<FAdaptiveOctreeNode> N3 = GetLeafNodeByPoint(Origin + (Perp1 - Perp2) * Offset);
 
     TArray<TSharedPtr<FAdaptiveOctreeNode>> Nodes;
-    if (NodeA.IsValid()) Nodes.AddUnique(NodeA);
-    if (NodeB.IsValid()) Nodes.AddUnique(NodeB);
-    if (NodeC.IsValid()) Nodes.AddUnique(NodeC);
-    if (NodeD.IsValid()) Nodes.AddUnique(NodeD);
+    if (N0.IsValid()) Nodes.AddUnique(N0);
+    if (N1.IsValid()) Nodes.AddUnique(N1);
+    if (N2.IsValid()) Nodes.AddUnique(N2);
+    if (N3.IsValid()) Nodes.AddUnique(N3);
 
     return Nodes;
+}
+
+TSharedPtr<FAdaptiveOctreeNode> FAdaptiveOctree::FindNeighborLeafAtEdge(
+    TSharedPtr<FAdaptiveOctreeNode> Node,
+    int PerpendicularAxis,
+    bool PositiveDirection,
+    const FVector& ZeroCrossingPoint)
+{
+    // Walk up until we find an ancestor where we can cross in the desired direction
+    TSharedPtr<FAdaptiveOctreeNode> Current = Node;
+    TSharedPtr<FAdaptiveOctreeNode> Parent = Current->Parent.Pin();
+
+    // The bit for this axis in the child index
+    int AxisBit = (PerpendicularAxis == 0) ? 1 : (PerpendicularAxis == 1) ? 2 : 4;
+
+    while (Parent.IsValid())
+    {
+        uint8 ChildIndex = Current->TreeIndex.Last();
+        bool CurrentSide = (ChildIndex & AxisBit) != 0;
+
+        // If we're on the negative side and want positive, or vice versa,
+        // the sibling in this parent is the neighbor
+        if (CurrentSide != PositiveDirection)
+        {
+            // Flip the bit to get the sibling on the other side
+            uint8 SiblingIndex = ChildIndex ^ AxisBit;
+            TSharedPtr<FAdaptiveOctreeNode> Sibling = Parent->Children[SiblingIndex];
+
+            if (!Sibling.IsValid()) return nullptr;
+
+            // Now descend toward the ZCP to find the leaf
+            TSharedPtr<FAdaptiveOctreeNode> Leaf = Sibling;
+            while (Leaf.IsValid() && !Leaf->IsLeaf())
+            {
+                int DescendIndex = 0;
+                if (ZeroCrossingPoint.X >= Leaf->Center.X) DescendIndex |= 1;
+                if (ZeroCrossingPoint.Y >= Leaf->Center.Y) DescendIndex |= 2;
+                if (ZeroCrossingPoint.Z >= Leaf->Center.Z) DescendIndex |= 4;
+
+                if (Leaf->Children[DescendIndex].IsValid())
+                    Leaf = Leaf->Children[DescendIndex];
+                else
+                    return nullptr;
+            }
+
+            return Leaf;
+        }
+
+        // Same side — need to go up further
+        Current = Parent;
+        Parent = Current->Parent.Pin();
+    }
+
+    // Hit root without finding neighbor — edge is on tree boundary
+    return nullptr;
 }
 
 TSharedPtr<FAdaptiveOctreeNode> FAdaptiveOctree::GetLeafNodeByPoint(FVector Position)

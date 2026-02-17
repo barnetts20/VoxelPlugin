@@ -46,12 +46,12 @@ AAdaptiveVoxelActor::AAdaptiveVoxelActor()
     //        return position.size() - sphereradius;
     //    };
     //spherenoise
-    auto DensityFunction = [&](FVector Position) -> double
-        {
-            double SphereRadius = Size * .85;
-            float NoiseValue = (FMath::PerlinNoise3D(Position / (Size * .1))) * Size * .1;// +(FMath::PerlinNoise3D(Position / 100000.0)) * 100000;
-            return Position.Size() - (SphereRadius + NoiseValue);
-        };
+    auto DensityFunction = [Size = this->Size](FVector Position) -> double
+    {
+        double SphereRadius = Size * .85;
+        float NoiseValue = (FMath::PerlinNoise3D(Position / (Size * .1))) * Size * .1;
+        return Position.Size() - (SphereRadius + NoiseValue);
+    };
     //Torus noise
     //auto DensityFunction = [this](FVector Position) -> double
     //    {
@@ -93,7 +93,7 @@ AAdaptiveVoxelActor::AAdaptiveVoxelActor()
 
     // 2. Sharper version — creates more abrupt features that stress
     //    the mesher harder (closer to what real terrain noise would do)
-    auto DensityFunction2 = [this](FVector Position) -> double
+    auto DensityFunction2 = [Size = this->Size](FVector Position) -> double
         {
             double MajorRadius = Size * 0.4;
             double MinorRadius = Size * 0.2;
@@ -118,7 +118,7 @@ AAdaptiveVoxelActor::AAdaptiveVoxelActor()
     // 3. Position-based perturbation (not using angles)
     //    This is closer to how noise would work — displacement based
     //    on raw XYZ coordinates. Good for catching precision issues.
-    auto DensityFunction3 = [this](FVector Position) -> double
+    auto DensityFunction3 = [Size = this->Size](FVector Position) -> double
         {
             double MajorRadius = Size * 0.4;
             double MinorRadius = Size * 0.2;

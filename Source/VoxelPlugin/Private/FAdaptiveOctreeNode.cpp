@@ -11,7 +11,7 @@ bool FAdaptiveOctreeNode::IsRoot()
 }
 
 // Root Constructor
-FAdaptiveOctreeNode::FAdaptiveOctreeNode(TFunction<double(FVector)> InDensityFunction, FVector InCenter, double InExtent, int InMinDepth, int InMaxDepth)
+FAdaptiveOctreeNode::FAdaptiveOctreeNode(TFunction<double(FVector)>* InDensityFunction, FVector InCenter, double InExtent, int InMinDepth, int InMaxDepth)
 {
     DensityFunction = InDensityFunction;
     Center = InCenter;
@@ -22,14 +22,14 @@ FAdaptiveOctreeNode::FAdaptiveOctreeNode(TFunction<double(FVector)> InDensityFun
 
     for (int i = 0; i < 8; i++) {
         FVector CornerPosition = Center + Offsets[i] * Extent;
-        Corners.Add(FNodeCorner(i, CornerPosition, DensityFunction(CornerPosition)));
+        Corners[i] = FNodeCorner(i, CornerPosition, (*DensityFunction)(CornerPosition));
         Children[i] = nullptr;
     }
 
     for (int EdgeIndex = 0; EdgeIndex < 12; EdgeIndex++)
     {
         FNodeEdge anEdge = FNodeEdge(Corners[EdgePairs[EdgeIndex][0]], Corners[EdgePairs[EdgeIndex][1]]);
-        Edges.Add(anEdge);
+        Edges[EdgeIndex] = anEdge;
         if (anEdge.SignChange) SignChangeEdges.Add(anEdge);
     }
 
@@ -37,7 +37,7 @@ FAdaptiveOctreeNode::FAdaptiveOctreeNode(TFunction<double(FVector)> InDensityFun
 }
 
 // Child Constructor
-FAdaptiveOctreeNode::FAdaptiveOctreeNode(TFunction<double(FVector)> InDensityFunction, TSharedPtr<FAdaptiveOctreeNode> InParent, uint8 ChildIndex)
+FAdaptiveOctreeNode::FAdaptiveOctreeNode(TFunction<double(FVector)>* InDensityFunction, TSharedPtr<FAdaptiveOctreeNode> InParent, uint8 ChildIndex)
 {
     Parent = InParent;
     DensityFunction = InDensityFunction;
@@ -49,14 +49,14 @@ FAdaptiveOctreeNode::FAdaptiveOctreeNode(TFunction<double(FVector)> InDensityFun
 
     for (int i = 0; i < 8; i++) {
         FVector CornerPosition = Center + Offsets[i] * Extent;
-        Corners.Add(FNodeCorner(i, CornerPosition, DensityFunction(CornerPosition)));
+        Corners[i] = FNodeCorner(i, CornerPosition, (*DensityFunction)(CornerPosition));
         Children[i] = nullptr;
     }
 
-    for (int EdgeIndex = 0; EdgeIndex < 12; EdgeIndex++)
+    for (int i = 0; i < 12; i++)
     {
-        FNodeEdge anEdge = FNodeEdge(Corners[EdgePairs[EdgeIndex][0]], Corners[EdgePairs[EdgeIndex][1]]);
-        Edges.Add(anEdge);
+        FNodeEdge anEdge = FNodeEdge(Corners[EdgePairs[i][0]], Corners[EdgePairs[i][1]]);
+        Edges[i] = anEdge;
         if (anEdge.SignChange) SignChangeEdges.Add(anEdge);
     }
 
@@ -128,25 +128,31 @@ bool FAdaptiveOctreeNode::ShouldMerge(FVector InCameraPosition, double InLodDist
         && TreeIndex.Num() >= DepthBounds[0];
 }
 
-void AppendUniqueEdges(TArray<FNodeEdge> InAppendEdges, TArray<FNodeEdge>& OutNodeEdges) {
-    for (FNodeEdge& anEdge : InAppendEdges) {
-        bool found = false;
-        for (int i = 0; i < OutNodeEdges.Num(); i++) {
-            if (OutNodeEdges[i] == anEdge) {
-                if (anEdge.Distance < OutNodeEdges[i].Distance) {
-                    OutNodeEdges[i] = anEdge;
-                }
-                found = true;
-                break;
+void AppendUniqueEdges(const TArray<FNodeEdge>& InAppendEdges, TArray<FNodeEdge>& OutNodeEdges, TMap<FEdgeKey, int32>& EdgeMap)
+{
+    for (const FNodeEdge& anEdge : InAppendEdges)
+    {
+        FEdgeKey Key(anEdge);
+        int32* ExistingIdx = EdgeMap.Find(Key);
+
+        if (ExistingIdx)
+        {
+            // Keep the one with the smaller Distance (same logic as before)
+            if (anEdge.Distance < OutNodeEdges[*ExistingIdx].Distance)
+            {
+                OutNodeEdges[*ExistingIdx] = anEdge;
             }
         }
-        if (!found) {
+        else
+        {
+            int32 NewIdx = OutNodeEdges.Num();
             OutNodeEdges.Add(anEdge);
+            EdgeMap.Add(Key, NewIdx);
         }
     }
 }
 
-void FAdaptiveOctreeNode::UpdateLod(FVector InCameraPosition, double InLodDistanceFactor, TArray<FNodeEdge>& OutNodeEdges, bool& OutChanged)
+void FAdaptiveOctreeNode::UpdateLod(FVector InCameraPosition, double InLodDistanceFactor, TArray<FNodeEdge>& OutNodeEdges, TMap<FEdgeKey, int32>& EdgeMap, bool& OutChanged)
 {
     if (IsLeaf())
     {
@@ -156,12 +162,12 @@ void FAdaptiveOctreeNode::UpdateLod(FVector InCameraPosition, double InLodDistan
             Split();
             if (fullUpdate) {
                 for (TSharedPtr<FAdaptiveOctreeNode> aChild : Children) {
-                    aChild->UpdateLod(InCameraPosition, InLodDistanceFactor, OutNodeEdges, OutChanged);
+                    aChild->UpdateLod(InCameraPosition, InLodDistanceFactor, OutNodeEdges, EdgeMap, OutChanged);
                 }
             }
             else {
                 for (TSharedPtr<FAdaptiveOctreeNode> aChild : Children) {
-                    AppendUniqueEdges(aChild->GetSignChangeEdges(), OutNodeEdges);
+                    AppendUniqueEdges(aChild->GetSignChangeEdges(), OutNodeEdges, EdgeMap);
                 }
                 return;
             }
@@ -173,16 +179,16 @@ void FAdaptiveOctreeNode::UpdateLod(FVector InCameraPosition, double InLodDistan
             auto parentPtr = Parent.Pin();
             parentPtr->Merge();
             if (fullUpdate) {
-                parentPtr->UpdateLod(InCameraPosition, InLodDistanceFactor, OutNodeEdges, OutChanged);
+                parentPtr->UpdateLod(InCameraPosition, InLodDistanceFactor, OutNodeEdges, EdgeMap, OutChanged);
             }
             else {
-                AppendUniqueEdges(parentPtr->GetSignChangeEdges(), OutNodeEdges);
+                AppendUniqueEdges(parentPtr->GetSignChangeEdges(), OutNodeEdges, EdgeMap);
                 return;
             }
-            
+
         }
         else {
-            AppendUniqueEdges(GetSignChangeEdges(), OutNodeEdges);
+            AppendUniqueEdges(GetSignChangeEdges(), OutNodeEdges, EdgeMap);
             return;
         }
     }
@@ -190,8 +196,7 @@ void FAdaptiveOctreeNode::UpdateLod(FVector InCameraPosition, double InLodDistan
     {
         for (int i = 0; i < 8; i++)
         {
-            Children[i]->UpdateLod(InCameraPosition, InLodDistanceFactor, OutNodeEdges, OutChanged);
-
+            Children[i]->UpdateLod(InCameraPosition, InLodDistanceFactor, OutNodeEdges, EdgeMap, OutChanged);
         }
     }
 }
@@ -200,6 +205,7 @@ void FAdaptiveOctreeNode::UpdateLod(FVector InCameraPosition, double InLodDistan
 TArray<FNodeEdge> FAdaptiveOctreeNode::GetSurfaceEdges()
 {
     TArray<FNodeEdge> SurfaceEdges;
+    TMap<FEdgeKey, int32> EdgeMap;
     TQueue<TSharedPtr<FAdaptiveOctreeNode>> NodeQueue;
     NodeQueue.Enqueue(this->AsShared());
 
@@ -212,7 +218,7 @@ TArray<FNodeEdge> FAdaptiveOctreeNode::GetSurfaceEdges()
 
         if (CurrentNode->IsLeaf() && CurrentNode->IsSurfaceNode)
         {
-            AppendUniqueEdges(CurrentNode->GetSignChangeEdges(), SurfaceEdges);
+            AppendUniqueEdges(CurrentNode->GetSignChangeEdges(), SurfaceEdges, EdgeMap);
         }
         else
         {
@@ -256,7 +262,7 @@ TArray<TSharedPtr<FAdaptiveOctreeNode>> FAdaptiveOctreeNode::GetSurfaceNodes()
     return SurfaceNodes;
 }
 
-TArray<FNodeEdge> FAdaptiveOctreeNode::GetSignChangeEdges()
+TArray<FNodeEdge>& FAdaptiveOctreeNode::GetSignChangeEdges()
 {
     //TArray<FNodeEdge> returnEdges;
     //for (int i = 0; i < 6; i++) {
@@ -292,9 +298,9 @@ void FAdaptiveOctreeNode::ComputeDualContourPosition()
         // Estimate surface normal at the zero-crossing via central differences
         // on the density function. This gives much better normals than the 
         // discrete corner gradient, especially for curved surfaces.
-        double dx = DensityFunction(P + FVector(h, 0, 0)) - DensityFunction(P - FVector(h, 0, 0));
-        double dy = DensityFunction(P + FVector(0, h, 0)) - DensityFunction(P - FVector(0, h, 0));
-        double dz = DensityFunction(P + FVector(0, 0, h)) - DensityFunction(P - FVector(0, 0, h));
+        double dx = (*DensityFunction)(P + FVector(h, 0, 0)) - (*DensityFunction)(P - FVector(h, 0, 0));
+        double dy = (*DensityFunction)(P + FVector(0, h, 0)) - (*DensityFunction)(P - FVector(0, h, 0));
+        double dz = (*DensityFunction)(P + FVector(0, 0, h)) - (*DensityFunction)(P - FVector(0, 0, h));
 
         FVector Normal = FVector(dx, dy, dz).GetSafeNormal();
 
@@ -332,7 +338,7 @@ void FAdaptiveOctreeNode::DrawAndLogNode()
     FVector NodeCenter = Center;
     double NodeExtent = Extent;
     FVector DCPosition = DualContourPosition;
-    TArray<FNodeCorner> NodeCorners = Corners;
+    TArray<FNodeCorner> NodeCorners(Corners, 8);
     int32 TreeDepth = TreeIndex.Num();
 
     // Dispatch drawing task to the game thread
@@ -440,61 +446,5 @@ TArray<TSharedPtr<FAdaptiveOctreeNode>> FAdaptiveOctreeNode::GetFaceNeighborLeav
             }
         }
     }
-
     return Result;
-}
-
-void FAdaptiveOctreeNode::BalancedSplit()
-{
-    if (!bIsLeaf) return;
-
-    // Split ourselves first
-    Split();
-
-    // Now check all 6 face neighbors
-    // If any neighbor is a leaf AND coarser than us (same depth = they'd be
-    // 1 level coarser than our new children), force-split them too
-    for (int Dir = 0; Dir < 6; Dir++) {
-        TSharedPtr<FAdaptiveOctreeNode> Neighbor = FindNeighbor(Dir);
-
-        if (Neighbor.IsValid() && Neighbor->IsLeaf()) {
-            // Neighbor is at our depth (same level as us pre-split).
-            // Our children are now 1 level deeper than neighbor — that's fine (diff = 1).
-            // But if our CHILDREN split later, they'd need neighbor to also be split.
-            // We don't need to do anything here — the constraint is checked when 
-            // children try to split.
-
-            // However, if neighbor is coarser than us (fewer TreeIndex entries),
-            // our children would be 2+ levels finer — must split neighbor.
-            if (Neighbor->TreeIndex.Num() < TreeIndex.Num()) {
-                // Recursive balanced split on the coarser neighbor
-                Neighbor->Split();
-            }
-        }
-    }
-}
-
-bool FAdaptiveOctreeNode::CanMergeBalanced()
-{
-    // Standard merge checks
-    if (bIsLeaf) return false;
-
-    for (const auto& Child : Children) {
-        if (!Child.IsValid() || !Child->IsLeaf()) return false;
-    }
-
-    // Balance check: after merging, we'd be a leaf at our depth.
-    // Check that no face-adjacent leaf is 2+ levels deeper than us.
-    for (int Dir = 0; Dir < 6; Dir++) {
-        TArray<TSharedPtr<FAdaptiveOctreeNode>> NeighborLeaves = GetFaceNeighborLeaves(Dir);
-        for (auto& NLeaf : NeighborLeaves) {
-            // If any neighbor leaf is 2+ levels deeper than we would be after merge,
-            // merging would violate the balance constraint
-            if (NLeaf->TreeIndex.Num() > TreeIndex.Num() + 1) {
-                return false;
-            }
-        }
-    }
-
-    return true;
 }

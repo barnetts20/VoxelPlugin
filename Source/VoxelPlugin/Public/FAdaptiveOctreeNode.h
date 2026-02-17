@@ -21,6 +21,7 @@ struct VOXELPLUGIN_API FNodeEdge
     FVector ZeroCrossingPoint;  // Position where sign flips
 
     // Constructor
+    FNodeEdge() : Size(0), SignChange(false), Distance(0), Axis(0) {}
     FNodeEdge(FNodeCorner InCorner1, FNodeCorner InCorner2)
     {
         Corners[0] = InCorner1;
@@ -70,7 +71,6 @@ struct VOXELPLUGIN_API FNodeEdge
             ZeroCrossingPoint = (InCorner1.Position + InCorner2.Position) * 0.5;
         }
     }
-
     bool IsCongruent(const FNodeEdge& Other) const {
         //return
         //    Corners[0].Position.Equals(Other.Corners[0].Position, .01)
@@ -341,10 +341,70 @@ private:
     }
 };
 
+struct FEdgeKey
+{
+    int64 X0, Y0, Z0;  // Quantized corner 0 (sorted so min corner is always first)
+    int64 X1, Y1, Z1;  // Quantized corner 1
+    int32 Axis;
+
+    // Quantization grid — 0.001 is well within the 0.01 epsilon used in IsCongruent
+    static constexpr double GridSize = 0.001;
+
+    static int64 Quantize(double V)
+    {
+        return FMath::RoundToInt64(V / GridSize);
+    }
+
+    FEdgeKey() = default;
+
+    FEdgeKey(const FNodeEdge& Edge)
+    {
+        int64 ax = Quantize(Edge.Corners[0].Position.X);
+        int64 ay = Quantize(Edge.Corners[0].Position.Y);
+        int64 az = Quantize(Edge.Corners[0].Position.Z);
+        int64 bx = Quantize(Edge.Corners[1].Position.X);
+        int64 by = Quantize(Edge.Corners[1].Position.Y);
+        int64 bz = Quantize(Edge.Corners[1].Position.Z);
+
+        // Canonical ordering: ensure (corner0 < corner1) so order doesn't matter
+        if (ax < bx || (ax == bx && ay < by) || (ax == bx && ay == by && az < bz))
+        {
+            X0 = ax; Y0 = ay; Z0 = az;
+            X1 = bx; Y1 = by; Z1 = bz;
+        }
+        else
+        {
+            X0 = bx; Y0 = by; Z0 = bz;
+            X1 = ax; Y1 = ay; Z1 = az;
+        }
+
+        Axis = Edge.Axis;
+    }
+
+    bool operator==(const FEdgeKey& Other) const
+    {
+        return X0 == Other.X0 && Y0 == Other.Y0 && Z0 == Other.Z0
+            && X1 == Other.X1 && Y1 == Other.Y1 && Z1 == Other.Z1
+            && Axis == Other.Axis;
+    }
+};
+
+FORCEINLINE uint32 GetTypeHash(const FEdgeKey& Key)
+{
+    uint32 Hash = GetTypeHash(Key.X0);
+    Hash = HashCombine(Hash, GetTypeHash(Key.Y0));
+    Hash = HashCombine(Hash, GetTypeHash(Key.Z0));
+    Hash = HashCombine(Hash, GetTypeHash(Key.X1));
+    Hash = HashCombine(Hash, GetTypeHash(Key.Y1));
+    Hash = HashCombine(Hash, GetTypeHash(Key.Z1));
+    Hash = HashCombine(Hash, GetTypeHash(Key.Axis));
+    return Hash;
+}
+
 struct VOXELPLUGIN_API FAdaptiveOctreeNode : public TSharedFromThis<FAdaptiveOctreeNode>
 {
 private:
-    TFunction<double(FVector)> DensityFunction;
+    TFunction<double(FVector)>* DensityFunction;
     void ComputeDualContourPosition();
     bool bIsLeaf = true;
     
@@ -410,8 +470,8 @@ public:
     FVector DualContourNormal;
     bool IsSurfaceNode;
     bool LodOverride = false; //If true prevent merge ops
-    TArray<FNodeCorner> Corners;
-    TArray<FNodeEdge> Edges;
+    FNodeCorner Corners[8];
+    FNodeEdge Edges[12];
     TArray<FNodeEdge> SignChangeEdges;
 
     bool IsLeaf();
@@ -422,19 +482,19 @@ public:
     void Merge();
     bool ShouldMerge(FVector InCameraPosition, double InLodDistanceFactor);    
     bool fullUpdate = false; //Force recursion until all nodes match the lod 
-    void UpdateLod(FVector InCameraPosition, double InLodDistanceFactor, TArray<FNodeEdge>& OutEdges, bool& OutChanged);
+    void UpdateLod(FVector InCameraPosition, double InLodDistanceFactor, TArray<FNodeEdge>& OutNodeEdges, TMap<FEdgeKey, int32>& EdgeMap, bool& OutChanged);
 
     TArray<FNodeEdge> GetSurfaceEdges();
     TArray<TSharedPtr<FAdaptiveOctreeNode>> GetSurfaceNodes();
-    TArray<FNodeEdge> GetSignChangeEdges();
+    TArray<FNodeEdge>& GetSignChangeEdges();
 
     void DrawAndLogNode();
 
     // Root Constructor
-    FAdaptiveOctreeNode(TFunction<double(FVector)> InDensityFunction, FVector InCenter, double InExtent, int InMinDepth, int InMaxDepth);
+    FAdaptiveOctreeNode(TFunction<double(FVector)>* InDensityFunction, FVector InCenter, double InExtent, int InMinDepth, int InMaxDepth);
 
     // Child Constructor
-    FAdaptiveOctreeNode(TFunction<double(FVector)> InDensityFunction, TSharedPtr<FAdaptiveOctreeNode> InParent, uint8 ChildIndex);
+    FAdaptiveOctreeNode(TFunction<double(FVector)>* InDensityFunction, TSharedPtr<FAdaptiveOctreeNode> InParent, uint8 ChildIndex);
 
     // Neighbor finding for restricted octree
     // Direction: 0=+X, 1=-X, 2=+Y, 3=-Y, 4=+Z, 5=-Z
@@ -442,72 +502,4 @@ public:
 
     // Get all face-adjacent leaf neighbors (may return multiple small neighbors on one face)
     TArray<TSharedPtr<FAdaptiveOctreeNode>> GetFaceNeighborLeaves(int Direction);
-
-    // Balanced split: splits this node and forces neighbors to maintain max 1-level difference
-    void BalancedSplit();
-
-    // Check if merge is allowed without violating the balance constraint
-    bool CanMergeBalanced();
-};
-
-struct VOXELPLUGIN_API FAdaptiveOctreeFlatNode {
-    // Basic node data
-    TArray<uint8> TreeIndex;
-
-    FVector Center;
-    double Extent;
-    double Density;
-
-    FVector DualContourPosition;
-    FVector DualContourNormal;
-    TArray<FNodeCorner> Corners;
-    TArray<FNodeEdge> Edges;
-    TArray<FNodeEdge> SignChangeEdges;
-
-    bool IsSurfaceNode;
-    bool IsLeaf;
-    bool IsValid;
-
-    // Constructor - creates an empty/invalid flat node
-    FAdaptiveOctreeFlatNode()
-        : Center(FVector::ZeroVector)
-        , Extent(0)
-        , Density(0)
-        , DualContourPosition(FVector::ZeroVector)
-        , DualContourNormal(FVector::ZeroVector)
-        , IsSurfaceNode(false)
-        , IsLeaf(true)
-        , IsValid(false)
-    {};
-
-    FAdaptiveOctreeFlatNode(TSharedPtr<FAdaptiveOctreeNode> InNode) 
-        : Center(FVector::ZeroVector)
-        , Extent(0)
-        , Density(0)
-        , DualContourPosition(FVector::ZeroVector)
-        , DualContourNormal(FVector::ZeroVector)
-        , IsSurfaceNode(false)
-        , IsLeaf(true)
-        , IsValid(InNode.IsValid())
-    {
-        if (IsValid) {
-            TreeIndex = InNode->TreeIndex;
-            Center = InNode->Center;
-            Extent = InNode->Extent;
-            Density = InNode->Density;
-            DualContourPosition = InNode->DualContourPosition;
-            DualContourNormal = InNode->DualContourNormal;
-            Corners = InNode->Corners;
-            Edges = InNode->Edges;
-            SignChangeEdges = InNode->SignChangeEdges;
-            IsSurfaceNode = InNode->IsSurfaceNode;
-            IsLeaf = InNode->IsLeaf();
-        }
-    };
-
-    // Equality operators for collections
-    bool operator==(const FAdaptiveOctreeFlatNode& Other) const
-    {
-        return TreeIndex == Other.TreeIndex;
-    }
 };
