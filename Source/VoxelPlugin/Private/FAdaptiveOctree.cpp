@@ -78,7 +78,7 @@ void FAdaptiveOctree::SplitToDepth(TSharedPtr<FAdaptiveOctreeNode> Node, int InM
     }
 }
 
-FVector2f ComputeTriplanarUV(FVector Position, FVector Normal)
+FVector2f FAdaptiveOctree::ComputeTriplanarUV(FVector Position, FVector Normal)
 {
     FVector2f UV;
     FVector AbsNormal = Normal.GetAbs();
@@ -99,7 +99,7 @@ FVector2f ComputeTriplanarUV(FVector Position, FVector Normal)
     return UV;
 };
 
-FORCEINLINE FVector QuantizePosition(const FVector& P, double GridSize = 1.0)
+FVector FAdaptiveOctree::QuantizePosition(const FVector& P, double GridSize)
 {
     return FVector(
         FMath::RoundToDouble(P.X / GridSize) * GridSize,
@@ -107,21 +107,6 @@ FORCEINLINE FVector QuantizePosition(const FVector& P, double GridSize = 1.0)
         FMath::RoundToDouble(P.Z / GridSize) * GridSize
     );
 }
-
-struct FMeshVertex
-{
-    FVector Position;       // Quantized position (chunk-local)
-    FVector OriginalPosition; // Unquantized for actual mesh output
-    FVector Normal;
-    FColor Color;
-    FVector2f UV;
-
-    bool operator==(const FMeshVertex& Other) const
-    {
-        // Exact comparison on quantized position — no epsilon needed
-        return Position == Other.Position;
-    }
-};
 
 uint32 GetTypeHash(const FMeshVertex& Vertex)
 {
@@ -131,21 +116,6 @@ uint32 GetTypeHash(const FMeshVertex& Vertex)
 
 void FAdaptiveOctree::UpdateMeshChunkStreamData(TSharedPtr<FMeshChunk> InChunk)
 {
-    auto PositionStream = InChunk->ChunkMeshData->GetPositionStream();
-    auto TangentStream = InChunk->ChunkMeshData->GetTangentStream();
-    auto ColorStream = InChunk->ChunkMeshData->GetColorStream();
-    auto TexCoordStream = InChunk->ChunkMeshData->GetTexCoordStream();
-    auto TriangleStream = InChunk->ChunkMeshData->GetTriangleStream();
-    auto PolygroupStream = InChunk->ChunkMeshData->GetPolygroupStream();
-
-    // Reset all streams
-    PositionStream.Empty();
-    TangentStream.Empty();
-    ColorStream.Empty();
-    TexCoordStream.Empty();
-    TriangleStream.Empty();
-    PolygroupStream.Empty();
-
     TMap<FMeshVertex, int32> VertexMap;
     TArray<FMeshVertex> UniqueVertices;
     TArray<FIndex3UI> Triangles;
@@ -241,7 +211,16 @@ void FAdaptiveOctree::UpdateMeshChunkStreamData(TSharedPtr<FMeshChunk> InChunk)
         }
     }
 
-    // Finalize Streams
+
+    InChunk->ChunkMeshData->ResetStreams();
+
+    auto PositionStream = InChunk->ChunkMeshData->GetPositionStream();
+    auto TangentStream = InChunk->ChunkMeshData->GetTangentStream();
+    auto ColorStream = InChunk->ChunkMeshData->GetColorStream();
+    auto TexCoordStream = InChunk->ChunkMeshData->GetTexCoordStream();
+    auto TriangleStream = InChunk->ChunkMeshData->GetTriangleStream();
+    auto PolygroupStream = InChunk->ChunkMeshData->GetPolygroupStream();
+
     PositionStream.SetNumUninitialized(UniqueVertices.Num());
     TangentStream.SetNumUninitialized(UniqueVertices.Num());
     ColorStream.SetNumUninitialized(UniqueVertices.Num());
@@ -251,14 +230,10 @@ void FAdaptiveOctree::UpdateMeshChunkStreamData(TSharedPtr<FMeshChunk> InChunk)
 
     ParallelFor(UniqueVertices.Num(), [&](int32 VertIdx) {
         FMeshVertex& Vertex = UniqueVertices[VertIdx];
-
-        // DC normal — stable, chunk-independent
         PositionStream.Set(VertIdx, Vertex.OriginalPosition);
-
         FRealtimeMeshTangentsHighPrecision Tangent;
         Tangent.SetNormal(FVector3f(Vertex.Normal));
         TangentStream.Set(VertIdx, Tangent);
-
         ColorStream.Set(VertIdx, Vertex.Color);
         TexCoordStream.Set(VertIdx, Vertex.UV);
      });
@@ -269,20 +244,6 @@ void FAdaptiveOctree::UpdateMeshChunkStreamData(TSharedPtr<FMeshChunk> InChunk)
     });
 
     InChunk->IsDirty = (Triangles.Num() > 0);
-}
-
-// Optional: Add a method to pre-compute a deterministic hash for a position to ensure consistent vertex ordering
-uint32 FAdaptiveOctree::ComputePositionHash(const FVector& Position, float GridSize)
-{
-    // Snap the position to a grid to ensure deterministic results
-    FVector SnappedPos = FVector(
-        FMath::RoundToFloat(Position.X / GridSize) * GridSize,
-        FMath::RoundToFloat(Position.Y / GridSize) * GridSize,
-        FMath::RoundToFloat(Position.Z / GridSize) * GridSize
-    );
-
-    // Compute a hash based on the snapped position
-    return FCrc::MemCrc32(&SnappedPos, sizeof(FVector));
 }
 
 void FAdaptiveOctree::UpdateLOD(FVector CameraPosition, double LodFactor)
@@ -317,7 +278,7 @@ void FAdaptiveOctree::UpdateMesh()
     if (!MeshChunksInitialized) return;
     {
         for (auto mChunk : MeshChunks) {
-            if(mChunk->IsDirty) mChunk->UpdateComponent();
+            if(mChunk->IsDirty) mChunk->UpdateComponent(mChunk);
         }
     }
 }
@@ -439,11 +400,7 @@ TArray<TSharedPtr<FAdaptiveOctreeNode>> FAdaptiveOctree::SampleNodesAroundEdge(c
     return Nodes;
 }
 
-TSharedPtr<FAdaptiveOctreeNode> FAdaptiveOctree::FindNeighborLeafAtEdge(
-    TSharedPtr<FAdaptiveOctreeNode> Node,
-    int PerpendicularAxis,
-    bool PositiveDirection,
-    const FVector& ZeroCrossingPoint)
+TSharedPtr<FAdaptiveOctreeNode> FAdaptiveOctree::FindNeighborLeafAtEdge(TSharedPtr<FAdaptiveOctreeNode> Node, int PerpendicularAxis, bool PositiveDirection, const FVector& ZeroCrossingPoint)
 {
     // Walk up until we find an ancestor where we can cross in the desired direction
     TSharedPtr<FAdaptiveOctreeNode> Current = Node;

@@ -29,16 +29,17 @@ public:
 
     void UpdateMeshChunkStreamData(TSharedPtr<FMeshChunk> InChunk);
 
-    uint32 ComputePositionHash(const FVector& Position, float GridSize);
-
+    FVector QuantizePosition(const FVector& P, double GridSize = 1.0);
+    
+    FVector2f ComputeTriplanarUV(FVector Position, FVector Normal);
+    
     void UpdateLOD(FVector CameraPosition, double LodFactor);
+
     void UpdateMesh();
 
     TArray<TSharedPtr<FAdaptiveOctreeNode>> GetLeaves();
     TArray<TSharedPtr<FAdaptiveOctreeNode>> GetSurfaceNodes();
     TArray<TSharedPtr<FAdaptiveOctreeNode>> GetChunks();
-
-    FVector CalculateSurfaceNormal(const FVector& Position);
 
     TSharedPtr<FAdaptiveOctreeNode> GetLeafNodeByPoint(FVector Position);
     TArray<TSharedPtr<FAdaptiveOctreeNode>> SampleNodesAroundEdge(const FNodeEdge& Edge);

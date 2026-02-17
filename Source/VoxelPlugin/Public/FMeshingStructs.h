@@ -8,18 +8,39 @@
 
 using namespace RealtimeMesh;
 
+struct VOXELPLUGIN_API FMeshVertex
+{
+    FVector Position;       // Quantized position (chunk-local)
+    FVector OriginalPosition; // Unquantized for actual mesh output
+    FVector Normal;
+    FColor Color;
+    FVector2f UV;
+
+    bool operator==(const FMeshVertex& Other) const
+    {
+        // Exact comparison on quantized position — no epsilon needed
+        return Position == Other.Position;
+    }
+};
+
+struct VOXELPLUGIN_API FEdgeVertexData {
+    TArray<FMeshVertex> Vertices;
+    TOptional<FNodeEdge> Edge;
+    bool IsValid;
+};
+
 struct VOXELPLUGIN_API FMeshStreamData {
     FRealtimeMeshSectionGroupKey MeshGroupKey;
     FRealtimeMeshSectionKey MeshSectionKey;
     FRealtimeMeshStreamSet MeshStream;
 
     FMeshStreamData() {
-        TRealtimeMeshStreamBuilder<FVector, FVector3f> PositionBuilder(MeshStream.AddStream(FRealtimeMeshStreams::Position, GetRealtimeMeshBufferLayout<FVector3f>()));
-        TRealtimeMeshStreamBuilder<FRealtimeMeshTangentsHighPrecision, FRealtimeMeshTangentsNormalPrecision> TangentBuilder(MeshStream.AddStream(FRealtimeMeshStreams::Tangents, GetRealtimeMeshBufferLayout<FRealtimeMeshTangentsNormalPrecision>()));
-        TRealtimeMeshStreamBuilder<TIndex3<uint32>> TrianglesBuilder(MeshStream.AddStream(FRealtimeMeshStreams::Triangles, GetRealtimeMeshBufferLayout<TIndex3<uint32>>()));
-        TRealtimeMeshStreamBuilder<uint32, uint16> PolygroupsBuilder(MeshStream.AddStream(FRealtimeMeshStreams::PolyGroups, GetRealtimeMeshBufferLayout<uint16>()));
-        TRealtimeMeshStreamBuilder<FVector2f, FVector2DHalf> TexCoordsBuilder(MeshStream.AddStream(FRealtimeMeshStreams::TexCoords, GetRealtimeMeshBufferLayout<FVector2DHalf>()));
-        TRealtimeMeshStreamBuilder<FColor> ColorBuilder(MeshStream.AddStream(FRealtimeMeshStreams::Color, GetRealtimeMeshBufferLayout<FColor>()));
+        MeshStream.AddStream(FRealtimeMeshStreams::Position, GetRealtimeMeshBufferLayout<FVector3f>());
+        MeshStream.AddStream(FRealtimeMeshStreams::Tangents, GetRealtimeMeshBufferLayout<FRealtimeMeshTangentsNormalPrecision>());
+        MeshStream.AddStream(FRealtimeMeshStreams::Triangles, GetRealtimeMeshBufferLayout<TIndex3<uint32>>());
+        MeshStream.AddStream(FRealtimeMeshStreams::PolyGroups, GetRealtimeMeshBufferLayout<uint16>());
+        MeshStream.AddStream(FRealtimeMeshStreams::TexCoords, GetRealtimeMeshBufferLayout<FVector2DHalf>());
+        MeshStream.AddStream(FRealtimeMeshStreams::Color, GetRealtimeMeshBufferLayout<FColor>());
     }
 
     TRealtimeMeshStreamBuilder<FVector, FVector3f> GetPositionStream() {
@@ -59,10 +80,8 @@ struct VOXELPLUGIN_API FMeshChunk {
     TSharedPtr<FMeshStreamData> ChunkMeshData;
 
     //Mesh Stuff
-    bool NeedsRebuild = true;
     bool IsDirty = false;
     bool IsInitialized = false;
-    TSharedPtr<FRWLock> MeshDataLock = MakeShared<FRWLock>();
     URealtimeMeshSimple* ChunkRtMesh;
     URealtimeMeshComponent* ChunkRtComponent;
     FRealtimeMeshLODKey LODKey = FRealtimeMeshLODKey::FRealtimeMeshLODKey(0);
@@ -104,20 +123,6 @@ struct VOXELPLUGIN_API FMeshChunk {
         IsInitialized = true;
     };
 
-    bool IsEdgeOnChunkFace(const FNodeEdge& Edge, int Coef) {
-        // Pre-compute face position vector and tolerance once
-        const float tolerance = 0.001f * ChunkExtent;
-        const FVector facePos = ChunkCenter + (Coef * FVector(ChunkExtent));
-
-        // Calculate perpendicular axes using modular arithmetic
-        const int axis1 = (Edge.Axis + 1) % 3;  // First perpendicular axis
-        const int axis2 = (Edge.Axis + 2) % 3;  // Second perpendicular axis
-
-        // Check if edge's zero-crossing lies on the face for either perpendicular axis
-        return FMath::Abs(Edge.ZeroCrossingPoint[axis1] - facePos[axis1]) < tolerance ||
-            FMath::Abs(Edge.ZeroCrossingPoint[axis2] - facePos[axis2]) < tolerance;
-    }
-
     bool IsNodeInChunk(const TSharedPtr<FAdaptiveOctreeNode> Node) {
         // Calculate extents once
         const FVector extentVec(ChunkExtent);
@@ -138,19 +143,13 @@ struct VOXELPLUGIN_API FMeshChunk {
         }
         return true;
     }
-    //Update all chunk mesh data in async 2
-    void UpdateMeshData(FMeshStreamData newMeshData) {
-        ChunkMeshData->MeshStream = FRealtimeMeshStreamSet(newMeshData.MeshStream);
-        IsDirty = true;
-    }
 
-    void UpdateComponent() {
-        AsyncTask(ENamedThreads::GameThread, [this]() {
-            if (!IsInitialized || !IsDirty) return;
-            IsDirty = false;
-            
-            ChunkRtMesh->UpdateSectionGroup(ChunkMeshData->MeshGroupKey, ChunkMeshData->MeshStream);
-            ChunkRtMesh->UpdateSectionConfig(ChunkMeshData->MeshSectionKey, SecConfig, true);
-        });
+   void UpdateComponent(TSharedPtr<FMeshChunk> Self) {
+        AsyncTask(ENamedThreads::GameThread, [Self]() {
+            if (!Self->IsInitialized || !Self->IsDirty) return;
+            Self->IsDirty = false;
+            Self->ChunkRtMesh->UpdateSectionGroup(Self->ChunkMeshData->MeshGroupKey, Self->ChunkMeshData->MeshStream);
+            Self->ChunkRtMesh->UpdateSectionConfig(Self->ChunkMeshData->MeshSectionKey, Self->SecConfig, true);
+            });
     }
 };
