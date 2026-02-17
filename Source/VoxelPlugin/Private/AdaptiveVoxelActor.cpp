@@ -103,14 +103,9 @@ void AAdaptiveVoxelActor::ScheduleDataUpdate(float IntervalInSeconds)
             AAdaptiveVoxelActor* Self = WeakThis.Get();
             if (!Self || Self->IsDestroyed) return;
             {
-                FVector CurrentCamPos = Self->CameraPosition;
-                double DistMoved = FVector::Dist(CurrentCamPos, Self->LastLodUpdatePosition);
-                if (DistMoved >= Self->LodDistanceThreshold)
-                {
-                    FRWScopeLock WriteLock(Self->OctreeLock, SLT_Write);
-                    Self->AdaptiveOctree->UpdateLOD(CurrentCamPos, Self->LodFactor);
-                    Self->LastLodUpdatePosition = CurrentCamPos;
-                }
+                FRWScopeLock WriteLock(Self->OctreeLock, SLT_Write);
+                Self->AdaptiveOctree->UpdateLOD(Self->CameraPosition, Self->LodFactor);
+                Self->LastLodUpdatePosition = Self->CameraPosition;
             }
 
             Self->DataUpdateIsRunning = false;

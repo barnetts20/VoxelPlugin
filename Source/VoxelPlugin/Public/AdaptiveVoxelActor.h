@@ -47,13 +47,13 @@ public:
     UMaterialInterface* Material;
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Scale")
-    double Size = 500000000.0;
+    double Size = 100000000.0;
     
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Octree")
-    int ChunkDepth = 5;
+    int ChunkDepth = 4;
     
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Octree")
-    int MinDepth = 7;
+    int MinDepth = 8;
     
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Octree")
     int MaxDepth = 18;

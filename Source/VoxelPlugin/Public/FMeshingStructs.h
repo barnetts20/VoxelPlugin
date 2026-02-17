@@ -123,14 +123,14 @@ struct VOXELPLUGIN_API FMeshChunk {
         IsInitialized = true;
     };
 
-    bool IsNodeInChunk(const TSharedPtr<FAdaptiveOctreeNode> Node) {
-        // Calculate extents once
-        const FVector extentVec(ChunkExtent);
-        FVector distFromCenter = (Node->Center - ChunkCenter).GetAbs();
-        return distFromCenter.X <= ChunkExtent &&
-            distFromCenter.Y <= ChunkExtent &&
-            distFromCenter.Z <= ChunkExtent;
-    }
+    //bool IsNodeInChunk(const TSharedPtr<FAdaptiveOctreeNode> Node) {
+    //    // Calculate extents once
+    //    const FVector extentVec(ChunkExtent);
+    //    FVector distFromCenter = (Node->Center - ChunkCenter).GetAbs();
+    //    return distFromCenter.X <= ChunkExtent &&
+    //        distFromCenter.Y <= ChunkExtent &&
+    //        distFromCenter.Z <= ChunkExtent;
+    //}
 
     bool ShouldProcessEdge(const FNodeEdge& Edge, const TArray<TSharedPtr<FAdaptiveOctreeNode>>& SampledNodes) {
         if (SampledNodes.Num() < 3) return false;

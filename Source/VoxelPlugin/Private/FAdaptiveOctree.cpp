@@ -20,16 +20,6 @@ FAdaptiveOctree::FAdaptiveOctree(TFunction<double(FVector, FVector)> InDensityFu
 
         const double Offset = ChunkNode->Extent * 2.0;
 
-        static const FVector Directions[6] =
-        {
-            FVector(1, 0, 0),
-            FVector(-1, 0, 0),
-            FVector(0, 1, 0),
-            FVector(0, -1, 0),
-            FVector(0, 0, 1),
-            FVector(0, 0, -1)
-        };
-
         for (int i = 0; i < 6; i++)
         {
             FVector NeighborPos = ChunkNode->Center + Directions[i] * Offset;
@@ -50,7 +40,6 @@ FAdaptiveOctree::FAdaptiveOctree(TFunction<double(FVector, FVector)> InDensityFu
 }
 
 void FAdaptiveOctree::InitializeMeshChunks(ARealtimeMeshActor* InParentActor, UMaterialInterface* InMaterial) {
-    ParentActor = InParentActor;
     for (auto chunk : Chunks) {
         TSharedPtr<FMeshChunk> newChunk = MakeShared<FMeshChunk>();
         newChunk->Initialize(InParentActor, InMaterial, chunk->Center, chunk->Extent);
@@ -283,48 +272,11 @@ void FAdaptiveOctree::UpdateMesh()
     }
 }
 
-// Retrieves all leaf nodes
-TArray<TSharedPtr<FAdaptiveOctreeNode>> FAdaptiveOctree::GetLeaves()
-{
-    TArray<TSharedPtr<FAdaptiveOctreeNode>> Leaves;
-    if (!Root.IsValid()) return Leaves;
-
-    TQueue<TSharedPtr<FAdaptiveOctreeNode>> NodeQueue;
-    NodeQueue.Enqueue(Root->AsShared());
-
-    while (!NodeQueue.IsEmpty())
-    {
-        TSharedPtr<FAdaptiveOctreeNode> CurrentNode;
-        NodeQueue.Dequeue(CurrentNode);
-
-        if (!CurrentNode.IsValid()) continue;
-
-        if (CurrentNode->IsLeaf())
-        {
-            Leaves.Add(CurrentNode->AsShared());
-        }
-        else
-        {
-            for (int i = 0; i < 8; i++)
-            {
-                if (CurrentNode->Children[i]) NodeQueue.Enqueue(CurrentNode->Children[i]);
-            }
-        }
-    }
-
-    return Leaves;
-}
-
 // Retrieves all surface nodes for meshing
 TArray<TSharedPtr<FAdaptiveOctreeNode>> FAdaptiveOctree::GetSurfaceNodes()
 {
     if (!Root.IsValid()) return TArray<TSharedPtr<FAdaptiveOctreeNode>>();
     return Root->GetSurfaceNodes();
-}
-
-TArray<TSharedPtr<FAdaptiveOctreeNode>> FAdaptiveOctree::GetChunks()
-{
-    return Chunks;
 }
 
 TArray<TSharedPtr<FAdaptiveOctreeNode>> FAdaptiveOctree::SampleNodesAroundEdge(const FNodeEdge& Edge)
@@ -398,57 +350,6 @@ TArray<TSharedPtr<FAdaptiveOctreeNode>> FAdaptiveOctree::SampleNodesAroundEdge(c
     if (N3.IsValid()) Nodes.AddUnique(N3);
 
     return Nodes;
-}
-
-TSharedPtr<FAdaptiveOctreeNode> FAdaptiveOctree::FindNeighborLeafAtEdge(TSharedPtr<FAdaptiveOctreeNode> Node, int PerpendicularAxis, bool PositiveDirection, const FVector& ZeroCrossingPoint)
-{
-    // Walk up until we find an ancestor where we can cross in the desired direction
-    TSharedPtr<FAdaptiveOctreeNode> Current = Node;
-    TSharedPtr<FAdaptiveOctreeNode> Parent = Current->Parent.Pin();
-
-    // The bit for this axis in the child index
-    int AxisBit = (PerpendicularAxis == 0) ? 1 : (PerpendicularAxis == 1) ? 2 : 4;
-
-    while (Parent.IsValid())
-    {
-        uint8 ChildIndex = Current->TreeIndex.Last();
-        bool CurrentSide = (ChildIndex & AxisBit) != 0;
-
-        // If we're on the negative side and want positive, or vice versa,
-        // the sibling in this parent is the neighbor
-        if (CurrentSide != PositiveDirection)
-        {
-            // Flip the bit to get the sibling on the other side
-            uint8 SiblingIndex = ChildIndex ^ AxisBit;
-            TSharedPtr<FAdaptiveOctreeNode> Sibling = Parent->Children[SiblingIndex];
-
-            if (!Sibling.IsValid()) return nullptr;
-
-            // Now descend toward the ZCP to find the leaf
-            TSharedPtr<FAdaptiveOctreeNode> Leaf = Sibling;
-            while (Leaf.IsValid() && !Leaf->IsLeaf())
-            {
-                int DescendIndex = 0;
-                if (ZeroCrossingPoint.X >= Leaf->Center.X) DescendIndex |= 1;
-                if (ZeroCrossingPoint.Y >= Leaf->Center.Y) DescendIndex |= 2;
-                if (ZeroCrossingPoint.Z >= Leaf->Center.Z) DescendIndex |= 4;
-
-                if (Leaf->Children[DescendIndex].IsValid())
-                    Leaf = Leaf->Children[DescendIndex];
-                else
-                    return nullptr;
-            }
-
-            return Leaf;
-        }
-
-        // Same side — need to go up further
-        Current = Parent;
-        Parent = Current->Parent.Pin();
-    }
-
-    // Hit root without finding neighbor — edge is on tree boundary
-    return nullptr;
 }
 
 TSharedPtr<FAdaptiveOctreeNode> FAdaptiveOctree::GetLeafNodeByPoint(FVector Position)
