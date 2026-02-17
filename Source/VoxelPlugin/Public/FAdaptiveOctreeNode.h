@@ -74,14 +74,6 @@ struct VOXELPLUGIN_API FNodeEdge
         }
     }
     bool IsCongruent(const FNodeEdge& Other) const {
-        //return
-        //    Corners[0].Position.Equals(Other.Corners[0].Position, .01)
-        //    || Corners[0].Position.Equals(Other.Corners[1].Position, .01)
-        //    || Corners[1].Position.Equals(Other.Corners[0].Position, .01)
-        //    || Corners[1].Position.Equals(Other.Corners[1].Position, .01)
-        //    &&
-        //    Axis == Other.Axis;
-
         // Both corners must match (in either order) AND axis must match
         bool CornersMatch =
             (Corners[0].Position.Equals(Other.Corners[0].Position, .01)
@@ -417,12 +409,6 @@ private:
         FVector(-1, -1, 1), FVector(1, -1, 1),
         FVector(-1, 1, 1), FVector(1, 1, 1)
     };
-    
-    inline static const int SharedCorners[3][4] = {
-        {0, 2, 4, 6}, // +X or -X aligned
-        {0, 1, 4, 5}, // +Y or -Y aligned
-        {0, 1, 2, 3}  // +Z or -Z aligned
-    };
 
     inline static const int EdgePairs[12][2] = {
         {0, 1}, {2, 3}, {4, 5}, {6, 7}, // X-axis edges
@@ -430,53 +416,22 @@ private:
         {0, 4}, {1, 5}, {2, 6}, {3, 7}  // Z-axis edges
     };
 
-    inline static const int FaceChildren[6][4] = {
-        {1, 3, 5, 7},  // +X face
-        {0, 2, 4, 6},  // -X face
-        {2, 3, 6, 7},  // +Y face
-        {0, 1, 4, 5},  // -Y face
-        {4, 5, 6, 7},  // +Z face
-        {0, 1, 2, 3},  // -Z face
-    };
-
-    // The opposite direction
-    inline static const int OppositeDir[6] = { 1, 0, 3, 2, 5, 4 };
-
-    // Which child on the opposite face mirrors a given child on this face
-    // e.g., for +X direction, child 1 mirrors child 0, child 3 mirrors 2, etc.
-    inline static const int MirrorChild[6][8] = {
-        // +X: child i's mirror across +X face (flip bit 0)
-        {1, 0, 3, 2, 5, 4, 7, 6},
-        // -X: same mapping (flip bit 0)
-        {1, 0, 3, 2, 5, 4, 7, 6},
-        // +Y: flip bit 1
-        {2, 3, 0, 1, 6, 7, 4, 5},
-        // -Y: flip bit 1
-        {2, 3, 0, 1, 6, 7, 4, 5},
-        // +Z: flip bit 2
-        {4, 5, 6, 7, 0, 1, 2, 3},
-        // -Z: flip bit 2
-        {4, 5, 6, 7, 0, 1, 2, 3},
-    };
-
 public:
     TArray<uint8> TreeIndex;
     TWeakPtr<FAdaptiveOctreeNode> Parent;
     TSharedPtr<FAdaptiveOctreeNode> Children[8];
-    int DepthBounds[2];
+    int DepthBounds[3];
 
     FVector AnchorCenter;
     FVector Center;
-    int ChunkDepth = 5;
     double Extent;
-    //double Density;
     FVector DualContourPosition;
     FVector DualContourNormal;
     bool IsSurfaceNode;
     bool LodOverride = false; //If true prevent merge ops
     FNodeCorner Corners[8];
-    //FNodeEdge Edges[12];
     TArray<FNodeEdge> SignChangeEdges;
+    double ScreenSpaceThreshold = 0.075;
 
     bool IsLeaf();
     bool IsRoot();
@@ -484,7 +439,8 @@ public:
     void Split();
     bool ShouldSplit(FVector InCameraPosition, double InLodDistanceFactor);
     void Merge();
-    bool ShouldMerge(FVector InCameraPosition, double InLodDistanceFactor);    
+    bool ShouldMerge(FVector InCameraPosition, double InLodDistanceFactor);
+
     void UpdateLod(FVector InCameraPosition, double InLodDistanceFactor, TArray<FNodeEdge>& OutNodeEdges, TMap<FEdgeKey, int32>& EdgeMap, bool& OutChanged);
 
     TArray<FNodeEdge> GetSurfaceEdges();
@@ -500,11 +456,4 @@ public:
     FAdaptiveOctreeNode(TFunction<double(FVector, FVector)>* DensityFunction, TSharedPtr<FAdaptiveOctreeNode> InParent, uint8 InChildIndex, FVector InAnchorCenter);
 
     FVector GetInterpolatedNormal(FVector P);
-
-    // Neighbor finding for restricted octree
-    // Direction: 0=+X, 1=-X, 2=+Y, 3=-Y, 4=+Z, 5=-Z
-    TSharedPtr<FAdaptiveOctreeNode> FindNeighbor(int Direction);
-
-    // Get all face-adjacent leaf neighbors (may return multiple small neighbors on one face)
-    TArray<TSharedPtr<FAdaptiveOctreeNode>> GetFaceNeighborLeaves(int Direction);
 };

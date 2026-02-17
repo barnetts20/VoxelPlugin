@@ -16,11 +16,12 @@ FAdaptiveOctreeNode::FAdaptiveOctreeNode(TFunction<double(FVector, FVector)>* In
     DensityFunction = InDensityFunction;
     Center = InCenter;
     AnchorCenter = InCenter;
+
     Extent = FMath::Max(InExtent, 0.0);
 
     DepthBounds[0] = InMinDepth;
     DepthBounds[1] = InMaxDepth;
-
+    DepthBounds[2] = InMinDepth + 3; //TODO THIS SHOULD BE PASSED 
     // Use a conservative h for the root
     double h = 0.1 * Extent;
 
@@ -64,10 +65,10 @@ FAdaptiveOctreeNode::FAdaptiveOctreeNode(TFunction<double(FVector, FVector)>* In
 
     DepthBounds[0] = InParent->DepthBounds[0];
     DepthBounds[1] = InParent->DepthBounds[1];
-
-    // DERIVE CHUNK EXTENT: Using the TreeIndex depth relative to ChunkDepth
-    // ChunkDepth should be a member or accessible variable (e.g., 5)
-    double ChunkExtent = Extent * FMath::Pow(2.0, (double)(TreeIndex.Num() - ChunkDepth));
+    DepthBounds[2] = InParent->DepthBounds[2];
+    // DERIVE CHUNK EXTENT: Using the TreeIndex depth relative to MinDepth
+    // MinDepth should be a member or accessible variable (e.g., 5)
+    double ChunkExtent = Extent * FMath::Pow(2.0, (double)(TreeIndex.Num() - DepthBounds[0]));
 
     // STABLE GRADIENT STEP: Node detail (10%) but clamped to Chunk stability (1e-6)
     double h = FMath::Max(0.1 * Extent, ChunkExtent * 2 * 1e-6);
@@ -129,9 +130,9 @@ void FAdaptiveOctreeNode::Split()
     if (!bIsLeaf) return;
 
     // Determine the anchor for children
-    // If THIS node is at the ChunkDepth, its children will use its center as their anchor.
+    // If THIS node is at the MinDepth, its children will use its center as their anchor.
     // Otherwise, they inherit the current anchor.
-    FVector NextAnchor = (TreeIndex.Num() == ChunkDepth) ? Center : AnchorCenter;
+    FVector NextAnchor = (TreeIndex.Num() == DepthBounds[0]) ? Center : AnchorCenter;
 
     for (uint8 i = 0; i < 8; i++)
     {
@@ -153,41 +154,40 @@ void FAdaptiveOctreeNode::Split()
 
 void FAdaptiveOctreeNode::Merge()
 {
-    if (bIsLeaf) return; // Already merged
+    if (bIsLeaf) return;
 
-    TArray<TSharedPtr<FAdaptiveOctreeNode>> NodesToDelete;
-    NodesToDelete.Append(Children); // Add children to cleanup list
-
-    while (NodesToDelete.Num() > 0)
+    for (int i = 0; i < 8; i++)
     {
-        TSharedPtr<FAdaptiveOctreeNode> Node = NodesToDelete.Pop();
-        if (!Node.IsValid()) continue;
-
-        // Add children of this node to the stack before clearing
-        if (!Node->bIsLeaf) {
-            NodesToDelete.Append(Node->Children);
+        if (Children[i].IsValid())
+        {
+            Children[i]->Merge(); // Recursively clean grandchildren
+            Children[i].Reset();
         }
-            
-        // Properly clear shared pointers
-        for (int i = 0; i < 8; i++) {
-            Node->Children[i].Reset();
-        }
-        Node.Reset();
     }
     bIsLeaf = true;
 }
 
-bool FAdaptiveOctreeNode::ShouldSplit(FVector InCameraPosition, double InLodDistanceFactor)
+bool FAdaptiveOctreeNode::ShouldSplit(FVector InCameraPosition, double InScreenSpaceThreshold)
 {
-    return TreeIndex.Num() < DepthBounds[0] || (FVector::Dist(DualContourPosition, InCameraPosition) < Extent * (InLodDistanceFactor + TreeIndex.Num()) && TreeIndex.Num() < DepthBounds[1]);
+    int Depth = TreeIndex.Num();
+    if (Depth >= DepthBounds[1]) return false;
+    if (Depth < DepthBounds[2]) return true;
+    double Distance = FMath::Max(FVector::Dist(DualContourPosition, InCameraPosition),1);
+    double AngularSize = (2 * Extent) / Distance;
+    return AngularSize > ScreenSpaceThreshold;
 }
 
-bool FAdaptiveOctreeNode::ShouldMerge(FVector InCameraPosition, double InLodDistanceFactor)
+bool FAdaptiveOctreeNode::ShouldMerge(FVector InCameraPosition, double InScreenSpaceThreshold)
 {
+    int Depth = TreeIndex.Num();
     if (LodOverride) return false;
-    //if (!CanMergeBalanced()) return false;  // <-- add this
-    return (FVector::Dist(DualContourPosition, InCameraPosition) > Extent * (InLodDistanceFactor + TreeIndex.Num()))
-        && TreeIndex.Num() >= DepthBounds[0];
+    if (Depth <= DepthBounds[0]) return false;
+    if (Depth < DepthBounds[2]) return false;
+    double Distance = FVector::Dist(DualContourPosition, InCameraPosition);
+    Distance = FMath::Max(Distance, 1);
+    double AngularSize = (2 * Extent) / Distance;
+
+    return AngularSize < ScreenSpaceThreshold * 0.5;
 }
 
 void AppendUniqueEdges(const TArray<FNodeEdge>& InAppendEdges, TArray<FNodeEdge>& OutNodeEdges, TMap<FEdgeKey, int32>& EdgeMap)
@@ -259,10 +259,8 @@ TArray<FNodeEdge> FAdaptiveOctreeNode::GetSurfaceEdges()
         return SignChangeEdges;
     }
 
-    // If we are NOT a leaf (e.g. a Chunk Root), only then do we gather from children
-    TArray<FNodeEdge> SurfaceEdges;
-    // ... (Your existing TQueue logic is fine here, BUT only if !IsLeaf()) ...
-    return SurfaceEdges;
+    ensure(false);
+    return TArray<FNodeEdge>();
 }
 
 // Retrieves all surface nodes for meshing
@@ -297,11 +295,6 @@ TArray<TSharedPtr<FAdaptiveOctreeNode>> FAdaptiveOctreeNode::GetSurfaceNodes()
 
 TArray<FNodeEdge>& FAdaptiveOctreeNode::GetSignChangeEdges()
 {
-    //TArray<FNodeEdge> returnEdges;
-    //for (int i = 0; i < 6; i++) {
-    //    if (Edges[i].SignChange) returnEdges.Add(Edges[i]);
-    //}
-    //return returnEdges;
     return SignChangeEdges;
 }
 
@@ -328,10 +321,7 @@ void FAdaptiveOctreeNode::ComputeDualContourPosition()
 
         MaxDensityRange = FMath::Max(MaxDensityRange, FMath::Abs(Denom));
 
-        double T = (0 - Edge.Corners[0].Density) / Denom;
-        T = FMath::Clamp(T, 0.0, 1.0);
-
-        FVector P = Edge.Corners[0].Position + T * (Edge.Corners[1].Position - Edge.Corners[0].Position);
+        FVector P = Edge.ZeroCrossingPoint;
         MassPoint += P;
 
         FVector Normal = GetInterpolatedNormal(P);
@@ -434,76 +424,4 @@ void FAdaptiveOctreeNode::DrawAndLogNode()
                 NodeCorners[i].Density);
         }
         });
-}
-
-TSharedPtr<FAdaptiveOctreeNode> FAdaptiveOctreeNode::FindNeighbor(int Direction)
-{
-    // If we're root, no neighbor in this direction
-    if (!Parent.IsValid()) return nullptr;
-
-    auto ParentPtr = Parent.Pin();
-    if (!ParentPtr.IsValid()) return nullptr;
-
-    // What child index are we?
-    uint8 MyChildIndex = TreeIndex.Last();
-
-    // Check if the neighbor is a sibling (shares the same parent)
-    // A child is on the +X face if bit 0 is set, -X if bit 0 is clear, etc.
-    // Direction 0 (+X): we need bit 0 to be 0 (so mirror is within same parent)
-    // Direction 1 (-X): we need bit 0 to be 1
-
-    int AxisBit = Direction / 2;  // 0 for X, 1 for Y, 2 for Z
-    bool PositiveDir = (Direction % 2 == 0);
-    bool ChildOnPositiveSide = (MyChildIndex & (1 << AxisBit)) != 0;
-
-    if (PositiveDir != ChildOnPositiveSide) {
-        // Neighbor is a sibling — just flip the relevant bit
-        uint8 SiblingIndex = MyChildIndex ^ (1 << AxisBit);
-        return ParentPtr->Children[SiblingIndex];
-    }
-
-    // Neighbor is NOT a sibling — go up to parent and find parent's neighbor
-    TSharedPtr<FAdaptiveOctreeNode> ParentNeighbor = ParentPtr->FindNeighbor(Direction);
-
-    if (!ParentNeighbor.IsValid()) return nullptr;
-
-    // If parent's neighbor is a leaf, it IS the neighbor (larger cell)
-    if (ParentNeighbor->IsLeaf()) return ParentNeighbor;
-
-    // Otherwise, descend into parent's neighbor to find the adjacent child
-    // We want the child on the opposite face
-    uint8 MirroredChild = MirrorChild[Direction][MyChildIndex];
-    return ParentNeighbor->Children[MirroredChild];
-}
-
-TArray<TSharedPtr<FAdaptiveOctreeNode>> FAdaptiveOctreeNode::GetFaceNeighborLeaves(int Direction)
-{
-    TArray<TSharedPtr<FAdaptiveOctreeNode>> Result;
-
-    TSharedPtr<FAdaptiveOctreeNode> Neighbor = FindNeighbor(Direction);
-    if (!Neighbor.IsValid()) return Result;
-
-    // Collect all leaf descendants of Neighbor that touch our face
-    TArray<TSharedPtr<FAdaptiveOctreeNode>> Stack;
-    Stack.Push(Neighbor);
-
-    while (Stack.Num() > 0) {
-        auto Current = Stack.Pop();
-        if (!Current.IsValid()) continue;
-
-        if (Current->IsLeaf()) {
-            Result.Add(Current);
-        }
-        else {
-            // Only descend into children that are on the face adjacent to us
-            int OppDir = OppositeDir[Direction];
-            for (int i = 0; i < 4; i++) {
-                int ChildIdx = FaceChildren[OppDir][i];
-                if (Current->Children[ChildIdx].IsValid()) {
-                    Stack.Push(Current->Children[ChildIdx]);
-                }
-            }
-        }
-    }
-    return Result;
 }

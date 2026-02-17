@@ -50,10 +50,7 @@ public:
     double Size = 100000000.0;
     
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Octree")
-    int ChunkDepth = 4;
-    
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Octree")
-    int MinDepth = 8;
+    int MinDepth = 4;
     
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Octree")
     int MaxDepth = 18;
@@ -62,10 +59,10 @@ public:
     int LodFactor = 8;
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Update")
-    double MinDataUpdateInterval = .1;
+    double MinDataUpdateInterval = .05;
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Update")
-    double MinMeshUpdateInterval = .2;
+    double MinMeshUpdateInterval = .1;
 
 protected:
     void CleanSceneRoot();

@@ -10,7 +10,7 @@ AAdaptiveVoxelActor::AAdaptiveVoxelActor()
     PrimaryActorTick.bCanEverTick = true;
     PrimaryActorTick.bStartWithTickEnabled = true;
     CameraPosition = FVector(0, 0, 0);
-    ChunkExtent = Size / FMath::Pow(2.0, (double)ChunkDepth);
+    ChunkExtent = Size / FMath::Pow(2.0, (double)MinDepth);
     LodDistanceThreshold = ChunkExtent * 2.0 * 1e-6;
     Material = UMaterial::GetDefaultMaterial(EMaterialDomain::MD_Surface);
 
@@ -47,7 +47,7 @@ AAdaptiveVoxelActor::AAdaptiveVoxelActor()
     };
 
     //Adaptive octree meshes the implicit structure
-    AdaptiveOctree = MakeShared<FAdaptiveOctree>(DensityFunction, GetActorLocation(), Size, ChunkDepth, MinDepth, MaxDepth);
+    AdaptiveOctree = MakeShared<FAdaptiveOctree>(DensityFunction, GetActorLocation(), Size, MinDepth, MaxDepth);
     //Sparsetree for user edits
     SparseOctree = MakeShared<FSparseOctree>();
 }
@@ -104,7 +104,10 @@ void AAdaptiveVoxelActor::ScheduleDataUpdate(float IntervalInSeconds)
             if (!Self || Self->IsDestroyed) return;
             {
                 FRWScopeLock WriteLock(Self->OctreeLock, SLT_Write);
-                Self->AdaptiveOctree->UpdateLOD(Self->CameraPosition, Self->LodFactor);
+                FVector CurrentCamPos = Self->CameraPosition;
+                FVector Velocity = (CurrentCamPos - Self->LastLodUpdatePosition);
+                FVector PredictedPos = CurrentCamPos + Velocity;
+                Self->AdaptiveOctree->UpdateLOD(PredictedPos, Self->LodFactor);
                 Self->LastLodUpdatePosition = Self->CameraPosition;
             }
 

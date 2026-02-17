@@ -1,15 +1,17 @@
 #include "FAdaptiveOctree.h"
 
 // Constructor
-FAdaptiveOctree::FAdaptiveOctree(TFunction<double(FVector, FVector)> InDensityFunction, FVector InCenter, double InRootExtent, int InChunkDepth, int InMinDepth, int InMaxDepth)
+FAdaptiveOctree::FAdaptiveOctree(TFunction<double(FVector, FVector)> InDensityFunction, FVector InCenter, double InRootExtent, int InMinDepth, int InMaxDepth)
 {
     DensityFunction = InDensityFunction;
     RootExtent = InRootExtent;
-    ChunkDepth = InChunkDepth;
+
     Root = MakeShared<FAdaptiveOctreeNode>(&DensityFunction, InCenter, InRootExtent, InMinDepth, InMaxDepth);
     {
-        SplitToDepth(Root, ChunkDepth);
+        SplitToDepth(Root, InMinDepth);
     }
+
+    ChunkExtent = Root->Extent / (2 * InMinDepth); //We should only need to calculate this once
     Chunks = GetSurfaceNodes(); //Get the nodes containing surface
     TArray<TSharedPtr<FAdaptiveOctreeNode>> NeighborChunks;
 
@@ -287,7 +289,6 @@ TArray<TSharedPtr<FAdaptiveOctreeNode>> FAdaptiveOctree::SampleNodesAroundEdge(c
     FVector Origin = Edge.Corners[0].Position;
     FVector End = Edge.Corners[1].Position;
     FVector Midpoint = (Origin + End) * 0.5;
-    double ChunkExtent = Root->Extent / (2 * ChunkDepth);
     // Helper lambda for biased top-down traversal
     auto GetLeafWithBias = [&](bool BiasPerp1, bool BiasPerp2) -> TSharedPtr<FAdaptiveOctreeNode> {
         TSharedPtr<FAdaptiveOctreeNode> CurrentNode = Root;

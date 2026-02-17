@@ -23,9 +23,9 @@ private:
     TSharedPtr<FAdaptiveOctreeNode> Root;
     TArray<TSharedPtr<FAdaptiveOctreeNode>> Chunks;
     TArray<TSharedPtr<FMeshChunk>> MeshChunks;
-    int ChunkDepth;
     bool MeshChunksInitialized = false;
     double RootExtent;
+    double ChunkExtent;
 
     void SplitToDepth(TSharedPtr<FAdaptiveOctreeNode> Node, int InMinDepth);
     
@@ -43,7 +43,7 @@ private:
 
 public:
     // Constructor
-    FAdaptiveOctree(TFunction<double(FVector, FVector)> InDensityFunction, FVector InCenter, double InRootExtent, int ChunkDepth, int InMinDepth, int InMaxDepth);
+    FAdaptiveOctree(TFunction<double(FVector, FVector)> InDensityFunction, FVector InCenter, double InRootExtent, int InMinDepth, int InMaxDepth);
 
     void InitializeMeshChunks(ARealtimeMeshActor* InParentActor, UMaterialInterface* InMaterial);
     
