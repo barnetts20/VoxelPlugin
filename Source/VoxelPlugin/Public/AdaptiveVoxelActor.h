@@ -35,7 +35,7 @@ private:
     bool Initialized = false;
     bool IsDestroyed = false;
 
-    double Size = 600000000.0;
+    double Size = 700000000.0;
 
 public:
     AAdaptiveVoxelActor();

@@ -15,6 +15,7 @@ private:
     TSharedPtr<FAdaptiveOctreeNode> Root;
     TArray<TSharedPtr<FAdaptiveOctreeNode>> Chunks;
     TArray<TSharedPtr<FMeshChunk>> MeshChunks;
+    int ChunkDepth;
     bool MeshChunksInitialized = false;
     double RootExtent;
 

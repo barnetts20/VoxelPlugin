@@ -1,10 +1,11 @@
 #include "FAdaptiveOctree.h"
 
 // Constructor
-FAdaptiveOctree::FAdaptiveOctree(TFunction<double(FVector, FVector)> InDensityFunction, FVector InCenter, double InRootExtent, int ChunkDepth, int InMinDepth, int InMaxDepth)
+FAdaptiveOctree::FAdaptiveOctree(TFunction<double(FVector, FVector)> InDensityFunction, FVector InCenter, double InRootExtent, int InChunkDepth, int InMinDepth, int InMaxDepth)
 {
     DensityFunction = InDensityFunction;
     RootExtent = InRootExtent;
+    ChunkDepth = InChunkDepth;
     Root = MakeShared<FAdaptiveOctreeNode>(&DensityFunction, InCenter, InRootExtent, InMinDepth, InMaxDepth);
     {
         SplitToDepth(Root, ChunkDepth);
@@ -145,7 +146,6 @@ void FAdaptiveOctree::UpdateMeshChunkStreamData(TSharedPtr<FMeshChunk> InChunk)
     TriangleStream.Empty();
     PolygroupStream.Empty();
 
-    // Map to store unique vertices and their indices
     TMap<FMeshVertex, int32> VertexMap;
     TArray<FMeshVertex> UniqueVertices;
     TArray<FIndex3UI> Triangles;
@@ -159,8 +159,7 @@ void FAdaptiveOctree::UpdateMeshChunkStreamData(TSharedPtr<FMeshChunk> InChunk)
     TArray<FEdgeVertexData> AllEdgeData;
     AllEdgeData.SetNum(InChunk->ChunkEdges.Num());
 
-    // With CM units, 0.0001 of Extent is appropriate for vertex snapping
-    double QuantizationGrid = InChunk->ChunkExtent * 1e-6;
+    double QuantizationGrid = InChunk->ChunkExtent * 2 * 1e-6;
 
     ParallelFor(InChunk->ChunkEdges.Num(), [&](int32 edgeIdx) {
         const FNodeEdge currentEdge = InChunk->ChunkEdges[edgeIdx];
@@ -176,12 +175,8 @@ void FAdaptiveOctree::UpdateMeshChunkStreamData(TSharedPtr<FMeshChunk> InChunk)
         AllEdgeData[edgeIdx].Vertices.SetNumZeroed(nodesToMesh.Num());
 
         for (int i = 0; i < nodesToMesh.Num(); i++) {
-            // STEP 1: Capture World Position in Double
             FVector WorldPos = nodesToMesh[i]->DualContourPosition;
 
-            // STEP 2: Precise Relative Subtraction
-            // This is critical. By doing this in double, we preserve the 
-            // 'small' local coordinate even at 1000km from origin.
             double LX = (double)WorldPos.X - (double)InChunk->ChunkCenter.X;
             double LY = (double)WorldPos.Y - (double)InChunk->ChunkCenter.Y;
             double LZ = (double)WorldPos.Z - (double)InChunk->ChunkCenter.Z;
@@ -189,18 +184,18 @@ void FAdaptiveOctree::UpdateMeshChunkStreamData(TSharedPtr<FMeshChunk> InChunk)
 
             FVector n = nodesToMesh[i]->DualContourNormal;
 
+            // Store quantized position for the normal calculation loop
             AllEdgeData[edgeIdx].Vertices[i].Position = QuantizePosition(LocalPos, QuantizationGrid);
             AllEdgeData[edgeIdx].Vertices[i].OriginalPosition = LocalPos;
-            AllEdgeData[edgeIdx].Vertices[i].Normal = n;
+            AllEdgeData[edgeIdx].Vertices[i].Normal = n; 
             AllEdgeData[edgeIdx].Vertices[i].Color = FColor::Green;
             AllEdgeData[edgeIdx].Vertices[i].UV = ComputeTriplanarUV(WorldPos, n);
         }
-     });
+    });
 
-    // Build mesh from collected data (single-threaded for TMap)
+    // Topology Build
     for (int32 edgeIdx = 0; edgeIdx < AllEdgeData.Num(); edgeIdx++) {
-        if (!AllEdgeData[edgeIdx].IsValid)
-            continue;
+        if (!AllEdgeData[edgeIdx].IsValid) continue;
 
         const auto& currentEdge = AllEdgeData[edgeIdx].Edge.GetValue();
         const TArray<FMeshVertex>& EdgeVertices = AllEdgeData[edgeIdx].Vertices;
@@ -210,11 +205,9 @@ void FAdaptiveOctree::UpdateMeshChunkStreamData(TSharedPtr<FMeshChunk> InChunk)
 
         for (int i = 0; i < EdgeVertices.Num(); i++) {
             int32* ExistingIndex = VertexMap.Find(EdgeVertices[i]);
-
             if (ExistingIndex) {
                 VertexIndices[i] = *ExistingIndex;
-            }
-            else {
+            } else {
                 int32 NewIndex = UniqueVertices.Num();
                 UniqueVertices.Add(EdgeVertices[i]);
                 VertexMap.Add(EdgeVertices[i], NewIndex);
@@ -231,8 +224,7 @@ void FAdaptiveOctree::UpdateMeshChunkStreamData(TSharedPtr<FMeshChunk> InChunk)
         {
             if (FlipWinding) {
                 Triangles.Add(FIndex3UI(VertexIndices[0], VertexIndices[2], VertexIndices[1]));
-            }
-            else {
+            } else {
                 Triangles.Add(FIndex3UI(VertexIndices[0], VertexIndices[1], VertexIndices[2]));
             }
 
@@ -242,15 +234,14 @@ void FAdaptiveOctree::UpdateMeshChunkStreamData(TSharedPtr<FMeshChunk> InChunk)
             {
                 if (FlipWinding) {
                     Triangles.Add(FIndex3UI(VertexIndices[0], VertexIndices[3], VertexIndices[2]));
-                }
-                else {
+                } else {
                     Triangles.Add(FIndex3UI(VertexIndices[0], VertexIndices[2], VertexIndices[3]));
                 }
             }
         }
     }
 
-    // Populate streams
+    // Finalize Streams
     PositionStream.SetNumUninitialized(UniqueVertices.Num());
     TangentStream.SetNumUninitialized(UniqueVertices.Num());
     ColorStream.SetNumUninitialized(UniqueVertices.Num());
@@ -259,21 +250,26 @@ void FAdaptiveOctree::UpdateMeshChunkStreamData(TSharedPtr<FMeshChunk> InChunk)
     PolygroupStream.SetNumUninitialized(Triangles.Num());
 
     ParallelFor(UniqueVertices.Num(), [&](int32 VertIdx) {
-        const FMeshVertex& Vertex = UniqueVertices[VertIdx];
+        FMeshVertex& Vertex = UniqueVertices[VertIdx];
+
+        // DC normal — stable, chunk-independent
         PositionStream.Set(VertIdx, Vertex.OriginalPosition);
+
         FRealtimeMeshTangentsHighPrecision Tangent;
         Tangent.SetNormal(FVector3f(Vertex.Normal));
         TangentStream.Set(VertIdx, Tangent);
+
         ColorStream.Set(VertIdx, Vertex.Color);
         TexCoordStream.Set(VertIdx, Vertex.UV);
-        });
+     });
+
     ParallelFor(Triangles.Num(), [&](int32 TriIdx) {
         TriangleStream.Set(TriIdx, Triangles[TriIdx]);
         PolygroupStream.Set(TriIdx, 0);
-        });
+    });
+
     InChunk->IsDirty = (Triangles.Num() > 0);
 }
-
 
 // Optional: Add a method to pre-compute a deterministic hash for a position to ensure consistent vertex ordering
 uint32 FAdaptiveOctree::ComputePositionHash(const FVector& Position, float GridSize)
@@ -398,7 +394,7 @@ TArray<TSharedPtr<FAdaptiveOctreeNode>> FAdaptiveOctree::SampleNodesAroundEdge(c
     FVector Origin = Edge.Corners[0].Position;
     FVector End = Edge.Corners[1].Position;
     FVector Midpoint = (Origin + End) * 0.5;
-
+    double ChunkExtent = Root->Extent / (2 * ChunkDepth);
     // Helper lambda for biased top-down traversal
     auto GetLeafWithBias = [&](bool BiasPerp1, bool BiasPerp2) -> TSharedPtr<FAdaptiveOctreeNode> {
         TSharedPtr<FAdaptiveOctreeNode> CurrentNode = Root;
@@ -407,7 +403,7 @@ TArray<TSharedPtr<FAdaptiveOctreeNode>> FAdaptiveOctree::SampleNodesAroundEdge(c
             int ChildIndex = 0;
 
             // Adaptive epsilon based on current node size to handle floating-point drift
-            double Epsilon = CurrentNode->Extent * 1e-4;
+            double Epsilon = ChunkExtent * 2 * 1e-6;
 
             // Helper to check which side of the splitting plane the point falls on
             auto CheckSide = [&](int AxisIndex, bool PositiveBias) {

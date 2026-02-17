@@ -17,27 +17,24 @@ FAdaptiveOctreeNode::FAdaptiveOctreeNode(TFunction<double(FVector, FVector)>* In
     Center = InCenter;
     AnchorCenter = InCenter;
     Extent = FMath::Max(InExtent, 0.0);
-    //Density = 0.0;
+
     DepthBounds[0] = InMinDepth;
     DepthBounds[1] = InMaxDepth;
+
+    // Use a conservative h for the root
+    double h = 0.1 * Extent;
 
     for (int i = 0; i < 8; i++) {
         FVector CornerPosition = Center + Offsets[i] * Extent;
         double d = (*DensityFunction)(CornerPosition, AnchorCenter);
 
-        // Calculate normal for this corner
-        double h = this->Extent * 0.05;
-
-        // 2. STABILITY SHIELD: Don't let h get smaller than the floating point 'gap'
-        // at this distance from the anchor.
-        double PrecisionLimit = (Center - AnchorCenter).Size() * 1e-6;
-        h = FMath::Max(h, 300);// PrecisionLimit);
-
+        // Forward difference is fine for the root as it's usually empty/air
         double dx = (*DensityFunction)(CornerPosition + FVector(h, 0, 0), AnchorCenter) - d;
         double dy = (*DensityFunction)(CornerPosition + FVector(0, h, 0), AnchorCenter) - d;
         double dz = (*DensityFunction)(CornerPosition + FVector(0, 0, h), AnchorCenter) - d;
+
         FVector grad(dx, dy, dz);
-        grad.Normalize();
+        if (!grad.Normalize()) { grad = FVector::UpVector; }
 
         Corners[i] = FNodeCorner(CornerPosition, d, grad);
     }
@@ -54,30 +51,44 @@ FAdaptiveOctreeNode::FAdaptiveOctreeNode(TFunction<double(FVector, FVector)>* In
 // Child Constructor
 FAdaptiveOctreeNode::FAdaptiveOctreeNode(TFunction<double(FVector, FVector)>* InDensityFunction, TSharedPtr<FAdaptiveOctreeNode> InParent, uint8 ChildIndex, FVector InAnchorCenter)
 {
+    TreeIndex = InParent->TreeIndex;
+    TreeIndex.Add(ChildIndex);
+
     Parent = InParent;
     DensityFunction = InDensityFunction;
-    Center = InParent->Center + Offsets[ChildIndex] * (InParent->Extent * 0.5);
     AnchorCenter = InAnchorCenter;
+
+    // Set spatial bounds first
     Extent = InParent->Extent * 0.5;
-    //Density = 0.0;
+    Center = InParent->Center + Offsets[ChildIndex] * Extent;
+
     DepthBounds[0] = InParent->DepthBounds[0];
     DepthBounds[1] = InParent->DepthBounds[1];
 
-    for (int i = 0; i < 8; i++) {
-        FVector CornerPosition = Center + Offsets[i] * Extent;
-        double d = (*DensityFunction)(CornerPosition, AnchorCenter);
+    // DERIVE CHUNK EXTENT: Using the TreeIndex depth relative to ChunkDepth
+    // ChunkDepth should be a member or accessible variable (e.g., 5)
+    double ChunkExtent = Extent * FMath::Pow(2.0, (double)(TreeIndex.Num() - ChunkDepth));
 
-        // Calculate normal for this corner
-        double dist = (CornerPosition - AnchorCenter).Size();
-        double h = FMath::Max(0.1 * Extent, dist * 1e-7);
+    // STABLE GRADIENT STEP: Node detail (10%) but clamped to Chunk stability (1e-6)
+    double h = FMath::Max(0.1 * Extent, ChunkExtent * 2 * 1e-6);
 
-        double dx = (*DensityFunction)(CornerPosition + FVector(h, 0, 0), AnchorCenter) - d;
-        double dy = (*DensityFunction)(CornerPosition + FVector(0, h, 0), AnchorCenter) - d;
-        double dz = (*DensityFunction)(CornerPosition + FVector(0, 0, h), AnchorCenter) - d;
-        FVector grad(dx, dy, dz);
-        grad.Normalize();
+    for (int i = 0; i < 8; i++)
+    {
+        FVector CornerPos = Center + (Offsets[i] * Extent);
+        double d = (*DensityFunction)(CornerPos, AnchorCenter);
 
-        Corners[i] = FNodeCorner(CornerPosition, d, grad);
+        // CENTRAL DIFFERENCE: Much smoother for planetary lighting
+        double dx = (*DensityFunction)(CornerPos + FVector(h, 0, 0), AnchorCenter) -
+            (*DensityFunction)(CornerPos - FVector(h, 0, 0), AnchorCenter);
+        double dy = (*DensityFunction)(CornerPos + FVector(0, h, 0), AnchorCenter) -
+            (*DensityFunction)(CornerPos - FVector(0, h, 0), AnchorCenter);
+        double dz = (*DensityFunction)(CornerPos + FVector(0, 0, h), AnchorCenter) -
+            (*DensityFunction)(CornerPos - FVector(0, 0, h), AnchorCenter);
+
+        FVector Normal(dx, dy, dz);
+        if (!Normal.Normalize()) { Normal = FVector::UpVector; }
+
+        Corners[i] = FNodeCorner(CornerPos, d, Normal);
     }
 
     for (int i = 0; i < 12; i++)
@@ -86,12 +97,6 @@ FAdaptiveOctreeNode::FAdaptiveOctreeNode(TFunction<double(FVector, FVector)>* In
         if (anEdge.SignChange) SignChangeEdges.Add(anEdge);
     }
 
-    TreeIndex = InParent->TreeIndex;
-    TreeIndex.Add(ChildIndex);
-    //Look up user density alterations in Sparse octree for this index? Would actually need to happen before all density evaluations.
-    //Each node can calculate its own density alteration via the sparse octree stored values, as well as its composite density modification
-    //By accumulating its parent node density alterations, this final value is applied to the density calculated by the density function before
-   
     ComputeDualContourPosition();
 }
 
@@ -323,45 +328,61 @@ void FAdaptiveOctreeNode::ComputeDualContourPosition()
         IsSurfaceNode = false;
         return;
     }
-
     IsSurfaceNode = true;
     FQEF Qef;
 
-    // 1. STABILITY LAYER: Scale-aware epsilon. 
-    // At 10^8, h must be large enough to overcome float precision noise.
     FVector MassPoint = FVector::ZeroVector;
+    double MaxDensityRange = 0.0;
+    int32 ValidEdges = 0;
 
     for (FNodeEdge& Edge : SignChangeEdges)
     {
-        // Re-calculate T in high precision double
         double Denom = Edge.Corners[1].Density - Edge.Corners[0].Density;
         if (FMath::Abs(Denom) < 1e-15) continue;
 
+        MaxDensityRange = FMath::Max(MaxDensityRange, FMath::Abs(Denom));
+
         double T = (0 - Edge.Corners[0].Density) / Denom;
         T = FMath::Clamp(T, 0.0, 1.0);
-        // This is our high-precision surface point
+
         FVector P = Edge.Corners[0].Position + T * (Edge.Corners[1].Position - Edge.Corners[0].Position);
         MassPoint += P;
 
         FVector Normal = GetInterpolatedNormal(P);
-
         Qef.AddPlane(P, Normal);
+        ValidEdges++;
     }
 
-    MassPoint /= (double)SignChangeEdges.Num();
+    if (ValidEdges == 0)
+    {
+        DualContourPosition = Center;
+        DualContourNormal = FVector::ZeroVector;
+        return;
+    }
 
-    double Error = 0.0;
-    FVector CalculatedPos = Qef.Solve(Center, Extent, &Error);
+    MassPoint /= (double)ValidEdges;
 
-    // 4. HOLE FIX: If QEF result is unstable, force it to the MassPoint.
-    // This is the primary fix for holes that aren't at LOD boundaries.
-    if (FVector::DistSquared(CalculatedPos, MassPoint) > (Extent * Extent) * 2.0)
+    // When density variation is below float precision, the zero-crossing
+    // T values are pure noise. The mass point averages out the jitter
+    // and gives a stable position. Skip the QEF entirely.
+    double PrecisionThreshold = 1e-5;
+    if (MaxDensityRange < PrecisionThreshold)
     {
         DualContourPosition = MassPoint;
     }
     else
     {
-        DualContourPosition = CalculatedPos;
+        double Error = 0.0;
+        FVector CalculatedPos = Qef.Solve(Center, Extent, &Error);
+
+        if (FVector::DistSquared(CalculatedPos, MassPoint) > (Extent * Extent) * 2.0)
+        {
+            DualContourPosition = MassPoint;
+        }
+        else
+        {
+            DualContourPosition = CalculatedPos;
+        }
     }
 
     // Standard bounding box clamp
