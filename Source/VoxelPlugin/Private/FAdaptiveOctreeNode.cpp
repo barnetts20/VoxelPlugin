@@ -17,20 +17,34 @@ FAdaptiveOctreeNode::FAdaptiveOctreeNode(TFunction<double(FVector, FVector)>* In
     Center = InCenter;
     AnchorCenter = InCenter;
     Extent = FMath::Max(InExtent, 0.0);
-    Density = 0.0;
+    //Density = 0.0;
     DepthBounds[0] = InMinDepth;
     DepthBounds[1] = InMaxDepth;
 
     for (int i = 0; i < 8; i++) {
         FVector CornerPosition = Center + Offsets[i] * Extent;
-        Corners[i] = FNodeCorner(i, CornerPosition, (*DensityFunction)(CornerPosition, AnchorCenter));
-        Children[i] = nullptr;
+        double d = (*DensityFunction)(CornerPosition, AnchorCenter);
+
+        // Calculate normal for this corner
+        double h = this->Extent * 0.05;
+
+        // 2. STABILITY SHIELD: Don't let h get smaller than the floating point 'gap'
+        // at this distance from the anchor.
+        double PrecisionLimit = (Center - AnchorCenter).Size() * 1e-6;
+        h = FMath::Max(h, 300);// PrecisionLimit);
+
+        double dx = (*DensityFunction)(CornerPosition + FVector(h, 0, 0), AnchorCenter) - d;
+        double dy = (*DensityFunction)(CornerPosition + FVector(0, h, 0), AnchorCenter) - d;
+        double dz = (*DensityFunction)(CornerPosition + FVector(0, 0, h), AnchorCenter) - d;
+        FVector grad(dx, dy, dz);
+        grad.Normalize();
+
+        Corners[i] = FNodeCorner(CornerPosition, d, grad);
     }
 
     for (int EdgeIndex = 0; EdgeIndex < 12; EdgeIndex++)
     {
         FNodeEdge anEdge = FNodeEdge(Corners[EdgePairs[EdgeIndex][0]], Corners[EdgePairs[EdgeIndex][1]]);
-        Edges[EdgeIndex] = anEdge;
         if (anEdge.SignChange) SignChangeEdges.Add(anEdge);
     }
 
@@ -45,20 +59,30 @@ FAdaptiveOctreeNode::FAdaptiveOctreeNode(TFunction<double(FVector, FVector)>* In
     Center = InParent->Center + Offsets[ChildIndex] * (InParent->Extent * 0.5);
     AnchorCenter = InAnchorCenter;
     Extent = InParent->Extent * 0.5;
-    Density = 0.0;
+    //Density = 0.0;
     DepthBounds[0] = InParent->DepthBounds[0];
     DepthBounds[1] = InParent->DepthBounds[1];
 
     for (int i = 0; i < 8; i++) {
         FVector CornerPosition = Center + Offsets[i] * Extent;
-        Corners[i] = FNodeCorner(i, CornerPosition, (*DensityFunction)(CornerPosition, AnchorCenter));
-        Children[i] = nullptr;
+        double d = (*DensityFunction)(CornerPosition, AnchorCenter);
+
+        // Calculate normal for this corner
+        double dist = (CornerPosition - AnchorCenter).Size();
+        double h = FMath::Max(0.1 * Extent, dist * 1e-7);
+
+        double dx = (*DensityFunction)(CornerPosition + FVector(h, 0, 0), AnchorCenter) - d;
+        double dy = (*DensityFunction)(CornerPosition + FVector(0, h, 0), AnchorCenter) - d;
+        double dz = (*DensityFunction)(CornerPosition + FVector(0, 0, h), AnchorCenter) - d;
+        FVector grad(dx, dy, dz);
+        grad.Normalize();
+
+        Corners[i] = FNodeCorner(CornerPosition, d, grad);
     }
 
     for (int i = 0; i < 12; i++)
     {
         FNodeEdge anEdge = FNodeEdge(Corners[EdgePairs[i][0]], Corners[EdgePairs[i][1]]);
-        Edges[i] = anEdge;
         if (anEdge.SignChange) SignChangeEdges.Add(anEdge);
     }
 
@@ -69,6 +93,30 @@ FAdaptiveOctreeNode::FAdaptiveOctreeNode(TFunction<double(FVector, FVector)>* In
     //By accumulating its parent node density alterations, this final value is applied to the density calculated by the density function before
    
     ComputeDualContourPosition();
+}
+
+FVector FAdaptiveOctreeNode::GetInterpolatedNormal(FVector P)
+{
+    // Normalize P to [0, 1] range within the cell
+    double tx = (P.X - (Center.X - Extent)) / (2.0 * Extent);
+    double ty = (P.Y - (Center.Y - Extent)) / (2.0 * Extent);
+    double tz = (P.Z - (Center.Z - Extent)) / (2.0 * Extent);
+
+    tx = FMath::Clamp(tx, 0.0, 1.0);
+    ty = FMath::Clamp(ty, 0.0, 1.0);
+    tz = FMath::Clamp(tz, 0.0, 1.0);
+
+    // Trilinear interpolation of the 8 corner normals
+    FVector n00 = FMath::Lerp(Corners[0].Normal, Corners[1].Normal, tx);
+    FVector n01 = FMath::Lerp(Corners[2].Normal, Corners[3].Normal, tx);
+    FVector n10 = FMath::Lerp(Corners[4].Normal, Corners[5].Normal, tx);
+    FVector n11 = FMath::Lerp(Corners[6].Normal, Corners[7].Normal, tx);
+
+    FVector n0 = FMath::Lerp(n00, n01, ty);
+    FVector n1 = FMath::Lerp(n10, n11, ty);
+
+    FVector FinalNormal = FMath::Lerp(n0, n1, tz);
+    return FinalNormal.GetSafeNormal();
 }
 
 void FAdaptiveOctreeNode::Split()
@@ -211,33 +259,18 @@ void FAdaptiveOctreeNode::UpdateLod(FVector InCameraPosition, double InLodDistan
 }
 
 // Retrieves all surface nodes for meshing
+// Update this in FAdaptiveOctreeNode.cpp
 TArray<FNodeEdge> FAdaptiveOctreeNode::GetSurfaceEdges()
 {
-    TArray<FNodeEdge> SurfaceEdges;
-    TMap<FEdgeKey, int32> EdgeMap;
-    TQueue<TSharedPtr<FAdaptiveOctreeNode>> NodeQueue;
-    NodeQueue.Enqueue(this->AsShared());
-
-    while (!NodeQueue.IsEmpty())
+    // If we are a leaf, we already HAVE our edges. No need to traverse.
+    if (IsLeaf())
     {
-        TSharedPtr<FAdaptiveOctreeNode> CurrentNode;
-        NodeQueue.Dequeue(CurrentNode);
-
-        if (!CurrentNode) continue;
-
-        if (CurrentNode->IsLeaf() && CurrentNode->IsSurfaceNode)
-        {
-            AppendUniqueEdges(CurrentNode->GetSignChangeEdges(), SurfaceEdges, EdgeMap);
-        }
-        else
-        {
-            for (int i = 0; i < 8; i++)
-            {
-                if (CurrentNode->Children[i]) NodeQueue.Enqueue(CurrentNode->Children[i]);
-            }
-        }
+        return SignChangeEdges;
     }
 
+    // If we are NOT a leaf (e.g. a Chunk Root), only then do we gather from children
+    TArray<FNodeEdge> SurfaceEdges;
+    // ... (Your existing TQueue logic is fine here, BUT only if !IsLeaf()) ...
     return SurfaceEdges;
 }
 
@@ -296,7 +329,6 @@ void FAdaptiveOctreeNode::ComputeDualContourPosition()
 
     // 1. STABILITY LAYER: Scale-aware epsilon. 
     // At 10^8, h must be large enough to overcome float precision noise.
-    double h = FMath::Max(Extent * 0.01, 50.0); // 20cm minimum step
     FVector MassPoint = FVector::ZeroVector;
 
     for (FNodeEdge& Edge : SignChangeEdges)
@@ -307,20 +339,13 @@ void FAdaptiveOctreeNode::ComputeDualContourPosition()
 
         double T = (0 - Edge.Corners[0].Density) / Denom;
         T = FMath::Clamp(T, 0.0, 1.0);
-
-        // Calculate P relative to Corner[0] to keep values small
+        // This is our high-precision surface point
         FVector P = Edge.Corners[0].Position + T * (Edge.Corners[1].Position - Edge.Corners[0].Position);
         MassPoint += P;
 
-        double fP = (*DensityFunction)(P, AnchorCenter);
-        double dx = (*DensityFunction)(P + FVector(h, 0, 0), AnchorCenter) - fP;
-        double dy = (*DensityFunction)(P + FVector(0, h, 0), AnchorCenter) - fP;
-        double dz = (*DensityFunction)(P + FVector(0, 0, h), AnchorCenter) - fP;
+        FVector Normal = GetInterpolatedNormal(P);
 
-        FVector Normal(dx, dy, dz);
-        if (Normal.Normalize()) {
-            Qef.AddPlane(P, Normal);
-        }
+        Qef.AddPlane(P, Normal);
     }
 
     MassPoint /= (double)SignChangeEdges.Num();

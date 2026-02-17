@@ -2,12 +2,14 @@
 
 #include "CoreMinimal.h"
 
-struct VOXELPLUGIN_API FNodeCorner {
-    int CornerIndex;
+struct FNodeCorner {
     FVector Position;
     double Density;
-    FNodeCorner(int InIndex, FVector InPosition, double InDensity) : CornerIndex(InIndex), Position(InPosition), Density(InDensity) {};
-    FNodeCorner() : CornerIndex(-1), Position(FVector::ZeroVector), Density(0) {};
+    FVector Normal; // Add this
+
+    FNodeCorner() : Position(0), Density(0), Normal(0, 0, 1) {}
+    FNodeCorner(FVector InPos, double InDensity, FVector InNormal)
+        : Position(InPos), Density(InDensity), Normal(InNormal) {}
 };
 
 struct VOXELPLUGIN_API FNodeEdge
@@ -467,13 +469,13 @@ public:
     FVector Center;
     int ChunkDepth = 5;
     double Extent;
-    double Density;
+    //double Density;
     FVector DualContourPosition;
     FVector DualContourNormal;
     bool IsSurfaceNode;
     bool LodOverride = false; //If true prevent merge ops
     FNodeCorner Corners[8];
-    FNodeEdge Edges[12];
+    //FNodeEdge Edges[12];
     TArray<FNodeEdge> SignChangeEdges;
 
     bool IsLeaf();
@@ -497,6 +499,8 @@ public:
 
     // Child Constructor
     FAdaptiveOctreeNode(TFunction<double(FVector, FVector)>* DensityFunction, TSharedPtr<FAdaptiveOctreeNode> InParent, uint8 InChildIndex, FVector InAnchorCenter);
+
+    FVector GetInterpolatedNormal(FVector P);
 
     // Neighbor finding for restricted octree
     // Direction: 0=+X, 1=-X, 2=+Y, 3=-Y, 4=+Z, 5=-Z

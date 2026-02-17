@@ -160,7 +160,7 @@ void FAdaptiveOctree::UpdateMeshChunkStreamData(TSharedPtr<FMeshChunk> InChunk)
     AllEdgeData.SetNum(InChunk->ChunkEdges.Num());
 
     // With CM units, 0.0001 of Extent is appropriate for vertex snapping
-    double QuantizationGrid = 1;// InChunk->ChunkExtent * 0.0001;
+    double QuantizationGrid = InChunk->ChunkExtent * 1e-6;
 
     ParallelFor(InChunk->ChunkEdges.Num(), [&](int32 edgeIdx) {
         const FNodeEdge currentEdge = InChunk->ChunkEdges[edgeIdx];
