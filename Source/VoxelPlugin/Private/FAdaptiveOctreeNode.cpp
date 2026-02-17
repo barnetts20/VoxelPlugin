@@ -21,7 +21,7 @@ FAdaptiveOctreeNode::FAdaptiveOctreeNode(TFunction<double(FVector, FVector)>* In
 
     DepthBounds[0] = InMinDepth;
     DepthBounds[1] = InMaxDepth;
-    DepthBounds[2] = InMinDepth + 3; //TODO THIS SHOULD BE PASSED 
+    DepthBounds[2] = 7; //TODO THIS SHOULD BE PASSED 
     // Use a conservative h for the root
     double h = 0.1 * Extent;
 
@@ -167,27 +167,30 @@ void FAdaptiveOctreeNode::Merge()
     bIsLeaf = true;
 }
 
-bool FAdaptiveOctreeNode::ShouldSplit(FVector InCameraPosition, double InScreenSpaceThreshold)
+
+bool FAdaptiveOctreeNode::ShouldSplit(FVector InCameraPosition, double InScreenSpaceThreshold, double InCameraFOV)
 {
     int Depth = TreeIndex.Num();
     if (Depth >= DepthBounds[1]) return false;
     if (Depth < DepthBounds[2]) return true;
-    double Distance = FMath::Max(FVector::Dist(DualContourPosition, InCameraPosition),1);
-    double AngularSize = (2 * Extent) / Distance;
-    return AngularSize > ScreenSpaceThreshold;
+    double Distance = FMath::Max(FVector::Dist(DualContourPosition, InCameraPosition), 1.0);
+    double FOVScale = 1.0 / FMath::Tan(FMath::DegreesToRadians(InCameraFOV * 0.5));
+    double AngularSize = ((2.0 * Extent) / Distance) * FOVScale;
+
+    return AngularSize > InScreenSpaceThreshold;
 }
 
-bool FAdaptiveOctreeNode::ShouldMerge(FVector InCameraPosition, double InScreenSpaceThreshold)
+bool FAdaptiveOctreeNode::ShouldMerge(FVector InCameraPosition, double InScreenSpaceThreshold, double InCameraFOV)
 {
     int Depth = TreeIndex.Num();
     if (LodOverride) return false;
     if (Depth <= DepthBounds[0]) return false;
     if (Depth < DepthBounds[2]) return false;
-    double Distance = FVector::Dist(DualContourPosition, InCameraPosition);
-    Distance = FMath::Max(Distance, 1);
-    double AngularSize = (2 * Extent) / Distance;
+    double Distance = FMath::Max(FVector::Dist(DualContourPosition, InCameraPosition), 1.0);
+    double FOVScale = 1.0 / FMath::Tan(FMath::DegreesToRadians(InCameraFOV * 0.5));
+    double AngularSize = ((2.0 * Extent) / Distance) * FOVScale;
 
-    return AngularSize < ScreenSpaceThreshold * 0.5;
+    return AngularSize < InScreenSpaceThreshold * 0.5;
 }
 
 void AppendUniqueEdges(const TArray<FNodeEdge>& InAppendEdges, TArray<FNodeEdge>& OutNodeEdges, TMap<FEdgeKey, int32>& EdgeMap)
@@ -214,11 +217,11 @@ void AppendUniqueEdges(const TArray<FNodeEdge>& InAppendEdges, TArray<FNodeEdge>
     }
 }
 
-void FAdaptiveOctreeNode::UpdateLod(FVector InCameraPosition, double InLodDistanceFactor, TArray<FNodeEdge>& OutNodeEdges, TMap<FEdgeKey, int32>& EdgeMap, bool& OutChanged)
+void FAdaptiveOctreeNode::UpdateLod(FVector InCameraPosition, double InScreenSpaceThreshold, double InCameraFOV, TArray<FNodeEdge>& OutNodeEdges, TMap<FEdgeKey, int32>& EdgeMap, bool& OutChanged)
 {
     if (IsLeaf())
     {
-        if (ShouldSplit(InCameraPosition, InLodDistanceFactor))
+        if (ShouldSplit(InCameraPosition, InScreenSpaceThreshold, InCameraFOV))
         {
             OutChanged = true;
             Split();
@@ -227,7 +230,7 @@ void FAdaptiveOctreeNode::UpdateLod(FVector InCameraPosition, double InLodDistan
             }
             return;
         }
-        else if (Parent.IsValid() && Parent.Pin()->ShouldMerge(InCameraPosition, InLodDistanceFactor) && TreeIndex.Last() == 7)
+        else if (Parent.IsValid() && Parent.Pin()->ShouldMerge(InCameraPosition, InScreenSpaceThreshold, InCameraFOV) && TreeIndex.Last() == 7)
         {
             OutChanged = true;
             auto parentPtr = Parent.Pin();
@@ -244,7 +247,7 @@ void FAdaptiveOctreeNode::UpdateLod(FVector InCameraPosition, double InLodDistan
     {
         for (int i = 0; i < 8; i++)
         {
-            Children[i]->UpdateLod(InCameraPosition, InLodDistanceFactor, OutNodeEdges, EdgeMap, OutChanged);
+            Children[i]->UpdateLod(InCameraPosition, InScreenSpaceThreshold, InCameraFOV, OutNodeEdges, EdgeMap, OutChanged);
         }
     }
 }

@@ -106,8 +106,8 @@ void AAdaptiveVoxelActor::ScheduleDataUpdate(float IntervalInSeconds)
                 FRWScopeLock WriteLock(Self->OctreeLock, SLT_Write);
                 FVector CurrentCamPos = Self->CameraPosition;
                 FVector Velocity = (CurrentCamPos - Self->LastLodUpdatePosition);
-                FVector PredictedPos = CurrentCamPos + Velocity;
-                Self->AdaptiveOctree->UpdateLOD(PredictedPos, Self->LodFactor);
+                FVector PredictedPos = CurrentCamPos + (Velocity * 2);
+                Self->AdaptiveOctree->UpdateLOD(PredictedPos, Self->ScreenSpaceThreshold, Self->CameraFOV);
                 Self->LastLodUpdatePosition = Self->CameraPosition;
             }
 
@@ -161,6 +161,11 @@ void AAdaptiveVoxelActor::Tick(float DeltaTime)
         auto viewLocations = world->ViewLocationsRenderedLastFrame;
         if (viewLocations.Num() > 0) {
             this->CameraPosition = viewLocations[0];
+
+            APlayerCameraManager* CamManager = UGameplayStatics::GetPlayerCameraManager(world, 0);
+            if (CamManager) {
+                CameraFOV = CamManager->GetFOVAngle();
+            }
         }
     }
 }

@@ -437,11 +437,11 @@ public:
     bool IsRoot();
 
     void Split();
-    bool ShouldSplit(FVector InCameraPosition, double InLodDistanceFactor);
+    bool ShouldSplit(FVector InCameraPosition, double InScreenSpaceThreshold, double InCameraFOV);
     void Merge();
-    bool ShouldMerge(FVector InCameraPosition, double InLodDistanceFactor);
+    bool ShouldMerge(FVector InCameraPosition, double InScreenSpaceThreshold, double InCameraFOV);
 
-    void UpdateLod(FVector InCameraPosition, double InLodDistanceFactor, TArray<FNodeEdge>& OutNodeEdges, TMap<FEdgeKey, int32>& EdgeMap, bool& OutChanged);
+    void UpdateLod(FVector InCameraPosition, double InScreenSpaceThreshold, double InCameraFOV, TArray<FNodeEdge>& OutNodeEdges, TMap<FEdgeKey, int32>& EdgeMap, bool& OutChanged);
 
     TArray<FNodeEdge> GetSurfaceEdges();
     TArray<TSharedPtr<FAdaptiveOctreeNode>> GetSurfaceNodes();

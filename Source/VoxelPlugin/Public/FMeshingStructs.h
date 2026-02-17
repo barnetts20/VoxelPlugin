@@ -144,9 +144,17 @@ struct VOXELPLUGIN_API FMeshChunk {
         return true;
     }
 
-   void UpdateComponent(TSharedPtr<FMeshChunk> Self) {
+    void UpdateComponent(TSharedPtr<FMeshChunk> Self) {
         AsyncTask(ENamedThreads::GameThread, [Self]() {
             if (!Self->IsInitialized || !Self->IsDirty) return;
+            if (!IsValid(Self->ChunkRtMesh) || !IsValid(Self->ChunkRtComponent)) return;
+
+            auto* PositionStream = Self->ChunkMeshData->MeshStream.Find(FRealtimeMeshStreams::Position);
+            if (!PositionStream || PositionStream->Num() == 0) {
+                Self->IsDirty = false;
+                return;
+            }
+
             Self->IsDirty = false;
             Self->ChunkRtMesh->UpdateSectionGroup(Self->ChunkMeshData->MeshGroupKey, Self->ChunkMeshData->MeshStream);
             Self->ChunkRtMesh->UpdateSectionConfig(Self->ChunkMeshData->MeshSectionKey, Self->SecConfig, true);

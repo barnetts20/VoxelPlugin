@@ -23,6 +23,7 @@ private:
 
     FVector CameraPosition = FVector::ZeroVector;
     FVector LastLodUpdatePosition = FVector(FLT_MAX); // force first update
+    double CameraFOV = 90;
 
     FRWLock OctreeLock;
 
@@ -56,7 +57,7 @@ public:
     int MaxDepth = 18;
     
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Octree")
-    int LodFactor = 8;
+    double ScreenSpaceThreshold = .075;
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Update")
     double MinDataUpdateInterval = .05;

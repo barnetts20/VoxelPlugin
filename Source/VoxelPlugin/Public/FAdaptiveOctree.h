@@ -47,7 +47,7 @@ public:
 
     void InitializeMeshChunks(ARealtimeMeshActor* InParentActor, UMaterialInterface* InMaterial);
     
-    void UpdateLOD(FVector CameraPosition, double LodFactor);
+    void UpdateLOD(FVector InCameraPosition, double InScreenSpaceThreshold, double InCameraFOV);
 
     void UpdateMesh();
 

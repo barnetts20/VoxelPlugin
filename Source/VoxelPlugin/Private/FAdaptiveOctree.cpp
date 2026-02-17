@@ -237,7 +237,7 @@ void FAdaptiveOctree::UpdateMeshChunkStreamData(TSharedPtr<FMeshChunk> InChunk)
     InChunk->IsDirty = (Triangles.Num() > 0);
 }
 
-void FAdaptiveOctree::UpdateLOD(FVector CameraPosition, double LodFactor)
+void FAdaptiveOctree::UpdateLOD(FVector CameraPosition, double InScreenSpaceThreshold, double InCameraFOV)
 {
     if (!MeshChunksInitialized) return;
 
@@ -249,7 +249,7 @@ void FAdaptiveOctree::UpdateLOD(FVector CameraPosition, double LodFactor)
             TArray<FNodeEdge> tChunkEdges;
             TMap<FEdgeKey, int32> tEdgeMap;
             bool tChanged = false;
-            Chunks[idx]->UpdateLod(CameraPosition, LodFactor, tChunkEdges, tEdgeMap, tChanged);
+            Chunks[idx]->UpdateLod(CameraPosition, InScreenSpaceThreshold, InCameraFOV, tChunkEdges, tEdgeMap, tChanged);
             if (tChanged) {
                 MeshChunks[idx]->ChunkEdges = tChunkEdges;
                 FPlatformAtomics::InterlockedExchange(&ChunksModified[idx], 1);
