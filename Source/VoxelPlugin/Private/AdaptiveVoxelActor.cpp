@@ -46,12 +46,36 @@ AAdaptiveVoxelActor::AAdaptiveVoxelActor()
     //        return position.size() - sphereradius;
     //    };
     //spherenoise
-    auto DensityFunction = [Size = this->Size](FVector Position) -> double
-    {
-        double SphereRadius = Size * .85;
-        float NoiseValue = (FMath::PerlinNoise3D(Position / (Size * .1))) * Size * .1;
-        return Position.Size() - (SphereRadius + NoiseValue);
-    };
+    auto DensityFunction = [this](FVector Position, FVector AnchorCenter) -> double
+        {
+            // 1. High-precision local offset relative to the Chunk Anchor
+            FVector LocalOffset = Position - AnchorCenter;
+
+            // 2. Consistent Domain Translation
+            double NoiseScale = Size * 0.1;
+
+            // We find the 'Base Domain Coordinate' of the Anchor. 
+            // Fmod handles the periodicity (repeating every 256 units).
+            FVector DomainBase(
+                FMath::Fmod(AnchorCenter.X / NoiseScale, 256.0),
+                FMath::Fmod(AnchorCenter.Y / NoiseScale, 256.0),
+                FMath::Fmod(AnchorCenter.Z / NoiseScale, 256.0)
+            );
+
+            // 3. Local Domain Offset
+            // This is a small number (e.g., within the chunk's extent)
+            FVector DomainLocal = LocalOffset / NoiseScale;
+
+            // Summing two small numbers preserves the precision lost at 10^8
+            FVector FinalSample = DomainBase + DomainLocal;
+            float NoiseVal = FMath::PerlinNoise3D(FinalSample) * (float)(Size * 0.1);
+
+            // 4. Planet-Relative Distance (Stay in Double)
+            FVector PlanetRelativeP = Position - GetActorLocation();
+            double RealDist = PlanetRelativeP.Size(); // RelativePos is small enough now
+
+            return RealDist - (Size * 0.85 + (double)NoiseVal);
+        };
     //Torus noise
     //auto DensityFunction = [this](FVector Position) -> double
     //    {

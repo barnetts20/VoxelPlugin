@@ -11,7 +11,7 @@ struct VOXELPLUGIN_API FAdaptiveOctree
 private:
     ARealtimeMeshActor* ParentActor;
     FRWLock OctreeLock;
-    TFunction<double(FVector)> DensityFunction;
+    TFunction<double(FVector, FVector)> DensityFunction;
     TSharedPtr<FAdaptiveOctreeNode> Root;
     TArray<TSharedPtr<FAdaptiveOctreeNode>> Chunks;
     TArray<TSharedPtr<FMeshChunk>> MeshChunks;
@@ -20,7 +20,7 @@ private:
 
 public:
     // Constructor
-    FAdaptiveOctree(TFunction<double(FVector)> InDensityFunction, FVector InCenter, double InRootExtent, int ChunkDepth, int InMinDepth, int InMaxDepth);
+    FAdaptiveOctree(TFunction<double(FVector, FVector)> InDensityFunction, FVector InCenter, double InRootExtent, int ChunkDepth, int InMinDepth, int InMaxDepth);
 
     void InitializeMeshChunks(ARealtimeMeshActor* InParentActor, UMaterialInterface* InMaterial);
 

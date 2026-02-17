@@ -1,7 +1,7 @@
 #include "FAdaptiveOctree.h"
 
 // Constructor
-FAdaptiveOctree::FAdaptiveOctree(TFunction<double(FVector)> InDensityFunction, FVector InCenter, double InRootExtent, int ChunkDepth, int InMinDepth, int InMaxDepth)
+FAdaptiveOctree::FAdaptiveOctree(TFunction<double(FVector, FVector)> InDensityFunction, FVector InCenter, double InRootExtent, int ChunkDepth, int InMinDepth, int InMaxDepth)
 {
     DensityFunction = InDensityFunction;
     RootExtent = InRootExtent;
@@ -150,9 +150,7 @@ void FAdaptiveOctree::UpdateMeshChunkStreamData(TSharedPtr<FMeshChunk> InChunk)
     TArray<FMeshVertex> UniqueVertices;
     TArray<FIndex3UI> Triangles;
 
-    // Collect all valid edge data in parallel
-    struct FEdgeVertexData
-    {
+    struct FEdgeVertexData {
         TArray<FMeshVertex> Vertices;
         TOptional<FNodeEdge> Edge;
         bool IsValid;
@@ -161,38 +159,35 @@ void FAdaptiveOctree::UpdateMeshChunkStreamData(TSharedPtr<FMeshChunk> InChunk)
     TArray<FEdgeVertexData> AllEdgeData;
     AllEdgeData.SetNum(InChunk->ChunkEdges.Num());
 
-    double QuantizationGrid = InChunk->ChunkExtent * 0.0001;
+    // With CM units, 0.0001 of Extent is appropriate for vertex snapping
+    double QuantizationGrid = 1;// InChunk->ChunkExtent * 0.0001;
 
     ParallelFor(InChunk->ChunkEdges.Num(), [&](int32 edgeIdx) {
         const FNodeEdge currentEdge = InChunk->ChunkEdges[edgeIdx];
         TArray<TSharedPtr<FAdaptiveOctreeNode>> nodesToMesh = SampleNodesAroundEdge(currentEdge);
+
         if (!InChunk->ShouldProcessEdge(currentEdge, nodesToMesh)) {
-            AllEdgeData[edgeIdx].IsValid = false;
-            return;
-        }
-
-        double MaxVertexDistance = currentEdge.Size * 5.0;
-        TArray<TSharedPtr<FAdaptiveOctreeNode>> validNodes;
-        for (auto& node : nodesToMesh) {
-            double dist = FVector::Dist(node->DualContourPosition, currentEdge.ZeroCrossingPoint);
-            if (dist <= MaxVertexDistance) {
-                validNodes.Add(node);
-            }
-        }
-
-        if (validNodes.Num() < 3) {
             AllEdgeData[edgeIdx].IsValid = false;
             return;
         }
 
         AllEdgeData[edgeIdx].IsValid = true;
         AllEdgeData[edgeIdx].Edge = currentEdge;
-        AllEdgeData[edgeIdx].Vertices.SetNumZeroed(validNodes.Num());
+        AllEdgeData[edgeIdx].Vertices.SetNumZeroed(nodesToMesh.Num());
 
-        for (int i = 0; i < validNodes.Num(); i++) {
-            FVector WorldPos = validNodes[i]->DualContourPosition;
-            FVector LocalPos = WorldPos - InChunk->ChunkCenter;
-            FVector n = validNodes[i]->DualContourNormal;
+        for (int i = 0; i < nodesToMesh.Num(); i++) {
+            // STEP 1: Capture World Position in Double
+            FVector WorldPos = nodesToMesh[i]->DualContourPosition;
+
+            // STEP 2: Precise Relative Subtraction
+            // This is critical. By doing this in double, we preserve the 
+            // 'small' local coordinate even at 1000km from origin.
+            double LX = (double)WorldPos.X - (double)InChunk->ChunkCenter.X;
+            double LY = (double)WorldPos.Y - (double)InChunk->ChunkCenter.Y;
+            double LZ = (double)WorldPos.Z - (double)InChunk->ChunkCenter.Z;
+            FVector LocalPos(LX, LY, LZ);
+
+            FVector n = nodesToMesh[i]->DualContourNormal;
 
             AllEdgeData[edgeIdx].Vertices[i].Position = QuantizePosition(LocalPos, QuantizationGrid);
             AllEdgeData[edgeIdx].Vertices[i].OriginalPosition = LocalPos;
@@ -200,7 +195,7 @@ void FAdaptiveOctree::UpdateMeshChunkStreamData(TSharedPtr<FMeshChunk> InChunk)
             AllEdgeData[edgeIdx].Vertices[i].Color = FColor::Green;
             AllEdgeData[edgeIdx].Vertices[i].UV = ComputeTriplanarUV(WorldPos, n);
         }
-        });
+     });
 
     // Build mesh from collected data (single-threaded for TMap)
     for (int32 edgeIdx = 0; edgeIdx < AllEdgeData.Num(); edgeIdx++) {
@@ -375,46 +370,91 @@ TArray<TSharedPtr<FAdaptiveOctreeNode>> FAdaptiveOctree::GetChunks()
     return Chunks;
 }
 
-FVector FAdaptiveOctree::CalculateSurfaceNormal(const FVector& Position)
-{
-    // Scale step size relative to the root extent for numerical stability
-    const double h = RootExtent * 1e-6;
-
-    double dx = (DensityFunction(Position + FVector(h, 0, 0)) -
-        DensityFunction(Position - FVector(h, 0, 0))) / (2.0 * h);
-    double dy = (DensityFunction(Position + FVector(0, h, 0)) -
-        DensityFunction(Position - FVector(0, h, 0))) / (2.0 * h);
-    double dz = (DensityFunction(Position + FVector(0, 0, h)) -
-        DensityFunction(Position - FVector(0, 0, h))) / (2.0 * h);
-
-    FVector Gradient(dx, dy, dz);
-    if (DensityFunction(Position) > 0)
-    {
-        Gradient = -Gradient;
-    }
-    return Gradient.GetSafeNormal();
-}
+//FVector FAdaptiveOctree::CalculateSurfaceNormal(const FVector& Position)
+//{
+//    // Scale step size relative to the root extent for numerical stability
+//    const double h = RootExtent * 1e-6;
+//
+//    double dx = (DensityFunction(Position + FVector(h, 0, 0)) -
+//        DensityFunction(Position - FVector(h, 0, 0))) / (2.0 * h);
+//    double dy = (DensityFunction(Position + FVector(0, h, 0)) -
+//        DensityFunction(Position - FVector(0, h, 0))) / (2.0 * h);
+//    double dz = (DensityFunction(Position + FVector(0, 0, h)) -
+//        DensityFunction(Position - FVector(0, 0, h))) / (2.0 * h);
+//
+//    FVector Gradient(dx, dy, dz);
+//    if (DensityFunction(Position) > 0)
+//    {
+//        Gradient = -Gradient;
+//    }
+//    return Gradient.GetSafeNormal();
+//}
 
 TArray<TSharedPtr<FAdaptiveOctreeNode>> FAdaptiveOctree::SampleNodesAroundEdge(const FNodeEdge& Edge)
 {
-    static const FVector AxisVectors[3] = {
-        FVector(1, 0, 0),
-        FVector(0, 1, 0),
-        FVector(0, 0, 1)
-    };
-
-    FVector Perp1 = AxisVectors[(Edge.Axis + 1) % 3];
-    FVector Perp2 = AxisVectors[(Edge.Axis + 2) % 3];
-
-    FVector Origin = Edge.Corners[0].Position;
-    double Offset = Edge.Size * 0.24;
-
-    TSharedPtr<FAdaptiveOctreeNode> N0 = GetLeafNodeByPoint(Origin + (Perp1 + Perp2) * Offset);
-    TSharedPtr<FAdaptiveOctreeNode> N1 = GetLeafNodeByPoint(Origin + (-Perp1 + Perp2) * Offset);
-    TSharedPtr<FAdaptiveOctreeNode> N2 = GetLeafNodeByPoint(Origin + (-Perp1 - Perp2) * Offset);
-    TSharedPtr<FAdaptiveOctreeNode> N3 = GetLeafNodeByPoint(Origin + (Perp1 - Perp2) * Offset);
-
     TArray<TSharedPtr<FAdaptiveOctreeNode>> Nodes;
+
+    // Calculate the exact mathematical midpoint of the edge
+    FVector Origin = Edge.Corners[0].Position;
+    FVector End = Edge.Corners[1].Position;
+    FVector Midpoint = (Origin + End) * 0.5;
+
+    // Helper lambda for biased top-down traversal
+    auto GetLeafWithBias = [&](bool BiasPerp1, bool BiasPerp2) -> TSharedPtr<FAdaptiveOctreeNode> {
+        TSharedPtr<FAdaptiveOctreeNode> CurrentNode = Root;
+
+        while (CurrentNode.IsValid() && !CurrentNode->IsLeaf()) {
+            int ChildIndex = 0;
+
+            // Adaptive epsilon based on current node size to handle floating-point drift
+            double Epsilon = CurrentNode->Extent * 1e-4;
+
+            // Helper to check which side of the splitting plane the point falls on
+            auto CheckSide = [&](int AxisIndex, bool PositiveBias) {
+                double Diff = Midpoint[AxisIndex] - CurrentNode->Center[AxisIndex];
+
+                // If the midpoint is exactly on the boundary, force it into the biased quadrant
+                if (FMath::Abs(Diff) <= Epsilon) {
+                    return PositiveBias;
+                }
+                // Otherwise, follow the actual spatial coordinate
+                return Diff > 0.0;
+                };
+
+            // Route the traversal based on the axis the edge runs along
+            if (Edge.Axis == 0) { // X-axis edge
+                if (Midpoint.X >= CurrentNode->Center.X) ChildIndex |= 1;
+                if (CheckSide(1, BiasPerp1)) ChildIndex |= 2; // Y is Perp1
+                if (CheckSide(2, BiasPerp2)) ChildIndex |= 4; // Z is Perp2
+            }
+            else if (Edge.Axis == 1) { // Y-axis edge
+                if (CheckSide(0, BiasPerp2)) ChildIndex |= 1; // X is Perp2
+                if (Midpoint.Y >= CurrentNode->Center.Y) ChildIndex |= 2;
+                if (CheckSide(2, BiasPerp1)) ChildIndex |= 4; // Z is Perp1
+            }
+            else if (Edge.Axis == 2) { // Z-axis edge
+                if (CheckSide(0, BiasPerp1)) ChildIndex |= 1; // X is Perp1
+                if (CheckSide(1, BiasPerp2)) ChildIndex |= 2; // Y is Perp2
+                if (Midpoint.Z >= CurrentNode->Center.Z) ChildIndex |= 4;
+            }
+
+            CurrentNode = CurrentNode->Children[ChildIndex];
+        }
+        return CurrentNode;
+        };
+
+    // Topologically find the 4 neighbors using your exact N0->N3 ordering
+    // N0: +Perp1, +Perp2
+    TSharedPtr<FAdaptiveOctreeNode> N0 = GetLeafWithBias(true, true);
+    // N1: -Perp1, +Perp2
+    TSharedPtr<FAdaptiveOctreeNode> N1 = GetLeafWithBias(false, true);
+    // N2: -Perp1, -Perp2
+    TSharedPtr<FAdaptiveOctreeNode> N2 = GetLeafWithBias(false, false);
+    // N3: +Perp1, -Perp2
+    TSharedPtr<FAdaptiveOctreeNode> N3 = GetLeafWithBias(true, false);
+
+    // AddUnique ensures that if a neighbor is a lower LOD (larger cell), 
+    // it is only added once, while strictly preserving the rotational winding order.
     if (N0.IsValid()) Nodes.AddUnique(N0);
     if (N1.IsValid()) Nodes.AddUnique(N1);
     if (N2.IsValid()) Nodes.AddUnique(N2);

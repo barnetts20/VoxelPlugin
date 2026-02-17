@@ -11,10 +11,11 @@ bool FAdaptiveOctreeNode::IsRoot()
 }
 
 // Root Constructor
-FAdaptiveOctreeNode::FAdaptiveOctreeNode(TFunction<double(FVector)>* InDensityFunction, FVector InCenter, double InExtent, int InMinDepth, int InMaxDepth)
+FAdaptiveOctreeNode::FAdaptiveOctreeNode(TFunction<double(FVector, FVector)>* InDensityFunction, FVector InCenter, double InExtent, int InMinDepth, int InMaxDepth)
 {
     DensityFunction = InDensityFunction;
     Center = InCenter;
+    AnchorCenter = InCenter;
     Extent = FMath::Max(InExtent, 0.0);
     Density = 0.0;
     DepthBounds[0] = InMinDepth;
@@ -22,7 +23,7 @@ FAdaptiveOctreeNode::FAdaptiveOctreeNode(TFunction<double(FVector)>* InDensityFu
 
     for (int i = 0; i < 8; i++) {
         FVector CornerPosition = Center + Offsets[i] * Extent;
-        Corners[i] = FNodeCorner(i, CornerPosition, (*DensityFunction)(CornerPosition));
+        Corners[i] = FNodeCorner(i, CornerPosition, (*DensityFunction)(CornerPosition, AnchorCenter));
         Children[i] = nullptr;
     }
 
@@ -37,11 +38,12 @@ FAdaptiveOctreeNode::FAdaptiveOctreeNode(TFunction<double(FVector)>* InDensityFu
 }
 
 // Child Constructor
-FAdaptiveOctreeNode::FAdaptiveOctreeNode(TFunction<double(FVector)>* InDensityFunction, TSharedPtr<FAdaptiveOctreeNode> InParent, uint8 ChildIndex)
+FAdaptiveOctreeNode::FAdaptiveOctreeNode(TFunction<double(FVector, FVector)>* InDensityFunction, TSharedPtr<FAdaptiveOctreeNode> InParent, uint8 ChildIndex, FVector InAnchorCenter)
 {
     Parent = InParent;
     DensityFunction = InDensityFunction;
     Center = InParent->Center + Offsets[ChildIndex] * (InParent->Extent * 0.5);
+    AnchorCenter = InAnchorCenter;
     Extent = InParent->Extent * 0.5;
     Density = 0.0;
     DepthBounds[0] = InParent->DepthBounds[0];
@@ -49,7 +51,7 @@ FAdaptiveOctreeNode::FAdaptiveOctreeNode(TFunction<double(FVector)>* InDensityFu
 
     for (int i = 0; i < 8; i++) {
         FVector CornerPosition = Center + Offsets[i] * Extent;
-        Corners[i] = FNodeCorner(i, CornerPosition, (*DensityFunction)(CornerPosition));
+        Corners[i] = FNodeCorner(i, CornerPosition, (*DensityFunction)(CornerPosition, AnchorCenter));
         Children[i] = nullptr;
     }
 
@@ -71,11 +73,18 @@ FAdaptiveOctreeNode::FAdaptiveOctreeNode(TFunction<double(FVector)>* InDensityFu
 
 void FAdaptiveOctreeNode::Split()
 {
-    if (!bIsLeaf) return; // Already split
+    if (!bIsLeaf) return;
+
+    // Determine the anchor for children
+    // If THIS node is at the ChunkDepth, its children will use its center as their anchor.
+    // Otherwise, they inherit the current anchor.
+    FVector NextAnchor = (TreeIndex.Num() == ChunkDepth) ? Center : AnchorCenter;
+
     for (uint8 i = 0; i < 8; i++)
     {
-        Children[i] = MakeShared<FAdaptiveOctreeNode>(DensityFunction, AsShared(), i);
-        // If any child is a surface node, propagate up to all ancestors
+        // Update constructor to take NextAnchor
+        Children[i] = MakeShared<FAdaptiveOctreeNode>(DensityFunction, AsShared(), i, NextAnchor);
+
         if (Children[i]->IsSurfaceNode)
         {
             TSharedPtr<FAdaptiveOctreeNode> Ancestor = AsShared();
@@ -283,43 +292,61 @@ void FAdaptiveOctreeNode::ComputeDualContourPosition()
     }
 
     IsSurfaceNode = true;
-
-    // Build QEF from sign-change edges.
-    // Each edge contributes a plane: (zero-crossing point, surface normal at that point).
     FQEF Qef;
 
-    // Step size for finite-difference normal estimation — scales with cell size
-    double h = Extent * 0.01;
+    // 1. STABILITY LAYER: Scale-aware epsilon. 
+    // At 10^8, h must be large enough to overcome float precision noise.
+    double h = FMath::Max(Extent * 0.01, 50.0); // 20cm minimum step
+    FVector MassPoint = FVector::ZeroVector;
 
     for (FNodeEdge& Edge : SignChangeEdges)
     {
-        FVector P = Edge.ZeroCrossingPoint;
+        // Re-calculate T in high precision double
+        double Denom = Edge.Corners[1].Density - Edge.Corners[0].Density;
+        if (FMath::Abs(Denom) < 1e-15) continue;
 
-        // Estimate surface normal at the zero-crossing via central differences
-        // on the density function. This gives much better normals than the 
-        // discrete corner gradient, especially for curved surfaces.
-        double dx = (*DensityFunction)(P + FVector(h, 0, 0)) - (*DensityFunction)(P - FVector(h, 0, 0));
-        double dy = (*DensityFunction)(P + FVector(0, h, 0)) - (*DensityFunction)(P - FVector(0, h, 0));
-        double dz = (*DensityFunction)(P + FVector(0, 0, h)) - (*DensityFunction)(P - FVector(0, 0, h));
+        double T = (0 - Edge.Corners[0].Density) / Denom;
+        T = FMath::Clamp(T, 0.0, 1.0);
 
-        FVector Normal = FVector(dx, dy, dz).GetSafeNormal();
+        // Calculate P relative to Corner[0] to keep values small
+        FVector P = Edge.Corners[0].Position + T * (Edge.Corners[1].Position - Edge.Corners[0].Position);
+        MassPoint += P;
 
-        // If normal estimation failed (e.g., density is constant), skip this plane
-        if (Normal.IsNearlyZero()) continue;
+        double fP = (*DensityFunction)(P, AnchorCenter);
+        double dx = (*DensityFunction)(P + FVector(h, 0, 0), AnchorCenter) - fP;
+        double dy = (*DensityFunction)(P + FVector(0, h, 0), AnchorCenter) - fP;
+        double dz = (*DensityFunction)(P + FVector(0, 0, h), AnchorCenter) - fP;
 
-        Qef.AddPlane(P, Normal);
+        FVector Normal(dx, dy, dz);
+        if (Normal.Normalize()) {
+            Qef.AddPlane(P, Normal);
+        }
     }
 
-    // Solve QEF — result is clamped to cell bounds internally
-    double Error = 0.0;
-    DualContourPosition = Qef.Solve(Center, Extent, &Error);
+    MassPoint /= (double)SignChangeEdges.Num();
 
-    // Use the average normal accumulated during QEF construction
-    // instead of recomputing via finite differences at the DC position.
-    // This saves 6 density evaluations per surface node.
+    double Error = 0.0;
+    FVector CalculatedPos = Qef.Solve(Center, Extent, &Error);
+
+    // 4. HOLE FIX: If QEF result is unstable, force it to the MassPoint.
+    // This is the primary fix for holes that aren't at LOD boundaries.
+    if (FVector::DistSquared(CalculatedPos, MassPoint) > (Extent * Extent) * 2.0)
+    {
+        DualContourPosition = MassPoint;
+    }
+    else
+    {
+        DualContourPosition = CalculatedPos;
+    }
+
+    // Standard bounding box clamp
+    DualContourPosition.X = FMath::Clamp(DualContourPosition.X, Center.X - Extent, Center.X + Extent);
+    DualContourPosition.Y = FMath::Clamp(DualContourPosition.Y, Center.Y - Extent, Center.Y + Extent);
+    DualContourPosition.Z = FMath::Clamp(DualContourPosition.Z, Center.Z - Extent, Center.Z + Extent);
+
     DualContourNormal = Qef.GetAverageNormal();
 
-    // Fallback: if normal is zero (degenerate case), use the discrete corner gradient
+    // Final Normal Fallback
     if (DualContourNormal.IsNearlyZero())
     {
         DualContourNormal.X = (Corners[1].Density + Corners[3].Density + Corners[5].Density + Corners[7].Density) -

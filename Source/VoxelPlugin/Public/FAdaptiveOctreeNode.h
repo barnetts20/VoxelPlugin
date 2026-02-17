@@ -404,7 +404,7 @@ FORCEINLINE uint32 GetTypeHash(const FEdgeKey& Key)
 struct VOXELPLUGIN_API FAdaptiveOctreeNode : public TSharedFromThis<FAdaptiveOctreeNode>
 {
 private:
-    TFunction<double(FVector)>* DensityFunction;
+    TFunction<double(FVector, FVector)>* DensityFunction;
     void ComputeDualContourPosition();
     bool bIsLeaf = true;
     
@@ -463,7 +463,9 @@ public:
     TSharedPtr<FAdaptiveOctreeNode> Children[8];
     int DepthBounds[2];
 
+    FVector AnchorCenter;
     FVector Center;
+    int ChunkDepth = 5;
     double Extent;
     double Density;
     FVector DualContourPosition;
@@ -491,10 +493,10 @@ public:
     void DrawAndLogNode();
 
     // Root Constructor
-    FAdaptiveOctreeNode(TFunction<double(FVector)>* InDensityFunction, FVector InCenter, double InExtent, int InMinDepth, int InMaxDepth);
+    FAdaptiveOctreeNode(TFunction<double(FVector, FVector)>* DensityFunction, FVector InCenter, double InExtent, int InMinDepth, int InMaxDepth);
 
     // Child Constructor
-    FAdaptiveOctreeNode(TFunction<double(FVector)>* InDensityFunction, TSharedPtr<FAdaptiveOctreeNode> InParent, uint8 ChildIndex);
+    FAdaptiveOctreeNode(TFunction<double(FVector, FVector)>* DensityFunction, TSharedPtr<FAdaptiveOctreeNode> InParent, uint8 InChildIndex, FVector InAnchorCenter);
 
     // Neighbor finding for restricted octree
     // Direction: 0=+X, 1=-X, 2=+Y, 3=-Y, 4=+Z, 5=-Z
