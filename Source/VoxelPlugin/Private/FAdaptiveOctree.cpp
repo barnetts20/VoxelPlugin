@@ -366,26 +366,6 @@ TArray<TSharedPtr<FAdaptiveOctreeNode>> FAdaptiveOctree::GetChunks()
     return Chunks;
 }
 
-//FVector FAdaptiveOctree::CalculateSurfaceNormal(const FVector& Position)
-//{
-//    // Scale step size relative to the root extent for numerical stability
-//    const double h = RootExtent * 1e-6;
-//
-//    double dx = (DensityFunction(Position + FVector(h, 0, 0)) -
-//        DensityFunction(Position - FVector(h, 0, 0))) / (2.0 * h);
-//    double dy = (DensityFunction(Position + FVector(0, h, 0)) -
-//        DensityFunction(Position - FVector(0, h, 0))) / (2.0 * h);
-//    double dz = (DensityFunction(Position + FVector(0, 0, h)) -
-//        DensityFunction(Position - FVector(0, 0, h))) / (2.0 * h);
-//
-//    FVector Gradient(dx, dy, dz);
-//    if (DensityFunction(Position) > 0)
-//    {
-//        Gradient = -Gradient;
-//    }
-//    return Gradient.GetSafeNormal();
-//}
-
 TArray<TSharedPtr<FAdaptiveOctreeNode>> FAdaptiveOctree::SampleNodesAroundEdge(const FNodeEdge& Edge)
 {
     TArray<TSharedPtr<FAdaptiveOctreeNode>> Nodes;

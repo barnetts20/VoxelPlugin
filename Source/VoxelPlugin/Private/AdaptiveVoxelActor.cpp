@@ -3,190 +3,50 @@
 #include "Kismet/GameplayStatics.h"
 
 using namespace RealtimeMesh;
-
+    
 // Sets default values
 AAdaptiveVoxelActor::AAdaptiveVoxelActor()
 {
     PrimaryActorTick.bCanEverTick = true;
     PrimaryActorTick.bStartWithTickEnabled = true;
     CameraPosition = FVector(0, 0, 0);
+    ChunkExtent = Size / FMath::Pow(2.0, (double)ChunkDepth);
+    LodDistanceThreshold = ChunkExtent * 2.0 * 1e-6;
+    Material = UMaterial::GetDefaultMaterial(EMaterialDomain::MD_Surface);
 
-    //Basic density function
-    //Torus - Warp Tunnel
-    //auto DensityFunction = [](FVector Position) -> double
-    //    {
-    //        double MajorRadius = 40000000.0; // Distance from the center to the ring
-    //        double MinorRadius = 38000000.0; // Tube radius
+    //Spherenoise - Example SDF applys perline noise to a sphere with domain shifting and noise scaling to help precision
+    auto DensityFunction = [this](FVector Position, FVector AnchorCenter) -> double {
+        // 1. High-precision local offset relative to the Chunk Anchor
+        FVector LocalOffset = Position - AnchorCenter;
 
-    //        FVector2D q(FVector2D(Position.X, Position.Y).Size() - MajorRadius, Position.Z);
-    //        return q.Size() - MinorRadius;
-    //    };
-    //Torus
-    //auto DensityFunction = [this](FVector Position) -> double
-    //    {
-    //        double MajorRadius = Size * .5; // Distance from the center to the ring
-    //        double MinorRadius = Size * .2; // Tube radius
+        // 2. Consistent Domain Translation
+        double NoiseScale = Size * 0.1;
 
-    //        FVector2D q(FVector2D(Position.X, Position.Y).Size() - MajorRadius, Position.Z);
-    //        return q.Size() - MinorRadius;
-    //    };
-    //Cube
-    //auto DensityFunction = [](FVector Position) -> double
-    //    {
-    //        FVector CubeSize(20000000.0, 20000000.0, 20000000.0); // Half-size of the cube
+        // We find the 'Base Domain Coordinate' of the Anchor. 
+        // Fmod handles the periodicity (repeating every 256 units).
+        double Periodicity = 4096 * 8;
+        FVector DomainBase(
+            FMath::Fmod(AnchorCenter.X / NoiseScale, Periodicity),
+            FMath::Fmod(AnchorCenter.Y / NoiseScale, Periodicity),
+            FMath::Fmod(AnchorCenter.Z / NoiseScale, Periodicity)
+        );
 
-    //        FVector q = Position.GetAbs() - CubeSize;
-    //        return FMath::Max(q.X, FMath::Max(q.Y, q.Z));
-    //    };
+        // 3. Local Domain Offset
+        // This is a small number (e.g., within the chunk's extent)
+        FVector DomainLocal = LocalOffset / NoiseScale;
 
-    //sphere
-    //auto densityfunction = [](fvector position) -> double
-    //    {
-    //        double sphereradius = 10000000.0;
-    //        return position.size() - sphereradius;
-    //    };
-    //spherenoise
-    auto DensityFunction = [this](FVector Position, FVector AnchorCenter) -> double
-        {
-            // 1. High-precision local offset relative to the Chunk Anchor
-            FVector LocalOffset = Position - AnchorCenter;
+        // Summing two small numbers preserves the precision lost at 10^8
+        FVector FinalSample = DomainBase + DomainLocal;
+        float NoiseVal = FMath::PerlinNoise3D(FinalSample) * (float)(Size * 0.1);
 
-            // 2. Consistent Domain Translation
-            double NoiseScale = Size * 0.1;
+        // 4. Planet-Relative Distance (Stay in Double)
+        FVector PlanetRelativeP = Position - GetActorLocation();
+        double RealDist = PlanetRelativeP.Size(); // RelativePos is small enough now
 
-            // We find the 'Base Domain Coordinate' of the Anchor. 
-            // Fmod handles the periodicity (repeating every 256 units).
-            FVector DomainBase(
-                FMath::Fmod(AnchorCenter.X / NoiseScale, 256.0),
-                FMath::Fmod(AnchorCenter.Y / NoiseScale, 256.0),
-                FMath::Fmod(AnchorCenter.Z / NoiseScale, 256.0)
-            );
+        return RealDist - (Size * 0.85 + (double)NoiseVal);
+    };
 
-            // 3. Local Domain Offset
-            // This is a small number (e.g., within the chunk's extent)
-            FVector DomainLocal = LocalOffset / NoiseScale;
-
-            // Summing two small numbers preserves the precision lost at 10^8
-            FVector FinalSample = DomainBase + DomainLocal;
-            float NoiseVal = FMath::PerlinNoise3D(FinalSample) * (float)(Size * 0.1);
-
-            // 4. Planet-Relative Distance (Stay in Double)
-            FVector PlanetRelativeP = Position - GetActorLocation();
-            double RealDist = PlanetRelativeP.Size(); // RelativePos is small enough now
-
-            return RealDist - (Size * 0.85 + (double)NoiseVal);
-        };
-    //Torus noise
-    //auto DensityFunction = [this](FVector Position) -> double
-    //    {
-    //        double MajorRadius = Size * 0.5;
-    //        double MinorRadius = Size * 0.2;
-    //        float NoiseValue = (FMath::PerlinNoise3D(Position / (Size * 0.1)) - .5) * Size * 0.075;
-    //        FVector2D q(FVector2D(Position.X, Position.Y).Size() - MajorRadius + NoiseValue, Position.Z);
-    //        return q.Size() - MinorRadius + NoiseValue;
-    //    };
-    // 1. Multi-frequency sine wave perturbation
-//    Creates mountain/valley terrain on the torus surface
-//    using spherical coordinates on the torus tube
-    //auto DensityFunction = [this](FVector Position) -> double
-    //    {
-    //        double MajorRadius = Size * 0.4;
-    //        double MinorRadius = Size * 0.2;
-
-    //        // Angle around the torus ring (major angle)
-    //        double Theta = FMath::Atan2(Position.Y, Position.X);
-
-    //        // Vector from ring center to position (in the tube cross-section plane)
-    //        double RingDist = FVector2D(Position.X, Position.Y).Size();
-
-    //        // Angle around the tube (minor angle)  
-    //        double Phi = FMath::Atan2(Position.Z, RingDist - MajorRadius);
-
-    //        // Multi-frequency analytical displacement
-    //        // These create ridge/valley patterns along and around the torus
-    //        double Perturbation = Size * 0.05 * (
-    //            0.5 * FMath::Sin(7.0 * Theta) * FMath::Cos(5.0 * Phi) +
-    //            0.3 * FMath::Sin(13.0 * Theta + 1.7) * FMath::Sin(11.0 * Phi + 0.3) +
-    //            0.2 * FMath::Cos(23.0 * Theta - 0.5) * FMath::Cos(17.0 * Phi + 2.1)
-    //            );
-
-    //        // Standard torus SDF + perturbation
-    //        FVector2D q(RingDist - MajorRadius, Position.Z);
-    //        return q.Size() - (MinorRadius + Perturbation);
-    //    };
-
-    // 2. Sharper version — creates more abrupt features that stress
-    //    the mesher harder (closer to what real terrain noise would do)
-    auto DensityFunction2 = [Size = this->Size](FVector Position) -> double
-        {
-            double MajorRadius = Size * 0.4;
-            double MinorRadius = Size * 0.2;
-
-            double Theta = FMath::Atan2(Position.Y, Position.X);
-            double RingDist = FVector2D(Position.X, Position.Y).Size();
-            double Phi = FMath::Atan2(Position.Z, RingDist - MajorRadius);
-
-            // Layered frequencies — high frequency components create small 
-            // features that will only resolve at deep LOD levels, stressing
-            // LOD boundary handling
-            double Perturbation =
-                Size * 0.04 * FMath::Sin(5.0 * Theta) * FMath::Cos(3.0 * Phi) +
-                Size * 0.02 * FMath::Sin(17.0 * Theta + 1.0) * FMath::Sin(13.0 * Phi) +
-                Size * 0.01 * FMath::Sin(41.0 * Theta + 2.3) * FMath::Cos(37.0 * Phi + 1.1) +
-                Size * 0.005 * FMath::Sin(97.0 * Theta) * FMath::Sin(89.0 * Phi);
-
-            FVector2D q(RingDist - MajorRadius, Position.Z);
-            return q.Size() - (MinorRadius + Perturbation);
-        };
-
-    // 3. Position-based perturbation (not using angles)
-    //    This is closer to how noise would work — displacement based
-    //    on raw XYZ coordinates. Good for catching precision issues.
-    auto DensityFunction3 = [Size = this->Size](FVector Position) -> double
-        {
-            double MajorRadius = Size * 0.4;
-            double MinorRadius = Size * 0.2;
-
-            // Use position directly — scaled so the frequencies make sense
-            double Sx = Position.X / (Size * 0.15);
-            double Sy = Position.Y / (Size * 0.15);
-            double Sz = Position.Z / (Size * 0.15);
-
-            double Perturbation = Size * 0.05 * (
-                0.5 * FMath::Sin(Sx * 3.0 + Sy * 2.0) * FMath::Cos(Sz * 4.0) +
-                0.3 * FMath::Sin(Sx * 7.0 - Sz * 5.0) * FMath::Sin(Sy * 6.0 + 1.0) +
-                0.2 * FMath::Cos(Sy * 11.0 + Sz * 9.0 + Sx * 3.0)
-                );
-
-            FVector2D q(FVector2D(Position.X, Position.Y).Size() - MajorRadius, Position.Z);
-            return q.Size() - (MinorRadius + Perturbation);
-        };
-    //auto DensityFunction = [&](FVector Position) -> double
-    //    {
-    //        double SphereRadius = Size * .85;
-
-    //        // Normalize the position to get the direction
-    //        FVector Direction = Position.GetSafeNormal();
-
-    //        // Create a wave pattern based on latitude and longitude
-    //        double latitude = FMath::Asin(Direction.Z);
-    //        double longitude = FMath::Atan2(Direction.Y, Direction.X);
-
-    //        // Create topographical variation using sin/cos
-    //        double frequency1 = 12.0;  // Controls how many waves around the sphere
-    //        double frequency2 = 8.0;  // Secondary wave pattern
-    //        double amplitude = Size * 0.1;  // Same scale as the Perlin noise was using
-
-    //        double variation = amplitude * (
-    //            0.5 * FMath::Sin(frequency1 * latitude) * FMath::Cos(frequency1 * longitude) +
-    //            0.3 * FMath::Sin(frequency2 * latitude * 2.0) * FMath::Cos(frequency2 * longitude * 0.5) +
-    //            0.2 * FMath::Sin(frequency1 * longitude * 0.7)
-    //            );
-
-    //        // Return signed distance
-    //        return Position.Size() - (SphereRadius + variation);
-    //    };
-    //Adaptive Octree Picks out the Implicit Structure
+    //Adaptive octree meshes the implicit structure
     AdaptiveOctree = MakeShared<FAdaptiveOctree>(DensityFunction, GetActorLocation(), Size, ChunkDepth, MinDepth, MaxDepth);
     //Sparsetree for user edits
     SparseOctree = MakeShared<FSparseOctree>();
@@ -207,7 +67,6 @@ void AAdaptiveVoxelActor::OnConstruction(const FTransform& Transform) {
     }
 }
 
-// Called when the game starts or when spawned
 void AAdaptiveVoxelActor::BeginPlay()
 {
     Super::BeginPlay();
@@ -227,31 +86,9 @@ void AAdaptiveVoxelActor::CleanSceneRoot() {
 void AAdaptiveVoxelActor::InitializeChunks() {
     CleanSceneRoot();
     AdaptiveOctree->InitializeMeshChunks(this, Material);
-
     Initialized = true;
-    ScheduleDataUpdate(.05);
-    ScheduleMeshUpdate(.1);
-
-    FVector quadrants[8];
-    quadrants[0] = FVector(1, 1, 1);
-    quadrants[1] = FVector(-1, 1, 1);
-    quadrants[2] = FVector(1, -1, 1);
-    quadrants[3] = FVector(1, 1, -1);
-    quadrants[4] = FVector(-1, -1, 1);
-    quadrants[5] = FVector(1, -1, -1);
-    quadrants[6] = FVector(-1, 1, -1);
-    quadrants[7] = FVector(-1, -1, -1);
-
-    FVector oneVec = FVector(1, 1, 1);
-    double scl = 1000000000;
-    DrawDebugBox(GetWorld(), quadrants[0] * scl, scl * oneVec, FColor::Red, true, 1000);
-    DrawDebugBox(GetWorld(), quadrants[1] * scl, scl * oneVec, FColor::Green, true, 1000);
-    DrawDebugBox(GetWorld(), quadrants[2] * scl, scl * oneVec, FColor::Blue, true, 1000);
-    DrawDebugBox(GetWorld(), quadrants[3] * scl, scl * oneVec, FColor::Purple, true, 1000);
-    DrawDebugBox(GetWorld(), quadrants[4] * scl, scl * oneVec, FColor::Orange, true, 1000);
-    DrawDebugBox(GetWorld(), quadrants[5] * scl, scl * oneVec, FColor::Yellow, true, 1000);
-    DrawDebugBox(GetWorld(), quadrants[6] * scl, scl * oneVec, FColor::Magenta, true, 1000);
-    DrawDebugBox(GetWorld(), quadrants[7] * scl, scl * oneVec, FColor::Cyan, true, 1000);
+    ScheduleDataUpdate(MinDataUpdateInterval);
+    ScheduleMeshUpdate(MinMeshUpdateInterval);
 }
 
 void AAdaptiveVoxelActor::ScheduleDataUpdate(float IntervalInSeconds)
@@ -259,56 +96,54 @@ void AAdaptiveVoxelActor::ScheduleDataUpdate(float IntervalInSeconds)
     if (!DataUpdateIsRunning && !IsDestroyed)
     {
         DataUpdateIsRunning = true;
+        TWeakObjectPtr<AAdaptiveVoxelActor> WeakThis(this);
 
-        FGraphEventRef Task = FFunctionGraphTask::CreateAndDispatchWhenReady([this, IntervalInSeconds]()
+        FFunctionGraphTask::CreateAndDispatchWhenReady([WeakThis, IntervalInSeconds]()
         {
-            //**********BEGIN IMPLEMENTATION BLOCK***************
-            //**********BEGIN IMPLEMENTATION BLOCK***************
-            //**********BEGIN IMPLEMENTATION BLOCK***************
+            AAdaptiveVoxelActor* Self = WeakThis.Get();
+            if (!Self || Self->IsDestroyed) return;
             {
-                FRWScopeLock WriteLock(OctreeLock, SLT_Write);
-                if (IsDestroyed) return;
-                AdaptiveOctree->UpdateLOD(CameraPosition, LodFactor);
+                FVector CurrentCamPos = Self->CameraPosition;
+                double DistMoved = FVector::Dist(CurrentCamPos, Self->LastLodUpdatePosition);
+                if (DistMoved >= Self->LodDistanceThreshold)
+                {
+                    FRWScopeLock WriteLock(Self->OctreeLock, SLT_Write);
+                    Self->AdaptiveOctree->UpdateLOD(CurrentCamPos, Self->LodFactor);
+                    Self->LastLodUpdatePosition = CurrentCamPos;
+                }
             }
-            //***********END IMPLEMENTATION BLOCK***************
-            //***********END IMPLEMENTATION BLOCK***************
-            //***********END IMPLEMENTATION BLOCK***************
 
-            DataUpdateIsRunning = false;
-            FTSTicker::GetCoreTicker().AddTicker(FTickerDelegate::CreateLambda([this, IntervalInSeconds](float DeltaTime)
-            {
-                ScheduleDataUpdate(IntervalInSeconds);
-                return false;
-            }), IntervalInSeconds);
+            Self->DataUpdateIsRunning = false;
+            FTSTicker::GetCoreTicker().AddTicker(
+                FTickerDelegate::CreateLambda([WeakThis, IntervalInSeconds](float) {
+                    if (auto* S = WeakThis.Get()) S->ScheduleDataUpdate(IntervalInSeconds);
+                    return false;
+                    }), IntervalInSeconds);
         }, TStatId(), nullptr, ENamedThreads::AnyBackgroundThreadNormalTask);
     }
 }
+
 void AAdaptiveVoxelActor::ScheduleMeshUpdate(float IntervalInSeconds)
 {
     if (!MeshUpdateIsRunning && !IsDestroyed)
     {
         MeshUpdateIsRunning = true;
-        FGraphEventRef Task = FFunctionGraphTask::CreateAndDispatchWhenReady([this, IntervalInSeconds]()
-        {
-            //**********BEGIN IMPLEMENTATION BLOCK***************
-            //**********BEGIN IMPLEMENTATION BLOCK***************
-            //**********BEGIN IMPLEMENTATION BLOCK***************
+        TWeakObjectPtr<AAdaptiveVoxelActor> WeakThis(this);
+        FFunctionGraphTask::CreateAndDispatchWhenReady([WeakThis, IntervalInSeconds]()
             {
-                FRWScopeLock ReadLock(OctreeLock, SLT_ReadOnly);
-                if(IsDestroyed) return;
-                AdaptiveOctree->UpdateMesh();
-            }
-            //***********END IMPLEMENTATION BLOCK***************
-            //***********END IMPLEMENTATION BLOCK***************
-            //***********END IMPLEMENTATION BLOCK***************
-
-            MeshUpdateIsRunning = false;
-            FTSTicker::GetCoreTicker().AddTicker(FTickerDelegate::CreateLambda([this, IntervalInSeconds](float DeltaTime)
-            {
-                ScheduleMeshUpdate(IntervalInSeconds);
-                return false;
-            }), IntervalInSeconds);
-        }, TStatId(), nullptr, ENamedThreads::AnyBackgroundThreadNormalTask);
+                AAdaptiveVoxelActor* Self = WeakThis.Get();
+                if (!Self || Self->IsDestroyed) return;
+                {
+                    FRWScopeLock ReadLock(Self->OctreeLock, SLT_ReadOnly);
+                    Self->AdaptiveOctree->UpdateMesh();
+                }
+                Self->MeshUpdateIsRunning = false;
+                FTSTicker::GetCoreTicker().AddTicker(
+                    FTickerDelegate::CreateLambda([WeakThis, IntervalInSeconds](float) {
+                        if (auto* S = WeakThis.Get()) S->ScheduleMeshUpdate(IntervalInSeconds);
+                        return false;
+                        }), IntervalInSeconds);
+            }, TStatId(), nullptr, ENamedThreads::AnyBackgroundThreadNormalTask);
     }
 }
 

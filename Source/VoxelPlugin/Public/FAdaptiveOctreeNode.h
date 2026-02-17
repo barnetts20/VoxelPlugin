@@ -485,7 +485,6 @@ public:
     bool ShouldSplit(FVector InCameraPosition, double InLodDistanceFactor);
     void Merge();
     bool ShouldMerge(FVector InCameraPosition, double InLodDistanceFactor);    
-    bool fullUpdate = false; //Force recursion until all nodes match the lod 
     void UpdateLod(FVector InCameraPosition, double InLodDistanceFactor, TArray<FNodeEdge>& OutNodeEdges, TMap<FEdgeKey, int32>& EdgeMap, bool& OutChanged);
 
     TArray<FNodeEdge> GetSurfaceEdges();

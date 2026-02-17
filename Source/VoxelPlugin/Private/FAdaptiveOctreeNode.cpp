@@ -222,32 +222,18 @@ void FAdaptiveOctreeNode::UpdateLod(FVector InCameraPosition, double InLodDistan
         {
             OutChanged = true;
             Split();
-            if (fullUpdate) {
-                for (TSharedPtr<FAdaptiveOctreeNode> aChild : Children) {
-                    aChild->UpdateLod(InCameraPosition, InLodDistanceFactor, OutNodeEdges, EdgeMap, OutChanged);
-                }
+            for (TSharedPtr<FAdaptiveOctreeNode> aChild : Children) {
+                AppendUniqueEdges(aChild->GetSignChangeEdges(), OutNodeEdges, EdgeMap);
             }
-            else {
-                for (TSharedPtr<FAdaptiveOctreeNode> aChild : Children) {
-                    AppendUniqueEdges(aChild->GetSignChangeEdges(), OutNodeEdges, EdgeMap);
-                }
-                return;
-            }
-
+            return;
         }
         else if (Parent.IsValid() && Parent.Pin()->ShouldMerge(InCameraPosition, InLodDistanceFactor) && TreeIndex.Last() == 7)
         {
             OutChanged = true;
             auto parentPtr = Parent.Pin();
             parentPtr->Merge();
-            if (fullUpdate) {
-                parentPtr->UpdateLod(InCameraPosition, InLodDistanceFactor, OutNodeEdges, EdgeMap, OutChanged);
-            }
-            else {
-                AppendUniqueEdges(parentPtr->GetSignChangeEdges(), OutNodeEdges, EdgeMap);
-                return;
-            }
-
+            AppendUniqueEdges(parentPtr->GetSignChangeEdges(), OutNodeEdges, EdgeMap);
+            return;
         }
         else {
             AppendUniqueEdges(GetSignChangeEdges(), OutNodeEdges, EdgeMap);
