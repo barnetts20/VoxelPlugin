@@ -2,6 +2,7 @@
 
 #include "CoreMinimal.h"
 
+//TODO: IS THIS ACTUALLY USEFUL? IF SO WE CAN KEEP OTHERWISE GET RID OF IT
 // Define different SDF types
 UENUM(BlueprintType)
 enum class ESDFType : uint8

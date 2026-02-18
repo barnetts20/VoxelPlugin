@@ -1,4 +1,4 @@
-// Fill out your copyright notice in the Description page of Project Settings.
+//TODO: FIGURE OUT HOW MUCH OF THIS IS NEEDED, IF ANY, CLEAN UP AND CENTRALIZE AND STRUCTS WE ENDED UP NEEDING
 #pragma once
 #include "CoreMinimal.h"
 

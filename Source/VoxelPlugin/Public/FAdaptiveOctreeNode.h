@@ -2,6 +2,7 @@
 
 #include "CoreMinimal.h"
 
+//TODO: Move the following structs into OctreeContour, along with any other meshing related or QEF related functions/structs we are using
 struct VOXELPLUGIN_API FNodeCorner {
     FVector Position;
     FVector Normal;
@@ -382,6 +383,7 @@ private:
     }
 };
 
+//Adaptive manifold dual contouring voxel octree node
 struct VOXELPLUGIN_API FAdaptiveOctreeNode : public TSharedFromThis<FAdaptiveOctreeNode>
 {
 private:

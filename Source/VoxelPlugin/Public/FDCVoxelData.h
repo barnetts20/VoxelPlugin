@@ -2,6 +2,7 @@
 #include "CoreMinimal.h"
 #include <FInt64Coordinate.h>
 
+//TODO: NOT BEING USED IN THE COMPLETED DC ALGO, REMOVE
 struct VOXELPLUGIN_API FVoxelData : public TSharedFromThis<FVoxelData>
 {
 public:

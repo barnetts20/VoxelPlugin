@@ -173,7 +173,9 @@ bool FAdaptiveOctreeNode::ShouldSplit(FVector InCameraPosition, double InScreenS
 {
     int Depth = TreeIndex.Num();
     if (Depth >= DepthBounds[1]) return false;
+    //TODO: We can probably reap a pretty substantial optimization by checking if the chunk is on the far side of the planet by enough to be expected to have no visible parts
     if (Depth < DepthBounds[2]) return true;
+    
     double Distance = FMath::Max(FVector::Dist(DualContourPosition, InCameraPosition), 1.0);
     double FOVScale = 1.0 / FMath::Tan(FMath::DegreesToRadians(InCameraFOV * 0.5));
     double AngularSize = ((2.0 * Extent) / Distance) * FOVScale;

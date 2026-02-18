@@ -1,4 +1,4 @@
-// Fill out your copyright notice in the Description page of Project Settings.
+//TODO: UPDATE TO DOUBLE PRECISION SPARSE OCTREE INSTEAD OF INT64 BASED
 
 #pragma once
 

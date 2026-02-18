@@ -21,6 +21,7 @@ private:
     // Adaptive octree meshes the SDF
     TSharedPtr<FAdaptiveOctree> AdaptiveOctree;
     // Sparse octree will be for storing user edits (terraforming etc) - TODO: needs to be refactored to basically be identical in construction/structure etc to the adaptive tree, just only difference is it is sparse
+    // We will sample it in the density function and write to it based on surface intersect position, we can alter the density and then composite the user edits with the existing density function
     TSharedPtr<FSparseOctree> SparseOctree;
 
     FVector CameraPosition = FVector::ZeroVector;
@@ -29,7 +30,7 @@ private:
 
     FRWLock OctreeLock;
 
-    bool TickInEditor = false;
+    bool TickInEditor = true;
     std::atomic<bool>  Initialized = false;
     std::atomic<bool>  IsDestroyed = false;
 

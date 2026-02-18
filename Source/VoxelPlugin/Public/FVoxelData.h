@@ -2,6 +2,7 @@
 #include "CoreMinimal.h"
 #include <FInt64Coordinate.h>
 
+//TODO: DOES NOT APPEAR TO BE IN USE IN THE COMPLETED DC IMPLEMENTATION, CHECK USAGES AND REMOVE IF POSSIBLE (WE MAY NEED IT, OR SOMETHING LIKE IT FOR SPARSE DATA)
 struct VOXELPLUGIN_API FVoxelData : public TSharedFromThis<FVoxelData>
 {
 public:

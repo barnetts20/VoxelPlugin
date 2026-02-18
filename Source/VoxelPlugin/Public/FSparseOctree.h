@@ -4,6 +4,7 @@
 #include "FSparseOctreeNode.h"
 #include "FInt64Coordinate.h"
 
+//TODO: REFACTOR TO DOUBLE PRECISION OR REPLACE, THIS MAY BE OVERENGINEERED
 struct VOXELPLUGIN_API FSparseOctree : public TSharedFromThis<FSparseOctree>
 {
 public:
