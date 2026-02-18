@@ -2,12 +2,14 @@
 
 #include "CoreMinimal.h"
 
-struct VOXELPLUGIN_API FNodeCorner {
-    int CornerIndex;
+struct FNodeCorner {
     FVector Position;
     double Density;
-    FNodeCorner(int InIndex, FVector InPosition, double InDensity) : CornerIndex(InIndex), Position(InPosition), Density(InDensity) {};
-    FNodeCorner() : CornerIndex(-1), Position(FVector::ZeroVector), Density(0) {};
+    FVector Normal; // Add this
+
+    FNodeCorner() : Position(0), Density(0), Normal(0, 0, 1) {}
+    FNodeCorner(FVector InPos, double InDensity, FVector InNormal)
+        : Position(InPos), Density(InDensity), Normal(InNormal) {}
 };
 
 struct VOXELPLUGIN_API FNodeEdge
@@ -21,6 +23,7 @@ struct VOXELPLUGIN_API FNodeEdge
     FVector ZeroCrossingPoint;  // Position where sign flips
 
     // Constructor
+    FNodeEdge() : Size(0), SignChange(false), Distance(0), Axis(0) {}
     FNodeEdge(FNodeCorner InCorner1, FNodeCorner InCorner2)
     {
         Corners[0] = InCorner1;
@@ -70,16 +73,7 @@ struct VOXELPLUGIN_API FNodeEdge
             ZeroCrossingPoint = (InCorner1.Position + InCorner2.Position) * 0.5;
         }
     }
-
     bool IsCongruent(const FNodeEdge& Other) const {
-        //return
-        //    Corners[0].Position.Equals(Other.Corners[0].Position, .01)
-        //    || Corners[0].Position.Equals(Other.Corners[1].Position, .01)
-        //    || Corners[1].Position.Equals(Other.Corners[0].Position, .01)
-        //    || Corners[1].Position.Equals(Other.Corners[1].Position, .01)
-        //    &&
-        //    Axis == Other.Axis;
-
         // Both corners must match (in either order) AND axis must match
         bool CornersMatch =
             (Corners[0].Position.Equals(Other.Corners[0].Position, .01)
@@ -116,6 +110,9 @@ struct VOXELPLUGIN_API FQEF
     // Mass point (average of intersection points — used as fallback and bias)
     FVector MassPoint;
 
+    // Accumulated normal (sum of normals passed to AddPlane — for average normal output)
+    FVector AccumulatedNormal;
+
     FQEF()
     {
         Reset();
@@ -130,6 +127,7 @@ struct VOXELPLUGIN_API FQEF
         BTB = 0.0;
         PlaneCount = 0;
         MassPoint = FVector::ZeroVector;
+        AccumulatedNormal = FVector::ZeroVector;
     }
 
     // Add a plane constraint: the solution should be close to InPoint
@@ -161,9 +159,18 @@ struct VOXELPLUGIN_API FQEF
         // Accumulate bTb
         BTB += d * d;
 
-        // Accumulate mass point
+        // Accumulate mass point and normal
         MassPoint += InPoint;
+        AccumulatedNormal += InNormal;
         PlaneCount++;
+    }
+
+    // Returns the average normal from all planes added to this QEF.
+    // Returns zero vector if no planes were added.
+    FVector GetAverageNormal() const
+    {
+        if (PlaneCount == 0) return FVector::ZeroVector;
+        return AccumulatedNormal.GetSafeNormal();
     }
 
     // Solve the QEF, returning the minimizing position.
@@ -328,10 +335,70 @@ private:
     }
 };
 
+struct FEdgeKey
+{
+    int64 X0, Y0, Z0;  // Quantized corner 0 (sorted so min corner is always first)
+    int64 X1, Y1, Z1;  // Quantized corner 1
+    int32 Axis;
+
+    // Quantization grid — 0.001 is well within the 0.01 epsilon used in IsCongruent
+    static constexpr double GridSize = 0.001;
+
+    static int64 Quantize(double V)
+    {
+        return FMath::RoundToInt64(V / GridSize);
+    }
+
+    FEdgeKey() = default;
+
+    FEdgeKey(const FNodeEdge& Edge)
+    {
+        int64 ax = Quantize(Edge.Corners[0].Position.X);
+        int64 ay = Quantize(Edge.Corners[0].Position.Y);
+        int64 az = Quantize(Edge.Corners[0].Position.Z);
+        int64 bx = Quantize(Edge.Corners[1].Position.X);
+        int64 by = Quantize(Edge.Corners[1].Position.Y);
+        int64 bz = Quantize(Edge.Corners[1].Position.Z);
+
+        // Canonical ordering: ensure (corner0 < corner1) so order doesn't matter
+        if (ax < bx || (ax == bx && ay < by) || (ax == bx && ay == by && az < bz))
+        {
+            X0 = ax; Y0 = ay; Z0 = az;
+            X1 = bx; Y1 = by; Z1 = bz;
+        }
+        else
+        {
+            X0 = bx; Y0 = by; Z0 = bz;
+            X1 = ax; Y1 = ay; Z1 = az;
+        }
+
+        Axis = Edge.Axis;
+    }
+
+    bool operator==(const FEdgeKey& Other) const
+    {
+        return X0 == Other.X0 && Y0 == Other.Y0 && Z0 == Other.Z0
+            && X1 == Other.X1 && Y1 == Other.Y1 && Z1 == Other.Z1
+            && Axis == Other.Axis;
+    }
+};
+
+FORCEINLINE uint32 GetTypeHash(const FEdgeKey& Key)
+{
+    uint32 Hash = GetTypeHash(Key.X0);
+    Hash = HashCombine(Hash, GetTypeHash(Key.Y0));
+    Hash = HashCombine(Hash, GetTypeHash(Key.Z0));
+    Hash = HashCombine(Hash, GetTypeHash(Key.X1));
+    Hash = HashCombine(Hash, GetTypeHash(Key.Y1));
+    Hash = HashCombine(Hash, GetTypeHash(Key.Z1));
+    Hash = HashCombine(Hash, GetTypeHash(Key.Axis));
+    return Hash;
+}
+
 struct VOXELPLUGIN_API FAdaptiveOctreeNode : public TSharedFromThis<FAdaptiveOctreeNode>
 {
 private:
-    TFunction<double(FVector)> DensityFunction;
+    TFunction<double(FVector, FVector)>* DensityFunction;
     void ComputeDualContourPosition();
     bool bIsLeaf = true;
     
@@ -342,12 +409,6 @@ private:
         FVector(-1, -1, 1), FVector(1, -1, 1),
         FVector(-1, 1, 1), FVector(1, 1, 1)
     };
-    
-    inline static const int SharedCorners[3][4] = {
-        {0, 2, 4, 6}, // +X or -X aligned
-        {0, 1, 4, 5}, // +Y or -Y aligned
-        {0, 1, 2, 3}  // +Z or -Z aligned
-    };
 
     inline static const int EdgePairs[12][2] = {
         {0, 1}, {2, 3}, {4, 5}, {6, 7}, // X-axis edges
@@ -355,146 +416,41 @@ private:
         {0, 4}, {1, 5}, {2, 6}, {3, 7}  // Z-axis edges
     };
 
-    inline static const int FaceChildren[6][4] = {
-        {1, 3, 5, 7},  // +X face
-        {0, 2, 4, 6},  // -X face
-        {2, 3, 6, 7},  // +Y face
-        {0, 1, 4, 5},  // -Y face
-        {4, 5, 6, 7},  // +Z face
-        {0, 1, 2, 3},  // -Z face
-    };
-
-    // The opposite direction
-    inline static const int OppositeDir[6] = { 1, 0, 3, 2, 5, 4 };
-
-    // Which child on the opposite face mirrors a given child on this face
-    // e.g., for +X direction, child 1 mirrors child 0, child 3 mirrors 2, etc.
-    inline static const int MirrorChild[6][8] = {
-        // +X: child i's mirror across +X face (flip bit 0)
-        {1, 0, 3, 2, 5, 4, 7, 6},
-        // -X: same mapping (flip bit 0)
-        {1, 0, 3, 2, 5, 4, 7, 6},
-        // +Y: flip bit 1
-        {2, 3, 0, 1, 6, 7, 4, 5},
-        // -Y: flip bit 1
-        {2, 3, 0, 1, 6, 7, 4, 5},
-        // +Z: flip bit 2
-        {4, 5, 6, 7, 0, 1, 2, 3},
-        // -Z: flip bit 2
-        {4, 5, 6, 7, 0, 1, 2, 3},
-    };
-
 public:
     TArray<uint8> TreeIndex;
     TWeakPtr<FAdaptiveOctreeNode> Parent;
     TSharedPtr<FAdaptiveOctreeNode> Children[8];
-    int DepthBounds[2];
+    int DepthBounds[3];
 
+    FVector AnchorCenter;
     FVector Center;
     double Extent;
-    double Density;
     FVector DualContourPosition;
     FVector DualContourNormal;
     bool IsSurfaceNode;
     bool LodOverride = false; //If true prevent merge ops
-    TArray<FNodeCorner> Corners;
-    TArray<FNodeEdge> Edges;
+    FNodeCorner Corners[8];
     TArray<FNodeEdge> SignChangeEdges;
 
     bool IsLeaf();
     bool IsRoot();
 
     void Split();
-    bool ShouldSplit(FVector InCameraPosition, double InLodDistanceFactor);
+    bool ShouldSplit(FVector InCameraPosition, double InScreenSpaceThreshold, double InCameraFOV);
     void Merge();
-    bool ShouldMerge(FVector InCameraPosition, double InLodDistanceFactor);    
-    bool fullUpdate = true; //Force recursion until all nodes match the lod 
-    void UpdateLod(FVector InCameraPosition, double InLodDistanceFactor, TArray<FNodeEdge>& OutEdges, bool& OutChanged);
+    bool ShouldMerge(FVector InCameraPosition, double InScreenSpaceThreshold, double InCameraFOV);
+
+    void UpdateLod(FVector InCameraPosition, double InScreenSpaceThreshold, double InCameraFOV, TArray<FNodeEdge>& OutNodeEdges, TMap<FEdgeKey, int32>& EdgeMap, bool& OutChanged);
 
     TArray<FNodeEdge> GetSurfaceEdges();
     TArray<TSharedPtr<FAdaptiveOctreeNode>> GetSurfaceNodes();
-    TArray<FNodeEdge> GetSignChangeEdges();
-
-    void DrawAndLogNode();
+    TArray<FNodeEdge>& GetSignChangeEdges();
 
     // Root Constructor
-    FAdaptiveOctreeNode(TFunction<double(FVector)> InDensityFunction, FVector InCenter, double InExtent, int InMinDepth, int InMaxDepth);
+    FAdaptiveOctreeNode(TFunction<double(FVector, FVector)>* DensityFunction, FVector InCenter, double InExtent, int InChunkDepth, int InMinDepth, int InMaxDepth);
 
     // Child Constructor
-    FAdaptiveOctreeNode(TFunction<double(FVector)> InDensityFunction, TSharedPtr<FAdaptiveOctreeNode> InParent, uint8 ChildIndex);
+    FAdaptiveOctreeNode(TFunction<double(FVector, FVector)>* DensityFunction, TSharedPtr<FAdaptiveOctreeNode> InParent, uint8 InChildIndex, FVector InAnchorCenter);
 
-    // Neighbor finding for restricted octree
-    // Direction: 0=+X, 1=-X, 2=+Y, 3=-Y, 4=+Z, 5=-Z
-    TSharedPtr<FAdaptiveOctreeNode> FindNeighbor(int Direction);
-
-    // Get all face-adjacent leaf neighbors (may return multiple small neighbors on one face)
-    TArray<TSharedPtr<FAdaptiveOctreeNode>> GetFaceNeighborLeaves(int Direction);
-
-    // Balanced split: splits this node and forces neighbors to maintain max 1-level difference
-    void BalancedSplit();
-
-    // Check if merge is allowed without violating the balance constraint
-    bool CanMergeBalanced();
-};
-
-struct VOXELPLUGIN_API FAdaptiveOctreeFlatNode {
-    // Basic node data
-    TArray<uint8> TreeIndex;
-
-    FVector Center;
-    double Extent;
-    double Density;
-
-    FVector DualContourPosition;
-    FVector DualContourNormal;
-    TArray<FNodeCorner> Corners;
-    TArray<FNodeEdge> Edges;
-    TArray<FNodeEdge> SignChangeEdges;
-
-    bool IsSurfaceNode;
-    bool IsLeaf;
-    bool IsValid;
-
-    // Constructor - creates an empty/invalid flat node
-    FAdaptiveOctreeFlatNode()
-        : Center(FVector::ZeroVector)
-        , Extent(0)
-        , Density(0)
-        , DualContourPosition(FVector::ZeroVector)
-        , DualContourNormal(FVector::ZeroVector)
-        , IsSurfaceNode(false)
-        , IsLeaf(true)
-        , IsValid(false)
-    {};
-
-    FAdaptiveOctreeFlatNode(TSharedPtr<FAdaptiveOctreeNode> InNode) 
-        : Center(FVector::ZeroVector)
-        , Extent(0)
-        , Density(0)
-        , DualContourPosition(FVector::ZeroVector)
-        , DualContourNormal(FVector::ZeroVector)
-        , IsSurfaceNode(false)
-        , IsLeaf(true)
-        , IsValid(InNode.IsValid())
-    {
-        if (IsValid) {
-            TreeIndex = InNode->TreeIndex;
-            Center = InNode->Center;
-            Extent = InNode->Extent;
-            Density = InNode->Density;
-            DualContourPosition = InNode->DualContourPosition;
-            DualContourNormal = InNode->DualContourNormal;
-            Corners = InNode->Corners;
-            Edges = InNode->Edges;
-            SignChangeEdges = InNode->SignChangeEdges;
-            IsSurfaceNode = InNode->IsSurfaceNode;
-            IsLeaf = InNode->IsLeaf();
-        }
-    };
-
-    // Equality operators for collections
-    bool operator==(const FAdaptiveOctreeFlatNode& Other) const
-    {
-        return TreeIndex == Other.TreeIndex;
-    }
+    FVector GetInterpolatedNormal(FVector P);
 };

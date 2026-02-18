@@ -8,18 +8,39 @@
 
 using namespace RealtimeMesh;
 
+struct VOXELPLUGIN_API FMeshVertex
+{
+    FVector Position;       // Quantized position (chunk-local)
+    FVector OriginalPosition; // Unquantized for actual mesh output
+    FVector Normal;
+    FColor Color;
+    FVector2f UV;
+
+    bool operator==(const FMeshVertex& Other) const
+    {
+        // Exact comparison on quantized position — no epsilon needed
+        return Position == Other.Position;
+    }
+};
+
+struct VOXELPLUGIN_API FEdgeVertexData {
+    TArray<FMeshVertex> Vertices;
+    TOptional<FNodeEdge> Edge;
+    bool IsValid;
+};
+
 struct VOXELPLUGIN_API FMeshStreamData {
     FRealtimeMeshSectionGroupKey MeshGroupKey;
     FRealtimeMeshSectionKey MeshSectionKey;
     FRealtimeMeshStreamSet MeshStream;
 
     FMeshStreamData() {
-        TRealtimeMeshStreamBuilder<FVector, FVector3f> PositionBuilder(MeshStream.AddStream(FRealtimeMeshStreams::Position, GetRealtimeMeshBufferLayout<FVector3f>()));
-        TRealtimeMeshStreamBuilder<FRealtimeMeshTangentsHighPrecision, FRealtimeMeshTangentsNormalPrecision> TangentBuilder(MeshStream.AddStream(FRealtimeMeshStreams::Tangents, GetRealtimeMeshBufferLayout<FRealtimeMeshTangentsNormalPrecision>()));
-        TRealtimeMeshStreamBuilder<TIndex3<uint32>> TrianglesBuilder(MeshStream.AddStream(FRealtimeMeshStreams::Triangles, GetRealtimeMeshBufferLayout<TIndex3<uint32>>()));
-        TRealtimeMeshStreamBuilder<uint32, uint16> PolygroupsBuilder(MeshStream.AddStream(FRealtimeMeshStreams::PolyGroups, GetRealtimeMeshBufferLayout<uint16>()));
-        TRealtimeMeshStreamBuilder<FVector2f, FVector2DHalf> TexCoordsBuilder(MeshStream.AddStream(FRealtimeMeshStreams::TexCoords, GetRealtimeMeshBufferLayout<FVector2DHalf>()));
-        TRealtimeMeshStreamBuilder<FColor> ColorBuilder(MeshStream.AddStream(FRealtimeMeshStreams::Color, GetRealtimeMeshBufferLayout<FColor>()));
+        MeshStream.AddStream(FRealtimeMeshStreams::Position, GetRealtimeMeshBufferLayout<FVector3f>());
+        MeshStream.AddStream(FRealtimeMeshStreams::Tangents, GetRealtimeMeshBufferLayout<FRealtimeMeshTangentsNormalPrecision>());
+        MeshStream.AddStream(FRealtimeMeshStreams::Triangles, GetRealtimeMeshBufferLayout<TIndex3<uint32>>());
+        MeshStream.AddStream(FRealtimeMeshStreams::PolyGroups, GetRealtimeMeshBufferLayout<uint16>());
+        MeshStream.AddStream(FRealtimeMeshStreams::TexCoords, GetRealtimeMeshBufferLayout<FVector2DHalf>());
+        MeshStream.AddStream(FRealtimeMeshStreams::Color, GetRealtimeMeshBufferLayout<FColor>());
     }
 
     TRealtimeMeshStreamBuilder<FVector, FVector3f> GetPositionStream() {
@@ -59,12 +80,12 @@ struct VOXELPLUGIN_API FMeshChunk {
     TSharedPtr<FMeshStreamData> ChunkMeshData;
 
     //Mesh Stuff
-    bool NeedsRebuild = true;
     bool IsDirty = false;
     bool IsInitialized = false;
-    TSharedPtr<FRWLock> MeshDataLock = MakeShared<FRWLock>();
-    URealtimeMeshSimple* ChunkRtMesh;
-    URealtimeMeshComponent* ChunkRtComponent;
+    
+    TWeakObjectPtr<URealtimeMeshSimple> ChunkRtMesh;
+    TWeakObjectPtr<URealtimeMeshComponent> ChunkRtComponent;
+
     FRealtimeMeshLODKey LODKey = FRealtimeMeshLODKey::FRealtimeMeshLODKey(0);
     FRealtimeMeshSectionConfig SecConfig = FRealtimeMeshSectionConfig(0);
 
@@ -94,7 +115,7 @@ struct VOXELPLUGIN_API FMeshChunk {
 
         ChunkRtComponent->SetCollisionEnabled(ECollisionEnabled::QueryAndPhysics);
         ChunkRtComponent->SetCollisionResponseToAllChannels(ECollisionResponse::ECR_Block);
-        ChunkRtComponent->SetRealtimeMesh(ChunkRtMesh);
+        ChunkRtComponent->SetRealtimeMesh(ChunkRtMesh.Get());
         ChunkRtComponent->SetRenderCustomDepth(true);
         
         ChunkMeshData->MeshGroupKey = FRealtimeMeshSectionGroupKey::Create(LODKey, FName(ChunkCenter.ToCompactString()));
@@ -104,60 +125,46 @@ struct VOXELPLUGIN_API FMeshChunk {
         IsInitialized = true;
     };
 
-    bool IsEdgeOnChunkFace(const FNodeEdge& Edge, int Coef) {
-        // Pre-compute face position vector and tolerance once
-        const float tolerance = 0.001f * ChunkExtent;
-        const FVector facePos = ChunkCenter + (Coef * FVector(ChunkExtent));
-
-        // Calculate perpendicular axes using modular arithmetic
-        const int axis1 = (Edge.Axis + 1) % 3;  // First perpendicular axis
-        const int axis2 = (Edge.Axis + 2) % 3;  // Second perpendicular axis
-
-        // Check if edge's zero-crossing lies on the face for either perpendicular axis
-        return FMath::Abs(Edge.ZeroCrossingPoint[axis1] - facePos[axis1]) < tolerance ||
-            FMath::Abs(Edge.ZeroCrossingPoint[axis2] - facePos[axis2]) < tolerance;
-    }
-
-    bool IsNodeInChunk(const TSharedPtr<FAdaptiveOctreeNode> Node) {
-        // Calculate extents once
-        const FVector extentVec(ChunkExtent);
-        FVector distFromCenter = (Node->Center - ChunkCenter).GetAbs();
-        return distFromCenter.X <= ChunkExtent &&
-            distFromCenter.Y <= ChunkExtent &&
-            distFromCenter.Z <= ChunkExtent;
-    }
-
     bool ShouldProcessEdge(const FNodeEdge& Edge, const TArray<TSharedPtr<FAdaptiveOctreeNode>>& SampledNodes) {
-        // If we don't have enough nodes to form a triangle bail out (ACTUALLY WE NEED TO FIX HOLES)
-        if (SampledNodes.Num() < 3) { 
-            //UE_LOG(LogTemp, Log, TEXT("< 3 EDGE SURROUNDING NODES. NUM = %d"), SampledNodes.Num());
-            return false; 
+        if (SampledNodes.Num() < 3) return false;
+
+        double OwnerExtent = Edge.Size * 0.5;
+        for (auto& Node : SampledNodes)
+        {
+            if (Node->Extent < OwnerExtent * 0.9)
+                return false;
         }
-        if (true) return true;
-        // If it's not on a stitching face, mesh it
-        if (!IsEdgeOnChunkFace(Edge, -1)) return true;
-        // For each node that is outside the chunk bounds, add its edges to test against
-        TArray<FNodeEdge> testEdges;
-        for (auto& node : SampledNodes) {
-            if (!IsNodeInChunk(node)) testEdges.Append(node->SignChangeEdges);
-        }
-        // If the other chunks edges do not contain the edge, mesh it
-        // Otherwise it will be handled by the external chunk
-        return !testEdges.Contains(Edge);
-    }
-    //Update all chunk mesh data in async 2
-    void UpdateMeshData(FMeshStreamData newMeshData) {
-        ChunkMeshData->MeshStream = FRealtimeMeshStreamSet(newMeshData.MeshStream);
-        IsDirty = true;
+        return true;
     }
 
-    void UpdateComponent() {
-        AsyncTask(ENamedThreads::GameThread, [this]() {
-            if (!IsInitialized || !IsDirty) return;
-            IsDirty = false;
-            
-            ChunkRtMesh->UpdateSectionGroup(ChunkMeshData->MeshGroupKey, ChunkMeshData->MeshStream);
-            ChunkRtMesh->UpdateSectionConfig(ChunkMeshData->MeshSectionKey, SecConfig, true);
+    void UpdateComponent(TSharedPtr<FMeshChunk> Self) {
+        AsyncTask(ENamedThreads::GameThread, [Self]() {
+            // 1. Initial State Check
+            if (!Self->IsInitialized || !Self->IsDirty) return;
+
+            // 2. Resolve Weak Pointers to Raw Pointers
+            // This is the "One-Time Resolution" that fixes the conversion error
+            URealtimeMeshSimple* MeshPtr = Self->ChunkRtMesh.Get();
+            URealtimeMeshComponent* CompPtr = Self->ChunkRtComponent.Get();
+
+            // 3. Safety Check: If the Actor/Component was destroyed, bail out
+            if (!MeshPtr || !CompPtr) return;
+
+            // 4. Ghost Mesh Check
+            auto* PositionStream = Self->ChunkMeshData->MeshStream.Find(FRealtimeMeshStreams::Position);
+            if (!PositionStream || PositionStream->Num() == 0) {
+                // Clear the section by passing an empty StreamSet
+                MeshPtr->UpdateSectionGroup(Self->ChunkMeshData->MeshGroupKey, FRealtimeMeshStreamSet());
+                Self->IsDirty = false;
+                return;
+            }
+
+            // 5. Standard Update
+            Self->IsDirty = false;
+
+            // Use the resolved MeshPtr instead of the WeakPtr wrapper
+            MeshPtr->UpdateSectionGroup(Self->ChunkMeshData->MeshGroupKey, Self->ChunkMeshData->MeshStream);
+            MeshPtr->UpdateSectionConfig(Self->ChunkMeshData->MeshSectionKey, Self->SecConfig, true);
         });
     }
 };

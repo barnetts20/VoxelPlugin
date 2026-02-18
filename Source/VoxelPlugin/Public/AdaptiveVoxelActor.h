@@ -2,6 +2,8 @@
 
 #include "CoreMinimal.h"
 #include "GameFramework/Actor.h"
+#include "Materials/Material.h"
+#include "MaterialDomain.h"
 #include "FAdaptiveOctree.h"
 #include "FSparseOctree.h"
 #include "FMeshingStructs.h"
@@ -16,25 +18,18 @@ class VOXELPLUGIN_API AAdaptiveVoxelActor : public ARealtimeMeshActor
     GENERATED_BODY()
     
 private:
-    TSharedPtr<FAdaptiveOctree> AdaptiveOctree;
-    TSharedPtr<FSparseOctree> SparseOctree;
+    TSharedPtr<FAdaptiveOctree> AdaptiveOctree; //Adaptive octree meshes
+    TSharedPtr<FSparseOctree> SparseOctree;     //Sparse octree will be for storing user edits (terraforming etc)
 
-    FVector CameraPosition;
-    FVector LastCameraPosition;
+    FVector CameraPosition = FVector::ZeroVector;
+    FVector LastLodUpdatePosition = FVector(FLT_MAX); // force first update
+    double CameraFOV = 90;
+
     FRWLock OctreeLock;
 
-    int ChunkDepth = 3;
-    int MinDepth = 7;
-    int MaxDepth = 14;
-    int LodFactor = 8;
-    int CollisionDepth = 14;
-
-    double MinDataUpdateInterval = .05;
     bool TickInEditor = false;
-    bool Initialized = false;
-    bool IsDestroyed = false;
-
-    double Size = 10000000.0;
+    std::atomic<bool>  Initialized = false;
+    std::atomic<bool>  IsDestroyed = false;
 
 public:
     AAdaptiveVoxelActor();
@@ -46,22 +41,45 @@ public:
 
     TSharedPtr<FAdaptiveOctree> GetOctree();
 
-    // Material properties
+    //Properties - TODO: Need to trigger reconstruction of entire object when any of these properties change, they are not compatible with changes while it is already running
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Materials")
     UMaterialInterface* Material;
 
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Scale")
+    double Size = 100000000.0;
+    
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Octree")
+    int ChunkDepth = 4;
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Octree")
+    int MinDepth = 7;
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Octree")
+    int MaxDepth = 19;
+    
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "LOD")
+    double ScreenSpaceThreshold = .075;
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "LOD")
+    double MinDataUpdateInterval = .01;
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "LOD")
+    double MinMeshUpdateInterval = .1;
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "LOD")
+    double VelocityLookAheadFactor = 16;
 
 protected:
     void CleanSceneRoot();
     void InitializeChunks();
 
-    //Async
-    bool DataUpdateIsRunning = false;
-    void ScheduleDataUpdate(float IntervalInSeconds);
-    bool MeshUpdateIsRunning = false;
-    void ScheduleMeshUpdate(float IntervalInSeconds);
+    std::atomic<bool> DataUpdateIsRunning = false;
+    std::atomic<bool> MeshUpdateIsRunning = false;
 
-    //Debug
-    //void DrawDebugSurfaceNodes();
+    FTimerHandle DataUpdateTimerHandle;
+    FTimerHandle MeshUpdateTimerHandle;
+
+    void RunDataUpdateTask();
+    void RunMeshUpdateTask();
 };
 
