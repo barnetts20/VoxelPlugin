@@ -11,7 +11,7 @@ bool FAdaptiveOctreeNode::IsRoot()
 }
 
 // Root Constructor
-FAdaptiveOctreeNode::FAdaptiveOctreeNode(TFunction<double(FVector, FVector)>* InDensityFunction, FVector InCenter, double InExtent, int InMinDepth, int InMaxDepth)
+FAdaptiveOctreeNode::FAdaptiveOctreeNode(TFunction<double(FVector, FVector)>* InDensityFunction, FVector InCenter, double InExtent, int InChunkDepth, int InMinDepth, int InMaxDepth)
 {
     DensityFunction = InDensityFunction;
     Center = InCenter;
@@ -19,9 +19,10 @@ FAdaptiveOctreeNode::FAdaptiveOctreeNode(TFunction<double(FVector, FVector)>* In
 
     Extent = FMath::Max(InExtent, 0.0);
 
-    DepthBounds[0] = InMinDepth;
+    DepthBounds[0] = InChunkDepth;
     DepthBounds[1] = InMaxDepth;
-    DepthBounds[2] = 7; //TODO THIS SHOULD BE PASSED 
+    DepthBounds[2] = InMinDepth;
+
     // Use a conservative h for the root
     double h = 0.1 * Extent;
 
@@ -66,8 +67,8 @@ FAdaptiveOctreeNode::FAdaptiveOctreeNode(TFunction<double(FVector, FVector)>* In
     DepthBounds[0] = InParent->DepthBounds[0];
     DepthBounds[1] = InParent->DepthBounds[1];
     DepthBounds[2] = InParent->DepthBounds[2];
-    // DERIVE CHUNK EXTENT: Using the TreeIndex depth relative to MinDepth
-    // MinDepth should be a member or accessible variable (e.g., 5)
+    // DERIVE CHUNK EXTENT: Using the TreeIndex depth relative to ChunkDepth
+    // ChunkDepth should be a member or accessible variable (e.g., 5)
     double ChunkExtent = Extent * FMath::Pow(2.0, (double)(TreeIndex.Num() - DepthBounds[0]));
 
     // STABLE GRADIENT STEP: Node detail (10%) but clamped to Chunk stability (1e-6)
@@ -130,7 +131,7 @@ void FAdaptiveOctreeNode::Split()
     if (!bIsLeaf) return;
 
     // Determine the anchor for children
-    // If THIS node is at the MinDepth, its children will use its center as their anchor.
+    // If THIS node is at the ChunkDepth, its children will use its center as their anchor.
     // Otherwise, they inherit the current anchor.
     FVector NextAnchor = (TreeIndex.Num() == DepthBounds[0]) ? Center : AnchorCenter;
 

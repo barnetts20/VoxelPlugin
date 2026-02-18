@@ -51,28 +51,38 @@ public:
     double Size = 100000000.0;
     
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Octree")
-    int MinDepth = 4;
-    
+    int ChunkDepth = 4;
+
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Octree")
-    int MaxDepth = 18;
-    
+    int MinDepth = 7;
+
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Octree")
+    int MaxDepth = 19;
+    
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "LOD")
     double ScreenSpaceThreshold = .075;
 
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Update")
-    double MinDataUpdateInterval = .05;
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "LOD")
+    double MinDataUpdateInterval = .01;
 
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Update")
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "LOD")
     double MinMeshUpdateInterval = .1;
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "LOD")
+    double VelocityLookAheadFactor = 16;
 
 protected:
     void CleanSceneRoot();
     void InitializeChunks();
 
     //Async
-    bool DataUpdateIsRunning = false;
-    void ScheduleDataUpdate(float IntervalInSeconds);
-    bool MeshUpdateIsRunning = false;
-    void ScheduleMeshUpdate(float IntervalInSeconds);
+    std::atomic<bool> DataUpdateIsRunning = false;
+    std::atomic<bool> MeshUpdateIsRunning = false;
+
+    FTimerHandle DataUpdateTimerHandle;
+    FTimerHandle MeshUpdateTimerHandle;
+
+    void RunDataUpdateTask();
+    void RunMeshUpdateTask();
 };
 

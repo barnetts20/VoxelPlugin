@@ -450,7 +450,7 @@ public:
     void DrawAndLogNode();
 
     // Root Constructor
-    FAdaptiveOctreeNode(TFunction<double(FVector, FVector)>* DensityFunction, FVector InCenter, double InExtent, int InMinDepth, int InMaxDepth);
+    FAdaptiveOctreeNode(TFunction<double(FVector, FVector)>* DensityFunction, FVector InCenter, double InExtent, int InChunkDepth, int InMinDepth, int InMaxDepth);
 
     // Child Constructor
     FAdaptiveOctreeNode(TFunction<double(FVector, FVector)>* DensityFunction, TSharedPtr<FAdaptiveOctreeNode> InParent, uint8 InChildIndex, FVector InAnchorCenter);

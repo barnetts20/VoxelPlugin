@@ -82,8 +82,10 @@ struct VOXELPLUGIN_API FMeshChunk {
     //Mesh Stuff
     bool IsDirty = false;
     bool IsInitialized = false;
-    URealtimeMeshSimple* ChunkRtMesh;
-    URealtimeMeshComponent* ChunkRtComponent;
+    
+    TWeakObjectPtr<URealtimeMeshSimple> ChunkRtMesh;
+    TWeakObjectPtr<URealtimeMeshComponent> ChunkRtComponent;
+
     FRealtimeMeshLODKey LODKey = FRealtimeMeshLODKey::FRealtimeMeshLODKey(0);
     FRealtimeMeshSectionConfig SecConfig = FRealtimeMeshSectionConfig(0);
 
@@ -113,7 +115,7 @@ struct VOXELPLUGIN_API FMeshChunk {
 
         ChunkRtComponent->SetCollisionEnabled(ECollisionEnabled::QueryAndPhysics);
         ChunkRtComponent->SetCollisionResponseToAllChannels(ECollisionResponse::ECR_Block);
-        ChunkRtComponent->SetRealtimeMesh(ChunkRtMesh);
+        ChunkRtComponent->SetRealtimeMesh(ChunkRtMesh.Get());
         ChunkRtComponent->SetRenderCustomDepth(true);
         
         ChunkMeshData->MeshGroupKey = FRealtimeMeshSectionGroupKey::Create(LODKey, FName(ChunkCenter.ToCompactString()));
@@ -122,15 +124,6 @@ struct VOXELPLUGIN_API FMeshChunk {
 
         IsInitialized = true;
     };
-
-    //bool IsNodeInChunk(const TSharedPtr<FAdaptiveOctreeNode> Node) {
-    //    // Calculate extents once
-    //    const FVector extentVec(ChunkExtent);
-    //    FVector distFromCenter = (Node->Center - ChunkCenter).GetAbs();
-    //    return distFromCenter.X <= ChunkExtent &&
-    //        distFromCenter.Y <= ChunkExtent &&
-    //        distFromCenter.Z <= ChunkExtent;
-    //}
 
     bool ShouldProcessEdge(const FNodeEdge& Edge, const TArray<TSharedPtr<FAdaptiveOctreeNode>>& SampledNodes) {
         if (SampledNodes.Num() < 3) return false;
@@ -147,10 +140,11 @@ struct VOXELPLUGIN_API FMeshChunk {
     void UpdateComponent(TSharedPtr<FMeshChunk> Self) {
         AsyncTask(ENamedThreads::GameThread, [Self]() {
             if (!Self->IsInitialized || !Self->IsDirty) return;
-            if (!IsValid(Self->ChunkRtMesh) || !IsValid(Self->ChunkRtComponent)) return;
+            if (!Self->ChunkRtMesh.IsValid() || !Self->ChunkRtComponent.IsValid()) return;
 
             auto* PositionStream = Self->ChunkMeshData->MeshStream.Find(FRealtimeMeshStreams::Position);
             if (!PositionStream || PositionStream->Num() == 0) {
+                Self->ChunkRtMesh->UpdateSectionGroup(Self->ChunkMeshData->MeshGroupKey, FRealtimeMeshStreamSet());
                 Self->IsDirty = false;
                 return;
             }
@@ -158,6 +152,6 @@ struct VOXELPLUGIN_API FMeshChunk {
             Self->IsDirty = false;
             Self->ChunkRtMesh->UpdateSectionGroup(Self->ChunkMeshData->MeshGroupKey, Self->ChunkMeshData->MeshStream);
             Self->ChunkRtMesh->UpdateSectionConfig(Self->ChunkMeshData->MeshSectionKey, Self->SecConfig, true);
-            });
+        });
     }
 };
