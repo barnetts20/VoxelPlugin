@@ -11,8 +11,6 @@ AAdaptiveVoxelActor::AAdaptiveVoxelActor()
     PrimaryActorTick.bCanEverTick = true;
     PrimaryActorTick.bStartWithTickEnabled = true;
     CameraPosition = FVector(0, 0, 0);
-    ChunkExtent = Size / FMath::Pow(2.0, (double)ChunkDepth);
-    LodDistanceThreshold = ChunkExtent * 2.0 * 1e-6;
     Material = UMaterial::GetDefaultMaterial(EMaterialDomain::MD_Surface);
 }
 

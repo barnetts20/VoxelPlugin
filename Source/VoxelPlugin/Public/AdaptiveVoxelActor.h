@@ -27,12 +27,10 @@ private:
 
     FRWLock OctreeLock;
 
-    bool TickInEditor = false; //TODO: Work on a more robust lifecycle so this can be enabled while also working in play mode
-    bool Initialized = false;
-    bool IsDestroyed = false;
+    bool TickInEditor = false;
+    std::atomic<bool>  Initialized = false;
+    std::atomic<bool>  IsDestroyed = false;
 
-    double ChunkExtent = 0;
-    double LodDistanceThreshold = 0;
 public:
     AAdaptiveVoxelActor();
     virtual void OnConstruction(const FTransform& Transform) override;
@@ -75,7 +73,6 @@ protected:
     void CleanSceneRoot();
     void InitializeChunks();
 
-    //Async
     std::atomic<bool> DataUpdateIsRunning = false;
     std::atomic<bool> MeshUpdateIsRunning = false;
 

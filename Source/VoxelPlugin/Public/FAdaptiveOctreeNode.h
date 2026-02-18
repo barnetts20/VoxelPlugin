@@ -431,7 +431,6 @@ public:
     bool LodOverride = false; //If true prevent merge ops
     FNodeCorner Corners[8];
     TArray<FNodeEdge> SignChangeEdges;
-    double ScreenSpaceThreshold = 0.075;
 
     bool IsLeaf();
     bool IsRoot();
@@ -446,8 +445,6 @@ public:
     TArray<FNodeEdge> GetSurfaceEdges();
     TArray<TSharedPtr<FAdaptiveOctreeNode>> GetSurfaceNodes();
     TArray<FNodeEdge>& GetSignChangeEdges();
-
-    void DrawAndLogNode();
 
     // Root Constructor
     FAdaptiveOctreeNode(TFunction<double(FVector, FVector)>* DensityFunction, FVector InCenter, double InExtent, int InChunkDepth, int InMinDepth, int InMaxDepth);
