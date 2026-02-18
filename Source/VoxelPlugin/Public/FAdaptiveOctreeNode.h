@@ -2,28 +2,29 @@
 
 #include "CoreMinimal.h"
 
-struct FNodeCorner {
+struct VOXELPLUGIN_API FNodeCorner {
     FVector Position;
+    FVector Normal;
     double Density;
-    FVector Normal; // Add this
 
     FNodeCorner() : Position(0), Density(0), Normal(0, 0, 1) {}
-    FNodeCorner(FVector InPos, double InDensity, FVector InNormal)
-        : Position(InPos), Density(InDensity), Normal(InNormal) {}
+
+    FNodeCorner(FVector InPos, double InDensity, FVector InNormal) : Position(InPos), Density(InDensity), Normal(InNormal) {}
 };
 
 struct VOXELPLUGIN_API FNodeEdge
 {
-    FNodeCorner Corners[2];     // The corners associated with this edge
+    FNodeCorner Corners[2];
     double Size;
-    bool SignChange;            // Does this edge contain a sign change
+    bool SignChange;
     double Distance;
-    FVector EdgeDirection;      // Precomputed normalized edge direction
-    int Axis;                   // Axis-aligned indicator (0 = X, 1 = Y, 2 = Z)
-    FVector ZeroCrossingPoint;  // Position where sign flips
+    FVector EdgeDirection;
+    int Axis;  
+    FVector ZeroCrossingPoint;
 
     // Constructor
     FNodeEdge() : Size(0), SignChange(false), Distance(0), Axis(0) {}
+
     FNodeEdge(FNodeCorner InCorner1, FNodeCorner InCorner2)
     {
         Corners[0] = InCorner1;
@@ -73,6 +74,7 @@ struct VOXELPLUGIN_API FNodeEdge
             ZeroCrossingPoint = (InCorner1.Position + InCorner2.Position) * 0.5;
         }
     }
+
     bool IsCongruent(const FNodeEdge& Other) const {
         // Both corners must match (in either order) AND axis must match
         bool CornersMatch =
@@ -91,12 +93,58 @@ struct VOXELPLUGIN_API FNodeEdge
     }
 };
 
+struct VOXELPLUGIN_API FEdgeKey
+{
+    int64 X0, Y0, Z0;  // Quantized corner 0 (sorted so min corner is always first)
+    int64 X1, Y1, Z1;  // Quantized corner 1
+    int32 Axis;
+
+    // Quantization grid — 0.001 is well within the 0.01 epsilon used in IsCongruent
+    static constexpr double GridSize = 0.001;
+
+    static int64 Quantize(double V)
+    {
+        return FMath::RoundToInt64(V / GridSize);
+    }
+
+    FEdgeKey() = default;
+
+    FEdgeKey(const FNodeEdge& Edge)
+    {
+        int64 ax = Quantize(Edge.Corners[0].Position.X);
+        int64 ay = Quantize(Edge.Corners[0].Position.Y);
+        int64 az = Quantize(Edge.Corners[0].Position.Z);
+        int64 bx = Quantize(Edge.Corners[1].Position.X);
+        int64 by = Quantize(Edge.Corners[1].Position.Y);
+        int64 bz = Quantize(Edge.Corners[1].Position.Z);
+
+        // Canonical ordering: ensure (corner0 < corner1) so order doesn't matter
+        if (ax < bx || (ax == bx && ay < by) || (ax == bx && ay == by && az < bz))
+        {
+            X0 = ax; Y0 = ay; Z0 = az;
+            X1 = bx; Y1 = by; Z1 = bz;
+        }
+        else
+        {
+            X0 = bx; Y0 = by; Z0 = bz;
+            X1 = ax; Y1 = ay; Z1 = az;
+        }
+
+        Axis = Edge.Axis;
+    }
+
+    bool operator==(const FEdgeKey& Other) const
+    {
+        return X0 == Other.X0 && Y0 == Other.Y0 && Z0 == Other.Z0
+            && X1 == Other.X1 && Y1 == Other.Y1 && Z1 == Other.Z1
+            && Axis == Other.Axis;
+    }
+};
+
 struct VOXELPLUGIN_API FQEF
 {
     // Accumulated ATA matrix (symmetric 3x3, stored as 6 unique values)
-    double ATA_00, ATA_01, ATA_02;
-    double           ATA_11, ATA_12;
-    double                     ATA_22;
+    double ATA_00, ATA_01, ATA_02, ATA_11, ATA_12, ATA_22;
 
     // Accumulated ATb vector
     double ATb_X, ATb_Y, ATb_Z;
@@ -217,7 +265,6 @@ struct VOXELPLUGIN_API FQEF
     }
 
 private:
-
     // Solve ATA * x = rhs using eigendecomposition of the 3x3 symmetric matrix.
     // Singular/near-singular eigenvalues are clamped, which gives us the 
     // pseudoinverse behavior we need for degenerate cases.
@@ -335,66 +382,6 @@ private:
     }
 };
 
-struct FEdgeKey
-{
-    int64 X0, Y0, Z0;  // Quantized corner 0 (sorted so min corner is always first)
-    int64 X1, Y1, Z1;  // Quantized corner 1
-    int32 Axis;
-
-    // Quantization grid — 0.001 is well within the 0.01 epsilon used in IsCongruent
-    static constexpr double GridSize = 0.001;
-
-    static int64 Quantize(double V)
-    {
-        return FMath::RoundToInt64(V / GridSize);
-    }
-
-    FEdgeKey() = default;
-
-    FEdgeKey(const FNodeEdge& Edge)
-    {
-        int64 ax = Quantize(Edge.Corners[0].Position.X);
-        int64 ay = Quantize(Edge.Corners[0].Position.Y);
-        int64 az = Quantize(Edge.Corners[0].Position.Z);
-        int64 bx = Quantize(Edge.Corners[1].Position.X);
-        int64 by = Quantize(Edge.Corners[1].Position.Y);
-        int64 bz = Quantize(Edge.Corners[1].Position.Z);
-
-        // Canonical ordering: ensure (corner0 < corner1) so order doesn't matter
-        if (ax < bx || (ax == bx && ay < by) || (ax == bx && ay == by && az < bz))
-        {
-            X0 = ax; Y0 = ay; Z0 = az;
-            X1 = bx; Y1 = by; Z1 = bz;
-        }
-        else
-        {
-            X0 = bx; Y0 = by; Z0 = bz;
-            X1 = ax; Y1 = ay; Z1 = az;
-        }
-
-        Axis = Edge.Axis;
-    }
-
-    bool operator==(const FEdgeKey& Other) const
-    {
-        return X0 == Other.X0 && Y0 == Other.Y0 && Z0 == Other.Z0
-            && X1 == Other.X1 && Y1 == Other.Y1 && Z1 == Other.Z1
-            && Axis == Other.Axis;
-    }
-};
-
-FORCEINLINE uint32 GetTypeHash(const FEdgeKey& Key)
-{
-    uint32 Hash = GetTypeHash(Key.X0);
-    Hash = HashCombine(Hash, GetTypeHash(Key.Y0));
-    Hash = HashCombine(Hash, GetTypeHash(Key.Z0));
-    Hash = HashCombine(Hash, GetTypeHash(Key.X1));
-    Hash = HashCombine(Hash, GetTypeHash(Key.Y1));
-    Hash = HashCombine(Hash, GetTypeHash(Key.Z1));
-    Hash = HashCombine(Hash, GetTypeHash(Key.Axis));
-    return Hash;
-}
-
 struct VOXELPLUGIN_API FAdaptiveOctreeNode : public TSharedFromThis<FAdaptiveOctreeNode>
 {
 private:
@@ -402,7 +389,7 @@ private:
     void ComputeDualContourPosition();
     bool bIsLeaf = true;
     
-    // Static arrays
+    // Static arrays, offset and edge pair lookup tables
     inline static const FVector Offsets[8] = {
         FVector(-1, -1, -1), FVector(1, -1, -1),
         FVector(-1, 1, -1), FVector(1, 1, -1),
@@ -420,30 +407,36 @@ public:
     TArray<uint8> TreeIndex;
     TWeakPtr<FAdaptiveOctreeNode> Parent;
     TSharedPtr<FAdaptiveOctreeNode> Children[8];
-    int DepthBounds[3];
+    FNodeCorner Corners[8];
+    TArray<FNodeEdge> SignChangeEdges;
 
+    int DepthBounds[3];
     FVector AnchorCenter;
     FVector Center;
     double Extent;
     FVector DualContourPosition;
     FVector DualContourNormal;
     bool IsSurfaceNode;
-    bool LodOverride = false; //If true prevent merge ops
-    FNodeCorner Corners[8];
-    TArray<FNodeEdge> SignChangeEdges;
+    bool LodOverride = false;
 
     bool IsLeaf();
+
     bool IsRoot();
 
     void Split();
+    
     bool ShouldSplit(FVector InCameraPosition, double InScreenSpaceThreshold, double InCameraFOV);
+    
     void Merge();
+    
     bool ShouldMerge(FVector InCameraPosition, double InScreenSpaceThreshold, double InCameraFOV);
 
     void UpdateLod(FVector InCameraPosition, double InScreenSpaceThreshold, double InCameraFOV, TArray<FNodeEdge>& OutNodeEdges, TMap<FEdgeKey, int32>& EdgeMap, bool& OutChanged);
 
     TArray<FNodeEdge> GetSurfaceEdges();
+    
     TArray<TSharedPtr<FAdaptiveOctreeNode>> GetSurfaceNodes();
+    
     TArray<FNodeEdge>& GetSignChangeEdges();
 
     // Root Constructor
@@ -454,3 +447,15 @@ public:
 
     FVector GetInterpolatedNormal(FVector P);
 };
+
+FORCEINLINE uint32 GetTypeHash(const FEdgeKey& Key)
+{
+    uint32 Hash = GetTypeHash(Key.X0);
+    Hash = HashCombine(Hash, GetTypeHash(Key.Y0));
+    Hash = HashCombine(Hash, GetTypeHash(Key.Z0));
+    Hash = HashCombine(Hash, GetTypeHash(Key.X1));
+    Hash = HashCombine(Hash, GetTypeHash(Key.Y1));
+    Hash = HashCombine(Hash, GetTypeHash(Key.Z1));
+    Hash = HashCombine(Hash, GetTypeHash(Key.Axis));
+    return Hash;
+}

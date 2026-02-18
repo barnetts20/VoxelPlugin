@@ -6,19 +6,20 @@
 /**
  * Adaptive Octree for LOD-based voxel meshing.
  */
-inline const FVector Directions[6] =
-{
-    FVector(1, 0, 0),
-    FVector(-1, 0, 0),
-    FVector(0, 1, 0),
-    FVector(0, -1, 0),
-    FVector(0, 0, 1),
-    FVector(0, 0, -1)
-};
 
 struct VOXELPLUGIN_API FAdaptiveOctree
 {
 private:
+    static inline const FVector Directions[6] =
+    {
+        FVector(1, 0, 0),
+        FVector(-1, 0, 0),
+        FVector(0, 1, 0),
+        FVector(0, -1, 0),
+        FVector(0, 0, 1),
+        FVector(0, 0, -1)
+    };
+
     TFunction<double(FVector, FVector)> DensityFunction;
     TSharedPtr<FAdaptiveOctreeNode> Root;
     TArray<TSharedPtr<FAdaptiveOctreeNode>> Chunks;
