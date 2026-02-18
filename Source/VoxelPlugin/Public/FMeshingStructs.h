@@ -139,19 +139,32 @@ struct VOXELPLUGIN_API FMeshChunk {
 
     void UpdateComponent(TSharedPtr<FMeshChunk> Self) {
         AsyncTask(ENamedThreads::GameThread, [Self]() {
+            // 1. Initial State Check
             if (!Self->IsInitialized || !Self->IsDirty) return;
-            if (!Self->ChunkRtMesh.IsValid() || !Self->ChunkRtComponent.IsValid()) return;
 
+            // 2. Resolve Weak Pointers to Raw Pointers
+            // This is the "One-Time Resolution" that fixes the conversion error
+            URealtimeMeshSimple* MeshPtr = Self->ChunkRtMesh.Get();
+            URealtimeMeshComponent* CompPtr = Self->ChunkRtComponent.Get();
+
+            // 3. Safety Check: If the Actor/Component was destroyed, bail out
+            if (!MeshPtr || !CompPtr) return;
+
+            // 4. Ghost Mesh Check
             auto* PositionStream = Self->ChunkMeshData->MeshStream.Find(FRealtimeMeshStreams::Position);
             if (!PositionStream || PositionStream->Num() == 0) {
-                Self->ChunkRtMesh->UpdateSectionGroup(Self->ChunkMeshData->MeshGroupKey, FRealtimeMeshStreamSet());
+                // Clear the section by passing an empty StreamSet
+                MeshPtr->UpdateSectionGroup(Self->ChunkMeshData->MeshGroupKey, FRealtimeMeshStreamSet());
                 Self->IsDirty = false;
                 return;
             }
 
+            // 5. Standard Update
             Self->IsDirty = false;
-            Self->ChunkRtMesh->UpdateSectionGroup(Self->ChunkMeshData->MeshGroupKey, Self->ChunkMeshData->MeshStream);
-            Self->ChunkRtMesh->UpdateSectionConfig(Self->ChunkMeshData->MeshSectionKey, Self->SecConfig, true);
+
+            // Use the resolved MeshPtr instead of the WeakPtr wrapper
+            MeshPtr->UpdateSectionGroup(Self->ChunkMeshData->MeshGroupKey, Self->ChunkMeshData->MeshStream);
+            MeshPtr->UpdateSectionConfig(Self->ChunkMeshData->MeshSectionKey, Self->SecConfig, true);
         });
     }
 };
