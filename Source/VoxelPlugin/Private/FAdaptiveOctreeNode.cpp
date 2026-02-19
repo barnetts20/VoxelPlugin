@@ -62,7 +62,7 @@ void FAdaptiveOctreeNode::ComputeCornerDensity() {
     SignChangeEdges.Empty();
     // Use a conservative h for the root
     double ChunkExtent = Extent * FMath::Pow(2.0, (double)(TreeIndex.Num() - DepthBounds[0]));
-    double h = FMath::Max(0.1 * Extent, ChunkExtent * 2 * 1e-6);
+    double h = FMath::Max(0.1 * Extent, ChunkExtent * 2 * 1e-5);
 
     for (int i = 0; i < 8; i++) {
         FVector CornerPosition = Center + Offsets[i] * Extent;

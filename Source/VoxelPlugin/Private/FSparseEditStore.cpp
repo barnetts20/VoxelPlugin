@@ -31,6 +31,19 @@ double FSparseEditStore::Sample(FVector Position) const
     return Sum;
 }
 
+int FSparseEditStore::GetDepthForBrushRadius(double BrushRadius, int SubdivisionLevels) const
+{
+    // Find the depth where node extent roughly matches brush radius
+    int Depth = 0;
+    double NodeExtent = Extent;
+    while (Depth < MaxDepth - SubdivisionLevels && NodeExtent > BrushRadius)
+    {
+        NodeExtent *= 0.5;
+        Depth++;
+    }
+    return Depth + SubdivisionLevels;
+}
+
 void FSparseEditStore::ApplySphericalEdit(FVector BrushCenter, double Radius, double Strength, int Depth)
 {
     Depth = FMath::Clamp(Depth, 0, MaxDepth);

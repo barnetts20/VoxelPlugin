@@ -15,6 +15,7 @@ public:
     FSparseEditStore(FVector InCenter, double InExtent, int InMaxDepth);
 
     double Sample(FVector Position) const;
+    int GetDepthForBrushRadius(double BrushRadius, int SubdivisionLevels) const;
     void ApplySphericalEdit(FVector BrushCenter, double Radius, double Strength, int Depth);
     void Clear();
     bool HasEdits() const;

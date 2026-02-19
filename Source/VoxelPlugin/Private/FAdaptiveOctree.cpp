@@ -10,7 +10,10 @@ FAdaptiveOctree::FAdaptiveOctree(TFunction<double(FVector, FVector)> InDensityFu
     //APPLY A LARGE EDIT TO TEST
     double OctantExtent = RootExtent * 0.5;
     FVector OctantCenter = InCenter + FVector(OctantExtent, OctantExtent, OctantExtent);
-    EditStore->ApplySphericalEdit(OctantCenter, OctantExtent * 1.5, 100000000000000000.0, 4);
+    float BrushStrength = 5;
+    //TODO: Depth can probably be derived by best fit to extent... even if its just a helper function, we should know roughly what depth we need given a size and a desired depth offset
+    int InsertDepth = EditStore->GetDepthForBrushRadius(OctantExtent, 4);
+    EditStore->ApplySphericalEdit(OctantCenter, OctantExtent, OctantExtent * BrushStrength, InsertDepth); 
 
     Root = MakeShared<FAdaptiveOctreeNode>(&DensityFunction, EditStore, InCenter, InRootExtent, InChunkDepth, InMinDepth, InMaxDepth);
     {
@@ -127,7 +130,7 @@ void FAdaptiveOctree::UpdateMeshChunkStreamData(TSharedPtr<FMeshChunk> InChunk)
     TArray<FEdgeVertexData> AllEdgeData;
     AllEdgeData.SetNum(InChunk->ChunkEdges.Num());
 
-    double QuantizationGrid = InChunk->ChunkExtent * 2 * 1e-6;
+    double QuantizationGrid = InChunk->ChunkExtent * 2 * 1e-5;
 
     ParallelFor(InChunk->ChunkEdges.Num(), [&](int32 edgeIdx) {
         const FNodeEdge currentEdge = InChunk->ChunkEdges[edgeIdx];
@@ -304,7 +307,7 @@ TArray<TSharedPtr<FAdaptiveOctreeNode>> FAdaptiveOctree::SampleNodesAroundEdge(c
             int ChildIndex = 0;
 
             // Adaptive epsilon based on current node size to handle floating-point drift
-            double Epsilon = ChunkExtent * 2 * 1e-6;
+            double Epsilon = ChunkExtent * 2 * 1e-5;
 
             // Helper to check which side of the splitting plane the point falls on
             auto CheckSide = [&](int AxisIndex, bool PositiveBias) {
