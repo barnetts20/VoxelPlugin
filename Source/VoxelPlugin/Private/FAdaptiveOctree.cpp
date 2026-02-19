@@ -5,8 +5,14 @@ FAdaptiveOctree::FAdaptiveOctree(TFunction<double(FVector, FVector)> InDensityFu
 {
     DensityFunction = InDensityFunction;
     RootExtent = InRootExtent;
+    EditStore = MakeShared<FSparseEditStore>(InCenter, InRootExtent, InMaxDepth);
+    
+    //APPLY A LARGE EDIT TO TEST
+    double OctantExtent = RootExtent * 0.5;
+    FVector OctantCenter = InCenter + FVector(OctantExtent, OctantExtent, OctantExtent);
+    EditStore->ApplySphericalEdit(OctantCenter, OctantExtent * 1.5, 100000000000000000.0, 4);
 
-    Root = MakeShared<FAdaptiveOctreeNode>(&DensityFunction, InCenter, InRootExtent, InChunkDepth, InMinDepth, InMaxDepth);
+    Root = MakeShared<FAdaptiveOctreeNode>(&DensityFunction, EditStore, InCenter, InRootExtent, InChunkDepth, InMinDepth, InMaxDepth);
     {
         SplitToDepth(Root, InChunkDepth);
     }

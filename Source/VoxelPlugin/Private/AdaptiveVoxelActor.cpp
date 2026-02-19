@@ -97,8 +97,6 @@ void AAdaptiveVoxelActor::InitializeChunks()
     
     // Adaptive octree meshes the implicit structure
     AdaptiveOctree = MakeShared<FAdaptiveOctree>(DensityFunction, GetActorLocation(), Size, ChunkDepth, MinDepth, MaxDepth);
-    // Sparsetree for user edits
-    SparseOctree = MakeShared<FSparseOctree>();
 
     AdaptiveOctree->InitializeMeshChunks(this, Material);
     Initialized = true;

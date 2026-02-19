@@ -21,6 +21,7 @@ private:
     };
 
     TFunction<double(FVector, FVector)> DensityFunction;
+    TSharedPtr<FSparseEditStore> EditStore;
     TSharedPtr<FAdaptiveOctreeNode> Root;
     TArray<TSharedPtr<FAdaptiveOctreeNode>> Chunks;
     TArray<TSharedPtr<FMeshChunk>> MeshChunks;

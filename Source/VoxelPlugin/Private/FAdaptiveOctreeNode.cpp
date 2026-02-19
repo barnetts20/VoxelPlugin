@@ -1,5 +1,47 @@
 #include "FAdaptiveOctreeNode.h"
 
+// Root Constructor
+FAdaptiveOctreeNode::FAdaptiveOctreeNode(TFunction<double(FVector, FVector)>* InDensityFunction, TSharedPtr<FSparseEditStore> InEditStore, FVector InCenter, double InExtent, int InChunkDepth, int InMinDepth, int InMaxDepth)
+{
+    DensityFunction = InDensityFunction;
+    EditStore = InEditStore;
+    Center = InCenter;
+    AnchorCenter = InCenter;
+
+    Extent = FMath::Max(InExtent, 0.0);
+
+    DepthBounds[0] = InChunkDepth;
+    DepthBounds[1] = InMaxDepth;
+    DepthBounds[2] = InMinDepth;
+
+    ComputeCornerDensity();
+    ComputeDualContourPosition();
+}
+
+// Child Constructor
+FAdaptiveOctreeNode::FAdaptiveOctreeNode(TSharedPtr<FAdaptiveOctreeNode> InParent, uint8 ChildIndex, FVector InAnchorCenter)
+{
+    TreeIndex = InParent->TreeIndex;
+    TreeIndex.Add(ChildIndex);
+
+    Parent = InParent;
+    DensityFunction = InParent->DensityFunction;
+    EditStore = InParent->EditStore;
+    AnchorCenter = InAnchorCenter;
+
+    // Set spatial bounds first
+    Extent = InParent->Extent * 0.5;
+    Center = InParent->Center + Offsets[ChildIndex] * Extent;
+
+    DepthBounds[0] = InParent->DepthBounds[0];
+    DepthBounds[1] = InParent->DepthBounds[1];
+    DepthBounds[2] = InParent->DepthBounds[2];
+    // DERIVE CHUNK EXTENT: Using the TreeIndex depth relative to ChunkDepth
+    // ChunkDepth should be a member or accessible variable (e.g., 5)
+    ComputeCornerDensity();
+    ComputeDualContourPosition();
+}
+
 bool FAdaptiveOctreeNode::IsLeaf()
 {
     return bIsLeaf;
@@ -10,30 +52,26 @@ bool FAdaptiveOctreeNode::IsRoot()
     return !Parent.IsValid();
 }
 
-// Root Constructor
-FAdaptiveOctreeNode::FAdaptiveOctreeNode(TFunction<double(FVector, FVector)>* InDensityFunction, FVector InCenter, double InExtent, int InChunkDepth, int InMinDepth, int InMaxDepth)
-{
-    DensityFunction = InDensityFunction;
-    Center = InCenter;
-    AnchorCenter = InCenter;
+double FAdaptiveOctreeNode::SampleDensity(FVector InPosition, FVector InAnchorCenter) {
+    double base = (*DensityFunction)(InPosition, InAnchorCenter);
+    double edit = EditStore->Sample(InPosition);
+    return base + edit;
+}
 
-    Extent = FMath::Max(InExtent, 0.0);
-
-    DepthBounds[0] = InChunkDepth;
-    DepthBounds[1] = InMaxDepth;
-    DepthBounds[2] = InMinDepth;
-
+void FAdaptiveOctreeNode::ComputeCornerDensity() {
+    SignChangeEdges.Empty();
     // Use a conservative h for the root
-    double h = 0.1 * Extent;
+    double ChunkExtent = Extent * FMath::Pow(2.0, (double)(TreeIndex.Num() - DepthBounds[0]));
+    double h = FMath::Max(0.1 * Extent, ChunkExtent * 2 * 1e-6);
 
     for (int i = 0; i < 8; i++) {
         FVector CornerPosition = Center + Offsets[i] * Extent;
-        double d = (*DensityFunction)(CornerPosition, AnchorCenter);
+        double d = SampleDensity(CornerPosition, AnchorCenter);
 
         // Forward difference is fine for the root as it's usually empty/air
-        double dx = (*DensityFunction)(CornerPosition + FVector(h, 0, 0), AnchorCenter) - d;
-        double dy = (*DensityFunction)(CornerPosition + FVector(0, h, 0), AnchorCenter) - d;
-        double dz = (*DensityFunction)(CornerPosition + FVector(0, 0, h), AnchorCenter) - d;
+        double dx = SampleDensity(CornerPosition + FVector(h, 0, 0), AnchorCenter) - d;
+        double dy = SampleDensity(CornerPosition + FVector(0, h, 0), AnchorCenter) - d;
+        double dz = SampleDensity(CornerPosition + FVector(0, 0, h), AnchorCenter) - d;
 
         FVector grad(dx, dy, dz);
         if (!grad.Normalize()) { grad = FVector::UpVector; }
@@ -46,60 +84,6 @@ FAdaptiveOctreeNode::FAdaptiveOctreeNode(TFunction<double(FVector, FVector)>* In
         FNodeEdge anEdge = FNodeEdge(Corners[EdgePairs[EdgeIndex][0]], Corners[EdgePairs[EdgeIndex][1]]);
         if (anEdge.SignChange) SignChangeEdges.Add(anEdge);
     }
-
-    ComputeDualContourPosition();
-}
-
-// Child Constructor
-FAdaptiveOctreeNode::FAdaptiveOctreeNode(TFunction<double(FVector, FVector)>* InDensityFunction, TSharedPtr<FAdaptiveOctreeNode> InParent, uint8 ChildIndex, FVector InAnchorCenter)
-{
-    TreeIndex = InParent->TreeIndex;
-    TreeIndex.Add(ChildIndex);
-
-    Parent = InParent;
-    DensityFunction = InDensityFunction;
-    AnchorCenter = InAnchorCenter;
-
-    // Set spatial bounds first
-    Extent = InParent->Extent * 0.5;
-    Center = InParent->Center + Offsets[ChildIndex] * Extent;
-
-    DepthBounds[0] = InParent->DepthBounds[0];
-    DepthBounds[1] = InParent->DepthBounds[1];
-    DepthBounds[2] = InParent->DepthBounds[2];
-    // DERIVE CHUNK EXTENT: Using the TreeIndex depth relative to ChunkDepth
-    // ChunkDepth should be a member or accessible variable (e.g., 5)
-    double ChunkExtent = Extent * FMath::Pow(2.0, (double)(TreeIndex.Num() - DepthBounds[0]));
-
-    // STABLE GRADIENT STEP: Node detail (10%) but clamped to Chunk stability (1e-6)
-    double h = FMath::Max(0.1 * Extent, ChunkExtent * 2 * 1e-6);
-
-    for (int i = 0; i < 8; i++)
-    {
-        FVector CornerPos = Center + (Offsets[i] * Extent);
-        double d = (*DensityFunction)(CornerPos, AnchorCenter);
-
-        // CENTRAL DIFFERENCE: Much smoother for planetary lighting
-        double dx = (*DensityFunction)(CornerPos + FVector(h, 0, 0), AnchorCenter) -
-            (*DensityFunction)(CornerPos - FVector(h, 0, 0), AnchorCenter);
-        double dy = (*DensityFunction)(CornerPos + FVector(0, h, 0), AnchorCenter) -
-            (*DensityFunction)(CornerPos - FVector(0, h, 0), AnchorCenter);
-        double dz = (*DensityFunction)(CornerPos + FVector(0, 0, h), AnchorCenter) -
-            (*DensityFunction)(CornerPos - FVector(0, 0, h), AnchorCenter);
-
-        FVector Normal(dx, dy, dz);
-        if (!Normal.Normalize()) { Normal = FVector::UpVector; }
-
-        Corners[i] = FNodeCorner(CornerPos, d, Normal);
-    }
-
-    for (int i = 0; i < 12; i++)
-    {
-        FNodeEdge anEdge = FNodeEdge(Corners[EdgePairs[i][0]], Corners[EdgePairs[i][1]]);
-        if (anEdge.SignChange) SignChangeEdges.Add(anEdge);
-    }
-
-    ComputeDualContourPosition();
 }
 
 FVector FAdaptiveOctreeNode::GetInterpolatedNormal(FVector P)
@@ -138,7 +122,7 @@ void FAdaptiveOctreeNode::Split()
     for (uint8 i = 0; i < 8; i++)
     {
         // Update constructor to take NextAnchor
-        Children[i] = MakeShared<FAdaptiveOctreeNode>(DensityFunction, AsShared(), i, NextAnchor);
+        Children[i] = MakeShared<FAdaptiveOctreeNode>(AsShared(), i, NextAnchor);
 
         if (Children[i]->IsSurfaceNode)
         {

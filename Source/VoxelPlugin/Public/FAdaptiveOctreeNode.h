@@ -1,6 +1,7 @@
 #pragma once
 
 #include "CoreMinimal.h"
+#include <FSparseEditStore.h>
 
 //TODO: Move the following structs into OctreeContour, along with any other meshing related or QEF related functions/structs we are using
 struct VOXELPLUGIN_API FNodeCorner {
@@ -409,6 +410,7 @@ public:
     TArray<uint8> TreeIndex;
     TWeakPtr<FAdaptiveOctreeNode> Parent;
     TSharedPtr<FAdaptiveOctreeNode> Children[8];
+    TSharedPtr<FSparseEditStore> EditStore;
     FNodeCorner Corners[8];
     TArray<FNodeEdge> SignChangeEdges;
 
@@ -442,10 +444,14 @@ public:
     TArray<FNodeEdge>& GetSignChangeEdges();
 
     // Root Constructor
-    FAdaptiveOctreeNode(TFunction<double(FVector, FVector)>* DensityFunction, FVector InCenter, double InExtent, int InChunkDepth, int InMinDepth, int InMaxDepth);
+    FAdaptiveOctreeNode(TFunction<double(FVector, FVector)>* DensityFunction, TSharedPtr<FSparseEditStore> InEditStore, FVector InCenter, double InExtent, int InChunkDepth, int InMinDepth, int InMaxDepth);
+
+    double SampleDensity(FVector InSamplePosition, FVector InAnchorCenter);
+
+    void ComputeCornerDensity();
 
     // Child Constructor
-    FAdaptiveOctreeNode(TFunction<double(FVector, FVector)>* DensityFunction, TSharedPtr<FAdaptiveOctreeNode> InParent, uint8 InChildIndex, FVector InAnchorCenter);
+    FAdaptiveOctreeNode(TSharedPtr<FAdaptiveOctreeNode> InParent, uint8 InChildIndex, FVector InAnchorCenter);
 
     FVector GetInterpolatedNormal(FVector P);
 };
