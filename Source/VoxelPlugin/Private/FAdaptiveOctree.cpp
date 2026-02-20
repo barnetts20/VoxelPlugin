@@ -5,7 +5,7 @@ FAdaptiveOctree::FAdaptiveOctree(TFunction<double(FVector, FVector)> InDensityFu
 {
     DensityFunction = InDensityFunction;
     RootExtent = InRootExtent;
-    EditStore = MakeShared<FSparseEditStore>(InCenter, InRootExtent, InMaxDepth);
+    EditStore = MakeShared<FSparseEditStore>(InCenter, InRootExtent, InMaxDepth, InChunkDepth);
     
     //APPLY A LARGE EDIT TO TEST
     double OctantExtent = RootExtent * 0.5;

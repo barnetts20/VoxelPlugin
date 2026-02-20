@@ -12,11 +12,12 @@ struct FSparseEditNode
 class FSparseEditStore
 {
 public:
-    FSparseEditStore(FVector InCenter, double InExtent, int InMaxDepth);
+    FSparseEditStore(FVector InCenter, double InExtent, int InMaxDepth, int InChunkDepth);
 
     double Sample(FVector Position) const;
     int GetDepthForBrushRadius(double BrushRadius, int SubdivisionLevels) const;
     void ApplySphericalEdit(FVector BrushCenter, double Radius, double Strength, int Depth);
+    const TArray<FVector>& GetAffectedChunkCenters() const;
     void Clear();
     bool HasEdits() const;
 
@@ -24,6 +25,8 @@ private:
     TSharedPtr<FSparseEditNode> Root;
     FVector Center;
     double Extent;
+    int ChunkDepth;
+    TArray<FVector> AffectedChunkCenters;
     int MaxDepth;
 
     static inline const FVector Offsets[8] = {
