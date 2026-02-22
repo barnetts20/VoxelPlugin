@@ -124,6 +124,7 @@ void FSparseEditStore::ApplyEditRecursive(TSharedPtr<FSparseEditNode> Node, FVec
     if (CurrentDepth == TargetDepth)
     {
         Node->HasEdits = true;
+        double MaxEdit = BrushRadius * 2;
         for (int i = 0; i < 8; i++)
         {
             FVector CornerPos = GetCornerPosition(NodeCenter, NodeExtent, i);
@@ -131,6 +132,7 @@ void FSparseEditStore::ApplyEditRecursive(TSharedPtr<FSparseEditNode> Node, FVec
             double Falloff = FMath::Clamp(1.0 - (Dist / BrushRadius), 0.0, 1.0);
             Falloff = Falloff * Falloff * (3.0 - 2.0 * Falloff);
             Node->CornerDensities[i] += Strength * Falloff;
+            Node->CornerDensities[i] = FMath::Clamp(Node->CornerDensities[i], -MaxEdit, MaxEdit);
         }
         return;
     }

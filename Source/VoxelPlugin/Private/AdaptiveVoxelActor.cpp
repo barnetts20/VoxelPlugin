@@ -44,6 +44,31 @@ void AAdaptiveVoxelActor::BeginPlay()
     InitializeChunks();
 }
 
+void AAdaptiveVoxelActor::EndPlay(const EEndPlayReason::Type EndPlayReason)
+{
+    IsDestroyed = true; // Signals background tasks to stop immediately
+
+    // Clear timers so no new tasks are dispatched
+    if (UWorld* World = GetWorld())
+    {
+        World->GetTimerManager().ClearAllTimersForObject(this);
+    }
+
+    // CRITICAL: Scope lock and clear the octree shared pointer
+    {
+        FRWScopeLock WriteLock(OctreeLock, SLT_Write);
+        if (AdaptiveOctree.IsValid())
+        {
+            // If FMeshChunk holds a UObject* (like the component), 
+            // we must null it out here.
+            AdaptiveOctree->Clear();
+            AdaptiveOctree.Reset();
+        }
+    }
+
+    Super::EndPlay(EndPlayReason);
+}
+
 void AAdaptiveVoxelActor::CleanSceneRoot()
 {
     auto destroyComponentArray = GetRootComponent()->GetAttachChildren();
@@ -99,6 +124,7 @@ void AAdaptiveVoxelActor::InitializeChunks()
     AdaptiveOctree = MakeShared<FAdaptiveOctree>(DensityFunction, GetActorLocation(), Size, ChunkDepth, MinDepth, MaxDepth);
 
     AdaptiveOctree->InitializeMeshChunks(this, Material);
+    //AdaptiveOctree->UpdateLOD(CameraPosition, ScreenSpaceThreshold, CameraFOV);
     Initialized = true;
 
     // Use Unreal's TimerManager to safely schedule repeating tasks
@@ -111,6 +137,7 @@ void AAdaptiveVoxelActor::InitializeChunks()
     }
 }
 
+int editcount = 0;
 void AAdaptiveVoxelActor::RunDataUpdateTask()
 {
     if (DataUpdateIsRunning || IsDestroyed) return;
@@ -122,19 +149,22 @@ void AAdaptiveVoxelActor::RunDataUpdateTask()
         {
             AAdaptiveVoxelActor* Self = WeakThis.Get();
             if (!Self || Self->IsDestroyed) return;
-
             {
                 FRWScopeLock WriteLock(Self->OctreeLock, SLT_Write);
+                //Self->AdaptiveOctree->TestEdit(FVector(0, 0, 0));
+                Self->AdaptiveOctree->CreatePendingMeshChunks();
+
                 FVector CurrentCamPos = Self->CameraPosition;
                 FVector Velocity = (CurrentCamPos - Self->LastLodUpdatePosition);
                 FVector PredictedPos = CurrentCamPos + (Velocity * Self->VelocityLookAheadFactor);
+                
                 Self->AdaptiveOctree->UpdateLOD(PredictedPos, Self->ScreenSpaceThreshold, Self->CameraFOV);
                 Self->LastLodUpdatePosition = Self->CameraPosition;
             }
 
             Self->DataUpdateIsRunning = false;
 
-        }, TStatId(), nullptr, ENamedThreads::AnyBackgroundThreadNormalTask);
+        }, TStatId(), nullptr, ENamedThreads::AnyBackgroundHiPriTask);
 }
 
 void AAdaptiveVoxelActor::RunMeshUpdateTask()
@@ -148,15 +178,15 @@ void AAdaptiveVoxelActor::RunMeshUpdateTask()
         {
             AAdaptiveVoxelActor* Self = WeakThis.Get();
             if (!Self || Self->IsDestroyed) return;
-
             {
                 FRWScopeLock ReadLock(Self->OctreeLock, SLT_ReadOnly);
+
                 Self->AdaptiveOctree->UpdateMesh();
             }
 
             Self->MeshUpdateIsRunning = false;
 
-        }, TStatId(), nullptr, ENamedThreads::AnyBackgroundThreadNormalTask);
+        }, TStatId(), nullptr, ENamedThreads::AnyBackgroundHiPriTask);
 }
 
 bool AAdaptiveVoxelActor::ShouldTickIfViewportsOnly() const
@@ -182,6 +212,7 @@ void AAdaptiveVoxelActor::Tick(float DeltaTime)
             if (CamManager)
             {
                 CameraFOV = CamManager->GetFOVAngle();
+
             }
         }
     }

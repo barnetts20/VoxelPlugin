@@ -30,7 +30,7 @@ private:
 
     FRWLock OctreeLock;
 
-    bool TickInEditor = true;
+    bool TickInEditor = false;
     std::atomic<bool>  Initialized = false;
     std::atomic<bool>  IsDestroyed = false;
 
@@ -45,16 +45,16 @@ public:
     double Size = 100000000.0;
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Octree")
-    int ChunkDepth = 4;
+    int ChunkDepth = 3;
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Octree")
     int MinDepth = 7;
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Octree")
-    int MaxDepth = 19;
+    int MaxDepth = 18;
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "LOD")
-    double ScreenSpaceThreshold = .075;
+    double ScreenSpaceThreshold = .05;
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "LOD")
     double MinDataUpdateInterval = .01;
@@ -68,6 +68,8 @@ public:
     virtual void OnConstruction(const FTransform& Transform) override;
     
     virtual void BeginPlay() override;
+
+    virtual void EndPlay(const EEndPlayReason::Type EndPlayReason) override;
     
     virtual void BeginDestroy() override;
     

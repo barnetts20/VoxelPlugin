@@ -53,16 +53,14 @@ bool FAdaptiveOctreeNode::IsRoot()
 }
 
 double FAdaptiveOctreeNode::SampleDensity(FVector InPosition, FVector InAnchorCenter) {
-    double base = (*DensityFunction)(InPosition, InAnchorCenter);
-    double edit = EditStore->Sample(InPosition);
-    return base + edit;
+    return (*DensityFunction)(InPosition, InAnchorCenter) + EditStore->Sample(InPosition);
 }
 
 void FAdaptiveOctreeNode::ComputeCornerDensity() {
     SignChangeEdges.Empty();
     // Use a conservative h for the root
     double ChunkExtent = Extent * FMath::Pow(2.0, (double)(TreeIndex.Num() - DepthBounds[0]));
-    double h = FMath::Max(0.1 * Extent, ChunkExtent * 2 * 1e-5);
+    double h = FMath::Max(0.1 * Extent, ChunkExtent * 1e-6);
 
     for (int i = 0; i < 8; i++) {
         FVector CornerPosition = Center + Offsets[i] * Extent;
@@ -84,6 +82,7 @@ void FAdaptiveOctreeNode::ComputeCornerDensity() {
         FNodeEdge anEdge = FNodeEdge(Corners[EdgePairs[EdgeIndex][0]], Corners[EdgePairs[EdgeIndex][1]]);
         if (anEdge.SignChange) SignChangeEdges.Add(anEdge);
     }
+    IsSurfaceNode = !SignChangeEdges.IsEmpty();;
 }
 
 FVector FAdaptiveOctreeNode::GetInterpolatedNormal(FVector P)
@@ -253,6 +252,7 @@ TArray<FNodeEdge> FAdaptiveOctreeNode::GetSurfaceEdges()
     return TArray<FNodeEdge>();
 }
 
+
 // Retrieves all surface nodes for meshing
 TArray<TSharedPtr<FAdaptiveOctreeNode>> FAdaptiveOctreeNode::GetSurfaceNodes()
 {
@@ -286,6 +286,24 @@ TArray<TSharedPtr<FAdaptiveOctreeNode>> FAdaptiveOctreeNode::GetSurfaceNodes()
 TArray<FNodeEdge>& FAdaptiveOctreeNode::GetSignChangeEdges()
 {
     return SignChangeEdges;
+}
+
+void FAdaptiveOctreeNode::Reconstruct()
+{
+    // Recompute this node as if it were freshly constructed
+    ComputeCornerDensity();
+    ComputeDualContourPosition();
+
+    // Propagate IsSurfaceNode up to ancestors
+    if (IsSurfaceNode)
+    {
+        TSharedPtr<FAdaptiveOctreeNode> Ancestor = Parent.Pin();
+        while (Ancestor.IsValid() && !Ancestor->IsSurfaceNode)
+        {
+            Ancestor->IsSurfaceNode = true;
+            Ancestor = Ancestor->Parent.Pin();
+        }
+    }
 }
 
 void FAdaptiveOctreeNode::ComputeDualContourPosition()
@@ -331,7 +349,7 @@ void FAdaptiveOctreeNode::ComputeDualContourPosition()
     // When density variation is below float precision, the zero-crossing
     // T values are pure noise. The mass point averages out the jitter
     // and gives a stable position. Skip the QEF entirely.
-    double PrecisionThreshold = 1e-5;
+    double PrecisionThreshold = 1e-6;
     if (MaxDensityRange < PrecisionThreshold)
     {
         DualContourPosition = MassPoint;

@@ -24,7 +24,8 @@ private:
     TSharedPtr<FSparseEditStore> EditStore;
     TSharedPtr<FAdaptiveOctreeNode> Root;
     TArray<TSharedPtr<FAdaptiveOctreeNode>> Chunks;
-    TArray<TSharedPtr<FMeshChunk>> MeshChunks;
+    TMap<TSharedPtr<FAdaptiveOctreeNode>, TSharedPtr<FMeshChunk>> MeshChunks;
+    TArray<TSharedPtr<FAdaptiveOctreeNode>> PendingNewChunks;
     bool MeshChunksInitialized = false;
     double RootExtent;
     double ChunkExtent;
@@ -44,8 +45,23 @@ private:
     TArray<TSharedPtr<FAdaptiveOctreeNode>> GetSurfaceNodes();
 
 public:
+    int32 ChunkDepth = 0;
+    ARealtimeMeshActor* CachedParentActor = nullptr;
+    UMaterialInterface* CachedMaterial = nullptr;
+
+    void ApplyEdit(FVector BrushCenter, double BrushRadius, double Strength);
+    void UpdateAffectedChunks(TSharedPtr<FAdaptiveOctreeNode> Node, FVector EditCenter, double SearchRadius);
+    void GatherLeafEdges(TSharedPtr<FAdaptiveOctreeNode> Node, TArray<FNodeEdge>& OutEdges);
+    TSharedPtr<FAdaptiveOctreeNode> GetNodeByPointAtDepth(FVector Position, int TargetDepth);
+    bool HasSurfaceNeighbor(TSharedPtr<FAdaptiveOctreeNode> Node);
+    void CreatePendingMeshChunks();
+
     // Constructor
     FAdaptiveOctree(TFunction<double(FVector, FVector)> InDensityFunction, FVector InCenter, double InRootExtent, int InChunkDepth, int InMinDepth, int InMaxDepth);
+
+    void TestEdit(FVector Center);
+
+    void ReconstructAffectedLeaves(TSharedPtr<FAdaptiveOctreeNode> Node, FVector EditCenter, double SearchRadius);
 
     void InitializeMeshChunks(ARealtimeMeshActor* InParentActor, UMaterialInterface* InMaterial);
     
@@ -53,6 +69,5 @@ public:
 
     void UpdateMesh();
 
-    void Clear(); //TODO: Need to test this
-    //TODO: Need to make a destructor that safely disposes references/pointers and locks
+    void Clear();
 };

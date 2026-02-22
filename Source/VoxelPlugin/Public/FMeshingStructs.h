@@ -134,13 +134,38 @@ struct VOXELPLUGIN_API FMeshChunk {
             if (Node->Extent < OwnerExtent * 0.9)
                 return false;
         }
+
+        // Ownership: this chunk only processes the edge if the edge's
+        // minimum corner falls within this chunk's bounds
+        FVector MinCorner = Edge.Corners[0].Position;
+        if (Edge.Corners[1].Position.X < MinCorner.X ||
+            (Edge.Corners[1].Position.X == MinCorner.X && Edge.Corners[1].Position.Y < MinCorner.Y) ||
+            (Edge.Corners[1].Position.X == MinCorner.X && Edge.Corners[1].Position.Y == MinCorner.Y && Edge.Corners[1].Position.Z < MinCorner.Z))
+        {
+            MinCorner = Edge.Corners[1].Position;
+        }
+
+        // Check if min corner is inside this chunk's AABB
+        double E = ChunkExtent;
+        if (MinCorner.X < ChunkCenter.X - E || MinCorner.X > ChunkCenter.X + E ||
+            MinCorner.Y < ChunkCenter.Y - E || MinCorner.Y > ChunkCenter.Y + E ||
+            MinCorner.Z < ChunkCenter.Z - E || MinCorner.Z > ChunkCenter.Z + E)
+        {
+            return false;
+        }
+
         return true;
     }
 
-    void UpdateComponent(TSharedPtr<FMeshChunk> Self) {
-        AsyncTask(ENamedThreads::GameThread, [Self]() {
+    void UpdateComponent(TSharedPtr<FMeshChunk> Self, TSharedPtr<FAdaptiveOctreeNode> ChunkNode, ARealtimeMeshActor* InParentActor, UMaterialInterface* InMaterial) {
+
+        AsyncTask(ENamedThreads::GameThread, [Self, ChunkNode, InParentActor, InMaterial]() {
             // 1. Initial State Check
-            if (!Self->IsInitialized || !Self->IsDirty) return;
+            if (!Self->IsInitialized) {
+                Self->Initialize(InParentActor, InMaterial, ChunkNode->Center, ChunkNode->Extent); //(ARealtimeMeshActor* InParentActor, UMaterialInterface* Material, FVector InCenter, double InExtent)
+            }
+                
+            if(!Self->IsDirty) return;
 
             // 2. Resolve Weak Pointers to Raw Pointers
             // This is the "One-Time Resolution" that fixes the conversion error
@@ -159,12 +184,12 @@ struct VOXELPLUGIN_API FMeshChunk {
                 return;
             }
 
-            // 5. Standard Update
-            Self->IsDirty = false;
-
             // Use the resolved MeshPtr instead of the WeakPtr wrapper
             MeshPtr->UpdateSectionGroup(Self->ChunkMeshData->MeshGroupKey, Self->ChunkMeshData->MeshStream);
             MeshPtr->UpdateSectionConfig(Self->ChunkMeshData->MeshSectionKey, Self->SecConfig, true);
+
+            // 5. Standard Update
+            Self->IsDirty = false;
         });
     }
 };

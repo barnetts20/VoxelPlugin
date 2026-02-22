@@ -389,7 +389,6 @@ struct VOXELPLUGIN_API FAdaptiveOctreeNode : public TSharedFromThis<FAdaptiveOct
 {
 private:
     TFunction<double(FVector, FVector)>* DensityFunction;
-    void ComputeDualContourPosition();
     bool bIsLeaf = true;
     
     // Static arrays, offset and edge pair lookup tables
@@ -443,6 +442,9 @@ public:
     
     TArray<FNodeEdge>& GetSignChangeEdges();
 
+    void Reconstruct();
+
+    void ComputeDualContourPosition();
     // Root Constructor
     FAdaptiveOctreeNode(TFunction<double(FVector, FVector)>* DensityFunction, TSharedPtr<FSparseEditStore> InEditStore, FVector InCenter, double InExtent, int InChunkDepth, int InMinDepth, int InMaxDepth);
 
