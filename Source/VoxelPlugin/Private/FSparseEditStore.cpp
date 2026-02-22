@@ -1,7 +1,15 @@
 #include "FSparseEditStore.h"
 
+// ============================================================================
+// CONSTRUCTION
+// ============================================================================
+
 FSparseEditStore::FSparseEditStore(FVector InCenter, double InExtent, int InMaxDepth, int InChunkDepth)
     : Center(InCenter), Extent(InExtent), MaxDepth(InMaxDepth), ChunkDepth(InChunkDepth) {}
+
+// ============================================================================
+// SAMPLING (Thread Safe — read only)
+// ============================================================================
 
 double FSparseEditStore::Sample(FVector Position) const
 {
@@ -15,9 +23,7 @@ double FSparseEditStore::Sample(FVector Position) const
     while (Current)
     {
         if (Current->HasEdits)
-        {
             Sum += InterpolateCorners(Current, NodeCenter, NodeExtent, Position);
-        }
 
         int ChildIndex = GetChildIndex(Position, NodeCenter);
         if (!Current->Children[ChildIndex]) break;
@@ -30,55 +36,7 @@ double FSparseEditStore::Sample(FVector Position) const
     return Sum;
 }
 
-int FSparseEditStore::GetDepthForBrushRadius(double BrushRadius, int SubdivisionLevels) const
-{
-    int Depth = 0;
-    double NodeExtent = Extent;
-    while (Depth < MaxDepth - SubdivisionLevels && NodeExtent > BrushRadius)
-    {
-        NodeExtent *= 0.5;
-        Depth++;
-    }
-    return Depth + SubdivisionLevels;
-}
-
-void FSparseEditStore::ApplySphericalEdit(FVector BrushCenter, double Radius, double Strength, int Depth)
-{
-    Depth = FMath::Clamp(Depth, 0, MaxDepth);
-    AffectedChunkCenters.Empty();
-
-    if (!Root)
-        Root = MakeShared<FSparseEditNode>();
-
-    ApplyEditRecursive(Root, Center, Extent, BrushCenter, Radius, Strength, 0, Depth);
-}
-
-const TArray<FVector>& FSparseEditStore::GetAffectedChunkCenters() const
-{
-    return AffectedChunkCenters;
-}
-
-void FSparseEditStore::Clear()
-{
-    Root.Reset();
-}
-
-bool FSparseEditStore::HasEdits() const
-{
-    return Root.IsValid();
-}
-
-int FSparseEditStore::GetChildIndex(FVector Position, FVector NodeCenter) const
-{
-    int Index = 0;
-    if (Position.X >= NodeCenter.X) Index |= 1;
-    if (Position.Y >= NodeCenter.Y) Index |= 2;
-    if (Position.Z >= NodeCenter.Z) Index |= 4;
-    return Index;
-}
-
-double FSparseEditStore::InterpolateCorners(const TSharedPtr<FSparseEditNode>& Node,
-    FVector NodeCenter, double NodeExtent, FVector Position) const
+double FSparseEditStore::InterpolateCorners(const TSharedPtr<FSparseEditNode>& Node, FVector NodeCenter, double NodeExtent, FVector Position) const
 {
     double tx = (Position.X - (NodeCenter.X - NodeExtent)) / (2.0 * NodeExtent);
     double ty = (Position.Y - (NodeCenter.Y - NodeExtent)) / (2.0 * NodeExtent);
@@ -99,15 +57,23 @@ double FSparseEditStore::InterpolateCorners(const TSharedPtr<FSparseEditNode>& N
     return FMath::Lerp(c0, c1, tz);
 }
 
-FVector FSparseEditStore::GetCornerPosition(FVector NodeCenter, double NodeExtent, int CornerIndex) const
+// ============================================================================
+// EDIT APPLICATION (Background Thread)
+// ============================================================================
+
+void FSparseEditStore::ApplySphericalEdit(FVector BrushCenter, double Radius, double Strength, int Depth)
 {
-    return NodeCenter + Offsets[CornerIndex] * NodeExtent;
+    Depth = FMath::Clamp(Depth, 0, MaxDepth);
+    AffectedChunkCenters.Empty();
+
+    if (!Root)
+        Root = MakeShared<FSparseEditNode>();
+
+    ApplyEditRecursive(Root, Center, Extent, BrushCenter, Radius, Strength, 0, Depth);
 }
 
-void FSparseEditStore::ApplyEditRecursive(TSharedPtr<FSparseEditNode> Node, FVector NodeCenter,
-    double NodeExtent, FVector BrushCenter, double BrushRadius,
-    double Strength, int CurrentDepth, int TargetDepth)
-{
+void FSparseEditStore::ApplyEditRecursive(TSharedPtr<FSparseEditNode> Node, FVector NodeCenter, double NodeExtent, FVector BrushCenter, double BrushRadius, double Strength, int CurrentDepth, int TargetDepth) {
+    // AABB-sphere overlap check
     FVector ClosestPoint;
     ClosestPoint.X = FMath::Clamp(BrushCenter.X, NodeCenter.X - NodeExtent, NodeCenter.X + NodeExtent);
     ClosestPoint.Y = FMath::Clamp(BrushCenter.Y, NodeCenter.Y - NodeExtent, NodeCenter.Y + NodeExtent);
@@ -116,27 +82,26 @@ void FSparseEditStore::ApplyEditRecursive(TSharedPtr<FSparseEditNode> Node, FVec
     if (FVector::Dist(ClosestPoint, BrushCenter) > BrushRadius)
         return;
 
+    // Record chunk-depth nodes for affected chunk tracking
     if (CurrentDepth == ChunkDepth)
-    {
         AffectedChunkCenters.AddUnique(NodeCenter);
-    }
 
+    // Write edit at target depth
     if (CurrentDepth == TargetDepth)
     {
         Node->HasEdits = true;
-        double MaxEdit = BrushRadius * 2;
         for (int i = 0; i < 8; i++)
         {
             FVector CornerPos = GetCornerPosition(NodeCenter, NodeExtent, i);
             double Dist = FVector::Dist(CornerPos, BrushCenter);
             double Falloff = FMath::Clamp(1.0 - (Dist / BrushRadius), 0.0, 1.0);
-            Falloff = Falloff * Falloff * (3.0 - 2.0 * Falloff);
+            Falloff = Falloff * Falloff * (3.0 - 2.0 * Falloff); // Smoothstep
             Node->CornerDensities[i] += Strength * Falloff;
-            Node->CornerDensities[i] = FMath::Clamp(Node->CornerDensities[i], -MaxEdit, MaxEdit);
         }
         return;
     }
 
+    // Recurse into children
     double ChildExtent = NodeExtent * 0.5;
     for (int i = 0; i < 8; i++)
     {
@@ -156,4 +121,54 @@ void FSparseEditStore::ApplyEditRecursive(TSharedPtr<FSparseEditNode> Node, FVec
         ApplyEditRecursive(Node->Children[i], ChildCenter, ChildExtent,
             BrushCenter, BrushRadius, Strength, CurrentDepth + 1, TargetDepth);
     }
+}
+
+// ============================================================================
+// QUERIES
+// ============================================================================
+
+int FSparseEditStore::GetDepthForBrushRadius(double BrushRadius, int SubdivisionLevels) const
+{
+    int Depth = 0;
+    double NodeExtent = Extent;
+    while (Depth < MaxDepth - SubdivisionLevels && NodeExtent > BrushRadius)
+    {
+        NodeExtent *= 0.5;
+        Depth++;
+    }
+    return Depth + SubdivisionLevels;
+}
+
+const TArray<FVector>& FSparseEditStore::GetAffectedChunkCenters() const
+{
+    return AffectedChunkCenters;
+}
+
+bool FSparseEditStore::HasEdits() const
+{
+    return Root.IsValid();
+}
+
+// ============================================================================
+// UTILITY
+// ============================================================================
+
+int FSparseEditStore::GetChildIndex(FVector Position, FVector NodeCenter) const
+{
+    int Index = 0;
+    if (Position.X >= NodeCenter.X) Index |= 1;
+    if (Position.Y >= NodeCenter.Y) Index |= 2;
+    if (Position.Z >= NodeCenter.Z) Index |= 4;
+    return Index;
+}
+
+FVector FSparseEditStore::GetCornerPosition(FVector NodeCenter, double NodeExtent, int CornerIndex) const
+{
+    return NodeCenter + Offsets[CornerIndex] * NodeExtent;
+}
+
+void FSparseEditStore::Clear()
+{
+    Root.Reset();
+    AffectedChunkCenters.Empty();
 }

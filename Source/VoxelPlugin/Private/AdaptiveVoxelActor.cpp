@@ -5,7 +5,10 @@
 
 using namespace RealtimeMesh;
 
-// Sets default values
+// ============================================================================
+// CONSTRUCTION (Game Thread)
+// ============================================================================
+
 AAdaptiveVoxelActor::AAdaptiveVoxelActor()
 {
     PrimaryActorTick.bCanEverTick = true;
@@ -14,11 +17,50 @@ AAdaptiveVoxelActor::AAdaptiveVoxelActor()
     Material = UMaterial::GetDefaultMaterial(EMaterialDomain::MD_Surface);
 }
 
+// ============================================================================
+// LIFECYCLE (Game Thread)
+// ============================================================================
+
+void AAdaptiveVoxelActor::BeginPlay()
+{
+    Super::BeginPlay();
+    InitializeChunks();
+}
+
+void AAdaptiveVoxelActor::OnConstruction(const FTransform& Transform)
+{
+    Super::OnConstruction(Transform);
+    if (GetWorld() && !GetWorld()->IsPreviewWorld() && TickInEditor)
+    {
+        InitializeChunks();
+    }
+}
+
+void AAdaptiveVoxelActor::EndPlay(const EEndPlayReason::Type EndPlayReason)
+{
+    IsDestroyed = true;
+
+    if (UWorld* World = GetWorld())
+    {
+        World->GetTimerManager().ClearAllTimersForObject(this);
+    }
+
+    {
+        FRWScopeLock WriteLock(OctreeLock, SLT_Write);
+        if (AdaptiveOctree.IsValid())
+        {
+            AdaptiveOctree->Clear();
+            AdaptiveOctree.Reset();
+        }
+    }
+
+    Super::EndPlay(EndPlayReason);
+}
+
 void AAdaptiveVoxelActor::BeginDestroy()
 {
     IsDestroyed = true;
 
-    // Safely clear all timers when the actor is destroyed to prevent dangling executions
     if (UWorld* World = GetWorld())
     {
         World->GetTimerManager().ClearAllTimersForObject(this);
@@ -28,46 +70,14 @@ void AAdaptiveVoxelActor::BeginDestroy()
     Super::BeginDestroy();
 }
 
-void AAdaptiveVoxelActor::OnConstruction(const FTransform& Transform)
+bool AAdaptiveVoxelActor::ShouldTickIfViewportsOnly() const
 {
-    Super::OnConstruction(Transform);
-    // Ensure we are not in a preview world (prevents running in editor mode)
-    if (GetWorld() && !GetWorld()->IsPreviewWorld() && TickInEditor)
-    {
-        InitializeChunks();
-    }
+    return TickInEditor;
 }
 
-void AAdaptiveVoxelActor::BeginPlay()
-{
-    Super::BeginPlay();
-    InitializeChunks();
-}
-
-void AAdaptiveVoxelActor::EndPlay(const EEndPlayReason::Type EndPlayReason)
-{
-    IsDestroyed = true; // Signals background tasks to stop immediately
-
-    // Clear timers so no new tasks are dispatched
-    if (UWorld* World = GetWorld())
-    {
-        World->GetTimerManager().ClearAllTimersForObject(this);
-    }
-
-    // CRITICAL: Scope lock and clear the octree shared pointer
-    {
-        FRWScopeLock WriteLock(OctreeLock, SLT_Write);
-        if (AdaptiveOctree.IsValid())
-        {
-            // If FMeshChunk holds a UObject* (like the component), 
-            // we must null it out here.
-            AdaptiveOctree->Clear();
-            AdaptiveOctree.Reset();
-        }
-    }
-
-    Super::EndPlay(EndPlayReason);
-}
+// ============================================================================
+// INITIALIZATION (Game Thread)
+// ============================================================================
 
 void AAdaptiveVoxelActor::CleanSceneRoot()
 {
@@ -85,49 +95,38 @@ void AAdaptiveVoxelActor::CleanSceneRoot()
 void AAdaptiveVoxelActor::InitializeChunks()
 {
     CleanSceneRoot();
-    // Spherenoise - Example SDF applys perline noise to a sphere with domain shifting and noise scaling to help precision
+
     auto DensityFunction = [this](FVector Position, FVector AnchorCenter) -> double {
-        // 1. High-precision local offset relative to the Chunk Anchor
         FVector LocalOffset = Position - AnchorCenter;
 
-        // 2. Consistent Domain Translation
-        double NoiseScale = Size * 0.1;
-
-        // We find the 'Base Domain Coordinate' of the Anchor. 
-        // Fmod handles the periodicity (repeating every 256 units).
-        double Periodicity = 4096 * 8;
+        double NoiseScale = Size * 0.2;
+        double Periodicity = 256;
         FVector DomainBase(
             FMath::Fmod(AnchorCenter.X / NoiseScale, Periodicity),
             FMath::Fmod(AnchorCenter.Y / NoiseScale, Periodicity),
             FMath::Fmod(AnchorCenter.Z / NoiseScale, Periodicity)
         );
 
-        // 3. Local Domain Offset
-        // This is a small number (e.g., within the chunk's extent)
         FVector DomainLocal = LocalOffset / NoiseScale;
-
-        // Summing two small numbers preserves the precision lost at 10^8
         FVector FinalSample = DomainBase + DomainLocal;
-        float NoiseVal = FMath::PerlinNoise3D(FinalSample) * (float)(Size * 0.1);
+        float NoiseVal = FMath::PerlinNoise3D(FinalSample) * (float)(Size * 0.02);
 
-        // 4. Planet-Relative Distance (Stay in Double)
         FVector PlanetRelativeP = Position - GetActorLocation();
-        double RealDist = PlanetRelativeP.Size(); // RelativePos is small enough now
+        double RealDist = PlanetRelativeP.Size();
 
         return RealDist - (Size * 0.85 + (double)NoiseVal);
-    };
+        };
 
     AdaptiveOctree.Reset();
-    SparseOctree.Reset();
-    
-    // Adaptive octree meshes the implicit structure
+
+    // Construct octree (data only — no UObject creation)
     AdaptiveOctree = MakeShared<FAdaptiveOctree>(DensityFunction, GetActorLocation(), Size, ChunkDepth, MinDepth, MaxDepth);
 
+    // Create mesh chunk entries and UObject components (Game Thread)
     AdaptiveOctree->InitializeMeshChunks(this, Material);
-    //AdaptiveOctree->UpdateLOD(CameraPosition, ScreenSpaceThreshold, CameraFOV);
     Initialized = true;
 
-    // Use Unreal's TimerManager to safely schedule repeating tasks
+    // Schedule update tasks
     if (UWorld* World = GetWorld())
     {
         World->GetTimerManager().ClearTimer(DataUpdateTimerHandle);
@@ -137,7 +136,71 @@ void AAdaptiveVoxelActor::InitializeChunks()
     }
 }
 
-int editcount = 0;
+// ============================================================================
+// TICK (Game Thread) — Camera cache + pending chunk creation
+// ============================================================================
+
+void AAdaptiveVoxelActor::Tick(float DeltaTime)
+{
+    Super::Tick(DeltaTime);
+    if (!Initialized) return;
+
+    // Cache camera data
+    auto world = GetWorld();
+    if (world != nullptr)
+    {
+        auto viewLocations = world->ViewLocationsRenderedLastFrame;
+        if (viewLocations.Num() > 0)
+        {
+            CameraPosition = viewLocations[0];
+
+            APlayerCameraManager* CamManager = UGameplayStatics::GetPlayerCameraManager(world, 0);
+            if (CamManager)
+            {
+                CameraFOV = CamManager->GetFOVAngle();
+            }
+        }
+    }
+
+    // Create any pending mesh chunks that need UObject components (Game Thread only)
+    if (AdaptiveOctree.IsValid() && AdaptiveOctree->PendingNewChunks.Num() > 0)
+    {
+        FRWScopeLock WriteLock(OctreeLock, SLT_Write);
+        AdaptiveOctree->CreatePendingMeshChunks();
+    }
+
+    if (world->IsGameWorld())
+    {
+        APlayerController* PC = UGameplayStatics::GetPlayerController(world, 0);
+        if (PC && PC->IsInputKeyDown(EKeys::E))
+        {
+            FVector CamLoc;
+            FRotator CamRot;
+            PC->GetPlayerViewPoint(CamLoc, CamRot);
+
+            FHitResult Hit;
+            FVector TraceEnd = CamLoc + CamRot.Vector() * (Size * 3.0);
+
+            FCollisionQueryParams Params;
+            Params.bTraceComplex = true;
+
+            if (world->LineTraceSingleByChannel(Hit, CamLoc, TraceEnd, ECC_Visibility, Params))
+            {
+                if (!PendingEditLocation.IsSet())
+                {
+                    PendingEditLocation = Hit.ImpactPoint;
+                    PendingBrushRadius = 400;
+                    PendingStrength = 800;
+                }
+            }
+        }
+    }
+}
+
+// ============================================================================
+// DATA UPDATE TASK (Background Thread) — LOD + Edits
+// ============================================================================
+
 void AAdaptiveVoxelActor::RunDataUpdateTask()
 {
     if (DataUpdateIsRunning || IsDestroyed) return;
@@ -151,21 +214,34 @@ void AAdaptiveVoxelActor::RunDataUpdateTask()
             if (!Self || Self->IsDestroyed) return;
             {
                 FRWScopeLock WriteLock(Self->OctreeLock, SLT_Write);
-                //Self->AdaptiveOctree->TestEdit(FVector(0, 0, 0));
-                Self->AdaptiveOctree->CreatePendingMeshChunks();
 
+                if (!Self->AdaptiveOctree.IsValid()) return;
+
+                // Process pending edits
+                if (Self->PendingEditLocation.IsSet())
+                {
+                    Self->AdaptiveOctree->ApplyEdit(
+                        Self->PendingEditLocation.GetValue(),
+                        Self->PendingBrushRadius,
+                        Self->PendingStrength);
+                    Self->PendingEditLocation.Reset();
+                }
+
+                // LOD update
                 FVector CurrentCamPos = Self->CameraPosition;
                 FVector Velocity = (CurrentCamPos - Self->LastLodUpdatePosition);
                 FVector PredictedPos = CurrentCamPos + (Velocity * Self->VelocityLookAheadFactor);
-                
                 Self->AdaptiveOctree->UpdateLOD(PredictedPos, Self->ScreenSpaceThreshold, Self->CameraFOV);
                 Self->LastLodUpdatePosition = Self->CameraPosition;
             }
 
             Self->DataUpdateIsRunning = false;
-
         }, TStatId(), nullptr, ENamedThreads::AnyBackgroundHiPriTask);
 }
+
+// ============================================================================
+// MESH UPDATE TASK (Game Thread dispatch via AsyncTask internally)
+// ============================================================================
 
 void AAdaptiveVoxelActor::RunMeshUpdateTask()
 {
@@ -181,42 +257,20 @@ void AAdaptiveVoxelActor::RunMeshUpdateTask()
             {
                 FRWScopeLock ReadLock(Self->OctreeLock, SLT_ReadOnly);
 
+                if (!Self->AdaptiveOctree.IsValid()) return;
+
+                // UpdateMesh iterates chunks and calls UpdateComponent,
+                // which dispatches to game thread via AsyncTask internally
                 Self->AdaptiveOctree->UpdateMesh();
             }
 
             Self->MeshUpdateIsRunning = false;
-
         }, TStatId(), nullptr, ENamedThreads::AnyBackgroundHiPriTask);
 }
 
-bool AAdaptiveVoxelActor::ShouldTickIfViewportsOnly() const
-{
-    return TickInEditor;
-}
-
-void AAdaptiveVoxelActor::Tick(float DeltaTime)
-{
-    Super::Tick(DeltaTime);
-    if (!Initialized) return;
-
-    // Cache cam data
-    auto world = GetWorld();
-    if (world != nullptr)
-    {
-        auto viewLocations = world->ViewLocationsRenderedLastFrame;
-        if (viewLocations.Num() > 0)
-        {
-            this->CameraPosition = viewLocations[0];
-
-            APlayerCameraManager* CamManager = UGameplayStatics::GetPlayerCameraManager(world, 0);
-            if (CamManager)
-            {
-                CameraFOV = CamManager->GetFOVAngle();
-
-            }
-        }
-    }
-}
+// ============================================================================
+// ACCESSORS
+// ============================================================================
 
 TSharedPtr<FAdaptiveOctree> AAdaptiveVoxelActor::GetOctree()
 {

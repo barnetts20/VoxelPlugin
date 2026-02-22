@@ -135,23 +135,29 @@ struct VOXELPLUGIN_API FMeshChunk {
                 return false;
         }
 
-        // Ownership: this chunk only processes the edge if the edge's
-        // minimum corner falls within this chunk's bounds
-        FVector MinCorner = Edge.Corners[0].Position;
-        if (Edge.Corners[1].Position.X < MinCorner.X ||
-            (Edge.Corners[1].Position.X == MinCorner.X && Edge.Corners[1].Position.Y < MinCorner.Y) ||
-            (Edge.Corners[1].Position.X == MinCorner.X && Edge.Corners[1].Position.Y == MinCorner.Y && Edge.Corners[1].Position.Z < MinCorner.Z))
-        {
-            MinCorner = Edge.Corners[1].Position;
-        }
-
-        // Check if min corner is inside this chunk's AABB
+        // Deterministic ownership: the edge midpoint's perpendicular coordinates
+        // must be strictly inside this chunk. For coordinates exactly on the
+        // boundary, the chunk with the LOWER center coordinate owns it.
+        FVector Mid = (Edge.Corners[0].Position + Edge.Corners[1].Position) * 0.5;
         double E = ChunkExtent;
-        if (MinCorner.X < ChunkCenter.X - E || MinCorner.X > ChunkCenter.X + E ||
-            MinCorner.Y < ChunkCenter.Y - E || MinCorner.Y > ChunkCenter.Y + E ||
-            MinCorner.Z < ChunkCenter.Z - E || MinCorner.Z > ChunkCenter.Z + E)
+        double Eps = E * 1e-9;
+
+        for (int Axis = 0; Axis < 3; Axis++)
         {
-            return false;
+            if (Axis == Edge.Axis) continue; // Skip the axis the edge runs along
+
+            double Low = ChunkCenter[Axis] - E;
+            double High = ChunkCenter[Axis] + E;
+            double P = Mid[Axis];
+
+            // Outside this chunk entirely
+            if (P < Low - Eps || P > High + Eps)
+                return false;
+
+            // On the upper boundary — only process if no neighbor above
+            // (i.e., the chunk with center < ours would claim it)
+            if (FMath::Abs(P - High) < Eps)
+                return false;
         }
 
         return true;

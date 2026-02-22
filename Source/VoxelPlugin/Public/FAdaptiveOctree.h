@@ -25,7 +25,7 @@ private:
     TSharedPtr<FAdaptiveOctreeNode> Root;
     TArray<TSharedPtr<FAdaptiveOctreeNode>> Chunks;
     TMap<TSharedPtr<FAdaptiveOctreeNode>, TSharedPtr<FMeshChunk>> MeshChunks;
-    TArray<TSharedPtr<FAdaptiveOctreeNode>> PendingNewChunks;
+
     bool MeshChunksInitialized = false;
     double RootExtent;
     double ChunkExtent;
@@ -48,6 +48,7 @@ public:
     int32 ChunkDepth = 0;
     ARealtimeMeshActor* CachedParentActor = nullptr;
     UMaterialInterface* CachedMaterial = nullptr;
+    TArray<TSharedPtr<FAdaptiveOctreeNode>> PendingNewChunks;
 
     void ApplyEdit(FVector BrushCenter, double BrushRadius, double Strength);
     void UpdateAffectedChunks(TSharedPtr<FAdaptiveOctreeNode> Node, FVector EditCenter, double SearchRadius);
@@ -71,3 +72,8 @@ public:
 
     void Clear();
 };
+
+inline uint32 GetTypeHash(const FMeshVertex& Vertex)
+{
+    return FCrc::MemCrc32(&Vertex.Position, sizeof(FVector));
+}
