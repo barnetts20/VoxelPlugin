@@ -79,7 +79,7 @@ void FSparseEditStore::ApplyEditRecursive(TSharedPtr<FSparseEditNode> Node, FVec
     ClosestPoint.Y = FMath::Clamp(BrushCenter.Y, NodeCenter.Y - NodeExtent, NodeCenter.Y + NodeExtent);
     ClosestPoint.Z = FMath::Clamp(BrushCenter.Z, NodeCenter.Z - NodeExtent, NodeCenter.Z + NodeExtent);
 
-    if (FVector::Dist(ClosestPoint, BrushCenter) > BrushRadius)
+    if (FVector::DistSquared(ClosestPoint, BrushCenter) > BrushRadius * BrushRadius)
         return;
 
     // Record chunk-depth nodes for affected chunk tracking
@@ -112,7 +112,7 @@ void FSparseEditStore::ApplyEditRecursive(TSharedPtr<FSparseEditNode> Node, FVec
         ChildClosest.Y = FMath::Clamp(BrushCenter.Y, ChildCenter.Y - ChildExtent, ChildCenter.Y + ChildExtent);
         ChildClosest.Z = FMath::Clamp(BrushCenter.Z, ChildCenter.Z - ChildExtent, ChildCenter.Z + ChildExtent);
 
-        if (FVector::Dist(ChildClosest, BrushCenter) > BrushRadius)
+        if (FVector::DistSquared(ChildClosest, BrushCenter) > BrushRadius * BrushRadius)
             continue;
 
         if (!Node->Children[i])

@@ -52,6 +52,7 @@ public:
 
     void ApplyEdit(FVector BrushCenter, double BrushRadius, double Strength);
     void UpdateAffectedChunks(TSharedPtr<FAdaptiveOctreeNode> Node, FVector EditCenter, double SearchRadius);
+    void BalanceChunkLeaves(TSharedPtr<FAdaptiveOctreeNode> Node, bool& OutBalanced);
     void GatherLeafEdges(TSharedPtr<FAdaptiveOctreeNode> Node, TArray<FNodeEdge>& OutEdges);
     TSharedPtr<FAdaptiveOctreeNode> GetNodeByPointAtDepth(FVector Position, int TargetDepth);
     bool HasSurfaceNeighbor(TSharedPtr<FAdaptiveOctreeNode> Node);

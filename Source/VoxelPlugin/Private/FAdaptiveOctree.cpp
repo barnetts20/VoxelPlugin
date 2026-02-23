@@ -126,7 +126,7 @@ void FAdaptiveOctree::ReconstructAffectedLeaves(TSharedPtr<FAdaptiveOctreeNode> 
     Closest.Y = FMath::Clamp(EditCenter.Y, Node->Center.Y - Node->Extent, Node->Center.Y + Node->Extent);
     Closest.Z = FMath::Clamp(EditCenter.Z, Node->Center.Z - Node->Extent, Node->Center.Z + Node->Extent);
 
-    if (FVector::Dist(Closest, EditCenter) > SearchRadius)
+    if (FVector::DistSquared(Closest, EditCenter) > SearchRadius * SearchRadius)
         return;
 
     // Recompute density and position for every node in range (chunk depth and below)
@@ -162,7 +162,7 @@ void FAdaptiveOctree::UpdateAffectedChunks(TSharedPtr<FAdaptiveOctreeNode> Node,
     Closest.Y = FMath::Clamp(EditCenter.Y, Node->Center.Y - Node->Extent, Node->Center.Y + Node->Extent);
     Closest.Z = FMath::Clamp(EditCenter.Z, Node->Center.Z - Node->Extent, Node->Center.Z + Node->Extent);
 
-    if (FVector::Dist(Closest, EditCenter) > SearchRadius)
+    if (FVector::DistSquared(Closest, EditCenter) > SearchRadius * SearchRadius)
         return;
 
     if (Node->TreeIndex.Num() == ChunkDepth)
@@ -198,6 +198,36 @@ void FAdaptiveOctree::UpdateAffectedChunks(TSharedPtr<FAdaptiveOctreeNode> Node,
         for (int i = 0; i < 8; i++)
             UpdateAffectedChunks(Node->Children[i], EditCenter, SearchRadius);
     }
+}
+
+void FAdaptiveOctree::BalanceChunkLeaves(TSharedPtr<FAdaptiveOctreeNode> Node, bool& OutBalanced)
+{
+    if (!Node.IsValid()) return;
+
+    if (Node->IsLeaf())
+    {
+        if (!Node->IsSurfaceNode) return; // Only balance near surface
+
+        int MyDepth = Node->TreeIndex.Num();
+        if (MyDepth >= Node->DepthBounds[1]) return; // Already at max depth
+
+        for (int face = 0; face < 6; face++)
+        {
+            FVector NeighborPos = Node->Center + Directions[face] * (Node->Extent * 2.0);
+            TSharedPtr<FAdaptiveOctreeNode> Neighbor = GetLeafNodeByPoint(NeighborPos);
+
+            if (Neighbor.IsValid() && Neighbor->TreeIndex.Num() >= MyDepth + 2)
+            {
+                Node->Split();
+                OutBalanced = false;
+                return;
+            }
+        }
+        return;
+    }
+
+    for (int i = 0; i < 8; i++)
+        BalanceChunkLeaves(Node->Children[i], OutBalanced);
 }
 
 // ============================================================================
@@ -245,7 +275,39 @@ void FAdaptiveOctree::UpdateMeshChunkStreamData(TSharedPtr<FMeshChunk> InChunk)
 
     ParallelFor(InChunk->ChunkEdges.Num(), [&](int32 edgeIdx) {
         const FNodeEdge currentEdge = InChunk->ChunkEdges[edgeIdx];
+
+        // === EARLY OWNERSHIP CHECK — skip tree traversal for ~30% of edges ===
+        FVector Mid = (currentEdge.Corners[0].Position + currentEdge.Corners[1].Position) * 0.5;
+        double E = InChunk->ChunkExtent;
+        double Eps = E * 1e-9;
+        for (int Axis = 0; Axis < 3; Axis++)
+        {
+            if (Axis == currentEdge.Axis) continue;
+            double P = Mid[Axis];
+            if (P < InChunk->ChunkCenter[Axis] - E - Eps ||
+                P > InChunk->ChunkCenter[Axis] + E + Eps ||
+                FMath::Abs(P - (InChunk->ChunkCenter[Axis] + E)) < Eps)
+            {
+                AllEdgeData[edgeIdx].IsValid = false;
+                return;
+            }
+        }
+
         TArray<TSharedPtr<FAdaptiveOctreeNode>> nodesToMesh = SampleNodesAroundEdge(currentEdge);
+        
+        if (nodesToMesh.Num() < 3)
+        {
+            FVector Midp = (currentEdge.Corners[0].Position + currentEdge.Corners[1].Position) * 0.5;
+            FString Depths;
+            for (auto& N : nodesToMesh)
+                Depths += FString::Printf(TEXT("%d "), N->TreeIndex.Num());
+
+            UE_LOG(LogTemp, Warning, TEXT("Edge rejected: %d nodes [depths: %s], edge size=%.1f, axis=%d, mid=(%.1f,%.1f,%.1f), chunk=(%.1f,%.1f,%.1f) extent=%.1f"),
+                nodesToMesh.Num(), *Depths, currentEdge.Size, currentEdge.Axis,
+                Midp.X, Midp.Y, Midp.Z,
+                InChunk->ChunkCenter.X, InChunk->ChunkCenter.Y, InChunk->ChunkCenter.Z,
+                InChunk->ChunkExtent);
+        }
 
         if (!InChunk->ShouldProcessEdge(currentEdge, nodesToMesh)) {
             AllEdgeData[edgeIdx].IsValid = false;
@@ -368,65 +430,36 @@ TArray<TSharedPtr<FAdaptiveOctreeNode>> FAdaptiveOctree::GetSurfaceNodes()
 TArray<TSharedPtr<FAdaptiveOctreeNode>> FAdaptiveOctree::SampleNodesAroundEdge(const FNodeEdge& Edge)
 {
     TArray<TSharedPtr<FAdaptiveOctreeNode>> Nodes;
-
     FVector Midpoint = (Edge.Corners[0].Position + Edge.Corners[1].Position) * 0.5;
-    double Epsilon = ChunkExtent * 1e-6;
+    double Epsilon = Edge.Size * 1e-6;
 
-    // Shared traversal: go from root to the deepest common ancestor first
-    TSharedPtr<FAdaptiveOctreeNode> CommonAncestor = Root;
-    while (CommonAncestor.IsValid() && !CommonAncestor->IsLeaf())
-    {
-        // Check if the midpoint is on any splitting plane of this node
-        bool OnBoundaryPerp1 = false, OnBoundaryPerp2 = false;
-        int Perp1Axis, Perp2Axis;
-
-        if (Edge.Axis == 0) { Perp1Axis = 1; Perp2Axis = 2; }
-        else if (Edge.Axis == 1) { Perp1Axis = 2; Perp2Axis = 0; }
-        else { Perp1Axis = 0; Perp2Axis = 1; }
-
-        OnBoundaryPerp1 = FMath::Abs(Midpoint[Perp1Axis] - CommonAncestor->Center[Perp1Axis]) <= Epsilon;
-        OnBoundaryPerp2 = FMath::Abs(Midpoint[Perp2Axis] - CommonAncestor->Center[Perp2Axis]) <= Epsilon;
-
-        // If we're on a boundary, this is where the 4 quadrants diverge
-        if (OnBoundaryPerp1 || OnBoundaryPerp2) break;
-
-        // All 4 biases would pick the same child — descend
-        int ChildIndex = 0;
-        if (Midpoint.X >= CommonAncestor->Center.X) ChildIndex |= 1;
-        if (Midpoint.Y >= CommonAncestor->Center.Y) ChildIndex |= 2;
-        if (Midpoint.Z >= CommonAncestor->Center.Z) ChildIndex |= 4;
-
-        CommonAncestor = CommonAncestor->Children[ChildIndex];
-    }
-
-    // Now do 4 biased traversals from CommonAncestor instead of Root
     auto GetLeafWithBias = [&](bool BiasPerp1, bool BiasPerp2) -> TSharedPtr<FAdaptiveOctreeNode> {
-        TSharedPtr<FAdaptiveOctreeNode> CurrentNode = CommonAncestor;
-        while (CurrentNode.IsValid() && !CurrentNode->IsLeaf()) {
+        TSharedPtr<FAdaptiveOctreeNode> Current = Root;
+        while (Current.IsValid() && !Current->IsLeaf()) {
             int ChildIndex = 0;
-            auto CheckSide = [&](int AxisIndex, bool PositiveBias) {
-                double Diff = Midpoint[AxisIndex] - CurrentNode->Center[AxisIndex];
-                if (FMath::Abs(Diff) <= Epsilon) return PositiveBias;
+            auto CheckSide = [&](int Ax, bool Bias) {
+                double Diff = Midpoint[Ax] - Current->Center[Ax];
+                if (FMath::Abs(Diff) <= Epsilon) return Bias;
                 return Diff > 0.0;
                 };
             if (Edge.Axis == 0) {
-                if (Midpoint.X >= CurrentNode->Center.X) ChildIndex |= 1;
+                if (Midpoint.X >= Current->Center.X) ChildIndex |= 1;
                 if (CheckSide(1, BiasPerp1)) ChildIndex |= 2;
                 if (CheckSide(2, BiasPerp2)) ChildIndex |= 4;
             }
             else if (Edge.Axis == 1) {
                 if (CheckSide(0, BiasPerp2)) ChildIndex |= 1;
-                if (Midpoint.Y >= CurrentNode->Center.Y) ChildIndex |= 2;
+                if (Midpoint.Y >= Current->Center.Y) ChildIndex |= 2;
                 if (CheckSide(2, BiasPerp1)) ChildIndex |= 4;
             }
             else {
                 if (CheckSide(0, BiasPerp1)) ChildIndex |= 1;
                 if (CheckSide(1, BiasPerp2)) ChildIndex |= 2;
-                if (Midpoint.Z >= CurrentNode->Center.Z) ChildIndex |= 4;
+                if (Midpoint.Z >= Current->Center.Z) ChildIndex |= 4;
             }
-            CurrentNode = CurrentNode->Children[ChildIndex];
+            Current = Current->Children[ChildIndex];
         }
-        return CurrentNode;
+        return Current;
         };
 
     TSharedPtr<FAdaptiveOctreeNode> N0 = GetLeafWithBias(true, true);

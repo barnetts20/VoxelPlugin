@@ -99,15 +99,15 @@ void AAdaptiveVoxelActor::InitializeChunks()
     auto DensityFunction = [this](FVector Position, FVector AnchorCenter) -> double {
         FVector LocalOffset = Position - AnchorCenter;
 
-        double NoiseScale = Size * 0.2;
+        double NoiseScale = 1 / (Size * 0.2);
         double Periodicity = 256;
         FVector DomainBase(
-            FMath::Fmod(AnchorCenter.X / NoiseScale, Periodicity),
-            FMath::Fmod(AnchorCenter.Y / NoiseScale, Periodicity),
-            FMath::Fmod(AnchorCenter.Z / NoiseScale, Periodicity)
+            FMath::Fmod(AnchorCenter.X * NoiseScale, Periodicity),
+            FMath::Fmod(AnchorCenter.Y * NoiseScale, Periodicity),
+            FMath::Fmod(AnchorCenter.Z * NoiseScale, Periodicity)
         );
 
-        FVector DomainLocal = LocalOffset / NoiseScale;
+        FVector DomainLocal = LocalOffset * NoiseScale;
         FVector FinalSample = DomainBase + DomainLocal;
         float NoiseVal = FMath::PerlinNoise3D(FinalSample) * (float)(Size * 0.02);
 
@@ -115,7 +115,7 @@ void AAdaptiveVoxelActor::InitializeChunks()
         double RealDist = PlanetRelativeP.Size();
 
         return RealDist - (Size * 0.85 + (double)NoiseVal);
-        };
+    };
 
     AdaptiveOctree.Reset();
 

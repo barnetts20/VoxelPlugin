@@ -505,9 +505,9 @@ TArray<TSharedPtr<FSparseOctreeNode>> FSparseOctree::GetAllNodesInRadius(FInt64C
         }
 
         // Compute internal distance without offset artifacts
-        double Distance = FVector::Dist(InternalPosition.ToDoubleVector(), CurrentNode->GetCenter().ToDoubleVector());
+        double Distance = FVector::DistSquared(InternalPosition.ToDoubleVector(), CurrentNode->GetCenter().ToDoubleVector());
 
-        if (Distance <= static_cast<double>(Range))
+        if (Distance <= static_cast<double>(Range * Range))
         {
             if (!bOnlyOccupied || CurrentNode->HasPayload())
             {
@@ -557,9 +557,9 @@ TArray<TSharedPtr<FSparseOctreeNode>> FSparseOctree::GetAllNodesInRadiusAtDepth(
         // Ensure we are at the correct depth
         if (CurrentNode->GetIndex().Num() == Depth)
         {
-            double Distance = FVector::Dist(InternalPosition.ToDoubleVector(), CurrentNode->GetCenter().ToDoubleVector());
+            double Distance = FVector::DistSquared(InternalPosition.ToDoubleVector(), CurrentNode->GetCenter().ToDoubleVector());
 
-            if (Distance <= static_cast<double>(Range))
+            if (Distance <= static_cast<double>(Range * Range))
             {
                 if (!bOnlyOccupied || CurrentNode->HasPayload())
                 {
@@ -686,9 +686,9 @@ TArray<TSharedPtr<FSparseOctreeNode>> FSparseOctree::GetAllLeavesInRadius(FInt64
 
         if (!CurrentNode.IsValid()) continue;
 
-        double Distance = FVector::Dist(InternalPosition.ToDoubleVector(), CurrentNode->GetCenter().ToDoubleVector());
+        double Distance = FVector::DistSquared(InternalPosition.ToDoubleVector(), CurrentNode->GetCenter().ToDoubleVector());
 
-        if (Distance <= static_cast<double>(Range))
+        if (Distance <= static_cast<double>(Range * Range))
         {
             if (CurrentNode->IsLeaf())
             {
