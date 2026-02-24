@@ -1,6 +1,8 @@
 #pragma once
 
+#include "FSparseEditStore.h"
 #include "CoreMinimal.h"
+
 
 //TODO: Move the following structs into OctreeContour, along with any other meshing related or QEF related functions/structs we are using
 struct VOXELPLUGIN_API FNodeCorner {
@@ -388,7 +390,9 @@ struct VOXELPLUGIN_API FAdaptiveOctreeNode : public TSharedFromThis<FAdaptiveOct
 {
 private:
     TFunction<double(FVector, FVector)>* DensityFunction;
+    TSharedPtr<FSparseEditStore> EditStore;
     void ComputeDualContourPosition();
+    double SampleDensity(FVector Position);
     bool bIsLeaf = true;
     int DepthPrecisionFloor = 18;
     // Static arrays, offset and edge pair lookup tables
@@ -442,10 +446,10 @@ public:
     TArray<FNodeEdge>& GetSignChangeEdges();
 
     // Root Constructor
-    FAdaptiveOctreeNode(TFunction<double(FVector, FVector)>* DensityFunction, FVector InCenter, double InExtent, int InChunkDepth, int InMinDepth, int InMaxDepth);
+    FAdaptiveOctreeNode(TFunction<double(FVector, FVector)>* DensityFunction, TSharedPtr<FSparseEditStore> InEditStore, FVector InCenter, double InExtent, int InChunkDepth, int InMinDepth, int InMaxDepth);
 
     // Child Constructor
-    FAdaptiveOctreeNode(TFunction<double(FVector, FVector)>* DensityFunction, TSharedPtr<FAdaptiveOctreeNode> InParent, uint8 InChildIndex, FVector InAnchorCenter);
+    FAdaptiveOctreeNode(TFunction<double(FVector, FVector)>* DensityFunction, TSharedPtr<FSparseEditStore> InEditStore, TSharedPtr<FAdaptiveOctreeNode> InParent, uint8 InChildIndex, FVector InAnchorCenter);
 
     void ComputeNodeData(bool bIsRoot);
 

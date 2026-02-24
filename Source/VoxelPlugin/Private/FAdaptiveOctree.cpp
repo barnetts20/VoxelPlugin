@@ -1,12 +1,13 @@
 #include "FAdaptiveOctree.h"
 
 // Constructor
-FAdaptiveOctree::FAdaptiveOctree(TFunction<double(FVector, FVector)> InDensityFunction, FVector InCenter, double InRootExtent, int InChunkDepth, int InMinDepth, int InMaxDepth)
+FAdaptiveOctree::FAdaptiveOctree(TFunction<double(FVector, FVector)> InDensityFunction, TSharedPtr<FSparseEditStore> InEditStore, FVector InCenter, double InRootExtent, int InChunkDepth, int InMinDepth, int InMaxDepth)
 {
     DensityFunction = InDensityFunction;
     RootExtent = InRootExtent;
+    EditStore = InEditStore;
 
-    Root = MakeShared<FAdaptiveOctreeNode>(&DensityFunction, InCenter, InRootExtent, InChunkDepth, InMinDepth, InMaxDepth);
+    Root = MakeShared<FAdaptiveOctreeNode>(&DensityFunction, InEditStore, InCenter, InRootExtent, InChunkDepth, InMinDepth, InMaxDepth);
     {
         SplitToDepth(Root, InChunkDepth);
     }

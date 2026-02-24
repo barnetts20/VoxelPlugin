@@ -1,8 +1,10 @@
 #pragma once
 
 #include "CoreMinimal.h"
-#include <FMeshingStructs.h>
+#include "FMeshingStructs.h"
+#include "FSparseEditStore.h"
 #include "FAdaptiveOctreeNode.h"
+
 /**
  * Adaptive Octree for LOD-based voxel meshing.
  */
@@ -21,6 +23,7 @@ private:
     };
 
     TFunction<double(FVector, FVector)> DensityFunction;
+    TSharedPtr<FSparseEditStore> EditStore;
     TSharedPtr<FAdaptiveOctreeNode> Root;
     TArray<TSharedPtr<FAdaptiveOctreeNode>> Chunks;
     TArray<TSharedPtr<FMeshChunk>> MeshChunks;
@@ -44,7 +47,7 @@ private:
 
 public:
     // Constructor
-    FAdaptiveOctree(TFunction<double(FVector, FVector)> InDensityFunction, FVector InCenter, double InRootExtent, int InChunkDepth, int InMinDepth, int InMaxDepth);
+    FAdaptiveOctree(TFunction<double(FVector, FVector)> InDensityFunction, TSharedPtr<FSparseEditStore> InEditStore, FVector InCenter, double InRootExtent, int InChunkDepth, int InMinDepth, int InMaxDepth);
 
     void InitializeMeshChunks(ARealtimeMeshActor* InParentActor, UMaterialInterface* InMaterial);
     

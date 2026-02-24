@@ -60,44 +60,21 @@ void AAdaptiveVoxelActor::CleanSceneRoot()
 void AAdaptiveVoxelActor::InitializeChunks()
 {
     CleanSceneRoot();
-    // Spherenoise - Example SDF applys perline noise to a sphere with domain shifting and noise scaling to help precision
+
+    // Spherenoise - Example SDF applies perlin noise to a sphere with domain shifting and noise scaling to help precision
     auto DensityFunction = [this](FVector Position, FVector AnchorCenter) -> double {
-        // 1. High-precision local offset relative to the Chunk Anchor
-        FVector LocalOffset = Position - AnchorCenter;
-
-        // 2. Consistent Domain Translation
         double NoiseScale = Size * 0.1;
-
-        // We find the 'Base Domain Coordinate' of the Anchor. 
-        // Fmod handles the periodicity (repeating every 256 units).
-        double Periodicity = 256;
-        FVector DomainBase(
-            FMath::Fmod(AnchorCenter.X / NoiseScale, Periodicity),
-            FMath::Fmod(AnchorCenter.Y / NoiseScale, Periodicity),
-            FMath::Fmod(AnchorCenter.Z / NoiseScale, Periodicity)
-        );
-
-        // 3. Local Domain Offset
-        // This is a small number (e.g., within the chunk's extent)
-        FVector DomainLocal = LocalOffset / NoiseScale;
-
-        // Summing two small numbers preserves the precision lost at 10^8
-        FVector FinalSample = DomainBase + DomainLocal;
-        float NoiseVal = FMath::PerlinNoise3D(FinalSample) * (float)(Size * 0.1);
-
-        // 4. Planet-Relative Distance (Stay in Double)
+        float NoiseVal = FMath::PerlinNoise3D(Position/NoiseScale) * (float)(Size * 0.1);
         FVector PlanetRelativeP = Position - GetActorLocation();
-        double RealDist = PlanetRelativeP.Size(); // RelativePos is small enough now
+        double RealDist = PlanetRelativeP.Size();
 
-        return RealDist - (Size * 0.85 + (double)NoiseVal);
+        return RealDist - (Size * 0.9 + (double)NoiseVal);
     };
 
-    //AdaptiveOctree.Reset();
-    //EditStore.Reset();
-    // Adaptive octree meshes the implicit structure
-    EditStore = MakeShared<FSparseEditStore>(GetActorLocation(), Size, ChunkDepth, MaxDepth);
-    AdaptiveOctree = MakeShared<FAdaptiveOctree>(DensityFunction, GetActorLocation(), Size, ChunkDepth, MinDepth, MaxDepth);
     // Store for user edits
+    EditStore = MakeShared<FSparseEditStore>(GetActorLocation(), Size, ChunkDepth, MaxDepth);
+    // Adaptive octree meshes the implicit structure
+    AdaptiveOctree = MakeShared<FAdaptiveOctree>(DensityFunction, EditStore, GetActorLocation(), Size, ChunkDepth, MinDepth, MaxDepth);
 
 
     AdaptiveOctree->InitializeMeshChunks(this, Material);

@@ -11,9 +11,11 @@ bool FAdaptiveOctreeNode::IsRoot()
 }
 
 // Root Constructor
-FAdaptiveOctreeNode::FAdaptiveOctreeNode(TFunction<double(FVector, FVector)>* InDensityFunction, FVector InCenter, double InExtent, int InChunkDepth, int InMinDepth, int InMaxDepth)
+FAdaptiveOctreeNode::FAdaptiveOctreeNode(TFunction<double(FVector, FVector)>* InDensityFunction, TSharedPtr<FSparseEditStore> InEditStore, FVector InCenter, double InExtent, int InChunkDepth, int InMinDepth, int InMaxDepth)
 {
     DensityFunction = InDensityFunction;
+    EditStore = InEditStore;
+
     Center = InCenter;
     AnchorCenter = InCenter;
 
@@ -27,13 +29,15 @@ FAdaptiveOctreeNode::FAdaptiveOctreeNode(TFunction<double(FVector, FVector)>* In
 }
 
 // Child Constructor
-FAdaptiveOctreeNode::FAdaptiveOctreeNode(TFunction<double(FVector, FVector)>* InDensityFunction, TSharedPtr<FAdaptiveOctreeNode> InParent, uint8 ChildIndex, FVector InAnchorCenter)
+FAdaptiveOctreeNode::FAdaptiveOctreeNode(TFunction<double(FVector, FVector)>* InDensityFunction, TSharedPtr<FSparseEditStore> InEditStore, TSharedPtr<FAdaptiveOctreeNode> InParent, uint8 ChildIndex, FVector InAnchorCenter)
 {
     TreeIndex = InParent->TreeIndex;
     TreeIndex.Add(ChildIndex);
 
     Parent = InParent;
     DensityFunction = InDensityFunction;
+    EditStore = InEditStore;
+
     AnchorCenter = InAnchorCenter;
 
     // Set spatial bounds first
@@ -57,7 +61,7 @@ void FAdaptiveOctreeNode::ComputeNodeData(bool bIsRoot)
     for (int i = 0; i < 8; i++)
     {
         FVector CornerPos = Center + (Offsets[i] * Extent);
-        CornerDensities[i] = (*DensityFunction)(CornerPos, AnchorCenter);
+        CornerDensities[i] = SampleDensity(CornerPos);
     }
 
     // PASS 2: Compute Normals and fill FNodeCorner using the cached densities
@@ -141,7 +145,7 @@ void FAdaptiveOctreeNode::Split()
     for (uint8 i = 0; i < 8; i++)
     {
         // Update constructor to take NextAnchor
-        Children[i] = MakeShared<FAdaptiveOctreeNode>(DensityFunction, AsShared(), i, NextAnchor);
+        Children[i] = MakeShared<FAdaptiveOctreeNode>(DensityFunction, EditStore, AsShared(), i, NextAnchor);
 
         if (Children[i]->IsSurfaceNode)
         {
@@ -170,7 +174,6 @@ void FAdaptiveOctreeNode::Merge()
     }
     bIsLeaf = true;
 }
-
 
 bool FAdaptiveOctreeNode::ShouldSplit(FVector InCameraPosition, double InScreenSpaceThreshold, double InCameraFOV)
 {
@@ -384,4 +387,8 @@ void FAdaptiveOctreeNode::ComputeDualContourPosition()
             (Corners[0].Density + Corners[1].Density + Corners[2].Density + Corners[3].Density);
         DualContourNormal.Normalize();
     }
+}
+
+double FAdaptiveOctreeNode::SampleDensity(FVector Position) {
+    return (*DensityFunction)(Position, AnchorCenter) + EditStore->Sample(Position);
 }
