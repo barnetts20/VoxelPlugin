@@ -29,7 +29,7 @@ private:
     TWeakObjectPtr<ARealtimeMeshActor> CachedParentActor;
     TWeakObjectPtr<UMaterialInterface> CachedMaterial;
 
-    TMap<TSharedPtr<FAdaptiveOctreeNode>, TSharedPtr<FMeshChunk>> ChunkMap; //TODO: Probably not really slower than a TArray right? IDK for sure
+    TMap<TSharedPtr<FAdaptiveOctreeNode>, TSharedPtr<FMeshChunk>> ChunkMap;
 
     bool MeshChunksInitialized = false;
     double RootExtent;
@@ -60,5 +60,6 @@ public:
     void UpdateMesh();
 
     void Clear(); //TODO: Need to test this
-    //TODO: Need to make a destructor that safely disposes references/pointers and locks
+
+    //TODO: Need to make a destructor that safely disposes references/pointers and locks - LIFECYCLE MANAGEMENT, SPAWN/DESPAWN STABILITY AND OPTIMIZATION
 };

@@ -87,7 +87,7 @@ protected:
 
     void CleanSceneRoot();
     
-    void InitializeChunks();
+    void Initialize();
 
     void RunDataUpdateTask();
 

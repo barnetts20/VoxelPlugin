@@ -34,14 +34,14 @@ void AAdaptiveVoxelActor::OnConstruction(const FTransform& Transform)
     // Ensure we are not in a preview world (prevents running in editor mode)
     if (GetWorld() && !GetWorld()->IsPreviewWorld() && TickInEditor)
     {
-        InitializeChunks();
+        Initialize();
     }
 }
 
 void AAdaptiveVoxelActor::BeginPlay()
 {
     Super::BeginPlay();
-    InitializeChunks();
+    Initialize();
 }
 
 void AAdaptiveVoxelActor::CleanSceneRoot()
@@ -57,7 +57,7 @@ void AAdaptiveVoxelActor::CleanSceneRoot()
     }
 }
 
-void AAdaptiveVoxelActor::InitializeChunks()
+void AAdaptiveVoxelActor::Initialize()
 {
     CleanSceneRoot();
 
@@ -153,11 +153,13 @@ void AAdaptiveVoxelActor::RunEditUpdateTask(FVector InEditCenter, double InEditR
             {
                 FRWScopeLock WriteLock(Self->OctreeLock, SLT_ReadOnly);
                 Self->EditStore->ApplySphericalEdit(InEditCenter, InEditRadius, InEditStrength, InEditResolution);
-                //TODO: RECALCULATE EFFECTED NODES CORNER AND DC DATA
+
+                //TODO: RECALCULATE EFFECTED NODES CORNER AND DC DATA, AT LEAST NEED TO RECALCULATE ON LEAF AND CHUNK LEVEL... MIGHT NEED TO RECALCULATE FOR EVERTHING BETWEEN THEM
                 //TODO: RECALCULATE EFFECTED NODES MESH DATA BUFFERS
-                //TODO: PERFORM CHUNK NODE SET UPDATE - PROBABLY NEED A REFACTOR WE NEED AN EFFICIENT MANAGEMENT OF OUR CHUNK SET, TMAP WAS A BIT HEAVY
+                //TODO: PERFORM CHUNK NODE SET UPDATE - FIGURE OUT IF OUR SURFACE CHUNK MAP SHOULD HAVE CHANGED
                 //TODO: FLAG EFFECTED CHUNKS DIRTY
-                //TODO: UPDATE EFFECTED MESHES ON THE GAME THREAD (NEEDS TO INHERIT LOCK)
+                //TODO: DISPATCH TO GAME THREAD, CONTINUE HOLDING LOCK SO THAT LOD/MESH UPDATE TIMERS CANNOT INTERFERE
+                //TODO: DIRECTLY UPDATE EFFECTED MESHES ON THE GAME THREAD, DO NOT WAIT ON MESH UPDATE TIMER (NEEDS TO INHERIT LOCK)
             }
         }, TStatId(), nullptr, ENamedThreads::AnyBackgroundThreadNormalTask);
 }

@@ -18,8 +18,9 @@ FAdaptiveOctree::FAdaptiveOctree(ARealtimeMeshActor* InParentActor, UMaterialInt
     PopulateChunks();
 }
 
+//TODO: PROBABLY A LIGHTER WEIGHT WAY TO UPDATE THIS AFTER THE INITIAL MAP HAS BEEN CONSTRUCTED, WE WILL NEED TO UPDATE THE CHUNK MAP POTENTIALLY WHEN EDITS OCCUR, WE WILL WANT TO ENSURE WE ARE DOING THAT UPDATE AS LIGHT WEIGHT AS POSSIBLE
 void FAdaptiveOctree::PopulateChunks() {
-    TArray<TSharedPtr<FAdaptiveOctreeNode>> Chunks = Root->GetSurfaceChunks(); //Get the nodes containing surface
+    TArray<TSharedPtr<FAdaptiveOctreeNode>> Chunks = Root->GetSurfaceChunks();
     TArray<TSharedPtr<FAdaptiveOctreeNode>> NeighborChunks;
     for (auto& ChunkNode : Chunks)
     {

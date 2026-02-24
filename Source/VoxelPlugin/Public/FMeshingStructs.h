@@ -137,32 +137,33 @@ struct VOXELPLUGIN_API FMeshChunk {
 
     void UpdateComponent(TSharedPtr<FMeshChunk> Self) {
         AsyncTask(ENamedThreads::GameThread, [Self]() {            
-            // 1. Initial State Check
+            // 1. Lazy Init
             if (!Self->IsInitialized) {
-                // 1. Resolve Weak Pointers
                 ARealtimeMeshActor* Parent = Self->CachedParentActor.Get();
                 UMaterialInterface* Material = Self->CachedMaterial.Get();
                 if (!Parent || !Material) return;
                 Self->InitializeComponent(Parent, Material);
             }
 
-            // 2. The Zero-Triangle Guard
-            auto* PositionStream = Self->ChunkMeshData->MeshStream.Find(FRealtimeMeshStreams::Position);
-            int32 NumVerts = PositionStream ? PositionStream->Num() : 0;
-            
+            // 2. Ensure valid component pointers
             URealtimeMeshSimple* MeshPtr = Self->ChunkRtMesh.Get();
             URealtimeMeshComponent* CompPtr = Self->ChunkRtComponent.Get();
             if (!MeshPtr || !CompPtr) return;
 
+            // 3. The Zero-Triangle Guard
+            auto* PositionStream = Self->ChunkMeshData->MeshStream.Find(FRealtimeMeshStreams::Position);
+            int32 NumVerts = PositionStream ? PositionStream->Num() : 0;
             if (NumVerts < 3) {
                 // If it was previously initialized but now has no data (e.g., deleted via terraforming)
                 MeshPtr->UpdateSectionGroup(Self->ChunkMeshData->MeshGroupKey, FRealtimeMeshStreamSet());
-                CompPtr->SetVisibility(false);
-                CompPtr->SetCollisionEnabled(ECollisionEnabled::NoCollision);
+                //TODO: I DONT THINK WE NEED THE FOLLOWING, BUT WILL NEED TO VERIFY, LEAVING COMMENTED OUT FOR REFERENCE
+                //CompPtr->SetVisibility(false); 
+                //CompPtr->SetCollisionEnabled(ECollisionEnabled::NoCollision);
                 Self->IsDirty = false;
                 return;
             }
 
+            // 4. Normal Mesh Update Case
             if (!Self->IsDirty) return;
             // Use the resolved MeshPtr instead of the WeakPtr wrapper
             MeshPtr->UpdateSectionGroup(Self->ChunkMeshData->MeshGroupKey, Self->ChunkMeshData->MeshStream);
