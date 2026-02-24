@@ -8,7 +8,9 @@
 #include "FSparseOctree.h"
 #include "FMeshingStructs.h"
 #include "RealtimeMeshActor.h"
+#include "FSparseEditStore.h"
 #include "AdaptiveVoxelActor.generated.h"
+
 
 using namespace RealtimeMesh;
 
@@ -22,7 +24,7 @@ private:
     TSharedPtr<FAdaptiveOctree> AdaptiveOctree;
     // Sparse octree will be for storing user edits (terraforming etc) - TODO: needs to be refactored to basically be identical in construction/structure etc to the adaptive tree, just only difference is it is sparse
     // We will sample it in the density function and write to it based on surface intersect position, we can alter the density and then composite the user edits with the existing density function
-    TSharedPtr<FSparseOctree> SparseOctree;
+    TSharedPtr<FSparseEditStore> EditStore;
 
     FVector CameraPosition = FVector::ZeroVector;
     FVector LastLodUpdatePosition = FVector(FLT_MAX);
@@ -51,7 +53,7 @@ public:
     int MinDepth = 7;
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Octree")
-    int MaxDepth = 19;
+    int MaxDepth = 18;
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "LOD")
     double ScreenSpaceThreshold = .075;

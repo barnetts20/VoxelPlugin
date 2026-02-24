@@ -390,7 +390,7 @@ private:
     TFunction<double(FVector, FVector)>* DensityFunction;
     void ComputeDualContourPosition();
     bool bIsLeaf = true;
-    
+    int DepthPrecisionFloor = 18;
     // Static arrays, offset and edge pair lookup tables
     inline static const FVector Offsets[8] = {
         FVector(-1, -1, -1), FVector(1, -1, -1),
@@ -446,6 +446,8 @@ public:
 
     // Child Constructor
     FAdaptiveOctreeNode(TFunction<double(FVector, FVector)>* DensityFunction, TSharedPtr<FAdaptiveOctreeNode> InParent, uint8 InChildIndex, FVector InAnchorCenter);
+
+    void ComputeNodeData(bool bIsRoot);
 
     FVector GetInterpolatedNormal(FVector P);
 };

@@ -23,31 +23,7 @@ FAdaptiveOctreeNode::FAdaptiveOctreeNode(TFunction<double(FVector, FVector)>* In
     DepthBounds[1] = InMaxDepth;
     DepthBounds[2] = InMinDepth;
 
-    // Use a conservative h for the root
-    double h = 0.1 * Extent;
-
-    for (int i = 0; i < 8; i++) {
-        FVector CornerPosition = Center + Offsets[i] * Extent;
-        double d = (*DensityFunction)(CornerPosition, AnchorCenter);
-
-        // Forward difference is fine for the root as it's usually empty/air
-        double dx = (*DensityFunction)(CornerPosition + FVector(h, 0, 0), AnchorCenter) - d;
-        double dy = (*DensityFunction)(CornerPosition + FVector(0, h, 0), AnchorCenter) - d;
-        double dz = (*DensityFunction)(CornerPosition + FVector(0, 0, h), AnchorCenter) - d;
-
-        FVector grad(dx, dy, dz);
-        if (!grad.Normalize()) { grad = FVector::UpVector; }
-
-        Corners[i] = FNodeCorner(CornerPosition, d, grad);
-    }
-
-    for (int EdgeIndex = 0; EdgeIndex < 12; EdgeIndex++)
-    {
-        FNodeEdge anEdge = FNodeEdge(Corners[EdgePairs[EdgeIndex][0]], Corners[EdgePairs[EdgeIndex][1]]);
-        if (anEdge.SignChange) SignChangeEdges.Add(anEdge);
-    }
-
-    ComputeDualContourPosition();
+    ComputeNodeData(true);
 }
 
 // Child Constructor
@@ -69,36 +45,63 @@ FAdaptiveOctreeNode::FAdaptiveOctreeNode(TFunction<double(FVector, FVector)>* In
     DepthBounds[2] = InParent->DepthBounds[2];
     // DERIVE CHUNK EXTENT: Using the TreeIndex depth relative to ChunkDepth
     // ChunkDepth should be a member or accessible variable (e.g., 5)
-    double ChunkExtent = Extent * FMath::Pow(2.0, (double)(TreeIndex.Num() - DepthBounds[0]));
+    ComputeNodeData(false);
+}
 
-    // STABLE GRADIENT STEP: Node detail (10%) but clamped to Chunk stability (1e-6)
-    double h = FMath::Max(0.1 * Extent, ChunkExtent * 2 * 1e-6);
+void FAdaptiveOctreeNode::ComputeNodeData(bool bIsRoot)
+{
+    SignChangeEdges.Reset();
 
+    // PASS 1: Sample only the 8 corner densities (The expensive part)
+    double CornerDensities[8];
     for (int i = 0; i < 8; i++)
     {
         FVector CornerPos = Center + (Offsets[i] * Extent);
-        double d = (*DensityFunction)(CornerPos, AnchorCenter);
+        CornerDensities[i] = (*DensityFunction)(CornerPos, AnchorCenter);
+    }
 
-        // CENTRAL DIFFERENCE: Much smoother for planetary lighting
-        double dx = (*DensityFunction)(CornerPos + FVector(h, 0, 0), AnchorCenter) -
-            (*DensityFunction)(CornerPos - FVector(h, 0, 0), AnchorCenter);
-        double dy = (*DensityFunction)(CornerPos + FVector(0, h, 0), AnchorCenter) -
-            (*DensityFunction)(CornerPos - FVector(0, h, 0), AnchorCenter);
-        double dz = (*DensityFunction)(CornerPos + FVector(0, 0, h), AnchorCenter) -
-            (*DensityFunction)(CornerPos - FVector(0, 0, h), AnchorCenter);
+    // PASS 2: Compute Normals and fill FNodeCorner using the cached densities
+    for (int i = 0; i < 8; i++)
+    {
+        FVector CornerPos = Center + (Offsets[i] * Extent);
+
+        // Use the relative neighbors within this node to get the gradient
+        // We use the 'Offsets' to figure out which corner is 'next' in X, Y, and Z
+        double d = CornerDensities[i];
+
+        // Find indices for neighbors in +X, +Y, +Z within the 0-7 corner array
+        // (This depends on your specific Offsets[] bit-order, usually: X=1, Y=2, Z=4)
+        int idxX = i ^ 1;
+        int idxY = i ^ 2;
+        int idxZ = i ^ 4;
+
+        // Gradient Calculation (Forward difference using internal node corners)
+        // Note: If the neighbor is 'behind' us (negative), we flip the subtraction
+        double dx = (Offsets[i].X < 0) ? (CornerDensities[idxX] - d) : (d - CornerDensities[idxX]);
+        double dy = (Offsets[i].Y < 0) ? (CornerDensities[idxY] - d) : (d - CornerDensities[idxY]);
+        double dz = (Offsets[i].Z < 0) ? (CornerDensities[idxZ] - d) : (d - CornerDensities[idxZ]);
 
         FVector Normal(dx, dy, dz);
-        if (!Normal.Normalize()) { Normal = FVector::UpVector; }
+        if (!Normal.Normalize())
+        {
+            // If the node is too small for a local gradient (Depth > 15 logic)
+            Normal = (CornerPos - AnchorCenter).GetSafeNormal();
+        }
 
         Corners[i] = FNodeCorner(CornerPos, d, Normal);
     }
 
+    // 4. Identify Sign-Change Edges
     for (int i = 0; i < 12; i++)
     {
-        FNodeEdge anEdge = FNodeEdge(Corners[EdgePairs[i][0]], Corners[EdgePairs[i][1]]);
-        if (anEdge.SignChange) SignChangeEdges.Add(anEdge);
+        FNodeEdge NewEdge(Corners[EdgePairs[i][0]], Corners[EdgePairs[i][1]]);
+        if (NewEdge.SignChange)
+        {
+            SignChangeEdges.Add(NewEdge);
+        }
     }
 
+    // 5. Place the Dual Vertex
     ComputeDualContourPosition();
 }
 
@@ -344,11 +347,7 @@ void FAdaptiveOctreeNode::ComputeDualContourPosition()
 
     MassPoint /= (double)ValidEdges;
 
-    // When density variation is below float precision, the zero-crossing
-    // T values are pure noise. The mass point averages out the jitter
-    // and gives a stable position. Skip the QEF entirely.
-    double PrecisionThreshold = 1e-5;
-    if (MaxDensityRange < PrecisionThreshold)
+    if (TreeIndex.Num() > DepthPrecisionFloor)
     {
         DualContourPosition = MassPoint;
     }

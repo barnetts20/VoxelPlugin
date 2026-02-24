@@ -70,7 +70,7 @@ void AAdaptiveVoxelActor::InitializeChunks()
 
         // We find the 'Base Domain Coordinate' of the Anchor. 
         // Fmod handles the periodicity (repeating every 256 units).
-        double Periodicity = 4096 * 8;
+        double Periodicity = 256;
         FVector DomainBase(
             FMath::Fmod(AnchorCenter.X / NoiseScale, Periodicity),
             FMath::Fmod(AnchorCenter.Y / NoiseScale, Periodicity),
@@ -92,13 +92,13 @@ void AAdaptiveVoxelActor::InitializeChunks()
         return RealDist - (Size * 0.85 + (double)NoiseVal);
     };
 
-    AdaptiveOctree.Reset();
-    SparseOctree.Reset();
-    
+    //AdaptiveOctree.Reset();
+    //EditStore.Reset();
     // Adaptive octree meshes the implicit structure
+    EditStore = MakeShared<FSparseEditStore>(GetActorLocation(), Size, ChunkDepth, MaxDepth);
     AdaptiveOctree = MakeShared<FAdaptiveOctree>(DensityFunction, GetActorLocation(), Size, ChunkDepth, MinDepth, MaxDepth);
-    // Sparsetree for user edits
-    SparseOctree = MakeShared<FSparseOctree>();
+    // Store for user edits
+
 
     AdaptiveOctree->InitializeMeshChunks(this, Material);
     Initialized = true;
