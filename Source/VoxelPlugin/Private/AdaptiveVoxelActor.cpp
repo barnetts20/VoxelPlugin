@@ -73,9 +73,9 @@ void AAdaptiveVoxelActor::InitializeChunks()
 
     // Store for user edits
     EditStore = MakeShared<FSparseEditStore>(GetActorLocation(), Size, ChunkDepth, MaxDepth);
+    
     // Adaptive octree meshes the implicit structure
     AdaptiveOctree = MakeShared<FAdaptiveOctree>(DensityFunction, EditStore, GetActorLocation(), Size, ChunkDepth, MinDepth, MaxDepth);
-
 
     AdaptiveOctree->InitializeMeshChunks(this, Material);
     Initialized = true;
@@ -135,6 +135,31 @@ void AAdaptiveVoxelActor::RunMeshUpdateTask()
 
             Self->MeshUpdateIsRunning = false;
 
+        }, TStatId(), nullptr, ENamedThreads::AnyBackgroundThreadNormalTask);
+}
+
+
+//TODO: THIS SHOULD PERFORM THE ENTIRE EDIT, IDEALLY THIS TAKES PRECENDENCE OVER LOD/MESH UPDATES SO THAT IT CAN FEEL RESPONSIVE - ONCE IT HAS THE LOCK IT COMPLETES THE FULL EDIT INCLUDING THE MESH UPDATE
+//TODO: WE NEED TO SPLIT MESHCHUNK INITIALIZE INTO DATA ONLY INTIALIZER AND COMPONENT/MESH INITIALIZER
+//TODO: THIS SHOULD INITIALIZE NEW CHUNKS THAT ARE NEEDED ALL THE WAY THROUGH THE DATA INIT PORTION, THEN SWAP TO GAME THREAD AND UPDATE THE ACTUAL DISPLAYED MESHES
+//TODO: LAST TIME, WE TIED THE EDITS TO THE EXISTING DATA/MESH PIPELINES, WHICH MADE IT FEEL UNRESPONSIVE, WE NEED TO FIGURE OUT HOW TO MAKE THE ENTIRE EDIT HAPPEN WHEN THE USER TRIGGERS IT WITHOUT AS MUCH OF A DELAY
+void AAdaptiveVoxelActor::RunEditUpdateTask(FVector InEditCenter, double InEditRadius, double InEditStrength, int InEditResolution)
+{
+    TWeakObjectPtr<AAdaptiveVoxelActor> WeakThis(this);
+    FFunctionGraphTask::CreateAndDispatchWhenReady([WeakThis, InEditCenter, InEditRadius, InEditStrength, InEditResolution]()
+        {
+            AAdaptiveVoxelActor* Self = WeakThis.Get();
+            if (!Self || Self->IsDestroyed) return;
+
+            {
+                FRWScopeLock WriteLock(Self->OctreeLock, SLT_ReadOnly);
+                Self->EditStore->ApplySphericalEdit(InEditCenter, InEditRadius, InEditStrength, InEditResolution);
+                //TODO: RECALCULATE EFFECTED NODES CORNER AND DC DATA
+                //TODO: RECALCULATE EFFECTED NODES MESH DATA BUFFERS
+                //TODO: PERFORM CHUNK NODE SET UPDATE - PROBABLY NEED A REFACTOR WE NEED AN EFFICIENT MANAGEMENT OF OUR CHUNK SET, TMAP WAS A BIT HEAVY
+                //TODO: FLAG EFFECTED CHUNKS DIRTY
+                //TODO: UPDATE EFFECTED MESHES ON THE GAME THREAD (NEEDS TO INHERIT LOCK)
+            }
         }, TStatId(), nullptr, ENamedThreads::AnyBackgroundThreadNormalTask);
 }
 

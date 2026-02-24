@@ -122,7 +122,7 @@ void FAdaptiveOctree::UpdateMeshChunkStreamData(TSharedPtr<FMeshChunk> InChunk)
     TArray<FEdgeVertexData> AllEdgeData;
     AllEdgeData.SetNum(InChunk->ChunkEdges.Num());
 
-    double QuantizationGrid = InChunk->ChunkExtent * 2 * 1e-6;
+    double QuantizationGrid = InChunk->ChunkExtent * 1e-6;
 
     ParallelFor(InChunk->ChunkEdges.Num(), [&](int32 edgeIdx) {
         const FNodeEdge currentEdge = InChunk->ChunkEdges[edgeIdx];
@@ -203,9 +203,6 @@ void FAdaptiveOctree::UpdateMeshChunkStreamData(TSharedPtr<FMeshChunk> InChunk)
             }
         }
     }
-
-
-    InChunk->ChunkMeshData->ResetStreams();
 
     auto PositionStream = InChunk->ChunkMeshData->GetPositionStream();
     auto TangentStream = InChunk->ChunkMeshData->GetTangentStream();
@@ -299,7 +296,7 @@ TArray<TSharedPtr<FAdaptiveOctreeNode>> FAdaptiveOctree::SampleNodesAroundEdge(c
             int ChildIndex = 0;
 
             // Adaptive epsilon based on current node size to handle floating-point drift
-            double Epsilon = ChunkExtent * 2 * 1e-6;
+            double Epsilon = ChunkExtent * 1e-6;
 
             // Helper to check which side of the splitting plane the point falls on
             auto CheckSide = [&](int AxisIndex, bool PositiveBias) {

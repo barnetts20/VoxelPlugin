@@ -22,8 +22,7 @@ class VOXELPLUGIN_API AAdaptiveVoxelActor : public ARealtimeMeshActor
 private:
     // Adaptive octree meshes the SDF
     TSharedPtr<FAdaptiveOctree> AdaptiveOctree;
-    // Sparse octree will be for storing user edits (terraforming etc) - TODO: needs to be refactored to basically be identical in construction/structure etc to the adaptive tree, just only difference is it is sparse
-    // We will sample it in the density function and write to it based on surface intersect position, we can alter the density and then composite the user edits with the existing density function
+    // Edit store saves user terraforming changes
     TSharedPtr<FSparseEditStore> EditStore;
 
     FVector CameraPosition = FVector::ZeroVector;
@@ -93,5 +92,7 @@ protected:
     void RunDataUpdateTask();
 
     void RunMeshUpdateTask();
+
+    void RunEditUpdateTask(FVector InEditCenter, double InEditRadius, double InEditStrength, int InEditResolution);
 };
 

@@ -25,8 +25,11 @@ private:
     TFunction<double(FVector, FVector)> DensityFunction;
     TSharedPtr<FSparseEditStore> EditStore;
     TSharedPtr<FAdaptiveOctreeNode> Root;
-    TArray<TSharedPtr<FAdaptiveOctreeNode>> Chunks;
-    TArray<TSharedPtr<FMeshChunk>> MeshChunks;
+    TArray<TSharedPtr<FAdaptiveOctreeNode>> Chunks; //TODO: NEED A RELATIONSHIP BETWEEN CHUNKS/MESH CHUNKS SO THAT WE CAN EASILY DYNAMICALLY ADD AND REMOVE CHUNKS THAT ARE CURRENTLY IN USE WHEN EDITS OCCUR
+    TArray<TSharedPtr<FMeshChunk>> MeshChunks;      //TODO: TMAP? SOMETHING FASTER?
+
+    TMap<TSharedPtr<FAdaptiveOctreeNode>, TSharedPtr<FMeshChunk>> ChunkMap; //TODO: Probably not really slower than a TArray right? IDK for sure
+
     bool MeshChunksInitialized = false;
     double RootExtent;
     double ChunkExtent;
