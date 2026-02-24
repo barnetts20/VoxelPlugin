@@ -415,7 +415,7 @@ public:
     TSharedPtr<FAdaptiveOctreeNode> Children[8];
     FNodeCorner Corners[8];
     TArray<FNodeEdge> SignChangeEdges;
-
+    int ChunkDepth = 4;
     int DepthBounds[3];
     FVector AnchorCenter;
     FVector Center;
@@ -443,6 +443,8 @@ public:
     
     TArray<TSharedPtr<FAdaptiveOctreeNode>> GetSurfaceNodes();
     
+    TArray<TSharedPtr<FAdaptiveOctreeNode>> GetSurfaceChunks();
+
     TArray<FNodeEdge>& GetSignChangeEdges();
 
     // Root Constructor

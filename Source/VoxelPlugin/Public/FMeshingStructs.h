@@ -89,41 +89,36 @@ struct VOXELPLUGIN_API FMeshChunk {
     FRealtimeMeshLODKey LODKey = FRealtimeMeshLODKey::FRealtimeMeshLODKey(0);
     FRealtimeMeshSectionConfig SecConfig = FRealtimeMeshSectionConfig(0);
 
-    void Initialize(ARealtimeMeshActor* InParentActor, UMaterialInterface* Material, FVector InCenter, double InExtent) {
+    void InitializeData(FVector InCenter, double InExtent) {
+        ChunkMeshData = MakeShared<FMeshStreamData>();
+        ChunkCenter = InCenter;
+        ChunkExtent = InExtent;
+        ChunkMeshData->MeshGroupKey = FRealtimeMeshSectionGroupKey::Create(LODKey, FName(ChunkCenter.ToCompactString()));
+        ChunkMeshData->MeshSectionKey = FRealtimeMeshSectionKey::CreateForPolyGroup(ChunkMeshData->MeshGroupKey, 0);
+    };
+
+    void InitializeComponent(ARealtimeMeshActor* InParentActor, UMaterialInterface* Material) {
         FRealtimeMeshCollisionConfiguration cConfig;
         cConfig.bShouldFastCookMeshes = false;
         cConfig.bUseComplexAsSimpleCollision = true;
         cConfig.bDeformableMesh = false;
         cConfig.bUseAsyncCook = true;
 
-        ChunkMeshData = MakeShared<FMeshStreamData>();
-
-        ChunkCenter = InCenter;
-        ChunkExtent = InExtent;
-
         ChunkRtMesh = NewObject<URealtimeMeshSimple>(InParentActor);
         ChunkRtMesh->SetCollisionConfig(cConfig);
         ChunkRtMesh->SetupMaterialSlot(0, "Material");
-
         ChunkRtComponent = NewObject<URealtimeMeshComponent>(InParentActor, URealtimeMeshComponent::StaticClass());
         ChunkRtComponent->RegisterComponent();
-
         ChunkRtComponent->SetMaterial(0, Material);
-        
-        ChunkRtComponent->AttachToComponent(InParentActor->GetRootComponent(),FAttachmentTransformRules::KeepRelativeTransform);
-        ChunkRtComponent->SetRelativeLocation(InCenter);
-
+        ChunkRtComponent->AttachToComponent(InParentActor->GetRootComponent(), FAttachmentTransformRules::KeepRelativeTransform);
+        ChunkRtComponent->SetRelativeLocation(ChunkCenter);
         ChunkRtComponent->SetCollisionEnabled(ECollisionEnabled::QueryAndPhysics);
         ChunkRtComponent->SetCollisionResponseToAllChannels(ECollisionResponse::ECR_Block);
         ChunkRtComponent->SetRealtimeMesh(ChunkRtMesh.Get());
         ChunkRtComponent->SetRenderCustomDepth(true);
-        
-        ChunkMeshData->MeshGroupKey = FRealtimeMeshSectionGroupKey::Create(LODKey, FName(ChunkCenter.ToCompactString()));
         ChunkRtMesh->CreateSectionGroup(ChunkMeshData->MeshGroupKey, ChunkMeshData->MeshStream);
-        ChunkMeshData->MeshSectionKey = FRealtimeMeshSectionKey::CreateForPolyGroup(ChunkMeshData->MeshGroupKey, 0);
-
         IsInitialized = true;
-    };
+    }
 
     bool ShouldProcessEdge(const FNodeEdge& Edge, const TArray<TSharedPtr<FAdaptiveOctreeNode>>& SampledNodes) {
         if (SampledNodes.Num() < 3) return false;

@@ -52,6 +52,8 @@ public:
     // Constructor
     FAdaptiveOctree(TFunction<double(FVector, FVector)> InDensityFunction, TSharedPtr<FSparseEditStore> InEditStore, FVector InCenter, double InRootExtent, int InChunkDepth, int InMinDepth, int InMaxDepth);
 
+    void PopulateChunks();
+
     void InitializeMeshChunks(ARealtimeMeshActor* InParentActor, UMaterialInterface* InMaterial);
     
     void UpdateLOD(FVector InCameraPosition, double InScreenSpaceThreshold, double InCameraFOV);

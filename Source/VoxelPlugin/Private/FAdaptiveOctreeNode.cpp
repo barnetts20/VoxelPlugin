@@ -15,7 +15,7 @@ FAdaptiveOctreeNode::FAdaptiveOctreeNode(TFunction<double(FVector, FVector)>* In
 {
     DensityFunction = InDensityFunction;
     EditStore = InEditStore;
-
+    ChunkDepth = InChunkDepth;
     Center = InCenter;
     AnchorCenter = InCenter;
 
@@ -33,6 +33,8 @@ FAdaptiveOctreeNode::FAdaptiveOctreeNode(TFunction<double(FVector, FVector)>* In
 {
     TreeIndex = InParent->TreeIndex;
     TreeIndex.Add(ChildIndex);
+
+    ChunkDepth = InParent->ChunkDepth;
 
     Parent = InParent;
     DensityFunction = InDensityFunction;
@@ -290,6 +292,35 @@ TArray<TSharedPtr<FAdaptiveOctreeNode>> FAdaptiveOctreeNode::GetSurfaceNodes()
         if (!CurrentNode) continue;
 
         if (CurrentNode->IsLeaf() && CurrentNode->IsSurfaceNode)
+        {
+            SurfaceNodes.Add(CurrentNode->AsShared());
+        }
+        else
+        {
+            for (int i = 0; i < 8; i++)
+            {
+                if (CurrentNode->Children[i]) NodeQueue.Enqueue(CurrentNode->Children[i]);
+            }
+        }
+    }
+
+    return SurfaceNodes;
+}
+
+TArray<TSharedPtr<FAdaptiveOctreeNode>> FAdaptiveOctreeNode::GetSurfaceChunks()
+{
+    TArray<TSharedPtr<FAdaptiveOctreeNode>> SurfaceNodes;
+    TQueue<TSharedPtr<FAdaptiveOctreeNode>> NodeQueue;
+    NodeQueue.Enqueue(this->AsShared());
+
+    while (!NodeQueue.IsEmpty())
+    {
+        TSharedPtr<FAdaptiveOctreeNode> CurrentNode;
+        NodeQueue.Dequeue(CurrentNode);
+
+        if (!CurrentNode || CurrentNode->TreeIndex.Num() > ChunkDepth) continue;
+
+        if (CurrentNode->TreeIndex.Num() == ChunkDepth && CurrentNode->IsSurfaceNode)
         {
             SurfaceNodes.Add(CurrentNode->AsShared());
         }

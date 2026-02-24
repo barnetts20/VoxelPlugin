@@ -4,18 +4,22 @@
 FAdaptiveOctree::FAdaptiveOctree(TFunction<double(FVector, FVector)> InDensityFunction, TSharedPtr<FSparseEditStore> InEditStore, FVector InCenter, double InRootExtent, int InChunkDepth, int InMinDepth, int InMaxDepth)
 {
     DensityFunction = InDensityFunction;
-    RootExtent = InRootExtent;
     EditStore = InEditStore;
+    RootExtent = InRootExtent;
+    ChunkExtent = InRootExtent / (2 * InChunkDepth);
 
     Root = MakeShared<FAdaptiveOctreeNode>(&DensityFunction, InEditStore, InCenter, InRootExtent, InChunkDepth, InMinDepth, InMaxDepth);
     {
         SplitToDepth(Root, InChunkDepth);
     }
 
-    ChunkExtent = Root->Extent / (2 * InChunkDepth); //We should only need to calculate this once
-    Chunks = GetSurfaceNodes(); //Get the nodes containing surface
-    TArray<TSharedPtr<FAdaptiveOctreeNode>> NeighborChunks;
+    PopulateChunks();
+}
 
+void FAdaptiveOctree::PopulateChunks() {
+    Chunks = Root->GetSurfaceChunks(); //Get the nodes containing surface
+
+    TArray<TSharedPtr<FAdaptiveOctreeNode>> NeighborChunks;
     for (auto& ChunkNode : Chunks)
     {
         if (!ChunkNode.IsValid())
@@ -38,7 +42,6 @@ FAdaptiveOctree::FAdaptiveOctree(TFunction<double(FVector, FVector)> InDensityFu
             }
         }
     }
-
     Chunks.Append(NeighborChunks);
 }
 
@@ -46,7 +49,8 @@ void FAdaptiveOctree::InitializeMeshChunks(ARealtimeMeshActor* InParentActor, UM
     MeshChunks.Empty();
     for (auto chunk : Chunks) {
         TSharedPtr<FMeshChunk> newChunk = MakeShared<FMeshChunk>();
-        newChunk->Initialize(InParentActor, InMaterial, chunk->Center, chunk->Extent);
+        newChunk->InitializeData(chunk->Center, chunk->Extent);
+        newChunk->InitializeComponent(InParentActor, InMaterial);
         newChunk->ChunkEdges = chunk->GetSurfaceEdges();
         UpdateMeshChunkStreamData(newChunk);
         MeshChunks.Add(newChunk);
