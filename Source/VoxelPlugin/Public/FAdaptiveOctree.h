@@ -22,11 +22,12 @@ private:
         FVector(0, 0, -1)
     };
 
+
     TFunction<double(FVector, FVector)> DensityFunction;
     TSharedPtr<FSparseEditStore> EditStore;
     TSharedPtr<FAdaptiveOctreeNode> Root;
-    TArray<TSharedPtr<FAdaptiveOctreeNode>> Chunks; //TODO: NEED A RELATIONSHIP BETWEEN CHUNKS/MESH CHUNKS SO THAT WE CAN EASILY DYNAMICALLY ADD AND REMOVE CHUNKS THAT ARE CURRENTLY IN USE WHEN EDITS OCCUR
-    TArray<TSharedPtr<FMeshChunk>> MeshChunks;      //TODO: TMAP? SOMETHING FASTER?
+    TWeakObjectPtr<ARealtimeMeshActor> CachedParentActor;
+    TWeakObjectPtr<UMaterialInterface> CachedMaterial;
 
     TMap<TSharedPtr<FAdaptiveOctreeNode>, TSharedPtr<FMeshChunk>> ChunkMap; //TODO: Probably not really slower than a TArray right? IDK for sure
 
@@ -50,11 +51,9 @@ private:
 
 public:
     // Constructor
-    FAdaptiveOctree(TFunction<double(FVector, FVector)> InDensityFunction, TSharedPtr<FSparseEditStore> InEditStore, FVector InCenter, double InRootExtent, int InChunkDepth, int InMinDepth, int InMaxDepth);
+    FAdaptiveOctree(ARealtimeMeshActor* InParentActor, UMaterialInterface* InMaterial, TFunction<double(FVector, FVector)> InDensityFunction, TSharedPtr<FSparseEditStore> InEditStore, FVector InCenter, double InRootExtent, int InChunkDepth, int InMinDepth, int InMaxDepth);
 
     void PopulateChunks();
-
-    void InitializeMeshChunks(ARealtimeMeshActor* InParentActor, UMaterialInterface* InMaterial);
     
     void UpdateLOD(FVector InCameraPosition, double InScreenSpaceThreshold, double InCameraFOV);
 

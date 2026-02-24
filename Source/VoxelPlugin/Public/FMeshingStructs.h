@@ -73,6 +73,8 @@ struct VOXELPLUGIN_API FMeshStreamData {
 };
 
 struct VOXELPLUGIN_API FMeshChunk {
+    TWeakObjectPtr<ARealtimeMeshActor> CachedParentActor;
+    TWeakObjectPtr <UMaterialInterface> CachedMaterial;
     //Data Model Info
     FVector ChunkCenter;
     double ChunkExtent;
@@ -116,7 +118,8 @@ struct VOXELPLUGIN_API FMeshChunk {
         ChunkRtComponent->SetCollisionResponseToAllChannels(ECollisionResponse::ECR_Block);
         ChunkRtComponent->SetRealtimeMesh(ChunkRtMesh.Get());
         ChunkRtComponent->SetRenderCustomDepth(true);
-        ChunkRtMesh->CreateSectionGroup(ChunkMeshData->MeshGroupKey, ChunkMeshData->MeshStream);
+        ChunkRtComponent->SetVisibleInRayTracing(false);
+        ChunkRtMesh->CreateSectionGroup(ChunkMeshData->MeshGroupKey, FRealtimeMeshStreamSet());
         IsInitialized = true;
     }
 
@@ -133,33 +136,39 @@ struct VOXELPLUGIN_API FMeshChunk {
     }
 
     void UpdateComponent(TSharedPtr<FMeshChunk> Self) {
-        AsyncTask(ENamedThreads::GameThread, [Self]() {
+        AsyncTask(ENamedThreads::GameThread, [Self]() {            
             // 1. Initial State Check
-            if (!Self->IsInitialized || !Self->IsDirty) return;
+            if (!Self->IsInitialized) {
+                // 1. Resolve Weak Pointers
+                ARealtimeMeshActor* Parent = Self->CachedParentActor.Get();
+                UMaterialInterface* Material = Self->CachedMaterial.Get();
+                if (!Parent || !Material) return;
+                Self->InitializeComponent(Parent, Material);
+            }
 
-            // 2. Resolve Weak Pointers to Raw Pointers
-            // This is the "One-Time Resolution" that fixes the conversion error
+            // 2. The Zero-Triangle Guard
+            auto* PositionStream = Self->ChunkMeshData->MeshStream.Find(FRealtimeMeshStreams::Position);
+            int32 NumVerts = PositionStream ? PositionStream->Num() : 0;
+            
             URealtimeMeshSimple* MeshPtr = Self->ChunkRtMesh.Get();
             URealtimeMeshComponent* CompPtr = Self->ChunkRtComponent.Get();
-
-            // 3. Safety Check: If the Actor/Component was destroyed, bail out
             if (!MeshPtr || !CompPtr) return;
 
-            // 4. Ghost Mesh Check
-            auto* PositionStream = Self->ChunkMeshData->MeshStream.Find(FRealtimeMeshStreams::Position);
-            if (!PositionStream || PositionStream->Num() == 0) {
-                // Clear the section by passing an empty StreamSet
+            if (NumVerts < 3) {
+                // If it was previously initialized but now has no data (e.g., deleted via terraforming)
                 MeshPtr->UpdateSectionGroup(Self->ChunkMeshData->MeshGroupKey, FRealtimeMeshStreamSet());
+                CompPtr->SetVisibility(false);
+                CompPtr->SetCollisionEnabled(ECollisionEnabled::NoCollision);
                 Self->IsDirty = false;
                 return;
             }
 
-            // 5. Standard Update
-            Self->IsDirty = false;
-
+            if (!Self->IsDirty) return;
             // Use the resolved MeshPtr instead of the WeakPtr wrapper
             MeshPtr->UpdateSectionGroup(Self->ChunkMeshData->MeshGroupKey, Self->ChunkMeshData->MeshStream);
             MeshPtr->UpdateSectionConfig(Self->ChunkMeshData->MeshSectionKey, Self->SecConfig, true);
+
+            Self->IsDirty = false;
         });
     }
 };

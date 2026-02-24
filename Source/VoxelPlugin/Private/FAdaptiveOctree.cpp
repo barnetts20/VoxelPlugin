@@ -1,12 +1,14 @@
 #include "FAdaptiveOctree.h"
 
 // Constructor
-FAdaptiveOctree::FAdaptiveOctree(TFunction<double(FVector, FVector)> InDensityFunction, TSharedPtr<FSparseEditStore> InEditStore, FVector InCenter, double InRootExtent, int InChunkDepth, int InMinDepth, int InMaxDepth)
+FAdaptiveOctree::FAdaptiveOctree(ARealtimeMeshActor* InParentActor, UMaterialInterface* InMaterial, TFunction<double(FVector, FVector)> InDensityFunction, TSharedPtr<FSparseEditStore> InEditStore, FVector InCenter, double InRootExtent, int InChunkDepth, int InMinDepth, int InMaxDepth)
 {
     DensityFunction = InDensityFunction;
     EditStore = InEditStore;
     RootExtent = InRootExtent;
-    ChunkExtent = InRootExtent / (2 * InChunkDepth);
+    ChunkExtent = InRootExtent / FMath::Pow(2.0, (double)InChunkDepth);
+    CachedParentActor = InParentActor;
+    CachedMaterial = InMaterial;
 
     Root = MakeShared<FAdaptiveOctreeNode>(&DensityFunction, InEditStore, InCenter, InRootExtent, InChunkDepth, InMinDepth, InMaxDepth);
     {
@@ -17,8 +19,7 @@ FAdaptiveOctree::FAdaptiveOctree(TFunction<double(FVector, FVector)> InDensityFu
 }
 
 void FAdaptiveOctree::PopulateChunks() {
-    Chunks = Root->GetSurfaceChunks(); //Get the nodes containing surface
-
+    TArray<TSharedPtr<FAdaptiveOctreeNode>> Chunks = Root->GetSurfaceChunks(); //Get the nodes containing surface
     TArray<TSharedPtr<FAdaptiveOctreeNode>> NeighborChunks;
     for (auto& ChunkNode : Chunks)
     {
@@ -43,17 +44,20 @@ void FAdaptiveOctree::PopulateChunks() {
         }
     }
     Chunks.Append(NeighborChunks);
-}
 
-void FAdaptiveOctree::InitializeMeshChunks(ARealtimeMeshActor* InParentActor, UMaterialInterface* InMaterial) {
-    MeshChunks.Empty();
     for (auto chunk : Chunks) {
+        //build map
         TSharedPtr<FMeshChunk> newChunk = MakeShared<FMeshChunk>();
+        newChunk->CachedParentActor = CachedParentActor;
+        newChunk->CachedMaterial = CachedMaterial;
         newChunk->InitializeData(chunk->Center, chunk->Extent);
-        newChunk->InitializeComponent(InParentActor, InMaterial);
         newChunk->ChunkEdges = chunk->GetSurfaceEdges();
+        
         UpdateMeshChunkStreamData(newChunk);
-        MeshChunks.Add(newChunk);
+
+        newChunk->IsDirty = (newChunk->ChunkMeshData->GetPositionStream().Num() > 0);
+        
+        ChunkMap.Add(chunk, newChunk);
     }
     MeshChunksInitialized = true;
 }
@@ -244,35 +248,48 @@ void FAdaptiveOctree::UpdateLOD(FVector CameraPosition, double InScreenSpaceThre
 {
     if (!MeshChunksInitialized) return;
 
-    TArray<int32> ChunksModified;
-    ChunksModified.SetNumZeroed(Chunks.Num());
+    TArray<TSharedPtr<FAdaptiveOctreeNode>> Chunks;
+    ChunkMap.GenerateKeyArray(Chunks);
+    int32 NumChunks = Chunks.Num();
+
+    TArray<TSharedPtr<FMeshChunk>> ModifiedChunks;
+    ModifiedChunks.SetNumZeroed(NumChunks);
 
     ParallelFor(Chunks.Num(), [&](int32 idx)
-        {
-            TArray<FNodeEdge> tChunkEdges;
-            TMap<FEdgeKey, int32> tEdgeMap;
-            bool tChanged = false;
-            Chunks[idx]->UpdateLod(CameraPosition, InScreenSpaceThreshold, InCameraFOV, tChunkEdges, tEdgeMap, tChanged);
-            if (tChanged) {
-                MeshChunks[idx]->ChunkEdges = tChunkEdges;
-                ChunksModified[idx] = 1;
-            }
-        });
+    {
+        TArray<FNodeEdge> tChunkEdges;
+        TMap<FEdgeKey, int32> tEdgeMap;
+        bool tChanged = false;
+        Chunks[idx]->UpdateLod(CameraPosition, InScreenSpaceThreshold, InCameraFOV, tChunkEdges, tEdgeMap, tChanged);
+        if (tChanged) {
+            auto MeshChunk = ChunkMap[Chunks[idx]];
+            MeshChunk->ChunkEdges = tChunkEdges;
+            ModifiedChunks[idx] = MeshChunk;
+        }
+    });
 
-    ParallelFor(MeshChunks.Num(), [&](int32 i)
-        {
-            if (ChunksModified[i] != 0) {
-                UpdateMeshChunkStreamData(MeshChunks[i]);
-            }
-        });
+    ParallelFor(NumChunks, [&](int32 i)
+    {
+        if (ModifiedChunks[i].IsValid()) {
+            UpdateMeshChunkStreamData(ModifiedChunks[i]);
+        }
+    });
 }
 
 void FAdaptiveOctree::UpdateMesh()
 {
     if (!MeshChunksInitialized) return;
+
+    // Use a reference to avoid incrementing shared pointer ref counts unnecessarily during iteration
+    for (auto& It : ChunkMap)
     {
-        for (auto mChunk : MeshChunks) {
-            if(mChunk->IsDirty) mChunk->UpdateComponent(mChunk);
+        TSharedPtr<FMeshChunk> Chunk = It.Value;
+
+        if (!Chunk.IsValid()) continue;
+
+        if (Chunk->IsDirty)
+        {
+            Chunk->UpdateComponent(Chunk);
         }
     }
 }

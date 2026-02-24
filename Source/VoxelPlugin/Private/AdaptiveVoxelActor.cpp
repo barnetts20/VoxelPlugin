@@ -75,9 +75,8 @@ void AAdaptiveVoxelActor::InitializeChunks()
     EditStore = MakeShared<FSparseEditStore>(GetActorLocation(), Size, ChunkDepth, MaxDepth);
     
     // Adaptive octree meshes the implicit structure
-    AdaptiveOctree = MakeShared<FAdaptiveOctree>(DensityFunction, EditStore, GetActorLocation(), Size, ChunkDepth, MinDepth, MaxDepth);
+    AdaptiveOctree = MakeShared<FAdaptiveOctree>(this, Material, DensityFunction, EditStore, GetActorLocation(), Size, ChunkDepth, MinDepth, MaxDepth);
 
-    AdaptiveOctree->InitializeMeshChunks(this, Material);
     Initialized = true;
 
     // Use Unreal's TimerManager to safely schedule repeating tasks
@@ -165,7 +164,7 @@ void AAdaptiveVoxelActor::RunEditUpdateTask(FVector InEditCenter, double InEditR
 
 bool AAdaptiveVoxelActor::ShouldTickIfViewportsOnly() const
 {
-    return TickInEditor;
+    return TickInEditor && Initialized;
 }
 
 void AAdaptiveVoxelActor::Tick(float DeltaTime)
