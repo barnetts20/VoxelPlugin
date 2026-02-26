@@ -201,7 +201,7 @@ void AAdaptiveVoxelActor::Tick(float DeltaTime)
             if (world->LineTraceSingleByChannel(Hit, Start, End, ECC_Visibility))
             {
                 RunEditUpdateTask(Hit.ImpactPoint, InEditRadius, InEditStrength, InEditResolution);
-                DrawDebugSphere(world, Hit.ImpactPoint, InEditStrength, 12, FColor::Red, false, DebugDrawTime);
+                DrawDebugSphere(world, Hit.ImpactPoint, InEditRadius, 32, FColor::Red, false, DebugDrawTime);
             }
         }
         if (PC && PC->IsInputKeyDown(EKeys::Q) && !EditUpdateIsRunning)
@@ -214,7 +214,7 @@ void AAdaptiveVoxelActor::Tick(float DeltaTime)
             if (world->LineTraceSingleByChannel(Hit, Start, End, ECC_Visibility))
             {
                 RunEditUpdateTask(Hit.ImpactPoint, InEditRadius, -InEditStrength, 3);
-                DrawDebugSphere(world, Hit.ImpactPoint, InEditStrength, 12, FColor::Green, false, DebugDrawTime);
+                DrawDebugSphere(world, Hit.ImpactPoint, InEditRadius, 32, FColor::Green, false, DebugDrawTime);
             }
         }
     }
