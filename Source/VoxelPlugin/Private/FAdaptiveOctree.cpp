@@ -260,7 +260,6 @@ void FAdaptiveOctree::ReconstructAffectedNodes(TSharedPtr<FAdaptiveOctreeNode> N
 
     Node->ComputeNodeData(false);
 
-
     if (Node->IsLeaf())
     {
         if (Node->IsSurfaceNode)

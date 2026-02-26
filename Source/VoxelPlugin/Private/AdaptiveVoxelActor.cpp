@@ -144,13 +144,12 @@ void AAdaptiveVoxelActor::RunEditUpdateTask(FVector InEditCenter, double InEditR
         {
             AAdaptiveVoxelActor* Self = WeakThis.Get();
             if (!Self || Self->IsDestroyed) return;
-
             {
                 FRWScopeLock WriteLock(Self->OctreeLock, SLT_Write);
                 //Updates data and chunk state of tree
                 Self->AdaptiveOctree->ApplyEdit(InEditCenter, InEditRadius, InEditStrength, InEditResolution);
                 //Dispatches component updates to game thread
-                //Self->RunMeshUpdateTask();
+                Self->RunMeshUpdateTask();
             }
         }, TStatId(), nullptr, ENamedThreads::AnyNormalThreadHiPriTask);
 }

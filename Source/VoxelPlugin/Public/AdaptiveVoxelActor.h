@@ -58,10 +58,10 @@ public:
     double ScreenSpaceThreshold = .07;
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "LOD")
-    double MinDataUpdateInterval = .1;
+    double MinDataUpdateInterval = .15;
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "LOD")
-    double MinMeshUpdateInterval = .01;
+    double MinMeshUpdateInterval = .1;
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "LOD")
     double VelocityLookAheadFactor = 16;
