@@ -453,7 +453,7 @@ public:
     // Child Constructor
     FAdaptiveOctreeNode(TFunction<double(FVector, FVector)>* DensityFunction, TSharedPtr<FSparseEditStore> InEditStore, TSharedPtr<FAdaptiveOctreeNode> InParent, uint8 InChildIndex, FVector InAnchorCenter);
 
-    void ComputeNodeData(bool bIsRoot);
+    void ComputeNodeData();
 
     FVector GetInterpolatedNormal(FVector P);
 };

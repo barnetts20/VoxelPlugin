@@ -26,7 +26,7 @@ FAdaptiveOctreeNode::FAdaptiveOctreeNode(TFunction<double(FVector, FVector)>* In
     DepthBounds[1] = InMaxDepth;
     DepthBounds[2] = InMinDepth;
 
-    ComputeNodeData(true);
+    ComputeNodeData();
 }
 
 // Child Constructor
@@ -52,10 +52,10 @@ FAdaptiveOctreeNode::FAdaptiveOctreeNode(TFunction<double(FVector, FVector)>* In
     DepthBounds[2] = InParent->DepthBounds[2];
     // DERIVE CHUNK EXTENT: Using the TreeIndex depth relative to ChunkDepth
     // ChunkDepth should be a member or accessible variable (e.g., 5)
-    ComputeNodeData(false);
+    ComputeNodeData();
 }
 
-void FAdaptiveOctreeNode::ComputeNodeData(bool bIsRoot)
+void FAdaptiveOctreeNode::ComputeNodeData()
 {
     SignChangeEdges.Reset();
 
@@ -264,20 +264,6 @@ void FAdaptiveOctreeNode::UpdateLod(FVector InCameraPosition, double InScreenSpa
     }
 }
 
-// Retrieves all surface nodes for meshing
-// Update this in FAdaptiveOctreeNode.cpp
-TArray<FNodeEdge> FAdaptiveOctreeNode::GetSurfaceEdges()
-{
-    // If we are a leaf, we already HAVE our edges. No need to traverse.
-    if (IsLeaf())
-    {
-        return SignChangeEdges;
-    }
-
-    ensure(false);
-    return TArray<FNodeEdge>();
-}
-//TODO: THESE METHODS ARE QUITE SIMILAR, WE MAY BE ABLE TO COLLAPSE TO ONE
 TArray<FNodeEdge>& FAdaptiveOctreeNode::GetSignChangeEdges()
 {
     return SignChangeEdges;

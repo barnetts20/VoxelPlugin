@@ -39,8 +39,6 @@ private:
     void SplitToDepth(TSharedPtr<FAdaptiveOctreeNode> Node, int InMinDepth);
     
     void UpdateMeshChunkStreamData(TSharedPtr<FMeshChunk> InChunk);
-    
-    void ReconstructAffectedNodes(TSharedPtr<FAdaptiveOctreeNode> InNode, FVector InEditCenter, double InReconstructRadius);
 
     static FVector QuantizePosition(const FVector& P, double GridSize = 1.0);
     
@@ -51,8 +49,6 @@ private:
     TSharedPtr<FAdaptiveOctreeNode> GetLeafNodeByPoint(FVector Position);
 
     TSharedPtr<FAdaptiveOctreeNode> GetChunkNodeByPoint(FVector Position);
-
-    TArray<TSharedPtr<FAdaptiveOctreeNode>> GetSurfaceNodes();
 
 public:
     // Constructor
@@ -70,9 +66,7 @@ public:
 
     void UpdateMesh();
 
-    void Clear(); //TODO: Need to test this
-
     void GatherLeafEdges(TSharedPtr<FAdaptiveOctreeNode> Node, TArray<FNodeEdge>& OutEdges);
 
-    //TODO: Need to make a destructor that safely disposes references/pointers and locks - LIFECYCLE MANAGEMENT, SPAWN/DESPAWN STABILITY AND OPTIMIZATION
+    void Clear();
 };

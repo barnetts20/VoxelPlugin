@@ -186,10 +186,10 @@ void AAdaptiveVoxelActor::Tick(float DeltaTime)
     //Example of edit flow, would want to move off tick for actual implementation
     if (world->IsGameWorld())
     {
-        double InEditRadius = 500;
-        double InEditStrength = 500;
+        double InEditRadius = 300;
+        double InEditStrength = 300 * 2;
         int InEditResolution = 3;
-        float DebugDrawTime = .5f;
+        float DebugDrawTime = .1f;
         APlayerController* PC = UGameplayStatics::GetPlayerController(world, 0);
         if (PC && PC->IsInputKeyDown(EKeys::E) && !EditUpdateIsRunning)
         {

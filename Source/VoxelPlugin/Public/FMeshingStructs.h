@@ -23,11 +23,6 @@ struct VOXELPLUGIN_API FMeshVertex
     }
 };
 
-FORCEINLINE uint32 GetTypeHash(const FMeshVertex& Vertex)
-{
-    return FCrc::MemCrc32(&Vertex.Position, sizeof(FVector));
-}
-
 struct VOXELPLUGIN_API FEdgeVertexData {
     TArray<FMeshVertex> Vertices;
     TOptional<FNodeEdge> Edge;
@@ -175,3 +170,8 @@ struct VOXELPLUGIN_API FMeshChunk {
         });
     }
 };
+
+FORCEINLINE uint32 GetTypeHash(const FMeshVertex& Vertex)
+{
+    return FCrc::MemCrc32(&Vertex.Position, sizeof(FVector));
+}
