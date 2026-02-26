@@ -139,6 +139,9 @@ void AAdaptiveVoxelActor::RunMeshUpdateTask()
 
 void AAdaptiveVoxelActor::RunEditUpdateTask(FVector InEditCenter, double InEditRadius, double InEditStrength, int InEditResolution)
 {
+    if (EditUpdateIsRunning || IsDestroyed) return;
+
+    EditUpdateIsRunning = true;
     TWeakObjectPtr<AAdaptiveVoxelActor> WeakThis(this);
     FFunctionGraphTask::CreateAndDispatchWhenReady([WeakThis, InEditCenter, InEditRadius, InEditStrength, InEditResolution]()
         {
@@ -146,11 +149,10 @@ void AAdaptiveVoxelActor::RunEditUpdateTask(FVector InEditCenter, double InEditR
             if (!Self || Self->IsDestroyed) return;
             {
                 FRWScopeLock WriteLock(Self->OctreeLock, SLT_Write);
-                //Updates data and chunk state of tree
                 Self->AdaptiveOctree->ApplyEdit(InEditCenter, InEditRadius, InEditStrength, InEditResolution);
-                //Dispatches component updates to game thread
-                Self->RunMeshUpdateTask();
+                Self->AdaptiveOctree->UpdateMesh();
             }
+            Self->EditUpdateIsRunning = false;
         }, TStatId(), nullptr, ENamedThreads::AnyNormalThreadHiPriTask);
 }
 
@@ -180,10 +182,16 @@ void AAdaptiveVoxelActor::Tick(float DeltaTime)
             }
         }
     }
+
+    //Example of edit flow, would want to move off tick for actual implementation
     if (world->IsGameWorld())
     {
+        double InEditRadius = 500;
+        double InEditStrength = 500;
+        int InEditResolution = 3;
+        float DebugDrawTime = .5f;
         APlayerController* PC = UGameplayStatics::GetPlayerController(world, 0);
-        if (PC && PC->WasInputKeyJustPressed(EKeys::E))
+        if (PC && PC->IsInputKeyDown(EKeys::E) && !EditUpdateIsRunning)
         {
             FVector Start = CameraPosition;
             FVector Forward = PC->GetControlRotation().Vector();
@@ -192,11 +200,11 @@ void AAdaptiveVoxelActor::Tick(float DeltaTime)
             FHitResult Hit;
             if (world->LineTraceSingleByChannel(Hit, Start, End, ECC_Visibility))
             {
-                RunEditUpdateTask(Hit.ImpactPoint, 500.0, 1000.0, 3); 
-                DrawDebugSphere(world, Hit.ImpactPoint, 500.0, 12, FColor::Red, false, 2.0f);
+                RunEditUpdateTask(Hit.ImpactPoint, InEditRadius, InEditStrength, InEditResolution);
+                DrawDebugSphere(world, Hit.ImpactPoint, InEditStrength, 12, FColor::Red, false, DebugDrawTime);
             }
         }
-        if (PC && PC->WasInputKeyJustPressed(EKeys::Q))
+        if (PC && PC->IsInputKeyDown(EKeys::Q) && !EditUpdateIsRunning)
         {
             FVector Start = CameraPosition;
             FVector Forward = PC->GetControlRotation().Vector();
@@ -205,8 +213,8 @@ void AAdaptiveVoxelActor::Tick(float DeltaTime)
             FHitResult Hit;
             if (world->LineTraceSingleByChannel(Hit, Start, End, ECC_Visibility))
             {
-                RunEditUpdateTask(Hit.ImpactPoint, 500.0, -1000.0, 3);
-                DrawDebugSphere(world, Hit.ImpactPoint, 500.0, 12, FColor::Green, false, 2.0f);
+                RunEditUpdateTask(Hit.ImpactPoint, InEditRadius, -InEditStrength, 3);
+                DrawDebugSphere(world, Hit.ImpactPoint, InEditStrength, 12, FColor::Green, false, DebugDrawTime);
             }
         }
     }

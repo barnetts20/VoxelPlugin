@@ -16,7 +16,7 @@ public:
 
     double Sample(FVector Position) const;
     int GetDepthForBrushRadius(double BrushRadius, int SubdivisionLevels) const;
-    void ApplySphericalEdit(FVector BrushCenter, double Radius, double Strength, int Depth);
+    TArray<FVector> ApplySphericalEdit(FVector BrushCenter, double Radius, double Strength, int Depth);
     const TArray<FVector>& GetAffectedChunkCenters() const;
     void Clear();
     bool HasEdits() const;

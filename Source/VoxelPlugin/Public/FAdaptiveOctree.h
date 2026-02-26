@@ -34,6 +34,7 @@ private:
     bool MeshChunksInitialized = false;
     double RootExtent;
     double ChunkExtent;
+    int ChunkDepth;
 
     void SplitToDepth(TSharedPtr<FAdaptiveOctreeNode> Node, int InMinDepth);
     
@@ -49,6 +50,8 @@ private:
 
     TSharedPtr<FAdaptiveOctreeNode> GetLeafNodeByPoint(FVector Position);
 
+    TSharedPtr<FAdaptiveOctreeNode> GetChunkNodeByPoint(FVector Position);
+
     TArray<TSharedPtr<FAdaptiveOctreeNode>> GetSurfaceNodes();
 
 public:
@@ -58,6 +61,10 @@ public:
     void PopulateChunks();
     
     void ApplyEdit(FVector InEditCenter, double InEditRadius, double InEditStrength, int InEditResolution);
+
+    void UpdateChunkMap(TSharedPtr<FAdaptiveOctreeNode> ChunkNode, TArray<TPair<TSharedPtr<FAdaptiveOctreeNode>, TSharedPtr<FMeshChunk>>>& OutDirtyChunks);
+
+    void ReconstructSubtree(TSharedPtr<FAdaptiveOctreeNode> Node, FVector EditCenter, double SearchRadius);
 
     void UpdateLOD(FVector InCameraPosition, double InScreenSpaceThreshold, double InCameraFOV);
 

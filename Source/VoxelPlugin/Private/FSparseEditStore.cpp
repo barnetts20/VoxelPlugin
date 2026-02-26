@@ -61,7 +61,7 @@ double FSparseEditStore::InterpolateCorners(const TSharedPtr<FSparseEditNode>& N
 // EDIT APPLICATION (Background Thread)
 // ============================================================================
 
-void FSparseEditStore::ApplySphericalEdit(FVector BrushCenter, double Radius, double Strength, int Depth)
+TArray<FVector> FSparseEditStore::ApplySphericalEdit(FVector BrushCenter, double Radius, double Strength, int Depth)
 {
     Depth = FMath::Clamp(Depth, 0, MaxDepth);
     AffectedChunkCenters.Empty();
@@ -70,6 +70,7 @@ void FSparseEditStore::ApplySphericalEdit(FVector BrushCenter, double Radius, do
         Root = MakeShared<FSparseEditNode>();
 
     ApplyEditRecursive(Root, Center, Extent, BrushCenter, Radius, Strength, 0, Depth);
+    return AffectedChunkCenters;
 }
 
 void FSparseEditStore::ApplyEditRecursive(TSharedPtr<FSparseEditNode> Node, FVector NodeCenter, double NodeExtent, FVector BrushCenter, double BrushRadius, double Strength, int CurrentDepth, int TargetDepth) {

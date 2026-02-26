@@ -81,6 +81,7 @@ public:
 protected:
     std::atomic<bool> DataUpdateIsRunning = false;
     std::atomic<bool> MeshUpdateIsRunning = false;
+    std::atomic<bool> EditUpdateIsRunning = false;
 
     FTimerHandle DataUpdateTimerHandle;
     FTimerHandle MeshUpdateTimerHandle;
