@@ -5,7 +5,6 @@
 #include "Materials/Material.h"
 #include "MaterialDomain.h"
 #include "FAdaptiveOctree.h"
-#include "FSparseOctree.h"
 #include "FMeshingStructs.h"
 #include "RealtimeMeshActor.h"
 #include "FSparseEditStore.h"

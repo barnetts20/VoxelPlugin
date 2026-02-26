@@ -7,8 +7,8 @@
 //TODO: Move the following structs into OctreeContour, along with any other meshing related or QEF related functions/structs we are using
 struct VOXELPLUGIN_API FNodeCorner {
     FVector Position;
-    FVector Normal;
     double Density;
+    FVector Normal;
 
     FNodeCorner() : Position(0), Density(0), Normal(0, 0, 1) {}
 

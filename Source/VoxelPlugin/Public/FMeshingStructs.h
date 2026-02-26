@@ -1,6 +1,5 @@
 #pragma once
 
-#include "FSparseOctree.h"
 #include "FAdaptiveOctreeNode.h"
 #include "RealtimeMeshActor.h"
 #include <RealtimeMeshCore.h>
