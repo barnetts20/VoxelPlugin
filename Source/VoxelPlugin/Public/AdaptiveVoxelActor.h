@@ -23,7 +23,7 @@ private:
     // Adaptive octree meshes the SDF
     TSharedPtr<FAdaptiveOctree> AdaptiveOctree;
     // Edit store saves user terraforming changes
-    TSharedPtr<FSparseEditStore> EditStore;
+    TSharedPtr<FSparseEditStore> EditStore; //MOVING TO OCTREE
 
     FVector CameraPosition = FVector::ZeroVector;
     FVector LastLodUpdatePosition = FVector(FLT_MAX);
@@ -55,13 +55,13 @@ public:
     int MaxDepth = 18;
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "LOD")
-    double ScreenSpaceThreshold = .075;
+    double ScreenSpaceThreshold = .07;
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "LOD")
-    double MinDataUpdateInterval = .01;
+    double MinDataUpdateInterval = .1;
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "LOD")
-    double MinMeshUpdateInterval = .1;
+    double MinMeshUpdateInterval = .01;
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "LOD")
     double VelocityLookAheadFactor = 16;

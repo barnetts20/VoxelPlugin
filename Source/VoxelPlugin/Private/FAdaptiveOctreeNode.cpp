@@ -1,4 +1,5 @@
 #include "FAdaptiveOctreeNode.h"
+#include "FAdaptiveOctree.h"
 
 bool FAdaptiveOctreeNode::IsLeaf()
 {
@@ -276,6 +277,11 @@ TArray<FNodeEdge> FAdaptiveOctreeNode::GetSurfaceEdges()
     ensure(false);
     return TArray<FNodeEdge>();
 }
+//TODO: THESE METHODS ARE QUITE SIMILAR, WE MAY BE ABLE TO COLLAPSE TO ONE
+TArray<FNodeEdge>& FAdaptiveOctreeNode::GetSignChangeEdges()
+{
+    return SignChangeEdges;
+}
 
 // Retrieves all surface nodes for meshing
 TArray<TSharedPtr<FAdaptiveOctreeNode>> FAdaptiveOctreeNode::GetSurfaceNodes()
@@ -334,11 +340,6 @@ TArray<TSharedPtr<FAdaptiveOctreeNode>> FAdaptiveOctreeNode::GetSurfaceChunks()
     }
 
     return SurfaceNodes;
-}
-
-TArray<FNodeEdge>& FAdaptiveOctreeNode::GetSignChangeEdges()
-{
-    return SignChangeEdges;
 }
 
 void FAdaptiveOctreeNode::ComputeDualContourPosition()

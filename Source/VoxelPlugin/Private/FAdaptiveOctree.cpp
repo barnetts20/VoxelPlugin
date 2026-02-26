@@ -18,7 +18,6 @@ FAdaptiveOctree::FAdaptiveOctree(ARealtimeMeshActor* InParentActor, UMaterialInt
     PopulateChunks();
 }
 
-//TODO: PROBABLY A LIGHTER WEIGHT WAY TO UPDATE THIS AFTER THE INITIAL MAP HAS BEEN CONSTRUCTED, WE WILL NEED TO UPDATE THE CHUNK MAP POTENTIALLY WHEN EDITS OCCUR, WE WILL WANT TO ENSURE WE ARE DOING THAT UPDATE AS LIGHT WEIGHT AS POSSIBLE
 void FAdaptiveOctree::PopulateChunks() {
     TArray<TSharedPtr<FAdaptiveOctreeNode>> Chunks = Root->GetSurfaceChunks();
     TArray<TSharedPtr<FAdaptiveOctreeNode>> NeighborChunks;
@@ -61,6 +60,14 @@ void FAdaptiveOctree::PopulateChunks() {
         ChunkMap.Add(chunk, newChunk);
     }
     MeshChunksInitialized = true;
+}
+
+void FAdaptiveOctree::ApplyEdit(FVector InEditCenter, double InEditRadius, double InEditStrength, int InEditResolution)
+{
+    int depth = 18;// EditStore->GetDepthForBrushRadius(InEditRadius, InEditResolution);
+    EditStore->ApplySphericalEdit(InEditCenter, InEditRadius, InEditStrength, depth);
+    double ReconstructRadius = InEditRadius * 1.5;
+    ReconstructAffectedNodes(Root, InEditCenter, ReconstructRadius);
 }
 
 void FAdaptiveOctree::SplitToDepth(TSharedPtr<FAdaptiveOctreeNode> Node, int InMinDepth)
@@ -108,12 +115,6 @@ FVector FAdaptiveOctree::QuantizePosition(const FVector& P, double GridSize)
         FMath::RoundToDouble(P.Y / GridSize) * GridSize,
         FMath::RoundToDouble(P.Z / GridSize) * GridSize
     );
-}
-
-uint32 GetTypeHash(const FMeshVertex& Vertex)
-{
-    // Hash the quantized position — guaranteed consistent with operator==
-    return FCrc::MemCrc32(&Vertex.Position, sizeof(FVector));
 }
 
 void FAdaptiveOctree::UpdateMeshChunkStreamData(TSharedPtr<FMeshChunk> InChunk)
@@ -245,6 +246,106 @@ void FAdaptiveOctree::UpdateMeshChunkStreamData(TSharedPtr<FMeshChunk> InChunk)
     InChunk->IsDirty = (Triangles.Num() > 0);
 }
 
+void FAdaptiveOctree::ReconstructAffectedNodes(TSharedPtr<FAdaptiveOctreeNode> Node, FVector EditCenter, double SearchRadius)
+{
+    if (!Node.IsValid()) return;
+
+    FVector Closest;
+    Closest.X = FMath::Clamp(EditCenter.X, Node->Center.X - Node->Extent, Node->Center.X + Node->Extent);
+    Closest.Y = FMath::Clamp(EditCenter.Y, Node->Center.Y - Node->Extent, Node->Center.Y + Node->Extent);
+    Closest.Z = FMath::Clamp(EditCenter.Z, Node->Center.Z - Node->Extent, Node->Center.Z + Node->Extent);
+
+    if (FVector::DistSquared(Closest, EditCenter) > SearchRadius * SearchRadius)
+        return;
+
+    Node->ComputeNodeData(false);
+
+
+    if (Node->IsLeaf())
+    {
+        if (Node->IsSurfaceNode)
+        {
+            TSharedPtr<FAdaptiveOctreeNode> Ancestor = Node->Parent.Pin();
+            while (Ancestor.IsValid() && !Ancestor->IsSurfaceNode)
+            {
+                Ancestor->IsSurfaceNode = true;
+                Ancestor = Ancestor->Parent.Pin();
+            }
+        }
+        return;
+    }
+
+    // Recurse into children — including past chunk depth
+    if (!Node->IsLeaf())
+    {
+        for (int i = 0; i < 8; i++)
+            ReconstructAffectedNodes(Node->Children[i], EditCenter, SearchRadius);
+    }
+
+    // After children are rebuilt, handle chunk mesh
+    if (Node->TreeIndex.Num() == Node->ChunkDepth)
+    {
+        TSharedPtr<FMeshChunk>* Found = ChunkMap.Find(Node);
+
+        if (Found && *Found)
+        {
+            if (!Node->IsSurfaceNode)
+            {
+                // Lost surface — clear mesh
+                (*Found)->ChunkMeshData->ResetStreams();
+                (*Found)->IsDirty = true;
+            }
+            else
+            {
+                // Still has surface — rebuild
+                TArray<FNodeEdge> NewEdges;
+                GatherLeafEdges(Node, NewEdges);
+                (*Found)->ChunkEdges = NewEdges;
+                UpdateMeshChunkStreamData(*Found);
+            }
+        }
+        else if (Node->IsSurfaceNode)
+        {
+            // Gained surface — create chunk
+            TSharedPtr<FMeshChunk> NewChunk = MakeShared<FMeshChunk>();
+            NewChunk->CachedParentActor = CachedParentActor;
+            NewChunk->CachedMaterial = CachedMaterial;
+            NewChunk->InitializeData(Node->Center, Node->Extent);
+
+            TArray<FNodeEdge> NewEdges;
+            GatherLeafEdges(Node, NewEdges);
+            NewChunk->ChunkEdges = NewEdges;
+            UpdateMeshChunkStreamData(NewChunk);
+
+            ChunkMap.Add(Node, NewChunk);
+
+            // Add non-surface neighbors as buffer chunks, same pattern as PopulateChunks
+            const double Offset = Node->Extent * 2.0;
+            for (int i = 0; i < 6; i++)
+            {
+                FVector NeighborPos = Node->Center + Directions[i] * Offset;
+                TSharedPtr<FAdaptiveOctreeNode> Neighbor = GetLeafNodeByPoint(NeighborPos);
+
+                if (!Neighbor.IsValid()) continue;
+                if (Neighbor->IsSurfaceNode) continue;
+                if (ChunkMap.Contains(Neighbor)) continue;
+
+                TSharedPtr<FMeshChunk> NeighborChunk = MakeShared<FMeshChunk>();
+                NeighborChunk->CachedParentActor = CachedParentActor;
+                NeighborChunk->CachedMaterial = CachedMaterial;
+                NeighborChunk->InitializeData(Neighbor->Center, Neighbor->Extent);
+
+                TArray<FNodeEdge> NeighborEdges;
+                GatherLeafEdges(Neighbor, NeighborEdges);
+                NeighborChunk->ChunkEdges = NeighborEdges;
+                UpdateMeshChunkStreamData(NeighborChunk);
+
+                ChunkMap.Add(Neighbor, NeighborChunk);
+            }
+        }
+    }
+}
+
 void FAdaptiveOctree::UpdateLOD(FVector CameraPosition, double InScreenSpaceThreshold, double InCameraFOV)
 {
     if (!MeshChunksInitialized) return;
@@ -295,6 +396,19 @@ void FAdaptiveOctree::UpdateMesh()
     }
 }
 
+void FAdaptiveOctree::GatherLeafEdges(TSharedPtr<FAdaptiveOctreeNode> Node, TArray<FNodeEdge>& OutEdges)
+{
+    if (!Node.IsValid()) return;
+
+    if (Node->IsLeaf())
+    {
+        OutEdges.Append(Node->GetSignChangeEdges());
+        return;
+    }
+
+    for (int i = 0; i < 8; i++)
+        GatherLeafEdges(Node->Children[i], OutEdges);
+}
 // Retrieves all surface nodes for meshing
 TArray<TSharedPtr<FAdaptiveOctreeNode>> FAdaptiveOctree::GetSurfaceNodes()
 {

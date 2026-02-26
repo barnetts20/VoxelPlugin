@@ -73,7 +73,6 @@ void AAdaptiveVoxelActor::Initialize()
 
     // Store for user edits
     EditStore = MakeShared<FSparseEditStore>(GetActorLocation(), Size, ChunkDepth, MaxDepth);
-    
     // Adaptive octree meshes the implicit structure
     AdaptiveOctree = MakeShared<FAdaptiveOctree>(this, Material, DensityFunction, EditStore, GetActorLocation(), Size, ChunkDepth, MinDepth, MaxDepth);
 
@@ -112,7 +111,7 @@ void AAdaptiveVoxelActor::RunDataUpdateTask()
 
             Self->DataUpdateIsRunning = false;
 
-        }, TStatId(), nullptr, ENamedThreads::AnyBackgroundThreadNormalTask);
+        }, TStatId(), nullptr, ENamedThreads::AnyNormalThreadHiPriTask);
 }
 
 void AAdaptiveVoxelActor::RunMeshUpdateTask()
@@ -134,14 +133,10 @@ void AAdaptiveVoxelActor::RunMeshUpdateTask()
 
             Self->MeshUpdateIsRunning = false;
 
-        }, TStatId(), nullptr, ENamedThreads::AnyBackgroundThreadNormalTask);
+        }, TStatId(), nullptr, ENamedThreads::AnyBackgroundHiPriTask);
 }
 
 
-//TODO: THIS SHOULD PERFORM THE ENTIRE EDIT, IDEALLY THIS TAKES PRECENDENCE OVER LOD/MESH UPDATES SO THAT IT CAN FEEL RESPONSIVE - ONCE IT HAS THE LOCK IT COMPLETES THE FULL EDIT INCLUDING THE MESH UPDATE
-//TODO: WE NEED TO SPLIT MESHCHUNK INITIALIZE INTO DATA ONLY INTIALIZER AND COMPONENT/MESH INITIALIZER
-//TODO: THIS SHOULD INITIALIZE NEW CHUNKS THAT ARE NEEDED ALL THE WAY THROUGH THE DATA INIT PORTION, THEN SWAP TO GAME THREAD AND UPDATE THE ACTUAL DISPLAYED MESHES
-//TODO: LAST TIME, WE TIED THE EDITS TO THE EXISTING DATA/MESH PIPELINES, WHICH MADE IT FEEL UNRESPONSIVE, WE NEED TO FIGURE OUT HOW TO MAKE THE ENTIRE EDIT HAPPEN WHEN THE USER TRIGGERS IT WITHOUT AS MUCH OF A DELAY
 void AAdaptiveVoxelActor::RunEditUpdateTask(FVector InEditCenter, double InEditRadius, double InEditStrength, int InEditResolution)
 {
     TWeakObjectPtr<AAdaptiveVoxelActor> WeakThis(this);
@@ -151,17 +146,13 @@ void AAdaptiveVoxelActor::RunEditUpdateTask(FVector InEditCenter, double InEditR
             if (!Self || Self->IsDestroyed) return;
 
             {
-                FRWScopeLock WriteLock(Self->OctreeLock, SLT_ReadOnly);
-                Self->EditStore->ApplySphericalEdit(InEditCenter, InEditRadius, InEditStrength, InEditResolution);
-
-                //TODO: RECALCULATE EFFECTED NODES CORNER AND DC DATA, AT LEAST NEED TO RECALCULATE ON LEAF AND CHUNK LEVEL... MIGHT NEED TO RECALCULATE FOR EVERTHING BETWEEN THEM
-                //TODO: RECALCULATE EFFECTED NODES MESH DATA BUFFERS
-                //TODO: PERFORM CHUNK NODE SET UPDATE - FIGURE OUT IF OUR SURFACE CHUNK MAP SHOULD HAVE CHANGED
-                //TODO: FLAG EFFECTED CHUNKS DIRTY
-                //TODO: DISPATCH TO GAME THREAD, CONTINUE HOLDING LOCK SO THAT LOD/MESH UPDATE TIMERS CANNOT INTERFERE
-                //TODO: DIRECTLY UPDATE EFFECTED MESHES ON THE GAME THREAD, DO NOT WAIT ON MESH UPDATE TIMER (NEEDS TO INHERIT LOCK)
+                FRWScopeLock WriteLock(Self->OctreeLock, SLT_Write);
+                //Updates data and chunk state of tree
+                Self->AdaptiveOctree->ApplyEdit(InEditCenter, InEditRadius, InEditStrength, InEditResolution);
+                //Dispatches component updates to game thread
+                //Self->RunMeshUpdateTask();
             }
-        }, TStatId(), nullptr, ENamedThreads::AnyBackgroundThreadNormalTask);
+        }, TStatId(), nullptr, ENamedThreads::AnyNormalThreadHiPriTask);
 }
 
 bool AAdaptiveVoxelActor::ShouldTickIfViewportsOnly() const
@@ -187,6 +178,36 @@ void AAdaptiveVoxelActor::Tick(float DeltaTime)
             if (CamManager)
             {
                 CameraFOV = CamManager->GetFOVAngle();
+            }
+        }
+    }
+    if (world->IsGameWorld())
+    {
+        APlayerController* PC = UGameplayStatics::GetPlayerController(world, 0);
+        if (PC && PC->WasInputKeyJustPressed(EKeys::E))
+        {
+            FVector Start = CameraPosition;
+            FVector Forward = PC->GetControlRotation().Vector();
+            FVector End = Start + Forward * Size;
+
+            FHitResult Hit;
+            if (world->LineTraceSingleByChannel(Hit, Start, End, ECC_Visibility))
+            {
+                RunEditUpdateTask(Hit.ImpactPoint, 500.0, 1000.0, 3); 
+                DrawDebugSphere(world, Hit.ImpactPoint, 500.0, 12, FColor::Red, false, 2.0f);
+            }
+        }
+        if (PC && PC->WasInputKeyJustPressed(EKeys::Q))
+        {
+            FVector Start = CameraPosition;
+            FVector Forward = PC->GetControlRotation().Vector();
+            FVector End = Start + Forward * Size;
+
+            FHitResult Hit;
+            if (world->LineTraceSingleByChannel(Hit, Start, End, ECC_Visibility))
+            {
+                RunEditUpdateTask(Hit.ImpactPoint, 500.0, -1000.0, 3);
+                DrawDebugSphere(world, Hit.ImpactPoint, 500.0, 12, FColor::Green, false, 2.0f);
             }
         }
     }

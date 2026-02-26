@@ -20,14 +20,15 @@ public:
     const TArray<FVector>& GetAffectedChunkCenters() const;
     void Clear();
     bool HasEdits() const;
-
-private:
-    TSharedPtr<FSparseEditNode> Root;
+    int MaxDepth;
     FVector Center;
     double Extent;
     int ChunkDepth;
+
+private:
+    TSharedPtr<FSparseEditNode> Root;
+
     TArray<FVector> AffectedChunkCenters;
-    int MaxDepth;
 
     static inline const FVector Offsets[8] = {
         FVector(-1, -1, -1), FVector(1, -1, -1),

@@ -39,6 +39,8 @@ private:
     
     void UpdateMeshChunkStreamData(TSharedPtr<FMeshChunk> InChunk);
     
+    void ReconstructAffectedNodes(TSharedPtr<FAdaptiveOctreeNode> InNode, FVector InEditCenter, double InReconstructRadius);
+
     static FVector QuantizePosition(const FVector& P, double GridSize = 1.0);
     
     static FVector2f ComputeTriplanarUV(FVector Position, FVector Normal);
@@ -55,11 +57,15 @@ public:
 
     void PopulateChunks();
     
+    void ApplyEdit(FVector InEditCenter, double InEditRadius, double InEditStrength, int InEditResolution);
+
     void UpdateLOD(FVector InCameraPosition, double InScreenSpaceThreshold, double InCameraFOV);
 
     void UpdateMesh();
 
     void Clear(); //TODO: Need to test this
+
+    void GatherLeafEdges(TSharedPtr<FAdaptiveOctreeNode> Node, TArray<FNodeEdge>& OutEdges);
 
     //TODO: Need to make a destructor that safely disposes references/pointers and locks - LIFECYCLE MANAGEMENT, SPAWN/DESPAWN STABILITY AND OPTIMIZATION
 };

@@ -4,7 +4,7 @@
 // CONSTRUCTION
 // ============================================================================
 
-FSparseEditStore::FSparseEditStore(FVector InCenter, double InExtent, int InMaxDepth, int InChunkDepth)
+FSparseEditStore::FSparseEditStore(FVector InCenter, double InExtent, int InChunkDepth, int InMaxDepth)
     : Center(InCenter), Extent(InExtent), ChunkDepth(InChunkDepth), MaxDepth(InMaxDepth) {}
 
 // ============================================================================

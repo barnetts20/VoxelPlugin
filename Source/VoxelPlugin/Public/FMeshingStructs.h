@@ -23,6 +23,11 @@ struct VOXELPLUGIN_API FMeshVertex
     }
 };
 
+FORCEINLINE uint32 GetTypeHash(const FMeshVertex& Vertex)
+{
+    return FCrc::MemCrc32(&Vertex.Position, sizeof(FVector));
+}
+
 struct VOXELPLUGIN_API FEdgeVertexData {
     TArray<FMeshVertex> Vertices;
     TOptional<FNodeEdge> Edge;
@@ -156,9 +161,6 @@ struct VOXELPLUGIN_API FMeshChunk {
             if (NumVerts < 3) {
                 // If it was previously initialized but now has no data (e.g., deleted via terraforming)
                 MeshPtr->UpdateSectionGroup(Self->ChunkMeshData->MeshGroupKey, FRealtimeMeshStreamSet());
-                //TODO: I DONT THINK WE NEED THE FOLLOWING, BUT WILL NEED TO VERIFY, LEAVING COMMENTED OUT FOR REFERENCE
-                //CompPtr->SetVisibility(false); 
-                //CompPtr->SetCollisionEnabled(ECollisionEnabled::NoCollision);
                 Self->IsDirty = false;
                 return;
             }
