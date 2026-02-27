@@ -1,6 +1,6 @@
 #include "FAdaptiveOctree.h"
 
-FAdaptiveOctree::FAdaptiveOctree(ARealtimeMeshActor* InParentActor, UMaterialInterface* InMaterial, TFunction<double(FVector, FVector)> InDensityFunction, TSharedPtr<FSparseEditStore> InEditStore, FVector InCenter, double InRootExtent, int InChunkDepth, int InMinDepth, int InMaxDepth)
+FAdaptiveOctree::FAdaptiveOctree(ARealtimeMeshActor* InParentActor, UMaterialInterface* InMaterial, TFunction<void(TSharedPtr<FAdaptiveOctreeNode>)> InDensityFunction, TSharedPtr<FSparseEditStore> InEditStore, FVector InCenter, double InRootExtent, int InChunkDepth, int InMinDepth, int InMaxDepth)
 {
     DensityFunction = InDensityFunction;
     EditStore = InEditStore;
@@ -11,9 +11,8 @@ FAdaptiveOctree::FAdaptiveOctree(ARealtimeMeshActor* InParentActor, UMaterialInt
     ChunkDepth = InChunkDepth;
 
     Root = MakeShared<FAdaptiveOctreeNode>(&DensityFunction, InEditStore, InCenter, InRootExtent, InChunkDepth, InMinDepth, InMaxDepth);
-    //{
-        SplitToDepth(Root, InChunkDepth);
-    //}
+    Root->ComputeNodeData();
+    SplitToDepth(Root, InChunkDepth);
 
     PopulateChunks();
 }

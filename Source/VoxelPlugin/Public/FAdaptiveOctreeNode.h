@@ -386,15 +386,13 @@ private:
 struct VOXELPLUGIN_API FAdaptiveOctreeNode : public TSharedFromThis<FAdaptiveOctreeNode>
 {
 private:
-    TFunction<double(FVector, FVector)>* DensityFunction;
-
-    TSharedPtr<FSparseEditStore> EditStore;
+    TFunction<void(TSharedPtr<FAdaptiveOctreeNode>)>* DensityFunction;
     
     void ComputeDualContourPosition();
     
     FVector GetInterpolatedNormal(FVector P);
     
-    double SampleDensity(FVector Position);
+    void SampleDensity();
     
     bool bIsLeaf = true;
     
@@ -415,6 +413,8 @@ private:
     };
 
 public:
+    TSharedPtr<FSparseEditStore> EditStore;
+
     TArray<uint8> TreeIndex;
     
     TWeakPtr<FAdaptiveOctreeNode> Parent;
@@ -462,10 +462,10 @@ public:
     TArray<FNodeEdge>& GetSignChangeEdges();
 
     // Root Constructor
-    FAdaptiveOctreeNode(TFunction<double(FVector, FVector)>* DensityFunction, TSharedPtr<FSparseEditStore> InEditStore, FVector InCenter, double InExtent, int InChunkDepth, int InMinDepth, int InMaxDepth);
+    FAdaptiveOctreeNode(TFunction<void(TSharedPtr<FAdaptiveOctreeNode>)>* DensityFunction, TSharedPtr<FSparseEditStore> InEditStore, FVector InCenter, double InExtent, int InChunkDepth, int InMinDepth, int InMaxDepth);
 
     // Child Constructor
-    FAdaptiveOctreeNode(TFunction<double(FVector, FVector)>* DensityFunction, TSharedPtr<FSparseEditStore> InEditStore, TSharedPtr<FAdaptiveOctreeNode> InParent, uint8 InChildIndex, FVector InAnchorCenter);
+    FAdaptiveOctreeNode(TFunction<void(TSharedPtr<FAdaptiveOctreeNode>)>* DensityFunction, TSharedPtr<FSparseEditStore> InEditStore, TSharedPtr<FAdaptiveOctreeNode> InParent, uint8 InChildIndex, FVector InAnchorCenter);
 
     void ComputeNodeData();
 };

@@ -22,7 +22,7 @@ private:
         FVector(0, 0, -1)
     };
 
-    TFunction<double(FVector, FVector)> DensityFunction;
+    TFunction<void(TSharedPtr<FAdaptiveOctreeNode>)> DensityFunction;
 
     TSharedPtr<FSparseEditStore> EditStore;
 
@@ -65,7 +65,7 @@ private:
     void GatherLeafEdges(TSharedPtr<FAdaptiveOctreeNode> Node, TArray<FNodeEdge>& OutEdges);
 
 public:
-    FAdaptiveOctree(ARealtimeMeshActor* InParentActor, UMaterialInterface* InMaterial, TFunction<double(FVector, FVector)> InDensityFunction, TSharedPtr<FSparseEditStore> InEditStore, FVector InCenter, double InRootExtent, int InChunkDepth, int InMinDepth, int InMaxDepth);
+    FAdaptiveOctree(ARealtimeMeshActor* InParentActor, UMaterialInterface* InMaterial, TFunction<void(TSharedPtr<FAdaptiveOctreeNode>)> InDensityFunction, TSharedPtr<FSparseEditStore> InEditStore, FVector InCenter, double InRootExtent, int InChunkDepth, int InMinDepth, int InMaxDepth);
 
     void ApplyEdit(FVector InEditCenter, double InEditRadius, double InEditStrength, int InEditResolution);
 

@@ -87,19 +87,29 @@ void AAdaptiveVoxelActor::Initialize()
     //};
     Noise = FastNoise::NewFromEncodedNodeTree("HgAZABoAAR8AGwAkABgAAAAXAAAAgL8AAIA/AAAAAAAAgD8RAAQAAAAAAABAEAAAAAA/EwAAAAA/BwABJQAAAIA/AACAP7geBUAAAIA/GwAZAP//AAAAAACAPwDNzExAAf//BQAAAAAAPwAAACBCARcAAAAAAAAAgD8AAMA/AAAAPw0ABAAAAAAAAEALAAEAAAAAAAAAAQAAAAAAAAAAAACAPwAAAAA/AAAAAAAAAACAPwEaAAEgAP//CQAB//8MAAAAAIA/Af//DAABGwD//wYAAAAAAD8AAAAAAA==");
     //Fast Noise example
-    auto DensityFunction = [this](FVector Position, FVector AnchorCenter) -> double {
-        FVector PlanetRelative = Position - GetActorLocation();
-        double RealDist = PlanetRelative.Size();
-        FVector Direction = PlanetRelative.GetSafeNormal();
-
-        // Sample noise at the surface direction, not at the 3D position
-        FVector NoiseSamplePos = Direction * Size;
+    auto DensityFunction = [this](TSharedPtr<FAdaptiveOctreeNode> Node) {
+        float xPos[8], yPos[8], zPos[8], noiseOut[8];
+        FVector corners[8];
         double NoiseScale = Size * 0.1;
-        auto samplePos = NoiseSamplePos / NoiseScale;
-        float NoiseVal = Noise->GenSingle3D(samplePos.X, samplePos.Y, samplePos.Z, 666) * (float)(Size * 0.1);// FMath::PerlinNoise3D(NoiseSamplePos / NoiseScale)* (float)(Size * 0.1);
+        for (int i = 0; i < 8; i++)
+        {
+            corners[i] = Node->Corners[i].Position;
+            FVector Dir = (corners[i] - GetActorLocation()).GetSafeNormal();
+            FVector SurfacePos = (Dir * Size) / NoiseScale;
+            xPos[i] = (float)SurfacePos.X;
+            yPos[i] = (float)SurfacePos.Y;
+            zPos[i] = (float)SurfacePos.Z;
+        }
 
-        double SurfaceRadius = Size * 0.9 + (double)NoiseVal;
-        return RealDist - SurfaceRadius;
+        Noise->GenPositionArray3D(noiseOut, 8, xPos, yPos, zPos, 0, 0, 0, 0);
+
+        for (int i = 0; i < 8; i++)
+        {
+            FVector PlanetRel = corners[i] - GetActorLocation();
+            double dist = PlanetRel.Size();
+            double height = (double)noiseOut[i] * Size * 0.1;
+            Node->Corners[i].Density = dist - (Size * 0.9 + height) + Node->EditStore->Sample(corners[i]);
+        }
     };
 
 

@@ -11,7 +11,7 @@ bool FAdaptiveOctreeNode::IsRoot()
     return !Parent.IsValid();
 }
 
-FAdaptiveOctreeNode::FAdaptiveOctreeNode(TFunction<double(FVector, FVector)>* InDensityFunction, TSharedPtr<FSparseEditStore> InEditStore, FVector InCenter, double InExtent, int InChunkDepth, int InMinDepth, int InMaxDepth)
+FAdaptiveOctreeNode::FAdaptiveOctreeNode(TFunction<void(TSharedPtr<FAdaptiveOctreeNode>)>* InDensityFunction, TSharedPtr<FSparseEditStore> InEditStore, FVector InCenter, double InExtent, int InChunkDepth, int InMinDepth, int InMaxDepth)
 {
     DensityFunction = InDensityFunction;
     EditStore = InEditStore;
@@ -25,10 +25,15 @@ FAdaptiveOctreeNode::FAdaptiveOctreeNode(TFunction<double(FVector, FVector)>* In
     DepthBounds[1] = InMaxDepth;
     DepthBounds[2] = InMinDepth;
 
-    ComputeNodeData();
+    for (int i = 0; i < 8; i++)
+    {
+        Corners[i].Position = Center + (Offsets[i] * Extent);
+    }
+
+    //ComputeNodeData();
 }
 
-FAdaptiveOctreeNode::FAdaptiveOctreeNode(TFunction<double(FVector, FVector)>* InDensityFunction, TSharedPtr<FSparseEditStore> InEditStore, TSharedPtr<FAdaptiveOctreeNode> InParent, uint8 ChildIndex, FVector InAnchorCenter)
+FAdaptiveOctreeNode::FAdaptiveOctreeNode(TFunction<void(TSharedPtr<FAdaptiveOctreeNode>)>* InDensityFunction, TSharedPtr<FSparseEditStore> InEditStore, TSharedPtr<FAdaptiveOctreeNode> InParent, uint8 ChildIndex, FVector InAnchorCenter)
 {
     TreeIndex = InParent->TreeIndex;
     TreeIndex.Add(ChildIndex);
@@ -48,23 +53,21 @@ FAdaptiveOctreeNode::FAdaptiveOctreeNode(TFunction<double(FVector, FVector)>* In
     DepthBounds[0] = InParent->DepthBounds[0];
     DepthBounds[1] = InParent->DepthBounds[1];
     DepthBounds[2] = InParent->DepthBounds[2];
+
+    for (int i = 0; i < 8; i++)
+    {
+        Corners[i].Position = Center + (Offsets[i] * Extent);
+    }
     // DERIVE CHUNK EXTENT: Using the TreeIndex depth relative to ChunkDepth
     // ChunkDepth should be a member or accessible variable (e.g., 5)
-    ComputeNodeData();
+    //ComputeNodeData();
 }
 
 void FAdaptiveOctreeNode::ComputeNodeData()
 {
     SignChangeEdges.Reset();
 
-    // PASS 1: Sample only the 8 corner densities (The expensive part)
-    double CornerDensities[8];
-    for (int i = 0; i < 8; i++)
-    {
-        FVector CornerPos = Center + (Offsets[i] * Extent);
-        CornerDensities[i] = SampleDensity(CornerPos);
-    }
-
+    SampleDensity();
     // PASS 2: Compute Normals and fill FNodeCorner using the cached densities
     for (int i = 0; i < 8; i++)
     {
@@ -72,7 +75,7 @@ void FAdaptiveOctreeNode::ComputeNodeData()
 
         // Use the relative neighbors within this node to get the gradient
         // We use the 'Offsets' to figure out which corner is 'next' in X, Y, and Z
-        double d = CornerDensities[i];
+        double d = Corners[i].Density;
 
         // Find indices for neighbors in +X, +Y, +Z within the 0-7 corner array
         // (This depends on your specific Offsets[] bit-order, usually: X=1, Y=2, Z=4)
@@ -82,9 +85,9 @@ void FAdaptiveOctreeNode::ComputeNodeData()
 
         // Gradient Calculation (Forward difference using internal node corners)
         // Note: If the neighbor is 'behind' us (negative), we flip the subtraction
-        double dx = (Offsets[i].X < 0) ? (CornerDensities[idxX] - d) : (d - CornerDensities[idxX]);
-        double dy = (Offsets[i].Y < 0) ? (CornerDensities[idxY] - d) : (d - CornerDensities[idxY]);
-        double dz = (Offsets[i].Z < 0) ? (CornerDensities[idxZ] - d) : (d - CornerDensities[idxZ]);
+        double dx = (Offsets[i].X < 0) ? (Corners[idxX].Density - d) : (d - Corners[idxX].Density);
+        double dy = (Offsets[i].Y < 0) ? (Corners[idxY].Density - d) : (d - Corners[idxY].Density);
+        double dz = (Offsets[i].Z < 0) ? (Corners[idxZ].Density - d) : (d - Corners[idxZ].Density);
 
         FVector Normal(dx, dy, dz);
         if (!Normal.Normalize())
@@ -93,7 +96,7 @@ void FAdaptiveOctreeNode::ComputeNodeData()
             Normal = (CornerPos - AnchorCenter).GetSafeNormal();
         }
 
-        Corners[i] = FNodeCorner(CornerPos, d, Normal);
+        Corners[i].Normal = Normal;
     }
 
     // 4. Identify Sign-Change Edges
@@ -147,7 +150,7 @@ void FAdaptiveOctreeNode::Split()
     {
         // Update constructor to take NextAnchor
         Children[i] = MakeShared<FAdaptiveOctreeNode>(DensityFunction, EditStore, AsShared(), i, NextAnchor);
-
+        Children[i]->ComputeNodeData();
         if (Children[i]->IsSurfaceNode)
         {
             TSharedPtr<FAdaptiveOctreeNode> Ancestor = AsShared();
@@ -375,6 +378,6 @@ void FAdaptiveOctreeNode::ComputeDualContourPosition()
     }
 }
 
-double FAdaptiveOctreeNode::SampleDensity(FVector Position) {
-    return (*DensityFunction)(Position, AnchorCenter) + EditStore->Sample(Position);
+void FAdaptiveOctreeNode::SampleDensity() {
+    (*DensityFunction)(AsShared());
 }
