@@ -11,7 +11,6 @@ bool FAdaptiveOctreeNode::IsRoot()
     return !Parent.IsValid();
 }
 
-// Root Constructor
 FAdaptiveOctreeNode::FAdaptiveOctreeNode(TFunction<double(FVector, FVector)>* InDensityFunction, TSharedPtr<FSparseEditStore> InEditStore, FVector InCenter, double InExtent, int InChunkDepth, int InMinDepth, int InMaxDepth)
 {
     DensityFunction = InDensityFunction;
@@ -29,7 +28,6 @@ FAdaptiveOctreeNode::FAdaptiveOctreeNode(TFunction<double(FVector, FVector)>* In
     ComputeNodeData();
 }
 
-// Child Constructor
 FAdaptiveOctreeNode::FAdaptiveOctreeNode(TFunction<double(FVector, FVector)>* InDensityFunction, TSharedPtr<FSparseEditStore> InEditStore, TSharedPtr<FAdaptiveOctreeNode> InParent, uint8 ChildIndex, FVector InAnchorCenter)
 {
     TreeIndex = InParent->TreeIndex;
@@ -267,36 +265,6 @@ void FAdaptiveOctreeNode::UpdateLod(FVector InCameraPosition, double InScreenSpa
 TArray<FNodeEdge>& FAdaptiveOctreeNode::GetSignChangeEdges()
 {
     return SignChangeEdges;
-}
-
-// Retrieves all surface nodes for meshing
-TArray<TSharedPtr<FAdaptiveOctreeNode>> FAdaptiveOctreeNode::GetSurfaceNodes()
-{
-    TArray<TSharedPtr<FAdaptiveOctreeNode>> SurfaceNodes;
-    TQueue<TSharedPtr<FAdaptiveOctreeNode>> NodeQueue;
-    NodeQueue.Enqueue(this->AsShared());
-
-    while (!NodeQueue.IsEmpty())
-    {
-        TSharedPtr<FAdaptiveOctreeNode> CurrentNode;
-        NodeQueue.Dequeue(CurrentNode);
-
-        if (!CurrentNode) continue;
-
-        if (CurrentNode->IsLeaf() && CurrentNode->IsSurfaceNode)
-        {
-            SurfaceNodes.Add(CurrentNode->AsShared());
-        }
-        else
-        {
-            for (int i = 0; i < 8; i++)
-            {
-                if (CurrentNode->Children[i]) NodeQueue.Enqueue(CurrentNode->Children[i]);
-            }
-        }
-    }
-
-    return SurfaceNodes;
 }
 
 TArray<TSharedPtr<FAdaptiveOctreeNode>> FAdaptiveOctreeNode::GetSurfaceChunks()

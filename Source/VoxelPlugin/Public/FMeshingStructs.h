@@ -73,21 +73,29 @@ struct VOXELPLUGIN_API FMeshStreamData {
 
 struct VOXELPLUGIN_API FMeshChunk {
     TWeakObjectPtr<ARealtimeMeshActor> CachedParentActor;
+    
     TWeakObjectPtr <UMaterialInterface> CachedMaterial;
+    
     //Data Model Info
     FVector ChunkCenter;
+    
     double ChunkExtent;
+    
     TArray<FNodeEdge> ChunkEdges;
+    
     TSharedPtr<FMeshStreamData> ChunkMeshData;
 
     //Mesh Stuff
     bool IsDirty = false;
+    
     bool IsInitialized = false;
     
     TWeakObjectPtr<URealtimeMeshSimple> ChunkRtMesh;
+    
     TWeakObjectPtr<URealtimeMeshComponent> ChunkRtComponent;
 
     FRealtimeMeshLODKey LODKey = FRealtimeMeshLODKey::FRealtimeMeshLODKey(0);
+    
     FRealtimeMeshSectionConfig SecConfig = FRealtimeMeshSectionConfig(0);
 
     void InitializeData(FVector InCenter, double InExtent) {

@@ -10,7 +10,6 @@
 #include "FSparseEditStore.h"
 #include "AdaptiveVoxelActor.generated.h"
 
-
 using namespace RealtimeMesh;
 
 UCLASS()
@@ -19,25 +18,25 @@ class VOXELPLUGIN_API AAdaptiveVoxelActor : public ARealtimeMeshActor
     GENERATED_BODY()
     
 private:
-    // Adaptive octree meshes the SDF
     TSharedPtr<FAdaptiveOctree> AdaptiveOctree;
-    // Edit store saves user terraforming changes
-    TSharedPtr<FSparseEditStore> EditStore; //MOVING TO OCTREE
 
     FVector CameraPosition = FVector::ZeroVector;
+    
     FVector LastLodUpdatePosition = FVector(FLT_MAX);
+    
     double CameraFOV = 90;
 
     FRWLock OctreeLock;
 
     bool TickInEditor = true;
-    std::atomic<bool>  Initialized = false;
-    std::atomic<bool>  IsDestroyed = false;
+    
+    std::atomic<bool> Initialized = false;
+    
+    std::atomic<bool> IsDestroyed = false;
 
 public:
     AAdaptiveVoxelActor();
 
-    //Properties - TODO: Need to trigger reconstruction of entire object when any of these properties change, they are not compatible with changes while it is already running
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Materials")
     UMaterialInterface* Material;
 
@@ -54,16 +53,16 @@ public:
     int MaxDepth = 18;
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "LOD")
-    double ScreenSpaceThreshold = .07;
+    double ScreenSpaceThreshold = .065;
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "LOD")
-    double MinDataUpdateInterval = .15;
+    double MinDataUpdateInterval = .1;
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "LOD")
     double MinMeshUpdateInterval = .1;
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "LOD")
-    double VelocityLookAheadFactor = 16;
+    double VelocityLookAheadFactor = 8;
 
     virtual void OnConstruction(const FTransform& Transform) override;
     
@@ -75,14 +74,15 @@ public:
     
     virtual void Tick(float DeltaTime) override;
 
-    TSharedPtr<FAdaptiveOctree> GetOctree();
-
 protected:
     std::atomic<bool> DataUpdateIsRunning = false;
+
     std::atomic<bool> MeshUpdateIsRunning = false;
+    
     std::atomic<bool> EditUpdateIsRunning = false;
 
     FTimerHandle DataUpdateTimerHandle;
+    
     FTimerHandle MeshUpdateTimerHandle;
 
     void CleanSceneRoot();

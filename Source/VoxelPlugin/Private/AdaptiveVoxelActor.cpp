@@ -61,7 +61,7 @@ void AAdaptiveVoxelActor::Initialize()
 {
     CleanSceneRoot();
 
-    // Spherenoise - Example SDF applies perlin noise to a sphere with domain shifting and noise scaling to help precision
+    // Spherenoise - Example SDF applies perlin noise to a sphere
     auto DensityFunction = [this](FVector Position, FVector AnchorCenter) -> double {
         double NoiseScale = Size * 0.1;
         float NoiseVal = FMath::PerlinNoise3D(Position/NoiseScale) * (float)(Size * 0.1);
@@ -71,8 +71,23 @@ void AAdaptiveVoxelActor::Initialize()
         return RealDist - (Size * 0.9 + (double)NoiseVal);
     };
 
+    //Spherenoise 2 - Example SDF applies perline noise to a sphere as if it was a height map
+    //auto DensityFunction = [this](FVector Position, FVector AnchorCenter) -> double {
+    //    FVector PlanetRelative = Position - GetActorLocation();
+    //    double RealDist = PlanetRelative.Size();
+    //    FVector Direction = PlanetRelative.GetSafeNormal();
+
+    //    // Sample noise at the surface direction, not at the 3D position
+    //    FVector NoiseSamplePos = Direction * Size;
+    //    double NoiseScale = Size * 0.1;
+    //    float NoiseVal = FMath::PerlinNoise3D(NoiseSamplePos / NoiseScale) * (float)(Size * 0.1);
+
+    //    double SurfaceRadius = Size * 0.9 + (double)NoiseVal;
+    //    return RealDist - SurfaceRadius;
+    //};
+
     // Store for user edits
-    EditStore = MakeShared<FSparseEditStore>(GetActorLocation(), Size, ChunkDepth, MaxDepth);
+    TSharedPtr<FSparseEditStore> EditStore = MakeShared<FSparseEditStore>(GetActorLocation(), Size, ChunkDepth, MaxDepth);
     // Adaptive octree meshes the implicit structure
     AdaptiveOctree = MakeShared<FAdaptiveOctree>(this, Material, DensityFunction, EditStore, GetActorLocation(), Size, ChunkDepth, MinDepth, MaxDepth);
 
@@ -135,7 +150,6 @@ void AAdaptiveVoxelActor::RunMeshUpdateTask()
 
         }, TStatId(), nullptr, ENamedThreads::AnyBackgroundHiPriTask);
 }
-
 
 void AAdaptiveVoxelActor::RunEditUpdateTask(FVector InEditCenter, double InEditRadius, double InEditStrength, int InEditResolution)
 {
@@ -218,9 +232,4 @@ void AAdaptiveVoxelActor::Tick(float DeltaTime)
             }
         }
     }
-}
-
-TSharedPtr<FAdaptiveOctree> AAdaptiveVoxelActor::GetOctree()
-{
-    return AdaptiveOctree;
 }

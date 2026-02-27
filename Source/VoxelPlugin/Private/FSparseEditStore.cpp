@@ -1,15 +1,7 @@
 #include "FSparseEditStore.h"
 
-// ============================================================================
-// CONSTRUCTION
-// ============================================================================
-
 FSparseEditStore::FSparseEditStore(FVector InCenter, double InExtent, int InChunkDepth, int InMaxDepth)
     : Center(InCenter), Extent(InExtent), ChunkDepth(InChunkDepth), MaxDepth(InMaxDepth) {}
-
-// ============================================================================
-// SAMPLING (Thread Safe — read only)
-// ============================================================================
 
 double FSparseEditStore::Sample(FVector Position) const
 {
@@ -35,31 +27,6 @@ double FSparseEditStore::Sample(FVector Position) const
 
     return Sum;
 }
-
-double FSparseEditStore::InterpolateCorners(const TSharedPtr<FSparseEditNode>& Node, FVector NodeCenter, double NodeExtent, FVector Position) const
-{
-    double tx = (Position.X - (NodeCenter.X - NodeExtent)) / (2.0 * NodeExtent);
-    double ty = (Position.Y - (NodeCenter.Y - NodeExtent)) / (2.0 * NodeExtent);
-    double tz = (Position.Z - (NodeCenter.Z - NodeExtent)) / (2.0 * NodeExtent);
-
-    tx = FMath::Clamp(tx, 0.0, 1.0);
-    ty = FMath::Clamp(ty, 0.0, 1.0);
-    tz = FMath::Clamp(tz, 0.0, 1.0);
-
-    double c00 = FMath::Lerp(Node->CornerDensities[0], Node->CornerDensities[1], tx);
-    double c01 = FMath::Lerp(Node->CornerDensities[2], Node->CornerDensities[3], tx);
-    double c10 = FMath::Lerp(Node->CornerDensities[4], Node->CornerDensities[5], tx);
-    double c11 = FMath::Lerp(Node->CornerDensities[6], Node->CornerDensities[7], tx);
-
-    double c0 = FMath::Lerp(c00, c01, ty);
-    double c1 = FMath::Lerp(c10, c11, ty);
-
-    return FMath::Lerp(c0, c1, tz);
-}
-
-// ============================================================================
-// EDIT APPLICATION (Background Thread)
-// ============================================================================
 
 TArray<FVector> FSparseEditStore::ApplySphericalEdit(FVector BrushCenter, double Radius, double Strength, int Depth)
 {
@@ -124,10 +91,6 @@ void FSparseEditStore::ApplyEditRecursive(TSharedPtr<FSparseEditNode> Node, FVec
     }
 }
 
-// ============================================================================
-// QUERIES
-// ============================================================================
-
 int FSparseEditStore::GetDepthForBrushRadius(double BrushRadius, int SubdivisionLevels) const
 {
     int Depth = 0;
@@ -139,20 +102,6 @@ int FSparseEditStore::GetDepthForBrushRadius(double BrushRadius, int Subdivision
     }
     return Depth + SubdivisionLevels;
 }
-
-const TArray<FVector>& FSparseEditStore::GetAffectedChunkCenters() const
-{
-    return AffectedChunkCenters;
-}
-
-bool FSparseEditStore::HasEdits() const
-{
-    return Root.IsValid();
-}
-
-// ============================================================================
-// UTILITY
-// ============================================================================
 
 int FSparseEditStore::GetChildIndex(FVector Position, FVector NodeCenter) const
 {
@@ -166,6 +115,27 @@ int FSparseEditStore::GetChildIndex(FVector Position, FVector NodeCenter) const
 FVector FSparseEditStore::GetCornerPosition(FVector NodeCenter, double NodeExtent, int CornerIndex) const
 {
     return NodeCenter + Offsets[CornerIndex] * NodeExtent;
+}
+
+double FSparseEditStore::InterpolateCorners(const TSharedPtr<FSparseEditNode>& Node, FVector NodeCenter, double NodeExtent, FVector Position) const
+{
+    double tx = (Position.X - (NodeCenter.X - NodeExtent)) / (2.0 * NodeExtent);
+    double ty = (Position.Y - (NodeCenter.Y - NodeExtent)) / (2.0 * NodeExtent);
+    double tz = (Position.Z - (NodeCenter.Z - NodeExtent)) / (2.0 * NodeExtent);
+
+    tx = FMath::Clamp(tx, 0.0, 1.0);
+    ty = FMath::Clamp(ty, 0.0, 1.0);
+    tz = FMath::Clamp(tz, 0.0, 1.0);
+
+    double c00 = FMath::Lerp(Node->CornerDensities[0], Node->CornerDensities[1], tx);
+    double c01 = FMath::Lerp(Node->CornerDensities[2], Node->CornerDensities[3], tx);
+    double c10 = FMath::Lerp(Node->CornerDensities[4], Node->CornerDensities[5], tx);
+    double c11 = FMath::Lerp(Node->CornerDensities[6], Node->CornerDensities[7], tx);
+
+    double c0 = FMath::Lerp(c00, c01, ty);
+    double c1 = FMath::Lerp(c10, c11, ty);
+
+    return FMath::Lerp(c0, c1, tz);
 }
 
 void FSparseEditStore::Clear()

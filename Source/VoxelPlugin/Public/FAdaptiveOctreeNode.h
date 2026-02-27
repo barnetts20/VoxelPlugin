@@ -3,8 +3,6 @@
 #include "FSparseEditStore.h"
 #include "CoreMinimal.h"
 
-
-//TODO: Move the following structs into OctreeContour, along with any other meshing related or QEF related functions/structs we are using
 struct VOXELPLUGIN_API FNodeCorner {
     FVector Position;
     double Density;
@@ -385,16 +383,23 @@ private:
     }
 };
 
-//Adaptive manifold dual contouring voxel octree node
 struct VOXELPLUGIN_API FAdaptiveOctreeNode : public TSharedFromThis<FAdaptiveOctreeNode>
 {
 private:
     TFunction<double(FVector, FVector)>* DensityFunction;
+
     TSharedPtr<FSparseEditStore> EditStore;
+    
     void ComputeDualContourPosition();
+    
+    FVector GetInterpolatedNormal(FVector P);
+    
     double SampleDensity(FVector Position);
+    
     bool bIsLeaf = true;
+    
     int DepthPrecisionFloor = 18;
+
     // Static arrays, offset and edge pair lookup tables
     inline static const FVector Offsets[8] = {
         FVector(-1, -1, -1), FVector(1, -1, -1),
@@ -411,37 +416,46 @@ private:
 
 public:
     TArray<uint8> TreeIndex;
+    
     TWeakPtr<FAdaptiveOctreeNode> Parent;
+    
     TSharedPtr<FAdaptiveOctreeNode> Children[8];
+    
     FNodeCorner Corners[8];
+    
     TArray<FNodeEdge> SignChangeEdges;
+    
     int ChunkDepth = 4;
+    
     int DepthBounds[3];
+    
     FVector AnchorCenter;
+    
     FVector Center;
+    
     double Extent;
+    
     FVector DualContourPosition;
+    
     FVector DualContourNormal;
+    
     bool IsSurfaceNode;
+    
     bool LodOverride = false;
 
     bool IsLeaf();
 
     bool IsRoot();
-
-    void Split();
     
     bool ShouldSplit(FVector InCameraPosition, double InScreenSpaceThreshold, double InCameraFOV);
-    
-    void Merge();
-    
+
     bool ShouldMerge(FVector InCameraPosition, double InScreenSpaceThreshold, double InCameraFOV);
 
-    void UpdateLod(FVector InCameraPosition, double InScreenSpaceThreshold, double InCameraFOV, TArray<FNodeEdge>& OutNodeEdges, TMap<FEdgeKey, int32>& EdgeMap, bool& OutChanged);
+    void Split();
 
-    TArray<FNodeEdge> GetSurfaceEdges();
-    
-    TArray<TSharedPtr<FAdaptiveOctreeNode>> GetSurfaceNodes();
+    void Merge();
+
+    void UpdateLod(FVector InCameraPosition, double InScreenSpaceThreshold, double InCameraFOV, TArray<FNodeEdge>& OutNodeEdges, TMap<FEdgeKey, int32>& EdgeMap, bool& OutChanged);
     
     TArray<TSharedPtr<FAdaptiveOctreeNode>> GetSurfaceChunks();
 
@@ -454,8 +468,6 @@ public:
     FAdaptiveOctreeNode(TFunction<double(FVector, FVector)>* DensityFunction, TSharedPtr<FSparseEditStore> InEditStore, TSharedPtr<FAdaptiveOctreeNode> InParent, uint8 InChildIndex, FVector InAnchorCenter);
 
     void ComputeNodeData();
-
-    FVector GetInterpolatedNormal(FVector P);
 };
 
 FORCEINLINE uint32 GetTypeHash(const FEdgeKey& Key)

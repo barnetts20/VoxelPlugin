@@ -1,6 +1,5 @@
 #include "FAdaptiveOctree.h"
 
-// Constructor
 FAdaptiveOctree::FAdaptiveOctree(ARealtimeMeshActor* InParentActor, UMaterialInterface* InMaterial, TFunction<double(FVector, FVector)> InDensityFunction, TSharedPtr<FSparseEditStore> InEditStore, FVector InCenter, double InRootExtent, int InChunkDepth, int InMinDepth, int InMaxDepth)
 {
     DensityFunction = InDensityFunction;
@@ -17,6 +16,23 @@ FAdaptiveOctree::FAdaptiveOctree(ARealtimeMeshActor* InParentActor, UMaterialInt
     //}
 
     PopulateChunks();
+}
+
+void FAdaptiveOctree::SplitToDepth(TSharedPtr<FAdaptiveOctreeNode> Node, int InMinDepth)
+{
+    if (!Node.IsValid()) return;
+
+    if (Node->TreeIndex.Num() < InMinDepth)
+    {
+        Node->Split();
+        for (int i = 0; i < 8; i++)
+        {
+            if (Node->Children[i])
+            {
+                SplitToDepth(Node->Children[i], InMinDepth);
+            }
+        }
+    }
 }
 
 void FAdaptiveOctree::PopulateChunks() {
@@ -61,42 +77,6 @@ void FAdaptiveOctree::PopulateChunks() {
         ChunkMap.Add(chunk, newChunk);
     }
     MeshChunksInitialized = true;
-}
-
-void FAdaptiveOctree::ApplyEdit(FVector InEditCenter, double InEditRadius, double InEditStrength, int InEditResolution)
-{
-    int depth = EditStore->GetDepthForBrushRadius(InEditRadius, InEditResolution);
-    TArray<FVector> AffectedChunkCenters = EditStore->ApplySphericalEdit(InEditCenter, InEditRadius, InEditStrength, depth);
-    double ReconstructRadius = InEditRadius * 1.5;
-
-    // Resolve chunk nodes
-    TArray<TSharedPtr<FAdaptiveOctreeNode>> ChunkNodes;
-    for (const FVector& Center : AffectedChunkCenters)
-    {
-        TSharedPtr<FAdaptiveOctreeNode> ChunkNode = GetChunkNodeByPoint(Center);
-        if (ChunkNode.IsValid())
-            ChunkNodes.Add(ChunkNode);
-    }
-
-    // Stage 1: Parallel — recompute all node data
-    ParallelFor(ChunkNodes.Num(), [&](int32 i) {
-        ReconstructSubtree(ChunkNodes[i], InEditCenter, ReconstructRadius);
-    });
-
-    // Stage 2: Serial — update chunk map
-    TArray<TPair<TSharedPtr<FAdaptiveOctreeNode>, TSharedPtr<FMeshChunk>>> DirtyChunks;
-    for (auto& ChunkNode : ChunkNodes)
-    {
-        UpdateChunkMap(ChunkNode, DirtyChunks);
-    }
-
-    // Stage 3: Parallel — gather edges + rebuild mesh streams
-    ParallelFor(DirtyChunks.Num(), [&](int32 i) {
-        TArray<FNodeEdge> NewEdges;
-        GatherLeafEdges(DirtyChunks[i].Key, NewEdges);
-        DirtyChunks[i].Value->ChunkEdges = NewEdges;
-        UpdateMeshChunkStreamData(DirtyChunks[i].Value);
-    });
 }
 
 void FAdaptiveOctree::UpdateChunkMap(TSharedPtr<FAdaptiveOctreeNode> ChunkNode, TArray<TPair<TSharedPtr<FAdaptiveOctreeNode>, TSharedPtr<FMeshChunk>>>& OutDirtyChunks)
@@ -145,6 +125,42 @@ void FAdaptiveOctree::UpdateChunkMap(TSharedPtr<FAdaptiveOctreeNode> ChunkNode, 
     }
 }
 
+void FAdaptiveOctree::ApplyEdit(FVector InEditCenter, double InEditRadius, double InEditStrength, int InEditResolution)
+{
+    int depth = EditStore->GetDepthForBrushRadius(InEditRadius, InEditResolution);
+    TArray<FVector> AffectedChunkCenters = EditStore->ApplySphericalEdit(InEditCenter, InEditRadius, InEditStrength, depth);
+    double ReconstructRadius = InEditRadius * 1.5;
+
+    // Resolve chunk nodes
+    TArray<TSharedPtr<FAdaptiveOctreeNode>> ChunkNodes;
+    for (const FVector& Center : AffectedChunkCenters)
+    {
+        TSharedPtr<FAdaptiveOctreeNode> ChunkNode = GetChunkNodeByPoint(Center);
+        if (ChunkNode.IsValid())
+            ChunkNodes.Add(ChunkNode);
+    }
+
+    // Stage 1: Parallel — recompute all node data
+    ParallelFor(ChunkNodes.Num(), [&](int32 i) {
+        ReconstructSubtree(ChunkNodes[i], InEditCenter, ReconstructRadius);
+        });
+
+    // Stage 2: Serial — update chunk map
+    TArray<TPair<TSharedPtr<FAdaptiveOctreeNode>, TSharedPtr<FMeshChunk>>> DirtyChunks;
+    for (auto& ChunkNode : ChunkNodes)
+    {
+        UpdateChunkMap(ChunkNode, DirtyChunks);
+    }
+
+    // Stage 3: Parallel — gather edges + rebuild mesh streams
+    ParallelFor(DirtyChunks.Num(), [&](int32 i) {
+        TArray<FNodeEdge> NewEdges;
+        GatherLeafEdges(DirtyChunks[i].Key, NewEdges);
+        DirtyChunks[i].Value->ChunkEdges = NewEdges;
+        UpdateMeshChunkStreamData(DirtyChunks[i].Value);
+        });
+}
+
 void FAdaptiveOctree::ReconstructSubtree(TSharedPtr<FAdaptiveOctreeNode> Node, FVector EditCenter, double SearchRadius)
 {
     if (!Node.IsValid()) return;
@@ -175,23 +191,6 @@ void FAdaptiveOctree::ReconstructSubtree(TSharedPtr<FAdaptiveOctreeNode> Node, F
 
     for (int i = 0; i < 8; i++)
         ReconstructSubtree(Node->Children[i], EditCenter, SearchRadius);
-}
-
-void FAdaptiveOctree::SplitToDepth(TSharedPtr<FAdaptiveOctreeNode> Node, int InMinDepth)
-{
-    if (!Node.IsValid()) return;
-
-    if (Node->TreeIndex.Num() < InMinDepth)
-    {
-        Node->Split();
-        for (int i = 0; i < 8; i++)
-        {
-            if (Node->Children[i])
-            {
-                SplitToDepth(Node->Children[i], InMinDepth);
-            }
-        }
-    }
 }
 
 FVector2f FAdaptiveOctree::ComputeTriplanarUV(FVector Position, FVector Normal)
@@ -542,7 +541,6 @@ TSharedPtr<FAdaptiveOctreeNode> FAdaptiveOctree::GetChunkNodeByPoint(FVector Pos
     return nullptr;
 }
 
-// Clears the entire octree
 void FAdaptiveOctree::Clear()
 {
     Root.Reset();
