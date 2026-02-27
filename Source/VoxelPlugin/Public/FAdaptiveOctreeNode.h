@@ -1,6 +1,5 @@
 #pragma once
 
-#include "FSparseEditStore.h"
 #include "CoreMinimal.h"
 
 struct VOXELPLUGIN_API FNodeCorner {
@@ -385,18 +384,14 @@ private:
 
 struct VOXELPLUGIN_API FAdaptiveOctreeNode : public TSharedFromThis<FAdaptiveOctreeNode>
 {
-private:
-    TFunction<void(TSharedPtr<FAdaptiveOctreeNode>)>* DensityFunction;
-    
+private:    
     void ComputeDualContourPosition();
     
     FVector GetInterpolatedNormal(FVector P);
     
-    void SampleDensity();
-    
     bool bIsLeaf = true;
     
-    int DepthPrecisionFloor = 18;
+    int DepthPrecisionFloor = 20;
 
     // Static arrays, offset and edge pair lookup tables
     inline static const FVector Offsets[8] = {
@@ -413,7 +408,6 @@ private:
     };
 
 public:
-    TSharedPtr<FSparseEditStore> EditStore;
 
     TArray<uint8> TreeIndex;
     
@@ -443,9 +437,9 @@ public:
     
     bool LodOverride = false;
 
-    bool IsLeaf();
+    const bool IsLeaf();
 
-    bool IsRoot();
+    const bool IsRoot();
     
     bool ShouldSplit(FVector InCameraPosition, double InScreenSpaceThreshold, double InCameraFOV);
 
@@ -454,20 +448,18 @@ public:
     void Split();
 
     void Merge();
-
-    void UpdateLod(FVector InCameraPosition, double InScreenSpaceThreshold, double InCameraFOV, TArray<FNodeEdge>& OutNodeEdges, TMap<FEdgeKey, int32>& EdgeMap, bool& OutChanged);
     
     TArray<TSharedPtr<FAdaptiveOctreeNode>> GetSurfaceChunks();
 
     TArray<FNodeEdge>& GetSignChangeEdges();
 
+    void FinalizeFromExistingCorners();
+
     // Root Constructor
-    FAdaptiveOctreeNode(TFunction<void(TSharedPtr<FAdaptiveOctreeNode>)>* DensityFunction, TSharedPtr<FSparseEditStore> InEditStore, FVector InCenter, double InExtent, int InChunkDepth, int InMinDepth, int InMaxDepth);
+    FAdaptiveOctreeNode(FVector InCenter, double InExtent, int InChunkDepth, int InMinDepth, int InMaxDepth);
 
     // Child Constructor
-    FAdaptiveOctreeNode(TFunction<void(TSharedPtr<FAdaptiveOctreeNode>)>* DensityFunction, TSharedPtr<FSparseEditStore> InEditStore, TSharedPtr<FAdaptiveOctreeNode> InParent, uint8 InChildIndex, FVector InAnchorCenter);
-
-    void ComputeNodeData();
+    FAdaptiveOctreeNode(TSharedPtr<FAdaptiveOctreeNode> InParent, uint8 InChildIndex, FVector InAnchorCenter);
 };
 
 FORCEINLINE uint32 GetTypeHash(const FEdgeKey& Key)

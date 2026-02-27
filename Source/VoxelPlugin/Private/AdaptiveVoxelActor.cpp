@@ -87,29 +87,11 @@ void AAdaptiveVoxelActor::Initialize()
     //};
     Noise = FastNoise::NewFromEncodedNodeTree("HgAZABoAAR8AGwAkABgAAAAXAAAAgL8AAIA/AAAAAAAAgD8RAAQAAAAAAABAEAAAAAA/EwAAAAA/BwABJQAAAIA/AACAP7geBUAAAIA/GwAZAP//AAAAAACAPwDNzExAAf//BQAAAAAAPwAAACBCARcAAAAAAAAAgD8AAMA/AAAAPw0ABAAAAAAAAEALAAEAAAAAAAAAAQAAAAAAAAAAAACAPwAAAAA/AAAAAAAAAACAPwEaAAEgAP//CQAB//8MAAAAAIA/Af//DAABGwD//wYAAAAAAD8AAAAAAA==");
     //Fast Noise example
-    auto DensityFunction = [this](TSharedPtr<FAdaptiveOctreeNode> Node) {
-        float xPos[8], yPos[8], zPos[8], noiseOut[8];
-        FVector corners[8];
-        double NoiseScale = Size * 0.1;
-        for (int i = 0; i < 8; i++)
-        {
-            corners[i] = Node->Corners[i].Position;
-            FVector Dir = (corners[i] - GetActorLocation()).GetSafeNormal();
-            FVector SurfacePos = (Dir * Size) / NoiseScale;
-            xPos[i] = (float)SurfacePos.X;
-            yPos[i] = (float)SurfacePos.Y;
-            zPos[i] = (float)SurfacePos.Z;
-        }
+    TFunction<void(int Count, const float* XPos, const float* YPos, const float* ZPos, float* OutNoise)> dfuncEx;
 
-        Noise->GenPositionArray3D(noiseOut, 8, xPos, yPos, zPos, 0, 0, 0, 0);
 
-        for (int i = 0; i < 8; i++)
-        {
-            FVector PlanetRel = corners[i] - GetActorLocation();
-            double dist = PlanetRel.Size();
-            double height = (double)noiseOut[i] * Size * 0.1;
-            Node->Corners[i].Density = dist - (Size * 0.9 + height) + Node->EditStore->Sample(corners[i]);
-        }
+    auto DensityFunction = [this](int Count, const float* XPos, const float* YPos, const float* ZPos, float* OutNoise) {
+        Noise->GenPositionArray3D(OutNoise, Count, XPos, YPos, ZPos, 0, 0, 0, 0);
     };
 
 

@@ -7,6 +7,14 @@
 
 using namespace RealtimeMesh;
 
+struct VOXELPLUGIN_API FCornerSample {
+    FVector Position;           // World position
+    double Density;             // Final SDF density
+    double Dist;
+    float NoiseValue;           // Raw noise result
+    TArray<double*> Targets;    // Pointers to all Corners[i].Density that share this position
+};
+
 struct VOXELPLUGIN_API FMeshVertex
 {
     FVector Position;       // Quantized position (chunk-local)

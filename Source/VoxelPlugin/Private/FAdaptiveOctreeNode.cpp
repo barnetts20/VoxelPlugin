@@ -1,20 +1,18 @@
 #include "FAdaptiveOctreeNode.h"
 #include "FAdaptiveOctree.h"
 
-bool FAdaptiveOctreeNode::IsLeaf()
+const bool FAdaptiveOctreeNode::IsLeaf()
 {
     return bIsLeaf;
 }
 
-bool FAdaptiveOctreeNode::IsRoot()
+const bool FAdaptiveOctreeNode::IsRoot()
 {
     return !Parent.IsValid();
 }
 
-FAdaptiveOctreeNode::FAdaptiveOctreeNode(TFunction<void(TSharedPtr<FAdaptiveOctreeNode>)>* InDensityFunction, TSharedPtr<FSparseEditStore> InEditStore, FVector InCenter, double InExtent, int InChunkDepth, int InMinDepth, int InMaxDepth)
+FAdaptiveOctreeNode::FAdaptiveOctreeNode(FVector InCenter, double InExtent, int InChunkDepth, int InMinDepth, int InMaxDepth)
 {
-    DensityFunction = InDensityFunction;
-    EditStore = InEditStore;
     ChunkDepth = InChunkDepth;
     Center = InCenter;
     AnchorCenter = InCenter;
@@ -29,11 +27,9 @@ FAdaptiveOctreeNode::FAdaptiveOctreeNode(TFunction<void(TSharedPtr<FAdaptiveOctr
     {
         Corners[i].Position = Center + (Offsets[i] * Extent);
     }
-
-    //ComputeNodeData();
 }
 
-FAdaptiveOctreeNode::FAdaptiveOctreeNode(TFunction<void(TSharedPtr<FAdaptiveOctreeNode>)>* InDensityFunction, TSharedPtr<FSparseEditStore> InEditStore, TSharedPtr<FAdaptiveOctreeNode> InParent, uint8 ChildIndex, FVector InAnchorCenter)
+FAdaptiveOctreeNode::FAdaptiveOctreeNode(TSharedPtr<FAdaptiveOctreeNode> InParent, uint8 ChildIndex, FVector InAnchorCenter)
 {
     TreeIndex = InParent->TreeIndex;
     TreeIndex.Add(ChildIndex);
@@ -41,8 +37,6 @@ FAdaptiveOctreeNode::FAdaptiveOctreeNode(TFunction<void(TSharedPtr<FAdaptiveOctr
     ChunkDepth = InParent->ChunkDepth;
 
     Parent = InParent;
-    DensityFunction = InDensityFunction;
-    EditStore = InEditStore;
 
     AnchorCenter = InAnchorCenter;
 
@@ -58,59 +52,6 @@ FAdaptiveOctreeNode::FAdaptiveOctreeNode(TFunction<void(TSharedPtr<FAdaptiveOctr
     {
         Corners[i].Position = Center + (Offsets[i] * Extent);
     }
-    // DERIVE CHUNK EXTENT: Using the TreeIndex depth relative to ChunkDepth
-    // ChunkDepth should be a member or accessible variable (e.g., 5)
-    //ComputeNodeData();
-}
-
-void FAdaptiveOctreeNode::ComputeNodeData()
-{
-    SignChangeEdges.Reset();
-
-    SampleDensity();
-    // PASS 2: Compute Normals and fill FNodeCorner using the cached densities
-    for (int i = 0; i < 8; i++)
-    {
-        FVector CornerPos = Center + (Offsets[i] * Extent);
-
-        // Use the relative neighbors within this node to get the gradient
-        // We use the 'Offsets' to figure out which corner is 'next' in X, Y, and Z
-        double d = Corners[i].Density;
-
-        // Find indices for neighbors in +X, +Y, +Z within the 0-7 corner array
-        // (This depends on your specific Offsets[] bit-order, usually: X=1, Y=2, Z=4)
-        int idxX = i ^ 1;
-        int idxY = i ^ 2;
-        int idxZ = i ^ 4;
-
-        // Gradient Calculation (Forward difference using internal node corners)
-        // Note: If the neighbor is 'behind' us (negative), we flip the subtraction
-        double dx = (Offsets[i].X < 0) ? (Corners[idxX].Density - d) : (d - Corners[idxX].Density);
-        double dy = (Offsets[i].Y < 0) ? (Corners[idxY].Density - d) : (d - Corners[idxY].Density);
-        double dz = (Offsets[i].Z < 0) ? (Corners[idxZ].Density - d) : (d - Corners[idxZ].Density);
-
-        FVector Normal(dx, dy, dz);
-        if (!Normal.Normalize())
-        {
-            // If the node is too small for a local gradient (Depth > 15 logic)
-            Normal = (CornerPos - AnchorCenter).GetSafeNormal();
-        }
-
-        Corners[i].Normal = Normal;
-    }
-
-    // 4. Identify Sign-Change Edges
-    for (int i = 0; i < 12; i++)
-    {
-        FNodeEdge NewEdge(Corners[EdgePairs[i][0]], Corners[EdgePairs[i][1]]);
-        if (NewEdge.SignChange)
-        {
-            SignChangeEdges.Add(NewEdge);
-        }
-    }
-
-    // 5. Place the Dual Vertex
-    ComputeDualContourPosition();
 }
 
 FVector FAdaptiveOctreeNode::GetInterpolatedNormal(FVector P)
@@ -137,6 +78,48 @@ FVector FAdaptiveOctreeNode::GetInterpolatedNormal(FVector P)
     return FinalNormal.GetSafeNormal();
 }
 
+void FAdaptiveOctreeNode::FinalizeFromExistingCorners()
+{
+    SignChangeEdges.Reset();
+
+    // Compute normals from local corners if not already set by map
+    for (int i = 0; i < 8; i++)
+    {
+        double d = Corners[i].Density;
+        int idxX = i ^ 1;
+        int idxY = i ^ 2;
+        int idxZ = i ^ 4;
+
+        double dx = (Offsets[i].X < 0) ? (Corners[idxX].Density - d) : (d - Corners[idxX].Density);
+        double dy = (Offsets[i].Y < 0) ? (Corners[idxY].Density - d) : (d - Corners[idxY].Density);
+        double dz = (Offsets[i].Z < 0) ? (Corners[idxZ].Density - d) : (d - Corners[idxZ].Density);
+
+        FVector Normal(dx, dy, dz);
+        if (!Normal.Normalize())
+            Normal = (Corners[i].Position - AnchorCenter).GetSafeNormal();
+
+        Corners[i].Normal = Normal;
+    }
+
+    for (int i = 0; i < 12; i++)
+    {
+        FNodeEdge NewEdge(Corners[EdgePairs[i][0]], Corners[EdgePairs[i][1]]);
+        if (NewEdge.SignChange)
+            SignChangeEdges.Add(NewEdge);
+    }
+    ComputeDualContourPosition();
+
+    if (IsSurfaceNode)
+    {
+        TSharedPtr<FAdaptiveOctreeNode> Ancestor = Parent.Pin();
+        while (Ancestor.IsValid() && !Ancestor->IsSurfaceNode)
+        {
+            Ancestor->IsSurfaceNode = true;
+            Ancestor = Ancestor->Parent.Pin();
+        }
+    }
+}
+
 void FAdaptiveOctreeNode::Split()
 {
     if (!bIsLeaf) return;
@@ -149,17 +132,7 @@ void FAdaptiveOctreeNode::Split()
     for (uint8 i = 0; i < 8; i++)
     {
         // Update constructor to take NextAnchor
-        Children[i] = MakeShared<FAdaptiveOctreeNode>(DensityFunction, EditStore, AsShared(), i, NextAnchor);
-        Children[i]->ComputeNodeData();
-        if (Children[i]->IsSurfaceNode)
-        {
-            TSharedPtr<FAdaptiveOctreeNode> Ancestor = AsShared();
-            while (Ancestor.IsValid() && !Ancestor->IsSurfaceNode)
-            {
-                Ancestor->IsSurfaceNode = true;
-                Ancestor = Ancestor->Parent.Pin();
-            }
-        }
+        Children[i] = MakeShared<FAdaptiveOctreeNode>( AsShared(), i, NextAnchor);
     }
     bIsLeaf = false;
 }
@@ -172,7 +145,7 @@ void FAdaptiveOctreeNode::Merge()
     {
         if (Children[i].IsValid())
         {
-            Children[i]->Merge(); // Recursively clean grandchildren
+            Children[i]->Merge();
             Children[i].Reset();
         }
     }
@@ -206,65 +179,6 @@ bool FAdaptiveOctreeNode::ShouldMerge(FVector InCameraPosition, double InScreenS
     return AngularSize < InScreenSpaceThreshold * 0.5;
 }
 
-void AppendUniqueEdges(const TArray<FNodeEdge>& InAppendEdges, TArray<FNodeEdge>& OutNodeEdges, TMap<FEdgeKey, int32>& EdgeMap)
-{
-    for (const FNodeEdge& anEdge : InAppendEdges)
-    {
-        FEdgeKey Key(anEdge);
-        int32* ExistingIdx = EdgeMap.Find(Key);
-
-        if (ExistingIdx)
-        {
-            // Keep the one with the smaller Distance (same logic as before)
-            if (anEdge.Distance < OutNodeEdges[*ExistingIdx].Distance)
-            {
-                OutNodeEdges[*ExistingIdx] = anEdge;
-            }
-        }
-        else
-        {
-            int32 NewIdx = OutNodeEdges.Num();
-            OutNodeEdges.Add(anEdge);
-            EdgeMap.Add(Key, NewIdx);
-        }
-    }
-}
-
-void FAdaptiveOctreeNode::UpdateLod(FVector InCameraPosition, double InScreenSpaceThreshold, double InCameraFOV, TArray<FNodeEdge>& OutNodeEdges, TMap<FEdgeKey, int32>& EdgeMap, bool& OutChanged)
-{
-    if (IsLeaf())
-    {
-        if (ShouldSplit(InCameraPosition, InScreenSpaceThreshold, InCameraFOV))
-        {
-            OutChanged = true;
-            Split();
-            for (TSharedPtr<FAdaptiveOctreeNode> aChild : Children) {
-                AppendUniqueEdges(aChild->GetSignChangeEdges(), OutNodeEdges, EdgeMap);
-            }
-            return;
-        }
-        else if (Parent.IsValid() && Parent.Pin()->ShouldMerge(InCameraPosition, InScreenSpaceThreshold, InCameraFOV) && TreeIndex.Last() == 7)
-        {
-            OutChanged = true;
-            auto parentPtr = Parent.Pin();
-            parentPtr->Merge();
-            AppendUniqueEdges(parentPtr->GetSignChangeEdges(), OutNodeEdges, EdgeMap);
-            return;
-        }
-        else {
-            AppendUniqueEdges(GetSignChangeEdges(), OutNodeEdges, EdgeMap);
-            return;
-        }
-    }
-    else
-    {
-        for (int i = 0; i < 8; i++)
-        {
-            Children[i]->UpdateLod(InCameraPosition, InScreenSpaceThreshold, InCameraFOV, OutNodeEdges, EdgeMap, OutChanged);
-        }
-    }
-}
-
 TArray<FNodeEdge>& FAdaptiveOctreeNode::GetSignChangeEdges()
 {
     return SignChangeEdges;
@@ -273,25 +187,25 @@ TArray<FNodeEdge>& FAdaptiveOctreeNode::GetSignChangeEdges()
 TArray<TSharedPtr<FAdaptiveOctreeNode>> FAdaptiveOctreeNode::GetSurfaceChunks()
 {
     TArray<TSharedPtr<FAdaptiveOctreeNode>> SurfaceNodes;
-    TQueue<TSharedPtr<FAdaptiveOctreeNode>> NodeQueue;
-    NodeQueue.Enqueue(this->AsShared());
+    TArray<TSharedPtr<FAdaptiveOctreeNode>> Stack;
+    Stack.Reserve(128);
+    Stack.Add(AsShared());
 
-    while (!NodeQueue.IsEmpty())
+    while (Stack.Num() > 0)
     {
-        TSharedPtr<FAdaptiveOctreeNode> CurrentNode;
-        NodeQueue.Dequeue(CurrentNode);
+        TSharedPtr<FAdaptiveOctreeNode> CurrentNode = Stack.Pop(EAllowShrinking::No);
 
         if (!CurrentNode || CurrentNode->TreeIndex.Num() > ChunkDepth) continue;
 
         if (CurrentNode->TreeIndex.Num() == ChunkDepth && CurrentNode->IsSurfaceNode)
         {
-            SurfaceNodes.Add(CurrentNode->AsShared());
+            SurfaceNodes.Add(CurrentNode);
         }
         else
         {
             for (int i = 0; i < 8; i++)
             {
-                if (CurrentNode->Children[i]) NodeQueue.Enqueue(CurrentNode->Children[i]);
+                if (CurrentNode->Children[i]) Stack.Add(CurrentNode->Children[i]);
             }
         }
     }
@@ -312,15 +226,12 @@ void FAdaptiveOctreeNode::ComputeDualContourPosition()
     FQEF Qef;
 
     FVector MassPoint = FVector::ZeroVector;
-    double MaxDensityRange = 0.0;
     int32 ValidEdges = 0;
 
     for (FNodeEdge& Edge : SignChangeEdges)
     {
         double Denom = Edge.Corners[1].Density - Edge.Corners[0].Density;
         if (FMath::Abs(Denom) < 1e-15) continue;
-
-        MaxDensityRange = FMath::Max(MaxDensityRange, FMath::Abs(Denom));
 
         FVector P = Edge.ZeroCrossingPoint;
         MassPoint += P;
@@ -376,8 +287,4 @@ void FAdaptiveOctreeNode::ComputeDualContourPosition()
             (Corners[0].Density + Corners[1].Density + Corners[2].Density + Corners[3].Density);
         DualContourNormal.Normalize();
     }
-}
-
-void FAdaptiveOctreeNode::SampleDensity() {
-    (*DensityFunction)(AsShared());
 }
