@@ -62,14 +62,14 @@ void AAdaptiveVoxelActor::Initialize()
     CleanSceneRoot();
 
     // Spherenoise - Example SDF applies perlin noise to a sphere
-    auto DensityFunction = [this](FVector Position, FVector AnchorCenter) -> double {
-        double NoiseScale = Size * 0.1;
-        float NoiseVal = FMath::PerlinNoise3D(Position/NoiseScale) * (float)(Size * 0.1);
-        FVector PlanetRelativeP = Position - GetActorLocation();
-        double RealDist = PlanetRelativeP.Size();
+    //auto DensityFunction = [this](FVector Position, FVector AnchorCenter) -> double {
+    //    double NoiseScale = Size * 0.1;
+    //    float NoiseVal = FMath::PerlinNoise3D(Position/NoiseScale) * (float)(Size * 0.1);
+    //    FVector PlanetRelativeP = Position - GetActorLocation();
+    //    double RealDist = PlanetRelativeP.Size();
 
-        return RealDist - (Size * 0.9 + (double)NoiseVal);
-    };
+    //    return RealDist - (Size * 0.9 + (double)NoiseVal);
+    //};
 
     //Spherenoise 2 - Example SDF applies perline noise to a sphere as if it was a height map
     //auto DensityFunction = [this](FVector Position, FVector AnchorCenter) -> double {
@@ -85,6 +85,23 @@ void AAdaptiveVoxelActor::Initialize()
     //    double SurfaceRadius = Size * 0.9 + (double)NoiseVal;
     //    return RealDist - SurfaceRadius;
     //};
+    Noise = FastNoise::NewFromEncodedNodeTree("HgAZABoAAR8AGwAkABgAAAAXAAAAgL8AAIA/AAAAAAAAgD8RAAQAAAAAAABAEAAAAAA/EwAAAAA/BwABJQAAAIA/AACAP7geBUAAAIA/GwAZAP//AAAAAACAPwDNzExAAf//BQAAAAAAPwAAACBCARcAAAAAAAAAgD8AAMA/AAAAPw0ABAAAAAAAAEALAAEAAAAAAAAAAQAAAAAAAAAAAACAPwAAAAA/AAAAAAAAAACAPwEaAAEgAP//CQAB//8MAAAAAIA/Af//DAABGwD//wYAAAAAAD8AAAAAAA==");
+    //Fast Noise example
+    auto DensityFunction = [this](FVector Position, FVector AnchorCenter) -> double {
+        FVector PlanetRelative = Position - GetActorLocation();
+        double RealDist = PlanetRelative.Size();
+        FVector Direction = PlanetRelative.GetSafeNormal();
+
+        // Sample noise at the surface direction, not at the 3D position
+        FVector NoiseSamplePos = Direction * Size;
+        double NoiseScale = Size * 0.1;
+        auto samplePos = NoiseSamplePos / NoiseScale;
+        float NoiseVal = Noise->GenSingle3D(samplePos.X, samplePos.Y, samplePos.Z, 666) * (float)(Size * 0.1);// FMath::PerlinNoise3D(NoiseSamplePos / NoiseScale)* (float)(Size * 0.1);
+
+        double SurfaceRadius = Size * 0.9 + (double)NoiseVal;
+        return RealDist - SurfaceRadius;
+    };
+
 
     // Store for user edits
     TSharedPtr<FSparseEditStore> EditStore = MakeShared<FSparseEditStore>(GetActorLocation(), Size, ChunkDepth, MaxDepth);

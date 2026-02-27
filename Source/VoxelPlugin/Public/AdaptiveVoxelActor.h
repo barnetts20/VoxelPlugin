@@ -1,6 +1,7 @@
 #pragma once
 
 #include "CoreMinimal.h"
+#include "FastNoise/FastNoise.h"
 #include "GameFramework/Actor.h"
 #include "Materials/Material.h"
 #include "MaterialDomain.h"
@@ -28,7 +29,9 @@ private:
 
     FRWLock OctreeLock;
 
-    bool TickInEditor = true;
+    bool TickInEditor = false;
+
+    FastNoise::SmartNode<> Noise;
     
     std::atomic<bool> Initialized = false;
     
