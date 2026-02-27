@@ -56,7 +56,7 @@ public:
     int MaxDepth = 18;
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "LOD")
-    double ScreenSpaceThreshold = .065;
+    double ScreenSpaceThreshold = .075;
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "LOD")
     double MinDataUpdateInterval = .1;

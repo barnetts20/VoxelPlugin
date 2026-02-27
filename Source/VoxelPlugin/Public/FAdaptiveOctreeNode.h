@@ -426,6 +426,8 @@ public:
     FVector AnchorCenter;
     
     FVector Center;
+
+    FVector TreeCenter;
     
     double Extent;
     

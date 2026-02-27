@@ -134,7 +134,7 @@ void FAdaptiveOctree::ApplyEdit(FVector InEditCenter, double InEditRadius, doubl
 {
     int depth = EditStore->GetDepthForBrushRadius(InEditRadius, InEditResolution);
     TArray<FVector> AffectedChunkCenters = EditStore->ApplySphericalEdit(InEditCenter, InEditRadius, InEditStrength, depth);
-    double ReconstructRadius = InEditRadius * 1.5;
+    double ReconstructRadius = InEditRadius * 2.5;
 
     // Resolve chunk nodes
     TArray<TSharedPtr<FAdaptiveOctreeNode>> ChunkNodes;
@@ -245,7 +245,7 @@ void FAdaptiveOctree::ReconstructSubtree(TSharedPtr<FAdaptiveOctreeNode> Node, F
     TArray<FCornerSample> Samples;
     Samples.Reserve(4096);
     CornerMap.Reserve(4096);
-    double QuantizeGrid = ChunkExtent * 1e-6;
+    double QuantizeGrid = ChunkExtent * 1e-8;
 
     GatherUniqueCorners(Node, Samples, CornerMap, QuantizeGrid, EditCenter, SearchRadius);
 
@@ -338,7 +338,7 @@ void FAdaptiveOctree::UpdateMeshChunkStreamData(TSharedPtr<FMeshChunk> InChunk)
     TArray<FEdgeVertexData> AllEdgeData;
     AllEdgeData.SetNum(InChunk->ChunkEdges.Num());
 
-    double QuantizationGrid = InChunk->ChunkExtent * 1e-6;
+    double QuantizationGrid = InChunk->ChunkExtent * 1e-8;
 
     ParallelFor(InChunk->ChunkEdges.Num(), [&](int32 edgeIdx) {
         const FNodeEdge currentEdge = InChunk->ChunkEdges[edgeIdx];
@@ -347,6 +347,13 @@ void FAdaptiveOctree::UpdateMeshChunkStreamData(TSharedPtr<FMeshChunk> InChunk)
         if (!InChunk->ShouldProcessEdge(currentEdge, nodesToMesh)) {
             AllEdgeData[edgeIdx].IsValid = false;
             return;
+        }
+
+        // And before that:
+        if (nodesToMesh.Num() < 3) {
+            // This shouldn't happen if ShouldProcessEdge catches it, 
+            // but log it separately
+            UE_LOG(LogTemp, Warning, TEXT("Edge got < 3 nodes from SampleNodesAroundEdge"));
         }
 
         AllEdgeData[edgeIdx].IsValid = true;
@@ -622,8 +629,7 @@ TArray<TSharedPtr<FAdaptiveOctreeNode>> FAdaptiveOctree::SampleNodesAroundEdge(c
     FVector End = Edge.Corners[1].Position;
     FVector Midpoint = (Origin + End) * 0.5;
     
-    // Adaptive epsilon based on current node size to handle floating-point drift
-    double Epsilon = ChunkExtent * 1e-6;
+    double Epsilon = ChunkExtent * 1e-8;
 
     // Helper lambda for biased top-down traversal
     auto GetLeafWithBias = [&](bool BiasPerp1, bool BiasPerp2) -> TSharedPtr<FAdaptiveOctreeNode> {

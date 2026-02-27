@@ -16,7 +16,7 @@ FAdaptiveOctreeNode::FAdaptiveOctreeNode(FVector InCenter, double InExtent, int 
     ChunkDepth = InChunkDepth;
     Center = InCenter;
     AnchorCenter = InCenter;
-
+    TreeCenter = InCenter;
     Extent = FMath::Max(InExtent, 0.0);
 
     DepthBounds[0] = InChunkDepth;
@@ -37,7 +37,7 @@ FAdaptiveOctreeNode::FAdaptiveOctreeNode(TSharedPtr<FAdaptiveOctreeNode> InParen
     ChunkDepth = InParent->ChunkDepth;
 
     Parent = InParent;
-
+    TreeCenter = InParent->TreeCenter;
     AnchorCenter = InAnchorCenter;
 
     // Set spatial bounds first
@@ -276,7 +276,6 @@ void FAdaptiveOctreeNode::ComputeDualContourPosition()
 
     DualContourNormal = Qef.GetAverageNormal();
 
-    // Final Normal Fallback
     if (DualContourNormal.IsNearlyZero())
     {
         DualContourNormal.X = (Corners[1].Density + Corners[3].Density + Corners[5].Density + Corners[7].Density) -
@@ -286,5 +285,15 @@ void FAdaptiveOctreeNode::ComputeDualContourPosition()
         DualContourNormal.Z = (Corners[4].Density + Corners[5].Density + Corners[6].Density + Corners[7].Density) -
             (Corners[0].Density + Corners[1].Density + Corners[2].Density + Corners[3].Density);
         DualContourNormal.Normalize();
+    }
+
+    if (DualContourNormal.IsNearlyZero())
+    {
+        DualContourNormal = (DualContourPosition - TreeCenter).GetSafeNormal();
+    }
+
+    if (DualContourNormal.IsNearlyZero())
+    {
+        DualContourNormal = FVector(0, 0, 1);
     }
 }
