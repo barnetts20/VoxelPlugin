@@ -349,13 +349,6 @@ void FAdaptiveOctree::UpdateMeshChunkStreamData(TSharedPtr<FMeshChunk> InChunk)
             return;
         }
 
-        // And before that:
-        if (nodesToMesh.Num() < 3) {
-            // This shouldn't happen if ShouldProcessEdge catches it, 
-            // but log it separately
-            UE_LOG(LogTemp, Warning, TEXT("Edge got < 3 nodes from SampleNodesAroundEdge"));
-        }
-
         AllEdgeData[edgeIdx].IsValid = true;
         AllEdgeData[edgeIdx].Edge = currentEdge;
         AllEdgeData[edgeIdx].Vertices.SetNumZeroed(nodesToMesh.Num());

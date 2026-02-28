@@ -156,7 +156,6 @@ bool FAdaptiveOctreeNode::ShouldSplit(FVector InCameraPosition, double InScreenS
 {
     int Depth = TreeIndex.Num();
     if (Depth >= DepthBounds[1]) return false;
-    //TODO: We can probably reap a pretty substantial optimization by checking if the chunk is on the far side of the planet by enough to be expected to have no visible parts
     if (Depth < DepthBounds[2]) return true;
     
     double Distance = FMath::Max(FVector::Dist(DualContourPosition, InCameraPosition), 1.0);
@@ -294,6 +293,6 @@ void FAdaptiveOctreeNode::ComputeDualContourPosition()
 
     if (DualContourNormal.IsNearlyZero())
     {
-        DualContourNormal = FVector(0, 0, 1);
+        DualContourNormal = (DualContourPosition - TreeCenter).GetSafeNormal();
     }
 }
