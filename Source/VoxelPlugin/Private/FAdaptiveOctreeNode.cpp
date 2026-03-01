@@ -230,7 +230,7 @@ void FAdaptiveOctreeNode::ComputeDualContourPosition()
     for (FNodeEdge& Edge : SignChangeEdges)
     {
         double Denom = Edge.Corners[1].Density - Edge.Corners[0].Density;
-        if (FMath::Abs(Denom) < 1e-15) continue;
+        //if (FMath::Abs(Denom) < 1e-15) continue;
 
         FVector P = Edge.ZeroCrossingPoint;
         MassPoint += P;

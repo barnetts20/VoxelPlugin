@@ -14,15 +14,15 @@ public class VoxelPlugin : ModuleRules
 
         PublicIncludePaths.AddRange(
 			new string[] {
-                Path.Combine(ModuleDirectory, "Shaders/Public")
+                //Path.Combine(ModuleDirectory, "Shaders/Public")
             }
 			);
 				
 		//string RealTimeMeshLibPath = Path.Combine(ModuleDirectory, "../RealTimeMesh/RealtimeMeshComponent/Binaries/Win64");//D:\Projects\vxl\Plugins\VoxelPlugin\Source\RealTimeMesh\RealtimeMeshComponent\Binaries\Win64
         PrivateIncludePaths.AddRange(
             new string[] {
-				Path.Combine(ModuleDirectory, "../RealtimeMeshComponent/Source/RealtimeMeshComponent/Public"),           
-				Path.Combine(ModuleDirectory, "../RealtimeMeshComponent/Source/RealtimeMeshComponent/Private"),
+				//Path.Combine(ModuleDirectory, "../RealtimeMeshComponent/Source/RealtimeMeshComponent/Public"),           
+				//Path.Combine(ModuleDirectory, "../RealtimeMeshComponent/Source/RealtimeMeshComponent/Private"),
 				
 				//Path.Combine(RealTimeMeshLibPath, "RealtimeMeshComponent.lib"),
 				//Path.Combine(RealTimeMeshLibPath, "../RealTimeMesh/RealtimeMeshComponent/Source/RealtimeMeshComponent/Public"),

@@ -23,11 +23,6 @@
 			"AdditionalDependencies": [
 				"RealtimeMeshComponent"
 			]
-		},
-		{
-			"Name": "ComputeShader",
-			"Type": "Runtime",
-			"LoadingPhase": "PostConfigInit"
 		}
 	]
 }

@@ -6,9 +6,7 @@
 
 void FVoxelPluginModule::StartupModule()
 {
-	// This code will execute after your module is loaded into memory; the exact timing is specified in the .uplugin file per-module
-	FString ShaderDir = FPaths::Combine(FPaths::ProjectPluginsDir(), TEXT("/VoxelPlugin/Shaders"));
-	AddShaderSourceDirectoryMapping(TEXT("/VoxelPlugin"), ShaderDir);
+
 }
 
 void FVoxelPluginModule::ShutdownModule()

@@ -354,14 +354,9 @@ void FAdaptiveOctree::UpdateMeshChunkStreamData(TSharedPtr<FMeshChunk> InChunk)
         AllEdgeData[edgeIdx].Vertices.SetNumZeroed(nodesToMesh.Num());
 
         for (int i = 0; i < nodesToMesh.Num(); i++) {
-            FVector WorldPos = nodesToMesh[i]->DualContourPosition;
-
-            double LX = WorldPos.X - InChunk->ChunkCenter.X;
-            double LY = WorldPos.Y - InChunk->ChunkCenter.Y;
-            double LZ = WorldPos.Z - InChunk->ChunkCenter.Z;
-            FVector LocalPos(LX, LY, LZ);
-
-            AllEdgeData[edgeIdx].Vertices[i].Position = QuantizePosition(LocalPos, QuantizationGrid);
+            FVector LocalPos(nodesToMesh[i]->DualContourPosition - InChunk->ChunkCenter);
+            
+            AllEdgeData[edgeIdx].Vertices[i].Position = LocalPos;// QuantizePosition(LocalPos, QuantizationGrid);
             AllEdgeData[edgeIdx].Vertices[i].OriginalPosition = LocalPos;
             AllEdgeData[edgeIdx].Vertices[i].Normal = nodesToMesh[i]->DualContourNormal;
             AllEdgeData[edgeIdx].Vertices[i].Color = FColor::Green;
