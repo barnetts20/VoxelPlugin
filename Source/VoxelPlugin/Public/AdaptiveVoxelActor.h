@@ -29,7 +29,7 @@ private:
 
     FRWLock OctreeLock;
 
-    bool TickInEditor = false;
+    bool TickInEditor = true;
 
     FastNoise::SmartNode<> Noise;
     
@@ -41,7 +41,10 @@ public:
     AAdaptiveVoxelActor();
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Materials")
-    UMaterialInterface* Material;
+    UMaterialInterface* SurfaceMaterial;
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Materials")
+    UMaterialInterface* OceanMaterial;
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Scale")
     double Size = 100000000.0;

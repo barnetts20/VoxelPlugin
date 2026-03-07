@@ -30,7 +30,9 @@ private:
 
     TWeakObjectPtr<ARealtimeMeshActor> CachedParentActor;
 
-    TWeakObjectPtr<UMaterialInterface> CachedMaterial;
+    TWeakObjectPtr<UMaterialInterface> CachedSurfaceMaterial;
+    
+    TWeakObjectPtr<UMaterialInterface> CachedOceanMaterial;
 
     TMap<TSharedPtr<FAdaptiveOctreeNode>, TSharedPtr<FMeshChunk>> ChunkMap;
 
@@ -73,7 +75,7 @@ private:
     void ComputeNodeData(TSharedPtr<FAdaptiveOctreeNode> Node);
 
 public:
-    FAdaptiveOctree(ARealtimeMeshActor* InParentActor, UMaterialInterface* InMaterial, TFunction<void(int, const float*, const float*, const float*, float*)> InDensityFunction, TSharedPtr<FSparseEditStore> InEditStore, FVector InCenter, double InRootExtent, int InChunkDepth, int InMinDepth, int InMaxDepth);
+    FAdaptiveOctree(ARealtimeMeshActor* InParentActor, UMaterialInterface* InSurfaceMaterial, UMaterialInterface* InOceanMaterial, TFunction<void(int, const float*, const float*, const float*, float*)> InDensityFunction, TSharedPtr<FSparseEditStore> InEditStore, FVector InCenter, double InRootExtent, int InChunkDepth, int InMinDepth, int InMaxDepth);
 
     void ApplyEdit(FVector InEditCenter, double InEditRadius, double InEditStrength, int InEditResolution);
 

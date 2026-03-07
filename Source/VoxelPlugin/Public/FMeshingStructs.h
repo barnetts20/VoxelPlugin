@@ -19,8 +19,10 @@ struct VOXELPLUGIN_API FMeshVertex
 {
     FVector Position;       // Quantized position (chunk-local)
     FVector OriginalPosition; // Unquantized for actual mesh output
+    FVector NormalizedPosition; // Projected onto planet radius sphere surface
     FVector Normal;
     FColor Color;
+    double Depth;
     FVector2f UV;
 
     bool operator==(const FMeshVertex& Other) const
@@ -82,7 +84,8 @@ struct VOXELPLUGIN_API FMeshStreamData {
 struct VOXELPLUGIN_API FMeshChunk {
     TWeakObjectPtr<ARealtimeMeshActor> CachedParentActor;
     
-    TWeakObjectPtr <UMaterialInterface> CachedMaterial;
+    TWeakObjectPtr <UMaterialInterface> CachedSurfaceMaterial;
+    TWeakObjectPtr <UMaterialInterface> CachedOceanMaterial;
     
     //Data Model Info
     FVector ChunkCenter;
@@ -91,7 +94,9 @@ struct VOXELPLUGIN_API FMeshChunk {
     
     TArray<FNodeEdge> ChunkEdges;
     
-    TSharedPtr<FMeshStreamData> ChunkMeshData;
+    TSharedPtr<FMeshStreamData> SurfaceMeshData;
+
+    TSharedPtr<FMeshStreamData> OceanMeshData;
 
     //Mesh Stuff
     bool IsDirty = false;
@@ -107,14 +112,20 @@ struct VOXELPLUGIN_API FMeshChunk {
     FRealtimeMeshSectionConfig SecConfig = FRealtimeMeshSectionConfig(0);
 
     void InitializeData(FVector InCenter, double InExtent) {
-        ChunkMeshData = MakeShared<FMeshStreamData>();
+        SurfaceMeshData = MakeShared<FMeshStreamData>();
+        OceanMeshData = MakeShared<FMeshStreamData>();
+
         ChunkCenter = InCenter;
         ChunkExtent = InExtent;
-        ChunkMeshData->MeshGroupKey = FRealtimeMeshSectionGroupKey::Create(LODKey, FName(ChunkCenter.ToCompactString()));
-        ChunkMeshData->MeshSectionKey = FRealtimeMeshSectionKey::CreateForPolyGroup(ChunkMeshData->MeshGroupKey, 0);
+
+        SurfaceMeshData->MeshGroupKey = FRealtimeMeshSectionGroupKey::Create(LODKey, FName("SURFACE"));
+        SurfaceMeshData->MeshSectionKey = FRealtimeMeshSectionKey::CreateForPolyGroup(SurfaceMeshData->MeshGroupKey, 0);
+
+        OceanMeshData->MeshGroupKey = FRealtimeMeshSectionGroupKey::Create(LODKey, FName("OCEAN"));
+        OceanMeshData->MeshSectionKey = FRealtimeMeshSectionKey::CreateForPolyGroup(OceanMeshData->MeshGroupKey, 0);
     };
 
-    void InitializeComponent(ARealtimeMeshActor* InParentActor, UMaterialInterface* Material) {
+    void InitializeComponent(ARealtimeMeshActor* InParentActor, UMaterialInterface* InSurfaceMaterial, UMaterialInterface* InOceanMaterial) {
         FRealtimeMeshCollisionConfiguration cConfig;
         cConfig.bShouldFastCookMeshes = false;
         cConfig.bUseComplexAsSimpleCollision = true;
@@ -123,10 +134,15 @@ struct VOXELPLUGIN_API FMeshChunk {
 
         ChunkRtMesh = NewObject<URealtimeMeshSimple>(InParentActor);
         ChunkRtMesh->SetCollisionConfig(cConfig);
-        ChunkRtMesh->SetupMaterialSlot(0, "Material");
+        ChunkRtMesh->SetupMaterialSlot(0, "Surface Material");
+        ChunkRtMesh->SetupMaterialSlot(1, "Ocean Material");
+
         ChunkRtComponent = NewObject<URealtimeMeshComponent>(InParentActor, URealtimeMeshComponent::StaticClass());
         ChunkRtComponent->RegisterComponent();
-        ChunkRtComponent->SetMaterial(0, Material);
+        
+        ChunkRtComponent->SetMaterial(0, InSurfaceMaterial);
+        ChunkRtComponent->SetMaterial(1, InOceanMaterial);
+
         ChunkRtComponent->AttachToComponent(InParentActor->GetRootComponent(), FAttachmentTransformRules::KeepRelativeTransform);
         ChunkRtComponent->SetRelativeLocation(ChunkCenter);
         ChunkRtComponent->SetCollisionEnabled(ECollisionEnabled::QueryAndPhysics);
@@ -134,7 +150,10 @@ struct VOXELPLUGIN_API FMeshChunk {
         ChunkRtComponent->SetRealtimeMesh(ChunkRtMesh.Get());
         ChunkRtComponent->SetRenderCustomDepth(true);
         ChunkRtComponent->SetVisibleInRayTracing(false);
-        ChunkRtMesh->CreateSectionGroup(ChunkMeshData->MeshGroupKey, FRealtimeMeshStreamSet());
+
+        ChunkRtMesh->CreateSectionGroup(SurfaceMeshData->MeshGroupKey, FRealtimeMeshStreamSet());
+        ChunkRtMesh->CreateSectionGroup(OceanMeshData->MeshGroupKey, FRealtimeMeshStreamSet());
+
         IsInitialized = true;
     }
 
@@ -155,31 +174,43 @@ struct VOXELPLUGIN_API FMeshChunk {
             // 1. Lazy Init
             if (!Self->IsInitialized) {
                 ARealtimeMeshActor* Parent = Self->CachedParentActor.Get();
-                UMaterialInterface* Material = Self->CachedMaterial.Get();
-                if (!Parent || !Material) return;
-                Self->InitializeComponent(Parent, Material);
+                UMaterialInterface* SurfaceMaterial = Self->CachedSurfaceMaterial.Get();
+                UMaterialInterface* OceanMaterial = Self->CachedOceanMaterial.Get();
+                if (!Parent || !SurfaceMaterial || !OceanMaterial) return;
+                Self->InitializeComponent(Parent, SurfaceMaterial, OceanMaterial);
             }
 
             // 2. Ensure valid component pointers
             URealtimeMeshSimple* MeshPtr = Self->ChunkRtMesh.Get();
             URealtimeMeshComponent* CompPtr = Self->ChunkRtComponent.Get();
             if (!MeshPtr || !CompPtr) return;
+            if (!Self->IsDirty) return;
 
-            // 3. The Zero-Triangle Guard
-            auto* PositionStream = Self->ChunkMeshData->MeshStream.Find(FRealtimeMeshStreams::Position);
-            int32 NumVerts = PositionStream ? PositionStream->Num() : 0;
-            if (NumVerts < 3) {
-                // If it was previously initialized but now has no data (e.g., deleted via terraforming)
-                MeshPtr->UpdateSectionGroup(Self->ChunkMeshData->MeshGroupKey, FRealtimeMeshStreamSet());
-                Self->IsDirty = false;
-                return;
+            // 3. Surface update
+            auto* SrfTriStream = Self->SurfaceMeshData->MeshStream.Find(FRealtimeMeshStreams::Triangles);
+            int32 SrfNumTris = SrfTriStream ? SrfTriStream->Num() : 0;
+            if (SrfNumTris <= 0) {
+                MeshPtr->UpdateSectionGroup(Self->SurfaceMeshData->MeshGroupKey, FRealtimeMeshStreamSet());
+            }
+            else {
+                MeshPtr->UpdateSectionGroup(Self->SurfaceMeshData->MeshGroupKey, Self->SurfaceMeshData->MeshStream);
+                FRealtimeMeshSectionConfig SrfConfig(0); // material slot 0
+                MeshPtr->UpdateSectionConfig(Self->SurfaceMeshData->MeshSectionKey, SrfConfig, true);
             }
 
-            // 4. Normal Mesh Update Case
-            if (!Self->IsDirty) return;
-            // Use the resolved MeshPtr instead of the WeakPtr wrapper
-            MeshPtr->UpdateSectionGroup(Self->ChunkMeshData->MeshGroupKey, Self->ChunkMeshData->MeshStream);
-            MeshPtr->UpdateSectionConfig(Self->ChunkMeshData->MeshSectionKey, Self->SecConfig, true);
+            // 4. Ocean update
+            auto* OcnTriStream = Self->OceanMeshData->MeshStream.Find(FRealtimeMeshStreams::Triangles);
+            int32 OcnNumTris = OcnTriStream ? OcnTriStream->Num() : 0;
+            if (OcnNumTris <= 0) {
+                MeshPtr->UpdateSectionGroup(Self->OceanMeshData->MeshGroupKey, FRealtimeMeshStreamSet());
+            }
+            else {
+                MeshPtr->UpdateSectionGroup(Self->OceanMeshData->MeshGroupKey, Self->OceanMeshData->MeshStream);
+                FRealtimeMeshSectionConfig OcnConfig(1); // material slot 1
+                OcnConfig.bIsVisible = true;
+                OcnConfig.bCastsShadow = false;
+                MeshPtr->UpdateSectionConfig(Self->OceanMeshData->MeshSectionKey, OcnConfig, false);
+            }
 
             Self->IsDirty = false;
         });

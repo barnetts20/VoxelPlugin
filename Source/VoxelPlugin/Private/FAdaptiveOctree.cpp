@@ -1,13 +1,14 @@
 #include "FAdaptiveOctree.h"
 
-FAdaptiveOctree::FAdaptiveOctree(ARealtimeMeshActor* InParentActor, UMaterialInterface* InMaterial, TFunction<void(int, const float*, const float*, const float*, float*)> InDensityFunction, TSharedPtr<FSparseEditStore> InEditStore, FVector InCenter, double InRootExtent, int InChunkDepth, int InMinDepth, int InMaxDepth)
+FAdaptiveOctree::FAdaptiveOctree(ARealtimeMeshActor* InParentActor, UMaterialInterface* InSurfaceMaterial, UMaterialInterface* InOceanMaterial, TFunction<void(int, const float*, const float*, const float*, float*)> InDensityFunction, TSharedPtr<FSparseEditStore> InEditStore, FVector InCenter, double InRootExtent, int InChunkDepth, int InMinDepth, int InMaxDepth)
 {
     DensityFunction = InDensityFunction;
     EditStore = InEditStore;
     RootExtent = InRootExtent;
     ChunkExtent = InRootExtent / FMath::Pow(2.0, (double)InChunkDepth);
     CachedParentActor = InParentActor;
-    CachedMaterial = InMaterial;
+    CachedSurfaceMaterial = InSurfaceMaterial;
+    CachedOceanMaterial = InOceanMaterial;
     ChunkDepth = InChunkDepth;
 
     Root = MakeShared<FAdaptiveOctreeNode>( InCenter, InRootExtent, InChunkDepth, InMinDepth, InMaxDepth);
@@ -21,7 +22,7 @@ void FAdaptiveOctree::SplitToDepth(TSharedPtr<FAdaptiveOctreeNode> Node, int InM
 {
     if (!Node.IsValid()) return;
 
-    if (Node->TreeIndex.Num() < InMinDepth)
+    if (Node->Index.Depth < InMinDepth)
     {
         Node->Split();
         for (int i = 0; i < 8; i++)
@@ -67,14 +68,15 @@ void FAdaptiveOctree::PopulateChunks()
     ParallelFor(Chunks.Num(), [&](int32 i) {
         NewChunks[i] = MakeShared<FMeshChunk>();
         NewChunks[i]->CachedParentActor = CachedParentActor;
-        NewChunks[i]->CachedMaterial = CachedMaterial;
+        NewChunks[i]->CachedSurfaceMaterial = CachedSurfaceMaterial;
+        NewChunks[i]->CachedOceanMaterial = CachedOceanMaterial;
         NewChunks[i]->InitializeData(Chunks[i]->Center, Chunks[i]->Extent);
 
         TArray<FNodeEdge> Edges;
         GatherLeafEdges(Chunks[i], Edges);
         NewChunks[i]->ChunkEdges = Edges;
         UpdateMeshChunkStreamData(NewChunks[i]);
-        NewChunks[i]->IsDirty = (NewChunks[i]->ChunkMeshData->GetPositionStream().Num() > 0);
+        NewChunks[i]->IsDirty = (NewChunks[i]->SurfaceMeshData->GetPositionStream().Num() > 0);
     });
 
     // Serial -- add to map
@@ -92,7 +94,7 @@ void FAdaptiveOctree::UpdateChunkMap(TSharedPtr<FAdaptiveOctreeNode> ChunkNode, 
     {
         if (!ChunkNode->IsSurfaceNode)
         {
-            (*Found)->ChunkMeshData->ResetStreams();
+            (*Found)->SurfaceMeshData->ResetStreams();
             (*Found)->IsDirty = true;
         }
         else
@@ -104,7 +106,8 @@ void FAdaptiveOctree::UpdateChunkMap(TSharedPtr<FAdaptiveOctreeNode> ChunkNode, 
     {
         TSharedPtr<FMeshChunk> NewChunk = MakeShared<FMeshChunk>();
         NewChunk->CachedParentActor = CachedParentActor;
-        NewChunk->CachedMaterial = CachedMaterial;
+        NewChunk->CachedSurfaceMaterial = CachedSurfaceMaterial;
+        NewChunk->CachedOceanMaterial = CachedOceanMaterial;
         NewChunk->InitializeData(ChunkNode->Center, ChunkNode->Extent);
         ChunkMap.Add(ChunkNode, NewChunk);
         OutDirtyChunks.Add({ ChunkNode, NewChunk });
@@ -122,7 +125,8 @@ void FAdaptiveOctree::UpdateChunkMap(TSharedPtr<FAdaptiveOctreeNode> ChunkNode, 
 
             TSharedPtr<FMeshChunk> NeighborChunk = MakeShared<FMeshChunk>();
             NeighborChunk->CachedParentActor = CachedParentActor;
-            NeighborChunk->CachedMaterial = CachedMaterial;
+            NeighborChunk->CachedSurfaceMaterial = CachedSurfaceMaterial;
+            NeighborChunk->CachedOceanMaterial = CachedOceanMaterial;
             NeighborChunk->InitializeData(Neighbor->Center, Neighbor->Extent);
             ChunkMap.Add(Neighbor, NeighborChunk);
             OutDirtyChunks.Add({ Neighbor, NeighborChunk });
@@ -236,6 +240,7 @@ void FAdaptiveOctree::FinalizeSubtree(TSharedPtr<FAdaptiveOctreeNode> Node, FVec
 
     // Then this node
     Node->FinalizeFromExistingCorners();
+    Node->ComputeNormalizedPosition(Root->Extent * .9);
 }
 
 void FAdaptiveOctree::ReconstructSubtree(TSharedPtr<FAdaptiveOctreeNode> Node, FVector EditCenter, double SearchRadius)
@@ -329,16 +334,20 @@ void FAdaptiveOctree::UpdateMeshChunkStreamData(TSharedPtr<FMeshChunk> InChunk)
 {
     TMap<FMeshVertex, int32> VertexMap;
     TArray<FMeshVertex> UniqueVertices;
-    TArray<FIndex3UI> Triangles;
+    TArray<FIndex3UI> SrfTriangles;
+    TArray<FIndex3UI> OcnTriangles;
     
     VertexMap.Reserve(1024);
     UniqueVertices.Reserve(1024);
-    Triangles.Reserve(2048);
+    SrfTriangles.Reserve(2048);
 
     TArray<FEdgeVertexData> AllEdgeData;
     AllEdgeData.SetNum(InChunk->ChunkEdges.Num());
 
     double QuantizationGrid = InChunk->ChunkExtent * 1e-8;
+    double OceanRadius = RootExtent * 0.9;
+
+    double OceanTriThreshold = -1000;
 
     ParallelFor(InChunk->ChunkEdges.Num(), [&](int32 edgeIdx) {
         const FNodeEdge currentEdge = InChunk->ChunkEdges[edgeIdx];
@@ -354,11 +363,18 @@ void FAdaptiveOctree::UpdateMeshChunkStreamData(TSharedPtr<FMeshChunk> InChunk)
         AllEdgeData[edgeIdx].Vertices.SetNumZeroed(nodesToMesh.Num());
 
         for (int i = 0; i < nodesToMesh.Num(); i++) {
+            FVector PlanetCenter = Root->Center;
             FVector LocalPos(nodesToMesh[i]->DualContourPosition - InChunk->ChunkCenter);
-            
-            AllEdgeData[edgeIdx].Vertices[i].Position = LocalPos;// QuantizePosition(LocalPos, QuantizationGrid);
+            FVector WorldPos = nodesToMesh[i]->DualContourPosition;
+            FVector DirFromCenter = (WorldPos - PlanetCenter).GetSafeNormal();
+            FVector NormLocalPos = (nodesToMesh[i]->NormalizedPosition) - InChunk->ChunkCenter;
+            double Dist = FVector::Dist(WorldPos, PlanetCenter);
+
+            AllEdgeData[edgeIdx].Vertices[i].Position = LocalPos;
             AllEdgeData[edgeIdx].Vertices[i].OriginalPosition = LocalPos;
+            AllEdgeData[edgeIdx].Vertices[i].NormalizedPosition = NormLocalPos;
             AllEdgeData[edgeIdx].Vertices[i].Normal = nodesToMesh[i]->DualContourNormal;
+            AllEdgeData[edgeIdx].Vertices[i].Depth = (float)(OceanRadius - Dist);
             AllEdgeData[edgeIdx].Vertices[i].Color = FColor::Green;
         }
     });
@@ -392,44 +408,71 @@ void FAdaptiveOctree::UpdateMeshChunkStreamData(TSharedPtr<FMeshChunk> InChunk)
             && VertexIndices[1] != VertexIndices[2]
             && VertexIndices[0] != VertexIndices[2])
         {
-            if (FlipWinding) {
-                Triangles.Add(FIndex3UI(VertexIndices[0], VertexIndices[2], VertexIndices[1]));
-            }
-            else {
-                Triangles.Add(FIndex3UI(VertexIndices[0], VertexIndices[1], VertexIndices[2]));
+            FIndex3UI tri0 = (FlipWinding ? FIndex3UI(VertexIndices[0], VertexIndices[2], VertexIndices[1]) : FIndex3UI(VertexIndices[0], VertexIndices[1], VertexIndices[2]));
+            SrfTriangles.Add(tri0);
+
+            if (UniqueVertices[tri0.V0].Depth > OceanTriThreshold ||
+                UniqueVertices[tri0.V1].Depth > OceanTriThreshold ||
+                UniqueVertices[tri0.V2].Depth > OceanTriThreshold) {
+                OcnTriangles.Add(tri0);
             }
 
+            FIndex3UI tri1;
             if (EdgeVertices.Num() == 4
                 && VertexIndices[0] != VertexIndices[3]
                 && VertexIndices[2] != VertexIndices[3])
             {
-                if (FlipWinding) {
-                    Triangles.Add(FIndex3UI(VertexIndices[0], VertexIndices[3], VertexIndices[2]));
-                }
-                else {
-                    Triangles.Add(FIndex3UI(VertexIndices[0], VertexIndices[2], VertexIndices[3]));
+                tri1 = (FlipWinding ? FIndex3UI(VertexIndices[0], VertexIndices[3], VertexIndices[2]) : FIndex3UI(VertexIndices[0], VertexIndices[2], VertexIndices[3]));
+                SrfTriangles.Add(tri1);
+
+                if (UniqueVertices[tri1.V0].Depth > OceanTriThreshold ||
+                    UniqueVertices[tri1.V1].Depth > OceanTriThreshold ||
+                    UniqueVertices[tri1.V2].Depth > OceanTriThreshold) {
+                    OcnTriangles.Add(tri1);
                 }
             }
         }
     }
 
-    TSharedPtr<FMeshStreamData> UpdatedData = MakeShared<FMeshStreamData>();
-    UpdatedData->MeshGroupKey = InChunk->ChunkMeshData->MeshGroupKey;
-    UpdatedData->MeshSectionKey = InChunk->ChunkMeshData->MeshSectionKey;
+    TSharedPtr<FMeshStreamData> UpdatedSurfaceData = MakeShared<FMeshStreamData>();
+    UpdatedSurfaceData->MeshGroupKey = InChunk->SurfaceMeshData->MeshGroupKey;
+    UpdatedSurfaceData->MeshSectionKey = InChunk->SurfaceMeshData->MeshSectionKey;
 
-    auto PositionStream = UpdatedData->GetPositionStream();
-    auto TangentStream = UpdatedData->GetTangentStream();
-    auto ColorStream = UpdatedData->GetColorStream();
-    auto TexCoordStream = UpdatedData->GetTexCoordStream();
-    auto TriangleStream = UpdatedData->GetTriangleStream();
-    auto PolygroupStream = UpdatedData->GetPolygroupStream();
+    TSharedPtr<FMeshStreamData> UpdatedOceanData = MakeShared<FMeshStreamData>();
+    UpdatedOceanData->MeshGroupKey = InChunk->OceanMeshData->MeshGroupKey;
+    UpdatedOceanData->MeshSectionKey = InChunk->OceanMeshData->MeshSectionKey;
 
-    PositionStream.SetNumUninitialized(UniqueVertices.Num());
-    TangentStream.SetNumUninitialized(UniqueVertices.Num());
-    ColorStream.SetNumUninitialized(UniqueVertices.Num());
-    TexCoordStream.SetNumUninitialized(UniqueVertices.Num());
-    TriangleStream.SetNumUninitialized(Triangles.Num());
-    PolygroupStream.SetNumUninitialized(Triangles.Num());
+    //Surface streams
+    auto SrfPositionStream = UpdatedSurfaceData->GetPositionStream();
+    auto SrfTangentStream = UpdatedSurfaceData->GetTangentStream();
+    auto SrfColorStream = UpdatedSurfaceData->GetColorStream();
+    auto SrfTexCoordStream = UpdatedSurfaceData->GetTexCoordStream();
+    auto SrfTriangleStream = UpdatedSurfaceData->GetTriangleStream();
+    auto SrfPolygroupStream = UpdatedSurfaceData->GetPolygroupStream();
+
+    //Ocean streams
+    auto OcnPositionStream = UpdatedOceanData->GetPositionStream();
+    auto OcnTangentStream = UpdatedOceanData->GetTangentStream();
+    auto OcnColorStream = UpdatedOceanData->GetColorStream();
+    auto OcnTexCoordStream = UpdatedOceanData->GetTexCoordStream();
+    auto OcnTriangleStream = UpdatedOceanData->GetTriangleStream();
+    auto OcnPolygroupStream = UpdatedOceanData->GetPolygroupStream();
+
+    //Init surface count
+    SrfPositionStream.SetNumUninitialized(UniqueVertices.Num());
+    SrfTangentStream.SetNumUninitialized(UniqueVertices.Num());
+    SrfColorStream.SetNumUninitialized(UniqueVertices.Num());
+    SrfTexCoordStream.SetNumUninitialized(UniqueVertices.Num());
+    SrfTriangleStream.SetNumUninitialized(SrfTriangles.Num());
+    SrfPolygroupStream.SetNumUninitialized(SrfTriangles.Num());
+
+    //Init ocean count
+    OcnPositionStream.SetNumUninitialized(UniqueVertices.Num());
+    OcnTangentStream.SetNumUninitialized(UniqueVertices.Num());
+    OcnColorStream.SetNumUninitialized(UniqueVertices.Num());
+    OcnTexCoordStream.SetNumUninitialized(UniqueVertices.Num());
+    OcnTriangleStream.SetNumUninitialized(OcnTriangles.Num());
+    OcnPolygroupStream.SetNumUninitialized(OcnTriangles.Num());
 
     FVector ChunkCenter = InChunk->ChunkCenter;
 
@@ -437,21 +480,49 @@ void FAdaptiveOctree::UpdateMeshChunkStreamData(TSharedPtr<FMeshChunk> InChunk)
         FMeshVertex& Vertex = UniqueVertices[VertIdx];
         FVector WorldPos = FVector(Vertex.OriginalPosition) + ChunkCenter;
 
-        PositionStream.Set(VertIdx, Vertex.OriginalPosition);
+        SrfPositionStream.Set(VertIdx, Vertex.OriginalPosition);
         FRealtimeMeshTangentsHighPrecision Tangent;
         Tangent.SetNormal(FVector3f(Vertex.Normal));
-        TangentStream.Set(VertIdx, Tangent);
-        ColorStream.Set(VertIdx, Vertex.Color);
-        TexCoordStream.Set(VertIdx, ComputeTriplanarUV(WorldPos, Vertex.Normal));
-        });
+        SrfTangentStream.Set(VertIdx, Tangent);
+        SrfColorStream.Set(VertIdx, Vertex.Color);
+        SrfTexCoordStream.Set(VertIdx, ComputeTriplanarUV(WorldPos, Vertex.Normal));
 
-    ParallelFor(Triangles.Num(), [&](int32 TriIdx) {
-        TriangleStream.Set(TriIdx, Triangles[TriIdx]);
-        PolygroupStream.Set(TriIdx, 0);
-        });
+        // Ocean — same index, different position/normal
+        OcnPositionStream.Set(VertIdx, Vertex.NormalizedPosition);
+        FRealtimeMeshTangentsHighPrecision OcnTangent;
+        FVector OcnNormal = (FVector(Vertex.NormalizedPosition) + ChunkCenter - Root->Center).GetSafeNormal();
+        OcnTangent.SetNormal(FVector3f(OcnNormal));
+        OcnTangentStream.Set(VertIdx, OcnTangent);
 
-    InChunk->ChunkMeshData = UpdatedData;
-    InChunk->IsDirty = (Triangles.Num() > 0);
+        // Encode
+        float absDepth = FMath::Max(Vertex.Depth, 0.0f);
+        bool isUnderwater = (Vertex.Depth >= 0);
+        uint32 intDepth = (uint32)FMath::Min(absDepth * 1000.0f, 4294967295.0f); // mm precision, full uint32 range
+
+        uint8 R = (intDepth >> 24) & 0xFF;
+        uint8 G = (intDepth >> 16) & 0xFF;
+        uint8 B = (intDepth >> 8) & 0xFF;
+        uint8 A = intDepth & 0xFF;
+
+        OcnColorStream.Set(VertIdx, FColor(R, G, B, A));
+
+        OcnTexCoordStream.Set(VertIdx, ComputeTriplanarUV(FVector(Vertex.NormalizedPosition) + ChunkCenter, OcnNormal));
+    });
+
+    ParallelFor(SrfTriangles.Num(), [&](int32 TriIdx) {
+        SrfTriangleStream.Set(TriIdx, SrfTriangles[TriIdx]);
+        SrfPolygroupStream.Set(TriIdx, 0);
+    });
+
+    ParallelFor(OcnTriangles.Num(), [&](int32 TriIdx) {
+        OcnTriangleStream.Set(TriIdx, OcnTriangles[TriIdx]);
+        OcnPolygroupStream.Set(TriIdx, 0);
+    });
+
+    InChunk->SurfaceMeshData = UpdatedSurfaceData;
+    InChunk->OceanMeshData = UpdatedOceanData;
+
+    InChunk->IsDirty = (SrfTriangles.Num() > 0);
 }
 
 void AppendUniqueEdges(const TArray<FNodeEdge>& InAppendEdges, TArray<FNodeEdge>& OutNodeEdges, TMap<FEdgeKey, int32>& EdgeMap)
@@ -493,7 +564,7 @@ void FAdaptiveOctree::UpdateLodRecursive(TSharedPtr<FAdaptiveOctreeNode> Node, F
             }
             return;
         }
-        else if (Node->Parent.IsValid() && Node->Parent.Pin()->ShouldMerge(CameraPosition, InScreenSpaceThreshold, InCameraFOV) && Node->TreeIndex.Last() == 7)
+        else if (Node->Parent.IsValid() && Node->Parent.Pin()->ShouldMerge(CameraPosition, InScreenSpaceThreshold, InCameraFOV) && Node->Index.LastChild() == 7)
         {
             OutChanged = true;
             auto ParentPtr = Node->Parent.Pin();
@@ -606,6 +677,7 @@ void FAdaptiveOctree::ComputeNodeData(TSharedPtr<FAdaptiveOctreeNode> Node)
     }
 
     Node->FinalizeFromExistingCorners();
+    Node->ComputeNormalizedPosition(Root->Extent * .9);
 }
 
 TArray<TSharedPtr<FAdaptiveOctreeNode>> FAdaptiveOctree::SampleNodesAroundEdge(const FNodeEdge& Edge)
@@ -713,7 +785,7 @@ TSharedPtr<FAdaptiveOctreeNode> FAdaptiveOctree::GetChunkNodeByPoint(FVector Pos
     TSharedPtr<FAdaptiveOctreeNode> CurrentNode = Root;
     while (CurrentNode.IsValid())
     {
-        if (CurrentNode->TreeIndex.Num() == ChunkDepth)
+        if (CurrentNode->Index.Depth == ChunkDepth)
         {
             return CurrentNode;
         }

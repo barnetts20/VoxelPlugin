@@ -25,14 +25,14 @@ FAdaptiveOctreeNode::FAdaptiveOctreeNode(FVector InCenter, double InExtent, int 
 
     for (int i = 0; i < 8; i++)
     {
-        Corners[i].Position = Center + (Offsets[i] * Extent);
+        Corners[i].Position = Center + (OctreeConstants::Offsets[i] * Extent);
     }
 }
 
 FAdaptiveOctreeNode::FAdaptiveOctreeNode(TSharedPtr<FAdaptiveOctreeNode> InParent, uint8 ChildIndex, FVector InAnchorCenter)
 {
-    TreeIndex = InParent->TreeIndex;
-    TreeIndex.Add(ChildIndex);
+    Index = InParent->Index;
+    Index.PushChild(ChildIndex);
 
     ChunkDepth = InParent->ChunkDepth;
 
@@ -42,7 +42,7 @@ FAdaptiveOctreeNode::FAdaptiveOctreeNode(TSharedPtr<FAdaptiveOctreeNode> InParen
 
     // Set spatial bounds first
     Extent = InParent->Extent * 0.5;
-    Center = InParent->Center + Offsets[ChildIndex] * Extent;
+    Center = InParent->Center + OctreeConstants::Offsets[ChildIndex] * Extent;
 
     DepthBounds[0] = InParent->DepthBounds[0];
     DepthBounds[1] = InParent->DepthBounds[1];
@@ -50,7 +50,7 @@ FAdaptiveOctreeNode::FAdaptiveOctreeNode(TSharedPtr<FAdaptiveOctreeNode> InParen
 
     for (int i = 0; i < 8; i++)
     {
-        Corners[i].Position = Center + (Offsets[i] * Extent);
+        Corners[i].Position = Center + (OctreeConstants::Offsets[i] * Extent);
     }
 }
 
@@ -90,9 +90,9 @@ void FAdaptiveOctreeNode::FinalizeFromExistingCorners()
         int idxY = i ^ 2;
         int idxZ = i ^ 4;
 
-        double dx = (Offsets[i].X < 0) ? (Corners[idxX].Density - d) : (d - Corners[idxX].Density);
-        double dy = (Offsets[i].Y < 0) ? (Corners[idxY].Density - d) : (d - Corners[idxY].Density);
-        double dz = (Offsets[i].Z < 0) ? (Corners[idxZ].Density - d) : (d - Corners[idxZ].Density);
+        double dx = (OctreeConstants::Offsets[i].X < 0) ? (Corners[idxX].Density - d) : (d - Corners[idxX].Density);
+        double dy = (OctreeConstants::Offsets[i].Y < 0) ? (Corners[idxY].Density - d) : (d - Corners[idxY].Density);
+        double dz = (OctreeConstants::Offsets[i].Z < 0) ? (Corners[idxZ].Density - d) : (d - Corners[idxZ].Density);
 
         FVector Normal(dx, dy, dz);
         if (!Normal.Normalize())
@@ -103,7 +103,7 @@ void FAdaptiveOctreeNode::FinalizeFromExistingCorners()
 
     for (int i = 0; i < 12; i++)
     {
-        FNodeEdge NewEdge(Corners[EdgePairs[i][0]], Corners[EdgePairs[i][1]]);
+        FNodeEdge NewEdge(Corners[OctreeConstants::EdgePairs[i][0]], Corners[OctreeConstants::EdgePairs[i][1]]);
         if (NewEdge.SignChange)
             SignChangeEdges.Add(NewEdge);
     }
@@ -127,7 +127,7 @@ void FAdaptiveOctreeNode::Split()
     // Determine the anchor for children
     // If THIS node is at the ChunkDepth, its children will use its center as their anchor.
     // Otherwise, they inherit the current anchor.
-    FVector NextAnchor = (TreeIndex.Num() == DepthBounds[0]) ? Center : AnchorCenter;
+    FVector NextAnchor = (Index.Depth == DepthBounds[0]) ? Center : AnchorCenter;
 
     for (uint8 i = 0; i < 8; i++)
     {
@@ -154,7 +154,13 @@ void FAdaptiveOctreeNode::Merge()
 
 bool FAdaptiveOctreeNode::ShouldSplit(FVector InCameraPosition, double InScreenSpaceThreshold, double InCameraFOV)
 {
-    int Depth = TreeIndex.Num();
+    FVector ToCam = (InCameraPosition - TreeCenter).GetSafeNormal();
+    FVector ToNode = (Center - TreeCenter).GetSafeNormal();
+    float Dot = FVector::DotProduct(ToCam, ToNode);
+    // Node is on the far hemisphere — don't split further
+    if (Dot < -0.2f) return false; // small negative threshold for horizon margin
+
+    int Depth = Index.Depth;
     if (Depth >= DepthBounds[1]) return false;
     if (Depth < DepthBounds[2]) return true;
     
@@ -167,7 +173,7 @@ bool FAdaptiveOctreeNode::ShouldSplit(FVector InCameraPosition, double InScreenS
 
 bool FAdaptiveOctreeNode::ShouldMerge(FVector InCameraPosition, double InScreenSpaceThreshold, double InCameraFOV)
 {
-    int Depth = TreeIndex.Num();
+    int Depth = Index.Depth;
     if (LodOverride) return false;
     if (Depth <= DepthBounds[0]) return false;
     if (Depth < DepthBounds[2]) return false;
@@ -194,9 +200,9 @@ TArray<TSharedPtr<FAdaptiveOctreeNode>> FAdaptiveOctreeNode::GetSurfaceChunks()
     {
         TSharedPtr<FAdaptiveOctreeNode> CurrentNode = Stack.Pop(EAllowShrinking::No);
 
-        if (!CurrentNode || CurrentNode->TreeIndex.Num() > ChunkDepth) continue;
+        if (!CurrentNode || CurrentNode->Index.Depth > ChunkDepth) continue;
 
-        if (CurrentNode->TreeIndex.Num() == ChunkDepth && CurrentNode->IsSurfaceNode)
+        if (CurrentNode->Index.Depth == ChunkDepth && CurrentNode->IsSurfaceNode)
         {
             SurfaceNodes.Add(CurrentNode);
         }
@@ -210,6 +216,11 @@ TArray<TSharedPtr<FAdaptiveOctreeNode>> FAdaptiveOctreeNode::GetSurfaceChunks()
     }
 
     return SurfaceNodes;
+}
+
+void FAdaptiveOctreeNode::ComputeNormalizedPosition(double InRadius) {
+    FVector DirFromCenter = (DualContourPosition - TreeCenter).GetSafeNormal();
+    NormalizedPosition = TreeCenter + DirFromCenter * InRadius;
 }
 
 void FAdaptiveOctreeNode::ComputeDualContourPosition()
@@ -249,7 +260,7 @@ void FAdaptiveOctreeNode::ComputeDualContourPosition()
 
     MassPoint /= (double)ValidEdges;
 
-    if (TreeIndex.Num() > DepthPrecisionFloor)
+    if (Index.Depth > DepthPrecisionFloor)
     {
         DualContourPosition = MassPoint;
     }
@@ -295,4 +306,6 @@ void FAdaptiveOctreeNode::ComputeDualContourPosition()
     {
         DualContourNormal = (DualContourPosition - TreeCenter).GetSafeNormal();
     }
+
+
 }

@@ -11,7 +11,8 @@ AAdaptiveVoxelActor::AAdaptiveVoxelActor()
     PrimaryActorTick.bCanEverTick = true;
     PrimaryActorTick.bStartWithTickEnabled = true;
     CameraPosition = FVector(0, 0, 0);
-    Material = UMaterial::GetDefaultMaterial(EMaterialDomain::MD_Surface);
+    SurfaceMaterial = UMaterial::GetDefaultMaterial(EMaterialDomain::MD_Surface);
+    OceanMaterial = UMaterial::GetDefaultMaterial(EMaterialDomain::MD_Surface);
 }
 
 void AAdaptiveVoxelActor::BeginDestroy()
@@ -98,7 +99,7 @@ void AAdaptiveVoxelActor::Initialize()
     // Store for user edits
     TSharedPtr<FSparseEditStore> EditStore = MakeShared<FSparseEditStore>(GetActorLocation(), Size, ChunkDepth, MaxDepth);
     // Adaptive octree meshes the implicit structure
-    AdaptiveOctree = MakeShared<FAdaptiveOctree>(this, Material, DensityFunction, EditStore, GetActorLocation(), Size, ChunkDepth, MinDepth, MaxDepth);
+    AdaptiveOctree = MakeShared<FAdaptiveOctree>(this, SurfaceMaterial, OceanMaterial, DensityFunction, EditStore, GetActorLocation(), Size, ChunkDepth, MinDepth, MaxDepth);
 
     Initialized = true;
 

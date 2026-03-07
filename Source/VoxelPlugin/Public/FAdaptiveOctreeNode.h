@@ -2,6 +2,53 @@
 
 #include "CoreMinimal.h"
 
+struct VOXELPLUGIN_API OctreeConstants {
+    inline static const FVector Offsets[8] = {
+        FVector(-1, -1, -1), FVector(1, -1, -1),
+        FVector(-1, 1, -1),  FVector(1, 1, -1),
+        FVector(-1, -1, 1),  FVector(1, -1, 1),
+        FVector(-1, 1, 1),   FVector(1, 1, 1)
+    };
+
+    inline static const int EdgePairs[12][2] = {
+        {0, 1}, {2, 3}, {4, 5}, {6, 7},
+        {0, 2}, {1, 3}, {4, 6}, {5, 7},
+        {0, 4}, {1, 5}, {2, 6}, {3, 7}
+    };
+
+    enum EFace : uint8 {
+        XPos = 0, XNeg = 1,
+        YPos = 2, YNeg = 3,
+        ZPos = 4, ZNeg = 5
+    };
+
+    inline static const uint8 FaceAxisBit[6] = {
+        0, 0, 1, 1, 2, 2
+    };
+
+    inline static const bool FaceIsPositive[6] = {
+        true, false, true, false, true, false
+    };
+
+    inline static const uint8 OuterChildren[6][4] = {
+        {1, 3, 5, 7},
+        {0, 2, 4, 6},
+        {2, 3, 6, 7},
+        {0, 1, 4, 5},
+        {4, 5, 6, 7},
+        {0, 1, 2, 3},
+    };
+
+    inline static const uint8 InnerChildren[6][4] = {
+        {0, 2, 4, 6},
+        {1, 3, 5, 7},
+        {0, 1, 4, 5},
+        {2, 3, 6, 7},
+        {0, 1, 2, 3},
+        {4, 5, 6, 7},
+    };
+};
+
 struct VOXELPLUGIN_API FNodeCorner {
     FVector Position;
     double Density;
@@ -138,6 +185,82 @@ struct VOXELPLUGIN_API FEdgeKey
         return X0 == Other.X0 && Y0 == Other.Y0 && Z0 == Other.Z0
             && X1 == Other.X1 && Y1 == Other.Y1 && Z1 == Other.Z1
             && Axis == Other.Axis;
+    }
+};
+
+struct VOXELPLUGIN_API FMortonIndex {
+    uint64 Low = 0;   // Bits 0-63:   levels 0-20
+    uint64 High = 0;  // Bits 64-127: levels 21-41
+    uint8 Depth = 0;
+
+    void PushChild(uint8 ChildIndex) {
+        uint8 BitOffset = Depth * 3;
+        if (BitOffset < 64) {
+            // Might straddle the boundary
+            Low |= (uint64(ChildIndex & 0x7) << BitOffset);
+            if (BitOffset > 61) {
+                // Bits spill into High
+                High |= (uint64(ChildIndex & 0x7) >> (64 - BitOffset));
+            }
+        }
+        else {
+            High |= (uint64(ChildIndex & 0x7) << (BitOffset - 64));
+        }
+        Depth++;
+    }
+
+    uint8 GetChildAtLevel(uint8 Level) const {
+        uint8 BitOffset = Level * 3;
+        if (BitOffset < 64) {
+            if (BitOffset > 61) {
+                // Straddles boundary
+                uint8 LowBits = (Low >> BitOffset) & 0x7;
+                uint8 HighBits = (High << (64 - BitOffset)) & 0x7;
+                return (LowBits | HighBits) & 0x7;
+            }
+            return (Low >> BitOffset) & 0x7;
+        }
+        return (High >> (BitOffset - 64)) & 0x7;
+    }
+
+    uint8 LastChild() const {
+        return GetChildAtLevel(Depth - 1);
+    }
+
+    void PopChild() {
+        Depth--;
+        uint8 BitOffset = Depth * 3;
+        if (BitOffset < 64) {
+            Low &= ~(uint64(0x7) << BitOffset);
+            if (BitOffset > 61) {
+                High &= ~(uint64(0x7) >> (64 - BitOffset));
+            }
+        }
+        else {
+            High &= ~(uint64(0x7) << (BitOffset - 64));
+        }
+    }
+
+    // Common ancestor depth between two indices
+    uint8 CommonDepth(const FMortonIndex& Other) const {
+        uint8 MaxCheck = FMath::Min(Depth, Other.Depth);
+        for (uint8 i = 0; i < MaxCheck; i++) {
+            if (GetChildAtLevel(i) != Other.GetChildAtLevel(i))
+                return i;
+        }
+        return MaxCheck;
+    }
+
+    bool operator==(const FMortonIndex& Other) const {
+        return Low == Other.Low && High == Other.High && Depth == Other.Depth;
+    }
+
+    // For use as TMap key
+    friend uint32 GetTypeHash(const FMortonIndex& Index) {
+        uint32 Hash = ::GetTypeHash(Index.Low);
+        Hash = HashCombine(Hash, ::GetTypeHash(Index.High));
+        Hash = HashCombine(Hash, ::GetTypeHash(Index.Depth));
+        return Hash;
     }
 };
 
@@ -393,28 +516,15 @@ private:
     
     int DepthPrecisionFloor = 20;
 
-    // Static arrays, offset and edge pair lookup tables
-    inline static const FVector Offsets[8] = {
-        FVector(-1, -1, -1), FVector(1, -1, -1),
-        FVector(-1, 1, -1), FVector(1, 1, -1),
-        FVector(-1, -1, 1), FVector(1, -1, 1),
-        FVector(-1, 1, 1), FVector(1, 1, 1)
-    };
-
-    inline static const int EdgePairs[12][2] = {
-        {0, 1}, {2, 3}, {4, 5}, {6, 7}, // X-axis edges
-        {0, 2}, {1, 3}, {4, 6}, {5, 7}, // Y-axis edges
-        {0, 4}, {1, 5}, {2, 6}, {3, 7}  // Z-axis edges
-    };
-
 public:
-
-    TArray<uint8> TreeIndex;
+    FMortonIndex Index;
     
     TWeakPtr<FAdaptiveOctreeNode> Parent;
     
     TSharedPtr<FAdaptiveOctreeNode> Children[8];
     
+    TWeakPtr<FAdaptiveOctreeNode> Neighbors[6];
+
     FNodeCorner Corners[8];
     
     TArray<FNodeEdge> SignChangeEdges;
@@ -435,6 +545,8 @@ public:
     
     FVector DualContourNormal;
     
+    FVector NormalizedPosition;
+
     bool IsSurfaceNode;
     
     bool LodOverride = false;
@@ -452,6 +564,8 @@ public:
     void Merge();
     
     TArray<TSharedPtr<FAdaptiveOctreeNode>> GetSurfaceChunks();
+
+    void ComputeNormalizedPosition(double InRadius);
 
     TArray<FNodeEdge>& GetSignChangeEdges();
 
