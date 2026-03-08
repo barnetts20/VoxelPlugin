@@ -523,6 +523,31 @@ private:
     bool bIsLeaf = true;
     
     int DepthPrecisionFloor = 20;
+    
+    bool ContainsCorner(const FVector& P) const;
+    //{
+    //    return
+    //        P.X >= Center.X - Extent && P.X <= Center.X + Extent &&
+    //        P.Y >= Center.Y - Extent && P.Y <= Center.Y + Extent &&
+    //        P.Z >= Center.Z - Extent && P.Z <= Center.Z + Extent;
+    //}
+
+    bool ContainsEdge(
+        int32 EdgeIndex,
+        FAdaptiveOctree* Owner) const;
+    /*{
+        const FOctreeEdge& Edge = Owner->GetEdgeData(EdgeIndex);
+
+        const FVector& P0 =
+            Owner->GetCornerData(Edge.Key.C0).Position;
+
+        const FVector& P1 =
+            Owner->GetCornerData(Edge.Key.C1).Position;
+
+        return
+            ContainsCorner(P0) &&
+            ContainsCorner(P1);
+    }*/
 
 public:
     FMortonIndex Index;
@@ -534,6 +559,7 @@ public:
     TWeakPtr<FAdaptiveOctreeNode> Neighbors[6];
 
     int32 Corners[8] = { INDEX_NONE, INDEX_NONE, INDEX_NONE, INDEX_NONE, INDEX_NONE, INDEX_NONE, INDEX_NONE, INDEX_NONE };
+    int32 Edges[12] = { INDEX_NONE, INDEX_NONE, INDEX_NONE, INDEX_NONE, INDEX_NONE, INDEX_NONE, INDEX_NONE, INDEX_NONE, INDEX_NONE, INDEX_NONE, INDEX_NONE, INDEX_NONE };
 
     TArray<FNodeEdge> SignChangeEdges;
     
@@ -563,6 +589,10 @@ public:
 
     const bool IsRoot();
     
+    TSharedPtr<FAdaptiveOctreeNode> GetLeafForEdge(
+        int32 EdgeIndex,
+        FAdaptiveOctree* Owner);
+
     bool ShouldSplit(FVector InCameraPosition, double InScreenSpaceThreshold, double InCameraFOV);
 
     bool ShouldMerge(FVector InCameraPosition, double InScreenSpaceThreshold, double InCameraFOV);

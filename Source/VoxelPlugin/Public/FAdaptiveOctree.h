@@ -36,6 +36,11 @@ private:
 
     TMap<TSharedPtr<FAdaptiveOctreeNode>, TSharedPtr<FMeshChunk>> ChunkMap;
     
+    TSparseArray<FCornerData> CornerPool;
+    TMap<FIntVector, int32> CornerMap;
+
+    TSparseArray<FOctreeEdge> EdgePool;
+    TMap<FEdgeKey, int32> EdgeLookupMap;
     // Thread safety for concurrent LOD splits
     FCriticalSection CornerPoolLock;
     FCriticalSection EdgePoolLock;
@@ -70,22 +75,20 @@ private:
     
     static FVector2f ComputeTriplanarUV(FVector Position, FVector Normal);
 
-    TArray<TSharedPtr<FAdaptiveOctreeNode>> SampleNodesAroundEdge(const FNodeEdge& Edge);
+    TArray<TSharedPtr<FAdaptiveOctreeNode>> SampleNodesAroundEdge(int32 EdgeIndex);
 
     TSharedPtr<FAdaptiveOctreeNode> GetLeafNodeByPoint(FVector Position);
 
     TSharedPtr<FAdaptiveOctreeNode> GetChunkNodeByPoint(FVector Position);
 
-    void GatherLeafEdges(TSharedPtr<FAdaptiveOctreeNode> Node, TArray<FNodeEdge>& OutEdges);
+    void GatherLeafEdges(
+        TSharedPtr<FAdaptiveOctreeNode> Node,
+        TArray<int32>& OutEdges
+    );
 
     void ComputeNodeData(TSharedPtr<FAdaptiveOctreeNode> Node);
 
 public:
-    TSparseArray<FCornerData> CornerPool;
-    TMap<FIntVector, int32> CornerMap;
-
-    TSparseArray<FOctreeEdge> EdgePool;
-    TMap<FEdgeKey, int32> EdgeLookupMap;
 
     FAdaptiveOctree(ARealtimeMeshActor* InParentActor, UMaterialInterface* InSurfaceMaterial, UMaterialInterface* InOceanMaterial, TFunction<void(int, const float*, const float*, const float*, float*)> InDensityFunction, TSharedPtr<FSparseEditStore> InEditStore, FVector InCenter, double InRootExtent, int InChunkDepth, int InMinDepth, int InMaxDepth);
 
@@ -99,19 +102,27 @@ public:
     void ReleaseCorner(int32 InCornerIndex);
 
     int32 AcquireEdge(int32 C0, int32 C1, TSharedPtr<FAdaptiveOctreeNode> RequestingNode);
-    void ReleaseEdge(int32 InCornerIndex);
+    void ReleaseEdge(int32 InEdgeIndex);
 
     void SortNodesCircular(TArray<TSharedPtr<FAdaptiveOctreeNode>, TInlineAllocator<4>>& Nodes, int32 Axis);
     void RegisterNodeEdges(TSharedPtr<FAdaptiveOctreeNode> Node);
+    
     void SetCornerDensity(int32 Index, double NewDensity);
     void SetCornerNormal(int32 Index, const FVector& NewNormal);
 
     // In FAdaptiveOctree.h
-    FORCEINLINE FCornerData GetCornerData(int32 Index) const
+    const FCornerData& GetCornerData(int32 Index) const
     {
         // Basic safety check for debugging
         check(CornerPool.IsValidIndex(Index));
         return CornerPool[Index];
+    }
+
+    const FOctreeEdge& GetEdgeData(int32 Index) const
+    {
+        // Basic safety check for debugging
+        check(EdgePool.IsValidIndex(Index));
+        return EdgePool[Index];
     }
 
     void UpdateMesh();

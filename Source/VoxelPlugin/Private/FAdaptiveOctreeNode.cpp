@@ -74,6 +74,44 @@ FVector FAdaptiveOctreeNode::GetInterpolatedNormal(FVector P, FAdaptiveOctree* I
     return FinalNormal.GetSafeNormal();
 }
 
+bool FAdaptiveOctreeNode::ContainsCorner(const FVector& P) const
+{
+    return
+        P.X >= Center.X - Extent && P.X <= Center.X + Extent &&
+        P.Y >= Center.Y - Extent && P.Y <= Center.Y + Extent &&
+        P.Z >= Center.Z - Extent && P.Z <= Center.Z + Extent;
+}
+
+bool FAdaptiveOctreeNode::ContainsEdge(
+    int32 EdgeIndex,
+    FAdaptiveOctree* Owner) const
+{
+    if (Owner == nullptr)
+    {
+        return false;
+    }
+
+    const FOctreeEdge& Edge = Owner->GetEdgeData(EdgeIndex);
+
+    const FVector& P0 =
+        Owner->GetCornerData(Edge.Key.C0).Position;
+
+    const FVector& P1 =
+        Owner->GetCornerData(Edge.Key.C1).Position;
+
+    if (!ContainsCorner(P0))
+    {
+        return false;
+    }
+
+    if (!ContainsCorner(P1))
+    {
+        return false;
+    }
+
+    return true;
+}
+
 void FAdaptiveOctreeNode::FinalizeFromExistingCorners(FAdaptiveOctree* InOwner)
 {
 
@@ -124,6 +162,38 @@ void FAdaptiveOctreeNode::FinalizeFromExistingCorners(FAdaptiveOctree* InOwner)
             Ancestor = Ancestor->Parent.Pin();
         }
     }
+}
+
+TSharedPtr<FAdaptiveOctreeNode>
+FAdaptiveOctreeNode::GetLeafForEdge(
+    int32 EdgeIndex,
+    FAdaptiveOctree* Owner)
+{
+    if (!Owner)
+        return nullptr;
+
+    // If leaf, best match
+    if (bIsLeaf)
+    {
+        return AsShared();
+    }
+
+    // Search children
+    for (int i = 0; i < 8; i++)
+    {
+        TSharedPtr<FAdaptiveOctreeNode> Child = Children[i];
+
+        if (!Child.IsValid())
+            continue;
+
+        if (Child->ContainsEdge(EdgeIndex, Owner))
+        {
+            return Child->GetLeafForEdge(EdgeIndex, Owner);
+        }
+    }
+
+    // fallback
+    return AsShared();
 }
 
 void FAdaptiveOctreeNode::Split(FAdaptiveOctree* InOwner)
