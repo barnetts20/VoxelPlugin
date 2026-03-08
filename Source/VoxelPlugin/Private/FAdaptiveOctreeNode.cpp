@@ -165,6 +165,8 @@ bool FAdaptiveOctreeNode::ShouldSplit(FVector InCameraPosition, double InScreenS
     if (Depth < DepthBounds[2]) return true;
     
     double Distance = FMath::Max(FVector::Dist(DualContourPosition, InCameraPosition), 1.0);
+    //double Distance2 = FMath::Max(FVector::Dist(NormalizedPosition, InCameraPosition), 1.0);
+    //double Distance = FMath::Min(Distance, Distance2);
     double FOVScale = 1.0 / FMath::Tan(FMath::DegreesToRadians(InCameraFOV * 0.5));
     double AngularSize = ((2.0 * Extent) / Distance) * FOVScale;
 
@@ -178,6 +180,8 @@ bool FAdaptiveOctreeNode::ShouldMerge(FVector InCameraPosition, double InScreenS
     if (Depth <= DepthBounds[0]) return false;
     if (Depth < DepthBounds[2]) return false;
     double Distance = FMath::Max(FVector::Dist(DualContourPosition, InCameraPosition), 1.0);
+    //double Distance2 = FMath::Max(FVector::Dist(NormalizedPosition, InCameraPosition), 1.0);
+    //double Distance = FMath::Min(Distance, Distance2);
     double FOVScale = 1.0 / FMath::Tan(FMath::DegreesToRadians(InCameraFOV * 0.5));
     double AngularSize = ((2.0 * Extent) / Distance) * FOVScale;
 
