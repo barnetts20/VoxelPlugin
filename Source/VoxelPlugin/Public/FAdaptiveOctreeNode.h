@@ -1,7 +1,7 @@
 #pragma once
 
 #include "CoreMinimal.h"
-
+struct FAdaptiveOctree;
 struct VOXELPLUGIN_API OctreeConstants {
     inline static const FVector Offsets[8] = {
         FVector(-1, -1, -1), FVector(1, -1, -1),
@@ -49,71 +49,107 @@ struct VOXELPLUGIN_API OctreeConstants {
     };
 };
 
-struct VOXELPLUGIN_API FNodeCorner {
-    FVector Position;
-    double Density;
-    FVector Normal;
-
-    FNodeCorner() : Position(0), Density(0), Normal(0, 0, 1) {}
-
-    FNodeCorner(FVector InPos, double InDensity, FVector InNormal) : Position(InPos), Density(InDensity), Normal(InNormal) {}
+//struct VOXELPLUGIN_API FNodeCorner {
+//    FVector Position;
+//    double Density;
+//    FVector Normal;
+//
+//    FNodeCorner() : Position(0), Density(0), Normal(0, 0, 1) {}
+//
+//    FNodeCorner(FVector InPos, double InDensity, FVector InNormal) : Position(InPos), Density(InDensity), Normal(InNormal) {}
+//};
+/**
+ * FCornerData - Corner payload stored in the octree's spatial corner map.
+ *
+ * Replaces the old per-node FNodeCorner. Multiple nodes sharing the same
+ * spatial corner hold raw pointers to the same FCornerData entry in the map.
+ * RefCount tracks how many nodes reference this corner; when it hits zero
+ * the entry is removed from the map.
+ *
+ * Pointer stability: Unreal's TMap uses TSparseArray internally, which does
+ * not relocate existing entries on insertion or removal. Raw pointers into
+ * map values remain valid for the lifetime of that entry.
+ */
+struct VOXELPLUGIN_API FCornerData
+{
+    FVector Position = FVector::ZeroVector;
+    double  Density = 0.0;
+    FVector Normal = FVector::ZeroVector;
+    int32   RefCount = 0;
 };
 
+/**
+ * Quantization helper for corner map keys.
+ *
+ * The grid size must be small enough to distinguish corners at the deepest
+ * octree level, but large enough to absorb floating-point noise. At depth 18
+ * with a root extent of 1e8, the smallest cell half-extent is ~381. A grid
+ * of 0.01 is well below that.
+ */
+namespace CornerKeyUtils
+{
+    inline constexpr double QuantizeGrid = 0.01;
+
+    FORCEINLINE FIntVector Quantize(const FVector& Position)
+    {
+        return FIntVector(
+            FMath::RoundToInt(Position.X / QuantizeGrid),
+            FMath::RoundToInt(Position.Y / QuantizeGrid),
+            FMath::RoundToInt(Position.Z / QuantizeGrid)
+        );
+    }
+};
+
+// 2. Update FNodeEdge to store indices
 struct VOXELPLUGIN_API FNodeEdge
 {
-    FNodeCorner Corners[2];
+    int32 Corners[2];
     double Size;
     bool SignChange;
     double Distance;
     FVector EdgeDirection;
-    int Axis;  
+    bool bStartIsInside;
+    int Axis;
     FVector ZeroCrossingPoint;
 
-    // Constructor
-    FNodeEdge() : Size(0), SignChange(false), Distance(0), Axis(0) {}
+    FNodeEdge() : Corners{ INDEX_NONE, INDEX_NONE }, Size(0), SignChange(false), Distance(0), Axis(0) {}
 
-    FNodeEdge(FNodeCorner InCorner1, FNodeCorner InCorner2)
+    // Pass the indices AND the data references to compute the intersection
+    FNodeEdge(int32 Idx1, int32 Idx2, const FCornerData& InCorner1, const FCornerData& InCorner2)
     {
-        Corners[0] = InCorner1;
-        Corners[1] = InCorner2;
+        // Canonical ordering ensures identical edges always have the same index order
+        if (Idx1 < Idx2) {
+            Corners[0] = Idx1; Corners[1] = Idx2;
+        }
+        else {
+            Corners[0] = Idx2; Corners[1] = Idx1;
+        }
 
         double d1 = InCorner1.Density;
+        if (d1 > 0) bStartIsInside = true;
         double d2 = InCorner2.Density;
 
         SignChange = (d1 < 0) != (d2 < 0);
 
-        // Determine which corner is positive and which is negative
-        FNodeCorner PosCorner = (d1 > d2) ? InCorner1 : InCorner2;
-        FNodeCorner NegCorner = (d1 > d2) ? InCorner2 : InCorner1;
+        const FCornerData& PosCorner = (d1 > d2 ? InCorner1 : InCorner2);
+        const FCornerData& NegCorner = (d1 > d2 ? InCorner2 : InCorner1);
 
         Size = FVector::Dist(InCorner1.Position, InCorner2.Position);
         Distance = Size;
-
-        // Compute edge direction: Always point from positive to negative
         EdgeDirection = (NegCorner.Position - PosCorner.Position).GetSafeNormal();
 
-        // Safe axis detection: find the axis with the largest delta
-        // This is immune to floating point noise at large coordinates
         FVector Delta = (InCorner2.Position - InCorner1.Position).GetAbs();
-        if (Delta.X > Delta.Y && Delta.X > Delta.Z)
-            Axis = 0;
-        else if (Delta.Y > Delta.X && Delta.Y > Delta.Z)
-            Axis = 1;
-        else
-            Axis = 2;
+        if (Delta.X > Delta.Y && Delta.X > Delta.Z) Axis = 0;
+        else if (Delta.Y > Delta.X && Delta.Y > Delta.Z) Axis = 1;
+        else Axis = 2;
 
         if (SignChange) {
-            // Stable zero-crossing interpolation
-            // t = d1 / (d1 - d2) gives the parametric position along the edge
-            // where the sign change occurs. Clamp to [0,1] for safety.
-            double Denominator = d1 - d2;
-            if (FMath::Abs(Denominator) < 1e-12) {
-                // Both densities essentially equal — place at midpoint
+            double Denom = d1 - d2;
+            if (FMath::Abs(Denom) < 1e-12) {
                 ZeroCrossingPoint = (InCorner1.Position + InCorner2.Position) * 0.5;
             }
             else {
-                double t = d1 / Denominator;
-                t = FMath::Clamp(t, 0.0, 1.0);
+                double t = FMath::Clamp(d1 / Denom, 0.0, 1.0);
                 ZeroCrossingPoint = InCorner1.Position + t * (InCorner2.Position - InCorner1.Position);
             }
         }
@@ -122,70 +158,40 @@ struct VOXELPLUGIN_API FNodeEdge
         }
     }
 
-    bool IsCongruent(const FNodeEdge& Other) const {
-        // Both corners must match (in either order) AND axis must match
-        bool CornersMatch =
-            (Corners[0].Position.Equals(Other.Corners[0].Position, .01)
-                && Corners[1].Position.Equals(Other.Corners[1].Position, .01))
-            || (Corners[0].Position.Equals(Other.Corners[1].Position, .01)
-                && Corners[1].Position.Equals(Other.Corners[0].Position, .01));
-
-        return CornersMatch && Axis == Other.Axis;
-    }
-
-    // Equality operator for ensuring uniqueness
-    bool operator==(const FNodeEdge& Other) const
-    {
-        return IsCongruent(Other) && Other.EdgeDirection == EdgeDirection;
+    bool operator==(const FNodeEdge& Other) const {
+        return Corners[0] == Other.Corners[0] &&
+            Corners[1] == Other.Corners[1];
     }
 };
 
-struct VOXELPLUGIN_API FEdgeKey
-{
-    int64 X0, Y0, Z0;  // Quantized corner 0 (sorted so min corner is always first)
-    int64 X1, Y1, Z1;  // Quantized corner 1
+struct FEdgeKey {
+    int32 C0;
+    int32 C1;
+
+    FEdgeKey(int32 InC0, int32 InC1) {
+        C0 = FMath::Min(InC0, InC1);
+        C1 = FMath::Max(InC0, InC1);
+    }
+
+    FEdgeKey() {
+        C0 = -1;
+        C1 = -1;
+    }
+
+    bool operator==(const FEdgeKey& Other) const { return C0 == Other.C0 && C1 == Other.C1; }
+    friend uint32 GetTypeHash(const FEdgeKey& Key) { return HashCombine(GetTypeHash(Key.C0), GetTypeHash(Key.C1)); }
+};
+struct FAdaptiveOctreeNode;
+struct FOctreeEdge {
+    FEdgeKey Key;
     int32 Axis;
+    bool bIsSignChange;
+    bool bStartIsInside;
 
-    // Quantization grid — 0.001 is well within the 0.01 epsilon used in IsCongruent
-    static constexpr double GridSize = 0.001;
+    // Store the actual shared pointers to the leaf nodes
+    TArray<TSharedPtr<FAdaptiveOctreeNode>, TInlineAllocator<4>> ConnectedNodes;
 
-    static int64 Quantize(double V)
-    {
-        return FMath::RoundToInt64(V / GridSize);
-    }
-
-    FEdgeKey() = default;
-
-    FEdgeKey(const FNodeEdge& Edge)
-    {
-        int64 ax = Quantize(Edge.Corners[0].Position.X);
-        int64 ay = Quantize(Edge.Corners[0].Position.Y);
-        int64 az = Quantize(Edge.Corners[0].Position.Z);
-        int64 bx = Quantize(Edge.Corners[1].Position.X);
-        int64 by = Quantize(Edge.Corners[1].Position.Y);
-        int64 bz = Quantize(Edge.Corners[1].Position.Z);
-
-        // Canonical ordering: ensure (corner0 < corner1) so order doesn't matter
-        if (ax < bx || (ax == bx && ay < by) || (ax == bx && ay == by && az < bz))
-        {
-            X0 = ax; Y0 = ay; Z0 = az;
-            X1 = bx; Y1 = by; Z1 = bz;
-        }
-        else
-        {
-            X0 = bx; Y0 = by; Z0 = bz;
-            X1 = ax; Y1 = ay; Z1 = az;
-        }
-
-        Axis = Edge.Axis;
-    }
-
-    bool operator==(const FEdgeKey& Other) const
-    {
-        return X0 == Other.X0 && Y0 == Other.Y0 && Z0 == Other.Z0
-            && X1 == Other.X1 && Y1 == Other.Y1 && Z1 == Other.Z1
-            && Axis == Other.Axis;
-    }
+    FOctreeEdge() : Axis(-1), bIsSignChange(false), bStartIsInside(false) {}
 };
 
 struct VOXELPLUGIN_API FMortonIndex {
@@ -505,12 +511,14 @@ private:
     }
 };
 
+
+
 struct VOXELPLUGIN_API FAdaptiveOctreeNode : public TSharedFromThis<FAdaptiveOctreeNode>
 {
 private:    
-    void ComputeDualContourPosition();
+    void ComputeDualContourPosition(FAdaptiveOctree* InOwner);
     
-    FVector GetInterpolatedNormal(FVector P);
+    FVector GetInterpolatedNormal(FVector P, FAdaptiveOctree* InOwner);
     
     bool bIsLeaf = true;
     
@@ -525,8 +533,8 @@ public:
     
     TWeakPtr<FAdaptiveOctreeNode> Neighbors[6];
 
-    FNodeCorner Corners[8];
-    
+    int32 Corners[8] = { INDEX_NONE, INDEX_NONE, INDEX_NONE, INDEX_NONE, INDEX_NONE, INDEX_NONE, INDEX_NONE, INDEX_NONE };
+
     TArray<FNodeEdge> SignChangeEdges;
     
     int ChunkDepth = 4;
@@ -559,9 +567,9 @@ public:
 
     bool ShouldMerge(FVector InCameraPosition, double InScreenSpaceThreshold, double InCameraFOV);
 
-    void Split();
+    void Split(FAdaptiveOctree* InOwner);
 
-    void Merge();
+    void Merge(FAdaptiveOctree* InOwner);
     
     TArray<TSharedPtr<FAdaptiveOctreeNode>> GetSurfaceChunks();
 
@@ -569,7 +577,7 @@ public:
 
     TArray<FNodeEdge>& GetSignChangeEdges();
 
-    void FinalizeFromExistingCorners();
+    void FinalizeFromExistingCorners(FAdaptiveOctree* InOwner);
 
     // Root Constructor
     FAdaptiveOctreeNode(FVector InCenter, double InExtent, int InChunkDepth, int InMinDepth, int InMaxDepth);
@@ -577,15 +585,3 @@ public:
     // Child Constructor
     FAdaptiveOctreeNode(TSharedPtr<FAdaptiveOctreeNode> InParent, uint8 InChildIndex, FVector InAnchorCenter);
 };
-
-FORCEINLINE uint32 GetTypeHash(const FEdgeKey& Key)
-{
-    uint32 Hash = GetTypeHash(Key.X0);
-    Hash = HashCombine(Hash, GetTypeHash(Key.Y0));
-    Hash = HashCombine(Hash, GetTypeHash(Key.Z0));
-    Hash = HashCombine(Hash, GetTypeHash(Key.X1));
-    Hash = HashCombine(Hash, GetTypeHash(Key.Y1));
-    Hash = HashCombine(Hash, GetTypeHash(Key.Z1));
-    Hash = HashCombine(Hash, GetTypeHash(Key.Axis));
-    return Hash;
-}

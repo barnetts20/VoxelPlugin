@@ -22,11 +22,6 @@ FAdaptiveOctreeNode::FAdaptiveOctreeNode(FVector InCenter, double InExtent, int 
     DepthBounds[0] = InChunkDepth;
     DepthBounds[1] = InMaxDepth;
     DepthBounds[2] = InMinDepth;
-
-    for (int i = 0; i < 8; i++)
-    {
-        Corners[i].Position = Center + (OctreeConstants::Offsets[i] * Extent);
-    }
 }
 
 FAdaptiveOctreeNode::FAdaptiveOctreeNode(TSharedPtr<FAdaptiveOctreeNode> InParent, uint8 ChildIndex, FVector InAnchorCenter)
@@ -47,16 +42,17 @@ FAdaptiveOctreeNode::FAdaptiveOctreeNode(TSharedPtr<FAdaptiveOctreeNode> InParen
     DepthBounds[0] = InParent->DepthBounds[0];
     DepthBounds[1] = InParent->DepthBounds[1];
     DepthBounds[2] = InParent->DepthBounds[2];
-
-    for (int i = 0; i < 8; i++)
-    {
-        Corners[i].Position = Center + (OctreeConstants::Offsets[i] * Extent);
-    }
 }
 
-FVector FAdaptiveOctreeNode::GetInterpolatedNormal(FVector P)
+FVector FAdaptiveOctreeNode::GetInterpolatedNormal(FVector P, FAdaptiveOctree* InOwner)
 {
     // Normalize P to [0, 1] range within the cell
+    FCornerData LocalCorners[8];
+    for (int i = 0; i < 8; i++)
+    {
+        LocalCorners[i] = InOwner->GetCornerData(Corners[i]);
+    }
+
     double tx = (P.X - (Center.X - Extent)) / (2.0 * Extent);
     double ty = (P.Y - (Center.Y - Extent)) / (2.0 * Extent);
     double tz = (P.Z - (Center.Z - Extent)) / (2.0 * Extent);
@@ -66,10 +62,10 @@ FVector FAdaptiveOctreeNode::GetInterpolatedNormal(FVector P)
     tz = FMath::Clamp(tz, 0.0, 1.0);
 
     // Trilinear interpolation of the 8 corner normals
-    FVector n00 = FMath::Lerp(Corners[0].Normal, Corners[1].Normal, tx);
-    FVector n01 = FMath::Lerp(Corners[2].Normal, Corners[3].Normal, tx);
-    FVector n10 = FMath::Lerp(Corners[4].Normal, Corners[5].Normal, tx);
-    FVector n11 = FMath::Lerp(Corners[6].Normal, Corners[7].Normal, tx);
+    FVector n00 = FMath::Lerp(LocalCorners[0].Normal, LocalCorners[1].Normal, tx);
+    FVector n01 = FMath::Lerp(LocalCorners[2].Normal, LocalCorners[3].Normal, tx);
+    FVector n10 = FMath::Lerp(LocalCorners[4].Normal, LocalCorners[5].Normal, tx);
+    FVector n11 = FMath::Lerp(LocalCorners[6].Normal, LocalCorners[7].Normal, tx);
 
     FVector n0 = FMath::Lerp(n00, n01, ty);
     FVector n1 = FMath::Lerp(n10, n11, ty);
@@ -78,36 +74,46 @@ FVector FAdaptiveOctreeNode::GetInterpolatedNormal(FVector P)
     return FinalNormal.GetSafeNormal();
 }
 
-void FAdaptiveOctreeNode::FinalizeFromExistingCorners()
+void FAdaptiveOctreeNode::FinalizeFromExistingCorners(FAdaptiveOctree* InOwner)
 {
-    SignChangeEdges.Reset();
+
+    // 1. GATHER (Read-only phase)
+    FCornerData LocalCorners[8];
+    for (int i = 0; i < 8; i++)
+    {
+        LocalCorners[i] = InOwner->GetCornerData(Corners[i]);
+    }
 
     // Compute normals from local corners if not already set by map
     for (int i = 0; i < 8; i++)
     {
-        double d = Corners[i].Density;
+        double d = LocalCorners[i].Density;
         int idxX = i ^ 1;
         int idxY = i ^ 2;
         int idxZ = i ^ 4;
 
-        double dx = (OctreeConstants::Offsets[i].X < 0) ? (Corners[idxX].Density - d) : (d - Corners[idxX].Density);
-        double dy = (OctreeConstants::Offsets[i].Y < 0) ? (Corners[idxY].Density - d) : (d - Corners[idxY].Density);
-        double dz = (OctreeConstants::Offsets[i].Z < 0) ? (Corners[idxZ].Density - d) : (d - Corners[idxZ].Density);
+        double dx = (OctreeConstants::Offsets[i].X < 0) ? (LocalCorners[idxX].Density - d) : (d - LocalCorners[idxX].Density);
+        double dy = (OctreeConstants::Offsets[i].Y < 0) ? (LocalCorners[idxY].Density - d) : (d - LocalCorners[idxY].Density);
+        double dz = (OctreeConstants::Offsets[i].Z < 0) ? (LocalCorners[idxZ].Density - d) : (d - LocalCorners[idxZ].Density);
 
         FVector Normal(dx, dy, dz);
         if (!Normal.Normalize())
-            Normal = (Corners[i].Position - AnchorCenter).GetSafeNormal();
+            Normal = (LocalCorners[i].Position - AnchorCenter).GetSafeNormal();
 
-        Corners[i].Normal = Normal;
+        InOwner->SetCornerNormal(Corners[i], Normal);
     }
 
+    SignChangeEdges.Reset();
     for (int i = 0; i < 12; i++)
     {
-        FNodeEdge NewEdge(Corners[OctreeConstants::EdgePairs[i][0]], Corners[OctreeConstants::EdgePairs[i][1]]);
-        if (NewEdge.SignChange)
-            SignChangeEdges.Add(NewEdge);
+        int32 IdxA = Corners[OctreeConstants::EdgePairs[i][0]];
+        int32 IdxB = Corners[OctreeConstants::EdgePairs[i][1]];
+
+        FNodeEdge NewEdge(IdxA, IdxB, LocalCorners[OctreeConstants::EdgePairs[i][0]], LocalCorners[OctreeConstants::EdgePairs[i][1]]);
+        if (NewEdge.SignChange) SignChangeEdges.Add(NewEdge);
     }
-    ComputeDualContourPosition();
+
+    ComputeDualContourPosition(InOwner);
 
     if (IsSurfaceNode)
     {
@@ -120,24 +126,34 @@ void FAdaptiveOctreeNode::FinalizeFromExistingCorners()
     }
 }
 
-void FAdaptiveOctreeNode::Split()
+void FAdaptiveOctreeNode::Split(FAdaptiveOctree* InOwner)
 {
     if (!bIsLeaf) return;
 
-    // Determine the anchor for children
-    // If THIS node is at the ChunkDepth, its children will use its center as their anchor.
-    // Otherwise, they inherit the current anchor.
     FVector NextAnchor = (Index.Depth == DepthBounds[0]) ? Center : AnchorCenter;
+
+    // Every child corner position is Center + {-1,0,+1} * Extent on each axis.
+    // AcquireCorner handles dedup — parent corners already exist in the map,
+    // so they just get AddRef'd. New interior points get allocated.
 
     for (uint8 i = 0; i < 8; i++)
     {
-        // Update constructor to take NextAnchor
-        Children[i] = MakeShared<FAdaptiveOctreeNode>( AsShared(), i, NextAnchor);
+        Children[i] = MakeShared<FAdaptiveOctreeNode>(AsShared(), i, NextAnchor);
+
+        double ChildExtent = Children[i]->Extent;  // already set by child constructor
+        FVector ChildCenter = Children[i]->Center;
+
+        for (int j = 0; j < 8; j++)
+        {
+            FVector CornerPos = ChildCenter + OctreeConstants::Offsets[j] * ChildExtent;
+            Children[i]->Corners[j] = InOwner->AcquireCorner(CornerPos);
+        }
     }
+
     bIsLeaf = false;
 }
 
-void FAdaptiveOctreeNode::Merge()
+void FAdaptiveOctreeNode::Merge(FAdaptiveOctree* InOwner)
 {
     if (bIsLeaf) return;
 
@@ -145,10 +161,32 @@ void FAdaptiveOctreeNode::Merge()
     {
         if (Children[i].IsValid())
         {
-            Children[i]->Merge();
+            // Recursive merge first to clean up the bottom of the tree
+            Children[i]->Merge(InOwner);
+
+            // Clean up the corners of the child we are about to delete
+            for (int j = 0; j < 8; j++)
+            {
+                int32 CornerIdx = Children[i]->Corners[j];
+
+                // Use INDEX_NONE check instead of null check
+                if (CornerIdx != INDEX_NONE)
+                {
+                    // ReleaseCorner handles the RefCount decrement and 
+                    // potential removal from the TSparseArray/Map
+                    InOwner->ReleaseCorner(CornerIdx);
+
+                    // Mark as invalid to prevent double-release 
+                    // (though the node is being deleted anyway)
+                    Children[i]->Corners[j] = INDEX_NONE;
+                }
+            }
+
+            // Finally, delete the child node
             Children[i].Reset();
         }
     }
+
     bIsLeaf = true;
 }
 
@@ -227,7 +265,7 @@ void FAdaptiveOctreeNode::ComputeNormalizedPosition(double InRadius) {
     NormalizedPosition = TreeCenter + DirFromCenter * InRadius;
 }
 
-void FAdaptiveOctreeNode::ComputeDualContourPosition()
+void FAdaptiveOctreeNode::ComputeDualContourPosition(FAdaptiveOctree* InOwner)
 {
     if (SignChangeEdges.Num() == 0)
     {
@@ -244,13 +282,13 @@ void FAdaptiveOctreeNode::ComputeDualContourPosition()
 
     for (FNodeEdge& Edge : SignChangeEdges)
     {
-        double Denom = Edge.Corners[1].Density - Edge.Corners[0].Density;
+        double Denom = InOwner->GetCornerData(Edge.Corners[1]).Density - InOwner->GetCornerData(Edge.Corners[0]).Density;
         //if (FMath::Abs(Denom) < 1e-15) continue;
 
         FVector P = Edge.ZeroCrossingPoint;
         MassPoint += P;
 
-        FVector Normal = GetInterpolatedNormal(P);
+        FVector Normal = GetInterpolatedNormal(P, InOwner);
         Qef.AddPlane(P, Normal);
         ValidEdges++;
     }
@@ -292,12 +330,12 @@ void FAdaptiveOctreeNode::ComputeDualContourPosition()
 
     if (DualContourNormal.IsNearlyZero())
     {
-        DualContourNormal.X = (Corners[1].Density + Corners[3].Density + Corners[5].Density + Corners[7].Density) -
-            (Corners[0].Density + Corners[2].Density + Corners[4].Density + Corners[6].Density);
-        DualContourNormal.Y = (Corners[2].Density + Corners[3].Density + Corners[6].Density + Corners[7].Density) -
-            (Corners[0].Density + Corners[1].Density + Corners[4].Density + Corners[5].Density);
-        DualContourNormal.Z = (Corners[4].Density + Corners[5].Density + Corners[6].Density + Corners[7].Density) -
-            (Corners[0].Density + Corners[1].Density + Corners[2].Density + Corners[3].Density);
+        DualContourNormal.X = (InOwner->GetCornerData(Corners[1]).Density + InOwner->GetCornerData(Corners[3]).Density + InOwner->GetCornerData(Corners[5]).Density + InOwner->GetCornerData(Corners[7]).Density) -
+            (InOwner->GetCornerData(Corners[0]).Density + InOwner->GetCornerData(Corners[2]).Density + InOwner->GetCornerData(Corners[4]).Density + InOwner->GetCornerData(Corners[6]).Density);
+        DualContourNormal.Y = (InOwner->GetCornerData(Corners[2]).Density + InOwner->GetCornerData(Corners[3]).Density + InOwner->GetCornerData(Corners[6]).Density + InOwner->GetCornerData(Corners[7]).Density) -
+            (InOwner->GetCornerData(Corners[0]).Density + InOwner->GetCornerData(Corners[1]).Density + InOwner->GetCornerData(Corners[4]).Density + InOwner->GetCornerData(Corners[5]).Density);
+        DualContourNormal.Z = (InOwner->GetCornerData(Corners[4]).Density + InOwner->GetCornerData(Corners[5]).Density + InOwner->GetCornerData(Corners[6]).Density + InOwner->GetCornerData(Corners[7]).Density) -
+            (InOwner->GetCornerData(Corners[0]).Density + InOwner->GetCornerData(Corners[1]).Density + InOwner->GetCornerData(Corners[2]).Density + InOwner->GetCornerData(Corners[3]).Density);
         DualContourNormal.Normalize();
     }
 
@@ -310,6 +348,4 @@ void FAdaptiveOctreeNode::ComputeDualContourPosition()
     {
         DualContourNormal = (DualContourPosition - TreeCenter).GetSafeNormal();
     }
-
-
 }
