@@ -1,6 +1,7 @@
 #pragma once
 
 #include "CoreMinimal.h"
+#include <FNodeStructureProvider.h>
 
 struct VOXELPLUGIN_API OctreeConstants {
     inline static const FVector Offsets[8] = {
@@ -16,6 +17,15 @@ struct VOXELPLUGIN_API OctreeConstants {
         {0, 4}, {1, 5}, {2, 6}, {3, 7}
     };
 
+    inline static const int FaceMap[6][4] = {
+        {1, 3, 5, 7}, // XPos
+        {0, 2, 4, 6}, // XNeg
+        {2, 3, 6, 7}, // YPos
+        {0, 1, 4, 5}, // YNeg
+        {4, 5, 6, 7}, // ZPos
+        {0, 1, 2, 3}  // ZNeg
+    };
+
     enum EFace : uint8 {
         XPos = 0, XNeg = 1,
         YPos = 2, YNeg = 3,
@@ -28,6 +38,49 @@ struct VOXELPLUGIN_API OctreeConstants {
 
     inline static const bool FaceIsPositive[6] = {
         true, false, true, false, true, false
+    };
+
+    // ChildToParentEdgeMap[ChildIndex][ChildEdgeIndex] -> ParentEdgeIndex
+    static const int32 ChildToParentEdgeMap[8][12] = {
+        // Child 0 (0,0,0): Bottom-Front-Left
+        { 0, -1, 2, -1, 4, -1, -1, -1, 8, -1, 10, -1 },
+        // Child 1 (1,0,0): Bottom-Front-Right
+        { 0, -1, 3, -1, -1, 5, -1, -1, 9, -1, -1, 11 },
+        // Child 2 (0,1,0): Bottom-Back-Left
+        { -1, 1, 2, -1, 6, -1, -1, -1, -1, 8, 10, -1 },
+        // Child 3 (1,1,0): Bottom-Back-Right
+        { -1, 1, 3, -1, -1, 7, -1, -1, -1, 9, -1, 11 },
+        // Child 4 (0,0,1): Top-Front-Left
+        { 0, -1, -1, 2, 4, -1, -1, -1, 8, -1, 10, -1 }, // Wait, checking Z-alignment...
+    };
+
+    static const int32 ChildToParentFaceMap[8][6] = {
+        // Child 0 (0,0,0): Min corner child
+        { -1,  1, -1,  3, -1,  5 }, // Touching Parent's X-, Y-, Z-
+        // Child 1 (1,0,0)
+        {  0, -1, -1,  3, -1,  5 }, // Touching Parent's X+, Y-, Z-
+        // Child 2 (0,1,0)
+        { -1,  1,  2, -1, -1,  5 }, // Touching Parent's X-, Y+, Z-
+        // Child 3 (1,1,0)
+        {  0, -1,  2, -1, -1,  5 }, // Touching Parent's X+, Y+, Z-
+        // Child 4 (0,0,1)
+        { -1,  1, -1,  3,  4, -1 }, // Touching Parent's X-, Y-, Z+
+        // Child 5 (1,0,1)
+        {  0, -1, -1,  3,  4, -1 }, // Touching Parent's X+, Y-, Z+
+        // Child 6 (0,1,1)
+        { -1,  1,  2, -1,  4, -1 }, // Touching Parent's X-, Y+, Z+
+        // Child 7 (1,1,1): Max corner child
+        {  0, -1,  2, -1,  4, -1 }  // Touching Parent's X+, Y+, Z+
+    };
+
+    // FaceEdges[FaceIndex][4] -> Node Edge Indices (0-11)
+    static const int32 FaceEdges[6][4] = {
+        { 3, 11, 7, 9 },  // 0: XPos (Right)
+        { 2, 10, 6, 8 },  // 1: XNeg (Left)
+        { 1, 9, 5, 8 },   // 2: YPos (Back)
+        { 0, 11, 4, 10 }, // 3: YNeg (Front)
+        { 4, 5, 6, 7 },   // 4: ZPos (Top)
+        { 0, 1, 2, 3 }    // 5: ZNeg (Bottom)
     };
 
     inline static const uint8 OuterChildren[6][4] = {
@@ -140,7 +193,7 @@ struct VOXELPLUGIN_API FNodeEdge
     }
 };
 
-struct VOXELPLUGIN_API FEdgeKey
+struct VOXELPLUGIN_API FNodeEdgeKey
 {
     int64 X0, Y0, Z0;  // Quantized corner 0 (sorted so min corner is always first)
     int64 X1, Y1, Z1;  // Quantized corner 1
@@ -154,9 +207,9 @@ struct VOXELPLUGIN_API FEdgeKey
         return FMath::RoundToInt64(V / GridSize);
     }
 
-    FEdgeKey() = default;
+    FNodeEdgeKey() = default;
 
-    FEdgeKey(const FNodeEdge& Edge)
+    FNodeEdgeKey(const FNodeEdge& Edge)
     {
         int64 ax = Quantize(Edge.Corners[0].Position.X);
         int64 ay = Quantize(Edge.Corners[0].Position.Y);
@@ -180,7 +233,7 @@ struct VOXELPLUGIN_API FEdgeKey
         Axis = Edge.Axis;
     }
 
-    bool operator==(const FEdgeKey& Other) const
+    bool operator==(const FNodeEdgeKey& Other) const
     {
         return X0 == Other.X0 && Y0 == Other.Y0 && Z0 == Other.Z0
             && X1 == Other.X1 && Y1 == Other.Y1 && Z1 == Other.Z1
@@ -282,7 +335,7 @@ struct VOXELPLUGIN_API FQEF
     FVector MassPoint;
 
     // Accumulated normal (sum of normals passed to AddPlane — for average normal output)
-    FVector AccumulatedNormal;
+    FVector3f AccumulatedNormal;
 
     FQEF()
     {
@@ -298,12 +351,12 @@ struct VOXELPLUGIN_API FQEF
         BTB = 0.0;
         PlaneCount = 0;
         MassPoint = FVector::ZeroVector;
-        AccumulatedNormal = FVector::ZeroVector;
+        AccumulatedNormal = FVector3f::ZeroVector;
     }
 
     // Add a plane constraint: the solution should be close to InPoint
     // along the direction InNormal
-    void AddPlane(const FVector& InPoint, const FVector& InNormal)
+    void AddPlane(const FVector& InPoint, const FVector3f& InNormal)
     {
         // The plane equation is: dot(Normal, X - Point) = 0
         // Which expands to: dot(Normal, X) = dot(Normal, Point)
@@ -338,9 +391,9 @@ struct VOXELPLUGIN_API FQEF
 
     // Returns the average normal from all planes added to this QEF.
     // Returns zero vector if no planes were added.
-    FVector GetAverageNormal() const
+    FVector3f GetAverageNormal() const
     {
-        if (PlaneCount == 0) return FVector::ZeroVector;
+        if (PlaneCount == 0) return FVector3f::ZeroVector;
         return AccumulatedNormal.GetSafeNormal();
     }
 
@@ -510,7 +563,7 @@ struct VOXELPLUGIN_API FAdaptiveOctreeNode : public TSharedFromThis<FAdaptiveOct
 private:    
     void ComputeDualContourPosition();
     
-    FVector GetInterpolatedNormal(FVector P);
+    FVector3f GetInterpolatedNormal(FVector P);
     
     bool bIsLeaf = true;
     
@@ -525,8 +578,10 @@ public:
     
     TWeakPtr<FAdaptiveOctreeNode> Neighbors[6];
 
-    FNodeCorner Corners[8];
-    
+    FCorner* Corners[8];
+    FEdge* Edges[12];
+    FFace* Faces[6];
+
     TArray<FNodeEdge> SignChangeEdges;
     
     int ChunkDepth = 4;
@@ -543,7 +598,7 @@ public:
     
     FVector DualContourPosition;
     
-    FVector DualContourNormal;
+    FVector3f DualContourNormal;
     
     FVector NormalizedPosition;
 
@@ -571,6 +626,12 @@ public:
 
     void FinalizeFromExistingCorners();
 
+    FORCEINLINE FVector GetCornerPosition(int32 Index) const
+    {
+        // Uses your existing OctreeConstants::Offsets to derive world position
+        return Center + (OctreeConstants::Offsets[Index] * Extent);
+    }
+
     // Root Constructor
     FAdaptiveOctreeNode(FVector InCenter, double InExtent, int InChunkDepth, int InMinDepth, int InMaxDepth);
 
@@ -578,7 +639,7 @@ public:
     FAdaptiveOctreeNode(TSharedPtr<FAdaptiveOctreeNode> InParent, uint8 InChildIndex, FVector InAnchorCenter);
 };
 
-FORCEINLINE uint32 GetTypeHash(const FEdgeKey& Key)
+FORCEINLINE uint32 GetTypeHash(const FNodeEdgeKey& Key)
 {
     uint32 Hash = GetTypeHash(Key.X0);
     Hash = HashCombine(Hash, GetTypeHash(Key.Y0));

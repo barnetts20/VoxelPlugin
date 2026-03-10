@@ -4,6 +4,7 @@
 
 #include "CoreMinimal.h"
 #include <FAdaptiveOctreeNode.h>
+#include <FSparseEditStore.h>
 
 struct VOXELPLUGIN_API FCorner
 {
@@ -26,7 +27,7 @@ public:
         PositionKey = InKey;
     }
 
-    FORCEINLINE const FInt64Vector GetKey() {
+    FORCEINLINE const FInt64Vector GetKey() const{
         return PositionKey;
     }
 
@@ -88,6 +89,31 @@ struct VOXELPLUGIN_API FEdgeKey
         return A == Other.A && B == Other.B;
     }
 
+    static FEdgeKey Generate(FCorner* A, FCorner* B) {
+        FInt64Vector RawDelta = A->GetKey() - B->GetKey();
+
+        int64 Magnitude = 0;
+        bool bSwap = false;
+
+        if (RawDelta.X != 0) {
+            Magnitude = RawDelta.X;
+            bSwap = RawDelta.X < 0;
+        }
+        else if (RawDelta.Y != 0) {
+            Magnitude = RawDelta.Y;
+            bSwap = RawDelta.Y < 0;
+        }
+        else {
+            Magnitude = RawDelta.Z;
+            bSwap = RawDelta.Z < 0;
+        }
+
+        FCorner* MinC = bSwap ? B : A;
+        FCorner* MaxC = bSwap ? A : B;
+
+        return FEdgeKey(MinC, MaxC);
+    }
+
     // This stays inside the struct but behaves as a global function
     friend FORCEINLINE uint32 GetTypeHash(const FEdgeKey& Key)
     {
@@ -112,7 +138,7 @@ private:
 
 public:
 
-    FEdge(FCorner* InCorner1, FCorner* InCorner2, FEdge* Parent) {
+    FEdge(FCorner* InCorner1, FCorner* InCorner2, FEdge* InParent) : Parent(InParent) {
         FInt64Vector RawDelta = InCorner2->GetKey() - InCorner1->GetKey();
 
         int64 Magnitude = 0;
@@ -141,15 +167,25 @@ public:
         Size = static_cast<double>(FMath::Abs(Magnitude));
     }
 
+    FEdge(FEdgeKey InKey, FEdge* InParent) : FEdge(InKey.A, InKey.B, InParent) {};
+
     FORCEINLINE const FEdgeKey GetKey() const {
         return Key;
     }
-    
-    FORCEINLINE const FCorner* GetMinCorner() {
+
+    FORCEINLINE FCorner* GetMinCorner() {
         return Key.A;
     }
 
-    FORCEINLINE const FCorner* GetMaxCorner() {
+    FORCEINLINE const FCorner* GetMinCorner() const{
+        return Key.A;
+    }
+    
+    FORCEINLINE FCorner* GetMaxCorner() {
+        return Key.B;
+    }
+
+    FORCEINLINE const FCorner* GetMaxCorner() const{
         return Key.B;
     }
 
@@ -189,8 +225,33 @@ struct VOXELPLUGIN_API FFaceKey
     int32 Axis; // 0, 1, or 2
 
     FFaceKey() : Min(nullptr), Max(nullptr), Axis(-1) {}
-    FFaceKey(FCorner* InMin, FCorner* InMax, int32 InAxis)
+    FFaceKey(FCorner* InMin, FCorner* InMax, short InAxis)
         : Min(InMin), Max(InMax), Axis(InAxis) {}
+
+    static FFaceKey Generate(FCorner* InCorners[4], short InAxis) {
+        // 1. Identify plane axes (U and V)
+        int32 U = (InAxis + 1) % 3;
+        int32 V = (InAxis + 2) % 3;
+
+        // 2. Sort the 4 corners to find the absolute Min and Max for the FFaceKey.
+        // In our quantized 1cm grid, Min is the corner with the lowest U and V.
+        FCorner* MinC = InCorners[0];
+        FCorner* MaxC = InCorners[0];
+
+        for (int i = 1; i < 4; i++)
+        {
+            const FInt64Vector& K = InCorners[i]->GetKey();
+            const FInt64Vector& MK = MinC->GetKey();
+            const FInt64Vector& XK = MaxC->GetKey();
+
+            // Standard 2D Sort: Compare U, then V
+            if (K[U] < MK[U] || (K[U] == MK[U] && K[V] < MK[V])) MinC = InCorners[i];
+            if (K[U] > XK[U] || (K[U] == XK[U] && K[V] > XK[V])) MaxC = InCorners[i];
+        }
+
+        // 3. Set the Key and AddRef the anchors
+        return FFaceKey(MinC, MaxC, InAxis);
+    }
 
     bool operator==(const FFaceKey& Other) const {
         return Min == Other.Min && Max == Other.Max && Axis == Other.Axis;
@@ -223,44 +284,53 @@ struct VOXELPLUGIN_API FFace {
         for (int i = 0; i < 4; i++) { Corners[i] = nullptr; Edges[i] = nullptr; }
     }
 
-    FFace(FCorner* InC[4], int32 InAxis, FFace* InParent) : Axis(InAxis), Parent(InParent)
+    FFace(FEdge* InEdges[4], short InAxis, FFace* InParent) : Axis(InAxis), Parent(InParent)
     {
-        // 1. Identify plane axes (U and V)
         int32 U = (Axis + 1) % 3;
         int32 V = (Axis + 2) % 3;
 
-        // 2. Sort the 4 corners to find the absolute Min and Max for the FFaceKey.
-        // In our quantized 1cm grid, Min is the corner with the lowest U and V.
-        FCorner* MinC = InC[0];
-        FCorner* MaxC = InC[0];
+        // FIX: We need a reference point for "Min" and "Max" before the Key exists.
+        // We'll just find the min/max coordinates from the input edges.
+        int64 MinU = MAX_int64, MaxU = MIN_int64;
+        int64 MinV = MAX_int64, MaxV = MIN_int64;
 
-        for (int i = 1; i < 4; i++)
-        {
-            const FInt64Vector& K = InC[i]->GetKey();
-            const FInt64Vector& MK = MinC->GetKey();
-            const FInt64Vector& XK = MaxC->GetKey();
-
-            // Standard 2D Sort: Compare U, then V
-            if (K[U] < MK[U] || (K[U] == MK[U] && K[V] < MK[V])) MinC = InC[i];
-            if (K[U] > XK[U] || (K[U] == XK[U] && K[V] > XK[V])) MaxC = InC[i];
+        for (int i = 0; i < 4; ++i) {
+            const FInt64Vector& K1 = InEdges[i]->GetMinCorner()->GetKey();
+            const FInt64Vector& K2 = InEdges[i]->GetMaxCorner()->GetKey();
+            MinU = FMath::Min(MinU, FMath::Min(K1[U], K2[U]));
+            MaxU = FMath::Max(MaxU, FMath::Max(K1[U], K2[U]));
+            MinV = FMath::Min(MinV, FMath::Min(K1[V], K2[V]));
+            MaxV = FMath::Max(MaxV, FMath::Max(K1[V], K2[V]));
         }
 
-        // 3. Set the Key and AddRef the anchors
-        Key = FFaceKey(MinC, MaxC, Axis);
-
-        // 4. Map the 4 corners to our internal Slot array (0-3)
-        // Slot 0: (MinU, MinV) | Slot 1: (MaxU, MinV) | Slot 2: (MaxU, MaxV) | Slot 3: (MinU, MaxV)
-        FInt64Vector P_Min = MinC->GetKey();
-        FInt64Vector P_Max = MaxC->GetKey();
-
-        for (int i = 0; i < 4; i++)
+        // 1. CANONICAL EDGE SORTING
+        for (int32 i = 0; i < 4; ++i)
         {
-            const FInt64Vector& K = InC[i]->GetKey();
-            bool bHighU = K[U] == P_Max[U];
-            bool bHighV = K[V] == P_Max[V];
+            FEdge* E = InEdges[i];
+            FInt64Vector P = E->GetMinCorner()->GetKey();
 
-            int32 Slot = (bHighU ? 1 : 0) | (bHighV ? 2 : 0);
-            Corners[Slot] = InC[i];
+            if (E->GetAxis() == U) {
+                // Lower V is Bottom (0), Higher V is Top (2)
+                Edges[(P[V] == MinV) ? 0 : 2] = E;
+            }
+            else {
+                // Higher U is Right (1), Lower U is Left (3)
+                Edges[(P[U] == MaxU) ? 1 : 3] = E;
+            }
+        }
+
+        // 2. CORNER EXTRACTION (Winding: BL -> BR -> TR -> TL)
+        Corners[0] = Edges[0]->GetMinCorner(); // (MinU, MinV)
+        Corners[1] = Edges[0]->GetMaxCorner(); // (MaxU, MinV)
+        Corners[2] = Edges[2]->GetMaxCorner(); // (MaxU, MaxV)
+        Corners[3] = Edges[2]->GetMinCorner(); // (MinU, MaxV)
+
+        // 3. NOW GENERATE KEY
+        Key = FFaceKey(Corners[0], Corners[2], Axis);
+
+        // 4. EDGE-LINKING
+        for (int32 i = 0; i < 4; i++) {
+            Edges[i]->RegisterConnectedFace(this);
         }
     }
 
@@ -284,6 +354,7 @@ struct VOXELPLUGIN_API FFace {
 class VOXELPLUGIN_API FNodeStructureProvider : public TSharedFromThis<FNodeStructureProvider>
 {
 private:
+    TSharedPtr<FSparseEditStore> EditStore;
     /** Mutexes marked mutable to allow locking in const-pointer scenarios */
     mutable FRWLock CornerLock;
     mutable FRWLock EdgeLock;
@@ -308,15 +379,15 @@ private:
      * These assume the caller is already holding the appropriate WriteLock.
      */
     FCorner* Internal_CreateCorner(const FInt64Vector& InKey);
-    FEdge* Internal_CreateEdge(const FEdgeKey& InKey);
-    FFace* Internal_CreateFace(const FFaceKey& InKey, int32 InAxis);
+    FEdge* Internal_CreateEdge(const FEdgeKey& InKey, FEdge* InParent);
+    FFace* Internal_CreateFace(FEdge* InEdges[4], int32 InAxis, FFace* InParent, TSharedPtr<FAdaptiveOctreeNode> InNode);
 
 public:
     FNodeStructureProvider();
     ~FNodeStructureProvider();
 
     /** SIMD Density Function: Handed in from the Planet Actor or Volume */
-    TFunction<void(int32 Count, const float* X, const float* Y, const float* Z, float* OutDensities)> InDensityFunction;
+    TFunction<void(int32 Count, const float* X, const float* Y, const float* Z, float* OutDensities)> DensityFunction;
 
     /** High-level batch population for Octree Splits */
     void PopulateNodeStructure(const TArray<TSharedPtr<class FAdaptiveOctreeNode>>& InNodes);
@@ -326,8 +397,8 @@ public:
 
     /** Thread-safe Acquisition API */
     FCorner* GetOrCreateCorner(const FVector& InPosition);
-    FEdge* GetOrCreateEdge(FCorner* InC1, FCorner* InC2);
-    FFace* GetOrCreateFace(FCorner* InC1, FCorner* InC2, int32 Axis);
+    FEdge* GetOrCreateEdge(FCorner* InC1, FCorner* InC2, FEdge* InParent);
+    FFace* GetOrCreateFace(FEdge* InEdges[4], int32 InAxis, FFace* InFace, TSharedPtr<FAdaptiveOctreeNode> InNode);
 
     /** * Cleanup: Optional method to prune the TChunkedArrays
      * using the FreeLists when RefCounts hit zero.

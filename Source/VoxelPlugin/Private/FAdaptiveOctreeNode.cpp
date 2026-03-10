@@ -22,11 +22,6 @@ FAdaptiveOctreeNode::FAdaptiveOctreeNode(FVector InCenter, double InExtent, int 
     DepthBounds[0] = InChunkDepth;
     DepthBounds[1] = InMaxDepth;
     DepthBounds[2] = InMinDepth;
-
-    for (int i = 0; i < 8; i++)
-    {
-        Corners[i].Position = Center + (OctreeConstants::Offsets[i] * Extent);
-    }
 }
 
 FAdaptiveOctreeNode::FAdaptiveOctreeNode(TSharedPtr<FAdaptiveOctreeNode> InParent, uint8 ChildIndex, FVector InAnchorCenter)
@@ -47,14 +42,9 @@ FAdaptiveOctreeNode::FAdaptiveOctreeNode(TSharedPtr<FAdaptiveOctreeNode> InParen
     DepthBounds[0] = InParent->DepthBounds[0];
     DepthBounds[1] = InParent->DepthBounds[1];
     DepthBounds[2] = InParent->DepthBounds[2];
-
-    for (int i = 0; i < 8; i++)
-    {
-        Corners[i].Position = Center + (OctreeConstants::Offsets[i] * Extent);
-    }
 }
 
-FVector FAdaptiveOctreeNode::GetInterpolatedNormal(FVector P)
+FVector3f FAdaptiveOctreeNode::GetInterpolatedNormal(FVector P)
 {
     // Normalize P to [0, 1] range within the cell
     double tx = (P.X - (Center.X - Extent)) / (2.0 * Extent);
@@ -66,15 +56,15 @@ FVector FAdaptiveOctreeNode::GetInterpolatedNormal(FVector P)
     tz = FMath::Clamp(tz, 0.0, 1.0);
 
     // Trilinear interpolation of the 8 corner normals
-    FVector n00 = FMath::Lerp(Corners[0].Normal, Corners[1].Normal, tx);
-    FVector n01 = FMath::Lerp(Corners[2].Normal, Corners[3].Normal, tx);
-    FVector n10 = FMath::Lerp(Corners[4].Normal, Corners[5].Normal, tx);
-    FVector n11 = FMath::Lerp(Corners[6].Normal, Corners[7].Normal, tx);
+    FVector3f n00 = FMath::Lerp(Corners[0]->GetNormal(), Corners[1]->GetNormal(), tx);
+    FVector3f n01 = FMath::Lerp(Corners[2]->GetNormal(), Corners[3]->GetNormal(), tx);
+    FVector3f n10 = FMath::Lerp(Corners[4]->GetNormal(), Corners[5]->GetNormal(), tx);
+    FVector3f n11 = FMath::Lerp(Corners[6]->GetNormal(), Corners[7]->GetNormal(), tx);
 
-    FVector n0 = FMath::Lerp(n00, n01, ty);
-    FVector n1 = FMath::Lerp(n10, n11, ty);
+    FVector3f n0 = FMath::Lerp(n00, n01, ty);
+    FVector3f n1 = FMath::Lerp(n10, n11, ty);
 
-    FVector FinalNormal = FMath::Lerp(n0, n1, tz);
+    FVector3f FinalNormal = FMath::Lerp(n0, n1, tz);
     return FinalNormal.GetSafeNormal();
 }
 
@@ -83,30 +73,29 @@ void FAdaptiveOctreeNode::FinalizeFromExistingCorners()
     SignChangeEdges.Reset();
 
     // Compute normals from local corners if not already set by map
-    for (int i = 0; i < 8; i++)
-    {
-        double d = Corners[i].Density;
-        int idxX = i ^ 1;
-        int idxY = i ^ 2;
-        int idxZ = i ^ 4;
+    //for (int i = 0; i < 8; i++)
+    //{
+    //    double d = Corners[i]->GetDensity();
+    //    int idxX = i ^ 1;
+    //    int idxY = i ^ 2;
+    //    int idxZ = i ^ 4;
 
-        double dx = (OctreeConstants::Offsets[i].X < 0) ? (Corners[idxX].Density - d) : (d - Corners[idxX].Density);
-        double dy = (OctreeConstants::Offsets[i].Y < 0) ? (Corners[idxY].Density - d) : (d - Corners[idxY].Density);
-        double dz = (OctreeConstants::Offsets[i].Z < 0) ? (Corners[idxZ].Density - d) : (d - Corners[idxZ].Density);
+    //    double dx = (OctreeConstants::Offsets[i].X < 0) ? (Corners[idxX]->GetDensity() - d) : (d - Corners[idxX]->GetDensity());
+    //    double dy = (OctreeConstants::Offsets[i].Y < 0) ? (Corners[idxY]->GetDensity() - d) : (d - Corners[idxY]->GetDensity());
+    //    double dz = (OctreeConstants::Offsets[i].Z < 0) ? (Corners[idxZ]->GetDensity() - d) : (d - Corners[idxZ]->GetDensity());
 
-        FVector Normal(dx, dy, dz);
-        if (!Normal.Normalize())
-            Normal = (Corners[i].Position - AnchorCenter).GetSafeNormal();
+    //    FVector3f Normal(dx, dy, dz);
+    //    if (!Normal.Normalize()) Normal = (FVector3f)(Corners[i]->GetPosition() - AnchorCenter).GetSafeNormal();
 
-        Corners[i].Normal = Normal;
-    }
+    //    Corners[i]->SetNormal(Normal);
+    //}
 
-    for (int i = 0; i < 12; i++)
-    {
-        FNodeEdge NewEdge(Corners[OctreeConstants::EdgePairs[i][0]], Corners[OctreeConstants::EdgePairs[i][1]]);
-        if (NewEdge.SignChange)
-            SignChangeEdges.Add(NewEdge);
-    }
+    //for (int i = 0; i < 12; i++)
+    //{
+    //    FEdge NewEdge(Corners[OctreeConstants::EdgePairs[i][0]], Corners[OctreeConstants::EdgePairs[i][1]]);
+    //    if (NewEdge.SignChange)
+    //        SignChangeEdges.Add(NewEdge);
+    //}
     ComputeDualContourPosition();
 
     if (IsSurfaceNode)
@@ -231,7 +220,7 @@ void FAdaptiveOctreeNode::ComputeDualContourPosition()
 {
     if (SignChangeEdges.Num() == 0)
     {
-        DualContourNormal = FVector::ZeroVector;
+        DualContourNormal = FVector3f::ZeroVector;
         DualContourPosition = Center;
         IsSurfaceNode = false;
         return;
@@ -250,7 +239,7 @@ void FAdaptiveOctreeNode::ComputeDualContourPosition()
         FVector P = Edge.ZeroCrossingPoint;
         MassPoint += P;
 
-        FVector Normal = GetInterpolatedNormal(P);
+        FVector3f Normal = GetInterpolatedNormal(P);
         Qef.AddPlane(P, Normal);
         ValidEdges++;
     }
@@ -258,7 +247,7 @@ void FAdaptiveOctreeNode::ComputeDualContourPosition()
     if (ValidEdges == 0)
     {
         DualContourPosition = Center;
-        DualContourNormal = FVector::ZeroVector;
+        DualContourNormal = FVector3f::ZeroVector;
         return;
     }
 
@@ -292,23 +281,23 @@ void FAdaptiveOctreeNode::ComputeDualContourPosition()
 
     if (DualContourNormal.IsNearlyZero())
     {
-        DualContourNormal.X = (Corners[1].Density + Corners[3].Density + Corners[5].Density + Corners[7].Density) -
-            (Corners[0].Density + Corners[2].Density + Corners[4].Density + Corners[6].Density);
-        DualContourNormal.Y = (Corners[2].Density + Corners[3].Density + Corners[6].Density + Corners[7].Density) -
-            (Corners[0].Density + Corners[1].Density + Corners[4].Density + Corners[5].Density);
-        DualContourNormal.Z = (Corners[4].Density + Corners[5].Density + Corners[6].Density + Corners[7].Density) -
-            (Corners[0].Density + Corners[1].Density + Corners[2].Density + Corners[3].Density);
+        DualContourNormal.X = (Corners[1]->GetDensity() + Corners[3]->GetDensity() + Corners[5]->GetDensity() + Corners[7]->GetDensity()) -
+            (Corners[0]->GetDensity() + Corners[2]->GetDensity() + Corners[4]->GetDensity() + Corners[6]->GetDensity());
+        DualContourNormal.Y = (Corners[2]->GetDensity() + Corners[3]->GetDensity() + Corners[6]->GetDensity() + Corners[7]->GetDensity()) -
+            (Corners[0]->GetDensity() + Corners[1]->GetDensity() + Corners[4]->GetDensity() + Corners[5]->GetDensity());
+        DualContourNormal.Z = (Corners[4]->GetDensity() + Corners[5]->GetDensity() + Corners[6]->GetDensity() + Corners[7]->GetDensity()) -
+            (Corners[0]->GetDensity() + Corners[1]->GetDensity() + Corners[2]->GetDensity() + Corners[3]->GetDensity());
         DualContourNormal.Normalize();
     }
 
     if (DualContourNormal.IsNearlyZero())
     {
-        DualContourNormal = (DualContourPosition - TreeCenter).GetSafeNormal();
+        DualContourNormal = (FVector3f)(DualContourPosition - TreeCenter).GetSafeNormal();
     }
 
     if (DualContourNormal.IsNearlyZero())
     {
-        DualContourNormal = (DualContourPosition - TreeCenter).GetSafeNormal();
+        DualContourNormal = (FVector3f)(DualContourPosition - TreeCenter).GetSafeNormal();
     }
 
 
