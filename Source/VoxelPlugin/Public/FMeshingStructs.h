@@ -149,7 +149,7 @@ struct VOXELPLUGIN_API FMeshChunk {
     };
 
     void UpdateComponent(TSharedPtr<FMeshChunk> Self) {
-        AsyncTask(ENamedThreads::GameThread, [Self]() {            
+        AsyncTask(ENamedThreads::GameThread, [Self]() {
             // 1. Lazy Init
             if (!Self->IsInitialized) {
                 ARealtimeMeshActor* Parent = Self->CachedParentActor.Get();
@@ -166,13 +166,13 @@ struct VOXELPLUGIN_API FMeshChunk {
             if (!Self->IsDirty) return;
 
             // 3. Surface update
+            // Use CreateSectionGroup (not Update) so sections are (re)created from the polygroup
+            // stream and RealtimeMesh knows which triangles belong to which section.
+            // CreateSectionGroup replaces the group if it already exists.
             auto* SrfTriStream = Self->SurfaceMeshData->MeshStream.Find(FRealtimeMeshStreams::Triangles);
             int32 SrfNumTris = SrfTriStream ? SrfTriStream->Num() : 0;
-            if (SrfNumTris <= 0) {
-                MeshPtr->UpdateSectionGroup(Self->SurfaceMeshData->MeshGroupKey, FRealtimeMeshStreamSet());
-            }
-            else {
-                MeshPtr->UpdateSectionGroup(Self->SurfaceMeshData->MeshGroupKey, Self->SurfaceMeshData->MeshStream);
+            if (SrfNumTris > 0) {
+                MeshPtr->CreateSectionGroup(Self->SurfaceMeshData->MeshGroupKey, Self->SurfaceMeshData->MeshStream);
                 FRealtimeMeshSectionConfig SrfConfig(0); // material slot 0
                 MeshPtr->UpdateSectionConfig(Self->SurfaceMeshData->MeshSectionKey, SrfConfig, true);
             }
@@ -180,11 +180,8 @@ struct VOXELPLUGIN_API FMeshChunk {
             // 4. Ocean update
             auto* OcnTriStream = Self->OceanMeshData->MeshStream.Find(FRealtimeMeshStreams::Triangles);
             int32 OcnNumTris = OcnTriStream ? OcnTriStream->Num() : 0;
-            if (OcnNumTris <= 0) {
-                MeshPtr->UpdateSectionGroup(Self->OceanMeshData->MeshGroupKey, FRealtimeMeshStreamSet());
-            }
-            else {
-                MeshPtr->UpdateSectionGroup(Self->OceanMeshData->MeshGroupKey, Self->OceanMeshData->MeshStream);
+            if (OcnNumTris > 0) {
+                MeshPtr->CreateSectionGroup(Self->OceanMeshData->MeshGroupKey, Self->OceanMeshData->MeshStream);
                 FRealtimeMeshSectionConfig OcnConfig(1); // material slot 1
                 OcnConfig.bIsVisible = true;
                 OcnConfig.bCastsShadow = false;
@@ -192,7 +189,7 @@ struct VOXELPLUGIN_API FMeshChunk {
             }
 
             Self->IsDirty = false;
-        });
+            });
     }
 };
 

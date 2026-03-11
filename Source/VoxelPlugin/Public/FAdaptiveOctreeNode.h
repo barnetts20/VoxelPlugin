@@ -43,18 +43,26 @@ struct VOXELPLUGIN_API OctreeConstants {
         true, false, true, false, true, false
     };
 
-    // ChildToParentEdgeMap[ChildIndex][ChildEdgeIndex] -> ParentEdgeIndex
+    // ChildToParentEdgeMap[ChildIndex][ChildEdgeIndex] -> ParentEdgeIndex (-1 = no parent edge)
+    // Edge axis groups: X-axis edges 0-3, Y-axis edges 4-7, Z-axis edges 8-11
+    // EdgePairs: {0,1},{2,3},{4,5},{6,7} = X-axis; {0,2},{1,3},{4,6},{5,7} = Y-axis; {0,4},{1,5},{2,6},{3,7} = Z-axis
     static constexpr int32 ChildToParentEdgeMap[8][12] = {
-        // Child 0 (0,0,0): Bottom-Front-Left
-        { 0, -1, 2, -1, 4, -1, -1, -1, 8, -1, 10, -1 },
-        // Child 1 (1,0,0): Bottom-Front-Right
-        { 0, -1, 3, -1, -1, 5, -1, -1, 9, -1, -1, 11 },
-        // Child 2 (0,1,0): Bottom-Back-Left
-        { -1, 1, 2, -1, 6, -1, -1, -1, -1, 8, 10, -1 },
-        // Child 3 (1,1,0): Bottom-Back-Right
-        { -1, 1, 3, -1, -1, 7, -1, -1, -1, 9, -1, 11 },
-        // Child 4 (0,0,1): Top-Front-Left
-        { 0, -1, -1, 2, 4, -1, -1, -1, 8, -1, 10, -1 }, // Wait, checking Z-alignment...
+        // Child 0 (0,0,0): Min corner — touches parent edges on X-,Y-,Z- faces
+        {  0, -1,  2, -1,  4, -1, -1, -1,  8, -1, 10, -1 },
+        // Child 1 (1,0,0): touches parent edges on X+,Y-,Z- faces
+        {  0, -1,  3, -1, -1,  5, -1, -1,  9, -1, -1, 11 },
+        // Child 2 (0,1,0): touches parent edges on X-,Y+,Z- faces
+        { -1,  1,  2, -1,  6, -1, -1, -1, -1,  8, 10, -1 },
+        // Child 3 (1,1,0): touches parent edges on X+,Y+,Z- faces
+        { -1,  1,  3, -1, -1,  7, -1, -1, -1,  9, -1, 11 },
+        // Child 4 (0,0,1): touches parent edges on X-,Y-,Z+ faces
+        {  0, -1, -1,  2,  4, -1, -1, -1,  8, -1, 10, -1 },
+        // Child 5 (1,0,1): touches parent edges on X+,Y-,Z+ faces
+        {  0, -1, -1,  3, -1,  5, -1, -1,  9, -1, -1, 11 },
+        // Child 6 (0,1,1): touches parent edges on X-,Y+,Z+ faces
+        { -1,  1, -1,  2,  6, -1, -1, -1, -1,  8, 10, -1 },
+        // Child 7 (1,1,1): Max corner — touches parent edges on X+,Y+,Z+ faces
+        { -1,  1, -1,  3, -1,  7, -1, -1, -1,  9, -1, 11 },
     };
 
     static constexpr int32 ChildToParentFaceMap[8][6] = {

@@ -317,7 +317,7 @@ struct VOXELPLUGIN_API FVoxelFace {
 
         if (UCount != 2 || VCount != 2)
         {
-            // Malformed face input — leave edges null, caller will detect via null corners
+            // Malformed face input ? leave edges null, caller will detect via null corners
             return;
         }
 
@@ -431,14 +431,16 @@ public:
 
     FORCEINLINE double CompositeSample(const FVector& P, double RawNoise) const
     {
-        double NoiseAmplitude = .03;//TODO: TEMPORARY, NEEDS TO BE EXPOSED
         double dx = P.X - Center.X;
         double dy = P.Y - Center.Y;
         double dz = P.Z - Center.Z;
         double Dist = FMath::Sqrt(dx * dx + dy * dy + dz * dz);
 
-        double surfaceRadius = Dist - SurfaceLevel;
-        return surfaceRadius - (RawNoise * NoiseAmplitude * surfaceRadius) + EditStore->Sample(P);
+        // Sphere SDF: positive = outside, negative = inside. Gradient magnitude = 1 UU/UU radially.
+        // RawNoise is [-1, 1]. Scale by 1% of planet radius to get world-space UU displacement.
+        // TODO: expose NoiseAmplitude as a UPROPERTY on the actor.
+        const double NoiseAmplitude = SurfaceLevel * 0.01;
+        return (Dist - SurfaceLevel) - (RawNoise * NoiseAmplitude) + EditStore->Sample(P);
     }
 
     /** * Cleanup: Optional method to prune the TChunkedArrays

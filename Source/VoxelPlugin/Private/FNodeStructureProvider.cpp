@@ -117,7 +117,7 @@ void FVoxelFace::RegisterNode(TSharedPtr<FAdaptiveOctreeNode> InNode)
     FWriteScopeLock WriteLock(Mutex);
 
     // Get the coordinate of the node center on the face's normal axis
-    
+
     // Axis 0: X, 1: Y, 2: Z
     double NodeCoord = InNode->Center[Axis];
 
@@ -154,8 +154,8 @@ FNodeStructureProvider::FNodeStructureProvider(TSharedPtr<FSparseEditStore> InEd
     EditStore = InEditStore;
     NoiseFunction = InDensityFunction;
     RootExtent = InRootExtent;
-    SeaLevel = InSeaLevel;
-    SurfaceLevel = InSurfaceLevel;
+    SeaLevel = InRootExtent * InSeaLevel;
+    SurfaceLevel = InRootExtent * InSurfaceLevel; // convert proportion to absolute world-space radius
     Center = InCenter;
 }
 
@@ -198,8 +198,8 @@ void FNodeStructureProvider::PopulateNodeStructure(const TArray<TSharedPtr<FAdap
         const float InvSurface = (float)(1.0 / SurfaceLevel); // normalize to unit-sphere for FastNoise
 
         int32 TotalCount = N * 7;
-        TArray<float> X, Y, Z;           // world-space positions — used by CompositeSample
-        TArray<float> NX, NY, NZ;        // unit-sphere positions — passed to FastNoise
+        TArray<float> X, Y, Z;           // world-space positions used by CompositeSample
+        TArray<float> NX, NY, NZ;        // unit-sphere positions passed to FastNoise
         TArray<float> OutDensities;
         X.SetNumUninitialized(TotalCount);   Y.SetNumUninitialized(TotalCount);   Z.SetNumUninitialized(TotalCount);
         NX.SetNumUninitialized(TotalCount); NY.SetNumUninitialized(TotalCount); NZ.SetNumUninitialized(TotalCount);
@@ -225,10 +225,10 @@ void FNodeStructureProvider::PopulateNodeStructure(const TArray<TSharedPtr<FAdap
             }
         }
 
-        // SIMD Density Pass — sample at unit-sphere coordinates
+        // SIMD Density Pass sample at unit-sphere coordinates
         NoiseFunction(TotalCount, NX.GetData(), NY.GetData(), NZ.GetData(), OutDensities.GetData());
 
-        // RESOLVE & STORE — CompositeSample uses world-space X/Y/Z for the SDF, OutDensities for noise
+        // RESOLVE & STORE CompositeSample uses world-space X/Y/Z for the SDF, OutDensities for noise
         ParallelFor(N, [&](int32 i)
             {
                 int32 Base = i * 7;
@@ -321,7 +321,7 @@ void FNodeStructureProvider::PopulateNodeStructure(const TArray<TSharedPtr<FAdap
             }
         }
         Node->ComputeDualContourPosition();
-        Node->ComputeNormalizedPosition(RootExtent * SeaLevel);
+        Node->ComputeNormalizedPosition(SeaLevel);
         Node->bDataReady = true;
     }
 }
@@ -348,8 +348,8 @@ void FNodeStructureProvider::UpdateNodeStructure(const TArray<TSharedPtr<FAdapti
     const float Epsilon = 1.0f;
 
     int32 TotalCount = N * 7;
-    TArray<float> X, Y, Z;          // world-space — used by CompositeSample
-    TArray<float> NX, NY, NZ;       // unit-sphere — passed to FastNoise
+    TArray<float> X, Y, Z;          // world-space used by CompositeSample
+    TArray<float> NX, NY, NZ;       // unit-sphere passed to FastNoise
     TArray<float> RawNoise;
     X.SetNumUninitialized(TotalCount);   Y.SetNumUninitialized(TotalCount);   Z.SetNumUninitialized(TotalCount);
     NX.SetNumUninitialized(TotalCount); NY.SetNumUninitialized(TotalCount); NZ.SetNumUninitialized(TotalCount);
@@ -374,7 +374,7 @@ void FNodeStructureProvider::UpdateNodeStructure(const TArray<TSharedPtr<FAdapti
         }
     }
 
-    // 3. SIMD Pass — sample at unit-sphere coordinates
+    // 3. SIMD Pass sample at unit-sphere coordinates
     NoiseFunction(TotalCount, NX.GetData(), NY.GetData(), NZ.GetData(), RawNoise.GetData());
 
     // 4. Resolve & Set
@@ -413,7 +413,7 @@ void FNodeStructureProvider::ApplyEdit(FVector InCenter, double InRadius, double
     int32 Depth = EditStore->GetDepthForBrushRadius(InRadius, InResolution);
     EditStore->ApplySphericalEdit(InCenter, InRadius, InStrength, Depth);
 
-    // 2. Resample all affected nodes — EditStore->Sample is now baked into GetFinalD
+    // 2. Resample all affected nodes EditStore->Sample is now baked into GetFinalD
     //    inside UpdateNodeStructure, so a straight resample pass is all we need
     UpdateNodeStructure(InAffectedNodes);
 }
