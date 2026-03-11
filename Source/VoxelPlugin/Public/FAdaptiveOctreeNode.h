@@ -1,7 +1,10 @@
 #pragma once
 
 #include "CoreMinimal.h"
-#include <FNodeStructureProvider.h>
+
+struct FVoxelCorner;
+struct FVoxelEdge;
+struct FVoxelFace;
 
 struct VOXELPLUGIN_API OctreeConstants {
     inline static const FVector Offsets[8] = {
@@ -41,7 +44,7 @@ struct VOXELPLUGIN_API OctreeConstants {
     };
 
     // ChildToParentEdgeMap[ChildIndex][ChildEdgeIndex] -> ParentEdgeIndex
-    static const int32 ChildToParentEdgeMap[8][12] = {
+    static constexpr int32 ChildToParentEdgeMap[8][12] = {
         // Child 0 (0,0,0): Bottom-Front-Left
         { 0, -1, 2, -1, 4, -1, -1, -1, 8, -1, 10, -1 },
         // Child 1 (1,0,0): Bottom-Front-Right
@@ -54,7 +57,7 @@ struct VOXELPLUGIN_API OctreeConstants {
         { 0, -1, -1, 2, 4, -1, -1, -1, 8, -1, 10, -1 }, // Wait, checking Z-alignment...
     };
 
-    static const int32 ChildToParentFaceMap[8][6] = {
+    static constexpr int32 ChildToParentFaceMap[8][6] = {
         // Child 0 (0,0,0): Min corner child
         { -1,  1, -1,  3, -1,  5 }, // Touching Parent's X-, Y-, Z-
         // Child 1 (1,0,0)
@@ -74,7 +77,7 @@ struct VOXELPLUGIN_API OctreeConstants {
     };
 
     // FaceEdges[FaceIndex][4] -> Node Edge Indices (0-11)
-    static const int32 FaceEdges[6][4] = {
+    static constexpr int32 FaceEdges[6][4] = {
         { 3, 11, 7, 9 },  // 0: XPos (Right)
         { 2, 10, 6, 8 },  // 1: XNeg (Left)
         { 1, 9, 5, 8 },   // 2: YPos (Back)
@@ -561,52 +564,50 @@ private:
 struct VOXELPLUGIN_API FAdaptiveOctreeNode : public TSharedFromThis<FAdaptiveOctreeNode>
 {
 private:    
-    void ComputeDualContourPosition();
-    
     FVector3f GetInterpolatedNormal(FVector P);
-    
-    bool bIsLeaf = true;
     
     int DepthPrecisionFloor = 20;
 
 public:
     FMortonIndex Index;
-    
     TWeakPtr<FAdaptiveOctreeNode> Parent;
-    
     TSharedPtr<FAdaptiveOctreeNode> Children[8];
+    FVoxelCorner* Corners[8];
+    FVoxelEdge* Edges[12];
+    FVoxelFace* Faces[6];
     
-    TWeakPtr<FAdaptiveOctreeNode> Neighbors[6];
+    bool bDataReady = false;
 
-    FCorner* Corners[8];
-    FEdge* Edges[12];
-    FFace* Faces[6];
-
-    TArray<FNodeEdge> SignChangeEdges;
-    
     int ChunkDepth = 4;
-    
     int DepthBounds[3];
     
-    FVector AnchorCenter;
+    // Octree center
+    FVector TreeCenter; 
+
+    //Chunk level parent center, used to construct the mesh at world origin in higher precision, 
+    //then move the entire chunk back to chunk center - yeilds higher precision mesh
+    FVector AnchorCenter; 
     
     FVector Center;
-
-    FVector TreeCenter;
     
     double Extent;
     
     FVector DualContourPosition;
-    
-    FVector3f DualContourNormal;
-    
-    FVector NormalizedPosition;
 
-    bool IsSurfaceNode;
+    FVector3f DualContourNormal;
+
+    //Position projected onto the sphere, used to construct ocean mesh
+    FVector NormalizedPosition;
     
+    // Turns off lod updates, useful for disabling lod during parallax movement, 
+    // or for a warp effect -> could disable the lod, set an override position, let the lod update for the position the 
+    // warp will END at, then warp the player to the point with no pop in
+    // placeholder, not using this yet
     bool LodOverride = false;
 
     const bool IsLeaf();
+
+    const bool IsSurface();
 
     const bool IsRoot();
     
@@ -622,10 +623,12 @@ public:
 
     void ComputeNormalizedPosition(double InRadius);
 
-    TArray<FNodeEdge>& GetSignChangeEdges();
+    TArray<struct FVoxelEdge*> GetSignChangeEdges() const;
 
     void FinalizeFromExistingCorners();
 
+    void ComputeDualContourPosition();
+    
     FORCEINLINE FVector GetCornerPosition(int32 Index) const
     {
         // Uses your existing OctreeConstants::Offsets to derive world position
@@ -637,6 +640,8 @@ public:
 
     // Child Constructor
     FAdaptiveOctreeNode(TSharedPtr<FAdaptiveOctreeNode> InParent, uint8 InChildIndex, FVector InAnchorCenter);
+
+    ~FAdaptiveOctreeNode();
 };
 
 FORCEINLINE uint32 GetTypeHash(const FNodeEdgeKey& Key)

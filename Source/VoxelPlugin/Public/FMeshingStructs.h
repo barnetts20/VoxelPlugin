@@ -20,7 +20,7 @@ struct VOXELPLUGIN_API FMeshVertex
     FVector Position;       // Quantized position (chunk-local)
     FVector OriginalPosition; // Unquantized for actual mesh output
     FVector NormalizedPosition; // Projected onto planet radius sphere surface
-    FVector Normal;
+    FVector3f Normal;
     FColor Color;
     double Depth;
     FVector2f UV;

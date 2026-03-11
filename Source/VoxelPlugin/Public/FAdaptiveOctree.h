@@ -24,6 +24,8 @@ private:
 
     TFunction<void(int, const float*, const float*, const float*, float*)> DensityFunction;
 
+    TSharedPtr<FNodeStructureProvider> StructureProvider;
+
     TSharedPtr<FSparseEditStore> EditStore;
 
     TSharedPtr<FAdaptiveOctreeNode> Root;
@@ -44,7 +46,7 @@ private:
 
     int ChunkDepth;
 
-    void SplitToDepth(TSharedPtr<FAdaptiveOctreeNode> Node, int InMinDepth);
+    void SplitToDepth(TSharedPtr<FAdaptiveOctreeNode> Node, int InMinDepth, TArray<TSharedPtr<FAdaptiveOctreeNode>>& OutNewNodes);
 
     void PopulateChunks();
 

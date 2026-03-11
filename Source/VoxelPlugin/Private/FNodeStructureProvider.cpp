@@ -4,50 +4,92 @@
 #include "FNodeStructureProvider.h"
 
 //FCORNER STUFF
-const double FCorner::GetDensity() {
+const double FVoxelCorner::GetDensity() {
     FReadScopeLock ReadLock(Mutex);
     return Density;
 }
 
-const FVector3f FCorner::GetNormal() {
+const FVector3f FVoxelCorner::GetNormal() {
     FReadScopeLock ReadLock(Mutex);
     return Normal;
 }
 
-void FCorner::SetDensity(double InDensity) {
+void FVoxelCorner::SetDensity(double InDensity) {
     FWriteScopeLock WriteLock(Mutex);
     Density = InDensity;
 }
 
-void FCorner::SetNormal(FVector3f InNormal) {
+void FVoxelCorner::SetNormal(FVector3f InNormal) {
     FWriteScopeLock WriteLock(Mutex);
     Normal = InNormal;
 }
 
-void FCorner::SetDensityAndNormal(double InDensity, FVector3f InNormal) {
+void FVoxelCorner::SetDensityAndNormal(double InDensity, FVector3f InNormal) {
     FWriteScopeLock WriteLock(Mutex);
     Density = InDensity;
     Normal = InNormal;
 }
 
 //FEDGE STUFF
-const short FEdge::GetSignChange() const {
-    return FMath::Sign(Key.A->GetDensity() - Key.B->GetDensity());
+const short FVoxelEdge::GetSignChange() const
+{
+    // Ensure we aren't dereferencing null corners
+    if (!Key.A || !Key.B) return 0;
+
+    double D0 = Key.A->GetDensity();
+    double D1 = Key.B->GetDensity();
+
+    // Standard Dual Contouring crossing: 
+    // Sign is different if (D0 > 0 && D1 <= 0) or (D0 <= 0 && D1 > 0)
+    bool bIn0 = D0 <= 0.0;
+    bool bIn1 = D1 <= 0.0;
+
+    if (bIn0 == bIn1) return 0; // Both same side, no crossing.
+
+    return bIn1 ? -1 : 1; // Return direction for potential manifold orientation
 }
 
-const FVector FEdge::GetZeroCrossingPoint() const {
+const FVector FVoxelEdge::GetZeroCrossingPoint() const {
     double d0 = Key.A->GetDensity();
     double d1 = Key.B->GetDensity();
     double t = d0 / (d0 - d1);
     return FMath::Lerp(Key.A->GetPosition(), Key.B->GetPosition(), t);
 }
 
-const FFace* FEdge::GetConnectedFace(uint8 idx) {
+FVector3f FVoxelEdge::GetAverageNormal() const
+{
+    // 1. Get densities to determine the interpolation weight
+    double d0 = Key.A->GetDensity();
+    double d1 = Key.B->GetDensity();
+
+    // Avoid division by zero if densities are identical (rare)
+    if (FMath::IsNearlyEqual(d0, d1))
+    {
+        return Key.A->GetNormal();
+    }
+
+    // 2. Calculate the 't' value (where the surface crosses the edge)
+    // t = 0 means surface is at Corner A, t = 1 means surface is at Corner B
+    float t = static_cast<float>(FMath::Clamp(d0 / (d0 - d1), 0.0, 1.0));
+
+    // 3. Linearly interpolate the pre-sampled normals from the corners
+    FVector3f NormalA = Key.A->GetNormal();
+    FVector3f NormalB = Key.B->GetNormal();
+
+    FVector3f Result = FMath::Lerp(NormalA, NormalB, t);
+
+    // 4. Ensure it's a unit vector for the QEF solver
+    Result.Normalize();
+
+    return Result;
+}
+
+const FVoxelFace* FVoxelEdge::GetConnectedFace(uint8 idx) {
     FReadScopeLock ReadLock(Mutex);
     return ConnectedFaces[idx];
 }
 
-void FEdge::RegisterConnectedFace(FFace* InFace) {
+void FVoxelEdge::RegisterConnectedFace(FVoxelFace* InFace) {
     FWriteScopeLock WriteLock(Mutex);
 
     // 1. Identify the two axes perpendicular to this edge
@@ -70,7 +112,7 @@ void FEdge::RegisterConnectedFace(FFace* InFace) {
 }
 
 //FACE STUFF
-void FFace::RegisterNode(TSharedPtr<FAdaptiveOctreeNode> InNode)
+void FVoxelFace::RegisterNode(TSharedPtr<FAdaptiveOctreeNode> InNode)
 {
     FWriteScopeLock WriteLock(Mutex);
 
@@ -94,7 +136,7 @@ void FFace::RegisterNode(TSharedPtr<FAdaptiveOctreeNode> InNode)
     }
 }
 
-void FFace::GetNodes(TSharedPtr<FAdaptiveOctreeNode> OutNodes[2])
+void FVoxelFace::GetNodes(TSharedPtr<FAdaptiveOctreeNode> OutNodes[2])
 {
     FReadScopeLock ReadLock(Mutex);
     OutNodes[0] = Nodes[0].IsValid() ? Nodes[0].Pin() : nullptr;
@@ -110,10 +152,11 @@ FNodeStructureProvider::~FNodeStructureProvider()
 {
 }
 
+//Initializes new node structural data/pointers
 void FNodeStructureProvider::PopulateNodeStructure(const TArray<TSharedPtr<class FAdaptiveOctreeNode>>& InNodes)
 {
     // Corners that need their first-ever sample
-    TArray<FCorner*> NewCorners;
+    TArray<FVoxelCorner*> NewCorners;
 
     // 1. ACQUIRE & ASSIGN
     for (const auto& Node : InNodes)
@@ -121,7 +164,7 @@ void FNodeStructureProvider::PopulateNodeStructure(const TArray<TSharedPtr<class
         for (int32 i = 0; i < 8; ++i)
         {
             FVector Pos = Node->GetCornerPosition(i);
-            FCorner* Corner = GetOrCreateCorner(Pos);
+            FVoxelCorner* Corner = GetOrCreateCorner(Pos);
 
             Node->Corners[i] = Corner;
             Corner->AddRef();
@@ -180,13 +223,13 @@ void FNodeStructureProvider::PopulateNodeStructure(const TArray<TSharedPtr<class
                 FVector SampleP(X[Base + Offset], Y[Base + Offset], Z[Base + Offset]);
                 return OutDensities[Base + Offset] + EditStore->Sample(SampleP);
             };
-            FVector Gradient(
+            FVector3f Gradient(
                 GetFinalD(1) - GetFinalD(2),
                 GetFinalD(3) - GetFinalD(4),
                 GetFinalD(5) - GetFinalD(6)
             );
             //Final set unless the corner is edited later
-            NewCorners[i]->SetDensityAndNormal(GetFinalD(0), (FVector3f)Gradient);
+            NewCorners[i]->SetDensityAndNormal(GetFinalD(0), Gradient);
         }
     }
 
@@ -199,10 +242,10 @@ void FNodeStructureProvider::PopulateNodeStructure(const TArray<TSharedPtr<class
 
         for (int32 i = 0; i < 12; ++i)
         {
-            FCorner* C1 = Node->Corners[OctreeConstants::EdgePairs[i][0]];
-            FCorner* C2 = Node->Corners[OctreeConstants::EdgePairs[i][1]];
+            FVoxelCorner* C1 = Node->Corners[OctreeConstants::EdgePairs[i][0]];
+            FVoxelCorner* C2 = Node->Corners[OctreeConstants::EdgePairs[i][1]];
 
-            FEdge* ParentEdge = nullptr;
+            FVoxelEdge* ParentEdge = nullptr;
             if (ParentNode.IsValid())
             {
                 int32 P_EdgeIdx = OctreeConstants::ChildToParentEdgeMap[ChildIdx][i];
@@ -213,7 +256,7 @@ void FNodeStructureProvider::PopulateNodeStructure(const TArray<TSharedPtr<class
                 }
             }
 
-            FEdge* Edge = GetOrCreateEdge(C1, C2, ParentEdge);
+            FVoxelEdge* Edge = GetOrCreateEdge(C1, C2, ParentEdge);
             Node->Edges[i] = Edge;
             Edge->AddRef();
         }
@@ -229,7 +272,7 @@ void FNodeStructureProvider::PopulateNodeStructure(const TArray<TSharedPtr<class
         for (int32 i = 0; i < 6; ++i)
         {
             const int32* FE = OctreeConstants::FaceEdges[i];
-            FEdge* F_Edges[4] = {
+            FVoxelEdge* F_Edges[4] = {
                 Node->Edges[FE[0]],
                 Node->Edges[FE[1]],
                 Node->Edges[FE[2]],
@@ -238,7 +281,7 @@ void FNodeStructureProvider::PopulateNodeStructure(const TArray<TSharedPtr<class
 
             short Axis = OctreeConstants::FaceAxisBit[i];
 
-            FFace* ParentFace = nullptr;
+            FVoxelFace* ParentFace = nullptr;
             if (ParentNode.IsValid())
             {
                 int32 P_FaceIdx = OctreeConstants::ChildToParentFaceMap[ChildIdx][i];
@@ -249,7 +292,7 @@ void FNodeStructureProvider::PopulateNodeStructure(const TArray<TSharedPtr<class
             }
 
             // GetOrCreateFace now handles the initial registration
-            FFace* Face = GetOrCreateFace(F_Edges, Axis, ParentFace, Node);
+            FVoxelFace* Face = GetOrCreateFace(F_Edges, Axis, ParentFace, Node);
 
             Node->Faces[i] = Face;
             Face->AddRef();
@@ -260,16 +303,95 @@ void FNodeStructureProvider::PopulateNodeStructure(const TArray<TSharedPtr<class
                 Face->RegisterNode(Node);
             }
         }
+        Node->ComputeDualContourPosition();
+        Node->bDataReady = true;
     }
 }
 
-void FNodeStructureProvider::UpdateCorners(const TArray<FCorner*>& CornersToUpdate)
+void FNodeStructureProvider::UpdateNodeStructure(const TArray<TSharedPtr<FAdaptiveOctreeNode>>& InNodes)
+{
+    if (InNodes.Num() == 0) return;
+
+    // 1. GATHER UNIQUE CORNERS
+    // We use a TSet to ensure we don't sample the same shared corner multiple times
+    TSet<FVoxelCorner*> UniqueCorners;
+    for (const auto& Node : InNodes)
+    {
+        for (int32 i = 0; i < 8; ++i)
+        {
+            if (Node->Corners[i])
+            {
+                UniqueCorners.Add(Node->Corners[i]);
+            }
+        }
+    }
+
+    if (UniqueCorners.Num() == 0) return;
+
+    // 2. PREPARE THE BATCH (Reuse your 7N logic)
+    TArray<FVoxelCorner*> CornerArray = UniqueCorners.Array();
+    int32 N = CornerArray.Num();
+    const float Epsilon = 1.0f;
+
+    int32 TotalCount = N * 7;
+    TArray<float> X, Y, Z, OutDensities;
+    X.SetNumUninitialized(TotalCount);
+    Y.SetNumUninitialized(TotalCount);
+    Z.SetNumUninitialized(TotalCount);
+    OutDensities.SetNum(TotalCount);
+
+    for (int32 i = 0; i < N; ++i)
+    {
+        FVector P = CornerArray[i]->GetPosition();
+        int32 Base = i * 7;
+
+        // Center + 6 Gradient offsets
+        X[Base] = P.X; Y[Base] = P.Y; Z[Base] = P.Z;
+        X[Base + 1] = P.X + Epsilon; X[Base + 2] = P.X - Epsilon;
+        Y[Base + 1] = P.Y; Y[Base + 2] = P.Y; Z[Base + 1] = P.Z; Z[Base + 2] = P.Z;
+        Y[Base + 3] = P.Y + Epsilon; Y[Base + 4] = P.Y - Epsilon;
+        X[Base + 3] = P.X; X[Base + 4] = P.X; Z[Base + 3] = P.Z; Z[Base + 4] = P.Z;
+        Z[Base + 5] = P.Z + Epsilon; Z[Base + 6] = P.Z - Epsilon;
+        X[Base + 5] = P.X; X[Base + 6] = P.X; Y[Base + 5] = P.Y; Y[Base + 6] = P.Y;
+    }
+
+    // 3. SIMD DENSITY PASS
+    DensityFunction(TotalCount, X.GetData(), Y.GetData(), Z.GetData(), OutDensities.GetData());
+
+    // 4. RESOLVE & UPDATE CORNERS
+    for (int32 i = 0; i < N; ++i)
+    {
+        int32 Base = i * 7;
+        auto GetFinalD = [&](int32 Offset) {
+            FVector SampleP(X[Base + Offset], Y[Base + Offset], Z[Base + Offset]);
+            return OutDensities[Base + Offset] + EditStore->Sample(SampleP);
+            };
+
+        FVector3f Gradient(
+            GetFinalD(1) - GetFinalD(2),
+            GetFinalD(3) - GetFinalD(4),
+            GetFinalD(5) - GetFinalD(6)
+        );
+
+        // Update the existing corner object
+        CornerArray[i]->SetDensityAndNormal(GetFinalD(0), Gradient);
+    }
+
+
+    for (const auto& Node : InNodes)
+    {
+        Node->ComputeDualContourPosition();
+        Node->bDataReady = true; 
+    }
+}
+
+void FNodeStructureProvider::UpdateCorners(const TArray<FVoxelCorner*>& CornersToUpdate)
 {
 }
 
-FCorner* FNodeStructureProvider::Internal_CreateCorner(const FInt64Vector& InKey)
+FVoxelCorner* FNodeStructureProvider::Internal_CreateCorner(const FInt64Vector& InKey)
 {
-    FCorner* NewCorner = nullptr;
+    FVoxelCorner* NewCorner = nullptr;
 
     if (FreeCornerIndices.Num() > 0)
     {
@@ -279,13 +401,13 @@ FCorner* FNodeStructureProvider::Internal_CreateCorner(const FInt64Vector& InKey
         // CORRECT: Placement New. 
         // Re-initializes the existing memory at 'NewCorner' address.
         // This properly resets the atomic RefCount and the Mutex.
-        new (NewCorner) FCorner(InKey);
+        new (NewCorner) FVoxelCorner(InKey);
     }
     else
     {
         // AddElement returns the index of the newly constructed item.
         // We pass the Key-based constructor here.
-        int32 NewIdx = CornerStore.AddElement(FCorner(InKey));
+        int32 NewIdx = CornerStore.AddElement(FVoxelCorner(InKey));
         NewCorner = &CornerStore[NewIdx];
     }
 
@@ -295,14 +417,14 @@ FCorner* FNodeStructureProvider::Internal_CreateCorner(const FInt64Vector& InKey
     return NewCorner;
 }
 
-FCorner* FNodeStructureProvider::GetOrCreateCorner(const FVector& InPosition)
+FVoxelCorner* FNodeStructureProvider::GetOrCreateCorner(const FVector& InPosition)
 {
-    FInt64Vector Key = FCorner::QuantizeKey(InPosition);
+    FInt64Vector Key = FVoxelCorner::QuantizeKey(InPosition);
 
     // 1. SHARED READ: Check if it exists without blocking other threads
     {
         FReadScopeLock ReadLock(CornerLock);
-        if (FCorner* const* Found = CornerLookup.Find(Key))
+        if (FVoxelCorner* const* Found = CornerLookup.Find(Key))
         {
             return *Found;
         }
@@ -312,7 +434,7 @@ FCorner* FNodeStructureProvider::GetOrCreateCorner(const FVector& InPosition)
     FWriteScopeLock WriteLock(CornerLock);
 
     // 3. DOUBLE-CHECK: Did another thread create it while we were waiting for the WriteLock?
-    if (FCorner* const* Found = CornerLookup.Find(Key))
+    if (FVoxelCorner* const* Found = CornerLookup.Find(Key))
     {
         return *Found;
     }
@@ -321,9 +443,9 @@ FCorner* FNodeStructureProvider::GetOrCreateCorner(const FVector& InPosition)
     return Internal_CreateCorner(Key);
 }
 
-FEdge* FNodeStructureProvider::Internal_CreateEdge(const FEdgeKey& InKey, FEdge* InParent)
+FVoxelEdge* FNodeStructureProvider::Internal_CreateEdge(const FVoxelEdgeKey& InKey, FVoxelEdge* InParent)
 {
-    FEdge* NewEdge = nullptr;
+    FVoxelEdge* NewEdge = nullptr;
 
     if (FreeEdgeIndices.Num() > 0)
     {
@@ -331,12 +453,12 @@ FEdge* FNodeStructureProvider::Internal_CreateEdge(const FEdgeKey& InKey, FEdge*
         NewEdge = &EdgeStore[RecycledIdx];
 
         // Use Placement New to reset atomics and run sorting logic
-        new (NewEdge) FEdge(InKey, InParent);
+        new (NewEdge) FVoxelEdge(InKey, InParent);
     }
     else
     {
         // AddElement constructs the FEdge in-place within the chunk
-        int32 NewIdx = EdgeStore.AddElement(FEdge(InKey, InParent));
+        int32 NewIdx = EdgeStore.AddElement(FVoxelEdge(InKey, InParent));
         NewEdge = &EdgeStore[NewIdx];
     }
 
@@ -346,24 +468,24 @@ FEdge* FNodeStructureProvider::Internal_CreateEdge(const FEdgeKey& InKey, FEdge*
     return NewEdge;
 }
 
-FEdge* FNodeStructureProvider::GetOrCreateEdge(FCorner* InC1, FCorner* InC2, FEdge* InParent)
+FVoxelEdge* FNodeStructureProvider::GetOrCreateEdge(FVoxelCorner* InC1, FVoxelCorner* InC2, FVoxelEdge* InParent)
 {
-    FEdgeKey SearchKey = FEdgeKey::Generate(InC1, InC2);
+    FVoxelEdgeKey SearchKey = FVoxelEdgeKey::Generate(InC1, InC2);
 
     {
         FReadScopeLock ReadLock(EdgeLock);
-        if (FEdge* const* Found = EdgeLookup.Find(SearchKey)) return *Found;
+        if (FVoxelEdge* const* Found = EdgeLookup.Find(SearchKey)) return *Found;
     }
 
     FWriteScopeLock WriteLock(EdgeLock);
-    if (FEdge* const* Found = EdgeLookup.Find(SearchKey)) return *Found;
+    if (FVoxelEdge* const* Found = EdgeLookup.Find(SearchKey)) return *Found;
 
     return Internal_CreateEdge(SearchKey, InParent);
 }
 
-FFace* FNodeStructureProvider::Internal_CreateFace(FEdge* InEdges[4], int32 InAxis, FFace* InParent, TSharedPtr<FAdaptiveOctreeNode> InitiatingNode)
+FVoxelFace* FNodeStructureProvider::Internal_CreateFace(FVoxelEdge* InEdges[4], int32 InAxis, FVoxelFace* InParent, TSharedPtr<FAdaptiveOctreeNode> InitiatingNode)
 {
-    FFace* NewFace = nullptr;
+    FVoxelFace* NewFace = nullptr;
 
     // 1. Construct Face using Placement New
     // The FFace constructor handles edge/corner sorting and key generation
@@ -371,11 +493,11 @@ FFace* FNodeStructureProvider::Internal_CreateFace(FEdge* InEdges[4], int32 InAx
     {
         int32 RecycledIdx = FreeFaceIndices.Pop();
         NewFace = &FaceStore[RecycledIdx];
-        new (NewFace) FFace(InEdges, static_cast<short>(InAxis), InParent);
+        new (NewFace) FVoxelFace(InEdges, static_cast<short>(InAxis), InParent);
     }
     else
     {
-        int32 NewIdx = FaceStore.AddElement(FFace(InEdges, static_cast<short>(InAxis), InParent));
+        int32 NewIdx = FaceStore.AddElement(FVoxelFace(InEdges, static_cast<short>(InAxis), InParent));
         NewFace = &FaceStore[NewIdx];
     }
 
@@ -388,21 +510,21 @@ FFace* FNodeStructureProvider::Internal_CreateFace(FEdge* InEdges[4], int32 InAx
     return NewFace;
 }
 
-FFace* FNodeStructureProvider::GetOrCreateFace(FEdge* InEdges[4], int32 Axis, FFace* InParent, TSharedPtr<FAdaptiveOctreeNode> InitiatingNode)
+FVoxelFace* FNodeStructureProvider::GetOrCreateFace(FVoxelEdge* InEdges[4], int32 Axis, FVoxelFace* InParent, TSharedPtr<FAdaptiveOctreeNode> InitiatingNode)
 {
     // 1. Generate the spatial handle
-    FCorner* KeyCorners[4] = {
+    FVoxelCorner* KeyCorners[4] = {
         InEdges[0]->GetMinCorner(), InEdges[0]->GetMaxCorner(),
         InEdges[2]->GetMinCorner(), InEdges[2]->GetMaxCorner()
     };
-    FFaceKey SearchKey = FFaceKey::Generate(KeyCorners, static_cast<short>(Axis));
+    FVoxelFaceKey SearchKey = FVoxelFaceKey::Generate(KeyCorners, static_cast<short>(Axis));
 
     // 2. Thread-safe lookup
     {
         FReadScopeLock ReadLock(FaceLock);
-        if (FFace* const* Found = FaceLookup.Find(SearchKey))
+        if (FVoxelFace* const* Found = FaceLookup.Find(SearchKey))
         {
-            FFace* ExistingFace = *Found;
+            FVoxelFace* ExistingFace = *Found;
             // IMPORTANT: Register the node here if it's the second visitor
             ExistingFace->RegisterNode(InitiatingNode);
             return ExistingFace;
@@ -412,9 +534,9 @@ FFace* FNodeStructureProvider::GetOrCreateFace(FEdge* InEdges[4], int32 Axis, FF
     FWriteScopeLock WriteLock(FaceLock);
 
     // Double-check for race conditions
-    if (FFace* const* Found = FaceLookup.Find(SearchKey))
+    if (FVoxelFace* const* Found = FaceLookup.Find(SearchKey))
     {
-        FFace* ExistingFace = *Found;
+        FVoxelFace* ExistingFace = *Found;
         ExistingFace->RegisterNode(InitiatingNode);
         return ExistingFace;
     }
