@@ -162,7 +162,7 @@ FNodeStructureProvider::~FNodeStructureProvider()
 }
 
 //Initializes new node structural data/pointers
-void FNodeStructureProvider::PopulateNodeStructure(const TArray<TSharedPtr<class FAdaptiveOctreeNode>>& InNodes)
+void FNodeStructureProvider::PopulateNodeStructure(const TArray<TSharedPtr<FAdaptiveOctreeNode>>& InNodes)
 {
     // Corners that need their first-ever sample
     TArray<FVoxelCorner*> NewCorners;
@@ -318,7 +318,7 @@ void FNodeStructureProvider::PopulateNodeStructure(const TArray<TSharedPtr<class
     }
 }
 
-void FNodeStructureProvider::UpdateNodeStructure(const TArray<TSharedPtr<class FAdaptiveOctreeNode>>& InNodes)
+void FNodeStructureProvider::UpdateNodeStructure(const TArray<TSharedPtr<FAdaptiveOctreeNode>>& InNodes)
 {
     if (InNodes.Num() == 0) return;
 
@@ -402,18 +402,13 @@ FVoxelCorner* FNodeStructureProvider::Internal_CreateCorner(const FInt64Vector& 
     {
         int32 RecycledIdx = FreeCornerIndices.Pop();
         NewCorner = &CornerStore[RecycledIdx];
-
-        // CORRECT: Placement New. 
-        // Re-initializes the existing memory at 'NewCorner' address.
-        // This properly resets the atomic RefCount and the Mutex.
+        // Placement new re-initializes the existing allocation (resets atomic, mutex)
         new (NewCorner) FVoxelCorner(InKey);
     }
     else
     {
-        // AddElement returns the index of the newly constructed item.
-        // We pass the Key-based constructor here.
-        int32 NewIdx = CornerStore.AddElement(FVoxelCorner(InKey));
-        NewCorner = &CornerStore[NewIdx];
+        NewCorner = new FVoxelCorner(InKey);
+        CornerStore.Add(NewCorner);
     }
 
     // Register in the map
@@ -456,15 +451,12 @@ FVoxelEdge* FNodeStructureProvider::Internal_CreateEdge(const FVoxelEdgeKey& InK
     {
         int32 RecycledIdx = FreeEdgeIndices.Pop();
         NewEdge = &EdgeStore[RecycledIdx];
-
-        // Use Placement New to reset atomics and run sorting logic
         new (NewEdge) FVoxelEdge(InKey, InParent);
     }
     else
     {
-        // AddElement constructs the FEdge in-place within the chunk
-        int32 NewIdx = EdgeStore.AddElement(FVoxelEdge(InKey, InParent));
-        NewEdge = &EdgeStore[NewIdx];
+        NewEdge = new FVoxelEdge(InKey, InParent);
+        EdgeStore.Add(NewEdge);
     }
 
     // Register in map
@@ -502,8 +494,8 @@ FVoxelFace* FNodeStructureProvider::Internal_CreateFace(FVoxelEdge* InEdges[4], 
     }
     else
     {
-        int32 NewIdx = FaceStore.AddElement(FVoxelFace(InEdges, static_cast<short>(InAxis), InParent));
-        NewFace = &FaceStore[NewIdx];
+        NewFace = new FVoxelFace(InEdges, static_cast<short>(InAxis), InParent);
+        FaceStore.Add(NewFace);
     }
 
     // 2. Immediate Binding of the creator node

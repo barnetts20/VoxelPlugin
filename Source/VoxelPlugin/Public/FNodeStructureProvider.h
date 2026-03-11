@@ -377,9 +377,9 @@ private:
     double RootExtent;
     double SeaLevel;
     /** Memory-stable storage for primitives */
-    TChunkedArray<FVoxelCorner> CornerStore;
-    TChunkedArray<FVoxelEdge> EdgeStore;
-    TChunkedArray<FVoxelFace> FaceStore;
+    TIndirectArray<FVoxelCorner> CornerStore;
+    TIndirectArray<FVoxelEdge> EdgeStore;
+    TIndirectArray<FVoxelFace> FaceStore;
 
     /** Fast lookups for existing primitives */
     TMap<FInt64Vector, FVoxelCorner*> CornerLookup;

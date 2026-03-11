@@ -76,5 +76,4 @@ public:
     void UpdateMesh();
 
     void Clear();
-    void UpdateLodRecursive(TSharedPtr<FAdaptiveOctreeNode> Node, FVector CameraPosition, double InScreenSpaceThreshold, double InCameraFOV, TArray<TSharedPtr<FAdaptiveOctreeNode>>& OutNewNodes, bool& OutChanged);
 };
