@@ -17,6 +17,7 @@ FAdaptiveOctree::FAdaptiveOctree(ARealtimeMeshActor* InParentActor, UMaterialInt
 
     //Split
     TArray<TSharedPtr<FAdaptiveOctreeNode>> splitNodes;
+    splitNodes.Add(Root);
     SplitToDepth(Root, InChunkDepth, splitNodes);
     StructureProvider->PopulateNodeStructure(splitNodes);
 
@@ -386,9 +387,23 @@ void FAdaptiveOctree::UpdateMeshChunkStreamData(TSharedPtr<FMeshChunk> InChunk)
                     OcnTriangles.Add(Tri);
                 }
             };
+        //short signChange = AllEdgeData[edgeIdx].Edge->GetSignChange();
+        //EmitTri(0, 1, 2);
+        //if (NumVerts == 4) EmitTri(0, 2, 3);
+        short Sign = 1;// (*AllEdgeData[edgeIdx].Edge)->GetSignChange();
 
-        EmitTri(0, 1, 2);
-        if (NumVerts == 4) EmitTri(0, 2, 3);
+        // Standard winding order for Dual Contouring quads
+        if (Sign > 0) // In -> Out (Edge points from solid to empty)
+        {
+            EmitTri(0, 1, 2);
+            if (NumVerts == 4) EmitTri(0, 2, 3);
+        }
+        else if (Sign < 0) // Out -> In (Edge points from empty to solid)
+        {
+            // Reverse winding to ensure normals point outwards
+            EmitTri(0, 2, 1);
+            if (NumVerts == 4) EmitTri(0, 3, 2);
+        }
     }
 
     TSharedPtr<FMeshStreamData> UpdatedSurfaceData = MakeShared<FMeshStreamData>();
@@ -557,6 +572,7 @@ void FAdaptiveOctree::UpdateLOD(FVector CameraPosition, double InScreenSpaceThre
             TSharedPtr<FMeshChunk> MeshChunk = ChunkMap[Chunks[i]];
             if (MeshChunk.IsValid())
             {
+                MeshChunk->ChunkEdges.Reset();
                 GatherLeafEdges(Chunks[i], MeshChunk->ChunkEdges);
                 DirtyChunks.Add(MeshChunk);
             }
@@ -593,7 +609,10 @@ void FAdaptiveOctree::GatherLeafEdges(TSharedPtr<FAdaptiveOctreeNode> Node, TArr
 
     if (Node->IsLeaf())
     {
-        OutEdges.Append(Node->GetSignChangeEdges());
+        auto nodeEdges = Node->GetSignChangeEdges();
+        for (auto edge : nodeEdges) {
+            OutEdges.AddUnique(edge);
+        }
         return;
     }
 
@@ -681,6 +700,7 @@ void FAdaptiveOctree::SampleNodesAroundEdge(FVoxelEdge* Edge, TArray<TSharedPtr<
     // Step 3: Iterate the 4 face slots in CCW winding order around the edge axis.
     // Slot encoding: bit0 = bHigherO1, bit1 = bHigherO2
     // CCW order: (Lo,Lo)=0 -> (Hi,Lo)=1 -> (Hi,Hi)=3 -> (Lo,Hi)=2
+
     const int32 WindingOrder[4] = { 0, 1, 3, 2 };
 
     for (int32 w = 0; w < 4; w++)

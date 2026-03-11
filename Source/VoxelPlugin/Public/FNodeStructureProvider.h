@@ -439,7 +439,7 @@ public:
         // Sphere SDF: positive = outside, negative = inside. Gradient magnitude = 1 UU/UU radially.
         // RawNoise is [-1, 1]. Scale by 1% of planet radius to get world-space UU displacement.
         // TODO: expose NoiseAmplitude as a UPROPERTY on the actor.
-        const double NoiseAmplitude = SurfaceLevel * 0.01;
+        const double NoiseAmplitude = SurfaceLevel * 0.09;
         return (Dist - SurfaceLevel) - (RawNoise * NoiseAmplitude) + EditStore->Sample(P);
     }
 
