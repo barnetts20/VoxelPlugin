@@ -27,7 +27,7 @@ public:
         PositionKey = InKey;
     }
 
-    FORCEINLINE const FInt64Vector GetKey() const{
+    FORCEINLINE const FInt64Vector GetKey() const {
         return PositionKey;
     }
 
@@ -42,11 +42,11 @@ public:
     }
 
     const double GetDensity();
-    
+
     const FVector3f GetNormal();
-    
+
     void SetDensity(double InDensity);
-    
+
     void SetNormal(FVector3f InNormal);
 
     void SetDensityAndNormal(double InDensity, FVector3f InNormal);
@@ -67,8 +67,8 @@ public:
         return RefCount.fetch_sub(1, std::memory_order_acq_rel) <= 1;
     }
 
-    FORCEINLINE int32 GetRefCount() const { 
-        return RefCount.load(); 
+    FORCEINLINE int32 GetRefCount() const {
+        return RefCount.load();
     }
 };
 
@@ -177,15 +177,15 @@ public:
         return Key.A;
     }
 
-    FORCEINLINE const FVoxelCorner* GetMinCorner() const{
+    FORCEINLINE const FVoxelCorner* GetMinCorner() const {
         return Key.A;
     }
-    
+
     FORCEINLINE FVoxelCorner* GetMaxCorner() {
         return Key.B;
     }
 
-    FORCEINLINE const FVoxelCorner* GetMaxCorner() const{
+    FORCEINLINE const FVoxelCorner* GetMaxCorner() const {
         return Key.B;
     }
 
@@ -204,6 +204,10 @@ public:
     // In FNodeStructureProvider.cpp
 
     FVector3f GetAverageNormal() const;
+
+    FVoxelEdge* GetParent() {
+        return Parent;
+    }
 
     const FVoxelFace* GetConnectedFace(uint8 idx);
 
@@ -342,6 +346,12 @@ struct VOXELPLUGIN_API FVoxelFace {
 
     void GetNodes(TSharedPtr<FAdaptiveOctreeNode> OutNodes[2]);
 
+    TSharedPtr<FAdaptiveOctreeNode> GetNode(int index);
+
+    FVoxelFace* GetParent() {
+        return Parent;
+    }
+
     FORCEINLINE void AddRef() {
         RefCount.fetch_add(1, std::memory_order_relaxed);
     }
@@ -364,6 +374,8 @@ private:
     mutable FRWLock EdgeLock;
     mutable FRWLock FaceLock;
 
+    double RootExtent;
+    double SeaLevel;
     /** Memory-stable storage for primitives */
     TChunkedArray<FVoxelCorner> CornerStore;
     TChunkedArray<FVoxelEdge> EdgeStore;
@@ -387,7 +399,7 @@ private:
     FVoxelFace* Internal_CreateFace(FVoxelEdge* InEdges[4], int32 InAxis, FVoxelFace* InParent, TSharedPtr<FAdaptiveOctreeNode> InNode);
 
 public:
-    FNodeStructureProvider();
+    FNodeStructureProvider(TSharedPtr<FSparseEditStore> InEditStore, TFunction<void(int32 Count, const float* X, const float* Y, const float* Z, float* OutDensities)> InDensityFunction, double InRootExtent, double InSeaLevel);
     ~FNodeStructureProvider();
 
     /** SIMD Density Function: Handed in from the Planet Actor or Volume */
@@ -396,8 +408,9 @@ public:
     /** High-level batch population for Octree Splits */
     void PopulateNodeStructure(const TArray<TSharedPtr<class FAdaptiveOctreeNode>>& InNodes);
     void UpdateNodeStructure(const TArray<TSharedPtr<class FAdaptiveOctreeNode>>& InNodes);
-    /** Batch update for runtime terrain edits */
-    void UpdateCorners(const TArray<FVoxelCorner*>& CornersToUpdate);
+
+    /** Apply a spherical terrain edit and resample all affected nodes */
+    void ApplyEdit(FVector InCenter, double InRadius, double InStrength, int InResolution, const TArray<TSharedPtr<class FAdaptiveOctreeNode>>& InAffectedNodes);
 
     /** Thread-safe Acquisition API */
     FVoxelCorner* GetOrCreateCorner(const FVector& InPosition);

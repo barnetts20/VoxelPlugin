@@ -22,11 +22,7 @@ private:
         FVector(0, 0, -1)
     };
 
-    TFunction<void(int, const float*, const float*, const float*, float*)> DensityFunction;
-
     TSharedPtr<FNodeStructureProvider> StructureProvider;
-
-    TSharedPtr<FSparseEditStore> EditStore;
 
     void GatherNodesInSphere(TSharedPtr<FAdaptiveOctreeNode> Node, const FVector& Center, double Radius, TArray<TSharedPtr<FAdaptiveOctreeNode>>& OutNodes);
 
@@ -35,7 +31,7 @@ private:
     TWeakObjectPtr<ARealtimeMeshActor> CachedParentActor;
 
     TWeakObjectPtr<UMaterialInterface> CachedSurfaceMaterial;
-    
+
     TWeakObjectPtr<UMaterialInterface> CachedOceanMaterial;
 
     TMap<TSharedPtr<FAdaptiveOctreeNode>, TSharedPtr<FMeshChunk>> ChunkMap;
@@ -54,23 +50,21 @@ private:
 
     void UpdateChunkMap(TSharedPtr<FAdaptiveOctreeNode> ChunkNode, TArray<TPair<TSharedPtr<FAdaptiveOctreeNode>, TSharedPtr<FMeshChunk>>>& OutDirtyChunks);
 
-    void ProcessChunkData(TSharedPtr<FAdaptiveOctreeNode> ChunkNode);
-
-    void ComputeNormalsFromMap(TArray<FCornerSample>& Samples, const TMap<FIntVector, int32>& CornerMap, FVector PlanetCenter);
-
     void UpdateMeshChunkStreamData(TSharedPtr<FMeshChunk> InChunk);
 
     static FVector QuantizePosition(const FVector& P, double GridSize = 1.0);
-    
-    static FVector2f ComputeTriplanarUV(FVector Position, FVector Normal);
 
-    TArray<TSharedPtr<FAdaptiveOctreeNode>> SampleNodesAroundEdge(const FVoxelEdge* Edge);
+    static FVector2f ComputeTriplanarUV(FVector Position, FVector3f Normal);
 
     TSharedPtr<FAdaptiveOctreeNode> GetLeafNodeByPoint(FVector Position);
 
     TSharedPtr<FAdaptiveOctreeNode> GetChunkNodeByPoint(FVector Position);
 
     void GatherLeafEdges(TSharedPtr<FAdaptiveOctreeNode> Node, TArray<FVoxelEdge*>& OutEdges);
+
+    void SampleNodesAroundEdge(FVoxelEdge* Edge, TArray<TSharedPtr<FAdaptiveOctreeNode>>& OutNodes);
+
+    void UpdateLodRecursive(TSharedPtr<FAdaptiveOctreeNode> Node, FVector CameraPosition, double InScreenSpaceThreshold, double InCameraFOV, TArray<TSharedPtr<FAdaptiveOctreeNode>>& OutNewNodes, bool& OutChanged);
 
 public:
     FAdaptiveOctree(ARealtimeMeshActor* InParentActor, UMaterialInterface* InSurfaceMaterial, UMaterialInterface* InOceanMaterial, TFunction<void(int, const float*, const float*, const float*, float*)> InDensityFunction, TSharedPtr<FSparseEditStore> InEditStore, FVector InCenter, double InRootExtent, int InChunkDepth, int InMinDepth, int InMaxDepth);

@@ -143,9 +143,18 @@ void FVoxelFace::GetNodes(TSharedPtr<FAdaptiveOctreeNode> OutNodes[2])
     OutNodes[1] = Nodes[1].IsValid() ? Nodes[1].Pin() : nullptr;
 }
 
-//STRUCTURE PROVIDER
-FNodeStructureProvider::FNodeStructureProvider()
+TSharedPtr<FAdaptiveOctreeNode> FVoxelFace::GetNode(int index)
 {
+    return Nodes[index].IsValid() ? Nodes[index].Pin() : nullptr;
+}
+
+//STRUCTURE PROVIDER
+FNodeStructureProvider::FNodeStructureProvider(TSharedPtr<FSparseEditStore> InEditStore, TFunction<void(int32 Count, const float* X, const float* Y, const float* Z, float* OutDensities)> InDensityFunction, double InRootExtent, double InSeaLevel)
+{
+    EditStore = InEditStore;
+    DensityFunction = InDensityFunction;
+    RootExtent = InRootExtent;
+    SeaLevel = InSeaLevel;
 }
 
 FNodeStructureProvider::~FNodeStructureProvider()
@@ -304,6 +313,7 @@ void FNodeStructureProvider::PopulateNodeStructure(const TArray<TSharedPtr<class
             }
         }
         Node->ComputeDualContourPosition();
+        Node->ComputeNormalizedPosition(RootExtent * SeaLevel);
         Node->bDataReady = true;
     }
 }
@@ -371,6 +381,17 @@ void FNodeStructureProvider::UpdateNodeStructure(const TArray<TSharedPtr<class F
         Node->ComputeDualContourPosition();
         Node->bDataReady = true;
     }
+}
+
+void FNodeStructureProvider::ApplyEdit(FVector InCenter, double InRadius, double InStrength, int InResolution, const TArray<TSharedPtr<FAdaptiveOctreeNode>>& InAffectedNodes)
+{
+    // 1. Write the edit into the sparse store at the appropriate depth
+    int32 Depth = EditStore->GetDepthForBrushRadius(InRadius, InResolution);
+    EditStore->ApplySphericalEdit(InCenter, InRadius, InStrength, Depth);
+
+    // 2. Resample all affected nodes — EditStore->Sample is now baked into GetFinalD
+    //    inside UpdateNodeStructure, so a straight resample pass is all we need
+    UpdateNodeStructure(InAffectedNodes);
 }
 
 FVoxelCorner* FNodeStructureProvider::Internal_CreateCorner(const FInt64Vector& InKey)

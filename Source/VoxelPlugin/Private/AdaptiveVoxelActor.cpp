@@ -90,11 +90,9 @@ void AAdaptiveVoxelActor::Initialize()
     //Fast Noise example
     TFunction<void(int Count, const float* XPos, const float* YPos, const float* ZPos, float* OutNoise)> dfuncEx;
 
-
     auto DensityFunction = [this](int Count, const float* XPos, const float* YPos, const float* ZPos, float* OutNoise) {
         Noise->GenPositionArray3D(OutNoise, Count, XPos, YPos, ZPos, 0, 0, 0, 0);
     };
-
 
     // Store for user edits
     TSharedPtr<FSparseEditStore> EditStore = MakeShared<FSparseEditStore>(GetActorLocation(), Size, ChunkDepth, MaxDepth);
