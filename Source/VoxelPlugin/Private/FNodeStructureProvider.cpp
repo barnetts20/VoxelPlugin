@@ -149,12 +149,14 @@ TSharedPtr<FAdaptiveOctreeNode> FVoxelFace::GetNode(int index)
 }
 
 //STRUCTURE PROVIDER
-FNodeStructureProvider::FNodeStructureProvider(TSharedPtr<FSparseEditStore> InEditStore, TFunction<void(int32 Count, const float* X, const float* Y, const float* Z, float* OutDensities)> InDensityFunction, double InRootExtent, double InSeaLevel)
+FNodeStructureProvider::FNodeStructureProvider(TSharedPtr<FSparseEditStore> InEditStore, TFunction<void(int32 Count, const float* X, const float* Y, const float* Z, float* OutDensities)> InDensityFunction, double InRootExtent, double InSeaLevel, double InSurfaceLevel, FVector InCenter)
 {
     EditStore = InEditStore;
-    DensityFunction = InDensityFunction;
+    NoiseFunction = InDensityFunction;
     RootExtent = InRootExtent;
     SeaLevel = InSeaLevel;
+    SurfaceLevel = InSurfaceLevel;
+    Center = InCenter;
 }
 
 FNodeStructureProvider::~FNodeStructureProvider()
@@ -221,8 +223,8 @@ void FNodeStructureProvider::PopulateNodeStructure(const TArray<TSharedPtr<FAdap
         }
 
         // SIMD Density Pass - this is why we pack the normal samples in addition to the corner samples - so we can get them all in one simd call
-        DensityFunction(TotalCount, X.GetData(), Y.GetData(), Z.GetData(), OutDensities.GetData());
-
+        NoiseFunction(TotalCount, X.GetData(), Y.GetData(), Z.GetData(), OutDensities.GetData());
+        
         // 3. RESOLVE & STORE
         for (int32 i = 0; i < N; ++i)
         {
@@ -340,11 +342,11 @@ void FNodeStructureProvider::UpdateNodeStructure(const TArray<TSharedPtr<FAdapti
     const float Epsilon = 1.0f;
 
     int32 TotalCount = N * 7;
-    TArray<float> X, Y, Z, OutDensities;
+    TArray<float> X, Y, Z, RawNoise;
     X.SetNumUninitialized(TotalCount);
     Y.SetNumUninitialized(TotalCount);
     Z.SetNumUninitialized(TotalCount);
-    OutDensities.SetNum(TotalCount);
+    RawNoise.SetNum(TotalCount);
 
     for (int32 i = 0; i < N; ++i)
     {
@@ -360,20 +362,29 @@ void FNodeStructureProvider::UpdateNodeStructure(const TArray<TSharedPtr<FAdapti
     }
 
     // 3. SIMD Pass
-    DensityFunction(TotalCount, X.GetData(), Y.GetData(), Z.GetData(), OutDensities.GetData());
+    NoiseFunction(TotalCount, X.GetData(), Y.GetData(), Z.GetData(), RawNoise.GetData());
 
     // 4. Resolve & Set
-    for (int32 i = 0; i < N; ++i)
-    {
-        int32 Base = i * 7;
-        auto GetFinalD = [&](int32 Offset) {
-            FVector SampleP(X[Base + Offset], Y[Base + Offset], Z[Base + Offset]);
-            return OutDensities[Base + Offset] + EditStore->Sample(SampleP);
-            };
+    ParallelFor(N, [&](int32 i)
+        {
+            int32 Base = i * 7;
 
-        FVector3f Normal(GetFinalD(1) - GetFinalD(2), GetFinalD(3) - GetFinalD(4), GetFinalD(5) - GetFinalD(6));
-        CornerArray[i]->SetDensityAndNormal(GetFinalD(0), Normal);
-    }
+            auto Sample = [&](int32 Offset) -> double
+                {
+                    return CompositeSample(
+                        FVector(X[Base + Offset], Y[Base + Offset], Z[Base + Offset]),
+                        (double)RawNoise[Base + Offset]);
+                };
+
+            double D0 = Sample(0);
+            FVector3f Gradient(
+                (float)(Sample(1) - Sample(2)),
+                (float)(Sample(3) - Sample(4)),
+                (float)(Sample(5) - Sample(6))
+            );
+
+            CornerArray[i]->SetDensityAndNormal(D0, Gradient);
+        });
 
     // 5. Finalize Nodes
     for (const auto& Node : InNodes)

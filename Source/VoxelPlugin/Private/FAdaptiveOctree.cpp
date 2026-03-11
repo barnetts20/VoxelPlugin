@@ -10,7 +10,8 @@ FAdaptiveOctree::FAdaptiveOctree(ARealtimeMeshActor* InParentActor, UMaterialInt
     CachedOceanMaterial = InOceanMaterial;
     ChunkDepth = InChunkDepth;
     double SeaLevel = .9; //Later on we will expose this to the BP, for now we can just hard code
-    StructureProvider = MakeShared<FNodeStructureProvider>(InEditStore, InDensityFunction, InRootExtent, SeaLevel);
+    double SurfaceLevel = .9; //Later on we will expose this to the BP, for now we can just hard code
+    StructureProvider = MakeShared<FNodeStructureProvider>(InEditStore, InDensityFunction, InRootExtent, SeaLevel, SurfaceLevel, InCenter);
 
     Root = MakeShared<FAdaptiveOctreeNode>(InCenter, InRootExtent, InChunkDepth, InMinDepth, InMaxDepth);
 

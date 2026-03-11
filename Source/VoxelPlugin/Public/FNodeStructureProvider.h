@@ -384,7 +384,9 @@ private:
     mutable FRWLock EdgeLock;
     mutable FRWLock FaceLock;
 
+    FVector Center;
     double RootExtent;
+    double SurfaceLevel;
     double SeaLevel;
     /** Memory-stable storage for primitives */
     TIndirectArray<FVoxelCorner> CornerStore;
@@ -409,11 +411,11 @@ private:
     FVoxelFace* Internal_CreateFace(FVoxelEdge* InEdges[4], int32 InAxis, FVoxelFace* InParent, TSharedPtr<FAdaptiveOctreeNode> InNode);
 
 public:
-    FNodeStructureProvider(TSharedPtr<FSparseEditStore> InEditStore, TFunction<void(int32 Count, const float* X, const float* Y, const float* Z, float* OutDensities)> InDensityFunction, double InRootExtent, double InSeaLevel);
+    FNodeStructureProvider(TSharedPtr<FSparseEditStore> InEditStore, TFunction<void(int32 Count, const float* X, const float* Y, const float* Z, float* OutDensities)> InDensityFunction, double InRootExtent, double InSeaLevel, double InSurfaceLevel, FVector InActorCenter);
     ~FNodeStructureProvider();
 
     /** SIMD Density Function: Handed in from the Planet Actor or Volume */
-    TFunction<void(int32 Count, const float* X, const float* Y, const float* Z, float* OutDensities)> DensityFunction;
+    TFunction<void(int32 Count, const float* X, const float* Y, const float* Z, float* OutDensities)> NoiseFunction;
 
     /** High-level batch population for Octree Splits */
     void PopulateNodeStructure(const TArray<TSharedPtr<FAdaptiveOctreeNode>>& InNodes);
@@ -426,6 +428,15 @@ public:
     FVoxelCorner* GetOrCreateCorner(const FVector& InPosition);
     FVoxelEdge* GetOrCreateEdge(FVoxelCorner* InC1, FVoxelCorner* InC2, FVoxelEdge* InParent);
     FVoxelFace* GetOrCreateFace(FVoxelEdge* InEdges[4], int32 InAxis, FVoxelFace* InFace, TSharedPtr<FAdaptiveOctreeNode> InNode);
+
+    FORCEINLINE double CompositeSample(const FVector& P, double RawNoise) const
+    {
+        double dx = P.X - Center.X;
+        double dy = P.Y - Center.Y;
+        double dz = P.Z - Center.Z;
+        double Dist = FMath::Sqrt(dx * dx + dy * dy + dz * dz);
+        return (Dist - SurfaceLevel) - RawNoise + EditStore->Sample(P);
+    }
 
     /** * Cleanup: Optional method to prune the TChunkedArrays
      * using the FreeLists when RefCounts hit zero.
