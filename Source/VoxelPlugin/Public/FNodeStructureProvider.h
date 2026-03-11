@@ -297,35 +297,45 @@ struct VOXELPLUGIN_API FVoxelFace {
         int32 U = (Axis + 1) % 3;
         int32 V = (Axis + 2) % 3;
 
-        // FIX: We need a reference point for "Min" and "Max" before the Key exists.
-        // We'll just find the min/max coordinates from the input edges.
-        int64 MinU = MAX_int64, MaxU = MIN_int64;
-        int64 MinV = MAX_int64, MaxV = MIN_int64;
-
-        for (int i = 0; i < 4; ++i) {
-            const FInt64Vector& K1 = InEdges[i]->GetMinCorner()->GetKey();
-            const FInt64Vector& K2 = InEdges[i]->GetMaxCorner()->GetKey();
-            MinU = FMath::Min(MinU, FMath::Min(K1[U], K2[U]));
-            MaxU = FMath::Max(MaxU, FMath::Max(K1[U], K2[U]));
-            MinV = FMath::Min(MinV, FMath::Min(K1[V], K2[V]));
-            MaxV = FMath::Max(MaxV, FMath::Max(K1[V], K2[V]));
-        }
-
         // 1. CANONICAL EDGE SORTING
+        // Partition into U-axis edges and V-axis edges, then sort each pair by position.
+        FVoxelEdge* UEdges[2] = { nullptr, nullptr }; // will become Slot 0 (bottom) and Slot 2 (top)
+        FVoxelEdge* VEdges[2] = { nullptr, nullptr }; // will become Slot 3 (left) and Slot 1 (right)
+        int32 UCount = 0, VCount = 0;
+
         for (int32 i = 0; i < 4; ++i)
         {
-            FVoxelEdge* E = InEdges[i];
-            FInt64Vector P = E->GetMinCorner()->GetKey();
-
-            if (E->GetAxis() == U) {
-                // Lower V is Bottom (0), Higher V is Top (2)
-                Edges[(P[V] == MinV) ? 0 : 2] = E;
+            if (InEdges[i]->GetAxis() == U)
+            {
+                if (UCount < 2) UEdges[UCount++] = InEdges[i];
             }
-            else {
-                // Higher U is Right (1), Lower U is Left (3)
-                Edges[(P[U] == MaxU) ? 1 : 3] = E;
+            else
+            {
+                if (VCount < 2) VEdges[VCount++] = InEdges[i];
             }
         }
+
+        if (UCount != 2 || VCount != 2)
+        {
+            // Malformed face input — leave edges null, caller will detect via null corners
+            return;
+        }
+
+        // Sort U-edges by their V coordinate: lower V = bottom (slot 0), higher V = top (slot 2)
+        if (UEdges[0]->GetMinCorner()->GetKey()[V] > UEdges[1]->GetMinCorner()->GetKey()[V])
+        {
+            Swap(UEdges[0], UEdges[1]);
+        }
+        Edges[0] = UEdges[0]; // bottom
+        Edges[2] = UEdges[1]; // top
+
+        // Sort V-edges by their U coordinate: lower U = left (slot 3), higher U = right (slot 1)
+        if (VEdges[0]->GetMinCorner()->GetKey()[U] > VEdges[1]->GetMinCorner()->GetKey()[U])
+        {
+            Swap(VEdges[0], VEdges[1]);
+        }
+        Edges[3] = VEdges[0]; // left
+        Edges[1] = VEdges[1]; // right
 
         // 2. CORNER EXTRACTION (Winding: BL -> BR -> TR -> TL)
         Corners[0] = Edges[0]->GetMinCorner(); // (MinU, MinV)

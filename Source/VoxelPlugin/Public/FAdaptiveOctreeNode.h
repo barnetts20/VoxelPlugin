@@ -77,13 +77,14 @@ struct VOXELPLUGIN_API OctreeConstants {
     };
 
     // FaceEdges[FaceIndex][4] -> Node Edge Indices (0-11)
+    // Edges 0-3: X-axis, 4-7: Y-axis, 8-11: Z-axis
     static constexpr int32 FaceEdges[6][4] = {
-        { 3, 11, 7, 9 },  // 0: XPos (Right)
-        { 2, 10, 6, 8 },  // 1: XNeg (Left)
-        { 1, 9, 5, 8 },   // 2: YPos (Back)
-        { 0, 11, 4, 10 }, // 3: YNeg (Front)
-        { 4, 5, 6, 7 },   // 4: ZPos (Top)
-        { 0, 1, 2, 3 }    // 5: ZNeg (Bottom)
+        {  5,  7,  9, 11 },  // 0: XPos - Y and Z axis edges on X+ face
+        {  4,  6,  8, 10 },  // 1: XNeg - Y and Z axis edges on X- face
+        {  1,  3, 10, 11 },  // 2: YPos - X and Z axis edges on Y+ face
+        {  0,  2,  8,  9 },  // 3: YNeg - X and Z axis edges on Y- face
+        {  2,  3,  6,  7 },  // 4: ZPos - X and Y axis edges on Z+ face
+        {  0,  1,  4,  5 },  // 5: ZNeg - X and Y axis edges on Z- face
     };
 
     inline static const uint8 OuterChildren[6][4] = {
