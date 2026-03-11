@@ -282,10 +282,10 @@ struct VOXELPLUGIN_API FVoxelFace {
     // The nodes at THIS LOD level
     TWeakPtr<FAdaptiveOctreeNode> Nodes[2];
 
+    short Axis; // 0, 1, or 2 (X, Y, or Z normal)
+
     // One-way upward link
     FVoxelFace* Parent = nullptr;
-
-    short Axis; // 0, 1, or 2 (X, Y, or Z normal)
 
     FVoxelFace() : Parent(nullptr) {
         Nodes[0] = Nodes[1] = nullptr;
@@ -406,11 +406,11 @@ public:
     TFunction<void(int32 Count, const float* X, const float* Y, const float* Z, float* OutDensities)> DensityFunction;
 
     /** High-level batch population for Octree Splits */
-    void PopulateNodeStructure(const TArray<TSharedPtr<class FAdaptiveOctreeNode>>& InNodes);
-    void UpdateNodeStructure(const TArray<TSharedPtr<class FAdaptiveOctreeNode>>& InNodes);
+    void PopulateNodeStructure(const TArray<TSharedPtr<FAdaptiveOctreeNode>>& InNodes);
+    void UpdateNodeStructure(const TArray<TSharedPtr<FAdaptiveOctreeNode>>& InNodes);
 
     /** Apply a spherical terrain edit and resample all affected nodes */
-    void ApplyEdit(FVector InCenter, double InRadius, double InStrength, int InResolution, const TArray<TSharedPtr<class FAdaptiveOctreeNode>>& InAffectedNodes);
+    void ApplyEdit(FVector InCenter, double InRadius, double InStrength, int InResolution, const TArray<TSharedPtr<FAdaptiveOctreeNode>>& InAffectedNodes);
 
     /** Thread-safe Acquisition API */
     FVoxelCorner* GetOrCreateCorner(const FVector& InPosition);

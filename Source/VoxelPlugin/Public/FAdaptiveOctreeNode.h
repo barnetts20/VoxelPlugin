@@ -486,14 +486,12 @@ public:
 
     TArray<struct FVoxelEdge*> GetSignChangeEdges() const;
 
-    void FinalizeFromExistingCorners();
-
     void ComputeDualContourPosition();
     
-    FORCEINLINE FVector GetCornerPosition(int32 Index) const
+    FORCEINLINE FVector GetCornerPosition(int32 CornerIndex) const
     {
         // Uses your existing OctreeConstants::Offsets to derive world position
-        return Center + (OctreeConstants::Offsets[Index] * Extent);
+        return Center + (OctreeConstants::Offsets[CornerIndex] * Extent);
     }
 
     // Root Constructor
@@ -504,15 +502,3 @@ public:
 
     ~FAdaptiveOctreeNode();
 };
-
-FORCEINLINE uint32 GetTypeHash(const FNodeEdgeKey& Key)
-{
-    uint32 Hash = GetTypeHash(Key.X0);
-    Hash = HashCombine(Hash, GetTypeHash(Key.Y0));
-    Hash = HashCombine(Hash, GetTypeHash(Key.Z0));
-    Hash = HashCombine(Hash, GetTypeHash(Key.X1));
-    Hash = HashCombine(Hash, GetTypeHash(Key.Y1));
-    Hash = HashCombine(Hash, GetTypeHash(Key.Z1));
-    Hash = HashCombine(Hash, GetTypeHash(Key.Axis));
-    return Hash;
-}
