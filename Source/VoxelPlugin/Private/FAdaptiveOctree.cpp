@@ -83,6 +83,20 @@ void FAdaptiveOctree::PopulateChunks()
     TArray<TSharedPtr<FAdaptiveOctreeNode>> Chunks = Root->GetSurfaceChunks();
     TArray<TSharedPtr<FAdaptiveOctreeNode>> NeighborChunks;
 
+    UE_LOG(LogTemp, Warning, TEXT("[Voxel] PopulateChunks: %d surface chunks found at ChunkDepth %d"), Chunks.Num(), ChunkDepth);
+
+    // Count nodes at chunk depth to verify the tree structure
+    int32 TotalReadyNodes = 0, TotalSignChangeEdges = 0;
+    for (auto& ChunkNode : Chunks)
+    {
+        if (!ChunkNode.IsValid()) continue;
+        if (ChunkNode->bDataReady) TotalReadyNodes++;
+        for (int i = 0; i < 12; i++)
+            if (ChunkNode->Edges[i] && ChunkNode->Edges[i]->GetSignChange()) TotalSignChangeEdges++;
+    }
+    UE_LOG(LogTemp, Warning, TEXT("[Voxel] PopulateChunks: %d/%d chunks have bDataReady, %d total sign-change edges across chunk-depth nodes"),
+        TotalReadyNodes, Chunks.Num(), TotalSignChangeEdges);
+
     for (auto& ChunkNode : Chunks)
     {
         if (!ChunkNode.IsValid()) continue;
@@ -107,32 +121,38 @@ void FAdaptiveOctree::PopulateChunks()
     TArray<TSharedPtr<FMeshChunk>> NewChunks;
     NewChunks.SetNum(Chunks.Num());
 
-    // 3. Parallelize the Meshing (Data is already populated by the Constructor)
-    ParallelFor(Chunks.Num(), [&](int32 i) {
+    // 3. Serial meshing - UpdateMeshChunkStreamData reads shared edge/face/node data
+    // that is not safe to access from multiple threads simultaneously.
+    for (int32 i = 0; i < Chunks.Num(); i++) {
         NewChunks[i] = MakeShared<FMeshChunk>();
         NewChunks[i]->CachedParentActor = CachedParentActor;
         NewChunks[i]->CachedSurfaceMaterial = CachedSurfaceMaterial;
         NewChunks[i]->CachedOceanMaterial = CachedOceanMaterial;
         NewChunks[i]->InitializeData(Chunks[i]->Center, Chunks[i]->Extent);
 
-        // GatherLeafEdges is a read-only operation on the Edges/Corners
-        // already populated by the StructureProvider in the constructor.
         TArray<FVoxelEdge*> Edges;
         GatherLeafEdges(Chunks[i], Edges);
         NewChunks[i]->ChunkEdges = Edges;
 
-        // Generates the actual vertex/index buffers
         UpdateMeshChunkStreamData(NewChunks[i]);
 
-        // Mark as dirty so the Game Thread knows to send this to the GPU
         NewChunks[i]->IsDirty = (NewChunks[i]->SurfaceMeshData->GetPositionStream().Num() > 0);
-        });
+    }
 
     // 4. Update the map (Serial)
+    int32 DirtyChunks = 0, TotalTris = 0, TotalEdgesProcessed = 0, TotalSignChange = 0;
     for (int32 i = 0; i < Chunks.Num(); i++)
     {
         ChunkMap.Add(Chunks[i], NewChunks[i]);
+        if (NewChunks[i]->IsDirty) DirtyChunks++;
+        if (auto* TriStream = NewChunks[i]->SurfaceMeshData->MeshStream.Find(FRealtimeMeshStreams::Triangles))
+            TotalTris += TriStream->Num();
+        TotalEdgesProcessed += NewChunks[i]->ChunkEdges.Num();
+        for (auto* Edge : NewChunks[i]->ChunkEdges)
+            if (Edge && Edge->GetSignChange()) TotalSignChange++;
     }
+    UE_LOG(LogTemp, Warning, TEXT("[Voxel] PopulateChunks done: %d chunks, %d dirty, %d total leaf edges, %d sign-change edges, %d triangles"),
+        Chunks.Num(), DirtyChunks, TotalEdgesProcessed, TotalSignChange, TotalTris);
 
     MeshChunksInitialized = true;
 }
@@ -245,6 +265,33 @@ FVector FAdaptiveOctree::QuantizePosition(const FVector& P, double GridSize)
 
 void FAdaptiveOctree::UpdateMeshChunkStreamData(TSharedPtr<FMeshChunk> InChunk)
 {
+    // Count sign-change edges before processing so we can log them
+    int32 SignChangeCount = 0;
+    for (auto* Edge : InChunk->ChunkEdges)
+        if (Edge && Edge->GetSignChange()) SignChangeCount++;
+
+    // Only log the first chunk that has sign-change edges (avoids spam)
+    static std::atomic<bool> bLoggedOnce = false;
+    bool bShouldLog = (SignChangeCount > 0 && !bLoggedOnce.exchange(true));
+    if (bShouldLog)
+    {
+        UE_LOG(LogTemp, Warning, TEXT("[Voxel] UpdateMeshChunkStreamData sample: %d total edges, %d sign-change, chunk center (%.0f, %.0f, %.0f) extent %.0f"),
+            InChunk->ChunkEdges.Num(), SignChangeCount,
+            InChunk->ChunkCenter.X, InChunk->ChunkCenter.Y, InChunk->ChunkCenter.Z, InChunk->ChunkExtent);
+
+        // Log corner densities of first sign-change edge to verify SDF values
+        for (auto* Edge : InChunk->ChunkEdges)
+        {
+            if (!Edge || !Edge->GetSignChange()) continue;
+            double D0 = Edge->GetMinCorner()->GetDensity();
+            double D1 = Edge->GetMaxCorner()->GetDensity();
+            FVector P0 = Edge->GetMinCorner()->GetPosition();
+            FVector P1 = Edge->GetMaxCorner()->GetPosition();
+            UE_LOG(LogTemp, Warning, TEXT("[Voxel]   First sign-change edge: D0=%.4f at (%.0f,%.0f,%.0f)  D1=%.4f at (%.0f,%.0f,%.0f)"),
+                D0, P0.X, P0.Y, P0.Z, D1, P1.X, P1.Y, P1.Z);
+            break;
+        }
+    }
     TMap<FMeshVertex, int32> VertexMap;
     TArray<FMeshVertex> UniqueVertices;
     TArray<FIndex3UI> SrfTriangles;
@@ -407,7 +454,7 @@ void FAdaptiveOctree::UpdateMeshChunkStreamData(TSharedPtr<FMeshChunk> InChunk)
         // Encode
         float absDepth = FMath::Max(Vertex.Depth, 0.0f);
         bool isUnderwater = (Vertex.Depth >= 0);
-        uint32 intDepth = (uint32)FMath::Min(absDepth * 1000.0f, 4294967295.0f); // mm precision, full uint32 range
+        uint32 intDepth = (uint32)FMath::Min(absDepth * 1000.0f, 4294967295.0f);
 
         uint8 R = (intDepth >> 24) & 0xFF;
         uint8 G = (intDepth >> 16) & 0xFF;
@@ -453,12 +500,12 @@ void FAdaptiveOctree::UpdateLodRecursive(TSharedPtr<FAdaptiveOctreeNode> Node, F
     }
     else
     {
-        // Check merge before recursing — only trigger on child 7 to avoid 8x redundant checks
+        // Check merge before recursing --- only trigger on child 7 to avoid 8x redundant checks
         if (Node->ShouldMerge(CameraPosition, InScreenSpaceThreshold, InCameraFOV))
         {
             OutChanged = true;
             Node->Merge();
-            // Parent node retains its existing structure data — no provider call needed
+            // Parent node retains its existing structure data --- no provider call needed
             return;
         }
 
@@ -477,14 +524,14 @@ void FAdaptiveOctree::UpdateLOD(FVector CameraPosition, double InScreenSpaceThre
     ChunkMap.GenerateKeyArray(Chunks);
     int32 NumChunks = Chunks.Num();
 
-    // Per-chunk results — pre-allocated for parallel write safety
+    // Per-chunk results --- pre-allocated for parallel write safety
     TArray<TArray<TSharedPtr<FAdaptiveOctreeNode>>> PerChunkNewNodes;
     TArray<bool> ChunkChanged;
     PerChunkNewNodes.SetNum(NumChunks);
     ChunkChanged.SetNum(NumChunks);
     for (int32 i = 0; i < NumChunks; i++) ChunkChanged[i] = false;
 
-    // Stage 1: Parallel LOD update — splits/merges only, no provider calls yet
+    // Stage 1: Parallel LOD update --- splits/merges only, no provider calls yet
     ParallelFor(NumChunks, [&](int32 idx)
         {
             UpdateLodRecursive(Chunks[idx], CameraPosition, InScreenSpaceThreshold, InCameraFOV, PerChunkNewNodes[idx], ChunkChanged[idx]);

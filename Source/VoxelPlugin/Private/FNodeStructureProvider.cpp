@@ -85,7 +85,6 @@ FVector3f FVoxelEdge::GetAverageNormal() const
 }
 
 const FVoxelFace* FVoxelEdge::GetConnectedFace(uint8 idx) {
-    FReadScopeLock ReadLock(Mutex);
     return ConnectedFaces[idx];
 }
 
@@ -138,7 +137,6 @@ void FVoxelFace::RegisterNode(TSharedPtr<FAdaptiveOctreeNode> InNode)
 
 void FVoxelFace::GetNodes(TSharedPtr<FAdaptiveOctreeNode> OutNodes[2])
 {
-    FReadScopeLock ReadLock(Mutex);
     OutNodes[0] = Nodes[0].IsValid() ? Nodes[0].Pin() : nullptr;
     OutNodes[1] = Nodes[1].IsValid() ? Nodes[1].Pin() : nullptr;
 }

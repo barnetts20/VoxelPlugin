@@ -47,7 +47,7 @@ struct VOXELPLUGIN_API OctreeConstants {
     // Edge axis groups: X-axis edges 0-3, Y-axis edges 4-7, Z-axis edges 8-11
     // EdgePairs: {0,1},{2,3},{4,5},{6,7} = X-axis; {0,2},{1,3},{4,6},{5,7} = Y-axis; {0,4},{1,5},{2,6},{3,7} = Z-axis
     static constexpr int32 ChildToParentEdgeMap[8][12] = {
-        // Child 0 (0,0,0): Min corner — touches parent edges on X-,Y-,Z- faces
+        // Child 0 (0,0,0): Min corner --- touches parent edges on X-,Y-,Z- faces
         {  0, -1,  2, -1,  4, -1, -1, -1,  8, -1, 10, -1 },
         // Child 1 (1,0,0): touches parent edges on X+,Y-,Z- faces
         {  0, -1,  3, -1, -1,  5, -1, -1,  9, -1, -1, 11 },
@@ -61,7 +61,7 @@ struct VOXELPLUGIN_API OctreeConstants {
         {  0, -1, -1,  3, -1,  5, -1, -1,  9, -1, -1, 11 },
         // Child 6 (0,1,1): touches parent edges on X-,Y+,Z+ faces
         { -1,  1, -1,  2,  6, -1, -1, -1, -1,  8, 10, -1 },
-        // Child 7 (1,1,1): Max corner — touches parent edges on X+,Y+,Z+ faces
+        // Child 7 (1,1,1): Max corner --- touches parent edges on X+,Y+,Z+ faces
         { -1,  1, -1,  3, -1,  7, -1, -1, -1,  9, -1, 11 },
     };
 
@@ -204,10 +204,10 @@ struct VOXELPLUGIN_API FQEF
     // Number of planes added
     int32 PlaneCount;
 
-    // Mass point (average of intersection points — used as fallback and bias)
+    // Mass point (average of intersection points --- used as fallback and bias)
     FVector MassPoint;
 
-    // Accumulated normal (sum of normals passed to AddPlane — for average normal output)
+    // Accumulated normal (sum of normals passed to AddPlane --- for average normal output)
     FVector3f AccumulatedNormal;
 
     FQEF()
@@ -392,7 +392,7 @@ private:
         double maxEigen = FMath::Max3(FMath::Abs(eigenvalues[0]),
             FMath::Abs(eigenvalues[1]),
             FMath::Abs(eigenvalues[2]));
-        double threshold = maxEigen * 0.1; // 10% threshold — fairly aggressive clamping
+        double threshold = maxEigen * 0.1; // 10% threshold --- fairly aggressive clamping
 
         // V^T * rhs
         double vtRhs[3];
@@ -408,7 +408,7 @@ private:
             if (FMath::Abs(eigenvalues[i]) > threshold)
                 scaled[i] = vtRhs[i] / eigenvalues[i];
             else
-                scaled[i] = 0.0; // Singular direction — collapse to mass point
+                scaled[i] = 0.0; // Singular direction --- collapse to mass point
         }
 
         // V * scaled
@@ -433,9 +433,9 @@ private:
 
 struct VOXELPLUGIN_API FAdaptiveOctreeNode : public TSharedFromThis<FAdaptiveOctreeNode>
 {
-private:    
+private:
     FVector3f GetInterpolatedNormal(FVector P);
-    
+
     int DepthPrecisionFloor = 20;
 
 public:
@@ -445,30 +445,30 @@ public:
     FVoxelCorner* Corners[8];
     FVoxelEdge* Edges[12];
     FVoxelFace* Faces[6];
-    
+
     bool bDataReady = false;
 
     int ChunkDepth = 4;
     int DepthBounds[3];
-    
+
     // Octree center
-    FVector TreeCenter; 
+    FVector TreeCenter;
 
     //Chunk level parent center, used to construct the mesh at world origin in higher precision, 
     //then move the entire chunk back to chunk center - yeilds higher precision mesh
-    FVector AnchorCenter; 
-    
+    FVector AnchorCenter;
+
     FVector Center;
-    
+
     double Extent;
-    
+
     FVector DualContourPosition;
 
     FVector3f DualContourNormal;
 
     //Position projected onto the sphere, used to construct ocean mesh
     FVector NormalizedPosition;
-    
+
     // Turns off lod updates, useful for disabling lod during parallax movement, 
     // or for a warp effect -> could disable the lod, set an override position, let the lod update for the position the 
     // warp will END at, then warp the player to the point with no pop in
@@ -480,7 +480,7 @@ public:
     const bool IsSurface();
 
     const bool IsRoot();
-    
+
     bool ShouldSplit(FVector InCameraPosition, double InScreenSpaceThreshold, double InCameraFOV);
 
     bool ShouldMerge(FVector InCameraPosition, double InScreenSpaceThreshold, double InCameraFOV);
@@ -488,7 +488,7 @@ public:
     void Split();
 
     void Merge();
-    
+
     TArray<TSharedPtr<FAdaptiveOctreeNode>> GetSurfaceChunks();
 
     void ComputeNormalizedPosition(double InRadius);
@@ -496,7 +496,7 @@ public:
     TArray<struct FVoxelEdge*> GetSignChangeEdges() const;
 
     void ComputeDualContourPosition();
-    
+
     FORCEINLINE FVector GetCornerPosition(int32 CornerIndex) const
     {
         // Uses your existing OctreeConstants::Offsets to derive world position
