@@ -431,11 +431,14 @@ public:
 
     FORCEINLINE double CompositeSample(const FVector& P, double RawNoise) const
     {
+        double NoiseAmplitude = .03;//TODO: TEMPORARY, NEEDS TO BE EXPOSED
         double dx = P.X - Center.X;
         double dy = P.Y - Center.Y;
         double dz = P.Z - Center.Z;
         double Dist = FMath::Sqrt(dx * dx + dy * dy + dz * dz);
-        return (Dist - SurfaceLevel) - RawNoise + EditStore->Sample(P);
+
+        double surfaceRadius = Dist - SurfaceLevel;
+        return surfaceRadius - (RawNoise * NoiseAmplitude * surfaceRadius) + EditStore->Sample(P);
     }
 
     /** * Cleanup: Optional method to prune the TChunkedArrays

@@ -195,12 +195,14 @@ void FNodeStructureProvider::PopulateNodeStructure(const TArray<TSharedPtr<FAdap
     {
         int32 N = NewCorners.Num();
         const float Epsilon = 1.0f; // 1cm
+        const float InvSurface = (float)(1.0 / SurfaceLevel); // normalize to unit-sphere for FastNoise
 
         int32 TotalCount = N * 7;
-        TArray<float> X, Y, Z, OutDensities;
-        X.SetNumUninitialized(TotalCount);
-        Y.SetNumUninitialized(TotalCount);
-        Z.SetNumUninitialized(TotalCount);
+        TArray<float> X, Y, Z;           // world-space positions — used by CompositeSample
+        TArray<float> NX, NY, NZ;        // unit-sphere positions — passed to FastNoise
+        TArray<float> OutDensities;
+        X.SetNumUninitialized(TotalCount);   Y.SetNumUninitialized(TotalCount);   Z.SetNumUninitialized(TotalCount);
+        NX.SetNumUninitialized(TotalCount); NY.SetNumUninitialized(TotalCount); NZ.SetNumUninitialized(TotalCount);
         OutDensities.SetNum(TotalCount);
 
         for (int32 i = 0; i < N; ++i)
@@ -208,40 +210,44 @@ void FNodeStructureProvider::PopulateNodeStructure(const TArray<TSharedPtr<FAdap
             FVector P = NewCorners[i]->GetPosition();
             int32 Base = i * 7;
 
-            // Center + 6 Gradient offsets
+            // World-space positions (center + gradient offsets)
             X[Base] = P.X; Y[Base] = P.Y; Z[Base] = P.Z;
+            X[Base + 1] = P.X + Epsilon; X[Base + 2] = P.X - Epsilon; Y[Base + 1] = P.Y; Y[Base + 2] = P.Y; Z[Base + 1] = P.Z; Z[Base + 2] = P.Z;
+            Y[Base + 3] = P.Y + Epsilon; Y[Base + 4] = P.Y - Epsilon; X[Base + 3] = P.X; X[Base + 4] = P.X; Z[Base + 3] = P.Z; Z[Base + 4] = P.Z;
+            Z[Base + 5] = P.Z + Epsilon; Z[Base + 6] = P.Z - Epsilon; X[Base + 5] = P.X; X[Base + 6] = P.X; Y[Base + 5] = P.Y; Y[Base + 6] = P.Y;
 
-            // X-axis
-            X[Base + 1] = P.X + Epsilon; X[Base + 2] = P.X - Epsilon;
-            Y[Base + 1] = P.Y; Y[Base + 2] = P.Y; Z[Base + 1] = P.Z; Z[Base + 2] = P.Z;
-            // Y-axis
-            Y[Base + 3] = P.Y + Epsilon; Y[Base + 4] = P.Y - Epsilon;
-            X[Base + 3] = P.X; X[Base + 4] = P.X; Z[Base + 3] = P.Z; Z[Base + 4] = P.Z;
-            // Z-axis
-            Z[Base + 5] = P.Z + Epsilon; Z[Base + 6] = P.Z - Epsilon;
-            X[Base + 5] = P.X; X[Base + 6] = P.X; Y[Base + 5] = P.Y; Y[Base + 6] = P.Y;
+            // Normalized positions for FastNoise (planet surface maps to unit sphere)
+            for (int32 j = 0; j < 7; ++j)
+            {
+                NX[Base + j] = X[Base + j] * InvSurface;
+                NY[Base + j] = Y[Base + j] * InvSurface;
+                NZ[Base + j] = Z[Base + j] * InvSurface;
+            }
         }
 
-        // SIMD Density Pass - this is why we pack the normal samples in addition to the corner samples - so we can get them all in one simd call
-        NoiseFunction(TotalCount, X.GetData(), Y.GetData(), Z.GetData(), OutDensities.GetData());
-        
-        // 3. RESOLVE & STORE
-        for (int32 i = 0; i < N; ++i)
-        {
-            int32 Base = i * 7;
+        // SIMD Density Pass — sample at unit-sphere coordinates
+        NoiseFunction(TotalCount, NX.GetData(), NY.GetData(), NZ.GetData(), OutDensities.GetData());
 
-            auto GetFinalD = [&](int32 Offset) {
-                FVector SampleP(X[Base + Offset], Y[Base + Offset], Z[Base + Offset]);
-                return OutDensities[Base + Offset] + EditStore->Sample(SampleP);
-            };
-            FVector3f Gradient(
-                GetFinalD(1) - GetFinalD(2),
-                GetFinalD(3) - GetFinalD(4),
-                GetFinalD(5) - GetFinalD(6)
-            );
-            //Final set unless the corner is edited later
-            NewCorners[i]->SetDensityAndNormal(GetFinalD(0), Gradient);
-        }
+        // RESOLVE & STORE — CompositeSample uses world-space X/Y/Z for the SDF, OutDensities for noise
+        ParallelFor(N, [&](int32 i)
+            {
+                int32 Base = i * 7;
+
+                auto Sample = [&](int32 Offset) -> double
+                    {
+                        return CompositeSample(
+                            FVector(X[Base + Offset], Y[Base + Offset], Z[Base + Offset]),
+                            (double)OutDensities[Base + Offset]);
+                    };
+
+                double D0 = Sample(0);
+                FVector3f Gradient(
+                    (float)(Sample(1) - Sample(2)),
+                    (float)(Sample(3) - Sample(4)),
+                    (float)(Sample(5) - Sample(6))
+                );
+                NewCorners[i]->SetDensityAndNormal(D0, Gradient);
+            });
     }
 
     // --- 4. EDGES ---
@@ -342,27 +348,34 @@ void FNodeStructureProvider::UpdateNodeStructure(const TArray<TSharedPtr<FAdapti
     const float Epsilon = 1.0f;
 
     int32 TotalCount = N * 7;
-    TArray<float> X, Y, Z, RawNoise;
-    X.SetNumUninitialized(TotalCount);
-    Y.SetNumUninitialized(TotalCount);
-    Z.SetNumUninitialized(TotalCount);
+    TArray<float> X, Y, Z;          // world-space — used by CompositeSample
+    TArray<float> NX, NY, NZ;       // unit-sphere — passed to FastNoise
+    TArray<float> RawNoise;
+    X.SetNumUninitialized(TotalCount);   Y.SetNumUninitialized(TotalCount);   Z.SetNumUninitialized(TotalCount);
+    NX.SetNumUninitialized(TotalCount); NY.SetNumUninitialized(TotalCount); NZ.SetNumUninitialized(TotalCount);
     RawNoise.SetNum(TotalCount);
+
+    const float InvSurface = (float)(1.0 / SurfaceLevel);
 
     for (int32 i = 0; i < N; ++i)
     {
         FVector P = CornerArray[i]->GetPosition();
         int32 Base = i * 7;
         X[Base] = P.X; Y[Base] = P.Y; Z[Base] = P.Z;
-        X[Base + 1] = P.X + Epsilon; X[Base + 2] = P.X - Epsilon;
-        Y[Base + 1] = P.Y; Y[Base + 2] = P.Y; Z[Base + 1] = P.Z; Z[Base + 2] = P.Z;
-        Y[Base + 3] = P.Y + Epsilon; Y[Base + 4] = P.Y - Epsilon;
-        X[Base + 3] = P.X; X[Base + 4] = P.X; Z[Base + 3] = P.Z; Z[Base + 4] = P.Z;
-        Z[Base + 5] = P.Z + Epsilon; Z[Base + 6] = P.Z - Epsilon;
-        X[Base + 5] = P.X; X[Base + 6] = P.X; Y[Base + 5] = P.Y; Y[Base + 6] = P.Y;
+        X[Base + 1] = P.X + Epsilon; X[Base + 2] = P.X - Epsilon; Y[Base + 1] = P.Y; Y[Base + 2] = P.Y; Z[Base + 1] = P.Z; Z[Base + 2] = P.Z;
+        Y[Base + 3] = P.Y + Epsilon; Y[Base + 4] = P.Y - Epsilon; X[Base + 3] = P.X; X[Base + 4] = P.X; Z[Base + 3] = P.Z; Z[Base + 4] = P.Z;
+        Z[Base + 5] = P.Z + Epsilon; Z[Base + 6] = P.Z - Epsilon; X[Base + 5] = P.X; X[Base + 6] = P.X; Y[Base + 5] = P.Y; Y[Base + 6] = P.Y;
+
+        for (int32 j = 0; j < 7; ++j)
+        {
+            NX[Base + j] = X[Base + j] * InvSurface;
+            NY[Base + j] = Y[Base + j] * InvSurface;
+            NZ[Base + j] = Z[Base + j] * InvSurface;
+        }
     }
 
-    // 3. SIMD Pass
-    NoiseFunction(TotalCount, X.GetData(), Y.GetData(), Z.GetData(), RawNoise.GetData());
+    // 3. SIMD Pass — sample at unit-sphere coordinates
+    NoiseFunction(TotalCount, NX.GetData(), NY.GetData(), NZ.GetData(), RawNoise.GetData());
 
     // 4. Resolve & Set
     ParallelFor(N, [&](int32 i)
