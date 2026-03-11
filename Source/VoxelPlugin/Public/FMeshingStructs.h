@@ -3,23 +3,15 @@
 #include "FAdaptiveOctreeNode.h"
 #include "RealtimeMeshActor.h"
 #include <RealtimeMeshCore.h>
+#include <FNodeStructureProvider.h>
 #include <RealtimeMeshSimple.h>
 
 using namespace RealtimeMesh;
 
-struct VOXELPLUGIN_API FCornerSample {
-    FVector Position;           // World position
-    double Density;             // Final SDF density
-    double Dist;
-    float NoiseValue;           // Raw noise result
-    TArray<double*> Targets;    // Pointers to all Corners[i].Density that share this position
-};
-
 struct VOXELPLUGIN_API FMeshVertex
 {
-    FVector Position;       // Quantized position (chunk-local)
-    FVector OriginalPosition; // Unquantized for actual mesh output
-    FVector NormalizedPosition; // Projected onto planet radius sphere surface
+    FVector Position;           // Quantized position (chunk-local)
+    FVector NormalizedPosition; // Projected onto planet radius sphere surface (chunk-local)
     FVector3f Normal;
     FColor Color;
     double Depth;
@@ -34,7 +26,7 @@ struct VOXELPLUGIN_API FMeshVertex
 
 struct VOXELPLUGIN_API FEdgeVertexData {
     TArray<FMeshVertex> Vertices;
-    TOptional<FNodeEdge> Edge;
+    TOptional<FVoxelEdge*> Edge;
     bool IsValid;
 };
 
@@ -83,7 +75,6 @@ struct VOXELPLUGIN_API FMeshStreamData {
 
 struct VOXELPLUGIN_API FMeshChunk {
     TWeakObjectPtr<ARealtimeMeshActor> CachedParentActor;
-    
     TWeakObjectPtr <UMaterialInterface> CachedSurfaceMaterial;
     TWeakObjectPtr <UMaterialInterface> CachedOceanMaterial;
     
@@ -92,7 +83,7 @@ struct VOXELPLUGIN_API FMeshChunk {
     
     double ChunkExtent;
     
-    TArray<FNodeEdge> ChunkEdges;
+    TArray<FVoxelEdge*> ChunkEdges;
     
     TSharedPtr<FMeshStreamData> SurfaceMeshData;
 
@@ -139,7 +130,7 @@ struct VOXELPLUGIN_API FMeshChunk {
 
         ChunkRtComponent = NewObject<URealtimeMeshComponent>(InParentActor, URealtimeMeshComponent::StaticClass());
         ChunkRtComponent->RegisterComponent();
-        
+
         ChunkRtComponent->SetMaterial(0, InSurfaceMaterial);
         ChunkRtComponent->SetMaterial(1, InOceanMaterial);
 
@@ -155,19 +146,7 @@ struct VOXELPLUGIN_API FMeshChunk {
         ChunkRtMesh->CreateSectionGroup(OceanMeshData->MeshGroupKey, FRealtimeMeshStreamSet());
 
         IsInitialized = true;
-    }
-
-    bool ShouldProcessEdge(const FNodeEdge& Edge, const TArray<TSharedPtr<FAdaptiveOctreeNode>>& SampledNodes) {
-        if (SampledNodes.Num() < 3) return false;
-
-        double OwnerExtent = Edge.Size * 0.5;
-        for (auto& Node : SampledNodes)
-        {
-            if (Node->Extent < OwnerExtent * 0.9)
-                return false;
-        }
-        return true;
-    }
+    };
 
     void UpdateComponent(TSharedPtr<FMeshChunk> Self) {
         AsyncTask(ENamedThreads::GameThread, [Self]() {            

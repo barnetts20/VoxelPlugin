@@ -308,27 +308,23 @@ void FNodeStructureProvider::PopulateNodeStructure(const TArray<TSharedPtr<class
     }
 }
 
-void FNodeStructureProvider::UpdateNodeStructure(const TArray<TSharedPtr<FAdaptiveOctreeNode>>& InNodes)
+void FNodeStructureProvider::UpdateNodeStructure(const TArray<TSharedPtr<class FAdaptiveOctreeNode>>& InNodes)
 {
     if (InNodes.Num() == 0) return;
 
-    // 1. GATHER UNIQUE CORNERS
-    // We use a TSet to ensure we don't sample the same shared corner multiple times
+    // 1. Gather Unique Existing Corners
     TSet<FVoxelCorner*> UniqueCorners;
     for (const auto& Node : InNodes)
     {
         for (int32 i = 0; i < 8; ++i)
         {
-            if (Node->Corners[i])
-            {
-                UniqueCorners.Add(Node->Corners[i]);
-            }
+            if (Node->Corners[i]) UniqueCorners.Add(Node->Corners[i]);
         }
     }
 
     if (UniqueCorners.Num() == 0) return;
 
-    // 2. PREPARE THE BATCH (Reuse your 7N logic)
+    // 2. Prepare 7N Batch
     TArray<FVoxelCorner*> CornerArray = UniqueCorners.Array();
     int32 N = CornerArray.Num();
     const float Epsilon = 1.0f;
@@ -344,8 +340,6 @@ void FNodeStructureProvider::UpdateNodeStructure(const TArray<TSharedPtr<FAdapti
     {
         FVector P = CornerArray[i]->GetPosition();
         int32 Base = i * 7;
-
-        // Center + 6 Gradient offsets
         X[Base] = P.X; Y[Base] = P.Y; Z[Base] = P.Z;
         X[Base + 1] = P.X + Epsilon; X[Base + 2] = P.X - Epsilon;
         Y[Base + 1] = P.Y; Y[Base + 2] = P.Y; Z[Base + 1] = P.Z; Z[Base + 2] = P.Z;
@@ -355,10 +349,10 @@ void FNodeStructureProvider::UpdateNodeStructure(const TArray<TSharedPtr<FAdapti
         X[Base + 5] = P.X; X[Base + 6] = P.X; Y[Base + 5] = P.Y; Y[Base + 6] = P.Y;
     }
 
-    // 3. SIMD DENSITY PASS
+    // 3. SIMD Pass
     DensityFunction(TotalCount, X.GetData(), Y.GetData(), Z.GetData(), OutDensities.GetData());
 
-    // 4. RESOLVE & UPDATE CORNERS
+    // 4. Resolve & Set
     for (int32 i = 0; i < N; ++i)
     {
         int32 Base = i * 7;
@@ -367,26 +361,16 @@ void FNodeStructureProvider::UpdateNodeStructure(const TArray<TSharedPtr<FAdapti
             return OutDensities[Base + Offset] + EditStore->Sample(SampleP);
             };
 
-        FVector3f Gradient(
-            GetFinalD(1) - GetFinalD(2),
-            GetFinalD(3) - GetFinalD(4),
-            GetFinalD(5) - GetFinalD(6)
-        );
-
-        // Update the existing corner object
-        CornerArray[i]->SetDensityAndNormal(GetFinalD(0), Gradient);
+        FVector3f Normal(GetFinalD(1) - GetFinalD(2), GetFinalD(3) - GetFinalD(4), GetFinalD(5) - GetFinalD(6));
+        CornerArray[i]->SetDensityAndNormal(GetFinalD(0), Normal);
     }
 
-
+    // 5. Finalize Nodes
     for (const auto& Node : InNodes)
     {
         Node->ComputeDualContourPosition();
-        Node->bDataReady = true; 
+        Node->bDataReady = true;
     }
-}
-
-void FNodeStructureProvider::UpdateCorners(const TArray<FVoxelCorner*>& CornersToUpdate)
-{
 }
 
 FVoxelCorner* FNodeStructureProvider::Internal_CreateCorner(const FInt64Vector& InKey)
