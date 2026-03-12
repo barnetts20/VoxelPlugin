@@ -210,7 +210,7 @@ void FNodeStructureProvider::PopulateNodeStructure(const TArray<TSharedPtr<FAdap
     if (NewCorners.Num() > 0)
     {
         int32 N = NewCorners.Num();
-        const float Epsilon = 1.0f; // 1cm
+        const float Epsilon = 1; // 1cm
         const float InvSurface = (float)(1.0 / SurfaceLevel); // normalize to unit-sphere for FastNoise
 
         int32 TotalCount = N * 7;
@@ -355,7 +355,7 @@ void FNodeStructureProvider::UpdateNodeStructure(const TArray<TSharedPtr<FAdapti
     // 2. Prepare 7N Batch
     TArray<FVoxelCorner*> CornerArray = UniqueCorners.Array();
     int32 N = CornerArray.Num();
-    const float Epsilon = 1.0f;
+    const float Epsilon = 1;
 
     int32 TotalCount = N * 7;
     TArray<float> X, Y, Z;          // world-space used by CompositeSample

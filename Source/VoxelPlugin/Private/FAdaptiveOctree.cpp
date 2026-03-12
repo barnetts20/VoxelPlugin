@@ -667,22 +667,24 @@ void FAdaptiveOctree::SampleNodesAroundEdge(FVoxelEdge* Edge, TArray<TSharedPtr<
         for (int32 i = 0; i < 4; i++)
             if (!Faces[i]) { MissingSlot = i; break; }
 
+        // Opposite face always has the two fine nodes
         int32 OppositeSlot = (MissingSlot + 2) % 4;
-        {
-            TSharedPtr<FAdaptiveOctreeNode> FN[2];
-            Faces[OppositeSlot]->GetNodes(FN);
-            for (int32 n = 0; n < 2; n++)
-                if (FN[n].IsValid()) OutNodes.AddUnique(FN[n]);
-        }
+        TSharedPtr<FAdaptiveOctreeNode> FN[2];
+        Faces[OppositeSlot]->GetNodes(FN);
+        if (FN[0].IsValid()) OutNodes.AddUnique(FN[0]);
+        if (FN[1].IsValid()) OutNodes.AddUnique(FN[1]);
 
+
+        // For missing slot, climb adjacent face parents to find coarse neighbor
         int32 AdjacentSlots[2] = { (MissingSlot + 1) % 4, (MissingSlot + 3) % 4 };
         for (int32 adj : AdjacentSlots)
         {
             FVoxelFace* CurrFace = Faces[adj] ? Faces[adj]->GetParent() : nullptr;
-            if (CurrFace) // was: while(CurrFace)
+            if (CurrFace)
             {
-                TSharedPtr<FAdaptiveOctreeNode> Node = GetNodeForSlot(CurrFace, MissingSlot);
-                if (Node.IsValid()) OutNodes.AddUnique(Node);
+                int32 NodeSlot = (MissingSlot < 2) ? 0 : 1;
+                TSharedPtr<FAdaptiveOctreeNode> Node = CurrFace->GetNode(NodeSlot);
+                if (Node.IsValid()) { OutNodes.AddUnique(Node); break; }
             }
         }
     }
