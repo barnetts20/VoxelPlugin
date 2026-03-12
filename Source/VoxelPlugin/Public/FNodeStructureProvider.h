@@ -91,27 +91,11 @@ struct VOXELPLUGIN_API FVoxelEdgeKey
 
     static FVoxelEdgeKey Generate(FVoxelCorner* A, FVoxelCorner* B) {
         FInt64Vector RawDelta = A->GetKey() - B->GetKey();
-
-        int64 Magnitude = 0;
         bool bSwap = false;
-
-        if (RawDelta.X != 0) {
-            Magnitude = RawDelta.X;
-            bSwap = RawDelta.X < 0;
-        }
-        else if (RawDelta.Y != 0) {
-            Magnitude = RawDelta.Y;
-            bSwap = RawDelta.Y < 0;
-        }
-        else {
-            Magnitude = RawDelta.Z;
-            bSwap = RawDelta.Z < 0;
-        }
-
-        FVoxelCorner* MinC = bSwap ? B : A;
-        FVoxelCorner* MaxC = bSwap ? A : B;
-
-        return FVoxelEdgeKey(MinC, MaxC);
+        if (RawDelta.X != 0) bSwap = RawDelta.X < 0;
+        else if (RawDelta.Y != 0) bSwap = RawDelta.Y < 0;
+        else                      bSwap = RawDelta.Z < 0;
+        return FVoxelEdgeKey(bSwap ? B : A, bSwap ? A : B);
     }
 
     // This stays inside the struct but behaves as a global function
@@ -236,30 +220,32 @@ struct VOXELPLUGIN_API FVoxelFaceKey
     FVoxelFaceKey(FVoxelCorner* InMin, FVoxelCorner* InMax, short InAxis)
         : Min(InMin), Max(InMax), Axis(InAxis) {}
 
-    static FVoxelFaceKey Generate(FVoxelCorner* InCorners[4], short InAxis) {
-        // 1. Identify plane axes (U and V)
+    static FVoxelFaceKey Generate(FVoxelEdge* InEdges[4], short InAxis)
+    {
         int32 U = (InAxis + 1) % 3;
         int32 V = (InAxis + 2) % 3;
 
-        // 2. Sort the 4 corners to find the absolute Min and Max for the FFaceKey.
-        // In our quantized 1cm grid, Min is the corner with the lowest U and V.
-        FVoxelCorner* MinC = InCorners[0];
-        FVoxelCorner* MaxC = InCorners[0];
+        // Collect all 8 corners from the 4 edges
+        FVoxelCorner* AllCorners[8] = {
+            InEdges[0]->GetMinCorner(), InEdges[0]->GetMaxCorner(),
+            InEdges[1]->GetMinCorner(), InEdges[1]->GetMaxCorner(),
+            InEdges[2]->GetMinCorner(), InEdges[2]->GetMaxCorner(),
+            InEdges[3]->GetMinCorner(), InEdges[3]->GetMaxCorner()
+        };
 
-        for (int i = 1; i < 4; i++)
+        FVoxelCorner* MinC = AllCorners[0];
+        FVoxelCorner* MaxC = AllCorners[0];
+        for (int32 i = 1; i < 8; i++)
         {
-            const FInt64Vector& K = InCorners[i]->GetKey();
+            const FInt64Vector& K = AllCorners[i]->GetKey();
             const FInt64Vector& MK = MinC->GetKey();
             const FInt64Vector& XK = MaxC->GetKey();
-
-            // Standard 2D Sort: Compare U, then V
-            if (K[U] < MK[U] || (K[U] == MK[U] && K[V] < MK[V])) MinC = InCorners[i];
-            if (K[U] > XK[U] || (K[U] == XK[U] && K[V] > XK[V])) MaxC = InCorners[i];
+            if (K[U] < MK[U] || (K[U] == MK[U] && K[V] < MK[V])) MinC = AllCorners[i];
+            if (K[U] > XK[U] || (K[U] == XK[U] && K[V] > XK[V])) MaxC = AllCorners[i];
         }
-
-        // 3. Set the Key and AddRef the anchors
         return FVoxelFaceKey(MinC, MaxC, InAxis);
     }
+
 
     bool operator==(const FVoxelFaceKey& Other) const {
         return Min == Other.Min && Max == Other.Max && Axis == Other.Axis;
@@ -344,7 +330,7 @@ struct VOXELPLUGIN_API FVoxelFace {
         Corners[3] = Edges[2]->GetMinCorner(); // (MinU, MaxV)
 
         // 3. NOW GENERATE KEY
-        Key = FVoxelFaceKey(Corners[0], Corners[2], Axis);
+        Key = FVoxelFaceKey::Generate(Edges, Axis);
 
         // 4. EDGE-LINKING
         for (int32 i = 0; i < 4; i++) {
@@ -355,6 +341,10 @@ struct VOXELPLUGIN_API FVoxelFace {
     void RegisterNode(TSharedPtr<FAdaptiveOctreeNode> InNode);
 
     void GetNodes(TSharedPtr<FAdaptiveOctreeNode> OutNodes[2]);
+
+    FVector GetCenter() {
+        return (Key.Min->GetPosition() + Key.Max->GetPosition()) * .5;
+    }
 
     TSharedPtr<FAdaptiveOctreeNode> GetNode(int index);
 
@@ -439,7 +429,7 @@ public:
         // Sphere SDF: positive = outside, negative = inside. Gradient magnitude = 1 UU/UU radially.
         // RawNoise is [-1, 1]. Scale by 1% of planet radius to get world-space UU displacement.
         // TODO: expose NoiseAmplitude as a UPROPERTY on the actor.
-        const double NoiseAmplitude = SurfaceLevel * 0.09;
+        const double NoiseAmplitude = SurfaceLevel * 0.0;
         return (Dist - SurfaceLevel) - (RawNoise * NoiseAmplitude) + EditStore->Sample(P);
     }
 

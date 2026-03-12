@@ -88,26 +88,44 @@ const FVoxelFace* FVoxelEdge::GetConnectedFace(uint8 idx) {
     return ConnectedFaces[idx];
 }
 
-void FVoxelEdge::RegisterConnectedFace(FVoxelFace* InFace) {
+void FVoxelEdge::RegisterConnectedFace(FVoxelFace* InFace)
+{
     FWriteScopeLock WriteLock(Mutex);
 
-    // 1. Identify the two axes perpendicular to this edge
-    // If Axis is 0 (X), O1 is 1 (Y) and O2 is 2 (Z)
-    int32 O1 = (Axis + 1) % 3;
-    int32 O2 = (Axis + 2) % 3;
+    int32 U, V;
+    if (Axis == 0) { U = 1; V = 2; }
+    else if (Axis == 1) { U = 0; V = 2; }
+    else { U = 0; V = 1; }
 
-    // 2. Get the position of the face relative to the edge
-    FVector EdgePos = Key.A->GetPosition();
-    FVector FacePos = InFace->Key.Min->GetPosition();
+    FVector EdgeCorner = Key.A->GetPosition();
+    FVector FaceCenter = InFace->GetCenter();
 
-    // 3. Determine the quadrant (Binary 00, 01, 10, 11)
-    bool bHigherO1 = FacePos[O1] >= EdgePos[O1];
-    bool bHigherO2 = FacePos[O2] >= EdgePos[O2];
+    double DiffU = FaceCenter[U] - EdgeCorner[U];
+    double DiffV = FaceCenter[V] - EdgeCorner[V];
 
-    // Map to 0-3 index
-    int32 Slot = (bHigherO1 ? 1 : 0) | (bHigherO2 ? 2 : 0);
+    int32 Slot;
+    if (!FMath::IsNearlyZero(DiffU))
+    {
+        Slot = (DiffU < 0.0) ? 0 : 2;
+    }
+    else
+    {
+        Slot = (DiffV < 0.0) ? 1 : 3;
+    }
+
+    // Count how many slots are filled before and after
+    int32 FilledBefore = 0;
+    for (int32 i = 0; i < 4; i++) if (ConnectedFaces[i]) FilledBefore++;
 
     ConnectedFaces[Slot] = InFace;
+
+    int32 FilledAfter = 0;
+    for (int32 i = 0; i < 4; i++) if (ConnectedFaces[i]) FilledAfter++;
+
+    if (FilledAfter == FilledBefore)
+    {
+        UE_LOG(LogTemp, Error, TEXT("[Edge] COLLISION: face registered into already-occupied slot %d on axis=%d, DiffU=%f DiffV=%f"), Slot, (int32)Axis, DiffU, DiffV);
+    }
 }
 
 //FACE STUFF
@@ -311,12 +329,6 @@ void FNodeStructureProvider::PopulateNodeStructure(const TArray<TSharedPtr<FAdap
 
             Node->Faces[i] = Face;
             Face->AddRef();
-
-            // Handle the neighbor registration for existing faces
-            if (Face->GetRefCount() > 1)
-            {
-                Face->RegisterNode(Node);
-            }
         }
         Node->ComputeDualContourPosition();
         Node->ComputeNormalizedPosition(SeaLevel);
@@ -531,36 +543,24 @@ FVoxelFace* FNodeStructureProvider::Internal_CreateFace(FVoxelEdge* InEdges[4], 
 
 FVoxelFace* FNodeStructureProvider::GetOrCreateFace(FVoxelEdge* InEdges[4], int32 Axis, FVoxelFace* InParent, TSharedPtr<FAdaptiveOctreeNode> InitiatingNode)
 {
-    // 1. Generate the spatial handle
-    FVoxelCorner* KeyCorners[4] = {
-        InEdges[0]->GetMinCorner(), InEdges[0]->GetMaxCorner(),
-        InEdges[2]->GetMinCorner(), InEdges[2]->GetMaxCorner()
-    };
-    FVoxelFaceKey SearchKey = FVoxelFaceKey::Generate(KeyCorners, static_cast<short>(Axis));
+    FVoxelFaceKey SearchKey = FVoxelFaceKey::Generate(InEdges, static_cast<short>(Axis));
 
-    // 2. Thread-safe lookup
     {
         FReadScopeLock ReadLock(FaceLock);
         if (FVoxelFace* const* Found = FaceLookup.Find(SearchKey))
         {
-            FVoxelFace* ExistingFace = *Found;
-            // IMPORTANT: Register the node here if it's the second visitor
-            ExistingFace->RegisterNode(InitiatingNode);
-            return ExistingFace;
+            (*Found)->RegisterNode(InitiatingNode);
+            return *Found;
         }
     }
 
     FWriteScopeLock WriteLock(FaceLock);
-
-    // Double-check for race conditions
     if (FVoxelFace* const* Found = FaceLookup.Find(SearchKey))
     {
-        FVoxelFace* ExistingFace = *Found;
-        ExistingFace->RegisterNode(InitiatingNode);
-        return ExistingFace;
+        (*Found)->RegisterNode(InitiatingNode);
+        return *Found;
     }
 
-    // 3. Creation path (Internal_CreateFace already handles registration)
     return Internal_CreateFace(InEdges, Axis, InParent, InitiatingNode);
 }
 

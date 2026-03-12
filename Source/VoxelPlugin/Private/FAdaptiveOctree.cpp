@@ -266,33 +266,13 @@ FVector FAdaptiveOctree::QuantizePosition(const FVector& P, double GridSize)
 
 void FAdaptiveOctree::UpdateMeshChunkStreamData(TSharedPtr<FMeshChunk> InChunk)
 {
-    // Count sign-change edges before processing so we can log them
-    int32 SignChangeCount = 0;
-    for (auto* Edge : InChunk->ChunkEdges)
-        if (Edge && Edge->GetSignChange()) SignChangeCount++;
+    // --- DIAGNOSTIC COUNTERS ---
+    std::atomic<int32> TotalEdges(0);
+    std::atomic<int32> SkippedEdges(0); // < 3 nodes
+    std::atomic<int32> ThreeNodeEdges(0);
+    std::atomic<int32> FourNodeEdges(0);
+    std::atomic<int32> MoreThanFourEdges(0);
 
-    // Only log the first chunk that has sign-change edges (avoids spam)
-    static std::atomic<bool> bLoggedOnce = false;
-    bool bShouldLog = (SignChangeCount > 0 && !bLoggedOnce.exchange(true));
-    if (bShouldLog)
-    {
-        UE_LOG(LogTemp, Warning, TEXT("[Voxel] UpdateMeshChunkStreamData sample: %d total edges, %d sign-change, chunk center (%.0f, %.0f, %.0f) extent %.0f"),
-            InChunk->ChunkEdges.Num(), SignChangeCount,
-            InChunk->ChunkCenter.X, InChunk->ChunkCenter.Y, InChunk->ChunkCenter.Z, InChunk->ChunkExtent);
-
-        // Log corner densities of first sign-change edge to verify SDF values
-        for (auto* Edge : InChunk->ChunkEdges)
-        {
-            if (!Edge || !Edge->GetSignChange()) continue;
-            double D0 = Edge->GetMinCorner()->GetDensity();
-            double D1 = Edge->GetMaxCorner()->GetDensity();
-            FVector P0 = Edge->GetMinCorner()->GetPosition();
-            FVector P1 = Edge->GetMaxCorner()->GetPosition();
-            UE_LOG(LogTemp, Warning, TEXT("[Voxel]   First sign-change edge: D0=%.4f at (%.0f,%.0f,%.0f)  D1=%.4f at (%.0f,%.0f,%.0f)"),
-                D0, P0.X, P0.Y, P0.Z, D1, P1.X, P1.Y, P1.Z);
-            break;
-        }
-    }
     TMap<FMeshVertex, int32> VertexMap;
     TArray<FMeshVertex> UniqueVertices;
     TArray<FIndex3UI> SrfTriangles;
@@ -305,9 +285,7 @@ void FAdaptiveOctree::UpdateMeshChunkStreamData(TSharedPtr<FMeshChunk> InChunk)
     TArray<FEdgeVertexData> AllEdgeData;
     AllEdgeData.SetNum(InChunk->ChunkEdges.Num());
 
-    double QuantizationGrid = InChunk->ChunkExtent * 1e-8;
-    double OceanRadius = RootExtent * 0.9;
-
+    double OceanRadius = RootExtent * 0.8;
     double OceanTriThreshold = -1000;
 
     ParallelFor(InChunk->ChunkEdges.Num(), [&](int32 edgeIdx) {
@@ -318,10 +296,20 @@ void FAdaptiveOctree::UpdateMeshChunkStreamData(TSharedPtr<FMeshChunk> InChunk)
             return;
         }
 
+        TotalEdges++;
+
         TArray<TSharedPtr<FAdaptiveOctreeNode>> NodesToMesh;
         SampleNodesAroundEdge(CurrentEdge, NodesToMesh);
 
-        if (NodesToMesh.Num() < 3)
+        int32 NodeCount = NodesToMesh.Num();
+
+        // Log specific counts for this edge
+        if (NodeCount < 3) SkippedEdges++;
+        else if (NodeCount == 3) ThreeNodeEdges++;
+        else if (NodeCount == 4) FourNodeEdges++;
+        else MoreThanFourEdges++;
+
+        if (NodeCount < 3)
         {
             AllEdgeData[edgeIdx].IsValid = false;
             return;
@@ -329,9 +317,9 @@ void FAdaptiveOctree::UpdateMeshChunkStreamData(TSharedPtr<FMeshChunk> InChunk)
 
         AllEdgeData[edgeIdx].IsValid = true;
         AllEdgeData[edgeIdx].Edge = CurrentEdge;
-        AllEdgeData[edgeIdx].Vertices.SetNumZeroed(NodesToMesh.Num());
+        AllEdgeData[edgeIdx].Vertices.SetNumZeroed(NodeCount);
 
-        for (int i = 0; i < NodesToMesh.Num(); i++)
+        for (int i = 0; i < NodeCount; i++)
         {
             FVector LocalPos = NodesToMesh[i]->DualContourPosition - InChunk->ChunkCenter;
             FVector WorldPos = NodesToMesh[i]->DualContourPosition;
@@ -345,6 +333,18 @@ void FAdaptiveOctree::UpdateMeshChunkStreamData(TSharedPtr<FMeshChunk> InChunk)
             AllEdgeData[edgeIdx].Vertices[i].Color = FColor::Green;
         }
         });
+
+    // --- LOG THE RESULTS ---
+    if (TotalEdges > 0)
+    {
+        UE_LOG(LogTemp, Warning, TEXT("[Voxel Mesh] Chunk at %s processed %d crossing edges:"),
+            *InChunk->ChunkCenter.ToString(), TotalEdges.load());
+        UE_LOG(LogTemp, Warning, TEXT("   - Quads (4 nodes): %d"), FourNodeEdges.load());
+        UE_LOG(LogTemp, Warning, TEXT("   - Tris  (3 nodes): %d"), ThreeNodeEdges.load());
+        UE_LOG(LogTemp, Error, TEXT("   - Holes ( <3 nodes): %d  <-- THIS CAUSES MISSING TRIS"), SkippedEdges.load());
+        if (MoreThanFourEdges > 0)
+            UE_LOG(LogTemp, Error, TEXT("   - Non-Manifold (>4 nodes): %d"), MoreThanFourEdges.load());
+    }
 
     for (int32 edgeIdx = 0; edgeIdx < AllEdgeData.Num(); edgeIdx++)
     {
@@ -387,23 +387,17 @@ void FAdaptiveOctree::UpdateMeshChunkStreamData(TSharedPtr<FMeshChunk> InChunk)
                     OcnTriangles.Add(Tri);
                 }
             };
-        //short signChange = AllEdgeData[edgeIdx].Edge->GetSignChange();
-        //EmitTri(0, 1, 2);
-        //if (NumVerts == 4) EmitTri(0, 2, 3);
-        short Sign = 1;// (*AllEdgeData[edgeIdx].Edge)->GetSignChange();
-
-        // Standard winding order for Dual Contouring quads
-        if (Sign > 0) // In -> Out (Edge points from solid to empty)
-        {
-            EmitTri(0, 1, 2);
-            if (NumVerts == 4) EmitTri(0, 2, 3);
-        }
-        else if (Sign < 0) // Out -> In (Edge points from empty to solid)
-        {
-            // Reverse winding to ensure normals point outwards
-            EmitTri(0, 2, 1);
-            if (NumVerts == 4) EmitTri(0, 3, 2);
-        }
+            short Sign = (*AllEdgeData[edgeIdx].Edge)->GetSignChange();
+            if (Sign > 0) // solid -> empty: standard winding
+            {
+                EmitTri(0, 1, 2);
+                if (NumVerts == 4) EmitTri(0, 2, 3);
+            }
+            else // empty -> solid: reverse winding
+            {
+                EmitTri(0, 2, 1);
+                if (NumVerts == 4) EmitTri(0, 3, 2);
+            }
     }
 
     TSharedPtr<FMeshStreamData> UpdatedSurfaceData = MakeShared<FMeshStreamData>();
@@ -624,13 +618,6 @@ void FAdaptiveOctree::SampleNodesAroundEdge(FVoxelEdge* Edge, TArray<TSharedPtr<
 {
     if (!Edge) return;
 
-    const short EdgeAxis = Edge->GetAxis();
-    const int32 O1 = (EdgeAxis + 1) % 3;
-    const int32 O2 = (EdgeAxis + 2) % 3;
-
-    // Step 1: Build a complete working face array across all 4 slots.
-    // Start with what the edge directly has, then climb the edge parent chain
-    // to fill any null slots from coarser levels.
     FVoxelFace* Faces[4] = { nullptr, nullptr, nullptr, nullptr };
     int32 FilledCount = 0;
 
@@ -663,15 +650,13 @@ void FAdaptiveOctree::SampleNodesAroundEdge(FVoxelEdge* Edge, TArray<TSharedPtr<
         }
     }
 
-    // Step 2: For T-junction case (3 faces), any still-null slot means
-    // the edge is interior to a coarser face and has no parent edge path.
-    // Climb the adjacent filled slot's face parent chain instead.
+    // T-junction fallback: climb adjacent filled slot's face parent chain
+    // Adjacent slots in the cycle: 0<->1<->2<->3<->0
     for (int32 i = 0; i < 4; i++)
     {
         if (Faces[i]) continue;
 
-        // Try both adjacent slots (differ by one bit)
-        const int32 AdjacentSlots[2] = { i ^ 1, i ^ 2 };
+        const int32 AdjacentSlots[2] = { (i + 1) % 4, (i + 3) % 4 };
         for (int32 adj : AdjacentSlots)
         {
             if (!Faces[adj]) continue;
@@ -679,12 +664,14 @@ void FAdaptiveOctree::SampleNodesAroundEdge(FVoxelEdge* Edge, TArray<TSharedPtr<
             FVoxelFace* CurrFace = Faces[adj]->GetParent();
             while (CurrFace)
             {
+                // Pick the node slot using the same world-space logic as RegisterNode:
+                // the node whose center is on the same side of the face plane as the edge.
+                double EdgeCoord = Edge->GetMinCorner()->GetPosition()[CurrFace->Axis];
+                double FaceCoord = CurrFace->Key.Min->GetPosition()[CurrFace->Axis];
+                int32 NodeSlot = (EdgeCoord < FaceCoord) ? 0 : 1;
+
                 TSharedPtr<FAdaptiveOctreeNode> ParentFaceNodes[2];
                 CurrFace->GetNodes(ParentFaceNodes);
-                // Check if this ancestor has a node on the side of the missing slot
-                bool bSlotHigherO1 = (i & 1) != 0;
-                bool bSlotHigherO2 = (i & 2) != 0;
-                int32 NodeSlot = (CurrFace->Axis == O1) ? (bSlotHigherO1 ? 1 : 0) : (bSlotHigherO2 ? 1 : 0);
                 if (ParentFaceNodes[NodeSlot].IsValid())
                 {
                     Faces[i] = CurrFace;
@@ -693,28 +680,20 @@ void FAdaptiveOctree::SampleNodesAroundEdge(FVoxelEdge* Edge, TArray<TSharedPtr<
                 }
                 CurrFace = CurrFace->GetParent();
             }
-            if (Faces[i]) break; // Found via this adjacent slot, no need to try the other
+            if (Faces[i]) break;
         }
     }
 
-    // Step 3: Iterate the 4 face slots in CCW winding order around the edge axis.
-    // Slot encoding: bit0 = bHigherO1, bit1 = bHigherO2
-    // CCW order: (Lo,Lo)=0 -> (Hi,Lo)=1 -> (Hi,Hi)=3 -> (Lo,Hi)=2
-
-    const int32 WindingOrder[4] = { 0, 1, 3, 2 };
-
-    for (int32 w = 0; w < 4; w++)
+    // Collect nodes - for each face, pick the node on the same side as the edge
+    // using the same world-space comparison as RegisterNode.
+    for (int32 SlotIdx = 0; SlotIdx < 4; SlotIdx++)
     {
-        int32 SlotIdx = WindingOrder[w];
         FVoxelFace* Face = Faces[SlotIdx];
         if (!Face) continue;
 
-        // Determine which of the face's two nodes is on the same side as this slot.
-        // Slot bit0 = bHigherO1, bit1 = bHigherO2.
-        // Face normal axis is either O1 or O2 use the corresponding bit to select the node.
-        bool bHigherO1 = (SlotIdx & 1) != 0;
-        bool bHigherO2 = (SlotIdx & 2) != 0;
-        int32 NodeSlot = (Face->Axis == O1) ? (bHigherO1 ? 1 : 0) : (bHigherO2 ? 1 : 0);
+        double EdgeCoord = Edge->GetMinCorner()->GetPosition()[Face->Axis];
+        double FaceCoord = Face->Key.Min->GetPosition()[Face->Axis];
+        int32 NodeSlot = (EdgeCoord < FaceCoord) ? 0 : 1;
 
         TSharedPtr<FAdaptiveOctreeNode> FaceNodes[2];
         Face->GetNodes(FaceNodes);
