@@ -50,7 +50,7 @@ void FAdaptiveOctree::PopulateChunks()
             FVector NeighborPos = ChunkNode->Center + Directions[i] * Offset;
             TSharedPtr<FAdaptiveOctreeNode> NeighborNode = GetLeafNodeByPoint(NeighborPos);
             if (!NeighborNode.IsValid()) continue;
-            if (!NeighborNode->IsSurfaceNode)
+            if (!NeighborNode->bIsSurfaceNode)
                 NeighborChunks.AddUnique(NeighborNode);
         }
     }
@@ -92,7 +92,7 @@ void FAdaptiveOctree::UpdateChunkMap(TSharedPtr<FAdaptiveOctreeNode> ChunkNode, 
 
     if (Found && *Found)
     {
-        if (!ChunkNode->IsSurfaceNode)
+        if (!ChunkNode->bIsSurfaceNode)
         {
             (*Found)->SurfaceMeshData->ResetStreams();
             (*Found)->IsDirty = true;
@@ -102,7 +102,7 @@ void FAdaptiveOctree::UpdateChunkMap(TSharedPtr<FAdaptiveOctreeNode> ChunkNode, 
             OutDirtyChunks.Add({ ChunkNode, *Found });
         }
     }
-    else if (ChunkNode->IsSurfaceNode)
+    else if (ChunkNode->bIsSurfaceNode)
     {
         TSharedPtr<FMeshChunk> NewChunk = MakeShared<FMeshChunk>();
         NewChunk->CachedParentActor = CachedParentActor;
@@ -120,7 +120,7 @@ void FAdaptiveOctree::UpdateChunkMap(TSharedPtr<FAdaptiveOctreeNode> ChunkNode, 
             TSharedPtr<FAdaptiveOctreeNode> Neighbor = GetLeafNodeByPoint(NeighborPos);
 
             if (!Neighbor.IsValid()) continue;
-            if (Neighbor->IsSurfaceNode) continue;
+            if (Neighbor->bIsSurfaceNode) continue;
             if (ChunkMap.Contains(Neighbor)) continue;
 
             TSharedPtr<FMeshChunk> NeighborChunk = MakeShared<FMeshChunk>();

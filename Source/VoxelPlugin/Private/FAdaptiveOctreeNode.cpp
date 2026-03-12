@@ -109,12 +109,12 @@ void FAdaptiveOctreeNode::FinalizeFromExistingCorners()
     }
     ComputeDualContourPosition();
 
-    if (IsSurfaceNode)
+    if (bIsSurfaceNode)
     {
         TSharedPtr<FAdaptiveOctreeNode> Ancestor = Parent.Pin();
-        while (Ancestor.IsValid() && !Ancestor->IsSurfaceNode)
+        while (Ancestor.IsValid() && !Ancestor->bIsSurfaceNode)
         {
-            Ancestor->IsSurfaceNode = true;
+            Ancestor->bIsSurfaceNode = true;
             Ancestor = Ancestor->Parent.Pin();
         }
     }
@@ -206,7 +206,7 @@ TArray<TSharedPtr<FAdaptiveOctreeNode>> FAdaptiveOctreeNode::GetSurfaceChunks()
 
         if (!CurrentNode || CurrentNode->Index.Depth > ChunkDepth) continue;
 
-        if (CurrentNode->Index.Depth == ChunkDepth && CurrentNode->IsSurfaceNode)
+        if (CurrentNode->Index.Depth == ChunkDepth && CurrentNode->bIsSurfaceNode)
         {
             SurfaceNodes.Add(CurrentNode);
         }
@@ -233,10 +233,10 @@ void FAdaptiveOctreeNode::ComputeDualContourPosition()
     {
         DualContourNormal = FVector::ZeroVector;
         DualContourPosition = Center;
-        IsSurfaceNode = false;
+        bIsSurfaceNode = false;
         return;
     }
-    IsSurfaceNode = true;
+    bIsSurfaceNode = true;
     FQEF Qef;
 
     FVector MassPoint = FVector::ZeroVector;

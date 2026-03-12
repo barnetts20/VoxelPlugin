@@ -1,6 +1,7 @@
 #pragma once
 
 #include "CoreMinimal.h"
+#include <FCornerProvider.h>
 
 struct VOXELPLUGIN_API OctreeConstants {
     inline static const FVector Offsets[8] = {
@@ -508,8 +509,6 @@ private:
 struct VOXELPLUGIN_API FAdaptiveOctreeNode : public TSharedFromThis<FAdaptiveOctreeNode>
 {
 private:    
-    void ComputeDualContourPosition();
-    
     FVector GetInterpolatedNormal(FVector P);
     
     bool bIsLeaf = true;
@@ -522,10 +521,8 @@ public:
     TWeakPtr<FAdaptiveOctreeNode> Parent;
     
     TSharedPtr<FAdaptiveOctreeNode> Children[8];
-    
-    TWeakPtr<FAdaptiveOctreeNode> Neighbors[6];
 
-    FNodeCorner Corners[8];
+    TSharedPtr<FVoxelCorner> Corners[8];
     
     TArray<FNodeEdge> SignChangeEdges;
     
@@ -547,8 +544,23 @@ public:
     
     FVector NormalizedPosition;
 
-    bool IsSurfaceNode;
-    
+    bool bIsInitialized;
+
+    bool bIsSurfaceNode;
+
+    //Analytic surface detection
+    bool IsSurface() const
+    {
+        if (!bIsInitialized) return false;
+        for (int32 i = 0; i < 12; i++)
+        {
+            const FVoxelCorner* A = Corners[OctreeConstants::EdgePairs[i][0]].Get();
+            const FVoxelCorner* B = Corners[OctreeConstants::EdgePairs[i][1]].Get();
+            if (A && B && (A->Density <= 0.0) != (B->Density <= 0.0)) return true;
+        }
+        return false;
+    }
+
     bool LodOverride = false;
 
     const bool IsLeaf();
@@ -566,10 +578,17 @@ public:
     TArray<TSharedPtr<FAdaptiveOctreeNode>> GetSurfaceChunks();
 
     void ComputeNormalizedPosition(double InRadius);
+    
+    void ComputeDualContourPosition();
 
     TArray<FNodeEdge>& GetSignChangeEdges();
 
     void FinalizeFromExistingCorners();
+    
+    FORCEINLINE FVector GetCornerPosition(int32 CornerIndex) const
+    {
+        return Center + (OctreeConstants::Offsets[CornerIndex] * Extent);
+    }
 
     // Root Constructor
     FAdaptiveOctreeNode(FVector InCenter, double InExtent, int InChunkDepth, int InMinDepth, int InMaxDepth);
