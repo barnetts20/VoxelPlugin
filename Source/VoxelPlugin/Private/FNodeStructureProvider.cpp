@@ -94,7 +94,7 @@ void FVoxelEdge::RegisterConnectedFace(FVoxelFace* InFace)
 
     int32 U, V;
     if (Axis == 0) { U = 1; V = 2; }
-    else if (Axis == 1) { U = 0; V = 2; }
+    else if (Axis == 1) { U = 2; V = 0; }
     else { U = 0; V = 1; }
 
     FVector EdgeCorner = Key.A->GetPosition();

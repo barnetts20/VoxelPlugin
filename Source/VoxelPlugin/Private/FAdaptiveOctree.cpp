@@ -679,11 +679,10 @@ void FAdaptiveOctree::SampleNodesAroundEdge(FVoxelEdge* Edge, TArray<TSharedPtr<
         for (int32 adj : AdjacentSlots)
         {
             FVoxelFace* CurrFace = Faces[adj] ? Faces[adj]->GetParent() : nullptr;
-            while (CurrFace)
+            if (CurrFace) // was: while(CurrFace)
             {
                 TSharedPtr<FAdaptiveOctreeNode> Node = GetNodeForSlot(CurrFace, MissingSlot);
-                if (Node.IsValid()) { OutNodes.AddUnique(Node); break; }
-                CurrFace = CurrFace->GetParent();
+                if (Node.IsValid()) OutNodes.AddUnique(Node);
             }
         }
     }
@@ -733,7 +732,7 @@ void FAdaptiveOctree::SampleNodesAroundEdge(FVoxelEdge* Edge, TArray<TSharedPtr<
     float NormalAlongEdge = AvgNormal[EdgeAxis];
 
     // Y axis edges have opposite handedness due to coordinate system
-    bool bFlip = (EdgeAxis == 1) ? (NormalAlongEdge > 0.0f) : (NormalAlongEdge < 0.0f);
+    bool bFlip = (NormalAlongEdge < 0.0f);
     if (bFlip) Algo::Reverse(OutNodes);
 }
 
