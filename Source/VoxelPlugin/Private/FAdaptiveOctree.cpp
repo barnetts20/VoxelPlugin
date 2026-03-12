@@ -300,15 +300,6 @@ void FAdaptiveOctree::UpdateMeshChunkStreamData(TSharedPtr<FMeshChunk> InChunk)
 
         TArray<TSharedPtr<FAdaptiveOctreeNode>> NodesToMesh;
         SampleNodesAroundEdge(CurrentEdge, NodesToMesh);
-        FVector RelPos = NodesToMesh[0]->Center - NodesToMesh[0]->TreeCenter;
-
-        // Get the octant sign along the edge axis (+1 or -1)
-        int EdgeAxis = CurrentEdge->GetAxis();
-        float OctantSign = (RelPos[EdgeAxis] >= 0) ? 1.0f : -1.0f;
-
-        // Flip if octant sign disagrees with edge sign change direction
-        bool bFlip = (OctantSign > 0) != (CurrentEdge->GetSignChange() > 0);
-        if (bFlip) Algo::Reverse(NodesToMesh);
 
         int32 NodeCount = NodesToMesh.Num();
 
@@ -619,17 +610,11 @@ void FAdaptiveOctree::SampleNodesAroundEdge(FVoxelEdge* Edge, TArray<TSharedPtr<
 {
     if (!Edge) return;
 
-    // Slot scheme around the edge (CCW when viewed along +EdgeAxis):
-    //   Slot 0 = -U
-    //   Slot 1 = -V
-    //   Slot 2 = +U
-    //   Slot 3 = +V
     const int32 EdgeAxis = Edge->GetAxis();
     const int32 U = (EdgeAxis + 1) % 3;
     const int32 V = (EdgeAxis + 2) % 3;
     const FVector EdgeCorner = Edge->GetMinCorner()->GetPosition();
 
-    // Helper: does this node center fall in the quadrant for the given slot?
     auto InQuadrant = [&](const FVector& NC, int32 Slot) -> bool
         {
             switch (Slot)
@@ -642,16 +627,13 @@ void FAdaptiveOctree::SampleNodesAroundEdge(FVoxelEdge* Edge, TArray<TSharedPtr<
             return false;
         };
 
-    // Helper: get the node from a face that belongs to the given slot's quadrant
     auto GetNodeForSlot = [&](FVoxelFace* Face, int32 Slot) -> TSharedPtr<FAdaptiveOctreeNode>
         {
             TSharedPtr<FAdaptiveOctreeNode> FN[2];
             Face->GetNodes(FN);
             for (int32 n = 0; n < 2; n++)
-            {
                 if (FN[n].IsValid() && InQuadrant(FN[n]->Center, Slot))
                     return FN[n];
-            }
             return nullptr;
         };
 
@@ -664,8 +646,7 @@ void FAdaptiveOctree::SampleNodesAroundEdge(FVoxelEdge* Edge, TArray<TSharedPtr<
         if (Faces[i]) FilledCount++;
     }
 
-    // --- CASE 1: Fully connected interior edge (4 faces, same LOD) ---
-    // One node per slot via quadrant check, gives CCW ring.
+    // --- CASE 1: 4 faces ---
     if (FilledCount == 4)
     {
         TSharedPtr<FAdaptiveOctreeNode> N0 = Faces[1]->GetNode(0);
@@ -677,24 +658,15 @@ void FAdaptiveOctree::SampleNodesAroundEdge(FVoxelEdge* Edge, TArray<TSharedPtr<
         if (N1.IsValid()) OutNodes.Add(N1);
         if (N2.IsValid()) OutNodes.Add(N2);
         if (N3.IsValid()) OutNodes.Add(N3);
-        return;
     }
 
     // --- CASE 2: T-junction (3 faces) ---
-    // One slot is empty. 
-    // The opposite slot (i+2)%4 has the face containing both fine nodes adjacent to the gap.
-    // Either adjacent slot (i+1)%4 or (i+3)%4 - climb its parent face to get the coarse node
-    // that fills the missing quadrant.
-    if (FilledCount == 3)
+    else if (FilledCount == 3)
     {
-        // Find the missing slot
         int32 MissingSlot = -1;
         for (int32 i = 0; i < 4; i++)
-        {
             if (!Faces[i]) { MissingSlot = i; break; }
-        }
 
-        // The 2 fine nodes come from the opposite face (both nodes are in adjacent quadrants)
         int32 OppositeSlot = (MissingSlot + 2) % 4;
         {
             TSharedPtr<FAdaptiveOctreeNode> FN[2];
@@ -703,8 +675,6 @@ void FAdaptiveOctree::SampleNodesAroundEdge(FVoxelEdge* Edge, TArray<TSharedPtr<
                 if (FN[n].IsValid()) OutNodes.AddUnique(FN[n]);
         }
 
-        // The coarse node comes from climbing either adjacent slot's parent face
-        // and finding the node in the missing slot's quadrant
         int32 AdjacentSlots[2] = { (MissingSlot + 1) % 4, (MissingSlot + 3) % 4 };
         for (int32 adj : AdjacentSlots)
         {
@@ -712,24 +682,15 @@ void FAdaptiveOctree::SampleNodesAroundEdge(FVoxelEdge* Edge, TArray<TSharedPtr<
             while (CurrFace)
             {
                 TSharedPtr<FAdaptiveOctreeNode> Node = GetNodeForSlot(CurrFace, MissingSlot);
-                if (Node.IsValid())
-                {
-                    OutNodes.AddUnique(Node);
-                    return;
-                }
+                if (Node.IsValid()) { OutNodes.AddUnique(Node); break; }
                 CurrFace = CurrFace->GetParent();
             }
         }
-        return;
     }
 
     // --- CASE 3: LOD corner (2 faces) ---
-    // Fine edge at a coarser LOD boundary - only 2 fine faces registered.
-    // The 2 filled slots give us their fine nodes (1 each via quadrant check).
-    // Climb the parent edge to find coarse faces covering the 2 empty slots.
-    if (FilledCount == 2)
+    else if (FilledCount == 2)
     {
-        // Collect fine nodes from the 2 filled slots
         int32 EmptySlots[2] = { -1, -1 };
         int32 EmptyCount = 0;
         for (int32 s = 0; s < 4; s++)
@@ -745,31 +706,35 @@ void FAdaptiveOctree::SampleNodesAroundEdge(FVoxelEdge* Edge, TArray<TSharedPtr<
             }
         }
 
-        // Climb parent edge to find coarse faces for the 2 empty slots
         FVoxelEdge* ParentEdge = Edge->GetParent();
         while (ParentEdge && (EmptySlots[0] != -1 || EmptySlots[1] != -1))
         {
             for (int32 e = 0; e < 2; e++)
             {
                 if (EmptySlots[e] == -1) continue;
-
                 FVoxelFace* CoarseFace = const_cast<FVoxelFace*>(ParentEdge->GetConnectedFace(EmptySlots[e]));
                 if (CoarseFace)
                 {
                     TSharedPtr<FAdaptiveOctreeNode> Node = GetNodeForSlot(CoarseFace, EmptySlots[e]);
-                    if (Node.IsValid())
-                    {
-                        OutNodes.AddUnique(Node);
-                        EmptySlots[e] = -1; // filled
-                    }
+                    if (Node.IsValid()) { OutNodes.AddUnique(Node); EmptySlots[e] = -1; }
                 }
             }
             ParentEdge = ParentEdge->GetParent();
         }
-        return;
     }
 
-    // FilledCount < 2: boundary edge, not enough data to form a triangle - skip
+    if (OutNodes.Num() < 3) return;
+
+    FVector3f AvgNormal = FVector3f::ZeroVector;
+    for (auto& N : OutNodes)
+        AvgNormal += N->DualContourNormal;
+    AvgNormal = AvgNormal.GetSafeNormal();
+
+    float NormalAlongEdge = AvgNormal[EdgeAxis];
+
+    // Y axis edges have opposite handedness due to coordinate system
+    bool bFlip = (EdgeAxis == 1) ? (NormalAlongEdge > 0.0f) : (NormalAlongEdge < 0.0f);
+    if (bFlip) Algo::Reverse(OutNodes);
 }
 
 TSharedPtr<FAdaptiveOctreeNode> FAdaptiveOctree::GetLeafNodeByPoint(FVector Position)
