@@ -65,9 +65,6 @@ public:
     double MinDataUpdateInterval = .1;
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "LOD")
-    double MinMeshUpdateInterval = .1;
-
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "LOD")
     double VelocityLookAheadFactor = 8;
 
     virtual void OnConstruction(const FTransform& Transform) override;
@@ -88,8 +85,6 @@ protected:
     std::atomic<bool> EditUpdateIsRunning = false;
 
     FTimerHandle DataUpdateTimerHandle;
-    
-    FTimerHandle MeshUpdateTimerHandle;
 
     void CleanSceneRoot();
     

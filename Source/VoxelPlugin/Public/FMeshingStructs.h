@@ -9,16 +9,14 @@ using namespace RealtimeMesh;
 
 struct VOXELPLUGIN_API FCornerSample {
     FVector Position;           // World position
-    double Density;             // Final SDF density
+    double Density;             // Final SDF density (computed in double, truncated to float on writeback)
     double Dist;
-    float NoiseValue;           // Raw noise result
-    TArray<double*> Targets;    // Pointers to all Corners[i].Density that share this position
+    TArray<float*> Targets;     // Pointers to all Corners[i].Density that share this position
 };
 
 struct VOXELPLUGIN_API FMeshVertex
 {
     FVector Position;       // Quantized position (chunk-local)
-    FVector OriginalPosition; // Unquantized for actual mesh output
     FVector NormalizedPosition; // Projected onto planet radius sphere surface
     FVector Normal;
     FColor Color;
@@ -27,7 +25,7 @@ struct VOXELPLUGIN_API FMeshVertex
 
     bool operator==(const FMeshVertex& Other) const
     {
-        // Exact comparison on quantized position — no epsilon needed
+        // Exact comparison on quantized position -- no epsilon needed
         return Position == Other.Position;
     }
 };
@@ -108,8 +106,6 @@ struct VOXELPLUGIN_API FMeshChunk {
     TWeakObjectPtr<URealtimeMeshComponent> ChunkRtComponent;
 
     FRealtimeMeshLODKey LODKey = FRealtimeMeshLODKey::FRealtimeMeshLODKey(0);
-
-    FRealtimeMeshSectionConfig SecConfig = FRealtimeMeshSectionConfig(0);
 
     void InitializeData(FVector InCenter, double InExtent) {
         SurfaceMeshData = MakeShared<FMeshStreamData>();

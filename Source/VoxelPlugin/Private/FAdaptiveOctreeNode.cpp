@@ -1,12 +1,12 @@
 #include "FAdaptiveOctreeNode.h"
 #include "FAdaptiveOctree.h"
 
-const bool FAdaptiveOctreeNode::IsLeaf()
+const bool FAdaptiveOctreeNode::IsLeaf() const
 {
     return bIsLeaf;
 }
 
-const bool FAdaptiveOctreeNode::IsRoot()
+const bool FAdaptiveOctreeNode::IsRoot() const
 {
     return !Parent.IsValid();
 }
@@ -54,20 +54,20 @@ FVector FAdaptiveOctreeNode::GetInterpolatedNormal(FVector P)
     double ty = (P.Y - (Center.Y - Extent)) / (2.0 * Extent);
     double tz = (P.Z - (Center.Z - Extent)) / (2.0 * Extent);
 
-    tx = FMath::Clamp(tx, 0.0, 1.0);
-    ty = FMath::Clamp(ty, 0.0, 1.0);
-    tz = FMath::Clamp(tz, 0.0, 1.0);
+    float ftx = (float)FMath::Clamp(tx, 0.0, 1.0);
+    float fty = (float)FMath::Clamp(ty, 0.0, 1.0);
+    float ftz = (float)FMath::Clamp(tz, 0.0, 1.0);
 
-    FVector n00 = FMath::Lerp(Corners[0].Normal, Corners[1].Normal, tx);
-    FVector n01 = FMath::Lerp(Corners[2].Normal, Corners[3].Normal, tx);
-    FVector n10 = FMath::Lerp(Corners[4].Normal, Corners[5].Normal, tx);
-    FVector n11 = FMath::Lerp(Corners[6].Normal, Corners[7].Normal, tx);
+    FVector3f n00 = FMath::Lerp(Corners[0].Normal, Corners[1].Normal, ftx);
+    FVector3f n01 = FMath::Lerp(Corners[2].Normal, Corners[3].Normal, ftx);
+    FVector3f n10 = FMath::Lerp(Corners[4].Normal, Corners[5].Normal, ftx);
+    FVector3f n11 = FMath::Lerp(Corners[6].Normal, Corners[7].Normal, ftx);
 
-    FVector n0 = FMath::Lerp(n00, n01, ty);
-    FVector n1 = FMath::Lerp(n10, n11, ty);
+    FVector3f n0 = FMath::Lerp(n00, n01, fty);
+    FVector3f n1 = FMath::Lerp(n10, n11, fty);
 
-    FVector FinalNormal = FMath::Lerp(n0, n1, tz);
-    return FinalNormal.GetSafeNormal();
+    FVector3f FinalNormal = FMath::Lerp(n0, n1, ftz);
+    return FVector(FinalNormal).GetSafeNormal();
 }
 
 void FAdaptiveOctreeNode::FinalizeFromExistingCorners(FVector TreeCenter, bool bSkipNormals)
@@ -90,7 +90,7 @@ void FAdaptiveOctreeNode::FinalizeFromExistingCorners(FVector TreeCenter, bool b
             FVector Normal(dx, dy, dz);
             if (!Normal.Normalize())
                 Normal = (Corners[i].Position - ChunkCenter).GetSafeNormal();
-            Corners[i].Normal = Normal;
+            Corners[i].Normal = FVector3f(Normal);
         }
     }
 

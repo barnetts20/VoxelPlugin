@@ -295,8 +295,9 @@ void FAdaptiveOctree::ReconstructSubtree(FAdaptiveOctreeNode* Node, FVector Edit
     // 5. Write back densities to all nodes that share each corner
     for (int32 i = 0; i < Count; i++)
     {
-        for (double* Target : Samples[i].Targets)
-            *Target = Samples[i].Density;
+        float FinalDensity = (float)Samples[i].Density;
+        for (float* Target : Samples[i].Targets)
+            *Target = FinalDensity;
     }
 
     // 6. Finalize edges/QEF
@@ -323,15 +324,6 @@ FVector2f FAdaptiveOctree::ComputeTriplanarUV(FVector Position, FVector Normal)
 
     return UV;
 };
-
-FVector FAdaptiveOctree::QuantizePosition(const FVector& P, double GridSize)
-{
-    return FVector(
-        FMath::RoundToDouble(P.X / GridSize) * GridSize,
-        FMath::RoundToDouble(P.Y / GridSize) * GridSize,
-        FMath::RoundToDouble(P.Z / GridSize) * GridSize
-    );
-}
 
 void FAdaptiveOctree::UpdateMeshChunkStreamData(TSharedPtr<FMeshChunk> InChunk)
 {
@@ -374,7 +366,6 @@ void FAdaptiveOctree::UpdateMeshChunkStreamData(TSharedPtr<FMeshChunk> InChunk)
             double Dist = FVector::Dist(WorldPos, PlanetCenter);
 
             AllEdgeData[edgeIdx].Vertices[i].Position = LocalPos;
-            AllEdgeData[edgeIdx].Vertices[i].OriginalPosition = LocalPos;
             AllEdgeData[edgeIdx].Vertices[i].NormalizedPosition = NormLocalPos;
             AllEdgeData[edgeIdx].Vertices[i].Normal = FVector(NodePtr->DualContourNormal);
             AllEdgeData[edgeIdx].Vertices[i].Depth = (float)(OceanRadius - Dist);
@@ -506,9 +497,9 @@ void FAdaptiveOctree::UpdateMeshChunkStreamData(TSharedPtr<FMeshChunk> InChunk)
 
     ParallelFor(UniqueVertices.Num(), [&](int32 VertIdx) {
         FMeshVertex& Vertex = UniqueVertices[VertIdx];
-        FVector WorldPos = FVector(Vertex.OriginalPosition) + ChunkCenter;
+        FVector WorldPos = FVector(Vertex.Position) + ChunkCenter;
 
-        SrfPositionStream.Set(VertIdx, Vertex.OriginalPosition);
+        SrfPositionStream.Set(VertIdx, Vertex.Position);
         FRealtimeMeshTangentsHighPrecision Tangent;
         Tangent.SetNormal(FVector3f(Vertex.Normal));
         SrfTangentStream.Set(VertIdx, Tangent);
@@ -518,7 +509,7 @@ void FAdaptiveOctree::UpdateMeshChunkStreamData(TSharedPtr<FMeshChunk> InChunk)
 
     ParallelFor(OcnUniqueVertices.Num(), [&](int32 VertIdx) {
         FMeshVertex& Vertex = OcnUniqueVertices[VertIdx];
-        FVector WorldPos = FVector(Vertex.OriginalPosition) + ChunkCenter;
+        FVector WorldPos = FVector(Vertex.Position) + ChunkCenter;
 
         OcnPositionStream.Set(VertIdx, Vertex.NormalizedPosition);
         FRealtimeMeshTangentsHighPrecision OcnTangent;
@@ -848,8 +839,8 @@ void FAdaptiveOctree::SplitAndComputeChildren(FAdaptiveOctreeNode* Node)
         {
             int32 gi = ChildCornerSources[ci][k];
             Node->Children[ci]->Corners[k].Position = GridPositions[gi];
-            Node->Children[ci]->Corners[k].Density = GridDensities[gi];
-            Node->Children[ci]->Corners[k].Normal = GridNormals[gi];
+            Node->Children[ci]->Corners[k].Density = (float)GridDensities[gi];
+            Node->Children[ci]->Corners[k].Normal = FVector3f(GridNormals[gi]);
         }
         Node->Children[ci]->FinalizeFromExistingCorners(Root->Center, true); // normals already computed from grid
     }
@@ -879,7 +870,7 @@ void FAdaptiveOctree::ComputeNodeData(FAdaptiveOctreeNode* Node)
     for (int i = 0; i < 8; i++)
     {
         double height = (double)noiseOut[i] * NoiseScale;
-        Node->Corners[i].Density = dists[i] - (RootExtent * 0.9 + height) + EditStore->Sample(Node->Corners[i].Position);
+        Node->Corners[i].Density = (float)(dists[i] - (RootExtent * 0.9 + height) + EditStore->Sample(Node->Corners[i].Position));
     }
 
     Node->FinalizeFromExistingCorners(Root->Center);

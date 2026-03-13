@@ -77,7 +77,6 @@ void AAdaptiveVoxelActor::Initialize()
     if (UWorld* World = GetWorld())
     {
         World->GetTimerManager().ClearTimer(DataUpdateTimerHandle);
-        World->GetTimerManager().ClearTimer(MeshUpdateTimerHandle);
     }
 
     RunDataUpdateTask();

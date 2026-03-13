@@ -52,13 +52,9 @@ private:
 
     void FinalizeSubtree(FAdaptiveOctreeNode* Node, FVector EditCenter, double SearchRadius);
 
-    void ComputeNormalsFromMap(TArray<FCornerSample>& Samples, const TMap<FIntVector, int32>& CornerMap, FVector PlanetCenter);
-
     void ReconstructSubtree(FAdaptiveOctreeNode* Node, FVector EditCenter, double SearchRadius);
 
     void UpdateMeshChunkStreamData(TSharedPtr<FMeshChunk> InChunk);
-
-    static FVector QuantizePosition(const FVector& P, double GridSize = 1.0);
 
     static FVector2f ComputeTriplanarUV(FVector Position, FVector Normal);
 

@@ -15,47 +15,15 @@ struct VOXELPLUGIN_API OctreeConstants {
         {0, 2}, {1, 3}, {4, 6}, {5, 7},
         {0, 4}, {1, 5}, {2, 6}, {3, 7}
     };
-
-    enum EFace : uint8 {
-        XPos = 0, XNeg = 1,
-        YPos = 2, YNeg = 3,
-        ZPos = 4, ZNeg = 5
-    };
-
-    inline static const uint8 FaceAxisBit[6] = {
-        0, 0, 1, 1, 2, 2
-    };
-
-    inline static const bool FaceIsPositive[6] = {
-        true, false, true, false, true, false
-    };
-
-    inline static const uint8 OuterChildren[6][4] = {
-        {1, 3, 5, 7},
-        {0, 2, 4, 6},
-        {2, 3, 6, 7},
-        {0, 1, 4, 5},
-        {4, 5, 6, 7},
-        {0, 1, 2, 3},
-    };
-
-    inline static const uint8 InnerChildren[6][4] = {
-        {0, 2, 4, 6},
-        {1, 3, 5, 7},
-        {0, 1, 4, 5},
-        {2, 3, 6, 7},
-        {0, 1, 2, 3},
-        {4, 5, 6, 7},
-    };
 };
 
 struct VOXELPLUGIN_API FNodeCorner {
     FVector Position;
-    double Density;
-    FVector Normal;
+    float Density;
+    FVector3f Normal;
 
     FNodeCorner() : Position(0), Density(0), Normal(0, 0, 1) {}
-    FNodeCorner(FVector InPos, double InDensity, FVector InNormal) : Position(InPos), Density(InDensity), Normal(InNormal) {}
+    FNodeCorner(FVector InPos, float InDensity, FVector3f InNormal) : Position(InPos), Density(InDensity), Normal(InNormal) {}
 };
 
 struct VOXELPLUGIN_API FEdgeKey
@@ -125,7 +93,7 @@ struct VOXELPLUGIN_API FNodeEdge
 
     FNodeEdge() : Size(0), SignChange(false), Axis(0) {}
 
-    FNodeEdge(FNodeCorner InCorner1, FNodeCorner InCorner2)
+    FNodeEdge(const FNodeCorner& InCorner1, const FNodeCorner& InCorner2)
     {
         Corners[0] = InCorner1;
         Corners[1] = InCorner2;
@@ -374,13 +342,13 @@ public:
 
     FVector3f DualContourNormal;
 
-    bool IsSurfaceNode;
+    bool IsSurfaceNode = false;
 
     bool LodOverride = false;
 
-    const bool IsLeaf();
+    const bool IsLeaf() const;
 
-    const bool IsRoot();
+    const bool IsRoot() const;
 
     static bool EvaluateSplit(double Extent, double DistSq, double FOVScale, double Threshold, int Depth, int MaxDepth, int MinDepth)
     {
