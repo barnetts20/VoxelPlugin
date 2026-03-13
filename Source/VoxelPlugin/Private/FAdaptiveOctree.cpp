@@ -764,11 +764,12 @@ void FAdaptiveOctree::SplitAndComputeChildren(TSharedPtr<FAdaptiveOctreeNode> No
     double NoiseScale = RootExtent * 0.1;
     FVector PlanetCenter = Root->Center;
 
+    double GridDists[19]; // alongside XPos, YPos, ZPos
     for (int32 i = 0; i < NewCount; i++)
     {
         FVector PlanetRel = GridPositions[8 + i] - PlanetCenter;
-        double Dist = PlanetRel.Size();
-        FVector Dir = (Dist > 1e-10) ? (PlanetRel / Dist) : FVector::UpVector;
+        GridDists[i] = PlanetRel.Size();
+        FVector Dir = (GridDists[i] > 1e-10) ? (PlanetRel / GridDists[i]) : FVector::UpVector;
         FVector SurfacePos = Dir * RootExtent;
         XPos[i] = (float)(SurfacePos.X / NoiseScale);
         YPos[i] = (float)(SurfacePos.Y / NoiseScale);
@@ -777,12 +778,12 @@ void FAdaptiveOctree::SplitAndComputeChildren(TSharedPtr<FAdaptiveOctreeNode> No
 
     DensityFunction(NewCount, XPos, YPos, ZPos, NoiseOut);
 
+    // Then in stage 2:
     for (int32 i = 0; i < NewCount; i++)
     {
         double Height = (double)NoiseOut[i] * NoiseScale;
-        FVector PlanetRel = GridPositions[8 + i] - PlanetCenter;
-        double Dist = PlanetRel.Size();
-        GridDensities[8 + i] = Dist - (RootExtent * 0.9 + Height) + EditStore->Sample(GridPositions[8 + i]);
+        GridDensities[8 + i] = GridDists[i] - (RootExtent * 0.9 + Height)
+            + EditStore->Sample(GridPositions[8 + i]);
     }
 
     // --- Stage 3: Compute 27 normals from grid gradients ---
