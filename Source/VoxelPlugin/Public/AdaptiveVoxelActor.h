@@ -52,7 +52,7 @@ public:
     double Size = 100000000.0;
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Octree")
-    int ChunkDepth = 4;
+    int ChunkDepth = 5;
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Octree")
     int MinDepth = 7;
@@ -64,7 +64,7 @@ public:
     double ScreenSpaceThreshold = .075;
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "LOD")
-    double VelocityLookAheadFactor = 8;
+    double VelocityLookAheadFactor = 2;
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "LOD")
     double MinDataUpdateInterval = .1;

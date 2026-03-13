@@ -51,6 +51,18 @@ struct VOXELPLUGIN_API FNodeEdge
     }
 };
 
+FORCEINLINE uint32 GetTypeHash(const FNodeEdge& Edge)
+{
+    uint32 Hash = GetTypeHash(Edge.Axis);
+    Hash = HashCombine(Hash, GetTypeHash(Edge.Positions[0].X));
+    Hash = HashCombine(Hash, GetTypeHash(Edge.Positions[0].Y));
+    Hash = HashCombine(Hash, GetTypeHash(Edge.Positions[0].Z));
+    Hash = HashCombine(Hash, GetTypeHash(Edge.Positions[1].X));
+    Hash = HashCombine(Hash, GetTypeHash(Edge.Positions[1].Y));
+    Hash = HashCombine(Hash, GetTypeHash(Edge.Positions[1].Z));
+    return Hash;
+}
+
 struct VOXELPLUGIN_API FMeshVertex
 {
     FVector Position;           // Quantized position (chunk-local)

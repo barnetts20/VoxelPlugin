@@ -30,8 +30,6 @@ private:
     double RootExtent;
     double ChunkExtent;
 
-    void SplitToDepth(TSharedPtr<FAdaptiveOctreeNode> Node, int InMinDepth);
-
     void PopulateChunks();
 
     void UpdateChunkMap(TSharedPtr<FAdaptiveOctreeNode> ChunkNode, TArray<TPair<TSharedPtr<FAdaptiveOctreeNode>, TSharedPtr<FMeshChunk>>>& OutDirtyChunks);
@@ -39,6 +37,10 @@ private:
     void UpdateMeshChunkStreamData(TSharedPtr<FMeshChunk> InChunk);
 
     void GatherLeafEdges(TSharedPtr<FAdaptiveOctreeNode> Node, TArray<FNodeEdge>& OutEdges);
+
+    void GatherLeafEdgesRecursive(TSharedPtr<FAdaptiveOctreeNode> Node, TSet<FNodeEdge>& OutEdges);
+    
+    void UpdateLodRecursive(TSharedPtr<FAdaptiveOctreeNode> Node, FVector CameraPosition, double InScreenSpaceThreshold, double InCameraFOV, bool& OutChanged, TArray<TSharedPtr<FAdaptiveOctreeNode>>& OutNewLeaves);
 
     TArray<TSharedPtr<FAdaptiveOctreeNode>> SampleNodesAroundEdge(const FNodeEdge& Edge);
 
@@ -63,11 +65,11 @@ public:
         int InMinDepth,
         int InMaxDepth);
 
+    void SplitToDepth(TSharedPtr<FAdaptiveOctreeNode> Node, int InMinDepth, TArray<TSharedPtr<FAdaptiveOctreeNode>>& OutNewLeaves);
+
     void ApplyEdit(FVector InEditCenter, double InEditRadius, double InEditStrength, int InEditResolution);
 
     void UpdateLOD(FVector InCameraPosition, double InScreenSpaceThreshold, double InCameraFOV);
-
-    void UpdateLodRecursive(TSharedPtr<FAdaptiveOctreeNode> Node, FVector CameraPosition, double InScreenSpaceThreshold, double InCameraFOV, bool& OutChanged);
 
     void UpdateMesh();
 

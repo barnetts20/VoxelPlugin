@@ -28,31 +28,36 @@ FAdaptiveOctree::FAdaptiveOctree(
     );
 
     Root = MakeShared<FAdaptiveOctreeNode>(InCenter, InRootExtent, InChunkDepth, InMinDepth, InMaxDepth);
-    SplitToDepth(Root, InChunkDepth);
+    TArray<TSharedPtr<FAdaptiveOctreeNode>> InitialLeaves;
+    SplitToDepth(Root, InChunkDepth, InitialLeaves);
+    CornerProvider->ProvisionCorners(InitialLeaves);
     PopulateChunks();
 }
 
-void FAdaptiveOctree::SplitToDepth(TSharedPtr<FAdaptiveOctreeNode> Node, int InMinDepth)
+void FAdaptiveOctree::SplitToDepth(TSharedPtr<FAdaptiveOctreeNode> Node, int InMinDepth, TArray<TSharedPtr<FAdaptiveOctreeNode>>& OutNewLeaves)
 {
     if (!Node.IsValid()) return;
-
     if (Node->Index.Depth < InMinDepth)
     {
         Node->Split();
         for (int i = 0; i < 8; i++)
         {
             if (Node->Children[i])
-                SplitToDepth(Node->Children[i], InMinDepth);
+                SplitToDepth(Node->Children[i], InMinDepth, OutNewLeaves);
         }
+    }
+    else
+    {
+        OutNewLeaves.Add(Node); // at target depth, this is a leaf
     }
 }
 
 void FAdaptiveOctree::PopulateChunks()
 {
-    // 1. Gather surface chunk nodes
+    // 1. Corners already provisioned — GetSurfaceChunks works correctly
     TArray<TSharedPtr<FAdaptiveOctreeNode>> Chunks = Root->GetSurfaceChunks();
 
-    // 2. Also gather non-surface neighbors as buffer chunks
+    // 2. Gather non-surface neighbors as buffer chunks
     TArray<TSharedPtr<FAdaptiveOctreeNode>> NeighborChunks;
     for (auto& ChunkNode : Chunks)
     {
@@ -69,31 +74,7 @@ void FAdaptiveOctree::PopulateChunks()
     }
     Chunks.Append(NeighborChunks);
 
-    // 3. Provision corners + finalize all chunk subtrees
-    // Gather all leaf nodes across all chunks
-    TArray<TSharedPtr<FAdaptiveOctreeNode>> AllLeafNodes;
-    for (auto& ChunkNode : Chunks)
-    {
-        TArray<TSharedPtr<FAdaptiveOctreeNode>> Stack;
-        Stack.Add(ChunkNode);
-        while (Stack.Num() > 0)
-        {
-            auto Current = Stack.Pop(EAllowShrinking::No);
-            if (!Current.IsValid()) continue;
-            if (Current->IsLeaf())
-            {
-                AllLeafNodes.Add(Current);
-            }
-            else
-            {
-                for (int i = 0; i < 8; i++)
-                    if (Current->Children[i]) Stack.Add(Current->Children[i]);
-            }
-        }
-    }
-    CornerProvider->ProvisionCorners(AllLeafNodes);
-
-    // 4. Build mesh chunks
+    // 3. Build mesh chunks
     TArray<TSharedPtr<FMeshChunk>> NewChunks;
     NewChunks.SetNum(Chunks.Num());
 
@@ -112,7 +93,7 @@ void FAdaptiveOctree::PopulateChunks()
             NewChunks[i]->IsDirty = (NewChunks[i]->SurfaceMeshData->GetPositionStream().Num() > 0);
         });
 
-    // 5. Serial add to map
+    // 4. Serial add to map
     for (int32 i = 0; i < Chunks.Num(); i++)
         ChunkMap.Add(Chunks[i], NewChunks[i]);
 
@@ -238,8 +219,14 @@ void FAdaptiveOctree::ApplyEdit(FVector InEditCenter, double InEditRadius, doubl
 
 void FAdaptiveOctree::GatherLeafEdges(TSharedPtr<FAdaptiveOctreeNode> Node, TArray<FNodeEdge>& OutEdges)
 {
-    if (!Node.IsValid()) return;
+    TSet<FNodeEdge> EdgeSet;
+    GatherLeafEdgesRecursive(Node, EdgeSet);
+    OutEdges = EdgeSet.Array();
+}
 
+void FAdaptiveOctree::GatherLeafEdgesRecursive(TSharedPtr<FAdaptiveOctreeNode> Node, TSet<FNodeEdge>& OutEdges)
+{
+    if (!Node.IsValid()) return;
     if (Node->IsLeaf())
     {
         for (int32 i = 0; i < 12; i++)
@@ -248,18 +235,15 @@ void FAdaptiveOctree::GatherLeafEdges(TSharedPtr<FAdaptiveOctreeNode> Node, TArr
             const FVoxelCorner* B = Node->Corners[OctreeConstants::EdgePairs[i][1]].Get();
             if (!A || !B) continue;
             if ((A->Density <= 0.0) == (B->Density <= 0.0)) continue;
-
-            FNodeEdge Edge(*A, *B);
-            OutEdges.AddUnique(Edge);
+            OutEdges.Add(FNodeEdge(*A, *B));
         }
         return;
     }
-
     for (int i = 0; i < 8; i++)
-        GatherLeafEdges(Node->Children[i], OutEdges);
+        GatherLeafEdgesRecursive(Node->Children[i], OutEdges);
 }
 
-void FAdaptiveOctree::UpdateLodRecursive(TSharedPtr<FAdaptiveOctreeNode> Node, FVector CameraPosition, double InScreenSpaceThreshold, double InCameraFOV, bool& OutChanged)
+void FAdaptiveOctree::UpdateLodRecursive(TSharedPtr<FAdaptiveOctreeNode> Node, FVector CameraPosition, double InScreenSpaceThreshold, double InCameraFOV, bool& OutChanged, TArray<TSharedPtr<FAdaptiveOctreeNode>>& OutNewLeaves)
 {
     if (Node->IsLeaf())
     {
@@ -267,12 +251,9 @@ void FAdaptiveOctree::UpdateLodRecursive(TSharedPtr<FAdaptiveOctreeNode> Node, F
         {
             OutChanged = true;
             Node->Split();
-
-            TArray<TSharedPtr<FAdaptiveOctreeNode>> NewChildren;
             for (int i = 0; i < 8; i++)
-                if (Node->Children[i]) NewChildren.Add(Node->Children[i]);
-
-            CornerProvider->ProvisionCorners(NewChildren);
+                if (Node->Children[i]) OutNewLeaves.Add(Node->Children[i]);
+            return;
         }
         else if (Node->Parent.IsValid() &&
             Node->Parent.Pin()->ShouldMerge(CameraPosition, InScreenSpaceThreshold, InCameraFOV) &&
@@ -280,13 +261,14 @@ void FAdaptiveOctree::UpdateLodRecursive(TSharedPtr<FAdaptiveOctreeNode> Node, F
         {
             OutChanged = true;
             Node->Parent.Pin()->Merge();
+            return;
         }
         return;
     }
 
     for (int i = 0; i < 8; i++)
         if (Node->Children[i])
-            UpdateLodRecursive(Node->Children[i], CameraPosition, InScreenSpaceThreshold, InCameraFOV, OutChanged);
+            UpdateLodRecursive(Node->Children[i], CameraPosition, InScreenSpaceThreshold, InCameraFOV, OutChanged, OutNewLeaves);
 }
 
 void FAdaptiveOctree::UpdateLOD(FVector CameraPosition, double InScreenSpaceThreshold, double InCameraFOV)
@@ -301,24 +283,31 @@ void FAdaptiveOctree::UpdateLOD(FVector CameraPosition, double InScreenSpaceThre
     ModifiedChunks.SetNumZeroed(NumChunks);
 
     ParallelFor(NumChunks, [&](int32 idx)
-        {
-            bool bChanged = false;
-            UpdateLodRecursive(Chunks[idx], CameraPosition, InScreenSpaceThreshold, InCameraFOV, bChanged);
-            if (bChanged)
-            {
-                TArray<FNodeEdge> ChunkEdges;
-                GatherLeafEdges(Chunks[idx], ChunkEdges);
-                auto MeshChunk = ChunkMap[Chunks[idx]];
-                MeshChunk->ChunkEdges = ChunkEdges;
-                ModifiedChunks[idx] = MeshChunk;
-            }
-        });
+    {
+        bool bChanged = false;
+        TArray<TSharedPtr<FAdaptiveOctreeNode>> NewLeaves;
+
+        UpdateLodRecursive(Chunks[idx], CameraPosition, InScreenSpaceThreshold, InCameraFOV, bChanged, NewLeaves);
+
+        if (!bChanged) return;
+
+        // Provision new leaves for this chunk immediately
+        if (NewLeaves.Num() > 0)
+            CornerProvider->ProvisionCorners(NewLeaves);
+
+        // Rebuild this chunk's mesh
+        TArray<FNodeEdge> ChunkEdges;
+        GatherLeafEdges(Chunks[idx], ChunkEdges);
+        auto MeshChunk = ChunkMap[Chunks[idx]];
+        MeshChunk->ChunkEdges = ChunkEdges;
+        ModifiedChunks[idx] = MeshChunk;
+    });
 
     ParallelFor(NumChunks, [&](int32 i)
-        {
-            if (ModifiedChunks[i].IsValid())
-                UpdateMeshChunkStreamData(ModifiedChunks[i]);
-        });
+    {
+        if (ModifiedChunks[i].IsValid())
+            UpdateMeshChunkStreamData(ModifiedChunks[i]);
+    });
 }
 
 void FAdaptiveOctree::UpdateMesh()
@@ -339,7 +328,7 @@ TArray<TSharedPtr<FAdaptiveOctreeNode>> FAdaptiveOctree::SampleNodesAroundEdge(c
     TArray<TSharedPtr<FAdaptiveOctreeNode>> Nodes;
 
     FVector Midpoint = (Edge.Positions[0] + Edge.Positions[1]) * 0.5;
-    double Epsilon = ChunkExtent * 1e-8;
+    double Epsilon = .5;
 
     auto GetLeafWithBias = [&](bool BiasPerp1, bool BiasPerp2) -> TSharedPtr<FAdaptiveOctreeNode>
         {

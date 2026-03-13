@@ -81,6 +81,7 @@ void AAdaptiveVoxelActor::RunDataUpdateTask()
             AAdaptiveVoxelActor* Self = WeakThis.Get();
             if (!Self || Self->IsDestroyed) return;
 
+            double t0 = FPlatformTime::Seconds();
             {
                 FRWScopeLock ReadLock(Self->OctreeLock, SLT_ReadOnly);
                 FVector CurrentCamPos = Self->CameraPosition;
@@ -89,6 +90,7 @@ void AAdaptiveVoxelActor::RunDataUpdateTask()
                 Self->AdaptiveOctree->UpdateLOD(PredictedPos, Self->ScreenSpaceThreshold, Self->CameraFOV);
                 Self->LastLodUpdatePosition = Self->CameraPosition;
             }
+            UE_LOG(LogTemp, Log, TEXT("[Pipeline] DataUpdate (UpdateLOD): %.2fms"), (FPlatformTime::Seconds() - t0) * 1000.0);
 
             Self->DataUpdateIsRunning = false;
             Self->RunMeshUpdateTask();
@@ -107,10 +109,12 @@ void AAdaptiveVoxelActor::RunMeshUpdateTask()
             AAdaptiveVoxelActor* Self = WeakThis.Get();
             if (!Self || Self->IsDestroyed) return;
 
+            double t0 = FPlatformTime::Seconds();
             {
                 FRWScopeLock ReadLock(Self->OctreeLock, SLT_ReadOnly);
                 Self->AdaptiveOctree->UpdateMesh();
             }
+            UE_LOG(LogTemp, Log, TEXT("[Pipeline] MeshUpdate (UpdateMesh): %.2fms"), (FPlatformTime::Seconds() - t0) * 1000.0);
 
             Self->MeshUpdateIsRunning = false;
             Self->RunDataCleanupTask();
@@ -129,20 +133,27 @@ void AAdaptiveVoxelActor::RunDataCleanupTask()
             AAdaptiveVoxelActor* Self = WeakThis.Get();
             if (!Self || Self->IsDestroyed) return;
 
+            double t0 = FPlatformTime::Seconds();
             Self->AdaptiveOctree->CleanupData();
+            UE_LOG(LogTemp, Log, TEXT("[Pipeline] DataCleanup (PruneCorners): %.2fms"), (FPlatformTime::Seconds() - t0) * 1000.0);
 
             Self->DataCleanupIsRunning = false;
 
-            if (UWorld* World = Self->GetWorld())
-            {
-                World->GetTimerManager().SetTimer(
-                    Self->DataUpdateTimerHandle,
-                    Self,
-                    &AAdaptiveVoxelActor::RunDataUpdateTask,
-                    Self->MinDataUpdateInterval,
-                    false
-                );
-            }
+            AsyncTask(ENamedThreads::GameThread, [WeakThis]()
+                {
+                    AAdaptiveVoxelActor* Self = WeakThis.Get();
+                    if (!Self || Self->IsDestroyed) return;
+                    if (UWorld* World = Self->GetWorld())
+                    {
+                        World->GetTimerManager().SetTimer(
+                            Self->DataUpdateTimerHandle,
+                            Self,
+                            &AAdaptiveVoxelActor::RunDataUpdateTask,
+                            Self->MinDataUpdateInterval,
+                            false
+                        );
+                    }
+                });
 
         }, TStatId(), nullptr, ENamedThreads::AnyBackgroundHiPriTask);
 }

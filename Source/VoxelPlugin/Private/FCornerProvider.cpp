@@ -22,13 +22,12 @@ TSharedPtr<FVoxelCorner> FCornerProvider::GetOrCreateCorner(FInt64Vector InKey)
     }
 
     FWriteScopeLock WriteLock(CornerLock);
-    TWeakPtr<FVoxelCorner>* Found = CornerLookup.Find(InKey);
+    TWeakPtr<FVoxelCorner>* Found = CornerLookup.Find(InKey); // add this
     if (Found)
     {
         TSharedPtr<FVoxelCorner> Pinned = Found->Pin();
         if (Pinned.IsValid()) return Pinned;
     }
-
     TSharedPtr<FVoxelCorner> NewCorner = MakeShared<FVoxelCorner>(InKey);
     CornerLookup.Add(InKey, NewCorner);
     return NewCorner;
@@ -91,8 +90,7 @@ void FCornerProvider::SampleCorners(TArray<TSharedPtr<FVoxelCorner>>& InCorners)
 void FCornerProvider::ProvisionCorners(const TArray<TSharedPtr<FAdaptiveOctreeNode>>& InNodes)
 {
     // 1. Acquire corners for all nodes, collect unsampled ones
-    TArray<TSharedPtr<FVoxelCorner>> NewCorners;
-
+    TSet<TSharedPtr<FVoxelCorner>> NewCornersSet;
     for (const auto& Node : InNodes)
     {
         for (int32 i = 0; i < 8; i++)
@@ -100,9 +98,10 @@ void FCornerProvider::ProvisionCorners(const TArray<TSharedPtr<FAdaptiveOctreeNo
             TSharedPtr<FVoxelCorner> Corner = GetOrCreateCorner(Node->GetCornerPosition(i));
             Node->Corners[i] = Corner;
             if (!Corner->bIsInitialized)
-                NewCorners.AddUnique(Corner);
+                NewCornersSet.Add(Corner);
         }
     }
+    TArray<TSharedPtr<FVoxelCorner>> NewCorners = NewCornersSet.Array();
 
     // 2. Sample any corners we haven't seen before
     SampleCorners(NewCorners);
@@ -145,9 +144,9 @@ void FCornerProvider::ApplyEdit(FVector InEditCenter, double InEditRadius, doubl
 void FCornerProvider::PruneExpiredCorners()
 {
     // Phase 1 — collect dead keys in parallel
+    FReadScopeLock ReadLock(CornerLock);
     TArray<FInt64Vector> AllKeys;
     {
-        FReadScopeLock ReadLock(CornerLock);
         CornerLookup.GenerateKeyArray(AllKeys);
     }
 
