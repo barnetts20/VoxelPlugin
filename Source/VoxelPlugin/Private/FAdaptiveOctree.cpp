@@ -143,7 +143,7 @@ void FAdaptiveOctree::ApplyEdit(FVector InEditCenter, double InEditRadius, doubl
     TArray<FVector> AffectedChunkCenters = EditStore->ApplySphericalEdit(InEditCenter, InEditRadius, InEditStrength, depth);
     double ReconstructRadius = InEditRadius * 2.5;
 
-    // Resolve chunk nodes — collect as shared ptrs since we need them for ChunkMap operations
+    // Resolve chunk nodes -- collect as shared ptrs since we need them for ChunkMap operations
     TArray<TSharedPtr<FAdaptiveOctreeNode>> ChunkNodes;
     for (const FVector& Center : AffectedChunkCenters)
     {
@@ -152,19 +152,19 @@ void FAdaptiveOctree::ApplyEdit(FVector InEditCenter, double InEditRadius, doubl
             ChunkNodes.Add(ChunkNodeRaw->AsShared());
     }
 
-    // Stage 1: Parallel — recompute all node data
+    // Stage 1: Parallel -- recompute all node data
     ParallelFor(ChunkNodes.Num(), [&](int32 i) {
         ReconstructSubtree(ChunkNodes[i].Get(), InEditCenter, ReconstructRadius);
         });
 
-    // Stage 2: Serial — update chunk map
+    // Stage 2: Serial -- update chunk map
     TArray<TPair<TSharedPtr<FAdaptiveOctreeNode>, TSharedPtr<FMeshChunk>>> DirtyChunks;
     for (auto& ChunkNode : ChunkNodes)
     {
         UpdateChunkMap(ChunkNode, DirtyChunks);
     }
 
-    // Stage 3: Parallel — gather edges + rebuild mesh streams
+    // Stage 3: Parallel -- gather edges + rebuild mesh streams
     ParallelFor(DirtyChunks.Num(), [&](int32 i) {
         TArray<FNodeEdge> NewEdges;
         TMap<FEdgeKey, int32> EdgeMap;
@@ -437,7 +437,7 @@ void FAdaptiveOctree::UpdateMeshChunkStreamData(TSharedPtr<FMeshChunk> InChunk)
         }
     }
 
-    // Compact ocean vertices — only include vertices actually referenced by OcnTriangles
+    // Compact ocean vertices -- only include vertices actually referenced by OcnTriangles
     TArray<FMeshVertex> OcnUniqueVertices;
     TMap<int32, int32> OcnVertexRemap;
     OcnUniqueVertices.Reserve(OcnTriangles.Num() * 3);
@@ -625,10 +625,10 @@ void FAdaptiveOctree::UpdateLOD(FVector CameraPosition, double InScreenSpaceThre
     double t0 = FPlatformTime::Seconds();
     ParallelFor(NumChunks, [&](int32 idx) {
         FAdaptiveOctreeNode* ChunkNode = Chunks[idx].Get();
-        double Distance = FMath::Max(FVector::Dist(ChunkNode->Center, CameraPosition), 1.0);
-        bool CouldSplit = FAdaptiveOctreeNode::EvaluateSplit(ChunkNode->Extent, Distance, FOVScale, InScreenSpaceThreshold, ChunkNode->Index.Depth, ChunkNode->DepthBounds[1], ChunkNode->DepthBounds[2]);
+        double DistSq = FMath::Max(FVector::DistSquared(ChunkNode->Center, CameraPosition), 1.0);
+        bool CouldSplit = FAdaptiveOctreeNode::EvaluateSplit(ChunkNode->Extent, DistSq, FOVScale, InScreenSpaceThreshold, ChunkNode->Index.Depth, ChunkNode->DepthBounds[1], ChunkNode->DepthBounds[2]);
         double SmallestExtent = ChunkNode->Extent / (double)(1 << (ChunkNode->DepthBounds[1] - ChunkNode->Index.Depth));
-        bool CouldMerge = FAdaptiveOctreeNode::EvaluateMerge(SmallestExtent, Distance, FOVScale, InScreenSpaceThreshold, ChunkNode->DepthBounds[1], ChunkNode->DepthBounds[0], ChunkNode->DepthBounds[2]);
+        bool CouldMerge = FAdaptiveOctreeNode::EvaluateMerge(SmallestExtent, DistSq, FOVScale, InScreenSpaceThreshold, ChunkNode->DepthBounds[1], ChunkNode->DepthBounds[0], ChunkNode->DepthBounds[2]);
 
         if (!CouldSplit && !CouldMerge) return; //Early out
 
@@ -897,7 +897,7 @@ FEdgeNeighbors FAdaptiveOctree::SampleNodesAroundEdge(const FNodeEdge& Edge)
 
     double Epsilon = ChunkExtent * 1e-8;
 
-    // Helper lambda for biased top-down traversal — uses raw pointers throughout
+    // Helper lambda for biased top-down traversal -- uses raw pointers throughout
     auto GetLeafWithBias = [&](bool BiasPerp1, bool BiasPerp2) -> FAdaptiveOctreeNode* {
         FAdaptiveOctreeNode* CurrentNode = Root.Get();
 

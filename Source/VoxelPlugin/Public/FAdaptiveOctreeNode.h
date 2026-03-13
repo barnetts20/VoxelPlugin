@@ -67,7 +67,7 @@ struct VOXELPLUGIN_API FEdgeKey
     uint8 Axis;
     uint32 CachedHash;  // Precomputed hash for TMap lookups
 
-    // Grid size 1.0: at max world size 1e8, fits int32 (±2.1e9).
+    // Grid size 1.0: at max world size 1e8, fits int32 (+/-2.1e9).
     // Smallest edge at depth 18 spans ~762 units, so grid 1.0 uniquely identifies all corners.
     static constexpr double InvGridSize = 1.0;  // multiply instead of divide
 
@@ -264,10 +264,10 @@ struct VOXELPLUGIN_API FQEF
     // Number of planes added
     int32 PlaneCount;
 
-    // Mass point (average of intersection points used as fallback and bias)
+    // Mass point (average of intersection points -- used as fallback and bias)
     FVector MassPoint;
 
-    // Accumulated normal (sum of normals passed to AddPlane for average normal output)
+    // Accumulated normal (sum of normals passed to AddPlane -- for average normal output)
     FVector AccumulatedNormal;
 
     FQEF()
@@ -452,7 +452,7 @@ private:
         double maxEigen = FMath::Max3(FMath::Abs(eigenvalues[0]),
             FMath::Abs(eigenvalues[1]),
             FMath::Abs(eigenvalues[2]));
-        double threshold = maxEigen * 0.1; // 10% threshold fairly aggressive clamping
+        double threshold = maxEigen * 0.1; // 10% threshold -- fairly aggressive clamping
 
         // V^T * rhs
         double vtRhs[3];
@@ -468,7 +468,7 @@ private:
             if (FMath::Abs(eigenvalues[i]) > threshold)
                 scaled[i] = vtRhs[i] / eigenvalues[i];
             else
-                scaled[i] = 0.0; // Singular direction collapse to mass point
+                scaled[i] = 0.0; // Singular direction -- collapse to mass point
         }
 
         // V * scaled
@@ -537,23 +537,30 @@ public:
 
     const bool IsRoot();
 
-    static bool EvaluateSplit(double Extent, double Distance, double FOVScale, double Threshold, int Depth, int MaxDepth, int MinDepth)
+    static bool EvaluateSplit(double Extent, double DistSq, double FOVScale, double Threshold, int Depth, int MaxDepth, int MinDepth)
     {
         if (Depth >= MaxDepth) return false;
         if (Depth < MinDepth) return true;
-        return ((2.0 * Extent / Distance) * FOVScale) > Threshold;
+        // Rearranged from: (2*Extent/Dist)*FOVScale > Threshold
+        // To avoid sqrt:   (2*Extent*FOVScale)^2 > Threshold^2 * DistSq
+        double lhs = 2.0 * Extent * FOVScale;
+        return (lhs * lhs) > (Threshold * Threshold * DistSq);
     }
 
-    static bool EvaluateMerge(double Extent, double Distance, double FOVScale, double Threshold, int Depth, int ChunkDepth, int MinDepth)
+    static bool EvaluateMerge(double Extent, double DistSq, double FOVScale, double Threshold, int Depth, int ChunkDepth, int MinDepth)
     {
         if (Depth <= ChunkDepth) return false;
         if (Depth < MinDepth) return false;
-        return ((2.0 * Extent / Distance) * FOVScale) < Threshold * 0.5;
+        // Rearranged from: (2*Extent/Dist)*FOVScale < Threshold*0.5
+        // To avoid sqrt:   (2*Extent*FOVScale)^2 < (Threshold*0.5)^2 * DistSq
+        double lhs = 2.0 * Extent * FOVScale;
+        double rhs = Threshold * 0.5;
+        return (lhs * lhs) < (rhs * rhs * DistSq);
     }
 
-    bool ShouldSplit(FVector InCameraPosition, double InScreenSpaceThreshold, double InCameraFOV);
+    bool ShouldSplit(FVector InCameraPosition, double InScreenSpaceThreshold, double InFOVScale);
 
-    bool ShouldMerge(FVector InCameraPosition, double InScreenSpaceThreshold, double InCameraFOV);
+    bool ShouldMerge(FVector InCameraPosition, double InScreenSpaceThreshold, double InFOVScale);
 
     void Split();
 
@@ -574,7 +581,7 @@ public:
     FAdaptiveOctreeNode(TSharedPtr<FAdaptiveOctreeNode> InParent, uint8 InChildIndex, FVector InAnchorCenter);
 };
 
-// Lightweight fixed-size result for SampleNodesAroundEdge — avoids TArray heap allocation
+// Lightweight fixed-size result for SampleNodesAroundEdge -- avoids TArray heap allocation
 // and TSharedPtr ref-count bumps in the hot mesh-building path.
 struct FEdgeNeighbors {
     FAdaptiveOctreeNode* Nodes[4] = { nullptr, nullptr, nullptr, nullptr };

@@ -131,7 +131,7 @@ void FAdaptiveOctreeNode::Split()
     for (uint8 i = 0; i < 8; i++)
     {
         // Update constructor to take NextAnchor
-        Children[i] = MakeShared<FAdaptiveOctreeNode>( AsShared(), i, NextAnchor);
+        Children[i] = MakeShared<FAdaptiveOctreeNode>(AsShared(), i, NextAnchor);
     }
     bIsLeaf = false;
 }
@@ -153,19 +153,29 @@ void FAdaptiveOctreeNode::Merge()
 
 bool FAdaptiveOctreeNode::ShouldSplit(FVector InCameraPosition, double InScreenSpaceThreshold, double InFOVScale)
 {
-    FVector ToCam = (InCameraPosition - TreeCenter).GetSafeNormal();
-    FVector ToNode = (Center - TreeCenter).GetSafeNormal();
-    if (FVector::DotProduct(ToCam, ToNode) < -0.2f) return false;
+    // Backface cull without normalization: 
+    // dot(ToCam, ToNode) < -0.2 * |ToCam| * |ToNode|
+    // Squaring both sides (valid when LHS is negative, which is the case we want to catch):
+    // dot^2 > 0.04 * |ToCam|^2 * |ToNode|^2  AND  dot < 0
+    FVector ToCam = InCameraPosition - TreeCenter;
+    FVector ToNode = Center - TreeCenter;
+    double Dot = FVector::DotProduct(ToCam, ToNode);
+    if (Dot < 0.0)
+    {
+        double DotSq = Dot * Dot;
+        double ThreshSq = 0.04 * ToCam.SizeSquared() * ToNode.SizeSquared();
+        if (DotSq > ThreshSq) return false;
+    }
 
-    double Distance = FMath::Max(FVector::Dist(DualContourPosition, InCameraPosition), 1.0);
-    return EvaluateSplit(Extent, Distance, InFOVScale, InScreenSpaceThreshold, Index.Depth, DepthBounds[1], DepthBounds[2]);
+    double DistSq = FMath::Max(FVector::DistSquared(DualContourPosition, InCameraPosition), 1.0);
+    return EvaluateSplit(Extent, DistSq, InFOVScale, InScreenSpaceThreshold, Index.Depth, DepthBounds[1], DepthBounds[2]);
 }
 
 bool FAdaptiveOctreeNode::ShouldMerge(FVector InCameraPosition, double InScreenSpaceThreshold, double InFOVScale)
 {
     if (LodOverride) return false;
-    double Distance = FMath::Max(FVector::Dist(DualContourPosition, InCameraPosition), 1.0);
-    return EvaluateMerge(Extent, Distance, InFOVScale, InScreenSpaceThreshold, Index.Depth, DepthBounds[0], DepthBounds[2]);
+    double DistSq = FMath::Max(FVector::DistSquared(DualContourPosition, InCameraPosition), 1.0);
+    return EvaluateMerge(Extent, DistSq, InFOVScale, InScreenSpaceThreshold, Index.Depth, DepthBounds[0], DepthBounds[2]);
 }
 
 TArray<FNodeEdge>& FAdaptiveOctreeNode::GetSignChangeEdges()
@@ -290,6 +300,4 @@ void FAdaptiveOctreeNode::ComputeDualContourPosition()
     {
         DualContourNormal = (DualContourPosition - TreeCenter).GetSafeNormal();
     }
-
-
 }
