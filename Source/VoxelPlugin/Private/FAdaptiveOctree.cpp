@@ -757,92 +757,72 @@ void FAdaptiveOctree::SplitAndComputeChildren(TSharedPtr<FAdaptiveOctreeNode> No
     // G26: body center
     GridPositions[26] = Node->Center;
 
-    // --- Stage 2: Sample 19 new densities ---
-    const int32 NewCount = 19;
-    float XPos[19], YPos[19], ZPos[19], NoiseOut[19];
+    // --- Stage 2: 4N bulk sample --- 
+    // Layout: [0..26] = 27 grid points, [27..53] = +X offsets, [54..80] = +Y offsets, [81..107] = +Z offsets
+    // G0-G7 densities are already known but included in the bulk call to keep index math uniform.
+    // Epsilon is sized relative to the child extent so the gradient captures detail at the right scale.
+    const int32 TotalCount = 108;
+    const double GradEpsilon = Node->Extent * 0.05; // half a child extent
+    static const FVector EpsilonOffsets[3] = {
+        FVector(1, 0, 0), FVector(0, 1, 0), FVector(0, 0, 1)
+    };
 
     double NoiseScale = RootExtent * 0.1;
     FVector PlanetCenter = Root->Center;
 
-    for (int32 i = 0; i < NewCount; i++)
-    {
-        FVector PlanetRel = GridPositions[8 + i] - PlanetCenter;
-        double Dist = PlanetRel.Size();
-        FVector Dir = (Dist > 1e-10) ? (PlanetRel / Dist) : FVector::UpVector;
-        FVector SurfacePos = Dir * RootExtent;
-        XPos[i] = (float)(SurfacePos.X / NoiseScale);
-        YPos[i] = (float)(SurfacePos.Y / NoiseScale);
-        ZPos[i] = (float)(SurfacePos.Z / NoiseScale);
-    }
+    float XPos[108], YPos[108], ZPos[108], NoiseOut[108];
 
-    DensityFunction(NewCount, XPos, YPos, ZPos, NoiseOut);
+    // Helper: project a world position onto the noise surface input
+    auto ProjectToNoise = [&](const FVector& WorldPos, int32 idx)
+        {
+            FVector PlanetRel = WorldPos - PlanetCenter;
+            double Dist = PlanetRel.Size();
+            FVector Dir = (Dist > 1e-10) ? (PlanetRel / Dist) : FVector::UpVector;
+            FVector SurfacePos = Dir * RootExtent;
+            XPos[idx] = (float)(SurfacePos.X / NoiseScale);
+            YPos[idx] = (float)(SurfacePos.Y / NoiseScale);
+            ZPos[idx] = (float)(SurfacePos.Z / NoiseScale);
+        };
 
-    for (int32 i = 0; i < NewCount; i++)
+    // Grid points [0..26]
+    for (int32 i = 0; i < 27; i++)
+        ProjectToNoise(GridPositions[i], i);
+
+    // Epsilon offset points [27..107]: axis 0 = +X, axis 1 = +Y, axis 2 = +Z
+    for (int32 axis = 0; axis < 3; axis++)
+        for (int32 gi = 0; gi < 27; gi++)
+            ProjectToNoise(GridPositions[gi] + EpsilonOffsets[axis] * GradEpsilon, 27 + axis * 27 + gi);
+
+    DensityFunction(TotalCount, XPos, YPos, ZPos, NoiseOut);
+
+    // Compute full densities for all 108 positions (SDF + edits)
+    double AllDensities[108];
+    for (int32 i = 0; i < TotalCount; i++)
     {
+        FVector WorldPos = (i < 27)
+            ? GridPositions[i]
+            : GridPositions[(i - 27) % 27] + EpsilonOffsets[(i - 27) / 27] * GradEpsilon;
+
         double Height = (double)NoiseOut[i] * NoiseScale;
-        FVector PlanetRel = GridPositions[8 + i] - PlanetCenter;
+        FVector PlanetRel = WorldPos - PlanetCenter;
         double Dist = PlanetRel.Size();
-        GridDensities[8 + i] = Dist - (RootExtent * 0.9 + Height) + EditStore->Sample(GridPositions[8 + i]);
+        AllDensities[i] = Dist - (RootExtent * 0.9 + Height) + EditStore->Sample(WorldPos);
     }
 
-    // --- Stage 3: Compute 27 normals from grid gradients ---
-    // For every grid point, we always sample exactly one inward-facing neighbor per axis.
-    // cx==-1 means we're on the -X face, so we step toward +X (inward).
-    // cx==+1 means we're on the +X face, so we step toward -X (inward).
-    // cx== 0 means we're in the middle, either direction works; we use +X.
-    // The difference is always (neighbor - self), then sign-corrected so the gradient
-    // points in the conventional +axis direction. This gives every grid point an
-    // identical stencil structure — one neighbor per axis, always inward — so normals
-    // are consistent across the entire grid with no extra samples.
+    // Write grid densities back (G0-G7 get overwritten with fresh samples, consistent with offsets)
+    for (int32 i = 0; i < 27; i++)
+        GridDensities[i] = AllDensities[i];
+
+    // --- Stage 3: Compute 27 normals from 4N forward differences ---
+    // Each grid point uses its 3 epsilon-offset neighbors for a true forward-difference gradient.
+    // Every point uses the identical stencil structure with no special casing.
     FVector GridNormals[27];
 
     for (int32 gi = 0; gi < 27; gi++)
     {
-        int8 cx = GridCoords[gi][0];
-        int8 cy = GridCoords[gi][1];
-        int8 cz = GridCoords[gi][2];
-
-        // X: step inward (toward cx==0). If at center, step +X.
-        // neighbor index in CoordToGrid uses cx+1 offset (+1 maps -1->0, 0->1, +1->2)
-        double dX;
-        if (cx <= 0)
-        {
-            // Step in +X direction: neighbor is at cx+1
-            int32 ngi = CoordToGrid[cx + 2][cy + 1][cz + 1];
-            dX = GridDensities[ngi] - GridDensities[gi]; // positive = density increases in +X
-        }
-        else
-        {
-            // Step in -X direction: neighbor is at cx-1
-            int32 ngi = CoordToGrid[cx][cy + 1][cz + 1]; // cx+1-1 = cx, i.e. index cx
-            dX = -(GridDensities[ngi] - GridDensities[gi]); // negate: we stepped -X but want +X gradient
-        }
-
-        // Y: step inward
-        double dY;
-        if (cy <= 0)
-        {
-            int32 ngi = CoordToGrid[cx + 1][cy + 2][cz + 1];
-            dY = GridDensities[ngi] - GridDensities[gi];
-        }
-        else
-        {
-            int32 ngi = CoordToGrid[cx + 1][cy][cz + 1];
-            dY = -(GridDensities[ngi] - GridDensities[gi]);
-        }
-
-        // Z: step inward
-        double dZ;
-        if (cz <= 0)
-        {
-            int32 ngi = CoordToGrid[cx + 1][cy + 1][cz + 2];
-            dZ = GridDensities[ngi] - GridDensities[gi];
-        }
-        else
-        {
-            int32 ngi = CoordToGrid[cx + 1][cy + 1][cz];
-            dZ = -(GridDensities[ngi] - GridDensities[gi]);
-        }
+        double dX = AllDensities[27 + 0 * 27 + gi] - AllDensities[gi];
+        double dY = AllDensities[27 + 1 * 27 + gi] - AllDensities[gi];
+        double dZ = AllDensities[27 + 2 * 27 + gi] - AllDensities[gi];
 
         FVector Normal(dX, dY, dZ);
         if (!Normal.Normalize())
