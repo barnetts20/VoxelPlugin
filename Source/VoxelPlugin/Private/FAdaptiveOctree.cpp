@@ -556,15 +556,14 @@ void FAdaptiveOctree::UpdateLodRecursive(TSharedPtr<FAdaptiveOctreeNode> Node, F
         if (Node->ShouldSplit(CameraPosition, InScreenSpaceThreshold, InCameraFOV))
         {
             OutChanged = true;
-            SplitAndComputeChildren(Node);// ->Split();
+            SplitAndComputeChildren(Node);
             for (int i = 0; i < 8; i++)
-            {
-                ComputeNodeData(Node->Children[i]);
                 AppendUniqueEdges(Node->Children[i]->GetSignChangeEdges(), OutNodeEdges, EdgeMap);
-            }
             return;
         }
-        else if (Node->Parent.IsValid() && Node->Parent.Pin()->ShouldMerge(CameraPosition, InScreenSpaceThreshold, InCameraFOV) && Node->Index.LastChild() == 7)
+        else if (Node->Parent.IsValid() &&
+            Node->Parent.Pin()->ShouldMerge(CameraPosition, InScreenSpaceThreshold, InCameraFOV) &&
+            Node->Index.LastChild() == 7)
         {
             OutChanged = true;
             auto ParentPtr = Node->Parent.Pin();
@@ -578,11 +577,32 @@ void FAdaptiveOctree::UpdateLodRecursive(TSharedPtr<FAdaptiveOctreeNode> Node, F
             return;
         }
     }
-    else
+
+    // --- SHORT CIRCUIT ---
+    // If this entire subtree is too far away to split or too close to merge,
+    // just collect its leaf edges without recursing into children
+    double Distance = FMath::Max(FVector::Dist(Node->Center, CameraPosition), 1.0);
+    double FOVScale = 1.0 / FMath::Tan(FMath::DegreesToRadians(InCameraFOV * 0.5));
+
+    // Largest node in subtree is this node — if it wouldn't split, nothing deeper will split
+    double AngularSizeThisNode = (2.0 * Node->Extent / Distance) * FOVScale;
+
+    // Smallest node in subtree is at MaxDepth — if it wouldn't merge, nothing deeper will merge  
+    double SmallestExtent = Node->Extent / FMath::Pow(2.0, (double)(Node->DepthBounds[1] - Node->Index.Depth));
+    double AngularSizeSmallest = (2.0 * SmallestExtent / Distance) * FOVScale;
+
+    bool SubtreeCouldSplit = AngularSizeThisNode > InScreenSpaceThreshold;
+    bool SubtreeCouldMerge = AngularSizeSmallest < InScreenSpaceThreshold * 0.5;
+
+    if (!SubtreeCouldSplit && !SubtreeCouldMerge)
     {
-        for (int i = 0; i < 8; i++)
-            UpdateLodRecursive(Node->Children[i], CameraPosition, InScreenSpaceThreshold, InCameraFOV, OutNodeEdges, EdgeMap, OutChanged);
+        return;
     }
+
+    // Subtree could change — recurse normally
+    for (int i = 0; i < 8; i++)
+        if (Node->Children[i])
+            UpdateLodRecursive(Node->Children[i], CameraPosition, InScreenSpaceThreshold, InCameraFOV, OutNodeEdges, EdgeMap, OutChanged);
 }
 
 void FAdaptiveOctree::UpdateLOD(FVector CameraPosition, double InScreenSpaceThreshold, double InCameraFOV)
