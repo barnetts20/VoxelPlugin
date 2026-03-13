@@ -125,15 +125,18 @@ void AAdaptiveVoxelActor::RunDataUpdateTask()
             AAdaptiveVoxelActor* Self = WeakThis.Get();
             if (!Self || Self->IsDestroyed) return;
 
+            double t0 = FPlatformTime::Seconds();
             {
-                FRWScopeLock WriteLock(Self->OctreeLock, SLT_Write);
+                FRWScopeLock ReadLock(Self->OctreeLock, SLT_Write);
                 FVector CurrentCamPos = Self->CameraPosition;
                 FVector Velocity = (CurrentCamPos - Self->LastLodUpdatePosition);
                 FVector PredictedPos = CurrentCamPos + (Velocity * Self->VelocityLookAheadFactor);
                 Self->AdaptiveOctree->UpdateLOD(PredictedPos, Self->ScreenSpaceThreshold, Self->CameraFOV);
                 Self->LastLodUpdatePosition = Self->CameraPosition;
             }
-
+            double elapsed = (FPlatformTime::Seconds() - t0) * 1000.0;
+            if (elapsed > 100.0)
+                UE_LOG(LogTemp, Log, TEXT("[Pipeline] DataUpdate (UpdateLOD): %.2fms"), elapsed);
             Self->DataUpdateIsRunning = false;
 
         }, TStatId(), nullptr, ENamedThreads::AnyNormalThreadHiPriTask);
@@ -150,12 +153,15 @@ void AAdaptiveVoxelActor::RunMeshUpdateTask()
         {
             AAdaptiveVoxelActor* Self = WeakThis.Get();
             if (!Self || Self->IsDestroyed) return;
-
+            double t0 = FPlatformTime::Seconds();
             {
                 FRWScopeLock ReadLock(Self->OctreeLock, SLT_ReadOnly);
                 Self->AdaptiveOctree->UpdateMesh();
             }
 
+            double elapsed = (FPlatformTime::Seconds() - t0) * 1000.0;
+            if (elapsed > 100.0)
+                UE_LOG(LogTemp, Log, TEXT("[Pipeline] MeshUpdate (UpdateMesh): %.2fms"), elapsed);
             Self->MeshUpdateIsRunning = false;
 
         }, TStatId(), nullptr, ENamedThreads::AnyBackgroundHiPriTask);

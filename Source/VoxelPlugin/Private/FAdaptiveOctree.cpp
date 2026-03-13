@@ -24,7 +24,7 @@ void FAdaptiveOctree::SplitToDepth(TSharedPtr<FAdaptiveOctreeNode> Node, int InM
 
     if (Node->Index.Depth < InMinDepth)
     {
-        Node->Split();
+        SplitAndComputeChildren(Node);// ->Split();
         for (int i = 0; i < 8; i++)
         {
             if (Node->Children[i])
@@ -556,7 +556,7 @@ void FAdaptiveOctree::UpdateLodRecursive(TSharedPtr<FAdaptiveOctreeNode> Node, F
         if (Node->ShouldSplit(CameraPosition, InScreenSpaceThreshold, InCameraFOV))
         {
             OutChanged = true;
-            Node->Split();
+            SplitAndComputeChildren(Node);// ->Split();
             for (int i = 0; i < 8; i++)
             {
                 ComputeNodeData(Node->Children[i]);
@@ -596,6 +596,8 @@ void FAdaptiveOctree::UpdateLOD(FVector CameraPosition, double InScreenSpaceThre
     TArray<TSharedPtr<FMeshChunk>> ModifiedChunks;
     ModifiedChunks.SetNumZeroed(NumChunks);
 
+    double t0 = FPlatformTime::Seconds();
+
     ParallelFor(Chunks.Num(), [&](int32 idx)
         {
             TArray<FNodeEdge> tChunkEdges;
@@ -609,12 +611,24 @@ void FAdaptiveOctree::UpdateLOD(FVector CameraPosition, double InScreenSpaceThre
             }
         });
 
+    double t1 = FPlatformTime::Seconds();
+
+    int32 NumModified = 0;
     ParallelFor(NumChunks, [&](int32 i)
         {
             if (ModifiedChunks[i].IsValid()) {
                 UpdateMeshChunkStreamData(ModifiedChunks[i]);
+                FPlatformAtomics::InterlockedIncrement(&NumModified);
             }
         });
+
+    double t2 = FPlatformTime::Seconds();
+
+    if ((t2 - t0) * 1000.0 > 100.0) // only log if anything interesting happened
+    {
+        UE_LOG(LogTemp, Log, TEXT("[LOD] LODPass+EdgeBuild: %.2fms | StreamBuild: %.2fms | ModifiedChunks: %d / %d"),
+            (t1 - t0) * 1000.0, (t2 - t1) * 1000.0, NumModified, NumChunks);
+    }
 }
 
 void FAdaptiveOctree::UpdateMesh()
@@ -647,6 +661,112 @@ void FAdaptiveOctree::GatherLeafEdges(TSharedPtr<FAdaptiveOctreeNode> Node, TArr
 
     for (int i = 0; i < 8; i++)
         GatherLeafEdges(Node->Children[i], OutEdges);
+}
+
+void FAdaptiveOctree::SplitAndComputeChildren(TSharedPtr<FAdaptiveOctreeNode> Node)
+{
+    // Verified lookup table: ChildCornerSources[childIdx][cornerIdx] = G index (0-26)
+    static const int32 ChildCornerSources[8][8] = {
+        {  0,  8, 12, 24, 16, 22, 20, 26 }, // child 0: octant (-1,-1,-1)
+        {  8,  1, 24, 13, 22, 17, 26, 21 }, // child 1: octant (+1,-1,-1)
+        { 12, 24,  2,  9, 20, 26, 18, 23 }, // child 2: octant (-1,+1,-1)
+        { 24, 13,  9,  3, 26, 21, 23, 19 }, // child 3: octant (+1,+1,-1)
+        { 16, 22, 20, 26,  4, 10, 14, 25 }, // child 4: octant (-1,-1,+1)
+        { 22, 17, 26, 21, 10,  5, 25, 15 }, // child 5: octant (+1,-1,+1)
+        { 20, 26, 18, 23, 14, 25,  6, 11 }, // child 6: octant (-1,+1,+1)
+        { 26, 21, 23, 19, 25, 15, 11,  7 }, // child 7: octant (+1,+1,+1)
+    };
+
+    Node->Split();
+
+    // Build the 27-point grid positions
+    FVector GridPositions[27];
+    double  GridDensities[27];
+
+    // G0-G7: parent corners, positions and densities already known
+    for (int i = 0; i < 8; i++)
+    {
+        GridPositions[i] = Node->Corners[i].Position;
+        GridDensities[i] = Node->Corners[i].Density;
+    }
+
+    // G8-G19: edge midpoints
+    for (int i = 0; i < 12; i++)
+    {
+        int a = OctreeConstants::EdgePairs[i][0];
+        int b = OctreeConstants::EdgePairs[i][1];
+        GridPositions[8 + i] = (Node->Corners[a].Position + Node->Corners[b].Position) * 0.5;
+    }
+
+    // G20-G25: face centers
+    // Faces defined by which axis is fixed and which sign
+    // -X(0): corners 0,2,4,6   +X(1): corners 1,3,5,7
+    // -Y(2): corners 0,1,4,5   +Y(3): corners 2,3,6,7
+    // -Z(4): corners 0,1,2,3   +Z(5): corners 4,5,6,7
+    static const int32 FaceCorners[6][4] = {
+        { 0, 2, 4, 6 }, // G20: -X face
+        { 1, 3, 5, 7 }, // G21: +X face
+        { 0, 1, 4, 5 }, // G22: -Y face
+        { 2, 3, 6, 7 }, // G23: +Y face
+        { 0, 1, 2, 3 }, // G24: -Z face
+        { 4, 5, 6, 7 }, // G25: +Z face
+    };
+    for (int i = 0; i < 6; i++)
+    {
+        GridPositions[20 + i] = (
+            Node->Corners[FaceCorners[i][0]].Position +
+            Node->Corners[FaceCorners[i][1]].Position +
+            Node->Corners[FaceCorners[i][2]].Position +
+            Node->Corners[FaceCorners[i][3]].Position) * 0.25;
+    }
+
+    // G26: body center
+    GridPositions[26] = Node->Center;
+
+    // Sample only the 19 new points (G8-G26)
+    const int32 NewCount = 19;
+    TArray<float> XPos, YPos, ZPos, NoiseOut;
+    XPos.SetNumUninitialized(NewCount);
+    YPos.SetNumUninitialized(NewCount);
+    ZPos.SetNumUninitialized(NewCount);
+    NoiseOut.SetNumUninitialized(NewCount);
+
+    double NoiseScale = RootExtent * 0.1;
+    FVector PlanetCenter = Root->Center;
+
+    for (int32 i = 0; i < NewCount; i++)
+    {
+        FVector PlanetRel = GridPositions[8 + i] - PlanetCenter;
+        double Dist = PlanetRel.Size();
+        FVector Dir = (Dist > 1e-10) ? (PlanetRel / Dist) : FVector::UpVector;
+        FVector SurfacePos = Dir * RootExtent;
+        XPos[i] = (float)(SurfacePos.X / NoiseScale);
+        YPos[i] = (float)(SurfacePos.Y / NoiseScale);
+        ZPos[i] = (float)(SurfacePos.Z / NoiseScale);
+    }
+
+    DensityFunction(NewCount, XPos.GetData(), YPos.GetData(), ZPos.GetData(), NoiseOut.GetData());
+
+    for (int32 i = 0; i < NewCount; i++)
+    {
+        double Height = (double)NoiseOut[i] * NoiseScale;
+        FVector PlanetRel = GridPositions[8 + i] - PlanetCenter;
+        double Dist = PlanetRel.Size();
+        GridDensities[8 + i] = Dist - (RootExtent * 0.9 + Height) + EditStore->Sample(GridPositions[8 + i]);
+    }
+
+    // Assign corners to children from the grid, then finalize
+    for (int ci = 0; ci < 8; ci++)
+    {
+        for (int k = 0; k < 8; k++)
+        {
+            int32 gi = ChildCornerSources[ci][k];
+            Node->Children[ci]->Corners[k].Position = GridPositions[gi];
+            Node->Children[ci]->Corners[k].Density = GridDensities[gi];
+        }
+        Node->Children[ci]->FinalizeFromExistingCorners();
+        Node->Children[ci]->ComputeNormalizedPosition(Root->Extent * 0.9);
+    }
 }
 
 void FAdaptiveOctree::ComputeNodeData(TSharedPtr<FAdaptiveOctreeNode> Node)

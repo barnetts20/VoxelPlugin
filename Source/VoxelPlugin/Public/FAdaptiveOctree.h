@@ -72,6 +72,8 @@ private:
 
     void GatherLeafEdges(TSharedPtr<FAdaptiveOctreeNode> Node, TArray<FNodeEdge>& OutEdges);
 
+    void SplitAndComputeChildren(TSharedPtr<FAdaptiveOctreeNode> Node);
+
     void ComputeNodeData(TSharedPtr<FAdaptiveOctreeNode> Node);
 
 public:
