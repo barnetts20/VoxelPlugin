@@ -60,112 +60,32 @@ struct VOXELPLUGIN_API FNodeCorner {
     FNodeCorner(FVector InPos, double InDensity, FVector InNormal) : Position(InPos), Density(InDensity), Normal(InNormal) {}
 };
 
-struct VOXELPLUGIN_API FNodeEdge
-{
-    FNodeCorner Corners[2]; //could store indices 1 uint8 instead of FVector + FVector3f + float... although we pass it around, so that might require other changes
-    double Size;         //size and distance might be the same
-    bool SignChange;
-    double Distance;
-    FVector EdgeDirection; //dont need full fvector for direction, use lighter type
-    int Axis;  //uint8
-    FVector ZeroCrossingPoint;
-
-    // Constructor
-    FNodeEdge() : Size(0), SignChange(false), Distance(0), Axis(0) {}
-
-    FNodeEdge(FNodeCorner InCorner1, FNodeCorner InCorner2)
-    {
-        Corners[0] = InCorner1;
-        Corners[1] = InCorner2;
-
-        double d1 = InCorner1.Density;
-        double d2 = InCorner2.Density;
-
-        SignChange = (d1 < 0) != (d2 < 0);
-
-        // Determine which corner is positive and which is negative
-        FNodeCorner PosCorner = (d1 > d2) ? InCorner1 : InCorner2;
-        FNodeCorner NegCorner = (d1 > d2) ? InCorner2 : InCorner1;
-
-        Size = FVector::Dist(InCorner1.Position, InCorner2.Position);
-        Distance = Size;
-
-        // Compute edge direction: Always point from positive to negative
-        EdgeDirection = (NegCorner.Position - PosCorner.Position).GetSafeNormal();
-
-        // Safe axis detection: find the axis with the largest delta
-        // This is immune to floating point noise at large coordinates
-        FVector Delta = (InCorner2.Position - InCorner1.Position).GetAbs();
-        if (Delta.X > Delta.Y && Delta.X > Delta.Z)
-            Axis = 0;
-        else if (Delta.Y > Delta.X && Delta.Y > Delta.Z)
-            Axis = 1;
-        else
-            Axis = 2;
-
-        if (SignChange) {
-            // Stable zero-crossing interpolation
-            // t = d1 / (d1 - d2) gives the parametric position along the edge
-            // where the sign change occurs. Clamp to [0,1] for safety.
-            double Denominator = d1 - d2;
-            if (FMath::Abs(Denominator) < 1e-12) {
-                // Both densities essentially equal ? place at midpoint
-                ZeroCrossingPoint = (InCorner1.Position + InCorner2.Position) * 0.5;
-            }
-            else {
-                double t = d1 / Denominator;
-                t = FMath::Clamp(t, 0.0, 1.0);
-                ZeroCrossingPoint = InCorner1.Position + t * (InCorner2.Position - InCorner1.Position);
-            }
-        }
-        else {
-            ZeroCrossingPoint = (InCorner1.Position + InCorner2.Position) * 0.5;
-        }
-    }
-
-    bool IsCongruent(const FNodeEdge& Other) const {
-        // Both corners must match (in either order) AND axis must match
-        bool CornersMatch =
-            (Corners[0].Position.Equals(Other.Corners[0].Position, .01)
-                && Corners[1].Position.Equals(Other.Corners[1].Position, .01))
-            || (Corners[0].Position.Equals(Other.Corners[1].Position, .01)
-                && Corners[1].Position.Equals(Other.Corners[0].Position, .01));
-
-        return CornersMatch && Axis == Other.Axis;
-    }
-
-    // Equality operator for ensuring uniqueness
-    bool operator==(const FNodeEdge& Other) const
-    {
-        return IsCongruent(Other) && Other.EdgeDirection == EdgeDirection;
-    }
-};
-
-//do we still need this?
 struct VOXELPLUGIN_API FEdgeKey
 {
-    int64 X0, Y0, Z0;  // Quantized corner 0 (sorted so min corner is always first)
-    int64 X1, Y1, Z1;  // Quantized corner 1
-    int32 Axis;
+    int32 X0, Y0, Z0;  // Quantized corner 0 (canonically ordered: min corner first)
+    int32 X1, Y1, Z1;  // Quantized corner 1
+    uint8 Axis;
+    uint32 CachedHash;  // Precomputed hash for TMap lookups
 
-    // Quantization grid ? 0.001 is well within the 0.01 epsilon used in IsCongruent
-    static constexpr double GridSize = 0.001;
+    // Grid size 1.0: at max world size 1e8, fits int32 (±2.1e9).
+    // Smallest edge at depth 18 spans ~762 units, so grid 1.0 uniquely identifies all corners.
+    static constexpr double InvGridSize = 1.0;  // multiply instead of divide
 
-    static int64 Quantize(double V)
+    static int32 Quantize(double V)
     {
-        return FMath::RoundToInt64(V / GridSize);
+        return FMath::RoundToInt32(V * InvGridSize);
     }
 
-    FEdgeKey() = default;
+    FEdgeKey() : X0(0), Y0(0), Z0(0), X1(0), Y1(0), Z1(0), Axis(0), CachedHash(0) {}
 
-    FEdgeKey(const FNodeEdge& Edge)
+    void BuildFromCorners(const FVector& PosA, const FVector& PosB, uint8 InAxis)
     {
-        int64 ax = Quantize(Edge.Corners[0].Position.X);
-        int64 ay = Quantize(Edge.Corners[0].Position.Y);
-        int64 az = Quantize(Edge.Corners[0].Position.Z);
-        int64 bx = Quantize(Edge.Corners[1].Position.X);
-        int64 by = Quantize(Edge.Corners[1].Position.Y);
-        int64 bz = Quantize(Edge.Corners[1].Position.Z);
+        int32 ax = Quantize(PosA.X);
+        int32 ay = Quantize(PosA.Y);
+        int32 az = Quantize(PosA.Z);
+        int32 bx = Quantize(PosB.X);
+        int32 by = Quantize(PosB.Y);
+        int32 bz = Quantize(PosB.Z);
 
         // Canonical ordering: ensure (corner0 < corner1) so order doesn't matter
         if (ax < bx || (ax == bx && ay < by) || (ax == bx && ay == by && az < bz))
@@ -179,7 +99,17 @@ struct VOXELPLUGIN_API FEdgeKey
             X1 = ax; Y1 = ay; Z1 = az;
         }
 
-        Axis = Edge.Axis;
+        Axis = InAxis;
+
+        // Precompute hash
+        uint32 Hash = ::GetTypeHash(X0);
+        Hash = HashCombine(Hash, ::GetTypeHash(Y0));
+        Hash = HashCombine(Hash, ::GetTypeHash(Z0));
+        Hash = HashCombine(Hash, ::GetTypeHash(X1));
+        Hash = HashCombine(Hash, ::GetTypeHash(Y1));
+        Hash = HashCombine(Hash, ::GetTypeHash(Z1));
+        Hash = HashCombine(Hash, ::GetTypeHash((int32)Axis));
+        CachedHash = Hash;
     }
 
     bool operator==(const FEdgeKey& Other) const
@@ -187,6 +117,59 @@ struct VOXELPLUGIN_API FEdgeKey
         return X0 == Other.X0 && Y0 == Other.Y0 && Z0 == Other.Z0
             && X1 == Other.X1 && Y1 == Other.Y1 && Z1 == Other.Z1
             && Axis == Other.Axis;
+    }
+};
+
+struct VOXELPLUGIN_API FNodeEdge
+{
+    FNodeCorner Corners[2];
+    double Size;
+    bool SignChange;
+    uint8 Axis;
+    FVector ZeroCrossingPoint;
+    FEdgeKey CachedKey; // Precomputed at construction, avoids recomputation in hot dedup paths
+
+    FNodeEdge() : Size(0), SignChange(false), Axis(0) {}
+
+    FNodeEdge(FNodeCorner InCorner1, FNodeCorner InCorner2)
+    {
+        Corners[0] = InCorner1;
+        Corners[1] = InCorner2;
+
+        double d1 = InCorner1.Density;
+        double d2 = InCorner2.Density;
+
+        SignChange = (d1 < 0) != (d2 < 0);
+
+        Size = FVector::Dist(InCorner1.Position, InCorner2.Position);
+
+        // Safe axis detection: find the axis with the largest delta
+        // This is immune to floating point noise at large coordinates
+        FVector Delta = (InCorner2.Position - InCorner1.Position).GetAbs();
+        if (Delta.X > Delta.Y && Delta.X > Delta.Z)
+            Axis = 0;
+        else if (Delta.Y > Delta.X && Delta.Y > Delta.Z)
+            Axis = 1;
+        else
+            Axis = 2;
+
+        if (SignChange) {
+            double Denominator = d1 - d2;
+            if (FMath::Abs(Denominator) < 1e-12) {
+                ZeroCrossingPoint = (InCorner1.Position + InCorner2.Position) * 0.5;
+            }
+            else {
+                double t = d1 / Denominator;
+                t = FMath::Clamp(t, 0.0, 1.0);
+                ZeroCrossingPoint = InCorner1.Position + t * (InCorner2.Position - InCorner1.Position);
+            }
+        }
+        else {
+            ZeroCrossingPoint = (InCorner1.Position + InCorner2.Position) * 0.5;
+        }
+
+        // Precompute the edge key for deduplication
+        CachedKey.BuildFromCorners(InCorner1.Position, InCorner2.Position, Axis);
     }
 };
 
@@ -281,10 +264,10 @@ struct VOXELPLUGIN_API FQEF
     // Number of planes added
     int32 PlaneCount;
 
-    // Mass point (average of intersection points ? used as fallback and bias)
+    // Mass point (average of intersection points used as fallback and bias)
     FVector MassPoint;
 
-    // Accumulated normal (sum of normals passed to AddPlane ? for average normal output)
+    // Accumulated normal (sum of normals passed to AddPlane for average normal output)
     FVector AccumulatedNormal;
 
     FQEF()
@@ -469,7 +452,7 @@ private:
         double maxEigen = FMath::Max3(FMath::Abs(eigenvalues[0]),
             FMath::Abs(eigenvalues[1]),
             FMath::Abs(eigenvalues[2]));
-        double threshold = maxEigen * 0.1; // 10% threshold ? fairly aggressive clamping
+        double threshold = maxEigen * 0.1; // 10% threshold fairly aggressive clamping
 
         // V^T * rhs
         double vtRhs[3];
@@ -485,7 +468,7 @@ private:
             if (FMath::Abs(eigenvalues[i]) > threshold)
                 scaled[i] = vtRhs[i] / eigenvalues[i];
             else
-                scaled[i] = 0.0; // Singular direction ? collapse to mass point
+                scaled[i] = 0.0; // Singular direction collapse to mass point
         }
 
         // V * scaled
@@ -613,12 +596,5 @@ struct FEdgeNeighbors {
 
 FORCEINLINE uint32 GetTypeHash(const FEdgeKey& Key)
 {
-    uint32 Hash = GetTypeHash(Key.X0);
-    Hash = HashCombine(Hash, GetTypeHash(Key.Y0));
-    Hash = HashCombine(Hash, GetTypeHash(Key.Z0));
-    Hash = HashCombine(Hash, GetTypeHash(Key.X1));
-    Hash = HashCombine(Hash, GetTypeHash(Key.Y1));
-    Hash = HashCombine(Hash, GetTypeHash(Key.Z1));
-    Hash = HashCombine(Hash, GetTypeHash(Key.Axis));
-    return Hash;
+    return Key.CachedHash;
 }

@@ -556,13 +556,12 @@ void AppendUniqueEdges(const TArray<FNodeEdge>& InAppendEdges, TArray<FNodeEdge>
 {
     for (const FNodeEdge& anEdge : InAppendEdges)
     {
-        FEdgeKey Key(anEdge);
+        const FEdgeKey& Key = anEdge.CachedKey;
         int32* ExistingIdx = EdgeMap.Find(Key);
 
         if (ExistingIdx)
         {
-            // Keep the one with the smaller Distance (same logic as before)
-            if (anEdge.Distance < OutNodeEdges[*ExistingIdx].Distance)
+            if (anEdge.Size < OutNodeEdges[*ExistingIdx].Size)
             {
                 OutNodeEdges[*ExistingIdx] = anEdge;
             }
