@@ -66,7 +66,7 @@ void AAdaptiveVoxelActor::Initialize()
 
     auto DensityFunction = [this](int Count, const float* XPos, const float* YPos, const float* ZPos, float* OutNoise) {
         Noise->GenPositionArray3D(OutNoise, Count, XPos, YPos, ZPos, 0, 0, 0, 0);
-        };
+    };
 
     TSharedPtr<FSparseEditStore> EditStore = MakeShared<FSparseEditStore>(GetActorLocation(), Size, ChunkDepth, MaxDepth);
     AdaptiveOctree = MakeShared<FAdaptiveOctree>(this, SurfaceMaterial, OceanMaterial, DensityFunction, EditStore, GetActorLocation(), Size, ChunkDepth, MinDepth, MaxDepth);

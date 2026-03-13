@@ -269,27 +269,27 @@ void FAdaptiveOctree::ReconstructSubtree(TSharedPtr<FAdaptiveOctreeNode> Node, F
     double NoiseScale = RootExtent * 0.1;
     FVector PlanetCenter = Root->Center;
 
-    for (int32 i = 0; i < Count; i++)
+    ParallelFor(Count, [&](int32 i)
     {
         FVector PlanetRel = Samples[i].Position - PlanetCenter;
         Samples[i].Dist = PlanetRel.Size();
-        FVector Dir = PlanetRel / Samples[i].Dist; // Cheaper than GetSafeNormal since we already have Size
+        FVector Dir = PlanetRel / Samples[i].Dist;
         FVector SurfacePos = Dir * RootExtent;
         XPos[i] = (float)(SurfacePos.X / NoiseScale);
         YPos[i] = (float)(SurfacePos.Y / NoiseScale);
         ZPos[i] = (float)(SurfacePos.Z / NoiseScale);
-    }
+    });
 
     // 3. One bulk noise call
     DensityFunction(Count, XPos.GetData(), YPos.GetData(), ZPos.GetData(), NoiseOut.GetData());
 
     // 4. SDF + edits -- uses pre-computed distances
-    for (int32 i = 0; i < Count; i++)
+    ParallelFor(Count, [&](int32 i)
     {
         double Height = (double)NoiseOut[i] * NoiseScale;
         double EditDensity = EditStore->Sample(Samples[i].Position);
         Samples[i].Density = Samples[i].Dist - (RootExtent * 0.9 + Height) + EditDensity;
-    }
+    });
 
     // 5. Write back densities to all nodes that share each corner
     for (int32 i = 0; i < Count; i++)
