@@ -31,7 +31,7 @@ private:
     TWeakObjectPtr<ARealtimeMeshActor> CachedParentActor;
 
     TWeakObjectPtr<UMaterialInterface> CachedSurfaceMaterial;
-    
+
     TWeakObjectPtr<UMaterialInterface> CachedOceanMaterial;
 
     TMap<TSharedPtr<FAdaptiveOctreeNode>, TSharedPtr<FMeshChunk>> ChunkMap;
@@ -44,52 +44,48 @@ private:
 
     int ChunkDepth;
 
-    void SplitToDepth(TSharedPtr<FAdaptiveOctreeNode> Node, int InMinDepth);
+    void SplitToDepth(FAdaptiveOctreeNode* Node, int InMinDepth);
 
     void PopulateChunks();
 
     void UpdateChunkMap(TSharedPtr<FAdaptiveOctreeNode> ChunkNode, TArray<TPair<TSharedPtr<FAdaptiveOctreeNode>, TSharedPtr<FMeshChunk>>>& OutDirtyChunks);
 
-    void ProcessChunkData(TSharedPtr<FAdaptiveOctreeNode> ChunkNode);
-
-    void FinalizeSubtree(TSharedPtr<FAdaptiveOctreeNode> Node, FVector EditCenter, double SearchRadius);
+    void FinalizeSubtree(FAdaptiveOctreeNode* Node, FVector EditCenter, double SearchRadius);
 
     void ComputeNormalsFromMap(TArray<FCornerSample>& Samples, const TMap<FIntVector, int32>& CornerMap, FVector PlanetCenter);
 
-    void ReconstructSubtree(TSharedPtr<FAdaptiveOctreeNode> Node, FVector EditCenter, double SearchRadius);
+    void ReconstructSubtree(FAdaptiveOctreeNode* Node, FVector EditCenter, double SearchRadius);
 
     void UpdateMeshChunkStreamData(TSharedPtr<FMeshChunk> InChunk);
 
     static FVector QuantizePosition(const FVector& P, double GridSize = 1.0);
-    
+
     static FVector2f ComputeTriplanarUV(FVector Position, FVector Normal);
 
-    TArray<TSharedPtr<FAdaptiveOctreeNode>> SampleNodesAroundEdge(const FNodeEdge& Edge);
+    FEdgeNeighbors SampleNodesAroundEdge(const FNodeEdge& Edge);
 
-    TSharedPtr<FAdaptiveOctreeNode> GetLeafNodeByPoint(FVector Position);
+    FAdaptiveOctreeNode* GetLeafNodeByPoint(FVector Position);
 
-    TSharedPtr<FAdaptiveOctreeNode> GetChunkNodeByPoint(FVector Position);
+    FAdaptiveOctreeNode* GetChunkNodeByPoint(FVector Position);
 
-    //void GatherLeafEdges(TSharedPtr<FAdaptiveOctreeNode> Node, TArray<FNodeEdge>& OutEdges);
+    void SplitAndComputeChildren(FAdaptiveOctreeNode* Node);
 
-    void SplitAndComputeChildren(TSharedPtr<FAdaptiveOctreeNode> Node);
-
-    void ComputeNodeData(TSharedPtr<FAdaptiveOctreeNode> Node);
+    void ComputeNodeData(FAdaptiveOctreeNode* Node);
 
 public:
     FAdaptiveOctree(ARealtimeMeshActor* InParentActor, UMaterialInterface* InSurfaceMaterial, UMaterialInterface* InOceanMaterial, TFunction<void(int, const float*, const float*, const float*, float*)> InDensityFunction, TSharedPtr<FSparseEditStore> InEditStore, FVector InCenter, double InRootExtent, int InChunkDepth, int InMinDepth, int InMaxDepth);
 
     void ApplyEdit(FVector InEditCenter, double InEditRadius, double InEditStrength, int InEditResolution);
 
-    void GatherUniqueCorners(TSharedPtr<FAdaptiveOctreeNode> Node, TArray<FCornerSample>& Samples, TMap<FIntVector, int32>& CornerMap, double QuantizeGrid, FVector EditCenter, double SearchRadius);
+    void GatherUniqueCorners(FAdaptiveOctreeNode* Node, TArray<FCornerSample>& Samples, TMap<FIntVector, int32>& CornerMap, double QuantizeGrid, FVector EditCenter, double SearchRadius);
 
-    void UpdateLodRecursive(TSharedPtr<FAdaptiveOctreeNode> Node, FVector CameraPosition, double InScreenSpaceThreshold, double InFOVScale, TArray<FNodeEdge>& OutNodeEdges, TMap<FEdgeKey, int32>& EdgeMap, bool& OutChanged);
+    void UpdateLodRecursive(FAdaptiveOctreeNode* Node, FVector CameraPosition, double InScreenSpaceThreshold, double InFOVScale, TArray<FNodeEdge>& OutNodeEdges, TMap<FEdgeKey, int32>& EdgeMap, bool& OutChanged);
 
     void UpdateLOD(FVector InCameraPosition, double InScreenSpaceThreshold, double InCameraFOV);
 
     void UpdateMesh();
 
     void Clear();
-    void UpdateLodRecursive(TSharedPtr<FAdaptiveOctreeNode> Node, FVector CameraPosition, double InScreenSpaceThreshold, double InCameraFOV, bool& OutChanged);
-    void GatherLeafEdges(TSharedPtr<FAdaptiveOctreeNode> Node, TArray<FNodeEdge>& OutEdges, TMap<FEdgeKey, int32>& EdgeMap);
+
+    void GatherLeafEdges(FAdaptiveOctreeNode* Node, TArray<FNodeEdge>& OutEdges, TMap<FEdgeKey, int32>& EdgeMap);
 };

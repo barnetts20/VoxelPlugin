@@ -109,7 +109,7 @@ struct VOXELPLUGIN_API FNodeEdge
             // where the sign change occurs. Clamp to [0,1] for safety.
             double Denominator = d1 - d2;
             if (FMath::Abs(Denominator) < 1e-12) {
-                // Both densities essentially equal — place at midpoint
+                // Both densities essentially equal ? place at midpoint
                 ZeroCrossingPoint = (InCorner1.Position + InCorner2.Position) * 0.5;
             }
             else {
@@ -142,13 +142,13 @@ struct VOXELPLUGIN_API FNodeEdge
 };
 
 //do we still need this?
-struct VOXELPLUGIN_API FEdgeKey 
+struct VOXELPLUGIN_API FEdgeKey
 {
     int64 X0, Y0, Z0;  // Quantized corner 0 (sorted so min corner is always first)
     int64 X1, Y1, Z1;  // Quantized corner 1
     int32 Axis;
 
-    // Quantization grid — 0.001 is well within the 0.01 epsilon used in IsCongruent
+    // Quantization grid ? 0.001 is well within the 0.01 epsilon used in IsCongruent
     static constexpr double GridSize = 0.001;
 
     static int64 Quantize(double V)
@@ -281,10 +281,10 @@ struct VOXELPLUGIN_API FQEF
     // Number of planes added
     int32 PlaneCount;
 
-    // Mass point (average of intersection points — used as fallback and bias)
+    // Mass point (average of intersection points ? used as fallback and bias)
     FVector MassPoint;
 
-    // Accumulated normal (sum of normals passed to AddPlane — for average normal output)
+    // Accumulated normal (sum of normals passed to AddPlane ? for average normal output)
     FVector AccumulatedNormal;
 
     FQEF()
@@ -469,7 +469,7 @@ private:
         double maxEigen = FMath::Max3(FMath::Abs(eigenvalues[0]),
             FMath::Abs(eigenvalues[1]),
             FMath::Abs(eigenvalues[2]));
-        double threshold = maxEigen * 0.1; // 10% threshold — fairly aggressive clamping
+        double threshold = maxEigen * 0.1; // 10% threshold ? fairly aggressive clamping
 
         // V^T * rhs
         double vtRhs[3];
@@ -485,7 +485,7 @@ private:
             if (FMath::Abs(eigenvalues[i]) > threshold)
                 scaled[i] = vtRhs[i] / eigenvalues[i];
             else
-                scaled[i] = 0.0; // Singular direction — collapse to mass point
+                scaled[i] = 0.0; // Singular direction ? collapse to mass point
         }
 
         // V * scaled
@@ -510,26 +510,26 @@ private:
 
 struct VOXELPLUGIN_API FAdaptiveOctreeNode : public TSharedFromThis<FAdaptiveOctreeNode>
 {
-private:    
+private:
     void ComputeDualContourPosition();
-    
+
     FVector GetInterpolatedNormal(FVector P);
-    
+
     bool bIsLeaf = true;
-    
+
     int DepthPrecisionFloor = 20;
 
 public:
     FMortonIndex Index; //do we need full 128 bits here? so far we are around depth 18-20 or so....
-    
+
     TWeakPtr<FAdaptiveOctreeNode> Parent;
-    
+
     TSharedPtr<FAdaptiveOctreeNode> Children[8];
 
     FNodeCorner Corners[8];
-    
+
     TArray<FNodeEdge> SignChangeEdges;
-    
+
     int DepthBounds[3]; //short
 
     FVector Center;
@@ -537,23 +537,23 @@ public:
     FVector ChunkCenter;
 
     FVector TreeCenter;
-    
+
     double Extent;
-    
+
     FVector DualContourPosition;
-    
+
     FVector DualContourNormal; //FVector3f
-    
+
     FVector NormalizedPosition;
 
     bool IsSurfaceNode;
-    
+
     bool LodOverride = false;
 
     const bool IsLeaf();
 
     const bool IsRoot();
-    
+
     static bool EvaluateSplit(double Extent, double Distance, double FOVScale, double Threshold, int Depth, int MaxDepth, int MinDepth)
     {
         if (Depth >= MaxDepth) return false;
@@ -575,7 +575,7 @@ public:
     void Split();
 
     void Merge();
-    
+
     TArray<TSharedPtr<FAdaptiveOctreeNode>> GetSurfaceChunks();
 
     void ComputeNormalizedPosition(double InRadius);
@@ -589,6 +589,26 @@ public:
 
     // Child Constructor
     FAdaptiveOctreeNode(TSharedPtr<FAdaptiveOctreeNode> InParent, uint8 InChildIndex, FVector InAnchorCenter);
+};
+
+// Lightweight fixed-size result for SampleNodesAroundEdge — avoids TArray heap allocation
+// and TSharedPtr ref-count bumps in the hot mesh-building path.
+struct FEdgeNeighbors {
+    FAdaptiveOctreeNode* Nodes[4] = { nullptr, nullptr, nullptr, nullptr };
+    int32 Count = 0;
+
+    void AddUnique(FAdaptiveOctreeNode* Node)
+    {
+        if (!Node) return;
+        for (int32 i = 0; i < Count; i++)
+        {
+            if (Nodes[i] == Node) return;
+        }
+        if (Count < 4)
+        {
+            Nodes[Count++] = Node;
+        }
+    }
 };
 
 FORCEINLINE uint32 GetTypeHash(const FEdgeKey& Key)

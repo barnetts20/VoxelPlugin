@@ -83,32 +83,32 @@ struct VOXELPLUGIN_API FMeshStreamData {
 
 struct VOXELPLUGIN_API FMeshChunk {
     TWeakObjectPtr<ARealtimeMeshActor> CachedParentActor;
-    
+
     TWeakObjectPtr <UMaterialInterface> CachedSurfaceMaterial;
     TWeakObjectPtr <UMaterialInterface> CachedOceanMaterial;
-    
+
     //Data Model Info
     FVector ChunkCenter;
-    
+
     double ChunkExtent;
-    
+
     TArray<FNodeEdge> ChunkEdges;
-    
+
     TSharedPtr<FMeshStreamData> SurfaceMeshData;
 
     TSharedPtr<FMeshStreamData> OceanMeshData;
 
     //Mesh Stuff
     bool IsDirty = false;
-    
+
     bool IsInitialized = false;
-    
+
     TWeakObjectPtr<URealtimeMeshSimple> ChunkRtMesh;
-    
+
     TWeakObjectPtr<URealtimeMeshComponent> ChunkRtComponent;
 
     FRealtimeMeshLODKey LODKey = FRealtimeMeshLODKey::FRealtimeMeshLODKey(0);
-    
+
     FRealtimeMeshSectionConfig SecConfig = FRealtimeMeshSectionConfig(0);
 
     void InitializeData(FVector InCenter, double InExtent) {
@@ -139,7 +139,7 @@ struct VOXELPLUGIN_API FMeshChunk {
 
         ChunkRtComponent = NewObject<URealtimeMeshComponent>(InParentActor, URealtimeMeshComponent::StaticClass());
         ChunkRtComponent->RegisterComponent();
-        
+
         ChunkRtComponent->SetMaterial(0, InSurfaceMaterial);
         ChunkRtComponent->SetMaterial(1, InOceanMaterial);
 
@@ -157,20 +157,20 @@ struct VOXELPLUGIN_API FMeshChunk {
         IsInitialized = true;
     }
 
-    bool ShouldProcessEdge(const FNodeEdge& Edge, const TArray<TSharedPtr<FAdaptiveOctreeNode>>& SampledNodes) {
-        if (SampledNodes.Num() < 3) return false;
+    bool ShouldProcessEdge(const FNodeEdge& Edge, const FEdgeNeighbors& Neighbors) {
+        if (Neighbors.Count < 3) return false;
 
         double OwnerExtent = Edge.Size * 0.5;
-        for (auto& Node : SampledNodes)
+        for (int32 i = 0; i < Neighbors.Count; i++)
         {
-            if (Node->Extent < OwnerExtent * 0.9)
+            if (Neighbors.Nodes[i]->Extent < OwnerExtent * 0.9)
                 return false;
         }
         return true;
     }
 
     void UpdateComponent(TSharedPtr<FMeshChunk> Self) {
-        AsyncTask(ENamedThreads::GameThread, [Self]() {            
+        AsyncTask(ENamedThreads::GameThread, [Self]() {
             // 1. Lazy Init
             if (!Self->IsInitialized) {
                 ARealtimeMeshActor* Parent = Self->CachedParentActor.Get();
@@ -216,7 +216,7 @@ struct VOXELPLUGIN_API FMeshChunk {
             }
 
             Self->IsDirty = false;
-        });
+            });
     }
 };
 
