@@ -189,10 +189,12 @@ struct VOXELPLUGIN_API FMeshChunk {
             // 3. Surface update
             auto* SrfTriStream = Self->SurfaceMeshData->MeshStream.Find(FRealtimeMeshStreams::Triangles);
             int32 SrfNumTris = SrfTriStream ? SrfTriStream->Num() : 0;
-            if (SrfNumTris <= 0) {
+            if (SrfNumTris <= 0)
+            {
                 MeshPtr->UpdateSectionGroup(Self->SurfaceMeshData->MeshGroupKey, FRealtimeMeshStreamSet());
             }
-            else {
+            else
+            {
                 MeshPtr->UpdateSectionGroup(Self->SurfaceMeshData->MeshGroupKey, Self->SurfaceMeshData->MeshStream);
                 FRealtimeMeshSectionConfig SrfConfig(0); // material slot 0
                 MeshPtr->UpdateSectionConfig(Self->SurfaceMeshData->MeshSectionKey, SrfConfig, true);
@@ -201,13 +203,14 @@ struct VOXELPLUGIN_API FMeshChunk {
             // 4. Ocean update
             auto* OcnTriStream = Self->OceanMeshData->MeshStream.Find(FRealtimeMeshStreams::Triangles);
             int32 OcnNumTris = OcnTriStream ? OcnTriStream->Num() : 0;
-            if (OcnNumTris <= 0) {
+            if (OcnNumTris <= 0)
+            {
                 MeshPtr->UpdateSectionGroup(Self->OceanMeshData->MeshGroupKey, FRealtimeMeshStreamSet());
             }
-            else {
+            else
+            {
                 MeshPtr->UpdateSectionGroup(Self->OceanMeshData->MeshGroupKey, Self->OceanMeshData->MeshStream);
                 FRealtimeMeshSectionConfig OcnConfig(1); // material slot 1
-                OcnConfig.bIsVisible = true;
                 OcnConfig.bCastsShadow = false;
                 MeshPtr->UpdateSectionConfig(Self->OceanMeshData->MeshSectionKey, OcnConfig, false);
             }
