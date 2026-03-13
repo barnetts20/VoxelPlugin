@@ -52,7 +52,7 @@ struct VOXELPLUGIN_API OctreeConstants {
 
 struct VOXELPLUGIN_API FNodeCorner {
     FVector Position; //we arent deduplicating via position lookup anymore, rather we do so by construction 
-    double Density; //float
+    double Density; //float, shouldnt need double precision density, can change it all the way up and down the stack
     FVector Normal; //fvector3f
 
     FNodeCorner() : Position(0), Density(0), Normal(0, 0, 1) {}
