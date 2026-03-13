@@ -243,8 +243,7 @@ void FAdaptiveOctree::FinalizeSubtree(FAdaptiveOctreeNode* Node, FVector EditCen
     }
 
     // Then this node
-    Node->FinalizeFromExistingCorners();
-    Node->ComputeNormalizedPosition(Root->Extent * .9);
+    Node->FinalizeFromExistingCorners(Root->Center);
 }
 
 void FAdaptiveOctree::ReconstructSubtree(FAdaptiveOctreeNode* Node, FVector EditCenter, double SearchRadius)
@@ -365,17 +364,19 @@ void FAdaptiveOctree::UpdateMeshChunkStreamData(TSharedPtr<FMeshChunk> InChunk)
         AllEdgeData[edgeIdx].Vertices.SetNumZeroed(neighbors.Count);
 
         FVector PlanetCenter = Root->Center;
+        double NormRadius = Root->Extent * 0.9;
         for (int i = 0; i < neighbors.Count; i++) {
             FAdaptiveOctreeNode* NodePtr = neighbors.Nodes[i];
             FVector LocalPos(NodePtr->DualContourPosition - InChunk->ChunkCenter);
             FVector WorldPos = NodePtr->DualContourPosition;
-            FVector NormLocalPos = (NodePtr->NormalizedPosition) - InChunk->ChunkCenter;
+            FVector NormPos = NodePtr->ComputeNormalizedPosition(PlanetCenter, NormRadius);
+            FVector NormLocalPos = NormPos - InChunk->ChunkCenter;
             double Dist = FVector::Dist(WorldPos, PlanetCenter);
 
             AllEdgeData[edgeIdx].Vertices[i].Position = LocalPos;
             AllEdgeData[edgeIdx].Vertices[i].OriginalPosition = LocalPos;
             AllEdgeData[edgeIdx].Vertices[i].NormalizedPosition = NormLocalPos;
-            AllEdgeData[edgeIdx].Vertices[i].Normal = NodePtr->DualContourNormal;
+            AllEdgeData[edgeIdx].Vertices[i].Normal = FVector(NodePtr->DualContourNormal);
             AllEdgeData[edgeIdx].Vertices[i].Depth = (float)(OceanRadius - Dist);
             AllEdgeData[edgeIdx].Vertices[i].Color = FColor::Green;
         }
@@ -579,7 +580,7 @@ void FAdaptiveOctree::UpdateLodRecursive(FAdaptiveOctreeNode* Node, FVector Came
 {
     if (Node->IsLeaf())
     {
-        if (Node->ShouldSplit(CameraPosition, InScreenSpaceThreshold, InFOVScale))
+        if (Node->ShouldSplit(Root->Center, CameraPosition, InScreenSpaceThreshold, InFOVScale))
         {
             OutChanged = true;
             SplitAndComputeChildren(Node);
@@ -850,8 +851,7 @@ void FAdaptiveOctree::SplitAndComputeChildren(FAdaptiveOctreeNode* Node)
             Node->Children[ci]->Corners[k].Density = GridDensities[gi];
             Node->Children[ci]->Corners[k].Normal = GridNormals[gi];
         }
-        Node->Children[ci]->FinalizeFromExistingCorners(true); // normals already computed from grid
-        Node->Children[ci]->ComputeNormalizedPosition(Root->Extent * 0.9);
+        Node->Children[ci]->FinalizeFromExistingCorners(Root->Center, true); // normals already computed from grid
     }
 }
 
@@ -882,8 +882,7 @@ void FAdaptiveOctree::ComputeNodeData(FAdaptiveOctreeNode* Node)
         Node->Corners[i].Density = dists[i] - (RootExtent * 0.9 + height) + EditStore->Sample(Node->Corners[i].Position);
     }
 
-    Node->FinalizeFromExistingCorners();
-    Node->ComputeNormalizedPosition(Root->Extent * .9);
+    Node->FinalizeFromExistingCorners(Root->Center);
 }
 
 FEdgeNeighbors FAdaptiveOctree::SampleNodesAroundEdge(const FNodeEdge& Edge)
