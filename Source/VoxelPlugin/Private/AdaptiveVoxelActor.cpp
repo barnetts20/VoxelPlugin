@@ -62,55 +62,25 @@ void AAdaptiveVoxelActor::Initialize()
 {
     CleanSceneRoot();
 
-    // Spherenoise - Example SDF applies perlin noise to a sphere
-    //auto DensityFunction = [this](FVector Position, FVector AnchorCenter) -> double {
-    //    double NoiseScale = Size * 0.1;
-    //    float NoiseVal = FMath::PerlinNoise3D(Position/NoiseScale) * (float)(Size * 0.1);
-    //    FVector PlanetRelativeP = Position - GetActorLocation();
-    //    double RealDist = PlanetRelativeP.Size();
-
-    //    return RealDist - (Size * 0.9 + (double)NoiseVal);
-    //};
-
-    //Spherenoise 2 - Example SDF applies perline noise to a sphere as if it was a height map
-    //auto DensityFunction = [this](FVector Position, FVector AnchorCenter) -> double {
-    //    FVector PlanetRelative = Position - GetActorLocation();
-    //    double RealDist = PlanetRelative.Size();
-    //    FVector Direction = PlanetRelative.GetSafeNormal();
-
-    //    // Sample noise at the surface direction, not at the 3D position
-    //    FVector NoiseSamplePos = Direction * Size;
-    //    double NoiseScale = Size * 0.1;
-    //    float NoiseVal = FMath::PerlinNoise3D(NoiseSamplePos / NoiseScale) * (float)(Size * 0.1);
-
-    //    double SurfaceRadius = Size * 0.9 + (double)NoiseVal;
-    //    return RealDist - SurfaceRadius;
-    //};
     Noise = FastNoise::NewFromEncodedNodeTree("GQAgAB8AEwCamRk+DQAMAAAAAAAAQAcAAAAAAD8AAAAAAAAAAAA/AAAAAD8AAAAAvwAAAAA/ARsAFwCamRk+AAAAPwAAAAAAAAA/IAAgABMAAABAQBsAJAACAAAADQAIAAAAAAAAQAsAAQAAAAAAAAABAAAAAAAAAAAAAIA/AAAAAD8AAAAAAAAAAIA/AAAAAAAAmpmZPgCamRk+AM3MTD4BEwDNzEw+IAAfABcAAACAvwAAgD8AAIDAAAAAPw8AAQAAAAAAAED//wEAAAAAAD8AAAAAAAAAAIA/AAAAAD8AAACAvwAAAAA/");
-    //Fast Noise example
-    TFunction<void(int Count, const float* XPos, const float* YPos, const float* ZPos, float* OutNoise)> dfuncEx;
-
 
     auto DensityFunction = [this](int Count, const float* XPos, const float* YPos, const float* ZPos, float* OutNoise) {
         Noise->GenPositionArray3D(OutNoise, Count, XPos, YPos, ZPos, 0, 0, 0, 0);
-    };
+        };
 
-
-    // Store for user edits
     TSharedPtr<FSparseEditStore> EditStore = MakeShared<FSparseEditStore>(GetActorLocation(), Size, ChunkDepth, MaxDepth);
-    // Adaptive octree meshes the implicit structure
     AdaptiveOctree = MakeShared<FAdaptiveOctree>(this, SurfaceMaterial, OceanMaterial, DensityFunction, EditStore, GetActorLocation(), Size, ChunkDepth, MinDepth, MaxDepth);
 
     Initialized = true;
 
-    // Use Unreal's TimerManager to safely schedule repeating tasks
+    // Clear both timers — only DataUpdate timer is used now as the chain starter
     if (UWorld* World = GetWorld())
     {
         World->GetTimerManager().ClearTimer(DataUpdateTimerHandle);
         World->GetTimerManager().ClearTimer(MeshUpdateTimerHandle);
-        World->GetTimerManager().SetTimer(DataUpdateTimerHandle, this, &AAdaptiveVoxelActor::RunDataUpdateTask, MinDataUpdateInterval, true);
-        World->GetTimerManager().SetTimer(MeshUpdateTimerHandle, this, &AAdaptiveVoxelActor::RunMeshUpdateTask, MinMeshUpdateInterval, true);
     }
+
+    RunDataUpdateTask();
 }
 
 void AAdaptiveVoxelActor::RunDataUpdateTask()
@@ -127,7 +97,7 @@ void AAdaptiveVoxelActor::RunDataUpdateTask()
 
             double t0 = FPlatformTime::Seconds();
             {
-                FRWScopeLock ReadLock(Self->OctreeLock, SLT_Write);
+                FRWScopeLock WriteLock(Self->OctreeLock, SLT_Write);
                 FVector CurrentCamPos = Self->CameraPosition;
                 FVector Velocity = (CurrentCamPos - Self->LastLodUpdatePosition);
                 FVector PredictedPos = CurrentCamPos + (Velocity * Self->VelocityLookAheadFactor);
@@ -137,7 +107,9 @@ void AAdaptiveVoxelActor::RunDataUpdateTask()
             double elapsed = (FPlatformTime::Seconds() - t0) * 1000.0;
             if (elapsed > 100.0)
                 UE_LOG(LogTemp, Log, TEXT("[Pipeline] DataUpdate (UpdateLOD): %.2fms"), elapsed);
+
             Self->DataUpdateIsRunning = false;
+            Self->RunMeshUpdateTask();
 
         }, TStatId(), nullptr, ENamedThreads::AnyNormalThreadHiPriTask);
 }
@@ -153,18 +125,36 @@ void AAdaptiveVoxelActor::RunMeshUpdateTask()
         {
             AAdaptiveVoxelActor* Self = WeakThis.Get();
             if (!Self || Self->IsDestroyed) return;
+
             double t0 = FPlatformTime::Seconds();
             {
                 FRWScopeLock ReadLock(Self->OctreeLock, SLT_ReadOnly);
                 Self->AdaptiveOctree->UpdateMesh();
             }
-
             double elapsed = (FPlatformTime::Seconds() - t0) * 1000.0;
-            if (elapsed > 100.0)
+            if (elapsed > 10.0)
                 UE_LOG(LogTemp, Log, TEXT("[Pipeline] MeshUpdate (UpdateMesh): %.2fms"), elapsed);
+
             Self->MeshUpdateIsRunning = false;
 
-        }, TStatId(), nullptr, ENamedThreads::AnyBackgroundHiPriTask);
+            // Chain back to data update after a minimum interval delay
+            AsyncTask(ENamedThreads::GameThread, [WeakThis]()
+                {
+                    AAdaptiveVoxelActor* Self = WeakThis.Get();
+                    if (!Self || Self->IsDestroyed) return;
+                    if (UWorld* World = Self->GetWorld())
+                    {
+                        World->GetTimerManager().SetTimer(
+                            Self->DataUpdateTimerHandle,
+                            Self,
+                            &AAdaptiveVoxelActor::RunDataUpdateTask,
+                            Self->MinDataUpdateInterval,
+                            false
+                        );
+                    }
+                });
+
+        }, TStatId(), nullptr, ENamedThreads::AnyNormalThreadHiPriTask);
 }
 
 void AAdaptiveVoxelActor::RunEditUpdateTask(FVector InEditCenter, double InEditRadius, double InEditStrength, int InEditResolution)

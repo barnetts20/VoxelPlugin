@@ -561,9 +561,7 @@ void FAdaptiveOctree::UpdateLodRecursive(TSharedPtr<FAdaptiveOctreeNode> Node, F
             SplitAndComputeChildren(Node);
             return;
         }
-        else if (Node->Parent.IsValid() &&
-            Node->Parent.Pin()->ShouldMerge(CameraPosition, InScreenSpaceThreshold, InCameraFOV) &&
-            Node->Index.LastChild() == 7)
+        else if (Node->Parent.IsValid() && Node->Index.LastChild() == 7 && Node->Parent.Pin()->ShouldMerge(CameraPosition, InScreenSpaceThreshold, InCameraFOV))
         {
             OutChanged = true;
             Node->Parent.Pin()->Merge();
@@ -573,6 +571,7 @@ void FAdaptiveOctree::UpdateLodRecursive(TSharedPtr<FAdaptiveOctreeNode> Node, F
     }
 
     // Short circuit — nothing in this subtree can change
+    //TODO USE CONSISTENT LOD CALCULATION, THIS SHOULD REUSE SHOULD SPLIT SHOULD MERGE, WE CAN REFACTOR THEM TO TAKE RAW DIMESION DATA
     double Distance = FMath::Max(FVector::Dist(Node->Center, CameraPosition), 1.0);
     double FOVScale = 1.0 / FMath::Tan(FMath::DegreesToRadians(InCameraFOV * 0.5));
     double AngularSizeThisNode = (2.0 * Node->Extent / Distance) * FOVScale;
@@ -600,10 +599,11 @@ void FAdaptiveOctree::UpdateLOD(FVector CameraPosition, double InScreenSpaceThre
 
     double t0 = FPlatformTime::Seconds();
 
-    // Pass 1 — pure LOD traversal, no edge work
+
     ParallelFor(NumChunks, [&](int32 idx)
         {
             bool tChanged = false;
+            // Pass 1 — pure LOD traversal, no edge work
             UpdateLodRecursive(Chunks[idx], CameraPosition, InScreenSpaceThreshold, InCameraFOV, tChanged);
 
             if (!tChanged) return;
