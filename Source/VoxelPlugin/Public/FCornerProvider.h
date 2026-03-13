@@ -47,8 +47,8 @@ public:
 
     FVector Center;
     double RootExtent;
-    double SurfaceLevel;
-    double SeaLevel;
+    double SurfaceExtent;
+    double SeaExtent;
 
     TSharedPtr<FVoxelCorner> GetOrCreateCorner(FVector InPosition);
 
@@ -56,11 +56,13 @@ public:
 
     void SampleCorners(TArray<TSharedPtr<FVoxelCorner>>& InCorners);
 
-    void ProvisionCorners(TArray<TSharedPtr<FAdaptiveOctreeNode>> InNodes);
+    void ProvisionCorners(const TArray<TSharedPtr<FAdaptiveOctreeNode>>& InNodes);
 
-    void UpdateCorners(TArray<TSharedPtr<FAdaptiveOctreeNode>> InNodes);
+    void UpdateCorners(const TArray<TSharedPtr<FAdaptiveOctreeNode>>& InNodes);
 
-    void ApplyEdit(FVector InEditCenter, double InEditRadius, double InEditStrength, int InEditResolution);
+    void ApplyEdit(FVector InEditCenter, double InEditRadius, double InEditStrength, int InEditResolution, const TArray<TSharedPtr<FAdaptiveOctreeNode>>& InAffectedNodes);
+
+    void PruneExpiredCorners();
 
     FORCEINLINE double CompositeSample(const FVector& P, double RawNoise) const
     {
@@ -69,10 +71,24 @@ public:
         double dz = P.Z - Center.Z;
         double Dist = FMath::Sqrt(dx * dx + dy * dy + dz * dz);
 
-        const double NoiseAmplitude = SurfaceLevel * 0.0; // TODO: expose as property
-        return (Dist - SurfaceLevel) - (RawNoise * NoiseAmplitude) + EditStore->Sample(P);
+        const double NoiseAmplitude = SurfaceExtent * 0.05; // TODO: expose as property
+        return (Dist - SurfaceExtent) - (RawNoise * NoiseAmplitude) + EditStore->Sample(P);
     }
 
-	FCornerProvider();
-	~FCornerProvider();
+    FCornerProvider(
+        TSharedPtr<FSparseEditStore> InEditStore,
+        TFunction<void(int32, const float*, const float*, const float*, float*)> InNoiseFunction,
+        FVector InCenter,
+        double InRootExtent,
+        double InSeaLevel,
+        double InSurfaceLevel)
+        : EditStore(InEditStore)
+        , NoiseFunction(InNoiseFunction)
+        , Center(InCenter)
+        , RootExtent(InRootExtent)
+        , SeaExtent(InSeaLevel* InRootExtent)
+        , SurfaceExtent(InSurfaceLevel* InRootExtent)
+    {
+    }
+    ~FCornerProvider() = default;
 };

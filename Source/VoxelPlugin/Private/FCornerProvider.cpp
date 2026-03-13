@@ -11,8 +11,17 @@ TSharedPtr<FVoxelCorner> FCornerProvider::GetOrCreateCorner(FVector InPosition)
 
 TSharedPtr<FVoxelCorner> FCornerProvider::GetOrCreateCorner(FInt64Vector InKey)
 {
-    FWriteScopeLock WriteLock(CornerLock);
+    {
+        FReadScopeLock ReadLock(CornerLock);
+        TWeakPtr<FVoxelCorner>* Found = CornerLookup.Find(InKey);
+        if (Found)
+        {
+            TSharedPtr<FVoxelCorner> Pinned = Found->Pin();
+            if (Pinned.IsValid()) return Pinned;
+        }
+    }
 
+    FWriteScopeLock WriteLock(CornerLock);
     TWeakPtr<FVoxelCorner>* Found = CornerLookup.Find(InKey);
     if (Found)
     {
@@ -32,7 +41,7 @@ void FCornerProvider::SampleCorners(TArray<TSharedPtr<FVoxelCorner>>& InCorners)
     if (N == 0) return;
 
     const float Epsilon = 1.0f;
-    const float InvSurface = (float)(1.0 / SurfaceLevel);
+    const float InvSurface = (float)(1.0 / SurfaceExtent);
     int32 TotalCount = N * 7;
 
     TArray<float> X, Y, Z, NX, NY, NZ, OutDensities;
@@ -79,7 +88,7 @@ void FCornerProvider::SampleCorners(TArray<TSharedPtr<FVoxelCorner>>& InCorners)
         });
 }
 
-void FCornerProvider::ProvisionCorners(TArray<TSharedPtr<FAdaptiveOctreeNode>> InNodes)
+void FCornerProvider::ProvisionCorners(const TArray<TSharedPtr<FAdaptiveOctreeNode>>& InNodes)
 {
     // 1. Acquire corners for all nodes, collect unsampled ones
     TArray<TSharedPtr<FVoxelCorner>> NewCorners;
@@ -102,12 +111,12 @@ void FCornerProvider::ProvisionCorners(TArray<TSharedPtr<FAdaptiveOctreeNode>> I
     ParallelFor(InNodes.Num(), [&](int32 i)
         {
             InNodes[i]->ComputeDualContourPosition();
-            InNodes[i]->ComputeNormalizedPosition(SeaLevel);
+            InNodes[i]->ComputeNormalizedPosition(SeaExtent);
             InNodes[i]->bIsInitialized = true;
         });
 }
 
-void FCornerProvider::UpdateCorners(TArray<TSharedPtr<FAdaptiveOctreeNode>> InNodes)
+void FCornerProvider::UpdateCorners(const TArray<TSharedPtr<FAdaptiveOctreeNode>>& InNodes)
 {
     // Collect unique corners across all affected nodes
     TSet<TSharedPtr<FVoxelCorner>> UniqueCorners;
@@ -122,38 +131,20 @@ void FCornerProvider::UpdateCorners(TArray<TSharedPtr<FAdaptiveOctreeNode>> InNo
     ParallelFor(InNodes.Num(), [&](int32 i)
         {
             InNodes[i]->ComputeDualContourPosition();
-            InNodes[i]->ComputeNormalizedPosition(SeaLevel);
+            InNodes[i]->ComputeNormalizedPosition(SeaExtent);
         });
 }
 
-void FCornerProvider::ApplyEdit(FVector InEditCenter, double InEditRadius, double InEditStrength, int InEditResolution)
+void FCornerProvider::ApplyEdit(FVector InEditCenter, double InEditRadius, double InEditStrength, int InEditResolution, const TArray<TSharedPtr<FAdaptiveOctreeNode>>& InAffectedNodes)
 {
-    // 1. Write edit into sparse store
     int32 Depth = EditStore->GetDepthForBrushRadius(InEditRadius, InEditResolution);
     EditStore->ApplySphericalEdit(InEditCenter, InEditRadius, InEditStrength, Depth);
-
-    // 2. Collect all live corners within the edit radius and resample them
-    // CompositeSample already calls EditStore->Sample, so a straight resample is all we need
-    TArray<TSharedPtr<FVoxelCorner>> AffectedCorners;
-    double RadiusSq = InEditRadius * InEditRadius;
-    {
-        FReadScopeLock ReadLock(CornerLock);
-        for (auto& Pair : CornerLookup)
-        {
-            TSharedPtr<FVoxelCorner> Corner = Pair.Value.Pin();
-            if (!Corner.IsValid()) continue;
-            if (FVector::DistSquared(Corner->GetPosition(), InEditCenter) <= RadiusSq)
-                AffectedCorners.Add(Corner);
-        }
-    }
-
-    SampleCorners(AffectedCorners);
+    UpdateCorners(InAffectedNodes);
 }
 
-FCornerProvider::FCornerProvider()
+void FCornerProvider::PruneExpiredCorners()
 {
-}
-
-FCornerProvider::~FCornerProvider()
-{
+    FWriteScopeLock WriteLock(CornerLock);
+    for (auto It = CornerLookup.CreateIterator(); It; ++It)
+        if (!It.Value().IsValid()) It.RemoveCurrent();
 }
