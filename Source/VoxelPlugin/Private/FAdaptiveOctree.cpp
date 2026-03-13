@@ -551,17 +551,17 @@ void AppendUniqueEdges(const TArray<FNodeEdge>& InAppendEdges, TArray<FNodeEdge>
     }
 }
 
-void FAdaptiveOctree::UpdateLodRecursive(TSharedPtr<FAdaptiveOctreeNode> Node, FVector CameraPosition, double InScreenSpaceThreshold, double InCameraFOV, bool& OutChanged)
+void FAdaptiveOctree::UpdateLodRecursive(TSharedPtr<FAdaptiveOctreeNode> Node, FVector CameraPosition, double InScreenSpaceThreshold, double InFOVScale, bool& OutChanged)
 {
     if (Node->IsLeaf())
     {
-        if (Node->ShouldSplit(CameraPosition, InScreenSpaceThreshold, InCameraFOV))
+        if (Node->ShouldSplit(CameraPosition, InScreenSpaceThreshold, InFOVScale))
         {
             OutChanged = true;
             SplitAndComputeChildren(Node);
             return;
         }
-        else if (Node->Parent.IsValid() && Node->Index.LastChild() == 7 && Node->Parent.Pin()->ShouldMerge(CameraPosition, InScreenSpaceThreshold, InCameraFOV))
+        else if (Node->Index.LastChild() == 7 && Node->Parent.IsValid() && Node->Parent.Pin()->ShouldMerge(CameraPosition, InScreenSpaceThreshold, InFOVScale))
         {
             OutChanged = true;
             Node->Parent.Pin()->Merge();
@@ -570,20 +570,18 @@ void FAdaptiveOctree::UpdateLodRecursive(TSharedPtr<FAdaptiveOctreeNode> Node, F
         return;
     }
 
-    // Short circuit — nothing in this subtree can change
-    //TODO USE CONSISTENT LOD CALCULATION, THIS SHOULD REUSE SHOULD SPLIT SHOULD MERGE, WE CAN REFACTOR THEM TO TAKE RAW DIMESION DATA
+    // Short circuit — same functions as ShouldSplit/ShouldMerge, using Center as conservative bounds estimate
     double Distance = FMath::Max(FVector::Dist(Node->Center, CameraPosition), 1.0);
-    double FOVScale = 1.0 / FMath::Tan(FMath::DegreesToRadians(InCameraFOV * 0.5));
-    double AngularSizeThisNode = (2.0 * Node->Extent / Distance) * FOVScale;
-    double SmallestExtent = Node->Extent / FMath::Pow(2.0, (double)(Node->DepthBounds[1] - Node->Index.Depth));
-    double AngularSizeSmallest = (2.0 * SmallestExtent / Distance) * FOVScale;
+    bool CouldSplit = FAdaptiveOctreeNode::EvaluateSplit(Node->Extent, Distance, InFOVScale, InScreenSpaceThreshold, Node->Index.Depth, Node->DepthBounds[1], Node->DepthBounds[2]);
+    double SmallestExtent = Node->Extent / (double)(1 << (Node->DepthBounds[1] - Node->Index.Depth));
+    bool CouldMerge = FAdaptiveOctreeNode::EvaluateMerge(SmallestExtent, Distance, InFOVScale, InScreenSpaceThreshold, Node->DepthBounds[1], Node->DepthBounds[0], Node->DepthBounds[2]);
 
-    if (AngularSizeThisNode <= InScreenSpaceThreshold && AngularSizeSmallest >= InScreenSpaceThreshold * 0.5)
+    if (!CouldSplit && !CouldMerge)
         return;
 
     for (int i = 0; i < 8; i++)
         if (Node->Children[i])
-            UpdateLodRecursive(Node->Children[i], CameraPosition, InScreenSpaceThreshold, InCameraFOV, OutChanged);
+            UpdateLodRecursive(Node->Children[i], CameraPosition, InScreenSpaceThreshold, InFOVScale, OutChanged);
 }
 
 void FAdaptiveOctree::UpdateLOD(FVector CameraPosition, double InScreenSpaceThreshold, double InCameraFOV)
@@ -597,22 +595,21 @@ void FAdaptiveOctree::UpdateLOD(FVector CameraPosition, double InScreenSpaceThre
     TArray<TSharedPtr<FMeshChunk>> ModifiedChunks;
     ModifiedChunks.SetNumZeroed(NumChunks);
 
-    double t0 = FPlatformTime::Seconds();
+    // Pre-compute once for entire pass
+    double FOVScale = 1.0 / FMath::Tan(FMath::DegreesToRadians(InCameraFOV * 0.5));
 
+    double t0 = FPlatformTime::Seconds();
 
     ParallelFor(NumChunks, [&](int32 idx)
         {
             bool tChanged = false;
-            // Pass 1 — pure LOD traversal, no edge work
-            UpdateLodRecursive(Chunks[idx], CameraPosition, InScreenSpaceThreshold, InCameraFOV, tChanged);
+            UpdateLodRecursive(Chunks[idx], CameraPosition, InScreenSpaceThreshold, FOVScale, tChanged);
 
             if (!tChanged) return;
 
-            // Pass 2 — only runs for changed chunks
             TArray<FNodeEdge> tChunkEdges;
             TMap<FEdgeKey, int32> tEdgeMap;
             GatherLeafEdges(Chunks[idx], tChunkEdges, tEdgeMap);
-
             auto MeshChunk = ChunkMap[Chunks[idx]];
             MeshChunk->ChunkEdges = tChunkEdges;
             ModifiedChunks[idx] = MeshChunk;
@@ -744,11 +741,7 @@ void FAdaptiveOctree::SplitAndComputeChildren(TSharedPtr<FAdaptiveOctreeNode> No
 
     // --- Stage 2: Sample 19 new densities ---
     const int32 NewCount = 19;
-    TArray<float> XPos, YPos, ZPos, NoiseOut;
-    XPos.SetNumUninitialized(NewCount);
-    YPos.SetNumUninitialized(NewCount);
-    ZPos.SetNumUninitialized(NewCount);
-    NoiseOut.SetNumUninitialized(NewCount);
+    float XPos[19], YPos[19], ZPos[19], NoiseOut[19];
 
     double NoiseScale = RootExtent * 0.1;
     FVector PlanetCenter = Root->Center;
@@ -764,7 +757,7 @@ void FAdaptiveOctree::SplitAndComputeChildren(TSharedPtr<FAdaptiveOctreeNode> No
         ZPos[i] = (float)(SurfacePos.Z / NoiseScale);
     }
 
-    DensityFunction(NewCount, XPos.GetData(), YPos.GetData(), ZPos.GetData(), NoiseOut.GetData());
+    DensityFunction(NewCount, XPos, YPos, ZPos, NoiseOut);
 
     for (int32 i = 0; i < NewCount; i++)
     {

@@ -13,9 +13,8 @@ const bool FAdaptiveOctreeNode::IsRoot()
 
 FAdaptiveOctreeNode::FAdaptiveOctreeNode(FVector InCenter, double InExtent, int InChunkDepth, int InMinDepth, int InMaxDepth)
 {
-    ChunkDepth = InChunkDepth;
     Center = InCenter;
-    AnchorCenter = InCenter;
+    ChunkCenter = InCenter;
     TreeCenter = InCenter;
     Extent = FMath::Max(InExtent, 0.0);
 
@@ -34,11 +33,9 @@ FAdaptiveOctreeNode::FAdaptiveOctreeNode(TSharedPtr<FAdaptiveOctreeNode> InParen
     Index = InParent->Index;
     Index.PushChild(ChildIndex);
 
-    ChunkDepth = InParent->ChunkDepth;
-
     Parent = InParent;
     TreeCenter = InParent->TreeCenter;
-    AnchorCenter = InAnchorCenter;
+    ChunkCenter = InAnchorCenter;
 
     // Set spatial bounds first
     Extent = InParent->Extent * 0.5;
@@ -97,7 +94,7 @@ void FAdaptiveOctreeNode::FinalizeFromExistingCorners(bool bSkipNormals)
 
             FVector Normal(dx, dy, dz);
             if (!Normal.Normalize())
-                Normal = (Corners[i].Position - AnchorCenter).GetSafeNormal();
+                Normal = (Corners[i].Position - ChunkCenter).GetSafeNormal();
             Corners[i].Normal = Normal;
         }
     }
@@ -129,7 +126,7 @@ void FAdaptiveOctreeNode::Split()
     // Determine the anchor for children
     // If THIS node is at the ChunkDepth, its children will use its center as their anchor.
     // Otherwise, they inherit the current anchor.
-    FVector NextAnchor = (Index.Depth == DepthBounds[0]) ? Center : AnchorCenter;
+    FVector NextAnchor = (Index.Depth == DepthBounds[0]) ? Center : ChunkCenter;
 
     for (uint8 i = 0; i < 8; i++)
     {
@@ -154,40 +151,21 @@ void FAdaptiveOctreeNode::Merge()
     bIsLeaf = true;
 }
 
-bool FAdaptiveOctreeNode::ShouldSplit(FVector InCameraPosition, double InScreenSpaceThreshold, double InCameraFOV)
+bool FAdaptiveOctreeNode::ShouldSplit(FVector InCameraPosition, double InScreenSpaceThreshold, double InFOVScale)
 {
     FVector ToCam = (InCameraPosition - TreeCenter).GetSafeNormal();
     FVector ToNode = (Center - TreeCenter).GetSafeNormal();
-    float Dot = FVector::DotProduct(ToCam, ToNode);
-    // Node is on the far hemisphere — don't split further
-    if (Dot < -0.2f) return false; // small negative threshold for horizon margin
+    if (FVector::DotProduct(ToCam, ToNode) < -0.2f) return false;
 
-    int Depth = Index.Depth;
-    if (Depth >= DepthBounds[1]) return false;
-    if (Depth < DepthBounds[2]) return true;
-    
     double Distance = FMath::Max(FVector::Dist(DualContourPosition, InCameraPosition), 1.0);
-    //double Distance2 = FMath::Max(FVector::Dist(NormalizedPosition, InCameraPosition), 1.0);
-    //double Distance = FMath::Min(Distance, Distance2);
-    double FOVScale = 1.0 / FMath::Tan(FMath::DegreesToRadians(InCameraFOV * 0.5));
-    double AngularSize = ((2.0 * Extent) / Distance) * FOVScale;
-
-    return AngularSize > InScreenSpaceThreshold;
+    return EvaluateSplit(Extent, Distance, InFOVScale, InScreenSpaceThreshold, Index.Depth, DepthBounds[1], DepthBounds[2]);
 }
 
-bool FAdaptiveOctreeNode::ShouldMerge(FVector InCameraPosition, double InScreenSpaceThreshold, double InCameraFOV)
+bool FAdaptiveOctreeNode::ShouldMerge(FVector InCameraPosition, double InScreenSpaceThreshold, double InFOVScale)
 {
-    int Depth = Index.Depth;
     if (LodOverride) return false;
-    if (Depth <= DepthBounds[0]) return false;
-    if (Depth < DepthBounds[2]) return false;
     double Distance = FMath::Max(FVector::Dist(DualContourPosition, InCameraPosition), 1.0);
-    //double Distance2 = FMath::Max(FVector::Dist(NormalizedPosition, InCameraPosition), 1.0);
-    //double Distance = FMath::Min(Distance, Distance2);
-    double FOVScale = 1.0 / FMath::Tan(FMath::DegreesToRadians(InCameraFOV * 0.5));
-    double AngularSize = ((2.0 * Extent) / Distance) * FOVScale;
-
-    return AngularSize < InScreenSpaceThreshold * 0.5;
+    return EvaluateMerge(Extent, Distance, InFOVScale, InScreenSpaceThreshold, Index.Depth, DepthBounds[0], DepthBounds[2]);
 }
 
 TArray<FNodeEdge>& FAdaptiveOctreeNode::GetSignChangeEdges()
@@ -206,9 +184,9 @@ TArray<TSharedPtr<FAdaptiveOctreeNode>> FAdaptiveOctreeNode::GetSurfaceChunks()
     {
         TSharedPtr<FAdaptiveOctreeNode> CurrentNode = Stack.Pop(EAllowShrinking::No);
 
-        if (!CurrentNode || CurrentNode->Index.Depth > ChunkDepth) continue;
+        if (!CurrentNode || CurrentNode->Index.Depth > DepthBounds[0]) continue;
 
-        if (CurrentNode->Index.Depth == ChunkDepth && CurrentNode->IsSurfaceNode)
+        if (CurrentNode->Index.Depth == DepthBounds[0] && CurrentNode->IsSurfaceNode)
         {
             SurfaceNodes.Add(CurrentNode);
         }

@@ -10,6 +10,7 @@ struct VOXELPLUGIN_API OctreeConstants {
         FVector(-1, 1, 1),   FVector(1, 1, 1)
     };
 
+    //short/uint8
     inline static const int EdgePairs[12][2] = {
         {0, 1}, {2, 3}, {4, 5}, {6, 7},
         {0, 2}, {1, 3}, {4, 6}, {5, 7},
@@ -50,9 +51,9 @@ struct VOXELPLUGIN_API OctreeConstants {
 };
 
 struct VOXELPLUGIN_API FNodeCorner {
-    FVector Position;
-    double Density;
-    FVector Normal;
+    FVector Position; //we arent deduplicating via position lookup anymore, rather we do so by construction 
+    double Density; //float
+    FVector Normal; //fvector3f
 
     FNodeCorner() : Position(0), Density(0), Normal(0, 0, 1) {}
 
@@ -61,12 +62,12 @@ struct VOXELPLUGIN_API FNodeCorner {
 
 struct VOXELPLUGIN_API FNodeEdge
 {
-    FNodeCorner Corners[2];
-    double Size;
+    FNodeCorner Corners[2]; //could store indices 1 uint8 instead of FVector + FVector3f + float... although we pass it around, so that might require other changes
+    double Size;         //size and distance might be the same
     bool SignChange;
     double Distance;
-    FVector EdgeDirection;
-    int Axis;  
+    FVector EdgeDirection; //dont need full fvector for direction, use lighter type
+    int Axis;  //uint8
     FVector ZeroCrossingPoint;
 
     // Constructor
@@ -140,7 +141,8 @@ struct VOXELPLUGIN_API FNodeEdge
     }
 };
 
-struct VOXELPLUGIN_API FEdgeKey
+//do we still need this?
+struct VOXELPLUGIN_API FEdgeKey 
 {
     int64 X0, Y0, Z0;  // Quantized corner 0 (sorted so min corner is always first)
     int64 X1, Y1, Z1;  // Quantized corner 1
@@ -188,6 +190,7 @@ struct VOXELPLUGIN_API FEdgeKey
     }
 };
 
+//wonder if there would be a way to have a flag to control the size of this... probably not... could add 2 versions of it or even an arbitrary number passed into to construction
 struct VOXELPLUGIN_API FMortonIndex {
     uint64 Low = 0;   // Bits 0-63:   levels 0-20
     uint64 High = 0;  // Bits 64-127: levels 21-41
@@ -517,25 +520,21 @@ private:
     int DepthPrecisionFloor = 20;
 
 public:
-    FMortonIndex Index;
+    FMortonIndex Index; //do we need full 128 bits here? so far we are around depth 18-20 or so....
     
     TWeakPtr<FAdaptiveOctreeNode> Parent;
     
     TSharedPtr<FAdaptiveOctreeNode> Children[8];
-    
-    TWeakPtr<FAdaptiveOctreeNode> Neighbors[6];
 
     FNodeCorner Corners[8];
     
     TArray<FNodeEdge> SignChangeEdges;
     
-    int ChunkDepth = 4;
-    
-    int DepthBounds[3];
-    
-    FVector AnchorCenter;
-    
+    int DepthBounds[3]; //short
+
     FVector Center;
+
+    FVector ChunkCenter;
 
     FVector TreeCenter;
     
@@ -543,7 +542,7 @@ public:
     
     FVector DualContourPosition;
     
-    FVector DualContourNormal;
+    FVector DualContourNormal; //FVector3f
     
     FVector NormalizedPosition;
 
@@ -555,6 +554,20 @@ public:
 
     const bool IsRoot();
     
+    static bool EvaluateSplit(double Extent, double Distance, double FOVScale, double Threshold, int Depth, int MaxDepth, int MinDepth)
+    {
+        if (Depth >= MaxDepth) return false;
+        if (Depth < MinDepth) return true;
+        return ((2.0 * Extent / Distance) * FOVScale) > Threshold;
+    }
+
+    static bool EvaluateMerge(double Extent, double Distance, double FOVScale, double Threshold, int Depth, int ChunkDepth, int MinDepth)
+    {
+        if (Depth <= ChunkDepth) return false;
+        if (Depth < MinDepth) return false;
+        return ((2.0 * Extent / Distance) * FOVScale) < Threshold * 0.5;
+    }
+
     bool ShouldSplit(FVector InCameraPosition, double InScreenSpaceThreshold, double InCameraFOV);
 
     bool ShouldMerge(FVector InCameraPosition, double InScreenSpaceThreshold, double InCameraFOV);
