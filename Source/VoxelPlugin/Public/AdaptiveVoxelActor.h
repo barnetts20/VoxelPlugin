@@ -31,6 +31,8 @@ private:
 
     bool TickInEditor = true;
 
+    FTimerHandle DataUpdateTimerHandle;
+
     FastNoise::SmartNode<> Noise;
     
     std::atomic<bool> Initialized = false;
@@ -62,14 +64,11 @@ public:
     double ScreenSpaceThreshold = .075;
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "LOD")
-    double MinDataUpdateInterval = .1;
-
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "LOD")
-    double MinMeshUpdateInterval = .1;
-
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "LOD")
     double VelocityLookAheadFactor = 8;
 
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "LOD")
+    double MinDataUpdateInterval = .1;
+    
     virtual void OnConstruction(const FTransform& Transform) override;
     
     virtual void BeginPlay() override;
@@ -87,9 +86,7 @@ protected:
     
     std::atomic<bool> EditUpdateIsRunning = false;
 
-    FTimerHandle DataUpdateTimerHandle;
-    
-    FTimerHandle MeshUpdateTimerHandle;
+    std::atomic<bool> DataCleanupIsRunning = false;
 
     void CleanSceneRoot();
     
@@ -100,5 +97,7 @@ protected:
     void RunMeshUpdateTask();
 
     void RunEditUpdateTask(FVector InEditCenter, double InEditRadius, double InEditStrength, int InEditResolution);
+
+    void RunDataCleanupTask();
 };
 

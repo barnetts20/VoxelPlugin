@@ -41,14 +41,12 @@ class VOXELPLUGIN_API FCornerProvider
 public:
     TMap<FInt64Vector, TWeakPtr<FVoxelCorner>> CornerLookup;
     FRWLock CornerLock;
-
-    TFunction<void(int32, const float*, const float*, const float*, float*)> NoiseFunction;
     TSharedPtr<FSparseEditStore> EditStore;
-
+    TFunction<void(int32, const float*, const float*, const float*, float*)> NoiseFunction;
     FVector Center;
     double RootExtent;
-    double SurfaceExtent;
     double SeaExtent;
+    double SurfaceExtent;
 
     TSharedPtr<FVoxelCorner> GetOrCreateCorner(FVector InPosition);
 

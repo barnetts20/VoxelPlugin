@@ -144,7 +144,35 @@ void FCornerProvider::ApplyEdit(FVector InEditCenter, double InEditRadius, doubl
 
 void FCornerProvider::PruneExpiredCorners()
 {
-    FWriteScopeLock WriteLock(CornerLock);
-    for (auto It = CornerLookup.CreateIterator(); It; ++It)
-        if (!It.Value().IsValid()) It.RemoveCurrent();
+    // Phase 1 — collect dead keys in parallel
+    TArray<FInt64Vector> AllKeys;
+    {
+        FReadScopeLock ReadLock(CornerLock);
+        CornerLookup.GenerateKeyArray(AllKeys);
+    }
+
+    if (AllKeys.Num() == 0) return;
+
+    TArray<FInt64Vector> DeadKeys;
+    FCriticalSection DeadKeysMutex;
+
+    ParallelFor(AllKeys.Num(), [&](int32 i)
+        {
+            FReadScopeLock ReadLock(CornerLock);
+            TWeakPtr<FVoxelCorner>* Found = CornerLookup.Find(AllKeys[i]);
+            if (Found && !Found->IsValid())
+            {
+                FScopeLock Lock(&DeadKeysMutex);
+                DeadKeys.Add(AllKeys[i]);
+            }
+        });
+
+    if (DeadKeys.Num() == 0) return;
+
+    // Phase 2 — write lock, remove dead keys
+    {
+        FWriteScopeLock WriteLock(CornerLock);
+        for (const auto& Key : DeadKeys)
+            CornerLookup.Remove(Key);
+    }
 }

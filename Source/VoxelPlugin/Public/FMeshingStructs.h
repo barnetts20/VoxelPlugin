@@ -9,145 +9,51 @@ using namespace RealtimeMesh;
 
 struct VOXELPLUGIN_API FNodeEdge
 {
-    FVoxelCorner* Corners[2];
-    double Size;
+    FVector Positions[2];
+    double Densities[2];
+    int32 Axis;
     bool SignChange;
-    double Distance;
-    FVector EdgeDirection;
-    int Axis;
     FVector ZeroCrossingPoint;
 
-    // Constructor
-    FNodeEdge() : Size(0), SignChange(false), Distance(0), Axis(0) {}
+    FNodeEdge() = default;
 
-    FNodeEdge(FVoxelCorner* InCorner1, FVoxelCorner* InCorner2)
+    FNodeEdge(const FVoxelCorner& A, const FVoxelCorner& B)
     {
-        Corners[0] = InCorner1;
-        Corners[1] = InCorner2;
+        Positions[0] = A.GetPosition();
+        Positions[1] = B.GetPosition();
+        Densities[0] = A.Density;
+        Densities[1] = B.Density;
 
-        double d1 = InCorner1->Density;
-        double d2 = InCorner2->Density;
+        SignChange = (A.Density <= 0.0) != (B.Density <= 0.0);
 
-        SignChange = (d1 < 0) != (d2 < 0);
+        FVector Delta = (Positions[1] - Positions[0]).GetAbs();
+        if (Delta.X > Delta.Y && Delta.X > Delta.Z) Axis = 0;
+        else if (Delta.Y > Delta.X && Delta.Y > Delta.Z) Axis = 1;
+        else Axis = 2;
 
-        // Determine which corner is positive and which is negative
-        FVoxelCorner* PosCorner = (d1 > d2) ? InCorner1 : InCorner2;
-        FVoxelCorner* NegCorner = (d1 > d2) ? InCorner2 : InCorner1;
-
-        Size = FVector::Dist(InCorner1->GetPosition(), InCorner2->GetPosition());
-        Distance = Size;
-
-        // Compute edge direction: Always point from positive to negative
-        EdgeDirection = (NegCorner->GetPosition() - PosCorner->GetPosition()).GetSafeNormal();
-
-        // Safe axis detection: find the axis with the largest delta
-        // This is immune to floating point noise at large coordinates
-        FVector Delta = (InCorner2->GetPosition() - InCorner1->GetPosition()).GetAbs();
-        if (Delta.X > Delta.Y && Delta.X > Delta.Z)
-            Axis = 0;
-        else if (Delta.Y > Delta.X && Delta.Y > Delta.Z)
-            Axis = 1;
+        if (SignChange)
+        {
+            double Denom = Densities[0] - Densities[1];
+            double t = FMath::Abs(Denom) < 1e-12 ? 0.5 : FMath::Clamp(Densities[0] / Denom, 0.0, 1.0);
+            ZeroCrossingPoint = Positions[0] + t * (Positions[1] - Positions[0]);
+        }
         else
-            Axis = 2;
-
-        if (SignChange) {
-            // Stable zero-crossing interpolation
-            // t = d1 / (d1 - d2) gives the parametric position along the edge
-            // where the sign change occurs. Clamp to [0,1] for safety.
-            double Denominator = d1 - d2;
-            if (FMath::Abs(Denominator) < 1e-12) {
-                // Both densities essentially equal — place at midpoint
-                ZeroCrossingPoint = (InCorner1->GetPosition() + InCorner2->GetPosition()) * 0.5;
-            }
-            else {
-                double t = d1 / Denominator;
-                t = FMath::Clamp(t, 0.0, 1.0);
-                ZeroCrossingPoint = InCorner1->GetPosition() + t * (InCorner2->GetPosition() - InCorner1->GetPosition());
-            }
-        }
-        else {
-            ZeroCrossingPoint = (InCorner1->GetPosition() + InCorner2->GetPosition()) * 0.5;
+        {
+            ZeroCrossingPoint = (Positions[0] + Positions[1]) * 0.5;
         }
     }
 
-    bool IsCongruent(const FNodeEdge& Other) const {
-        // Both corners must match (in either order) AND axis must match
-        bool CornersMatch =
-            (Corners[0]->GetPosition().Equals(Other.Corners[0]->GetPosition(), .01)
-                && Corners[1]->GetPosition().Equals(Other.Corners[1]->GetPosition(), .01))
-            || (Corners[0]->GetPosition().Equals(Other.Corners[1]->GetPosition(), .01)
-                && Corners[1]->GetPosition().Equals(Other.Corners[0]->GetPosition(), .01));
-
-        return CornersMatch && Axis == Other.Axis;
-    }
-
-    // Equality operator for ensuring uniqueness
     bool operator==(const FNodeEdge& Other) const
     {
-        return IsCongruent(Other) && Other.EdgeDirection == EdgeDirection;
+        return Axis == Other.Axis &&
+            ((Positions[0].Equals(Other.Positions[0], 0.01) && Positions[1].Equals(Other.Positions[1], 0.01)) ||
+                (Positions[0].Equals(Other.Positions[1], 0.01) && Positions[1].Equals(Other.Positions[0], 0.01)));
     }
-};
-
-struct VOXELPLUGIN_API FEdgeKey
-{
-    int64 X0, Y0, Z0;  // Quantized corner 0 (sorted so min corner is always first)
-    int64 X1, Y1, Z1;  // Quantized corner 1
-    int32 Axis;
-
-    // Quantization grid — 0.001 is well within the 0.01 epsilon used in IsCongruent
-    static constexpr double GridSize = 0.001;
-
-    static int64 Quantize(double V)
-    {
-        return FMath::RoundToInt64(V / GridSize);
-    }
-
-    FEdgeKey() = default;
-
-    FEdgeKey(const FNodeEdge& Edge)
-    {
-        int64 ax = Quantize(Edge.Corners[0]->Position.X);
-        int64 ay = Quantize(Edge.Corners[0]->Position.Y);
-        int64 az = Quantize(Edge.Corners[0]->Position.Z);
-        int64 bx = Quantize(Edge.Corners[1]->Position.X);
-        int64 by = Quantize(Edge.Corners[1]->Position.Y);
-        int64 bz = Quantize(Edge.Corners[1]->Position.Z);
-
-        // Canonical ordering: ensure (corner0 < corner1) so order doesn't matter
-        if (ax < bx || (ax == bx && ay < by) || (ax == bx && ay == by && az < bz))
-        {
-            X0 = ax; Y0 = ay; Z0 = az;
-            X1 = bx; Y1 = by; Z1 = bz;
-        }
-        else
-        {
-            X0 = bx; Y0 = by; Z0 = bz;
-            X1 = ax; Y1 = ay; Z1 = az;
-        }
-
-        Axis = Edge.Axis;
-    }
-
-    bool operator==(const FEdgeKey& Other) const
-    {
-        return X0 == Other.X0 && Y0 == Other.Y0 && Z0 == Other.Z0
-            && X1 == Other.X1 && Y1 == Other.Y1 && Z1 == Other.Z1
-            && Axis == Other.Axis;
-    }
-};
-
-struct VOXELPLUGIN_API FCornerSample {
-    FVector Position;           // World position
-    double Density;             // Final SDF density
-    double Dist;
-    float NoiseValue;           // Raw noise result
-    TArray<double*> Targets;    // Pointers to all Corners[i].Density that share this position
 };
 
 struct VOXELPLUGIN_API FMeshVertex
 {
-    FVector Position;       // Quantized position (chunk-local)
-    FVector OriginalPosition; // Unquantized for actual mesh output
+    FVector Position;           // Quantized position (chunk-local)
     FVector NormalizedPosition; // Projected onto planet radius sphere surface
     FVector Normal;
     FColor Color;
@@ -289,7 +195,7 @@ struct VOXELPLUGIN_API FMeshChunk {
     bool ShouldProcessEdge(const FNodeEdge& Edge, const TArray<TSharedPtr<FAdaptiveOctreeNode>>& SampledNodes) {
         if (SampledNodes.Num() < 3) return false;
 
-        double OwnerExtent = Edge.Size * 0.5;
+        double OwnerExtent = FVector::Dist(Edge.Positions[0], Edge.Positions[1]) * 0.5;
         for (auto& Node : SampledNodes)
         {
             if (Node->Extent < OwnerExtent * 0.9)
