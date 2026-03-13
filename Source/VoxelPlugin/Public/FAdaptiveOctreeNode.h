@@ -569,7 +569,7 @@ public:
 
     TArray<FNodeEdge>& GetSignChangeEdges();
 
-    void FinalizeFromExistingCorners();
+    void FinalizeFromExistingCorners(bool bSkipNormals = false);
 
     // Root Constructor
     FAdaptiveOctreeNode(FVector InCenter, double InExtent, int InChunkDepth, int InMinDepth, int InMaxDepth);

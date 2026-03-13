@@ -29,7 +29,7 @@ void FAdaptiveOctree::SplitToDepth(TSharedPtr<FAdaptiveOctreeNode> Node, int InM
         {
             if (Node->Children[i])
             {
-                ComputeNodeData(Node->Children[i]);
+                //ComputeNodeData(Node->Children[i]);
                 SplitToDepth(Node->Children[i], InMinDepth);
             }
         }
@@ -169,7 +169,7 @@ void FAdaptiveOctree::ApplyEdit(FVector InEditCenter, double InEditRadius, doubl
         GatherLeafEdges(DirtyChunks[i].Key, NewEdges, EdgeMap);
         DirtyChunks[i].Value->ChunkEdges = NewEdges;
         UpdateMeshChunkStreamData(DirtyChunks[i].Value);
-        });
+    });
 }
 
 void FAdaptiveOctree::GatherUniqueCorners(TSharedPtr<FAdaptiveOctreeNode> Node, TArray<FCornerSample>& Samples, TMap<FIntVector, int32>& CornerMap, double QuantizeGrid, FVector EditCenter, double SearchRadius)
@@ -671,25 +671,50 @@ void FAdaptiveOctree::GatherLeafEdges(TSharedPtr<FAdaptiveOctreeNode> Node, TArr
 
 void FAdaptiveOctree::SplitAndComputeChildren(TSharedPtr<FAdaptiveOctreeNode> Node)
 {
-    // Verified lookup table: ChildCornerSources[childIdx][cornerIdx] = G index (0-26)
     static const int32 ChildCornerSources[8][8] = {
-        {  0,  8, 12, 24, 16, 22, 20, 26 }, // child 0: octant (-1,-1,-1)
-        {  8,  1, 24, 13, 22, 17, 26, 21 }, // child 1: octant (+1,-1,-1)
-        { 12, 24,  2,  9, 20, 26, 18, 23 }, // child 2: octant (-1,+1,-1)
-        { 24, 13,  9,  3, 26, 21, 23, 19 }, // child 3: octant (+1,+1,-1)
-        { 16, 22, 20, 26,  4, 10, 14, 25 }, // child 4: octant (-1,-1,+1)
-        { 22, 17, 26, 21, 10,  5, 25, 15 }, // child 5: octant (+1,-1,+1)
-        { 20, 26, 18, 23, 14, 25,  6, 11 }, // child 6: octant (-1,+1,+1)
-        { 26, 21, 23, 19, 25, 15, 11,  7 }, // child 7: octant (+1,+1,+1)
+        {  0,  8, 12, 24, 16, 22, 20, 26 },
+        {  8,  1, 24, 13, 22, 17, 26, 21 },
+        { 12, 24,  2,  9, 20, 26, 18, 23 },
+        { 24, 13,  9,  3, 26, 21, 23, 19 },
+        { 16, 22, 20, 26,  4, 10, 14, 25 },
+        { 22, 17, 26, 21, 10,  5, 25, 15 },
+        { 20, 26, 18, 23, 14, 25,  6, 11 },
+        { 26, 21, 23, 19, 25, 15, 11,  7 },
+    };
+
+    static const int8 GridCoords[27][3] = {
+        {-1,-1,-1},{+1,-1,-1},{-1,+1,-1},{+1,+1,-1},
+        {-1,-1,+1},{+1,-1,+1},{-1,+1,+1},{+1,+1,+1},
+        { 0,-1,-1},{ 0,+1,-1},{ 0,-1,+1},{ 0,+1,+1},
+        {-1, 0,-1},{+1, 0,-1},{-1, 0,+1},{+1, 0,+1},
+        {-1,-1, 0},{+1,-1, 0},{-1,+1, 0},{+1,+1, 0},
+        {-1, 0, 0},{+1, 0, 0},{ 0,-1, 0},{ 0,+1, 0},
+        { 0, 0,-1},{ 0, 0,+1},{ 0, 0, 0}
+    };
+
+    // CoordToGrid[x+1][y+1][z+1]
+    static const int8 CoordToGrid[3][3][3] = {
+        { {  0, 16,  4 }, { 12, 20, 14 }, {  2, 18,  6 } },
+        { {  8, 22, 10 }, { 24, 26, 25 }, {  9, 23, 11 } },
+        { {  1, 17,  5 }, { 13, 21, 15 }, {  3, 19,  7 } },
+    };
+
+    static const int32 FaceCorners[6][4] = {
+        { 0, 2, 4, 6 },
+        { 1, 3, 5, 7 },
+        { 0, 1, 4, 5 },
+        { 2, 3, 6, 7 },
+        { 0, 1, 2, 3 },
+        { 4, 5, 6, 7 },
     };
 
     Node->Split();
 
-    // Build the 27-point grid positions
+    // --- Stage 1: Build grid positions ---
     FVector GridPositions[27];
     double  GridDensities[27];
 
-    // G0-G7: parent corners, positions and densities already known
+    // G0-G7: parent corners
     for (int i = 0; i < 8; i++)
     {
         GridPositions[i] = Node->Corners[i].Position;
@@ -705,18 +730,6 @@ void FAdaptiveOctree::SplitAndComputeChildren(TSharedPtr<FAdaptiveOctreeNode> No
     }
 
     // G20-G25: face centers
-    // Faces defined by which axis is fixed and which sign
-    // -X(0): corners 0,2,4,6   +X(1): corners 1,3,5,7
-    // -Y(2): corners 0,1,4,5   +Y(3): corners 2,3,6,7
-    // -Z(4): corners 0,1,2,3   +Z(5): corners 4,5,6,7
-    static const int32 FaceCorners[6][4] = {
-        { 0, 2, 4, 6 }, // G20: -X face
-        { 1, 3, 5, 7 }, // G21: +X face
-        { 0, 1, 4, 5 }, // G22: -Y face
-        { 2, 3, 6, 7 }, // G23: +Y face
-        { 0, 1, 2, 3 }, // G24: -Z face
-        { 4, 5, 6, 7 }, // G25: +Z face
-    };
     for (int i = 0; i < 6; i++)
     {
         GridPositions[20 + i] = (
@@ -729,7 +742,7 @@ void FAdaptiveOctree::SplitAndComputeChildren(TSharedPtr<FAdaptiveOctreeNode> No
     // G26: body center
     GridPositions[26] = Node->Center;
 
-    // Sample only the 19 new points (G8-G26)
+    // --- Stage 2: Sample 19 new densities ---
     const int32 NewCount = 19;
     TArray<float> XPos, YPos, ZPos, NoiseOut;
     XPos.SetNumUninitialized(NewCount);
@@ -761,7 +774,49 @@ void FAdaptiveOctree::SplitAndComputeChildren(TSharedPtr<FAdaptiveOctreeNode> No
         GridDensities[8 + i] = Dist - (RootExtent * 0.9 + Height) + EditStore->Sample(GridPositions[8 + i]);
     }
 
-    // Assign corners to children from the grid, then finalize
+    // --- Stage 3: Compute 27 normals from grid gradients ---
+    FVector GridNormals[27];
+
+    for (int32 gi = 0; gi < 27; gi++)
+    {
+        int8 cx = GridCoords[gi][0];
+        int8 cy = GridCoords[gi][1];
+        int8 cz = GridCoords[gi][2];
+
+        // X gradient
+        double dX;
+        if (cx == 0)
+            dX = GridDensities[CoordToGrid[2][cy + 1][cz + 1]] - GridDensities[CoordToGrid[0][cy + 1][cz + 1]];
+        else if (cx == -1)
+            dX = GridDensities[CoordToGrid[1][cy + 1][cz + 1]] - GridDensities[CoordToGrid[0][cy + 1][cz + 1]];
+        else
+            dX = GridDensities[CoordToGrid[2][cy + 1][cz + 1]] - GridDensities[CoordToGrid[1][cy + 1][cz + 1]];
+
+        // Y gradient
+        double dY;
+        if (cy == 0)
+            dY = GridDensities[CoordToGrid[cx + 1][2][cz + 1]] - GridDensities[CoordToGrid[cx + 1][0][cz + 1]];
+        else if (cy == -1)
+            dY = GridDensities[CoordToGrid[cx + 1][1][cz + 1]] - GridDensities[CoordToGrid[cx + 1][0][cz + 1]];
+        else
+            dY = GridDensities[CoordToGrid[cx + 1][2][cz + 1]] - GridDensities[CoordToGrid[cx + 1][1][cz + 1]];
+
+        // Z gradient
+        double dZ;
+        if (cz == 0)
+            dZ = GridDensities[CoordToGrid[cx + 1][cy + 1][2]] - GridDensities[CoordToGrid[cx + 1][cy + 1][0]];
+        else if (cz == -1)
+            dZ = GridDensities[CoordToGrid[cx + 1][cy + 1][1]] - GridDensities[CoordToGrid[cx + 1][cy + 1][0]];
+        else
+            dZ = GridDensities[CoordToGrid[cx + 1][cy + 1][2]] - GridDensities[CoordToGrid[cx + 1][cy + 1][1]];
+
+        FVector Normal(dX, dY, dZ);
+        if (!Normal.Normalize())
+            Normal = (GridPositions[gi] - PlanetCenter).GetSafeNormal();
+        GridNormals[gi] = Normal;
+    }
+
+    // --- Stage 4: Assign to children and finalize ---
     for (int ci = 0; ci < 8; ci++)
     {
         for (int k = 0; k < 8; k++)
@@ -769,8 +824,9 @@ void FAdaptiveOctree::SplitAndComputeChildren(TSharedPtr<FAdaptiveOctreeNode> No
             int32 gi = ChildCornerSources[ci][k];
             Node->Children[ci]->Corners[k].Position = GridPositions[gi];
             Node->Children[ci]->Corners[k].Density = GridDensities[gi];
+            Node->Children[ci]->Corners[k].Normal = GridNormals[gi];
         }
-        Node->Children[ci]->FinalizeFromExistingCorners();
+        Node->Children[ci]->FinalizeFromExistingCorners(true);
         Node->Children[ci]->ComputeNormalizedPosition(Root->Extent * 0.9);
     }
 }
@@ -870,10 +926,11 @@ TArray<TSharedPtr<FAdaptiveOctreeNode>> FAdaptiveOctree::SampleNodesAroundEdge(c
 
     // AddUnique ensures that if a neighbor is a lower LOD (larger cell), 
     // it is only added once, while strictly preserving the rotational winding order.
-    if (N0.IsValid()) Nodes.AddUnique(N0);
-    if (N1.IsValid()) Nodes.AddUnique(N1);
-    if (N2.IsValid()) Nodes.AddUnique(N2);
-    if (N3.IsValid()) Nodes.AddUnique(N3);
+    double MaxNodeExtent = Edge.Size * 2.0;
+    if (N0.IsValid() && N0->Extent <= MaxNodeExtent) Nodes.AddUnique(N0);
+    if (N1.IsValid() && N1->Extent <= MaxNodeExtent) Nodes.AddUnique(N1);
+    if (N2.IsValid() && N2->Extent <= MaxNodeExtent) Nodes.AddUnique(N2);
+    if (N3.IsValid() && N3->Extent <= MaxNodeExtent) Nodes.AddUnique(N3);
 
     return Nodes;
 }

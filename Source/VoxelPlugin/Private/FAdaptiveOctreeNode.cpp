@@ -78,27 +78,28 @@ FVector FAdaptiveOctreeNode::GetInterpolatedNormal(FVector P)
     return FinalNormal.GetSafeNormal();
 }
 
-void FAdaptiveOctreeNode::FinalizeFromExistingCorners()
+void FAdaptiveOctreeNode::FinalizeFromExistingCorners(bool bSkipNormals)
 {
     SignChangeEdges.Reset();
 
-    // Compute normals from local corners if not already set by map
-    for (int i = 0; i < 8; i++)
+    if (!bSkipNormals)
     {
-        double d = Corners[i].Density;
-        int idxX = i ^ 1;
-        int idxY = i ^ 2;
-        int idxZ = i ^ 4;
+        for (int i = 0; i < 8; i++)
+        {
+            double d = Corners[i].Density;
+            int idxX = i ^ 1;
+            int idxY = i ^ 2;
+            int idxZ = i ^ 4;
 
-        double dx = (OctreeConstants::Offsets[i].X < 0) ? (Corners[idxX].Density - d) : (d - Corners[idxX].Density);
-        double dy = (OctreeConstants::Offsets[i].Y < 0) ? (Corners[idxY].Density - d) : (d - Corners[idxY].Density);
-        double dz = (OctreeConstants::Offsets[i].Z < 0) ? (Corners[idxZ].Density - d) : (d - Corners[idxZ].Density);
+            double dx = (OctreeConstants::Offsets[i].X < 0) ? (Corners[idxX].Density - d) : (d - Corners[idxX].Density);
+            double dy = (OctreeConstants::Offsets[i].Y < 0) ? (Corners[idxY].Density - d) : (d - Corners[idxY].Density);
+            double dz = (OctreeConstants::Offsets[i].Z < 0) ? (Corners[idxZ].Density - d) : (d - Corners[idxZ].Density);
 
-        FVector Normal(dx, dy, dz);
-        if (!Normal.Normalize())
-            Normal = (Corners[i].Position - AnchorCenter).GetSafeNormal();
-
-        Corners[i].Normal = Normal;
+            FVector Normal(dx, dy, dz);
+            if (!Normal.Normalize())
+                Normal = (Corners[i].Position - AnchorCenter).GetSafeNormal();
+            Corners[i].Normal = Normal;
+        }
     }
 
     for (int i = 0; i < 12; i++)
@@ -107,6 +108,7 @@ void FAdaptiveOctreeNode::FinalizeFromExistingCorners()
         if (NewEdge.SignChange)
             SignChangeEdges.Add(NewEdge);
     }
+
     ComputeDualContourPosition();
 
     if (IsSurfaceNode)
