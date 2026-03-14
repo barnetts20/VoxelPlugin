@@ -44,6 +44,35 @@ private:
 
     int ChunkDepth;
 
+    // Centralized terrain parameters -- derived from RootExtent at construction
+    double PlanetRadius;    // RootExtent * 0.9 -- base sphere surface
+    double OceanRadius;     // Sea level radius (initially == PlanetRadius)
+    double NoiseScale;      // RootExtent * 0.1 -- noise displacement amplitude
+
+    // Composite density sample: combines sphere SDF, noise height, and edit store.
+    // Dist: distance from planet center to the sample point.
+    // NoiseHeight: raw noise output for this point.
+    // Position: world-space position for edit store lookup.
+    float ComputeDensity(double Dist, float NoiseHeight, FVector Position) const
+    {
+        double Height = (double)NoiseHeight * NoiseScale;
+        return (float)(Dist - (PlanetRadius + Height) + EditStore->Sample(Position));
+    }
+
+    // Compute noise sampling coordinates for a world-space position.
+    // Projects onto the unit sphere surface and scales by noise frequency.
+    void ComputeNoisePosition(FVector WorldPos, float& OutX, float& OutY, float& OutZ) const
+    {
+        FVector PlanetRel = WorldPos - Root->Center;
+        double Dist = PlanetRel.Size();
+        FVector Dir = (Dist > 1e-10) ? (PlanetRel / Dist) : FVector::UpVector;
+        FVector SurfacePos = Dir * RootExtent;
+        double InvNoiseScale = 1.0 / NoiseScale;
+        OutX = (float)(SurfacePos.X * InvNoiseScale);
+        OutY = (float)(SurfacePos.Y * InvNoiseScale);
+        OutZ = (float)(SurfacePos.Z * InvNoiseScale);
+    }
+
     void SplitToDepth(FAdaptiveOctreeNode* Node, int InMinDepth);
 
     void PopulateChunks();
@@ -84,4 +113,10 @@ public:
     void Clear();
 
     void GatherLeafEdges(FAdaptiveOctreeNode* Node, TArray<FNodeEdge>& OutEdges, TMap<FEdgeKey, int32>& EdgeMap);
+
+    // Public accessors for shader/atmosphere/rendering use
+    double GetPlanetRadius() const { return PlanetRadius; }
+    double GetOceanRadius() const { return OceanRadius; }
+    double GetNoiseScale() const { return NoiseScale; }
+    FVector GetPlanetCenter() const { return Root.IsValid() ? Root->Center : FVector::ZeroVector; }
 };

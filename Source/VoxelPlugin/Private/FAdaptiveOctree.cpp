@@ -11,6 +11,10 @@ FAdaptiveOctree::FAdaptiveOctree(ARealtimeMeshActor* InParentActor, UMaterialInt
     CachedOceanMaterial = InOceanMaterial;
     ChunkDepth = InChunkDepth;
 
+    PlanetRadius = InRootExtent * 0.9;
+    OceanRadius = PlanetRadius;
+    NoiseScale = InRootExtent * 0.1;
+
     Root = MakeShared<FAdaptiveOctreeNode>(InCenter, InRootExtent, InChunkDepth, InMinDepth, InMaxDepth);
     ComputeNodeData(Root.Get());
     SplitToDepth(Root.Get(), InChunkDepth);
@@ -267,29 +271,22 @@ void FAdaptiveOctree::ReconstructSubtree(FAdaptiveOctreeNode* Node, FVector Edit
     ZPos.SetNumUninitialized(Count);
     NoiseOut.SetNumUninitialized(Count);
 
-    double NoiseScale = RootExtent * 0.1;
     FVector PlanetCenter = Root->Center;
 
     ParallelFor(Count, [&](int32 i)
         {
             FVector PlanetRel = Samples[i].Position - PlanetCenter;
             Samples[i].Dist = PlanetRel.Size();
-            FVector Dir = PlanetRel / Samples[i].Dist;
-            FVector SurfacePos = Dir * RootExtent;
-            XPos[i] = (float)(SurfacePos.X / NoiseScale);
-            YPos[i] = (float)(SurfacePos.Y / NoiseScale);
-            ZPos[i] = (float)(SurfacePos.Z / NoiseScale);
+            ComputeNoisePosition(Samples[i].Position, XPos[i], YPos[i], ZPos[i]);
         });
 
     // 3. One bulk noise call
     DensityFunction(Count, XPos.GetData(), YPos.GetData(), ZPos.GetData(), NoiseOut.GetData());
 
-    // 4. SDF + edits -- uses pre-computed distances
+    // 4. SDF + edits
     ParallelFor(Count, [&](int32 i)
         {
-            double Height = (double)NoiseOut[i] * NoiseScale;
-            double EditDensity = EditStore->Sample(Samples[i].Position);
-            Samples[i].Density = Samples[i].Dist - (RootExtent * 0.9 + Height) + EditDensity;
+            Samples[i].Density = ComputeDensity(Samples[i].Dist, NoiseOut[i], Samples[i].Position);
         });
 
     // 5. Write back densities to all nodes that share each corner
@@ -339,7 +336,6 @@ void FAdaptiveOctree::UpdateMeshChunkStreamData(TSharedPtr<FMeshChunk> InChunk)
     TArray<FEdgeVertexData> AllEdgeData;
     AllEdgeData.SetNum(InChunk->ChunkEdges.Num());
 
-    double OceanRadius = RootExtent * 0.9;
     double OceanTriThreshold = -1000;
 
     ParallelFor(InChunk->ChunkEdges.Num(), [&](int32 edgeIdx) {
@@ -356,12 +352,11 @@ void FAdaptiveOctree::UpdateMeshChunkStreamData(TSharedPtr<FMeshChunk> InChunk)
         AllEdgeData[edgeIdx].Vertices.SetNumZeroed(neighbors.Count);
 
         FVector PlanetCenter = Root->Center;
-        double NormRadius = Root->Extent * 0.9;
         for (int i = 0; i < neighbors.Count; i++) {
             FAdaptiveOctreeNode* NodePtr = neighbors.Nodes[i];
             FVector LocalPos(NodePtr->DualContourPosition - InChunk->ChunkCenter);
             FVector WorldPos = NodePtr->DualContourPosition;
-            FVector NormPos = NodePtr->ComputeNormalizedPosition(PlanetCenter, NormRadius);
+            FVector NormPos = NodePtr->ComputeNormalizedPosition(PlanetCenter, OceanRadius);
             FVector NormLocalPos = NormPos - InChunk->ChunkCenter;
             double Dist = FVector::Dist(WorldPos, PlanetCenter);
 
@@ -731,28 +726,21 @@ void FAdaptiveOctree::SplitAndComputeChildren(FAdaptiveOctreeNode* Node)
     const int32 NewCount = 19;
     float XPos[19], YPos[19], ZPos[19], NoiseOut[19];
 
-    double NoiseScale = RootExtent * 0.1;
     FVector PlanetCenter = Root->Center;
+    double GridDists[19];
 
     for (int32 i = 0; i < NewCount; i++)
     {
         FVector PlanetRel = GridPositions[8 + i] - PlanetCenter;
-        double Dist = PlanetRel.Size();
-        FVector Dir = (Dist > 1e-10) ? (PlanetRel / Dist) : FVector::UpVector;
-        FVector SurfacePos = Dir * RootExtent;
-        XPos[i] = (float)(SurfacePos.X / NoiseScale);
-        YPos[i] = (float)(SurfacePos.Y / NoiseScale);
-        ZPos[i] = (float)(SurfacePos.Z / NoiseScale);
+        GridDists[i] = PlanetRel.Size();
+        ComputeNoisePosition(GridPositions[8 + i], XPos[i], YPos[i], ZPos[i]);
     }
 
     DensityFunction(NewCount, XPos, YPos, ZPos, NoiseOut);
 
     for (int32 i = 0; i < NewCount; i++)
     {
-        double Height = (double)NoiseOut[i] * NoiseScale;
-        FVector PlanetRel = GridPositions[8 + i] - PlanetCenter;
-        double Dist = PlanetRel.Size();
-        GridDensities[8 + i] = Dist - (RootExtent * 0.9 + Height) + EditStore->Sample(GridPositions[8 + i]);
+        GridDensities[8 + i] = ComputeDensity(GridDists[i], NoiseOut[i], GridPositions[8 + i]);
     }
 
     // --- Stage 3: Compute 27 normals from grid gradients ---
@@ -825,26 +813,20 @@ void FAdaptiveOctree::ComputeNodeData(FAdaptiveOctreeNode* Node)
     float xPos[8], yPos[8], zPos[8], noiseOut[8];
     double dists[8];
 
-    double NoiseScale = RootExtent * 0.1;
     FVector PlanetCenter = Root->Center;
 
     for (int i = 0; i < 8; i++)
     {
         FVector PlanetRel = Node->Corners[i].Position - PlanetCenter;
         dists[i] = PlanetRel.Size();
-        FVector Dir = PlanetRel / dists[i];
-        FVector SurfacePos = Dir * RootExtent;
-        xPos[i] = (float)(SurfacePos.X / NoiseScale);
-        yPos[i] = (float)(SurfacePos.Y / NoiseScale);
-        zPos[i] = (float)(SurfacePos.Z / NoiseScale);
+        ComputeNoisePosition(Node->Corners[i].Position, xPos[i], yPos[i], zPos[i]);
     }
 
     DensityFunction(8, xPos, yPos, zPos, noiseOut);
 
     for (int i = 0; i < 8; i++)
     {
-        double height = (double)noiseOut[i] * NoiseScale;
-        Node->Corners[i].Density = (float)(dists[i] - (RootExtent * 0.9 + height) + EditStore->Sample(Node->Corners[i].Position));
+        Node->Corners[i].Density = ComputeDensity(dists[i], noiseOut[i], Node->Corners[i].Position);
     }
 
     Node->FinalizeFromExistingCorners(Root->Center);
