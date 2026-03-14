@@ -5,6 +5,24 @@
 #include "FSparseEditStore.h"
 #include "FAdaptiveOctreeNode.h"
 
+struct VOXELPLUGIN_API FOctreeParams {
+    ARealtimeMeshActor* InParentActor; 
+    UMaterialInterface* InSurfaceMaterial; 
+    UMaterialInterface* InOceanMaterial; 
+    TFunction<void(int, const float*, const float*, const float*, float*)> NoiseFunction;
+    TSharedPtr<FSparseEditStore> InEditStore; 
+    FVector InCenter; 
+
+    double PlanetRadius; //min surface radius in real world units
+    double InRootExtent; //compute a buffer larger than planet radius, dont directly expose
+    double SeaLevel; // should be relative to planet radius 0 at planet radius
+    double NoiseScale;
+
+    int InChunkDepth; 
+    int InMinDepth; 
+    int InMaxDepth;
+};
+
 /**
  * Adaptive Octree for LOD-based voxel meshing.
  */
