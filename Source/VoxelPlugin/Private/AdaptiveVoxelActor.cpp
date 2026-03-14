@@ -49,10 +49,17 @@ void AAdaptiveVoxelActor::OnConstruction(const FTransform& Transform)
     if (MaxScale < 1.0) MaxScale = 1.0;
     SetActorScale3D(FVector(MaxScale));
 
-    // Ensure we are not in a preview world (prevents running in editor mode)
+    // Only reinitialize if scale changed (affects planet radius).
+    // Position/rotation changes are handled by MeshAttachmentRoot + local-space camera.
+    bool bScaleChanged = !FMath::IsNearlyEqual(MaxScale, LastConstructedScale, 1.0);
+
     if (GetWorld() && !GetWorld()->IsPreviewWorld() && TickInEditor)
     {
-        Initialize();
+        if (!Initialized || bScaleChanged)
+        {
+            LastConstructedScale = MaxScale;
+            Initialize();
+        }
     }
 }
 
@@ -234,8 +241,10 @@ void AAdaptiveVoxelActor::Tick(float DeltaTime)
         if (viewLocations.Num() > 0)
         {
             // Convert world-space camera to actor-local space (octree is built at origin).
+            // Uses a scale-less transform since the octree operates in unscaled local space.
             FVector WorldCamPos = viewLocations[0];
-            this->CameraPosition = WorldCamPos - GetActorLocation();
+            FTransform NoScaleTransform(GetActorRotation(), GetActorLocation());
+            this->CameraPosition = NoScaleTransform.InverseTransformPosition(WorldCamPos);
 
             APlayerCameraManager* CamManager = UGameplayStatics::GetPlayerCameraManager(world, 0);
             if (CamManager)
@@ -249,7 +258,8 @@ void AAdaptiveVoxelActor::Tick(float DeltaTime)
     if (world->IsGameWorld())
     {
         // Edit traces need world-space camera, not actor-local
-        FVector WorldCamPos = CameraPosition + GetActorLocation();
+        FTransform NoScaleTransform(GetActorRotation(), GetActorLocation());
+        FVector WorldCamPos = NoScaleTransform.TransformPosition(CameraPosition);
         double TraceDistance = GetActorScale3D().GetMax() * 3.0;
         double InEditRadius = 300;
         double InEditStrength = 300 * 2;
@@ -265,7 +275,7 @@ void AAdaptiveVoxelActor::Tick(float DeltaTime)
             FHitResult Hit;
             if (world->LineTraceSingleByChannel(Hit, Start, End, ECC_Visibility))
             {
-                FVector LocalHit = Hit.ImpactPoint - GetActorLocation();
+                FVector LocalHit = NoScaleTransform.InverseTransformPosition(Hit.ImpactPoint);
                 RunEditUpdateTask(LocalHit, InEditRadius, InEditStrength, InEditResolution);
                 DrawDebugSphere(world, Hit.ImpactPoint, InEditRadius, 32, FColor::Red, false, DebugDrawTime);
             }
@@ -279,7 +289,7 @@ void AAdaptiveVoxelActor::Tick(float DeltaTime)
             FHitResult Hit;
             if (world->LineTraceSingleByChannel(Hit, Start, End, ECC_Visibility))
             {
-                FVector LocalHit = Hit.ImpactPoint - GetActorLocation();
+                FVector LocalHit = NoScaleTransform.InverseTransformPosition(Hit.ImpactPoint);
                 RunEditUpdateTask(LocalHit, InEditRadius, -InEditStrength, 3);
                 DrawDebugSphere(world, Hit.ImpactPoint, InEditRadius, 32, FColor::Green, false, DebugDrawTime);
             }
