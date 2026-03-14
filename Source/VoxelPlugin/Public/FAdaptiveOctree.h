@@ -5,23 +5,43 @@
 #include "FSparseEditStore.h"
 #include "FAdaptiveOctreeNode.h"
 
-//TODO: COMPLETE PARAM STRUCT, CHANGE CONSTRUCTOR
 struct VOXELPLUGIN_API FOctreeParams {
-    ARealtimeMeshActor* InParentActor; 
-    UMaterialInterface* InSurfaceMaterial; 
-    UMaterialInterface* InOceanMaterial; 
+    // --- Rendering ---
+    ARealtimeMeshActor* ParentActor = nullptr;
+    USceneComponent* MeshAttachmentRoot = nullptr;
+    UMaterialInterface* SurfaceMaterial = nullptr;
+    UMaterialInterface* OceanMaterial = nullptr;
+
+    // --- Data Dependencies ---
     TFunction<void(int, const float*, const float*, const float*, float*)> NoiseFunction;
-    TSharedPtr<FSparseEditStore> InEditStore; 
-    FVector InCenter; 
+    TSharedPtr<FSparseEditStore> EditStore;
 
-    double PlanetRadius; //min surface radius in real world units
-    double InRootExtent = 1.2; //compute a buffer larger than planet radius, dont directly expose
-    double SeaLevel; // should be relative to planet radius 0 at planet radius
-    double NoiseScale;
+    // --- Spatial ---
+    FVector Center = FVector::ZeroVector;
 
-    int InChunkDepth; 
-    int InMinDepth; 
-    int InMaxDepth;
+    // Planet radius: the minimum possible surface elevation.
+    // Noise can only push the surface outward from this radius.
+    double PlanetRadius = 1000.0;
+
+    // Maximum displacement that noise can apply to the surface.
+    // Surface elevation ranges from PlanetRadius to PlanetRadius + NoiseAmplitude.
+    double NoiseAmplitude = 100.0;
+
+    // Sea level as a coefficient of NoiseAmplitude.
+    //  0.0 = sea level at PlanetRadius (no ocean)
+    //  0.5 = sea level halfway through the noise range (~50/50 land/ocean)
+    //  1.0 = sea level at PlanetRadius + NoiseAmplitude (fully submerged)
+    // Values outside [0,1] are valid: -1 ensures no ocean, 2 gives deep ocean.
+    double SeaLevelCoefficient = 0.5;
+
+    // Buffer factor applied when computing root extent from PlanetRadius + NoiseAmplitude.
+    // Ensures the octree bounds always contain all possible surface points.
+    double RootExtentBuffer = 1.05;
+
+    // --- Tree Structure ---
+    int ChunkDepth = 4;
+    int MinDepth = 7;
+    int MaxDepth = 18;
 };
 
 /**
@@ -39,6 +59,8 @@ private:
 
     TWeakObjectPtr<ARealtimeMeshActor> CachedParentActor;
 
+    TWeakObjectPtr<USceneComponent> CachedMeshAttachRoot;
+
     TWeakObjectPtr<UMaterialInterface> CachedSurfaceMaterial;
 
     TWeakObjectPtr<UMaterialInterface> CachedOceanMaterial;
@@ -53,18 +75,23 @@ private:
 
     int ChunkDepth;
 
-    // Centralized terrain parameters -- derived from RootExtent at construction
-    double PlanetRadius;    // RootExtent * 0.9 -- base sphere surface
-    double OceanRadius;     // Sea level radius (initially == PlanetRadius)
-    double NoiseScale;      // RootExtent * 0.1 -- noise displacement amplitude
+    // Centralized terrain parameters -- derived from FOctreeParams at construction
+    double PlanetRadius;    // Minimum surface radius (noise only adds elevation)
+    double OceanRadius;     // Sea level radius, derived from SeaLevelCoefficient
+    double NoiseAmplitude;  // Maximum noise displacement above PlanetRadius
 
     // Composite density sample: combines sphere SDF, noise height, and edit store.
     // Dist: distance from planet center to the sample point.
-    // NoiseHeight: raw noise output for this point.
+    // NoiseHeight: raw noise output in [-1, 1] range.
     // Position: world-space position for edit store lookup.
+    //
+    // Noise is remapped from [-1,1] to [0,1] so that the surface ranges from
+    // PlanetRadius (noise=-1) to PlanetRadius+NoiseAmplitude (noise=+1).
+    // This guarantees PlanetRadius is the minimum possible surface elevation.
     float ComputeDensity(double Dist, float NoiseHeight, FVector Position) const
     {
-        double Height = (double)NoiseHeight * NoiseScale;
+        double Remapped = ((double)NoiseHeight + 1.0) * 0.5; // [-1,1] -> [0,1]
+        double Height = Remapped * NoiseAmplitude;
         return (float)(Dist - (PlanetRadius + Height) + EditStore->Sample(Position));
     }
 
@@ -76,10 +103,10 @@ private:
         double Dist = PlanetRel.Size();
         FVector Dir = (Dist > 1e-10) ? (PlanetRel / Dist) : FVector::UpVector;
         FVector SurfacePos = Dir * RootExtent;
-        double InvNoiseScale = 1.0 / NoiseScale;
-        OutX = (float)(SurfacePos.X * InvNoiseScale);
-        OutY = (float)(SurfacePos.Y * InvNoiseScale);
-        OutZ = (float)(SurfacePos.Z * InvNoiseScale);
+        double InvNoiseAmplitude = 1.0 / NoiseAmplitude;
+        OutX = (float)(SurfacePos.X * InvNoiseAmplitude);
+        OutY = (float)(SurfacePos.Y * InvNoiseAmplitude);
+        OutZ = (float)(SurfacePos.Z * InvNoiseAmplitude);
     }
 
     void SplitToDepth(FAdaptiveOctreeNode* Node, int InMinDepth);
@@ -107,7 +134,7 @@ private:
     void ComputeNodeData(FAdaptiveOctreeNode* Node);
 
 public:
-    FAdaptiveOctree(ARealtimeMeshActor* InParentActor, UMaterialInterface* InSurfaceMaterial, UMaterialInterface* InOceanMaterial, TFunction<void(int, const float*, const float*, const float*, float*)> InDensityFunction, TSharedPtr<FSparseEditStore> InEditStore, FVector InCenter, double InRootExtent, int InChunkDepth, int InMinDepth, int InMaxDepth);
+    explicit FAdaptiveOctree(const FOctreeParams& Params);
 
     void ApplyEdit(FVector InEditCenter, double InEditRadius, double InEditStrength, int InEditResolution);
 
@@ -126,6 +153,6 @@ public:
     // Public accessors for shader/atmosphere/rendering use
     double GetPlanetRadius() const { return PlanetRadius; }
     double GetOceanRadius() const { return OceanRadius; }
-    double GetNoiseScale() const { return NoiseScale; }
+    double GetNoiseAmplitude() const { return NoiseAmplitude; }
     FVector GetPlanetCenter() const { return Root.IsValid() ? Root->Center : FVector::ZeroVector; }
 };

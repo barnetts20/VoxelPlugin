@@ -1,24 +1,31 @@
 #include "FAdaptiveOctree.h"
 #include <FOctreeConstants.h>
 
-FAdaptiveOctree::FAdaptiveOctree(ARealtimeMeshActor* InParentActor, UMaterialInterface* InSurfaceMaterial, UMaterialInterface* InOceanMaterial, TFunction<void(int, const float*, const float*, const float*, float*)> InDensityFunction, TSharedPtr<FSparseEditStore> InEditStore, FVector InCenter, double InRootExtent, int InChunkDepth, int InMinDepth, int InMaxDepth)
+FAdaptiveOctree::FAdaptiveOctree(const FOctreeParams& Params)
 {
-    DensityFunction = InDensityFunction;
-    EditStore = InEditStore;
-    RootExtent = InRootExtent;
-    ChunkExtent = InRootExtent / FMath::Pow(2.0, (double)InChunkDepth);
-    CachedParentActor = InParentActor;
-    CachedSurfaceMaterial = InSurfaceMaterial;
-    CachedOceanMaterial = InOceanMaterial;
-    ChunkDepth = InChunkDepth;
+    DensityFunction = Params.NoiseFunction;
+    EditStore = Params.EditStore;
+    CachedParentActor = Params.ParentActor;
+    CachedMeshAttachRoot = Params.MeshAttachmentRoot;
+    CachedSurfaceMaterial = Params.SurfaceMaterial;
+    CachedOceanMaterial = Params.OceanMaterial;
+    ChunkDepth = Params.ChunkDepth;
 
-    PlanetRadius = InRootExtent * 0.9;
-    OceanRadius = PlanetRadius;
-    NoiseScale = InRootExtent * 0.1;
+    // Core terrain parameters from params
+    PlanetRadius = Params.PlanetRadius;
+    NoiseAmplitude = Params.NoiseAmplitude;
 
-    Root = MakeShared<FAdaptiveOctreeNode>(InCenter, InRootExtent, InChunkDepth, InMinDepth, InMaxDepth);
+    // Derive root extent: must contain all possible surface points
+    RootExtent = (PlanetRadius + NoiseAmplitude) * Params.RootExtentBuffer;
+    ChunkExtent = RootExtent / FMath::Pow(2.0, (double)Params.ChunkDepth);
+
+    // Ocean radius derived from sea level coefficient
+    // SeaLevel 0 = at PlanetRadius, 0.5 = halfway through noise range, 1.0 = fully submerged
+    OceanRadius = PlanetRadius + (Params.SeaLevelCoefficient * NoiseAmplitude);
+
+    Root = MakeShared<FAdaptiveOctreeNode>(Params.Center, RootExtent, Params.ChunkDepth, Params.MinDepth, Params.MaxDepth);
     ComputeNodeData(Root.Get());
-    SplitToDepth(Root.Get(), InChunkDepth);
+    SplitToDepth(Root.Get(), Params.ChunkDepth);
 
     PopulateChunks();
 }
@@ -72,6 +79,7 @@ void FAdaptiveOctree::PopulateChunks()
     ParallelFor(Chunks.Num(), [&](int32 i) {
         NewChunks[i] = MakeShared<FMeshChunk>();
         NewChunks[i]->CachedParentActor = CachedParentActor;
+        NewChunks[i]->CachedMeshAttachRoot = CachedMeshAttachRoot;
         NewChunks[i]->CachedSurfaceMaterial = CachedSurfaceMaterial;
         NewChunks[i]->CachedOceanMaterial = CachedOceanMaterial;
         NewChunks[i]->InitializeData(Chunks[i]->Center, Chunks[i]->Extent);
@@ -111,6 +119,7 @@ void FAdaptiveOctree::UpdateChunkMap(TSharedPtr<FAdaptiveOctreeNode> ChunkNode, 
     {
         TSharedPtr<FMeshChunk> NewChunk = MakeShared<FMeshChunk>();
         NewChunk->CachedParentActor = CachedParentActor;
+        NewChunk->CachedMeshAttachRoot = CachedMeshAttachRoot;
         NewChunk->CachedSurfaceMaterial = CachedSurfaceMaterial;
         NewChunk->CachedOceanMaterial = CachedOceanMaterial;
         NewChunk->InitializeData(ChunkNode->Center, ChunkNode->Extent);
@@ -133,6 +142,7 @@ void FAdaptiveOctree::UpdateChunkMap(TSharedPtr<FAdaptiveOctreeNode> ChunkNode, 
 
             TSharedPtr<FMeshChunk> NeighborChunk = MakeShared<FMeshChunk>();
             NeighborChunk->CachedParentActor = CachedParentActor;
+            NeighborChunk->CachedMeshAttachRoot = CachedMeshAttachRoot;
             NeighborChunk->CachedSurfaceMaterial = CachedSurfaceMaterial;
             NeighborChunk->CachedOceanMaterial = CachedOceanMaterial;
             NeighborChunk->InitializeData(NeighborRaw->Center, NeighborRaw->Extent);

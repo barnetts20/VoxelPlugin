@@ -81,6 +81,7 @@ struct VOXELPLUGIN_API FMeshStreamData {
 
 struct VOXELPLUGIN_API FMeshChunk {
     TWeakObjectPtr<ARealtimeMeshActor> CachedParentActor;
+    TWeakObjectPtr<USceneComponent> CachedMeshAttachRoot;
 
     TWeakObjectPtr <UMaterialInterface> CachedSurfaceMaterial;
     TWeakObjectPtr <UMaterialInterface> CachedOceanMaterial;
@@ -121,7 +122,7 @@ struct VOXELPLUGIN_API FMeshChunk {
         OceanMeshData->MeshSectionKey = FRealtimeMeshSectionKey::CreateForPolyGroup(OceanMeshData->MeshGroupKey, 0);
     };
 
-    void InitializeComponent(ARealtimeMeshActor* InParentActor, UMaterialInterface* InSurfaceMaterial, UMaterialInterface* InOceanMaterial) {
+    void InitializeComponent(ARealtimeMeshActor* InParentActor, USceneComponent* InAttachRoot, UMaterialInterface* InSurfaceMaterial, UMaterialInterface* InOceanMaterial) {
         FRealtimeMeshCollisionConfiguration cConfig;
         cConfig.bShouldFastCookMeshes = false;
         cConfig.bUseComplexAsSimpleCollision = true;
@@ -139,7 +140,7 @@ struct VOXELPLUGIN_API FMeshChunk {
         ChunkRtComponent->SetMaterial(0, InSurfaceMaterial);
         ChunkRtComponent->SetMaterial(1, InOceanMaterial);
 
-        ChunkRtComponent->AttachToComponent(InParentActor->GetRootComponent(), FAttachmentTransformRules::KeepRelativeTransform);
+        ChunkRtComponent->AttachToComponent(InAttachRoot, FAttachmentTransformRules::KeepRelativeTransform);
         ChunkRtComponent->SetRelativeLocation(ChunkCenter);
         ChunkRtComponent->SetCollisionEnabled(ECollisionEnabled::QueryAndPhysics);
         ChunkRtComponent->SetCollisionResponseToAllChannels(ECollisionResponse::ECR_Block);
@@ -170,10 +171,11 @@ struct VOXELPLUGIN_API FMeshChunk {
             // 1. Lazy Init
             if (!Self->IsInitialized) {
                 ARealtimeMeshActor* Parent = Self->CachedParentActor.Get();
+                USceneComponent* AttachRoot = Self->CachedMeshAttachRoot.Get();
                 UMaterialInterface* SurfaceMaterial = Self->CachedSurfaceMaterial.Get();
                 UMaterialInterface* OceanMaterial = Self->CachedOceanMaterial.Get();
-                if (!Parent || !SurfaceMaterial || !OceanMaterial) return;
-                Self->InitializeComponent(Parent, SurfaceMaterial, OceanMaterial);
+                if (!Parent || !AttachRoot || !SurfaceMaterial || !OceanMaterial) return;
+                Self->InitializeComponent(Parent, AttachRoot, SurfaceMaterial, OceanMaterial);
             }
 
             // 2. Ensure valid component pointers

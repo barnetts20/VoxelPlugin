@@ -13,6 +13,16 @@ AAdaptiveVoxelActor::AAdaptiveVoxelActor()
     CameraPosition = FVector(0, 0, 0);
     SurfaceMaterial = UMaterial::GetDefaultMaterial(EMaterialDomain::MD_Surface);
     OceanMaterial = UMaterial::GetDefaultMaterial(EMaterialDomain::MD_Surface);
+
+    // Default scale defines planet radius in world units (cm).
+    // 80,000,000 cm = 800 km radius planet.
+    SetActorScale3D(FVector(80000000.0));
+
+    // Mesh chunks attach to this component instead of the actor root.
+    // bAbsoluteScale prevents actor scale from being inherited by mesh geometry.
+    MeshAttachmentRoot = CreateDefaultSubobject<USceneComponent>(TEXT("MeshAttachmentRoot"));
+    MeshAttachmentRoot->SetupAttachment(GetRootComponent());
+    MeshAttachmentRoot->SetAbsolute(false, false, true);
 }
 
 void AAdaptiveVoxelActor::BeginDestroy()
@@ -32,6 +42,13 @@ void AAdaptiveVoxelActor::BeginDestroy()
 void AAdaptiveVoxelActor::OnConstruction(const FTransform& Transform)
 {
     Super::OnConstruction(Transform);
+
+    // Lock all scale axes to the max component to keep the planet spherical
+    FVector CurrentScale = GetActorScale3D();
+    double MaxScale = FMath::Max3(FMath::Abs(CurrentScale.X), FMath::Abs(CurrentScale.Y), FMath::Abs(CurrentScale.Z));
+    if (MaxScale < 1.0) MaxScale = 1.0;
+    SetActorScale3D(FVector(MaxScale));
+
     // Ensure we are not in a preview world (prevents running in editor mode)
     if (GetWorld() && !GetWorld()->IsPreviewWorld() && TickInEditor)
     {
@@ -47,7 +64,7 @@ void AAdaptiveVoxelActor::BeginPlay()
 
 void AAdaptiveVoxelActor::CleanSceneRoot()
 {
-    auto destroyComponentArray = GetRootComponent()->GetAttachChildren();
+    auto destroyComponentArray = MeshAttachmentRoot->GetAttachChildren();
     for (TObjectPtr<USceneComponent> child : destroyComponentArray)
     {
         URealtimeMeshComponent* meshComponent = Cast<URealtimeMeshComponent>(child);
@@ -66,14 +83,38 @@ void AAdaptiveVoxelActor::Initialize()
 
     auto DensityFunction = [this](int Count, const float* XPos, const float* YPos, const float* ZPos, float* OutNoise) {
         Noise->GenPositionArray3D(OutNoise, Count, XPos, YPos, ZPos, 0, 0, 0, 0);
-    };
+        };
 
-    TSharedPtr<FSparseEditStore> EditStore = MakeShared<FSparseEditStore>(GetActorLocation(), Size, ChunkDepth, MaxDepth);
-    AdaptiveOctree = MakeShared<FAdaptiveOctree>(this, SurfaceMaterial, OceanMaterial, DensityFunction, EditStore, GetActorLocation(), Size, ChunkDepth, MinDepth, MaxDepth);
+    // PlanetRadius is the max component of actor scale (all axes locked to same value).
+    // This is the minimum possible surface elevation — noise only adds height above it.
+    double ActorPlanetRadius = GetActorScale3D().GetMax();
+    double ActorNoiseAmplitude = ActorPlanetRadius * NoiseAmplitudeRatio;
+    double ActorRootExtent = (ActorPlanetRadius + ActorNoiseAmplitude) * 1.05;
+
+    // Everything is built in actor-local space (origin 0,0,0).
+    // MeshAttachmentRoot handles world placement by following the actor.
+    TSharedPtr<FSparseEditStore> EditStore = MakeShared<FSparseEditStore>(FVector::ZeroVector, ActorRootExtent, ChunkDepth, MaxDepth);
+
+    FOctreeParams Params;
+    Params.ParentActor = this;
+    Params.MeshAttachmentRoot = MeshAttachmentRoot;
+    Params.SurfaceMaterial = SurfaceMaterial;
+    Params.OceanMaterial = OceanMaterial;
+    Params.NoiseFunction = DensityFunction;
+    Params.EditStore = EditStore;
+    Params.Center = FVector::ZeroVector;
+    Params.PlanetRadius = ActorPlanetRadius;
+    Params.NoiseAmplitude = ActorNoiseAmplitude;
+    Params.SeaLevelCoefficient = SeaLevelCoefficient;
+    Params.ChunkDepth = ChunkDepth;
+    Params.MinDepth = MinDepth;
+    Params.MaxDepth = MaxDepth;
+
+    AdaptiveOctree = MakeShared<FAdaptiveOctree>(Params);
 
     Initialized = true;
 
-    // Clear both timers — only DataUpdate timer is used now as the chain starter
+    // Clear both timers only DataUpdate timer is used now as the chain starter
     if (UWorld* World = GetWorld())
     {
         World->GetTimerManager().ClearTimer(DataUpdateTimerHandle);
@@ -192,7 +233,9 @@ void AAdaptiveVoxelActor::Tick(float DeltaTime)
         auto viewLocations = world->ViewLocationsRenderedLastFrame;
         if (viewLocations.Num() > 0)
         {
-            this->CameraPosition = viewLocations[0];
+            // Convert world-space camera to actor-local space (octree is built at origin).
+            FVector WorldCamPos = viewLocations[0];
+            this->CameraPosition = WorldCamPos - GetActorLocation();
 
             APlayerCameraManager* CamManager = UGameplayStatics::GetPlayerCameraManager(world, 0);
             if (CamManager)
@@ -205,6 +248,9 @@ void AAdaptiveVoxelActor::Tick(float DeltaTime)
     //Example of edit flow, would want to move off tick for actual implementation
     if (world->IsGameWorld())
     {
+        // Edit traces need world-space camera, not actor-local
+        FVector WorldCamPos = CameraPosition + GetActorLocation();
+        double TraceDistance = GetActorScale3D().GetMax() * 3.0;
         double InEditRadius = 300;
         double InEditStrength = 300 * 2;
         int InEditResolution = 3;
@@ -212,27 +258,29 @@ void AAdaptiveVoxelActor::Tick(float DeltaTime)
         APlayerController* PC = UGameplayStatics::GetPlayerController(world, 0);
         if (PC && PC->IsInputKeyDown(EKeys::E) && !EditUpdateIsRunning)
         {
-            FVector Start = CameraPosition;
+            FVector Start = WorldCamPos;
             FVector Forward = PC->GetControlRotation().Vector();
-            FVector End = Start + Forward * Size;
+            FVector End = Start + Forward * TraceDistance;
 
             FHitResult Hit;
             if (world->LineTraceSingleByChannel(Hit, Start, End, ECC_Visibility))
             {
-                RunEditUpdateTask(Hit.ImpactPoint, InEditRadius, InEditStrength, InEditResolution);
+                FVector LocalHit = Hit.ImpactPoint - GetActorLocation();
+                RunEditUpdateTask(LocalHit, InEditRadius, InEditStrength, InEditResolution);
                 DrawDebugSphere(world, Hit.ImpactPoint, InEditRadius, 32, FColor::Red, false, DebugDrawTime);
             }
         }
         if (PC && PC->IsInputKeyDown(EKeys::Q) && !EditUpdateIsRunning)
         {
-            FVector Start = CameraPosition;
+            FVector Start = WorldCamPos;
             FVector Forward = PC->GetControlRotation().Vector();
-            FVector End = Start + Forward * Size;
+            FVector End = Start + Forward * TraceDistance;
 
             FHitResult Hit;
             if (world->LineTraceSingleByChannel(Hit, Start, End, ECC_Visibility))
             {
-                RunEditUpdateTask(Hit.ImpactPoint, InEditRadius, -InEditStrength, 3);
+                FVector LocalHit = Hit.ImpactPoint - GetActorLocation();
+                RunEditUpdateTask(LocalHit, InEditRadius, -InEditStrength, 3);
                 DrawDebugSphere(world, Hit.ImpactPoint, InEditRadius, 32, FColor::Green, false, DebugDrawTime);
             }
         }
