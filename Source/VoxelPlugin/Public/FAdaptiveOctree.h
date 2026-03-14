@@ -80,6 +80,10 @@ private:
     double OceanRadius;     // Sea level radius, derived from SeaLevelCoefficient
     double NoiseAmplitude;  // Maximum noise displacement above PlanetRadius
 
+    // Triplanar UV scale: produces consistent UV tiling regardless of tree scale.
+    // Calibrated so that ~8000 UV wraps occur across the planet diameter.
+    double TriplanarUVScale;
+
     // Composite density sample: combines sphere SDF, noise height, and edit store.
     // Dist: distance from planet center to the sample point.
     // NoiseHeight: raw noise output in [-1, 1] range.
@@ -121,7 +125,7 @@ private:
 
     void UpdateMeshChunkStreamData(TSharedPtr<FMeshChunk> InChunk);
 
-    static FVector2f ComputeTriplanarUV(FVector Position, FVector Normal);
+    FVector2f ComputeTriplanarUV(FVector Position, FVector Normal) const;
 
     FEdgeNeighbors SampleNodesAroundEdge(const FNodeEdge& Edge);
 

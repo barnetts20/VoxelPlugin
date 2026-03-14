@@ -19,9 +19,16 @@ FAdaptiveOctree::FAdaptiveOctree(const FOctreeParams& Params)
     RootExtent = (PlanetRadius + NoiseAmplitude) * Params.RootExtentBuffer;
     ChunkExtent = RootExtent / FMath::Pow(2.0, (double)Params.ChunkDepth);
 
+    // Configure edge key quantization for this tree's scale.
+    // Maps the smallest possible corner spacing to ~1 grid unit.
+    FEdgeKey::InvGridSize = FMath::Pow(2.0, (double)Params.MaxDepth) / RootExtent;
+
     // Ocean radius derived from sea level coefficient
     // SeaLevel 0 = at PlanetRadius, 0.5 = halfway through noise range, 1.0 = fully submerged
     OceanRadius = PlanetRadius + (Params.SeaLevelCoefficient * NoiseAmplitude);
+
+    // UV scale: 0.0001 was calibrated for PlanetRadius=80M. Keep the same visual tiling.
+    TriplanarUVScale = 0.0001 * (80000000.0 / FMath::Max(PlanetRadius, 1.0));
 
     Root = MakeShared<FAdaptiveOctreeNode>(Params.Center, RootExtent, Params.ChunkDepth, Params.MinDepth, Params.MaxDepth);
     ComputeNodeData(Root.Get());
@@ -312,22 +319,23 @@ void FAdaptiveOctree::ReconstructSubtree(FAdaptiveOctreeNode* Node, FVector Edit
     FinalizeSubtree(Node, EditCenter, SearchRadius);
 }
 
-FVector2f FAdaptiveOctree::ComputeTriplanarUV(FVector Position, FVector Normal)
+FVector2f FAdaptiveOctree::ComputeTriplanarUV(FVector Position, FVector Normal) const
 {
     FVector2f UV;
     FVector AbsNormal = Normal.GetAbs();
+    float Scale = (float)TriplanarUVScale;
 
     if (AbsNormal.X > AbsNormal.Y && AbsNormal.X > AbsNormal.Z)
     {
-        UV = FVector2f(Position.Y, Position.Z) * 0.0001f;
+        UV = FVector2f(Position.Y, Position.Z) * Scale;
     }
     else if (AbsNormal.Y > AbsNormal.X && AbsNormal.Y > AbsNormal.Z)
     {
-        UV = FVector2f(Position.X, Position.Z) * 0.0001f;
+        UV = FVector2f(Position.X, Position.Z) * Scale;
     }
     else
     {
-        UV = FVector2f(Position.X, Position.Y) * 0.0001f;
+        UV = FVector2f(Position.X, Position.Y) * Scale;
     }
 
     return UV;
@@ -347,7 +355,7 @@ void FAdaptiveOctree::UpdateMeshChunkStreamData(TSharedPtr<FMeshChunk> InChunk)
     TArray<FEdgeVertexData> AllEdgeData;
     AllEdgeData.SetNum(InChunk->ChunkEdges.Num());
 
-    double OceanTriThreshold = -1000;
+    double OceanTriThreshold = -NoiseAmplitude;
 
     ParallelFor(InChunk->ChunkEdges.Num(), [&](int32 edgeIdx) {
         const FNodeEdge currentEdge = InChunk->ChunkEdges[edgeIdx];
@@ -498,7 +506,10 @@ void FAdaptiveOctree::UpdateMeshChunkStreamData(TSharedPtr<FMeshChunk> InChunk)
         OcnTangentStream.Set(VertIdx, OcnTangent);
 
         float absDepth = FMath::Max(Vertex.Depth, 0.0f);
-        uint32 intDepth = (uint32)FMath::Min(absDepth * 1000.0f, 4294967295.0f);
+        // Encode depth as fixed-point in vertex color, normalized by NoiseAmplitude.
+        // At any scale, a depth of NoiseAmplitude encodes to the same integer range.
+        float DepthEncodeScale = (float)(1000.0 * (80000000.0 / FMath::Max(PlanetRadius, 1.0)));
+        uint32 intDepth = (uint32)FMath::Min(absDepth * DepthEncodeScale, 4294967295.0f);
         uint8 R = (intDepth >> 24) & 0xFF;
         uint8 G = (intDepth >> 16) & 0xFF;
         uint8 B = (intDepth >> 8) & 0xFF;
@@ -597,7 +608,7 @@ void FAdaptiveOctree::UpdateLOD(FVector CameraPosition, double InScreenSpaceThre
     double t0 = FPlatformTime::Seconds();
     ParallelFor(NumChunks, [&](int32 idx) {
         FAdaptiveOctreeNode* ChunkNode = Chunks[idx].Get();
-        double DistSq = FMath::Max(FVector::DistSquared(ChunkNode->Center, CameraPosition), 1.0);
+        double DistSq = FMath::Max(FVector::DistSquared(ChunkNode->Center, CameraPosition), 1e-12);
         bool CouldSplit = FAdaptiveOctreeNode::EvaluateSplit(ChunkNode->Extent, DistSq, FOVScale, InScreenSpaceThreshold, ChunkNode->Index.Depth, ChunkNode->DepthBounds[1], ChunkNode->DepthBounds[2]);
         double SmallestExtent = ChunkNode->Extent / (double)(1 << (ChunkNode->DepthBounds[1] - ChunkNode->Index.Depth));
         bool CouldMerge = FAdaptiveOctreeNode::EvaluateMerge(SmallestExtent, DistSq, FOVScale, InScreenSpaceThreshold, ChunkNode->DepthBounds[1], ChunkNode->DepthBounds[0], ChunkNode->DepthBounds[2]);

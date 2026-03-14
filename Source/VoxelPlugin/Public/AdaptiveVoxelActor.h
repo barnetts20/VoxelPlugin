@@ -21,8 +21,8 @@ class VOXELPLUGIN_API AAdaptiveVoxelActor : public ARealtimeMeshActor
 private:
     TSharedPtr<FAdaptiveOctree> AdaptiveOctree;
 
-    // Scene component with absolute scale — mesh chunks attach here
-    // so they are not affected by actor scale (which is used as a parameter source only).
+    // Mesh chunks attach to this component. Inherits full actor transform
+    // (position, rotation, scale) so normalized-space geometry is scaled to world size.
     UPROPERTY()
     TObjectPtr<USceneComponent> MeshAttachmentRoot;
 
@@ -35,8 +35,6 @@ private:
     FRWLock OctreeLock;
 
     bool TickInEditor = true;
-
-    double LastConstructedScale = 0.0;
 
     FastNoise::SmartNode<> Noise;
 

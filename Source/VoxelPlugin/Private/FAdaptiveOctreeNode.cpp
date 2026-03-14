@@ -156,14 +156,14 @@ bool FAdaptiveOctreeNode::ShouldSplit(FVector TreeCenter, FVector InCameraPositi
         if (DotSq > ThreshSq) return false;
     }
 
-    double DistSq = FMath::Max(FVector::DistSquared(DualContourPosition, InCameraPosition), 1.0);
+    double DistSq = FMath::Max(FVector::DistSquared(DualContourPosition, InCameraPosition), 1e-12);
     return EvaluateSplit(Extent, DistSq, InFOVScale, InScreenSpaceThreshold, Index.Depth, DepthBounds[1], DepthBounds[2]);
 }
 
 bool FAdaptiveOctreeNode::ShouldMerge(FVector InCameraPosition, double InScreenSpaceThreshold, double InFOVScale)
 {
     if (LodOverride) return false;
-    double DistSq = FMath::Max(FVector::DistSquared(DualContourPosition, InCameraPosition), 1.0);
+    double DistSq = FMath::Max(FVector::DistSquared(DualContourPosition, InCameraPosition), 1e-12);
     return EvaluateMerge(Extent, DistSq, InFOVScale, InScreenSpaceThreshold, Index.Depth, DepthBounds[0], DepthBounds[2]);
 }
 

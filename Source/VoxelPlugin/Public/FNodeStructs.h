@@ -5,7 +5,7 @@
 #include "CoreMinimal.h"
 struct FAdaptiveOctreeNode;
 /**
- * 
+ *
  */
 struct VOXELPLUGIN_API FNodeCorner {
     FVector Position;
@@ -23,7 +23,9 @@ struct VOXELPLUGIN_API FEdgeKey
     uint8 Axis;
     uint32 CachedHash;
 
-    static constexpr double InvGridSize = 1.0;
+    // Set once by FAdaptiveOctree at construction.
+    // Value: 2^MaxDepth / RootExtent — maps the smallest possible edge to ~1 grid unit.
+    static inline double InvGridSize = 1.0;
 
     static int32 Quantize(double V)
     {

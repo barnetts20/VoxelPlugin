@@ -19,10 +19,10 @@ AAdaptiveVoxelActor::AAdaptiveVoxelActor()
     SetActorScale3D(FVector(80000000.0));
 
     // Mesh chunks attach to this component instead of the actor root.
-    // bAbsoluteScale prevents actor scale from being inherited by mesh geometry.
+    // Inherits actor transform (position, rotation, scale) so normalized-space geometry
+    // is placed and scaled to world size by the actor transform.
     MeshAttachmentRoot = CreateDefaultSubobject<USceneComponent>(TEXT("MeshAttachmentRoot"));
     MeshAttachmentRoot->SetupAttachment(GetRootComponent());
-    MeshAttachmentRoot->SetAbsolute(false, false, true);
 }
 
 void AAdaptiveVoxelActor::BeginDestroy()
@@ -43,23 +43,22 @@ void AAdaptiveVoxelActor::OnConstruction(const FTransform& Transform)
 {
     Super::OnConstruction(Transform);
 
-    // Lock all scale axes to the max component to keep the planet spherical
-    FVector CurrentScale = GetActorScale3D();
-    double MaxScale = FMath::Max3(FMath::Abs(CurrentScale.X), FMath::Abs(CurrentScale.Y), FMath::Abs(CurrentScale.Z));
-    if (MaxScale < 1.0) MaxScale = 1.0;
-    SetActorScale3D(FVector(MaxScale));
+    // Lock all scale axes to the max component to keep the planet spherical.
+    // Only override if axes actually differ to avoid fighting the editor drag.
+    //FVector CurrentScale = GetActorScale3D();
+    //double MaxScale = FMath::Max3(FMath::Abs(CurrentScale.X), FMath::Abs(CurrentScale.Y), FMath::Abs(CurrentScale.Z));
+    //if (MaxScale < 1.0) MaxScale = 1.0;
+    //if (!CurrentScale.Equals(FVector(MaxScale), 0.01))
+    //{
+    //    SetActorScale3D(FVector(MaxScale));
+    //}
 
-    // Only reinitialize if scale changed (affects planet radius).
-    // Position/rotation changes are handled by MeshAttachmentRoot + local-space camera.
-    bool bScaleChanged = !FMath::IsNearlyEqual(MaxScale, LastConstructedScale, 1.0);
-
-    if (GetWorld() && !GetWorld()->IsPreviewWorld() && TickInEditor)
+    // Only initialize once. The octree is built in normalized space, so
+    // position/rotation/scale changes are all handled by the actor transform
+    // without requiring reconstruction.
+    if (GetWorld() && !GetWorld()->IsPreviewWorld() && TickInEditor && !Initialized)
     {
-        if (!Initialized || bScaleChanged)
-        {
-            LastConstructedScale = MaxScale;
-            Initialize();
-        }
+        Initialize();
     }
 }
 
@@ -92,15 +91,16 @@ void AAdaptiveVoxelActor::Initialize()
         Noise->GenPositionArray3D(OutNoise, Count, XPos, YPos, ZPos, 0, 0, 0, 0);
         };
 
-    // PlanetRadius is the max component of actor scale (all axes locked to same value).
-    // This is the minimum possible surface elevation — noise only adds height above it.
-    double ActorPlanetRadius = GetActorScale3D().GetMax();
-    double ActorNoiseAmplitude = ActorPlanetRadius * NoiseAmplitudeRatio;
-    double ActorRootExtent = (ActorPlanetRadius + ActorNoiseAmplitude) * 1.05;
+    // Octree is built in normalized space: PlanetRadius = 1.0.
+    // Actor scale transforms the mesh to world size.
+    // NoiseAmplitude is relative to the unit radius.
+    double NormalizedPlanetRadius = 1.0;
+    double NormalizedNoiseAmplitude = NoiseAmplitudeRatio;
+    double NormalizedRootExtent = (NormalizedPlanetRadius + NormalizedNoiseAmplitude) * 1.05;
 
-    // Everything is built in actor-local space (origin 0,0,0).
-    // MeshAttachmentRoot handles world placement by following the actor.
-    TSharedPtr<FSparseEditStore> EditStore = MakeShared<FSparseEditStore>(FVector::ZeroVector, ActorRootExtent, ChunkDepth, MaxDepth);
+    // Everything is built in actor-local normalized space (origin 0,0,0).
+    // MeshAttachmentRoot handles world placement and scaling via the actor transform.
+    TSharedPtr<FSparseEditStore> EditStore = MakeShared<FSparseEditStore>(FVector::ZeroVector, NormalizedRootExtent, ChunkDepth, MaxDepth);
 
     FOctreeParams Params;
     Params.ParentActor = this;
@@ -110,8 +110,8 @@ void AAdaptiveVoxelActor::Initialize()
     Params.NoiseFunction = DensityFunction;
     Params.EditStore = EditStore;
     Params.Center = FVector::ZeroVector;
-    Params.PlanetRadius = ActorPlanetRadius;
-    Params.NoiseAmplitude = ActorNoiseAmplitude;
+    Params.PlanetRadius = NormalizedPlanetRadius;
+    Params.NoiseAmplitude = NormalizedNoiseAmplitude;
     Params.SeaLevelCoefficient = SeaLevelCoefficient;
     Params.ChunkDepth = ChunkDepth;
     Params.MinDepth = MinDepth;
@@ -240,11 +240,11 @@ void AAdaptiveVoxelActor::Tick(float DeltaTime)
         auto viewLocations = world->ViewLocationsRenderedLastFrame;
         if (viewLocations.Num() > 0)
         {
-            // Convert world-space camera to actor-local space (octree is built at origin).
-            // Uses a scale-less transform since the octree operates in unscaled local space.
+            // Convert world-space camera to normalized actor-local space.
+            // Full inverse transform includes position, rotation, AND scale
+            // since the octree is built in normalized space (radius ~1.0).
             FVector WorldCamPos = viewLocations[0];
-            FTransform NoScaleTransform(GetActorRotation(), GetActorLocation());
-            this->CameraPosition = NoScaleTransform.InverseTransformPosition(WorldCamPos);
+            this->CameraPosition = GetActorTransform().InverseTransformPosition(WorldCamPos);
 
             APlayerCameraManager* CamManager = UGameplayStatics::GetPlayerCameraManager(world, 0);
             if (CamManager)
@@ -257,12 +257,17 @@ void AAdaptiveVoxelActor::Tick(float DeltaTime)
     //Example of edit flow, would want to move off tick for actual implementation
     if (world->IsGameWorld())
     {
-        // Edit traces need world-space camera, not actor-local
-        FTransform NoScaleTransform(GetActorRotation(), GetActorLocation());
-        FVector WorldCamPos = NoScaleTransform.TransformPosition(CameraPosition);
-        double TraceDistance = GetActorScale3D().GetMax() * 3.0;
-        double InEditRadius = 300;
-        double InEditStrength = 300 * 2;
+        // Convert between normalized local space and world space using full actor transform
+        FTransform ActorTransform = GetActorTransform();
+        FVector WorldCamPos = ActorTransform.TransformPosition(CameraPosition);
+        double ActorScale = GetActorScale3D().GetMax();
+        double TraceDistance = ActorScale * 3.0;
+
+        // World-space edit parameters, converted to normalized space for the octree
+        double WorldEditRadius = 300;
+        double WorldEditStrength = 300 * 2;
+        double LocalEditRadius = WorldEditRadius / ActorScale;
+        double LocalEditStrength = WorldEditStrength / ActorScale;
         int InEditResolution = 3;
         float DebugDrawTime = .1f;
         APlayerController* PC = UGameplayStatics::GetPlayerController(world, 0);
@@ -275,9 +280,9 @@ void AAdaptiveVoxelActor::Tick(float DeltaTime)
             FHitResult Hit;
             if (world->LineTraceSingleByChannel(Hit, Start, End, ECC_Visibility))
             {
-                FVector LocalHit = NoScaleTransform.InverseTransformPosition(Hit.ImpactPoint);
-                RunEditUpdateTask(LocalHit, InEditRadius, InEditStrength, InEditResolution);
-                DrawDebugSphere(world, Hit.ImpactPoint, InEditRadius, 32, FColor::Red, false, DebugDrawTime);
+                FVector LocalHit = ActorTransform.InverseTransformPosition(Hit.ImpactPoint);
+                RunEditUpdateTask(LocalHit, LocalEditRadius, LocalEditStrength, InEditResolution);
+                DrawDebugSphere(world, Hit.ImpactPoint, WorldEditRadius, 32, FColor::Red, false, DebugDrawTime);
             }
         }
         if (PC && PC->IsInputKeyDown(EKeys::Q) && !EditUpdateIsRunning)
@@ -289,9 +294,9 @@ void AAdaptiveVoxelActor::Tick(float DeltaTime)
             FHitResult Hit;
             if (world->LineTraceSingleByChannel(Hit, Start, End, ECC_Visibility))
             {
-                FVector LocalHit = NoScaleTransform.InverseTransformPosition(Hit.ImpactPoint);
-                RunEditUpdateTask(LocalHit, InEditRadius, -InEditStrength, 3);
-                DrawDebugSphere(world, Hit.ImpactPoint, InEditRadius, 32, FColor::Green, false, DebugDrawTime);
+                FVector LocalHit = ActorTransform.InverseTransformPosition(Hit.ImpactPoint);
+                RunEditUpdateTask(LocalHit, LocalEditRadius, -LocalEditStrength, 3);
+                DrawDebugSphere(world, Hit.ImpactPoint, WorldEditRadius, 32, FColor::Green, false, DebugDrawTime);
             }
         }
     }
