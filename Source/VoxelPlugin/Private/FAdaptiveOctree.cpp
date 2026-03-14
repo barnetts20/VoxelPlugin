@@ -430,32 +430,6 @@ void FAdaptiveOctree::UpdateMeshChunkStreamData(TSharedPtr<FMeshChunk> InChunk)
     }
 
     // Compact ocean vertices -- only include vertices actually referenced by OcnTriangles
-    TArray<FMeshVertex> OcnUniqueVertices;
-    TMap<int32, int32> OcnVertexRemap;
-    OcnUniqueVertices.Reserve(OcnTriangles.Num() * 3);
-    OcnVertexRemap.Reserve(OcnTriangles.Num() * 3);
-
-    for (FIndex3UI& Tri : OcnTriangles)
-    {
-        auto Remap = [&](uint32& Idx)
-            {
-                int32* NewIdx = OcnVertexRemap.Find((int32)Idx);
-                if (NewIdx)
-                {
-                    Idx = (uint32)*NewIdx;
-                }
-                else
-                {
-                    int32 NewIndex = OcnUniqueVertices.Num();
-                    OcnUniqueVertices.Add(UniqueVertices[(int32)Idx]);
-                    OcnVertexRemap.Add((int32)Idx, NewIndex);
-                    Idx = (uint32)NewIndex;
-                }
-            };
-        Remap(Tri.V0);
-        Remap(Tri.V1);
-        Remap(Tri.V2);
-    }
 
     TSharedPtr<FMeshStreamData> UpdatedSurfaceData = MakeShared<FMeshStreamData>();
     UpdatedSurfaceData->MeshGroupKey = InChunk->SurfaceMeshData->MeshGroupKey;
@@ -486,10 +460,10 @@ void FAdaptiveOctree::UpdateMeshChunkStreamData(TSharedPtr<FMeshChunk> InChunk)
     SrfTriangleStream.SetNumUninitialized(SrfTriangles.Num());
     SrfPolygroupStream.SetNumUninitialized(SrfTriangles.Num());
 
-    OcnPositionStream.SetNumUninitialized(OcnUniqueVertices.Num());
-    OcnTangentStream.SetNumUninitialized(OcnUniqueVertices.Num());
-    OcnColorStream.SetNumUninitialized(OcnUniqueVertices.Num());
-    OcnTexCoordStream.SetNumUninitialized(OcnUniqueVertices.Num());
+    OcnPositionStream.SetNumUninitialized(UniqueVertices.Num());
+    OcnTangentStream.SetNumUninitialized(UniqueVertices.Num());
+    OcnColorStream.SetNumUninitialized(UniqueVertices.Num());
+    OcnTexCoordStream.SetNumUninitialized(UniqueVertices.Num());
     OcnTriangleStream.SetNumUninitialized(OcnTriangles.Num());
     OcnPolygroupStream.SetNumUninitialized(OcnTriangles.Num());
 
@@ -507,8 +481,8 @@ void FAdaptiveOctree::UpdateMeshChunkStreamData(TSharedPtr<FMeshChunk> InChunk)
         SrfTexCoordStream.Set(VertIdx, ComputeTriplanarUV(WorldPos, Vertex.Normal));
         });
 
-    ParallelFor(OcnUniqueVertices.Num(), [&](int32 VertIdx) {
-        FMeshVertex& Vertex = OcnUniqueVertices[VertIdx];
+    ParallelFor(UniqueVertices.Num(), [&](int32 VertIdx) {
+        FMeshVertex& Vertex = UniqueVertices[VertIdx];
         FVector WorldPos = FVector(Vertex.Position) + ChunkCenter;
 
         OcnPositionStream.Set(VertIdx, Vertex.NormalizedPosition);
