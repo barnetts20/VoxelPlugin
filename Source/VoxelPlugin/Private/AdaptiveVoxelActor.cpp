@@ -48,7 +48,7 @@ void AAdaptiveVoxelActor::OnConstruction(const FTransform& Transform)
     {
         // Only reconstruct if not yet initialized or scale changed.
         // Position/rotation are handled live by the actor transform.
-        if (!Initialized || !GetActorScale3D().Equals(LastInitScale, 0.01))
+        if (!Initialized || !GetActorScale3D().Equals(LastInitScale, 0.01) || bEnableOcean != LastInitOceanEnabled)
         {
             Initialize();
         }
@@ -129,10 +129,12 @@ void AAdaptiveVoxelActor::Initialize()
     Params.ChunkDepth = ChunkDepth;
     Params.MinDepth = MinDepth;
     Params.MaxDepth = MaxDepth;
+    Params.bEnableOcean = bEnableOcean;
 
     AdaptiveOctree = MakeShared<FAdaptiveOctree>(Params);
 
     LastInitScale = GetActorScale3D();
+    LastInitOceanEnabled = bEnableOcean;
     Initialized = true;
 
     RunDataUpdateTask();

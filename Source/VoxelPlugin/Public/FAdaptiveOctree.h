@@ -42,6 +42,10 @@ struct VOXELPLUGIN_API FOctreeParams {
     int ChunkDepth = 4;
     int MinDepth = 7;
     int MaxDepth = 18;
+
+    // --- Ocean ---
+    // When false, skips ocean mesh generation, ocean LOD distance, and ocean position caching.
+    bool bEnableOcean = true;
 };
 
 /**
@@ -84,6 +88,8 @@ private:
     // Calibrated so that ~8000 UV wraps occur across the planet diameter.
     double TriplanarUVScale;
 
+    bool bEnableOcean;
+
     // Composite density sample: combines sphere SDF, noise height, and edit store.
     // Dist: distance from planet center to the sample point.
     // NoiseHeight: raw noise output in [-1, 1] range.
@@ -94,7 +100,8 @@ private:
     // This guarantees PlanetRadius is the minimum possible surface elevation.
     float ComputeDensity(double Dist, float NoiseHeight, FVector Position) const
     {
-        double Remapped = ((double)NoiseHeight + 1.0) * 0.5; // [-1,1] -> [0,1]
+        double Clamped = FMath::Clamp((double)NoiseHeight, -1.0, 1.0);
+        double Remapped = (Clamped + 1.0) * 0.5; // [-1,1] -> [0,1]
         double Height = Remapped * NoiseAmplitude;
         return (float)(Dist - (PlanetRadius + Height) + EditStore->Sample(Position));
     }
@@ -144,7 +151,7 @@ public:
 
     void GatherUniqueCorners(FAdaptiveOctreeNode* Node, TArray<FCornerSample>& Samples, TMap<FIntVector, int32>& CornerMap, double QuantizeGrid, FVector EditCenter, double SearchRadius);
 
-    void UpdateLodRecursive(FAdaptiveOctreeNode* Node, FVector CameraPosition, double InScreenSpaceThreshold, double InFOVScale, TArray<FNodeEdge>& OutNodeEdges, TMap<FEdgeKey, int32>& EdgeMap, bool& OutChanged);
+    void UpdateLodRecursive(FAdaptiveOctreeNode* Node, FVector CameraPosition, double ThresholdSq, double MergeThresholdSq, double InFOVScale, TArray<FNodeEdge>& OutNodeEdges, TMap<FEdgeKey, int32>& EdgeMap, bool& OutChanged);
 
     void UpdateLOD(FVector InCameraPosition, double InScreenSpaceThreshold, double InCameraFOV);
 

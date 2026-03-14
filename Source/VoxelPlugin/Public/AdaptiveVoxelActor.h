@@ -44,6 +44,7 @@ private:
     std::atomic<bool> IsDestroyed = false;
 
     FVector LastInitScale = FVector::ZeroVector;
+    bool LastInitOceanEnabled = true;
 
 public:
     AAdaptiveVoxelActor();
@@ -64,6 +65,9 @@ public:
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrain", meta = (ClampMin = "-1.0", ClampMax = "2.0"))
     double SeaLevelCoefficient = 0.5;
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrain")
+    bool bEnableOcean = true;
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Octree")
     int ChunkDepth = 4;

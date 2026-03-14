@@ -6,7 +6,7 @@
 struct VOXELPLUGIN_API FAdaptiveOctreeNode : public TSharedFromThis<FAdaptiveOctreeNode>
 {
 private:
-    void ComputeDualContourPosition(FVector TreeCenter, double OceanRadius);
+    void ComputeDualContourPosition(FVector TreeCenter, double OceanRadius, bool bEnableOcean);
 
     FVector GetInterpolatedNormal(FVector P);
 
@@ -47,27 +47,27 @@ public:
 
     const bool IsRoot() const;
 
-    static bool EvaluateSplit(double Extent, double DistSq, double FOVScale, double Threshold, int Depth, int MaxDepth, int MinDepth)
+    static bool EvaluateSplit(double Extent, double DistSq, double FOVScale, double ThresholdSq, int Depth, int MaxDepth, int MinDepth)
     {
         if (Depth >= MaxDepth) return false;
         if (Depth < MinDepth) return true;
         double lhs = 2.0 * Extent * FOVScale;
-        return (lhs * lhs) > (Threshold * Threshold * DistSq);
+        return (lhs * lhs) > (ThresholdSq * DistSq);
     }
 
-    static bool EvaluateMerge(double Extent, double DistSq, double FOVScale, double Threshold, int Depth, int ChunkDepth, int MinDepth)
+    static bool EvaluateMerge(double Extent, double DistSq, double FOVScale, double MergeThresholdSq, int Depth, int ChunkDepth, int MinDepth)
     {
         if (Depth <= ChunkDepth) return false;
         if (Depth < MinDepth) return false;
         double lhs = 2.0 * Extent * FOVScale;
-        double rhs = Threshold * 0.5;
-        return (lhs * lhs) < (rhs * rhs * DistSq);
+        return (lhs * lhs) < (MergeThresholdSq * DistSq);
     }
 
     // TreeCenter passed explicitly -- no longer stored per-node
-    bool ShouldSplit(FVector TreeCenter, FVector InCameraPosition, double InScreenSpaceThreshold, double InFOVScale);
+    // ThresholdSq / MergeThresholdSq precomputed once per LOD pass
+    bool ShouldSplit(FVector TreeCenter, FVector InCameraPosition, double ThresholdSq, double InFOVScale);
 
-    bool ShouldMerge(FVector TreeCenter, FVector InCameraPosition, double InScreenSpaceThreshold, double InFOVScale);
+    bool ShouldMerge(FVector TreeCenter, FVector InCameraPosition, double MergeThresholdSq, double InFOVScale);
 
     void Split();
 
@@ -82,7 +82,7 @@ public:
 
     // TreeCenter passed explicitly for fallback normal computation
     // OceanRadius used to precompute OceanPosition for LOD
-    void FinalizeFromExistingCorners(FVector TreeCenter, double OceanRadius, bool bSkipNormals = false);
+    void FinalizeFromExistingCorners(FVector TreeCenter, double OceanRadius, bool bEnableOcean, bool bSkipNormals = false);
 
     // Root Constructor
     FAdaptiveOctreeNode(FVector InCenter, double InExtent, int InChunkDepth, int InMinDepth, int InMaxDepth);
