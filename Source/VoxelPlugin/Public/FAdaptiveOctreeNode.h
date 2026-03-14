@@ -12,8 +12,6 @@ private:
 
     bool bIsLeaf = true;
 
-    static constexpr int DepthPrecisionFloor = 20;
-
 public:
     FMortonIndex Index;
 
@@ -25,7 +23,7 @@ public:
 
     TArray<FNodeEdge> SignChangeEdges;
 
-    uint8 DepthBounds[3];
+    uint8 DepthBounds[4];
 
     FVector Center;
 

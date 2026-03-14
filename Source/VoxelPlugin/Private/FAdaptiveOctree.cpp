@@ -426,8 +426,8 @@ void FAdaptiveOctree::UpdateMeshChunkStreamData(TSharedPtr<FMeshChunk> InChunk)
 
             if (bEnableOcean &&
                 (UniqueVertices[tri0.V0].Depth > OceanTriThreshold ||
-                    UniqueVertices[tri0.V1].Depth > OceanTriThreshold ||
-                    UniqueVertices[tri0.V2].Depth > OceanTriThreshold))
+                UniqueVertices[tri0.V1].Depth > OceanTriThreshold ||
+                UniqueVertices[tri0.V2].Depth > OceanTriThreshold))
                 OcnTriangles.Add(tri0);
 
             if (NumEdgeVerts == 4
@@ -441,8 +441,8 @@ void FAdaptiveOctree::UpdateMeshChunkStreamData(TSharedPtr<FMeshChunk> InChunk)
 
                 if (bEnableOcean &&
                     (UniqueVertices[tri1.V0].Depth > OceanTriThreshold ||
-                        UniqueVertices[tri1.V1].Depth > OceanTriThreshold ||
-                        UniqueVertices[tri1.V2].Depth > OceanTriThreshold))
+                    UniqueVertices[tri1.V1].Depth > OceanTriThreshold ||
+                    UniqueVertices[tri1.V2].Depth > OceanTriThreshold))
                     OcnTriangles.Add(tri1);
             }
         }

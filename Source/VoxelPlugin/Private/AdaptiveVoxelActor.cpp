@@ -122,7 +122,7 @@ void AAdaptiveVoxelActor::Initialize()
     Params.OceanMaterial = OceanMaterial;
     Params.NoiseFunction = DensityFunction;
     Params.EditStore = EditStore;
-    Params.Center = FVector::ZeroVector;
+    Params.Center = FVector::ZeroVector; //TODO: Remove... we just pass zerovector anyway
     Params.PlanetRadius = ActorPlanetRadius;
     Params.NoiseAmplitude = ActorNoiseAmplitude;
     Params.SeaLevelCoefficient = SeaLevelCoefficient;
