@@ -6,7 +6,7 @@
 struct VOXELPLUGIN_API FAdaptiveOctreeNode : public TSharedFromThis<FAdaptiveOctreeNode>
 {
 private:
-    void ComputeDualContourPosition(FVector TreeCenter);
+    void ComputeDualContourPosition(FVector TreeCenter, double OceanRadius);
 
     FVector GetInterpolatedNormal(FVector P);
 
@@ -34,6 +34,8 @@ public:
     double Extent;
 
     FVector DualContourPosition;
+
+    FVector OceanPosition;
 
     FVector3f DualContourNormal;
 
@@ -65,7 +67,7 @@ public:
     // TreeCenter passed explicitly -- no longer stored per-node
     bool ShouldSplit(FVector TreeCenter, FVector InCameraPosition, double InScreenSpaceThreshold, double InFOVScale);
 
-    bool ShouldMerge(FVector InCameraPosition, double InScreenSpaceThreshold, double InFOVScale);
+    bool ShouldMerge(FVector TreeCenter, FVector InCameraPosition, double InScreenSpaceThreshold, double InFOVScale);
 
     void Split();
 
@@ -79,7 +81,8 @@ public:
     TArray<FNodeEdge>& GetSignChangeEdges();
 
     // TreeCenter passed explicitly for fallback normal computation
-    void FinalizeFromExistingCorners(FVector TreeCenter, bool bSkipNormals = false);
+    // OceanRadius used to precompute OceanPosition for LOD
+    void FinalizeFromExistingCorners(FVector TreeCenter, double OceanRadius, bool bSkipNormals = false);
 
     // Root Constructor
     FAdaptiveOctreeNode(FVector InCenter, double InExtent, int InChunkDepth, int InMinDepth, int InMaxDepth);

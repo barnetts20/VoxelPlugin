@@ -21,8 +21,9 @@ class VOXELPLUGIN_API AAdaptiveVoxelActor : public ARealtimeMeshActor
 private:
     TSharedPtr<FAdaptiveOctree> AdaptiveOctree;
 
-    // Mesh chunks attach to this component. Inherits full actor transform
-    // (position, rotation, scale) so normalized-space geometry is scaled to world size.
+    // Mesh chunks attach to this component. Inherits actor position and rotation
+    // but uses absolute scale (1,1,1). Octree is built at world scale; scale changes
+    // trigger full reconstruction via OnConstruction.
     UPROPERTY()
     TObjectPtr<USceneComponent> MeshAttachmentRoot;
 
@@ -42,6 +43,8 @@ private:
 
     std::atomic<bool> IsDestroyed = false;
 
+    FVector LastInitScale = FVector::ZeroVector;
+
 public:
     AAdaptiveVoxelActor();
 
@@ -51,8 +54,10 @@ public:
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Materials")
     UMaterialInterface* OceanMaterial;
 
-    // Planet radius is derived from the maximum component of actor scale (in world units).
-    // All scale axes are locked to the max component to keep the planet spherical.
+    // Planet radius in world units is determined by actor scale (max component).
+    // The octree is built at world scale in actor-local space (origin 0,0,0).
+    // Position and rotation changes are handled live by the actor transform.
+    // Scale changes trigger full reconstruction.
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrain", meta = (ClampMin = "0.01", ClampMax = "1.0"))
     double NoiseAmplitudeRatio = 0.25;

@@ -265,7 +265,7 @@ void FAdaptiveOctree::FinalizeSubtree(FAdaptiveOctreeNode* Node, FVector EditCen
     }
 
     // Then this node
-    Node->FinalizeFromExistingCorners(Root->Center);
+    Node->FinalizeFromExistingCorners(Root->Center, OceanRadius);
 }
 
 void FAdaptiveOctree::ReconstructSubtree(FAdaptiveOctreeNode* Node, FVector EditCenter, double SearchRadius)
@@ -531,8 +531,10 @@ void FAdaptiveOctree::UpdateMeshChunkStreamData(TSharedPtr<FMeshChunk> InChunk)
     InChunk->SurfaceMeshData = UpdatedSurfaceData;
     if (UpdatedOceanData->GetTriangleStream().Num() > 0)
         InChunk->OceanMeshData = UpdatedOceanData;
+    else
+        InChunk->OceanMeshData = UpdatedOceanData; // Push empty stream to clear old ocean mesh
 
-    InChunk->IsDirty = (SrfTriangles.Num() > 0);
+    InChunk->IsDirty = true;
 }
 
 void AppendUniqueEdges(const TArray<FNodeEdge>& InAppendEdges, TArray<FNodeEdge>& OutNodeEdges, TMap<FEdgeKey, int32>& EdgeMap)
@@ -573,7 +575,7 @@ void FAdaptiveOctree::UpdateLodRecursive(FAdaptiveOctreeNode* Node, FVector Came
         else if (Node->Index.LastChild() == 7 && Node->Parent.IsValid())
         {
             FAdaptiveOctreeNode* ParentPtr = Node->Parent.Pin().Get();
-            if (ParentPtr && ParentPtr->ShouldMerge(CameraPosition, InScreenSpaceThreshold, InFOVScale))
+            if (ParentPtr && ParentPtr->ShouldMerge(Root->Center, CameraPosition, InScreenSpaceThreshold, InFOVScale))
             {
                 OutChanged = true;
                 ParentPtr->Merge();
@@ -789,7 +791,7 @@ void FAdaptiveOctree::SplitAndComputeChildren(FAdaptiveOctreeNode* Node)
             Node->Children[ci]->Corners[k].Density = (float)GridDensities[gi];
             Node->Children[ci]->Corners[k].Normal = FVector3f(GridNormals[gi]);
         }
-        Node->Children[ci]->FinalizeFromExistingCorners(Root->Center, true); // normals already computed from grid
+        Node->Children[ci]->FinalizeFromExistingCorners(Root->Center, OceanRadius, true); // normals already computed from grid
     }
 }
 
@@ -814,7 +816,7 @@ void FAdaptiveOctree::ComputeNodeData(FAdaptiveOctreeNode* Node)
         Node->Corners[i].Density = ComputeDensity(dists[i], noiseOut[i], Node->Corners[i].Position);
     }
 
-    Node->FinalizeFromExistingCorners(Root->Center);
+    Node->FinalizeFromExistingCorners(Root->Center, OceanRadius);
 }
 
 FEdgeNeighbors FAdaptiveOctree::SampleNodesAroundEdge(const FNodeEdge& Edge)
@@ -940,5 +942,7 @@ FAdaptiveOctreeNode* FAdaptiveOctree::GetChunkNodeByPoint(FVector Position)
 
 void FAdaptiveOctree::Clear()
 {
+    ChunkMap.Empty();
     Root.Reset();
+    MeshChunksInitialized = false;
 }
