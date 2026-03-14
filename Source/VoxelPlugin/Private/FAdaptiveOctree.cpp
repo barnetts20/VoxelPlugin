@@ -1,4 +1,5 @@
 #include "FAdaptiveOctree.h"
+#include <FOctreeConstants.h>
 
 FAdaptiveOctree::FAdaptiveOctree(ARealtimeMeshActor* InParentActor, UMaterialInterface* InSurfaceMaterial, UMaterialInterface* InOceanMaterial, TFunction<void(int, const float*, const float*, const float*, float*)> InDensityFunction, TSharedPtr<FSparseEditStore> InEditStore, FVector InCenter, double InRootExtent, int InChunkDepth, int InMinDepth, int InMaxDepth)
 {
@@ -50,7 +51,7 @@ void FAdaptiveOctree::PopulateChunks()
         const double Offset = ChunkNode->Extent * 2.0;
         for (int i = 0; i < 6; i++)
         {
-            FVector NeighborPos = ChunkNode->Center + Directions[i] * Offset;
+            FVector NeighborPos = ChunkNode->Center + OctreeConstants::Directions[i] * Offset;
             FAdaptiveOctreeNode* NeighborNode = GetLeafNodeByPoint(NeighborPos);
             if (!NeighborNode) continue;
             if (!NeighborNode->IsSurfaceNode)
@@ -120,7 +121,7 @@ void FAdaptiveOctree::UpdateChunkMap(TSharedPtr<FAdaptiveOctreeNode> ChunkNode, 
         const double Offset = ChunkNode->Extent * 2.0;
         for (int i = 0; i < 6; i++)
         {
-            FVector NeighborPos = ChunkNode->Center + Directions[i] * Offset;
+            FVector NeighborPos = ChunkNode->Center + OctreeConstants::Directions[i] * Offset;
             FAdaptiveOctreeNode* NeighborRaw = GetLeafNodeByPoint(NeighborPos);
 
             if (!NeighborRaw) continue;
@@ -651,43 +652,6 @@ void FAdaptiveOctree::GatherLeafEdges(FAdaptiveOctreeNode* Node, TArray<FNodeEdg
 
 void FAdaptiveOctree::SplitAndComputeChildren(FAdaptiveOctreeNode* Node)
 {
-    static const int32 ChildCornerSources[8][8] = {
-        {  0,  8, 12, 24, 16, 22, 20, 26 },
-        {  8,  1, 24, 13, 22, 17, 26, 21 },
-        { 12, 24,  2,  9, 20, 26, 18, 23 },
-        { 24, 13,  9,  3, 26, 21, 23, 19 },
-        { 16, 22, 20, 26,  4, 10, 14, 25 },
-        { 22, 17, 26, 21, 10,  5, 25, 15 },
-        { 20, 26, 18, 23, 14, 25,  6, 11 },
-        { 26, 21, 23, 19, 25, 15, 11,  7 },
-    };
-
-    static const int8 GridCoords[27][3] = {
-        {-1,-1,-1},{+1,-1,-1},{-1,+1,-1},{+1,+1,-1},
-        {-1,-1,+1},{+1,-1,+1},{-1,+1,+1},{+1,+1,+1},
-        { 0,-1,-1},{ 0,+1,-1},{ 0,-1,+1},{ 0,+1,+1},
-        {-1, 0,-1},{+1, 0,-1},{-1, 0,+1},{+1, 0,+1},
-        {-1,-1, 0},{+1,-1, 0},{-1,+1, 0},{+1,+1, 0},
-        {-1, 0, 0},{+1, 0, 0},{ 0,-1, 0},{ 0,+1, 0},
-        { 0, 0,-1},{ 0, 0,+1},{ 0, 0, 0}
-    };
-
-    // CoordToGrid[x+1][y+1][z+1]
-    static const int8 CoordToGrid[3][3][3] = {
-        { {  0, 16,  4 }, { 12, 20, 14 }, {  2, 18,  6 } },
-        { {  8, 22, 10 }, { 24, 26, 25 }, {  9, 23, 11 } },
-        { {  1, 17,  5 }, { 13, 21, 15 }, {  3, 19,  7 } },
-    };
-
-    static const int32 FaceCorners[6][4] = {
-        { 0, 2, 4, 6 },
-        { 1, 3, 5, 7 },
-        { 0, 1, 4, 5 },
-        { 2, 3, 6, 7 },
-        { 0, 1, 2, 3 },
-        { 4, 5, 6, 7 },
-    };
-
     Node->Split();
 
     // --- Stage 1: Build grid positions ---
@@ -713,10 +677,10 @@ void FAdaptiveOctree::SplitAndComputeChildren(FAdaptiveOctreeNode* Node)
     for (int i = 0; i < 6; i++)
     {
         GridPositions[20 + i] = (
-            Node->Corners[FaceCorners[i][0]].Position +
-            Node->Corners[FaceCorners[i][1]].Position +
-            Node->Corners[FaceCorners[i][2]].Position +
-            Node->Corners[FaceCorners[i][3]].Position) * 0.25;
+            Node->Corners[OctreeConstants::FaceCorners[i][0]].Position +
+            Node->Corners[OctreeConstants::FaceCorners[i][1]].Position +
+            Node->Corners[OctreeConstants::FaceCorners[i][2]].Position +
+            Node->Corners[OctreeConstants::FaceCorners[i][3]].Position) * 0.25;
     }
 
     // G26: body center
@@ -748,43 +712,43 @@ void FAdaptiveOctree::SplitAndComputeChildren(FAdaptiveOctreeNode* Node)
 
     for (int32 gi = 0; gi < 27; gi++)
     {
-        int8 cx = GridCoords[gi][0];
-        int8 cy = GridCoords[gi][1];
-        int8 cz = GridCoords[gi][2];
+        int8 cx = OctreeConstants::GridCoords[gi][0];
+        int8 cy = OctreeConstants::GridCoords[gi][1];
+        int8 cz = OctreeConstants::GridCoords[gi][2];
 
         double dX;
         if (cx <= 0)
         {
-            int32 ngi = CoordToGrid[cx + 2][cy + 1][cz + 1];
+            int32 ngi = OctreeConstants::CoordToGrid[cx + 2][cy + 1][cz + 1];
             dX = GridDensities[ngi] - GridDensities[gi];
         }
         else
         {
-            int32 ngi = CoordToGrid[cx][cy + 1][cz + 1];
+            int32 ngi = OctreeConstants::CoordToGrid[cx][cy + 1][cz + 1];
             dX = -(GridDensities[ngi] - GridDensities[gi]);
         }
 
         double dY;
         if (cy <= 0)
         {
-            int32 ngi = CoordToGrid[cx + 1][cy + 2][cz + 1];
+            int32 ngi = OctreeConstants::CoordToGrid[cx + 1][cy + 2][cz + 1];
             dY = GridDensities[ngi] - GridDensities[gi];
         }
         else
         {
-            int32 ngi = CoordToGrid[cx + 1][cy][cz + 1];
+            int32 ngi = OctreeConstants::CoordToGrid[cx + 1][cy][cz + 1];
             dY = -(GridDensities[ngi] - GridDensities[gi]);
         }
 
         double dZ;
         if (cz <= 0)
         {
-            int32 ngi = CoordToGrid[cx + 1][cy + 1][cz + 2];
+            int32 ngi = OctreeConstants::CoordToGrid[cx + 1][cy + 1][cz + 2];
             dZ = GridDensities[ngi] - GridDensities[gi];
         }
         else
         {
-            int32 ngi = CoordToGrid[cx + 1][cy + 1][cz];
+            int32 ngi = OctreeConstants::CoordToGrid[cx + 1][cy + 1][cz];
             dZ = -(GridDensities[ngi] - GridDensities[gi]);
         }
 
@@ -799,7 +763,7 @@ void FAdaptiveOctree::SplitAndComputeChildren(FAdaptiveOctreeNode* Node)
     {
         for (int k = 0; k < 8; k++)
         {
-            int32 gi = ChildCornerSources[ci][k];
+            int32 gi = OctreeConstants::ChildCornerSources[ci][k];
             Node->Children[ci]->Corners[k].Position = GridPositions[gi];
             Node->Children[ci]->Corners[k].Density = (float)GridDensities[gi];
             Node->Children[ci]->Corners[k].Normal = FVector3f(GridNormals[gi]);

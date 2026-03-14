@@ -5,6 +5,7 @@
 #include "FSparseEditStore.h"
 #include "FAdaptiveOctreeNode.h"
 
+//TODO: COMPLETE PARAM STRUCT, CHANGE CONSTRUCTOR
 struct VOXELPLUGIN_API FOctreeParams {
     ARealtimeMeshActor* InParentActor; 
     UMaterialInterface* InSurfaceMaterial; 
@@ -14,7 +15,7 @@ struct VOXELPLUGIN_API FOctreeParams {
     FVector InCenter; 
 
     double PlanetRadius; //min surface radius in real world units
-    double InRootExtent; //compute a buffer larger than planet radius, dont directly expose
+    double InRootExtent = 1.2; //compute a buffer larger than planet radius, dont directly expose
     double SeaLevel; // should be relative to planet radius 0 at planet radius
     double NoiseScale;
 
@@ -30,16 +31,6 @@ struct VOXELPLUGIN_API FOctreeParams {
 struct VOXELPLUGIN_API FAdaptiveOctree
 {
 private:
-    static inline const FVector Directions[6] =
-    {
-        FVector(1, 0, 0),
-        FVector(-1, 0, 0),
-        FVector(0, 1, 0),
-        FVector(0, -1, 0),
-        FVector(0, 0, 1),
-        FVector(0, 0, -1)
-    };
-
     TFunction<void(int, const float*, const float*, const float*, float*)> DensityFunction;
 
     TSharedPtr<FSparseEditStore> EditStore;

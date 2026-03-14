@@ -1,5 +1,7 @@
 #include "FAdaptiveOctreeNode.h"
 #include "FAdaptiveOctree.h"
+#include <FQEF.h>
+#include <FOctreeConstants.h>
 
 const bool FAdaptiveOctreeNode::IsLeaf() const
 {
