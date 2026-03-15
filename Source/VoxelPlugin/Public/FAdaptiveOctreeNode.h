@@ -6,7 +6,7 @@
 struct VOXELPLUGIN_API FAdaptiveOctreeNode : public TSharedFromThis<FAdaptiveOctreeNode>
 {
 private:
-    void ComputeDualContourPosition(FVector TreeCenter, double OceanRadius, bool bEnableOcean);
+    void ComputeDualContourPosition(FVector TreeCenter);
 
     FVector GetInterpolatedNormal(FVector P);
 
@@ -27,13 +27,11 @@ public:
 
     FVector Center;
 
-    FVector ChunkCenter;
+    FVector ChunkCenter; // TODO: REMOVE FROM NODE, PASS DOWN FOR RELEVANT OPS
 
     double Extent;
 
     FVector DualContourPosition;
-
-    FVector OceanPosition;
 
     FVector3f DualContourNormal;
 
@@ -80,7 +78,7 @@ public:
 
     // TreeCenter passed explicitly for fallback normal computation
     // OceanRadius used to precompute OceanPosition for LOD
-    void FinalizeFromExistingCorners(FVector TreeCenter, double OceanRadius, bool bEnableOcean, bool bSkipNormals = false);
+    void FinalizeFromExistingCorners(FVector TreeCenter, bool bSkipNormals = false);
 
     // Root Constructor
     FAdaptiveOctreeNode(FVector InCenter, double InExtent, int InChunkDepth, int InMinDepth, int InMaxDepth);

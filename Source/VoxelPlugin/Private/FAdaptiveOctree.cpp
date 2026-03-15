@@ -8,7 +8,6 @@ FAdaptiveOctree::FAdaptiveOctree(const FOctreeParams& Params)
     CachedParentActor = Params.ParentActor;
     CachedMeshAttachRoot = Params.MeshAttachmentRoot;
     CachedSurfaceMaterial = Params.SurfaceMaterial;
-    CachedOceanMaterial = Params.OceanMaterial;
     ChunkDepth = Params.ChunkDepth;
 
     // Core terrain parameters from params
@@ -22,11 +21,6 @@ FAdaptiveOctree::FAdaptiveOctree(const FOctreeParams& Params)
     // Configure edge key quantization for this tree's scale.
     // Maps the smallest possible corner spacing to ~1 grid unit.
     FEdgeKey::InvGridSize = FMath::Pow(2.0, (double)Params.MaxDepth) / RootExtent;
-
-    bEnableOcean = Params.bEnableOcean;
-
-    // Ocean radius derived from sea level coefficient.
-    OceanRadius = PlanetRadius + (Params.SeaLevelCoefficient * NoiseAmplitude);
 
     // UV scale: 0.0001 was calibrated for PlanetRadius=80M. Keep the same visual tiling.
     TriplanarUVScale = 0.0001 * (80000000.0 / FMath::Max(PlanetRadius, 1.0));
@@ -89,7 +83,6 @@ void FAdaptiveOctree::PopulateChunks()
         NewChunks[i]->CachedParentActor = CachedParentActor;
         NewChunks[i]->CachedMeshAttachRoot = CachedMeshAttachRoot;
         NewChunks[i]->CachedSurfaceMaterial = CachedSurfaceMaterial;
-        NewChunks[i]->CachedOceanMaterial = CachedOceanMaterial;
         NewChunks[i]->InitializeData(Chunks[i]->Center, Chunks[i]->Extent);
 
         TArray<FNodeEdge> Edges;
@@ -129,7 +122,6 @@ void FAdaptiveOctree::UpdateChunkMap(TSharedPtr<FAdaptiveOctreeNode> ChunkNode, 
         NewChunk->CachedParentActor = CachedParentActor;
         NewChunk->CachedMeshAttachRoot = CachedMeshAttachRoot;
         NewChunk->CachedSurfaceMaterial = CachedSurfaceMaterial;
-        NewChunk->CachedOceanMaterial = CachedOceanMaterial;
         NewChunk->InitializeData(ChunkNode->Center, ChunkNode->Extent);
         ChunkMap.Add(ChunkNode, NewChunk);
         OutDirtyChunks.Add({ ChunkNode, NewChunk });
@@ -152,7 +144,6 @@ void FAdaptiveOctree::UpdateChunkMap(TSharedPtr<FAdaptiveOctreeNode> ChunkNode, 
             NeighborChunk->CachedParentActor = CachedParentActor;
             NeighborChunk->CachedMeshAttachRoot = CachedMeshAttachRoot;
             NeighborChunk->CachedSurfaceMaterial = CachedSurfaceMaterial;
-            NeighborChunk->CachedOceanMaterial = CachedOceanMaterial;
             NeighborChunk->InitializeData(NeighborRaw->Center, NeighborRaw->Extent);
             ChunkMap.Add(Neighbor, NeighborChunk);
             OutDirtyChunks.Add({ Neighbor, NeighborChunk });
@@ -266,7 +257,7 @@ void FAdaptiveOctree::FinalizeSubtree(FAdaptiveOctreeNode* Node, FVector EditCen
     }
 
     // Then this node
-    Node->FinalizeFromExistingCorners(Root->Center, OceanRadius, bEnableOcean);
+    Node->FinalizeFromExistingCorners(Root->Center);
 }
 
 void FAdaptiveOctree::ReconstructSubtree(FAdaptiveOctreeNode* Node, FVector EditCenter, double SearchRadius)
@@ -379,14 +370,6 @@ void FAdaptiveOctree::UpdateMeshChunkStreamData(TSharedPtr<FMeshChunk> InChunk)
             AllEdgeData[edgeIdx].Vertices[i].Position = LocalPos;
             AllEdgeData[edgeIdx].Vertices[i].Normal = FVector(NodePtr->DualContourNormal);
             AllEdgeData[edgeIdx].Vertices[i].Color = FColor::Green;
-
-            if (bEnableOcean)
-            {
-                FVector OceanLocalPos = NodePtr->OceanPosition - InChunk->ChunkCenter;
-                double Dist = FVector::Dist(NodePtr->DualContourPosition, PlanetCenter);
-                AllEdgeData[edgeIdx].Vertices[i].NormalizedPosition = OceanLocalPos;
-                AllEdgeData[edgeIdx].Vertices[i].Depth = (float)(OceanRadius - Dist);
-            }
         }
         });
 
@@ -424,12 +407,6 @@ void FAdaptiveOctree::UpdateMeshChunkStreamData(TSharedPtr<FMeshChunk> InChunk)
                 : FIndex3UI(VertexIndices[0], VertexIndices[1], VertexIndices[2]);
             SrfTriangles.Add(tri0);
 
-            if (bEnableOcean &&
-                (UniqueVertices[tri0.V0].Depth > OceanTriThreshold ||
-                UniqueVertices[tri0.V1].Depth > OceanTriThreshold ||
-                UniqueVertices[tri0.V2].Depth > OceanTriThreshold))
-                OcnTriangles.Add(tri0);
-
             if (NumEdgeVerts == 4
                 && VertexIndices[0] != VertexIndices[3]
                 && VertexIndices[2] != VertexIndices[3])
@@ -438,12 +415,6 @@ void FAdaptiveOctree::UpdateMeshChunkStreamData(TSharedPtr<FMeshChunk> InChunk)
                     ? FIndex3UI(VertexIndices[0], VertexIndices[3], VertexIndices[2])
                     : FIndex3UI(VertexIndices[0], VertexIndices[2], VertexIndices[3]);
                 SrfTriangles.Add(tri1);
-
-                if (bEnableOcean &&
-                    (UniqueVertices[tri1.V0].Depth > OceanTriThreshold ||
-                    UniqueVertices[tri1.V1].Depth > OceanTriThreshold ||
-                    UniqueVertices[tri1.V2].Depth > OceanTriThreshold))
-                    OcnTriangles.Add(tri1);
             }
         }
     }
@@ -486,56 +457,6 @@ void FAdaptiveOctree::UpdateMeshChunkStreamData(TSharedPtr<FMeshChunk> InChunk)
         });
 
     InChunk->SurfaceMeshData = UpdatedSurfaceData;
-
-    // Ocean mesh pipeline — only when ocean is enabled
-    if (bEnableOcean)
-    {
-        TSharedPtr<FMeshStreamData> UpdatedOceanData = MakeShared<FMeshStreamData>();
-        UpdatedOceanData->MeshGroupKey = InChunk->OceanMeshData->MeshGroupKey;
-        UpdatedOceanData->MeshSectionKey = InChunk->OceanMeshData->MeshSectionKey;
-
-        auto OcnPositionStream = UpdatedOceanData->GetPositionStream();
-        auto OcnTangentStream = UpdatedOceanData->GetTangentStream();
-        auto OcnColorStream = UpdatedOceanData->GetColorStream();
-        auto OcnTexCoordStream = UpdatedOceanData->GetTexCoordStream();
-        auto OcnTriangleStream = UpdatedOceanData->GetTriangleStream();
-        auto OcnPolygroupStream = UpdatedOceanData->GetPolygroupStream();
-
-        OcnPositionStream.SetNumUninitialized(UniqueVertices.Num());
-        OcnTangentStream.SetNumUninitialized(UniqueVertices.Num());
-        OcnColorStream.SetNumUninitialized(UniqueVertices.Num());
-        OcnTexCoordStream.SetNumUninitialized(UniqueVertices.Num());
-        OcnTriangleStream.SetNumUninitialized(OcnTriangles.Num());
-        OcnPolygroupStream.SetNumUninitialized(OcnTriangles.Num());
-
-        ParallelFor(UniqueVertices.Num(), [&](int32 VertIdx) {
-            FMeshVertex& Vertex = UniqueVertices[VertIdx];
-
-            OcnPositionStream.Set(VertIdx, Vertex.NormalizedPosition);
-            FRealtimeMeshTangentsHighPrecision OcnTangent;
-            FVector OcnNormal = (FVector(Vertex.NormalizedPosition) + ChunkCenter - Root->Center).GetSafeNormal();
-            OcnTangent.SetNormal(FVector3f(OcnNormal));
-            OcnTangentStream.Set(VertIdx, OcnTangent);
-
-            float absDepth = FMath::Max(Vertex.Depth, 0.0f);
-            float DepthEncodeScale = (float)(1000.0 * (80000000.0 / FMath::Max(PlanetRadius, 1.0)));
-            uint32 intDepth = (uint32)FMath::Min(absDepth * DepthEncodeScale, 4294967295.0f);
-            uint8 R = (intDepth >> 24) & 0xFF;
-            uint8 G = (intDepth >> 16) & 0xFF;
-            uint8 B = (intDepth >> 8) & 0xFF;
-            uint8 A = intDepth & 0xFF;
-            OcnColorStream.Set(VertIdx, FColor(R, G, B, A));
-            OcnTexCoordStream.Set(VertIdx, ComputeTriplanarUV(FVector(Vertex.NormalizedPosition) + ChunkCenter, OcnNormal));
-            });
-
-        ParallelFor(OcnTriangles.Num(), [&](int32 TriIdx) {
-            OcnTriangleStream.Set(TriIdx, OcnTriangles[TriIdx]);
-            OcnPolygroupStream.Set(TriIdx, 0);
-            });
-
-        InChunk->OceanMeshData = UpdatedOceanData;
-    }
-
     InChunk->IsDirty = true;
 }
 
@@ -795,7 +716,7 @@ void FAdaptiveOctree::SplitAndComputeChildren(FAdaptiveOctreeNode* Node)
             Node->Children[ci]->Corners[k].Density = (float)GridDensities[gi];
             Node->Children[ci]->Corners[k].Normal = FVector3f(GridNormals[gi]);
         }
-        Node->Children[ci]->FinalizeFromExistingCorners(Root->Center, OceanRadius, bEnableOcean, true); // normals already computed from grid
+        Node->Children[ci]->FinalizeFromExistingCorners(Root->Center, true); // normals already computed from grid
     }
 }
 
@@ -820,7 +741,7 @@ void FAdaptiveOctree::ComputeNodeData(FAdaptiveOctreeNode* Node)
         Node->Corners[i].Density = ComputeDensity(dists[i], noiseOut[i], Node->Corners[i].Position);
     }
 
-    Node->FinalizeFromExistingCorners(Root->Center, OceanRadius, bEnableOcean);
+    Node->FinalizeFromExistingCorners(Root->Center);
 }
 
 FEdgeNeighbors FAdaptiveOctree::SampleNodesAroundEdge(const FNodeEdge& Edge)

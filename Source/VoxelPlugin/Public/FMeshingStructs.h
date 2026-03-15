@@ -84,7 +84,6 @@ struct VOXELPLUGIN_API FMeshChunk {
     TWeakObjectPtr<USceneComponent> CachedMeshAttachRoot;
 
     TWeakObjectPtr <UMaterialInterface> CachedSurfaceMaterial;
-    TWeakObjectPtr <UMaterialInterface> CachedOceanMaterial;
 
     //Data Model Info
     FVector ChunkCenter;
@@ -94,8 +93,6 @@ struct VOXELPLUGIN_API FMeshChunk {
     TArray<FNodeEdge> ChunkEdges;
 
     TSharedPtr<FMeshStreamData> SurfaceMeshData;
-
-    TSharedPtr<FMeshStreamData> OceanMeshData;
 
     //Mesh Stuff
     bool IsDirty = false;
@@ -110,19 +107,15 @@ struct VOXELPLUGIN_API FMeshChunk {
 
     void InitializeData(FVector InCenter, double InExtent) {
         SurfaceMeshData = MakeShared<FMeshStreamData>();
-        OceanMeshData = MakeShared<FMeshStreamData>();
 
         ChunkCenter = InCenter;
         ChunkExtent = InExtent;
 
         SurfaceMeshData->MeshGroupKey = FRealtimeMeshSectionGroupKey::Create(LODKey, FName("SURFACE"));
         SurfaceMeshData->MeshSectionKey = FRealtimeMeshSectionKey::CreateForPolyGroup(SurfaceMeshData->MeshGroupKey, 0);
-
-        OceanMeshData->MeshGroupKey = FRealtimeMeshSectionGroupKey::Create(LODKey, FName("OCEAN"));
-        OceanMeshData->MeshSectionKey = FRealtimeMeshSectionKey::CreateForPolyGroup(OceanMeshData->MeshGroupKey, 0);
     };
 
-    void InitializeComponent(ARealtimeMeshActor* InParentActor, USceneComponent* InAttachRoot, UMaterialInterface* InSurfaceMaterial, UMaterialInterface* InOceanMaterial) {
+    void InitializeComponent(ARealtimeMeshActor* InParentActor, USceneComponent* InAttachRoot, UMaterialInterface* InSurfaceMaterial) {
         FRealtimeMeshCollisionConfiguration cConfig;
         cConfig.bShouldFastCookMeshes = false;
         cConfig.bUseComplexAsSimpleCollision = true;
@@ -138,7 +131,6 @@ struct VOXELPLUGIN_API FMeshChunk {
         ChunkRtComponent->RegisterComponent();
 
         ChunkRtComponent->SetMaterial(0, InSurfaceMaterial);
-        ChunkRtComponent->SetMaterial(1, InOceanMaterial);
 
         ChunkRtComponent->AttachToComponent(InAttachRoot, FAttachmentTransformRules::KeepRelativeTransform);
         ChunkRtComponent->SetRelativeLocation(ChunkCenter);
@@ -149,7 +141,6 @@ struct VOXELPLUGIN_API FMeshChunk {
         ChunkRtComponent->SetVisibleInRayTracing(false);
 
         ChunkRtMesh->CreateSectionGroup(SurfaceMeshData->MeshGroupKey, FRealtimeMeshStreamSet());
-        ChunkRtMesh->CreateSectionGroup(OceanMeshData->MeshGroupKey, FRealtimeMeshStreamSet());
 
         IsInitialized = true;
     }
@@ -173,9 +164,8 @@ struct VOXELPLUGIN_API FMeshChunk {
                 ARealtimeMeshActor* Parent = Self->CachedParentActor.Get();
                 USceneComponent* AttachRoot = Self->CachedMeshAttachRoot.Get();
                 UMaterialInterface* SurfaceMaterial = Self->CachedSurfaceMaterial.Get();
-                UMaterialInterface* OceanMaterial = Self->CachedOceanMaterial.Get();
-                if (!Parent || !AttachRoot || !SurfaceMaterial || !OceanMaterial) return;
-                Self->InitializeComponent(Parent, AttachRoot, SurfaceMaterial, OceanMaterial);
+                if (!Parent || !AttachRoot || !SurfaceMaterial) return;
+                Self->InitializeComponent(Parent, AttachRoot, SurfaceMaterial);
             }
 
             // 2. Ensure valid component pointers
@@ -198,23 +188,8 @@ struct VOXELPLUGIN_API FMeshChunk {
                 MeshPtr->UpdateSectionConfig(Self->SurfaceMeshData->MeshSectionKey, SrfConfig, true);
             }
 
-            // 4. Ocean update
-            auto* OcnTriStream = Self->OceanMeshData->MeshStream.Find(FRealtimeMeshStreams::Triangles);
-            int32 OcnNumTris = OcnTriStream ? OcnTriStream->Num() : 0;
-            if (OcnNumTris <= 0)
-            {
-                MeshPtr->UpdateSectionGroup(Self->OceanMeshData->MeshGroupKey, FRealtimeMeshStreamSet());
-            }
-            else
-            {
-                MeshPtr->UpdateSectionGroup(Self->OceanMeshData->MeshGroupKey, Self->OceanMeshData->MeshStream);
-                FRealtimeMeshSectionConfig OcnConfig(1); // material slot 1
-                OcnConfig.bCastsShadow = false;
-                MeshPtr->UpdateSectionConfig(Self->OceanMeshData->MeshSectionKey, OcnConfig, false);
-            }
-
             Self->IsDirty = false;
-            });
+        });
     }
 };
 

@@ -10,7 +10,6 @@ struct VOXELPLUGIN_API FOctreeParams {
     ARealtimeMeshActor* ParentActor = nullptr;
     USceneComponent* MeshAttachmentRoot = nullptr;
     UMaterialInterface* SurfaceMaterial = nullptr;
-    UMaterialInterface* OceanMaterial = nullptr;
 
     // --- Data Dependencies ---
     TFunction<void(int, const float*, const float*, const float*, float*)> NoiseFunction;
@@ -27,25 +26,14 @@ struct VOXELPLUGIN_API FOctreeParams {
     // Surface elevation ranges from PlanetRadius to PlanetRadius + NoiseAmplitude.
     double NoiseAmplitude = 100.0;
 
-    // Sea level as a coefficient of NoiseAmplitude.
-    //  0.0 = sea level at PlanetRadius (no ocean)
-    //  0.5 = sea level halfway through the noise range (~50/50 land/ocean)
-    //  1.0 = sea level at PlanetRadius + NoiseAmplitude (fully submerged)
-    // Values outside [0,1] are valid: -1 ensures no ocean, 2 gives deep ocean.
-    double SeaLevelCoefficient = 0.5;
-
     // Buffer factor applied when computing root extent from PlanetRadius + NoiseAmplitude.
     // Ensures the octree bounds always contain all possible surface points.
-    double RootExtentBuffer = 1.05;
+    double RootExtentBuffer = 1.1;
 
     // --- Tree Structure ---
     int ChunkDepth = 4;
     int MinDepth = 7;
     int MaxDepth = 18;
-
-    // --- Ocean ---
-    // When false, skips ocean mesh generation, ocean LOD distance, and ocean position caching.
-    bool bEnableOcean = true;
 };
 
 /**
@@ -67,8 +55,6 @@ private:
 
     TWeakObjectPtr<UMaterialInterface> CachedSurfaceMaterial;
 
-    TWeakObjectPtr<UMaterialInterface> CachedOceanMaterial;
-
     TMap<TSharedPtr<FAdaptiveOctreeNode>, TSharedPtr<FMeshChunk>> ChunkMap;
 
     bool MeshChunksInitialized = false;
@@ -81,14 +67,11 @@ private:
 
     // Centralized terrain parameters -- derived from FOctreeParams at construction
     double PlanetRadius;    // Minimum surface radius (noise only adds elevation)
-    double OceanRadius;     // Sea level radius, derived from SeaLevelCoefficient
     double NoiseAmplitude;  // Maximum noise displacement above PlanetRadius
 
     // Triplanar UV scale: produces consistent UV tiling regardless of tree scale.
     // Calibrated so that ~8000 UV wraps occur across the planet diameter.
     double TriplanarUVScale;
-
-    bool bEnableOcean;
 
     // Composite density sample: combines sphere SDF, noise height, and edit store.
     // Dist: distance from planet center to the sample point.
@@ -163,7 +146,6 @@ public:
 
     // Public accessors for shader/atmosphere/rendering use
     double GetPlanetRadius() const { return PlanetRadius; }
-    double GetOceanRadius() const { return OceanRadius; }
     double GetNoiseAmplitude() const { return NoiseAmplitude; }
     FVector GetPlanetCenter() const { return Root.IsValid() ? Root->Center : FVector::ZeroVector; }
 };
