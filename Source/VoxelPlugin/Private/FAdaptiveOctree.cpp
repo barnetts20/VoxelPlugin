@@ -165,6 +165,9 @@ void FAdaptiveOctree::ApplyEdit(FVector InEditCenter, double InEditRadius, doubl
         if (ChunkNodeRaw)
             ChunkNodes.Add(ChunkNodeRaw->AsShared());
     }
+    
+    UE_LOG(LogTemp, Warning, TEXT("[Edit] AffectedCenters: %d, ResolvedChunks: %d, EditCenter: %s, Radius: %.1f"),
+        AffectedChunkCenters.Num(), ChunkNodes.Num(), *InEditCenter.ToString(), InEditRadius);
 
     // Stage 1: Parallel -- recompute all node data
     ParallelFor(ChunkNodes.Num(), [&](int32 i) {
@@ -536,9 +539,9 @@ void FAdaptiveOctree::UpdateLOD(FVector CameraPosition, double InScreenSpaceThre
     ParallelFor(NumChunks, [&](int32 idx) {
         FAdaptiveOctreeNode* ChunkNode = Chunks[idx].Get();
         double DistSq = FMath::Max(FVector::DistSquared(ChunkNode->Center, CameraPosition), 1e-12);
-        bool CouldSplit = FAdaptiveOctreeNode::EvaluateSplit(ChunkNode->Extent, DistSq, FOVScale, ThresholdSq, ChunkNode->Index.Depth, ChunkNode->DepthBounds[1], ChunkNode->DepthBounds[2]);
-        double SmallestExtent = ChunkNode->Extent / (double)(1 << (ChunkNode->DepthBounds[1] - ChunkNode->Index.Depth));
-        bool CouldMerge = FAdaptiveOctreeNode::EvaluateMerge(SmallestExtent, DistSq, FOVScale, MergeThresholdSq, ChunkNode->DepthBounds[1], ChunkNode->DepthBounds[0], ChunkNode->DepthBounds[2]);
+        bool CouldSplit = FAdaptiveOctreeNode::EvaluateSplit(ChunkNode->Extent, DistSq, FOVScale, ThresholdSq, ChunkNode->Index.Depth, ChunkNode->DepthBounds[2], ChunkNode->DepthBounds[1]);
+        double SmallestExtent = ChunkNode->Extent / (double)(1 << (ChunkNode->DepthBounds[2] - ChunkNode->Index.Depth));
+        bool CouldMerge = FAdaptiveOctreeNode::EvaluateMerge(SmallestExtent, DistSq, FOVScale, MergeThresholdSq, ChunkNode->Index.Depth, ChunkNode->DepthBounds[0], ChunkNode->DepthBounds[1]);
 
         if (!CouldSplit && !CouldMerge) return; //Early out
 

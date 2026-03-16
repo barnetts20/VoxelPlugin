@@ -23,7 +23,7 @@ public:
 
     TArray<FNodeEdge> SignChangeEdges;
 
-    uint8 DepthBounds[4];
+    uint8 DepthBounds[3];
 
     FVector Center;
 

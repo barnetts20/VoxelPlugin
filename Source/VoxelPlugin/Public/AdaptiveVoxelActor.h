@@ -63,10 +63,10 @@ public:
     int ChunkDepth = 4;
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Octree")
-    int MinDepth = 7;
+    int MinDepth = 6;
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Octree")
-    int MaxDepth = 18;
+    int MaxDepth = 21;
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "LOD")
     double ScreenSpaceThreshold = .075;

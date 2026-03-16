@@ -125,7 +125,6 @@ struct VOXELPLUGIN_API FMeshChunk {
         ChunkRtMesh = NewObject<URealtimeMeshSimple>(InParentActor);
         ChunkRtMesh->SetCollisionConfig(cConfig);
         ChunkRtMesh->SetupMaterialSlot(0, "Surface Material");
-        ChunkRtMesh->SetupMaterialSlot(1, "Ocean Material");
 
         ChunkRtComponent = NewObject<URealtimeMeshComponent>(InParentActor, URealtimeMeshComponent::StaticClass());
         ChunkRtComponent->RegisterComponent();

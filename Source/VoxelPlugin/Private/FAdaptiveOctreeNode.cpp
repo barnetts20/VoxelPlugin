@@ -20,9 +20,8 @@ FAdaptiveOctreeNode::FAdaptiveOctreeNode(FVector InCenter, double InExtent, int 
     Extent = FMath::Max(InExtent, 0.0);
 
     DepthBounds[0] = (uint8)InChunkDepth;
-    DepthBounds[1] = (uint8)InMaxDepth;
-    DepthBounds[2] = (uint8)InMinDepth;
-    DepthBounds[3] = 12;
+    DepthBounds[1] = (uint8)InMinDepth;
+    DepthBounds[2] = (uint8)InMaxDepth;
 
     for (int i = 0; i < 8; i++)
     {
@@ -44,7 +43,7 @@ FAdaptiveOctreeNode::FAdaptiveOctreeNode(TSharedPtr<FAdaptiveOctreeNode> InParen
     DepthBounds[0] = InParent->DepthBounds[0];
     DepthBounds[1] = InParent->DepthBounds[1];
     DepthBounds[2] = InParent->DepthBounds[2];
-    DepthBounds[3] = InParent->DepthBounds[3];
+
     for (int i = 0; i < 8; i++)
     {
         Corners[i].Position = Center + (OctreeConstants::Offsets[i] * Extent);
@@ -156,7 +155,7 @@ bool FAdaptiveOctreeNode::ShouldSplit(FVector TreeCenter, FVector InCameraPositi
         double NodeDistSq = FVector::DistSquared(Center, TreeCenter);
         if ((Dot * Dot) > (0.04 * CamDistSq * NodeDistSq)) return false;
     }
-    return EvaluateSplit(Extent, FVector::DistSquared(DualContourPosition, InCameraPosition), InFOVScale, ThresholdSq, Index.Depth, DepthBounds[3], DepthBounds[2]);
+    return EvaluateSplit(Extent, FVector::DistSquared(DualContourPosition, InCameraPosition), InFOVScale, ThresholdSq, Index.Depth, DepthBounds[2], DepthBounds[1]);
 }
 
 bool FAdaptiveOctreeNode::ShouldMerge(FVector TreeCenter, FVector InCameraPosition, double MergeThresholdSq, double InFOVScale)

@@ -14,7 +14,6 @@
 	"IsBetaVersion": false,
 	"IsExperimentalVersion": false,
 	"Installed": false,
-	"LoadingPhase": "PostConfigInit",
 	"Modules": [
 		{
 			"Name": "VoxelPlugin",
@@ -23,6 +22,12 @@
 			"AdditionalDependencies": [
 				"RealtimeMeshComponent"
 			]
+		}
+	],
+	"Plugins": [
+		{
+			"Name": "RealtimeMeshComponent",
+			"Enabled": true
 		}
 	]
 }
