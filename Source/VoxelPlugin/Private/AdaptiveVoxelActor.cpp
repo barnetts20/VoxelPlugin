@@ -12,7 +12,6 @@ AAdaptiveVoxelActor::AAdaptiveVoxelActor()
     PrimaryActorTick.bStartWithTickEnabled = true;
     CameraPosition = FVector(0, 0, 0);
     SurfaceMaterial = UMaterial::GetDefaultMaterial(EMaterialDomain::MD_Surface);
-    OceanMaterial = UMaterial::GetDefaultMaterial(EMaterialDomain::MD_Surface);
 
     // Default scale defines planet radius in world units (cm).
     // 80,000,000 cm = 800 km radius planet.
@@ -48,7 +47,7 @@ void AAdaptiveVoxelActor::OnConstruction(const FTransform& Transform)
     {
         // Only reconstruct if not yet initialized or scale changed.
         // Position/rotation are handled live by the actor transform.
-        if (!Initialized || !GetActorScale3D().Equals(LastInitScale, 0.01) || bEnableOcean != LastInitOceanEnabled)
+        if (!Initialized || !GetActorScale3D().Equals(LastInitScale, 0.01))
         {
             Initialize();
         }
@@ -119,22 +118,18 @@ void AAdaptiveVoxelActor::Initialize()
     Params.ParentActor = this;
     Params.MeshAttachmentRoot = MeshAttachmentRoot;
     Params.SurfaceMaterial = SurfaceMaterial;
-    Params.OceanMaterial = OceanMaterial;
     Params.NoiseFunction = DensityFunction;
     Params.EditStore = EditStore;
     Params.Center = FVector::ZeroVector; //TODO: Remove... we just pass zerovector anyway
     Params.PlanetRadius = ActorPlanetRadius;
     Params.NoiseAmplitude = ActorNoiseAmplitude;
-    Params.SeaLevelCoefficient = SeaLevelCoefficient;
     Params.ChunkDepth = ChunkDepth;
     Params.MinDepth = MinDepth;
     Params.MaxDepth = MaxDepth;
-    Params.bEnableOcean = bEnableOcean;
 
     AdaptiveOctree = MakeShared<FAdaptiveOctree>(Params);
 
     LastInitScale = GetActorScale3D();
-    LastInitOceanEnabled = bEnableOcean;
     Initialized = true;
 
     RunDataUpdateTask();

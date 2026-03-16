@@ -20,9 +20,8 @@ FAdaptiveOctreeNode::FAdaptiveOctreeNode(FVector InCenter, double InExtent, int 
     Extent = FMath::Max(InExtent, 0.0);
 
     DepthBounds[0] = (uint8)InChunkDepth;
-    DepthBounds[1] = (uint8)InMaxDepth;
-    DepthBounds[2] = (uint8)InMinDepth;
-    DepthBounds[3] = 12;
+    DepthBounds[1] = (uint8)InMinDepth;
+    DepthBounds[2] = (uint8)InMaxDepth;
 
     for (int i = 0; i < 8; i++)
     {
@@ -73,7 +72,7 @@ FVector FAdaptiveOctreeNode::GetInterpolatedNormal(FVector P)
     return FVector(FinalNormal).GetSafeNormal();
 }
 
-void FAdaptiveOctreeNode::FinalizeFromExistingCorners(FVector TreeCenter, double OceanRadius, bool bEnableOcean, bool bSkipNormals)
+void FAdaptiveOctreeNode::FinalizeFromExistingCorners(FVector TreeCenter, bool bSkipNormals)
 {
     SignChangeEdges.Reset();
 
@@ -104,7 +103,7 @@ void FAdaptiveOctreeNode::FinalizeFromExistingCorners(FVector TreeCenter, double
             SignChangeEdges.Add(NewEdge);
     }
 
-    ComputeDualContourPosition(TreeCenter, OceanRadius, bEnableOcean);
+    ComputeDualContourPosition(TreeCenter);
 
     if (IsSurfaceNode)
     {
@@ -157,13 +156,8 @@ bool FAdaptiveOctreeNode::ShouldSplit(FVector TreeCenter, FVector InCameraPositi
     }
 
     double SurfaceDistSq = FVector::DistSquared(DualContourPosition, InCameraPosition);
-    double OceanDistSq = FVector::DistSquared(OceanPosition, InCameraPosition);
 
-    bool bOceanDriving = (OceanDistSq < SurfaceDistSq);
-    double DistSq = FMath::Max(FMath::Min(SurfaceDistSq, OceanDistSq), 1e-12);
-    int EffectiveMaxDepth = bOceanDriving ? (int)DepthBounds[3] : (int)DepthBounds[1];
-
-    return EvaluateSplit(Extent, DistSq, InFOVScale, ThresholdSq, Index.Depth, EffectiveMaxDepth, DepthBounds[2]);
+    return EvaluateSplit(Extent, SurfaceDistSq, InFOVScale, ThresholdSq, Index.Depth, DepthBounds[2], DepthBounds[1]);
 }
 
 bool FAdaptiveOctreeNode::ShouldMerge(FVector TreeCenter, FVector InCameraPosition, double MergeThresholdSq, double InFOVScale)
@@ -171,10 +165,7 @@ bool FAdaptiveOctreeNode::ShouldMerge(FVector TreeCenter, FVector InCameraPositi
     if (LodOverride) return false;
 
     double SurfaceDistSq = FVector::DistSquared(DualContourPosition, InCameraPosition);
-    double OceanDistSq = FVector::DistSquared(OceanPosition, InCameraPosition);
-    double DistSq = FMath::Max(FMath::Min(SurfaceDistSq, OceanDistSq), 1e-12);
-
-    return EvaluateMerge(Extent, DistSq, InFOVScale, MergeThresholdSq, Index.Depth, DepthBounds[0], DepthBounds[2]);
+    return EvaluateMerge(Extent, SurfaceDistSq, InFOVScale, MergeThresholdSq, Index.Depth, DepthBounds[0], DepthBounds[1]);
 }
 
 TArray<FNodeEdge>& FAdaptiveOctreeNode::GetSignChangeEdges()
@@ -217,13 +208,12 @@ FVector FAdaptiveOctreeNode::ComputeNormalizedPosition(FVector TreeCenter, doubl
     return TreeCenter + DirFromCenter * InRadius;
 }
 
-void FAdaptiveOctreeNode::ComputeDualContourPosition(FVector TreeCenter, double OceanRadius, bool bEnableOcean)
+void FAdaptiveOctreeNode::ComputeDualContourPosition(FVector TreeCenter)
 {
     if (SignChangeEdges.Num() == 0)
     {
         DualContourNormal = FVector3f::ZeroVector;
         DualContourPosition = Center;
-        OceanPosition = bEnableOcean ? Center.GetSafeNormal() * OceanRadius : Center;
         IsSurfaceNode = false;
         return;
     }
@@ -275,8 +265,6 @@ void FAdaptiveOctreeNode::ComputeDualContourPosition(FVector TreeCenter, double 
     // Cache ocean surface projection of the dual contour position.
     // When ocean is disabled, OceanPosition == DualContourPosition
     // so the min() in LOD distance is a no-op.
-
-    OceanPosition = bEnableOcean ? DualContourPosition.GetSafeNormal() * OceanRadius : DualContourPosition;
 
     DualContourNormal = FVector3f(Qef.GetAverageNormal());
 }

@@ -44,16 +44,12 @@ private:
     std::atomic<bool> IsDestroyed = false;
 
     FVector LastInitScale = FVector::ZeroVector;
-    bool LastInitOceanEnabled = true;
 
 public:
     AAdaptiveVoxelActor();
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Materials")
     UMaterialInterface* SurfaceMaterial;
-
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Materials")
-    UMaterialInterface* OceanMaterial;
 
     // Planet radius in world units is determined by actor scale (max component).
     // The octree is built at world scale in actor-local space (origin 0,0,0).
@@ -62,12 +58,6 @@ public:
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrain", meta = (ClampMin = "0.01", ClampMax = "1.0"))
     double NoiseAmplitudeRatio = 0.25;
-
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrain", meta = (ClampMin = "-1.0", ClampMax = "2.0"))
-    double SeaLevelCoefficient = 0.5;
-
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrain")
-    bool bEnableOcean = true;
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Octree")
     int ChunkDepth = 4;
