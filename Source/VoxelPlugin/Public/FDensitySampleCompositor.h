@@ -3,15 +3,9 @@
 #pragma once
 
 #include "CoreMinimal.h"
+#include "FastNoise/FastNoise.h"
 #include "FSparseEditStore.h"
 
-namespace FastNoise
-{
-    class Generator;
-
-    template<typename T>
-    class SmartNode;
-}
 /**
  * Non-owning view into three SoA float streams.
  * Callers own the backing storage (stack arrays, TArrays, etc).
@@ -103,5 +97,5 @@ public:
 };
 
 struct VOXELPLUGIN_API FCompositorExamples {
-    static TFunction<void(const FSampleInput&, float*)> HeightMapLayer(double ActorPlanetRadius, double ActorNoiseAmplitude, FastNoise::SmartNode<FastNoise::Generator> InNoise);
+    static TFunction<void(const FSampleInput&, float*)> HeightMapLayer(double ActorPlanetRadius, double ActorNoiseAmplitude, FastNoise::SmartNode<> InNoise);
 };
