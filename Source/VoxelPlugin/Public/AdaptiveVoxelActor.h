@@ -43,6 +43,7 @@ private:
 
     FVector LastInitScale = FVector::ZeroVector;
 
+    FastNoise::SmartNode<> Noise;
 public:
     AAdaptiveVoxelActor();
 
