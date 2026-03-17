@@ -13,10 +13,11 @@ const bool FAdaptiveOctreeNode::IsRoot() const
     return !Parent.IsValid();
 }
 
-FAdaptiveOctreeNode::FAdaptiveOctreeNode(FVector InCenter, double InExtent, int InChunkDepth, int InMinDepth, int InMaxDepth)
+FAdaptiveOctreeNode::FAdaptiveOctreeNode(double InExtent, int InChunkDepth, int InMinDepth, int InMaxDepth)
 {
-    Center = InCenter;
-    ChunkCenter = InCenter;
+    Center = FVector::ZeroVector;
+    ChunkCenter = FVector::ZeroVector;
+
     Extent = FMath::Max(InExtent, 0.0);
 
     DepthBounds[0] = (uint8)InChunkDepth;
@@ -72,7 +73,7 @@ FVector FAdaptiveOctreeNode::GetInterpolatedNormal(FVector P)
     return FVector(FinalNormal).GetSafeNormal();
 }
 
-void FAdaptiveOctreeNode::FinalizeFromExistingCorners(FVector TreeCenter, bool bSkipNormals)
+void FAdaptiveOctreeNode::FinalizeFromExistingCorners(bool bSkipNormals)
 {
     SignChangeEdges.Reset();
 
@@ -103,7 +104,7 @@ void FAdaptiveOctreeNode::FinalizeFromExistingCorners(FVector TreeCenter, bool b
             SignChangeEdges.Add(NewEdge);
     }
 
-    ComputeDualContourPosition(TreeCenter);
+    ComputeDualContourPosition();
 
     if (IsSurfaceNode)
     {
@@ -144,14 +145,14 @@ void FAdaptiveOctreeNode::Merge()
     bIsLeaf = true;
 }
 
-bool FAdaptiveOctreeNode::ShouldSplit(FVector TreeCenter, FVector InCameraPosition, double ThresholdSq, double InFOVScale)
+bool FAdaptiveOctreeNode::ShouldSplit(FVector InCameraPosition, double ThresholdSq, double InFOVScale)
 {
     // Back-face cull: skip nodes on the far side of the planet
-    double Dot = FVector::DotProduct(InCameraPosition - TreeCenter, Center - TreeCenter);
+    double Dot = FVector::DotProduct(InCameraPosition, Center);
     if (Dot < 0.0)
     {
-        double CamDistSq = FVector::DistSquared(InCameraPosition, TreeCenter);
-        double NodeDistSq = FVector::DistSquared(Center, TreeCenter);
+        double CamDistSq = InCameraPosition.SizeSquared();
+        double NodeDistSq = Center.SizeSquared();
         if ((Dot * Dot) > (0.04 * CamDistSq * NodeDistSq)) return false;
     }
 
@@ -160,7 +161,7 @@ bool FAdaptiveOctreeNode::ShouldSplit(FVector TreeCenter, FVector InCameraPositi
     return EvaluateSplit(Extent, SurfaceDistSq, InFOVScale, ThresholdSq, Index.Depth, DepthBounds[2], DepthBounds[1]);
 }
 
-bool FAdaptiveOctreeNode::ShouldMerge(FVector TreeCenter, FVector InCameraPosition, double MergeThresholdSq, double InFOVScale)
+bool FAdaptiveOctreeNode::ShouldMerge(FVector InCameraPosition, double MergeThresholdSq, double InFOVScale)
 {
     if (LodOverride) return false;
 
@@ -202,13 +203,12 @@ TArray<TSharedPtr<FAdaptiveOctreeNode>> FAdaptiveOctreeNode::GetSurfaceChunks()
     return SurfaceNodes;
 }
 
-FVector FAdaptiveOctreeNode::ComputeNormalizedPosition(FVector TreeCenter, double InRadius) const
+FVector FAdaptiveOctreeNode::ComputeNormalizedPosition(double InRadius) const
 {
-    FVector DirFromCenter = (DualContourPosition - TreeCenter).GetSafeNormal();
-    return TreeCenter + DirFromCenter * InRadius;
+    return DualContourPosition.GetSafeNormal() * InRadius;
 }
 
-void FAdaptiveOctreeNode::ComputeDualContourPosition(FVector TreeCenter)
+void FAdaptiveOctreeNode::ComputeDualContourPosition()
 {
     if (SignChangeEdges.Num() == 0)
     {

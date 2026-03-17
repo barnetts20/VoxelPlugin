@@ -10,7 +10,6 @@ using namespace RealtimeMesh;
 struct VOXELPLUGIN_API FCornerSample {
     FVector Position;           // World position
     double Density;             // Final SDF density (computed in double, truncated to float on writeback)
-    double Dist;
     TArray<float*> Targets;     // Pointers to all Corners[i].Density that share this position
 };
 

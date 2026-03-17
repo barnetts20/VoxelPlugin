@@ -6,7 +6,7 @@
 struct VOXELPLUGIN_API FAdaptiveOctreeNode : public TSharedFromThis<FAdaptiveOctreeNode>
 {
 private:
-    void ComputeDualContourPosition(FVector TreeCenter);
+    void ComputeDualContourPosition();
 
     FVector GetInterpolatedNormal(FVector P);
 
@@ -59,11 +59,10 @@ public:
         return (lhs * lhs) < (MergeThresholdSq * DistSq);
     }
 
-    // TreeCenter passed explicitly -- no longer stored per-node
     // ThresholdSq / MergeThresholdSq precomputed once per LOD pass
-    bool ShouldSplit(FVector TreeCenter, FVector InCameraPosition, double ThresholdSq, double InFOVScale);
+    bool ShouldSplit(FVector InCameraPosition, double ThresholdSq, double InFOVScale);
 
-    bool ShouldMerge(FVector TreeCenter, FVector InCameraPosition, double MergeThresholdSq, double InFOVScale);
+    bool ShouldMerge(FVector InCameraPosition, double MergeThresholdSq, double InFOVScale);
 
     void Split();
 
@@ -72,15 +71,14 @@ public:
     TArray<TSharedPtr<FAdaptiveOctreeNode>> GetSurfaceChunks();
 
     // Computes normalized position on the fly -- no longer stored on the node
-    FVector ComputeNormalizedPosition(FVector TreeCenter, double InRadius) const;
+    FVector ComputeNormalizedPosition(double InRadius) const;
 
     TArray<FNodeEdge>& GetSignChangeEdges();
 
-    // TreeCenter passed explicitly for fallback normal computation
-    void FinalizeFromExistingCorners(FVector TreeCenter, bool bSkipNormals = false);
+    void FinalizeFromExistingCorners(bool bSkipNormals = false);
 
     // Root Constructor
-    FAdaptiveOctreeNode(FVector InCenter, double InExtent, int InChunkDepth, int InMinDepth, int InMaxDepth);
+    FAdaptiveOctreeNode(double InExtent, int InChunkDepth, int InMinDepth, int InMaxDepth);
 
     // Child Constructor
     FAdaptiveOctreeNode(TSharedPtr<FAdaptiveOctreeNode> InParent, uint8 InChildIndex, FVector InAnchorCenter);

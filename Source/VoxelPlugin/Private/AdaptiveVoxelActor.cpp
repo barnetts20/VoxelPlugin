@@ -1,7 +1,8 @@
-#include "AdaptiveVoxelActor.h"
+ï»¿#include "AdaptiveVoxelActor.h"
 #include "DrawDebugHelpers.h"
 #include "Kismet/GameplayStatics.h"
 #include "TimerManager.h"
+#include <FDensitySampleCompositor.h>
 
 using namespace RealtimeMesh;
 
@@ -89,7 +90,7 @@ void AAdaptiveVoxelActor::Initialize()
         World->GetTimerManager().ClearTimer(DataUpdateTimerHandle);
     }
 
-    // Destroy old octree first — this releases all chunk shared pointers
+    // Destroy old octree first ï¿½ this releases all chunk shared pointers
     if (AdaptiveOctree.IsValid())
     {
         AdaptiveOctree->Clear();
@@ -99,12 +100,6 @@ void AAdaptiveVoxelActor::Initialize()
     // Now clean up any components that were already attached
     CleanSceneRoot();
 
-    Noise = FastNoise::NewFromEncodedNodeTree("GQAgAB8AEwCamRk+DQAMAAAAAAAAQAcAAAAAAD8AAAAAAAAAAAA/AAAAAD8AAAAAvwAAAAA/ARsAFwCamRk+AAAAPwAAAAAAAAA/IAAgABMAAABAQBsAJAACAAAADQAIAAAAAAAAQAsAAQAAAAAAAAABAAAAAAAAAAAAAIA/AAAAAD8AAAAAAAAAAIA/AAAAAAAAmpmZPgCamRk+AM3MTD4BEwDNzEw+IAAfABcAAACAvwAAgD8AAIDAAAAAPw8AAQAAAAAAAED//wEAAAAAAD8AAAAAAAAAAIA/AAAAAD8AAACAvwAAAAA/");
-
-    auto DensityFunction = [this](int Count, const float* XPos, const float* YPos, const float* ZPos, float* OutNoise) {
-        Noise->GenPositionArray3D(OutNoise, Count, XPos, YPos, ZPos, 0, 0, 0, 0);
-        };
-
     // Octree is built at world scale in actor-local space (origin 0,0,0).
     // Actor scale determines planet radius. Collision data is baked at this scale.
     // MeshAttachmentRoot handles world placement via position/rotation only (absolute scale).
@@ -112,15 +107,54 @@ void AAdaptiveVoxelActor::Initialize()
     double ActorNoiseAmplitude = ActorPlanetRadius * NoiseAmplitudeRatio;
     double ActorRootExtent = (ActorPlanetRadius + ActorNoiseAmplitude) * 1.05;
 
+    FastNoise::SmartNode<> Noise = FastNoise::NewFromEncodedNodeTree("GQAgAB8AEwCamRk+DQAMAAAAAAAAQAcAAAAAAD8AAAAAAAAAAAA/AAAAAD8AAAAAvwAAAAA/ARsAFwCamRk+AAAAPwAAAAAAAAA/IAAgABMAAABAQBsAJAACAAAADQAIAAAAAAAAQAsAAQAAAAAAAAABAAAAAAAAAAAAAIA/AAAAAD8AAAAAAAAAAIA/AAAAAAAAmpmZPgCamRk+AM3MTD4BEwDNzEw+IAAfABcAAACAvwAAgD8AAIDAAAAAPw8AAQAAAAAAAED//wEAAAAAAD8AAAAAAAAAAIA/AAAAAD8AAACAvwAAAAA/");
+    auto HeightmapLayer = [NoiseNode = Noise, PlanetRadius = ActorPlanetRadius, NoiseAmplitude = ActorNoiseAmplitude](const FSampleInput& Input, float* DensityOut) {
+        int32 Count = Input.Num();
+
+        // Project positions onto sphere surface for noise sampling
+        TArray<float> PX, PY, PZ;
+        PX.SetNumUninitialized(Count);
+        PY.SetNumUninitialized(Count);
+        PZ.SetNumUninitialized(Count);
+
+        double InvNoiseAmplitude = 1.0 / NoiseAmplitude;
+        double RootExtent = (PlanetRadius + NoiseAmplitude) * 1.05;
+
+        for (int32 i = 0; i < Count; i++)
+        {
+            FVector Pos(Input.X[i], Input.Y[i], Input.Z[i]);
+            double Dist = Pos.Size();
+            FVector Dir = (Dist > 1e-10) ? (Pos / Dist) : FVector::UpVector;
+            FVector SurfacePos = Dir * RootExtent;
+            PX[i] = (float)(SurfacePos.X * InvNoiseAmplitude);
+            PY[i] = (float)(SurfacePos.Y * InvNoiseAmplitude);
+            PZ[i] = (float)(SurfacePos.Z * InvNoiseAmplitude);
+        }
+
+        TArray<float> NoiseOut;
+        NoiseOut.SetNumUninitialized(Count);
+        NoiseNode->GenPositionArray3D(NoiseOut.GetData(), Count,
+            PX.GetData(), PY.GetData(), PZ.GetData(), 0, 0, 0, 0);
+
+        for (int32 i = 0; i < Count; i++)
+        {
+            double Dist = FVector(Input.X[i], Input.Y[i], Input.Z[i]).Size();
+            double Clamped = FMath::Clamp((double)NoiseOut[i], -1.0, 1.0);
+            double Remapped = (Clamped + 1.0) * 0.5;
+            double Height = Remapped * NoiseAmplitude;
+            DensityOut[i] = (float)(Dist - (PlanetRadius + Height));
+        }
+        };
+
     TSharedPtr<FSparseEditStore> EditStore = MakeShared<FSparseEditStore>(FVector::ZeroVector, ActorRootExtent, ChunkDepth, MaxDepth);
+    TSharedPtr<FDensitySampleCompositor> Compositor = MakeShared<FDensitySampleCompositor>(EditStore);
+    Compositor->AddSampleLayer(HeightmapLayer);
 
     FOctreeParams Params;
     Params.ParentActor = this;
     Params.MeshAttachmentRoot = MeshAttachmentRoot;
     Params.SurfaceMaterial = SurfaceMaterial;
-    Params.NoiseFunction = DensityFunction;
-    Params.EditStore = EditStore;
-    Params.Center = FVector::ZeroVector; //TODO: Remove... we just pass zerovector anyway
+    Params.Compositor = Compositor;
     Params.PlanetRadius = ActorPlanetRadius;
     Params.NoiseAmplitude = ActorNoiseAmplitude;
     Params.ChunkDepth = ChunkDepth;
@@ -246,7 +280,7 @@ void AAdaptiveVoxelActor::Tick(float DeltaTime)
         if (viewLocations.Num() > 0)
         {
             // Convert world-space camera to actor-local space.
-            // Position and rotation only — octree is built at world scale, not normalized.
+            // Position and rotation only ï¿½ octree is built at world scale, not normalized.
             FVector WorldCamPos = viewLocations[0];
             FTransform NoScaleTransform(GetActorRotation(), GetActorLocation());
             this->CameraPosition = NoScaleTransform.InverseTransformPosition(WorldCamPos);

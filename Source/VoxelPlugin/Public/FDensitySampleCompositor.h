@@ -3,83 +3,95 @@
 #pragma once
 
 #include "CoreMinimal.h"
-#include <FSparseEditStore.h>
 
+#include "FSparseEditStore.h"
+
+/**
+ * Non-owning view into three SoA float streams.
+ * Callers own the backing storage (stack arrays, TArrays, etc).
+ */
 struct VOXELPLUGIN_API FSampleInput
 {
-    TArray<float> X;
-    TArray<float> Y;
-    TArray<float> Z;
+    float* X;
+    float* Y;
+    float* Z;
+    int32 Count;
 
-    int32 Num() const { return X.Num(); }
+    int32 Num() const { return Count; }
 
-    const float* XData() const { return X.GetData(); }
-    const float* YData() const { return Y.GetData(); }
-    const float* ZData() const { return Z.GetData(); }
+    const float* XData() const { return X; }
+    const float* YData() const { return Y; }
+    const float* ZData() const { return Z; }
 
     FVector GetPosition(int32 Index) const
     {
         return FVector(X[Index], Y[Index], Z[Index]);
     }
 
-    // Construct empty, sized — caller fills arrays directly (octree path)
-    explicit FSampleInput(int32 Count)
-    {
-        X.SetNumUninitialized(Count);
-        Y.SetNumUninitialized(Count);
-        Z.SetNumUninitialized(Count);
-    }
-
-    // Construct from FVector span — parallel for if large enough
-    explicit FSampleInput(TArrayView<const FVector> Positions)
-    {
-        int32 Count = Positions.Num();
-        X.SetNumUninitialized(Count);
-        Y.SetNumUninitialized(Count);
-        Z.SetNumUninitialized(Count);
-
-        // Parallel worth it above some threshold
-        if (Count > 8192)
-        {
-            ParallelFor(Count, [&](int32 i)
-                {
-                    X[i] = (float)Positions[i].X;
-                    Y[i] = (float)Positions[i].Y;
-                    Z[i] = (float)Positions[i].Z;
-                });
-        }
-        else
-        {
-            for (int32 i = 0; i < Count; i++)
-            {
-                X[i] = (float)Positions[i].X;
-                Y[i] = (float)Positions[i].Y;
-                Z[i] = (float)Positions[i].Z;
-            }
-        }
-    }
-
-    // TArray overload just delegates to the view
-    explicit FSampleInput(const TArray<FVector>& Positions)
-        : FSampleInput(TArrayView<const FVector>(Positions)) {}
+    FSampleInput(float* InX, float* InY, float* InZ, int32 InCount)
+        : X(InX), Y(InY), Z(InZ), Count(InCount) {}
 };
 
 class VOXELPLUGIN_API FDensitySampleCompositor
 {
+private:
+    TArray<TFunction<void(const FSampleInput&, float*)>> SampleLayers;
+    TSharedPtr<FSparseEditStore> EditStore;
 public:
-	TSharedPtr<FSparseEditStore> EditStore;
-    virtual void SampleBase(FSampleInput InSampleInput,
-        float* DensityOut) const = 0;
 
-    void Sample(FSampleInput InSampleInput, float* DensityOut) const {
-        SampleBase(InSampleInput, DensityOut);
-
-        //Sampling the edit store is more expensive than just building arrays, so we just always parallelize
-        ParallelFor(InSampleInput.Num(), [&](int32 i) {
-            DensityOut[i] += EditStore->Sample(InSampleInput.GetPosition(i));
-        });
+    TSharedPtr<FSparseEditStore> GetEditStore() {
+        return EditStore;
     }
 
-	FDensitySampleCompositor();
-	~FDensitySampleCompositor();
+    void AddSampleLayer(TFunction<void(const FSampleInput&, float*)> Layer)
+    {
+        SampleLayers.Add(MoveTemp(Layer));
+    }
+
+    void Sample(const FSampleInput& Input, float* DensityOut) const
+    {
+        int32 Count = Input.Num();
+        if (Count <= 0 || SampleLayers.Num() <= 0) return;
+
+        // Fast path: single layer — no temp allocation, no ParallelFor overhead
+        if (SampleLayers.Num() == 1)
+        {
+            SampleLayers[0](Input, DensityOut);
+        }
+        else
+        {
+            // Multi-layer path
+            TArray<TArray<float>> LayerOutputs;
+            LayerOutputs.SetNum(SampleLayers.Num());
+            for (auto& L : LayerOutputs) L.SetNumUninitialized(Count);
+
+            ParallelFor(SampleLayers.Num(), [&](int32 LayerIdx) {
+                SampleLayers[LayerIdx](Input, LayerOutputs[LayerIdx].GetData());
+                });
+
+            FMemory::Memcpy(DensityOut, LayerOutputs[0].GetData(), Count * sizeof(float));
+            for (int32 LayerIdx = 1; LayerIdx < SampleLayers.Num(); LayerIdx++)
+                for (int32 i = 0; i < Count; i++)
+                    DensityOut[i] += LayerOutputs[LayerIdx][i];
+        }
+
+        // Edit store — scalar loop for small batches, parallel only when worth it
+        if (EditStore.IsValid())
+        {
+            if (Count > 128)
+            {
+                ParallelFor(Count, [&](int32 i) {
+                    DensityOut[i] += EditStore->Sample(Input.GetPosition(i));
+                    });
+            }
+            else
+            {
+                for (int32 i = 0; i < Count; i++)
+                    DensityOut[i] += EditStore->Sample(Input.GetPosition(i));
+            }
+        }
+    }
+
+    FDensitySampleCompositor() {};
+    FDensitySampleCompositor(TSharedPtr<FSparseEditStore> InEditStore) : EditStore(InEditStore) {};
 };

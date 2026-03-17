@@ -4,6 +4,7 @@
 #include "FMeshingStructs.h"
 #include "FSparseEditStore.h"
 #include "FAdaptiveOctreeNode.h"
+#include <FDensitySampleCompositor.h>
 
 struct VOXELPLUGIN_API FOctreeParams {
     // --- Rendering ---
@@ -12,11 +13,7 @@ struct VOXELPLUGIN_API FOctreeParams {
     UMaterialInterface* SurfaceMaterial = nullptr;
 
     // --- Data Dependencies ---
-    TFunction<void(int, const float*, const float*, const float*, float*)> NoiseFunction;
-    TSharedPtr<FSparseEditStore> EditStore;
-
-    // --- Spatial ---
-    FVector Center = FVector::ZeroVector;
+    TSharedPtr<FDensitySampleCompositor> Compositor;
 
     // Planet radius: the minimum possible surface elevation.
     // Noise can only push the surface outward from this radius.
@@ -43,9 +40,7 @@ struct VOXELPLUGIN_API FOctreeParams {
 struct VOXELPLUGIN_API FAdaptiveOctree
 {
 private:
-    TFunction<void(int, const float*, const float*, const float*, float*)> DensityFunction;
-
-    TSharedPtr<FSparseEditStore> EditStore;
+    TSharedPtr<FDensitySampleCompositor> Compositor;
 
     TSharedPtr<FAdaptiveOctreeNode> Root;
 
@@ -72,36 +67,6 @@ private:
     // Triplanar UV scale: produces consistent UV tiling regardless of tree scale.
     // Calibrated so that ~8000 UV wraps occur across the planet diameter.
     double TriplanarUVScale;
-
-    // Composite density sample: combines sphere SDF, noise height, and edit store.
-    // Dist: distance from planet center to the sample point.
-    // NoiseHeight: raw noise output in [-1, 1] range.
-    // Position: world-space position for edit store lookup.
-    //
-    // Noise is remapped from [-1,1] to [0,1] so that the surface ranges from
-    // PlanetRadius (noise=-1) to PlanetRadius+NoiseAmplitude (noise=+1).
-    // This guarantees PlanetRadius is the minimum possible surface elevation.
-    float ComputeDensity(double Dist, float NoiseHeight, FVector Position) const
-    {
-        double Clamped = FMath::Clamp((double)NoiseHeight, -1.0, 1.0);
-        double Remapped = (Clamped + 1.0) * 0.5; // [-1,1] -> [0,1]
-        double Height = Remapped * NoiseAmplitude;
-        return (float)(Dist - (PlanetRadius + Height) + EditStore->Sample(Position));
-    }
-
-    // Compute noise sampling coordinates for a world-space position.
-    // Projects onto the unit sphere surface and scales by noise frequency.
-    void ComputeNoisePosition(FVector WorldPos, float& OutX, float& OutY, float& OutZ) const
-    {
-        FVector PlanetRel = WorldPos - Root->Center;
-        double Dist = PlanetRel.Size();
-        FVector Dir = (Dist > 1e-10) ? (PlanetRel / Dist) : FVector::UpVector;
-        FVector SurfacePos = Dir * RootExtent;
-        double InvNoiseAmplitude = 1.0 / NoiseAmplitude;
-        OutX = (float)(SurfacePos.X * InvNoiseAmplitude);
-        OutY = (float)(SurfacePos.Y * InvNoiseAmplitude);
-        OutZ = (float)(SurfacePos.Z * InvNoiseAmplitude);
-    }
 
     void SplitToDepth(FAdaptiveOctreeNode* Node, int InMinDepth);
 

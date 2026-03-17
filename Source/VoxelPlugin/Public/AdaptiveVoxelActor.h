@@ -37,8 +37,6 @@ private:
 
     bool TickInEditor = true;
 
-    FastNoise::SmartNode<> Noise;
-
     std::atomic<bool> Initialized = false;
 
     std::atomic<bool> IsDestroyed = false;

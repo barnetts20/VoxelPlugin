@@ -3,12 +3,10 @@
 
 FAdaptiveOctree::FAdaptiveOctree(const FOctreeParams& Params)
 {
-    DensityFunction = Params.NoiseFunction;
-    EditStore = Params.EditStore;
     CachedParentActor = Params.ParentActor;
     CachedMeshAttachRoot = Params.MeshAttachmentRoot;
     CachedSurfaceMaterial = Params.SurfaceMaterial;
-
+    Compositor = Params.Compositor;
     ChunkDepth = Params.ChunkDepth;
 
     // Core terrain parameters from params
@@ -26,7 +24,7 @@ FAdaptiveOctree::FAdaptiveOctree(const FOctreeParams& Params)
     // UV scale: 0.0001 was calibrated for PlanetRadius=80M. Keep the same visual tiling.
     TriplanarUVScale = 0.0001 * (80000000.0 / FMath::Max(PlanetRadius, 1.0));
 
-    Root = MakeShared<FAdaptiveOctreeNode>(Params.Center, RootExtent, Params.ChunkDepth, Params.MinDepth, Params.MaxDepth);
+    Root = MakeShared<FAdaptiveOctreeNode>(RootExtent, Params.ChunkDepth, Params.MinDepth, Params.MaxDepth);
     ComputeNodeData(Root.Get());
     SplitToDepth(Root.Get(), Params.ChunkDepth);
 
@@ -154,8 +152,8 @@ void FAdaptiveOctree::UpdateChunkMap(TSharedPtr<FAdaptiveOctreeNode> ChunkNode, 
 
 void FAdaptiveOctree::ApplyEdit(FVector InEditCenter, double InEditRadius, double InEditStrength, int InEditResolution)
 {
-    int depth = EditStore->GetDepthForBrushRadius(InEditRadius, InEditResolution);
-    TArray<FVector> AffectedChunkCenters = EditStore->ApplySphericalEdit(InEditCenter, InEditRadius, InEditStrength, depth);
+    int depth = Compositor->GetEditStore()->GetDepthForBrushRadius(InEditRadius, InEditResolution);
+    TArray<FVector> AffectedChunkCenters = Compositor->GetEditStore()->ApplySphericalEdit(InEditCenter, InEditRadius, InEditStrength, depth);
     double ReconstructRadius = InEditRadius * 2.5;
 
     // Resolve chunk nodes -- collect as shared ptrs since we need them for ChunkMap operations
@@ -258,7 +256,7 @@ void FAdaptiveOctree::FinalizeSubtree(FAdaptiveOctreeNode* Node, FVector EditCen
     }
 
     // Then this node
-    Node->FinalizeFromExistingCorners(Root->Center);
+    Node->FinalizeFromExistingCorners();
 }
 
 void FAdaptiveOctree::ReconstructSubtree(FAdaptiveOctreeNode* Node, FVector EditCenter, double SearchRadius)
@@ -274,30 +272,31 @@ void FAdaptiveOctree::ReconstructSubtree(FAdaptiveOctreeNode* Node, FVector Edit
 
     if (Samples.Num() == 0) return;
 
-    // 2. Build position arrays + pre-compute distances
+    // 2. Build position arrays
     int32 Count = Samples.Num();
-    TArray<float> XPos, YPos, ZPos, NoiseOut;
-    XPos.SetNumUninitialized(Count);
-    YPos.SetNumUninitialized(Count);
-    ZPos.SetNumUninitialized(Count);
-    NoiseOut.SetNumUninitialized(Count);
+    TArray<float> SX, SY, SZ;
+    SX.SetNumUninitialized(Count);
+    SY.SetNumUninitialized(Count);
+    SZ.SetNumUninitialized(Count);
 
-    FVector PlanetCenter = Root->Center;
-
-    ParallelFor(Count, [&](int32 i)
-        {
-            FVector PlanetRel = Samples[i].Position - PlanetCenter;
-            Samples[i].Dist = PlanetRel.Size();
-            ComputeNoisePosition(Samples[i].Position, XPos[i], YPos[i], ZPos[i]);
-        });
+    for (int32 i = 0; i < Count; i++)
+    {
+        FVector curPos = Samples[i].Position;
+        SX[i] = (float)curPos.X;
+        SY[i] = (float)curPos.Y;
+        SZ[i] = (float)curPos.Z;
+    }
 
     // 3. One bulk noise call
-    DensityFunction(Count, XPos.GetData(), YPos.GetData(), ZPos.GetData(), NoiseOut.GetData());
+    TArray<float> SampleOut;
+    SampleOut.SetNumUninitialized(Count);
+
+    FSampleInput SampleIn(SX.GetData(), SY.GetData(), SZ.GetData(), Count);
+    Compositor->Sample(SampleIn, SampleOut.GetData());
 
     // 4. SDF + edits
-    ParallelFor(Count, [&](int32 i)
-        {
-            Samples[i].Density = ComputeDensity(Samples[i].Dist, NoiseOut[i], Samples[i].Position);
+    ParallelFor(Count, [&](int32 i) {
+        Samples[i].Density = SampleOut[i];
         });
 
     // 5. Write back densities to all nodes that share each corner
@@ -489,7 +488,7 @@ void FAdaptiveOctree::UpdateLodRecursive(FAdaptiveOctreeNode* Node, FVector Came
 {
     if (Node->IsLeaf())
     {
-        if (Node->ShouldSplit(Root->Center, CameraPosition, ThresholdSq, InFOVScale))
+        if (Node->ShouldSplit(CameraPosition, ThresholdSq, InFOVScale))
         {
             OutChanged = true;
             SplitAndComputeChildren(Node);
@@ -500,7 +499,7 @@ void FAdaptiveOctree::UpdateLodRecursive(FAdaptiveOctreeNode* Node, FVector Came
         else if (Node->Index.LastChild() == 7 && Node->Parent.IsValid())
         {
             FAdaptiveOctreeNode* ParentPtr = Node->Parent.Pin().Get();
-            if (ParentPtr && ParentPtr->ShouldMerge(Root->Center, CameraPosition, MergeThresholdSq, InFOVScale))
+            if (ParentPtr && ParentPtr->ShouldMerge(CameraPosition, MergeThresholdSq, InFOVScale))
             {
                 OutChanged = true;
                 ParentPtr->Merge();
@@ -637,24 +636,23 @@ void FAdaptiveOctree::SplitAndComputeChildren(FAdaptiveOctreeNode* Node)
     GridPositions[26] = Node->Center;
 
     // --- Stage 2: Sample 19 new densities ---
-    const int32 NewCount = 19;
-    float XPos[19], YPos[19], ZPos[19], NoiseOut[19];
+    const int32 Count = 19;
+    float SX[19], SY[19], SZ[19], SampleOut[19];
 
-    FVector PlanetCenter = Root->Center;
-    double GridDists[19];
-
-    for (int32 i = 0; i < NewCount; i++)
+    for (int32 i = 0; i < Count; i++)
     {
-        FVector PlanetRel = GridPositions[8 + i] - PlanetCenter;
-        GridDists[i] = PlanetRel.Size();
-        ComputeNoisePosition(GridPositions[8 + i], XPos[i], YPos[i], ZPos[i]);
+        FVector curPos = GridPositions[8 + i];
+        SX[i] = (float)curPos.X;
+        SY[i] = (float)curPos.Y;
+        SZ[i] = (float)curPos.Z;
     }
 
-    DensityFunction(NewCount, XPos, YPos, ZPos, NoiseOut);
+    FSampleInput SampleIn(SX, SY, SZ, Count);
+    Compositor->Sample(SampleIn, SampleOut);
 
-    for (int32 i = 0; i < NewCount; i++)
+    for (int32 i = 0; i < Count; i++)
     {
-        GridDensities[8 + i] = ComputeDensity(GridDists[i], NoiseOut[i], GridPositions[8 + i]);
+        GridDensities[8 + i] = SampleOut[i];
     }
 
     // --- Stage 3: Compute 27 normals from grid gradients ---
@@ -703,8 +701,7 @@ void FAdaptiveOctree::SplitAndComputeChildren(FAdaptiveOctreeNode* Node)
         }
 
         FVector Normal(dX, dY, dZ);
-        if (!Normal.Normalize())
-            Normal = (GridPositions[gi] - PlanetCenter).GetSafeNormal();
+        if (!Normal.Normalize()) Normal = GridPositions[gi].GetSafeNormal();
         GridNormals[gi] = Normal;
     }
 
@@ -718,32 +715,31 @@ void FAdaptiveOctree::SplitAndComputeChildren(FAdaptiveOctreeNode* Node)
             Node->Children[ci]->Corners[k].Density = (float)GridDensities[gi];
             Node->Children[ci]->Corners[k].Normal = FVector3f(GridNormals[gi]);
         }
-        Node->Children[ci]->FinalizeFromExistingCorners(Root->Center, true); // normals already computed from grid
+        Node->Children[ci]->FinalizeFromExistingCorners(true); // normals already computed from grid
     }
 }
 
 void FAdaptiveOctree::ComputeNodeData(FAdaptiveOctreeNode* Node)
 {
-    float xPos[8], yPos[8], zPos[8], noiseOut[8];
-    double dists[8];
-
-    FVector PlanetCenter = Root->Center;
+    float SX[8], SY[8], SZ[8], SampleOut[8];
 
     for (int i = 0; i < 8; i++)
     {
-        FVector PlanetRel = Node->Corners[i].Position - PlanetCenter;
-        dists[i] = PlanetRel.Size();
-        ComputeNoisePosition(Node->Corners[i].Position, xPos[i], yPos[i], zPos[i]);
+        FVector curPos = Node->Corners[i].Position;
+        SX[i] = (float)curPos.X;
+        SY[i] = (float)curPos.Y;
+        SZ[i] = (float)curPos.Z;
     }
 
-    DensityFunction(8, xPos, yPos, zPos, noiseOut);
+    FSampleInput SampleIn(SX, SY, SZ, 8);
+    Compositor->Sample(SampleIn, SampleOut);
 
     for (int i = 0; i < 8; i++)
     {
-        Node->Corners[i].Density = ComputeDensity(dists[i], noiseOut[i], Node->Corners[i].Position);
+        Node->Corners[i].Density = SampleOut[i];
     }
 
-    Node->FinalizeFromExistingCorners(Root->Center);
+    Node->FinalizeFromExistingCorners();
 }
 
 FEdgeNeighbors FAdaptiveOctree::SampleNodesAroundEdge(const FNodeEdge& Edge)
