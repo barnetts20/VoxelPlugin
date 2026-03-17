@@ -16,7 +16,8 @@ const bool FAdaptiveOctreeNode::IsRoot() const
 FAdaptiveOctreeNode::FAdaptiveOctreeNode(double InExtent, int InChunkDepth, int InMinDepth, int InMaxDepth)
 {
     Center = FVector::ZeroVector;
-    ChunkCenter = FVector::ZeroVector;
+    ChunkCenter = Center;
+    DualContourPosition = Center;
 
     Extent = FMath::Max(InExtent, 0.0);
 
@@ -40,11 +41,12 @@ FAdaptiveOctreeNode::FAdaptiveOctreeNode(TSharedPtr<FAdaptiveOctreeNode> InParen
 
     Extent = InParent->Extent * 0.5;
     Center = InParent->Center + OctreeConstants::Offsets[ChildIndex] * Extent;
+    DualContourPosition = Center;
 
     DepthBounds[0] = InParent->DepthBounds[0];
     DepthBounds[1] = InParent->DepthBounds[1];
     DepthBounds[2] = InParent->DepthBounds[2];
-    DepthBounds[3] = InParent->DepthBounds[3];
+
     for (int i = 0; i < 8; i++)
     {
         Corners[i].Position = Center + (OctreeConstants::Offsets[i] * Extent);

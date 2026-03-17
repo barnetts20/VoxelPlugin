@@ -23,7 +23,7 @@ public:
 
     TArray<FNodeEdge> SignChangeEdges;
 
-    uint8 DepthBounds[4];
+    uint8 DepthBounds[3];
 
     FVector Center;
 
@@ -33,7 +33,7 @@ public:
 
     FVector DualContourPosition;
 
-    FVector3f DualContourNormal;
+    FVector3f DualContourNormal = FVector3f(0, 0, 1);
 
     bool IsSurfaceNode = false;
 
