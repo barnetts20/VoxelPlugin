@@ -111,38 +111,58 @@ void AAdaptiveVoxelActor::Initialize()
     auto HeightmapLayer = [NoiseNode = Noise, PlanetRadius = ActorPlanetRadius, NoiseAmplitude = ActorNoiseAmplitude](const FSampleInput& Input, float* DensityOut) {
         int32 Count = Input.Num();
 
-        // Project positions onto sphere surface for noise sampling
-        TArray<float> PX, PY, PZ;
-        PX.SetNumUninitialized(Count);
-        PY.SetNumUninitialized(Count);
-        PZ.SetNumUninitialized(Count);
-
         double InvNoiseAmplitude = 1.0 / NoiseAmplitude;
         double RootExtent = (PlanetRadius + NoiseAmplitude) * 1.05;
 
-        for (int32 i = 0; i < Count; i++)
+        // Stack buffers for the common small-count paths (8, 19 samples).
+        // Only heap-allocate for large bulk calls (ReconstructSubtree).
+        constexpr int32 StackLimit = 64;
+
+        float  StackPX[StackLimit], StackPY[StackLimit], StackPZ[StackLimit], StackNoise[StackLimit];
+        double StackDist[StackLimit];
+
+        TArray<float>  HeapPX, HeapPY, HeapPZ, HeapNoise;
+        TArray<double> HeapDist;
+
+        float* PX; float* PY; float* PZ; float* NoiseOut;
+        double* Distances;
+
+        if (Count <= StackLimit)
         {
-            FVector Pos(Input.X[i], Input.Y[i], Input.Z[i]);
-            double Dist = Pos.Size();
-            FVector Dir = (Dist > 1e-10) ? (Pos / Dist) : FVector::UpVector;
-            FVector SurfacePos = Dir * RootExtent;
-            PX[i] = (float)(SurfacePos.X * InvNoiseAmplitude);
-            PY[i] = (float)(SurfacePos.Y * InvNoiseAmplitude);
-            PZ[i] = (float)(SurfacePos.Z * InvNoiseAmplitude);
+            PX = StackPX; PY = StackPY; PZ = StackPZ; NoiseOut = StackNoise;
+            Distances = StackDist;
+        }
+        else
+        {
+            HeapPX.SetNumUninitialized(Count);
+            HeapPY.SetNumUninitialized(Count);
+            HeapPZ.SetNumUninitialized(Count);
+            HeapNoise.SetNumUninitialized(Count);
+            HeapDist.SetNumUninitialized(Count);
+            PX = HeapPX.GetData(); PY = HeapPY.GetData(); PZ = HeapPZ.GetData();
+            NoiseOut = HeapNoise.GetData(); Distances = HeapDist.GetData();
         }
 
-        TArray<float> NoiseOut;
-        NoiseOut.SetNumUninitialized(Count);
-        NoiseNode->GenPositionArray3D(NoiseOut.GetData(), Count,
-            PX.GetData(), PY.GetData(), PZ.GetData(), 0, 0, 0, 0);
+        // Project positions onto sphere surface for noise sampling.
+        // Cache Dist to avoid recomputing sqrt in the density loop.
+        for (int32 i = 0; i < Count; i++)
+        {
+            double px = Input.X[i], py = Input.Y[i], pz = Input.Z[i];
+            double Dist = FMath::Sqrt(px * px + py * py + pz * pz);
+            Distances[i] = Dist;
+            double InvDist = (Dist > 1e-10) ? (RootExtent / Dist) : 0.0;
+            PX[i] = (float)(px * InvDist * InvNoiseAmplitude);
+            PY[i] = (float)(py * InvDist * InvNoiseAmplitude);
+            PZ[i] = (float)(pz * InvDist * InvNoiseAmplitude);
+        }
+
+        NoiseNode->GenPositionArray3D(NoiseOut, Count, PX, PY, PZ, 0, 0, 0, 0);
 
         for (int32 i = 0; i < Count; i++)
         {
-            double Dist = FVector(Input.X[i], Input.Y[i], Input.Z[i]).Size();
             double Clamped = FMath::Clamp((double)NoiseOut[i], -1.0, 1.0);
-            double Remapped = (Clamped + 1.0) * 0.5;
-            double Height = Remapped * NoiseAmplitude;
-            DensityOut[i] = (float)(Dist - (PlanetRadius + Height));
+            double Height = (Clamped + 1.0) * 0.5 * NoiseAmplitude;
+            DensityOut[i] = (float)(Distances[i] - (PlanetRadius + Height));
         }
         };
 

@@ -294,20 +294,15 @@ void FAdaptiveOctree::ReconstructSubtree(FAdaptiveOctreeNode* Node, FVector Edit
     FSampleInput SampleIn(SX.GetData(), SY.GetData(), SZ.GetData(), Count);
     Compositor->Sample(SampleIn, SampleOut.GetData());
 
-    // 4. SDF + edits
-    ParallelFor(Count, [&](int32 i) {
-        Samples[i].Density = SampleOut[i];
-        });
-
-    // 5. Write back densities to all nodes that share each corner
+    // 4. Write back densities to all nodes that share each corner
     for (int32 i = 0; i < Count; i++)
     {
-        float FinalDensity = (float)Samples[i].Density;
+        float FinalDensity = SampleOut[i];
         for (float* Target : Samples[i].Targets)
             *Target = FinalDensity;
     }
 
-    // 6. Finalize edges/QEF
+    // 5. Finalize edges/QEF
     FinalizeSubtree(Node, EditCenter, SearchRadius);
 }
 
