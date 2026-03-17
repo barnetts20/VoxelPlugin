@@ -106,7 +106,8 @@ void AAdaptiveVoxelActor::Initialize()
     double ActorPlanetRadius = GetActorScale3D().GetMax();
     double ActorNoiseAmplitude = ActorPlanetRadius * NoiseAmplitudeRatio;
     double ActorRootExtent = (ActorPlanetRadius + ActorNoiseAmplitude) * 1.05;
-
+    
+    //Composes a density sampling layer that treats the input noise node as if it was a heightmap
     FastNoise::SmartNode<> Noise = FastNoise::NewFromEncodedNodeTree("GQAgAB8AEwCamRk+DQAMAAAAAAAAQAcAAAAAAD8AAAAAAAAAAAA/AAAAAD8AAAAAvwAAAAA/ARsAFwCamRk+AAAAPwAAAAAAAAA/IAAgABMAAABAQBsAJAACAAAADQAIAAAAAAAAQAsAAQAAAAAAAAABAAAAAAAAAAAAAIA/AAAAAD8AAAAAAAAAAIA/AAAAAAAAmpmZPgCamRk+AM3MTD4BEwDNzEw+IAAfABcAAACAvwAAgD8AAIDAAAAAPw8AAQAAAAAAAED//wEAAAAAAD8AAAAAAAAAAIA/AAAAAD8AAACAvwAAAAA/");
     auto HeightmapLayer = [NoiseNode = Noise, PlanetRadius = ActorPlanetRadius, NoiseAmplitude = ActorNoiseAmplitude](const FSampleInput& Input, float* DensityOut) {
         int32 Count = Input.Num();
@@ -164,7 +165,7 @@ void AAdaptiveVoxelActor::Initialize()
             double Height = (Clamped + 1.0) * 0.5 * NoiseAmplitude;
             DensityOut[i] = (float)(Distances[i] - (PlanetRadius + Height));
         }
-        };
+    };
 
     TSharedPtr<FSparseEditStore> EditStore = MakeShared<FSparseEditStore>(FVector::ZeroVector, ActorRootExtent, ChunkDepth, MaxDepth);
     TSharedPtr<FDensitySampleCompositor> Compositor = MakeShared<FDensitySampleCompositor>(EditStore);
@@ -311,45 +312,45 @@ void AAdaptiveVoxelActor::Tick(float DeltaTime)
                 CameraFOV = CamManager->GetFOVAngle();
             }
         }
-    }
 
-    //Example of edit flow, would want to move off tick for actual implementation
-    if (world->IsGameWorld())
-    {
-        FTransform NoScaleTransform(GetActorRotation(), GetActorLocation());
-        FVector WorldCamPos = NoScaleTransform.TransformPosition(CameraPosition);
-        double TraceDistance = GetActorScale3D().GetMax() * 3.0;
-        double InEditRadius = 300;
-        double InEditStrength = 300 * 2;
-        int InEditResolution = 3;
-        float DebugDrawTime = .1f;
-        APlayerController* PC = UGameplayStatics::GetPlayerController(world, 0);
-        if (PC && PC->IsInputKeyDown(EKeys::E) && !EditUpdateIsRunning)
+        //Example of edit flow, would want to move off tick for actual implementation
+        if (world->IsGameWorld())
         {
-            FVector Start = WorldCamPos;
-            FVector Forward = PC->GetControlRotation().Vector();
-            FVector End = Start + Forward * TraceDistance;
-
-            FHitResult Hit;
-            if (world->LineTraceSingleByChannel(Hit, Start, End, ECC_Visibility))
+            FTransform NoScaleTransform(GetActorRotation(), GetActorLocation());
+            FVector WorldCamPos = NoScaleTransform.TransformPosition(CameraPosition);
+            double TraceDistance = GetActorScale3D().GetMax() * 3.0;
+            double InEditRadius = 300;
+            double InEditStrength = 300 * 2;
+            int InEditResolution = 3;
+            float DebugDrawTime = .1f;
+            APlayerController* PC = UGameplayStatics::GetPlayerController(world, 0);
+            if (PC && PC->IsInputKeyDown(EKeys::E) && !EditUpdateIsRunning)
             {
-                FVector LocalHit = NoScaleTransform.InverseTransformPosition(Hit.ImpactPoint);
-                RunEditUpdateTask(LocalHit, InEditRadius, InEditStrength, InEditResolution);
-                DrawDebugSphere(world, Hit.ImpactPoint, InEditRadius, 32, FColor::Red, false, DebugDrawTime);
+                FVector Start = WorldCamPos;
+                FVector Forward = PC->GetControlRotation().Vector();
+                FVector End = Start + Forward * TraceDistance;
+
+                FHitResult Hit;
+                if (world->LineTraceSingleByChannel(Hit, Start, End, ECC_Visibility))
+                {
+                    FVector LocalHit = NoScaleTransform.InverseTransformPosition(Hit.ImpactPoint);
+                    RunEditUpdateTask(LocalHit, InEditRadius, InEditStrength, InEditResolution);
+                    DrawDebugSphere(world, Hit.ImpactPoint, InEditRadius, 32, FColor::Red, false, DebugDrawTime);
+                }
             }
-        }
-        if (PC && PC->IsInputKeyDown(EKeys::Q) && !EditUpdateIsRunning)
-        {
-            FVector Start = WorldCamPos;
-            FVector Forward = PC->GetControlRotation().Vector();
-            FVector End = Start + Forward * TraceDistance;
-
-            FHitResult Hit;
-            if (world->LineTraceSingleByChannel(Hit, Start, End, ECC_Visibility))
+            if (PC && PC->IsInputKeyDown(EKeys::Q) && !EditUpdateIsRunning)
             {
-                FVector LocalHit = NoScaleTransform.InverseTransformPosition(Hit.ImpactPoint);
-                RunEditUpdateTask(LocalHit, InEditRadius, -InEditStrength, 3);
-                DrawDebugSphere(world, Hit.ImpactPoint, InEditRadius, 32, FColor::Green, false, DebugDrawTime);
+                FVector Start = WorldCamPos;
+                FVector Forward = PC->GetControlRotation().Vector();
+                FVector End = Start + Forward * TraceDistance;
+
+                FHitResult Hit;
+                if (world->LineTraceSingleByChannel(Hit, Start, End, ECC_Visibility))
+                {
+                    FVector LocalHit = NoScaleTransform.InverseTransformPosition(Hit.ImpactPoint);
+                    RunEditUpdateTask(LocalHit, InEditRadius, -InEditStrength, 3);
+                    DrawDebugSphere(world, Hit.ImpactPoint, InEditRadius, 32, FColor::Green, false, DebugDrawTime);
+                }
             }
         }
     }
