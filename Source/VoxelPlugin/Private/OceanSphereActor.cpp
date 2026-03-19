@@ -2,18 +2,39 @@
 #include "FOceanQuadTreeNode.h"
 #include "Kismet/GameplayStatics.h"
 #include "TimerManager.h"
+#include "FastNoise/FastNoise.h"
 
 AOceanSphereActor::AOceanSphereActor()
 {
     PrimaryActorTick.bCanEverTick = true;
     PrimaryActorTick.bStartWithTickEnabled = true;
+
+    // Mesh components attach here. Position and rotation follow the actor transform;
+    // scale is held absolute at (1,1,1) so the tree-at-origin geometry is never scaled.
+    MeshAttachmentRoot = CreateDefaultSubobject<USceneComponent>(TEXT("MeshAttachmentRoot"));
+    MeshAttachmentRoot->SetupAttachment(GetRootComponent());
+    MeshAttachmentRoot->SetAbsolute(false, false, true);
 }
 
 void AOceanSphereActor::OnConstruction(const FTransform& Transform)
 {
     Super::OnConstruction(Transform);
     if (bIsInitializing) return;
-    if (GetWorld() && !GetWorld()->IsPreviewWorld() && bTickInEditor)
+    if (!GetWorld() || GetWorld()->IsPreviewWorld() || !bTickInEditor) return;
+
+    // Only re-initialize when structural params change.
+    // Position and rotation are handled live by the actor transform — no re-init needed.
+    bool bParamsChanged =
+        !FMath::IsNearlyEqual(OceanRadius, LastInitOceanRadius, 0.01) ||
+        !FMath::IsNearlyEqual((double)OceanSurfaceThreshold, (double)LastInitThreshold, 0.01) ||
+        !FMath::IsNearlyEqual(StandalonePlanetRadius, LastInitStandalonePlanetRadius, 0.01) ||
+        !FMath::IsNearlyEqual(StandaloneNoiseAmplitudeRatio, LastInitStandaloneNoiseAmplitudeRatio, 1e-6) ||
+        FaceResolution != LastInitFaceResolution ||
+        ChunkDepth != LastInitChunkDepth ||
+        MinDepth != LastInitMinDepth ||
+        MaxDepth != LastInitMaxDepth;
+
+    if (bParamsChanged)
         Initialize();
 }
 
@@ -52,16 +73,82 @@ void AOceanSphereActor::Initialize()
     for (int32 i = 0; i < 6; ++i)
         RootNodes[i].Reset();
 
+    // If no compositor was provided from outside, build a standalone one using the
+    // same heightmap noise as AdaptiveVoxelActor so depth culling and sampling work
+    // correctly when the ocean actor is placed independently.
+    // When the planet actor calls SetCompositor() before Initialize(), this is skipped.
+    if (!Compositor.IsValid())
+    {
+        double PlanetRadius = StandalonePlanetRadius;
+        double NoiseAmplitude = PlanetRadius * StandaloneNoiseAmplitudeRatio;
+        double RootExtent = (PlanetRadius + NoiseAmplitude) * 1.05;
+
+        Noise = FastNoise::NewFromEncodedNodeTree("GQAgAB8AEwCamRk+DQAMAAAAAAAAQAcAAAAAAD8AAAAAAAAAAAA/AAAAAD8AAAAAvwAAAAA/ARsAFwCamRk+AAAAPwAAAAAAAAA/IAAgABMAAABAQBsAJAACAAAADQAIAAAAAAAAQAsAAQAAAAAAAAABAAAAAAAAAAAAAIA/AAAAAD8AAAAAAAAAAIA/AAAAAAAAmpmZPgCamRk+AM3MTD4BEwDNzEw+IAAfABcAAACAvwAAgD8AAIDAAAAAPw8AAQAAAAAAAED//wEAAAAAAD8AAAAAAAAAAIA/AAAAAD8AAACAvwAAAAA/");
+
+        auto HeightmapLayer = [NoiseNode = Noise, PlanetRadius, NoiseAmplitude, RootExtent]
+        (const FSampleInput& Input, float* DensityOut)
+            {
+                int32 Count = Input.Num();
+                double InvNoiseAmplitude = 1.0 / NoiseAmplitude;
+
+                constexpr int32 StackLimit = 64;
+                float  StackPX[StackLimit], StackPY[StackLimit], StackPZ[StackLimit], StackNoise[StackLimit];
+                double StackDist[StackLimit];
+                TArray<float>  HeapPX, HeapPY, HeapPZ, HeapNoise;
+                TArray<double> HeapDist;
+
+                float* PX; float* PY; float* PZ; float* NoiseOut; double* Distances;
+                if (Count <= StackLimit)
+                {
+                    PX = StackPX; PY = StackPY; PZ = StackPZ;
+                    NoiseOut = StackNoise; Distances = StackDist;
+                }
+                else
+                {
+                    HeapPX.SetNumUninitialized(Count); HeapPY.SetNumUninitialized(Count);
+                    HeapPZ.SetNumUninitialized(Count); HeapNoise.SetNumUninitialized(Count);
+                    HeapDist.SetNumUninitialized(Count);
+                    PX = HeapPX.GetData(); PY = HeapPY.GetData(); PZ = HeapPZ.GetData();
+                    NoiseOut = HeapNoise.GetData(); Distances = HeapDist.GetData();
+                }
+
+                for (int32 i = 0; i < Count; i++)
+                {
+                    double px = Input.X[i], py = Input.Y[i], pz = Input.Z[i];
+                    double Dist = FMath::Sqrt(px * px + py * py + pz * pz);
+                    Distances[i] = Dist;
+                    double InvDist = (Dist > 1e-10) ? (RootExtent / Dist) : 0.0;
+                    PX[i] = (float)(px * InvDist * InvNoiseAmplitude);
+                    PY[i] = (float)(py * InvDist * InvNoiseAmplitude);
+                    PZ[i] = (float)(pz * InvDist * InvNoiseAmplitude);
+                }
+
+                NoiseNode->GenPositionArray3D(NoiseOut, Count, PX, PY, PZ, 0, 0, 0, 0);
+
+                for (int32 i = 0; i < Count; i++)
+                {
+                    double Clamped = FMath::Clamp((double)NoiseOut[i], -1.0, 1.0);
+                    double Height = (Clamped + 1.0) * 0.5 * NoiseAmplitude;
+                    DensityOut[i] = (float)(Distances[i] - (PlanetRadius + Height));
+                }
+            };
+
+        Compositor = MakeShared<FDensitySampleCompositor>();
+        Compositor->AddSampleLayer(HeightmapLayer);
+    }
+
+    // The cube-sphere is always built at origin with a unit cube of size 1000
+    // regardless of actor position. Actor transform handles world placement.
     const double Size = 1000.0;
     const double HalfSize = Size * 0.5;
 
     const FVector FaceCenters[6] = {
-        FVector(HalfSize, 0, 0),
-        FVector(-HalfSize, 0, 0),
-        FVector(0,  HalfSize, 0),
-        FVector(0, -HalfSize, 0),
-        FVector(0, 0,  HalfSize),
-        FVector(0, 0, -HalfSize),
+        FVector(HalfSize,       0,       0),
+        FVector(-HalfSize,       0,       0),
+        FVector(0,  HalfSize,       0),
+        FVector(0, -HalfSize,       0),
+        FVector(0,       0,  HalfSize),
+        FVector(0,       0, -HalfSize),
     };
 
     for (int32 i = 0; i < 6; ++i)
@@ -75,8 +162,15 @@ void AOceanSphereActor::Initialize()
             OceanRadius,
             MinDepth,
             MaxDepth,
-            ChunkDepth);
+            ChunkDepth,
+            Compositor);  // may be null — nodes handle null compositor gracefully
+
         RootNodes[i]->ChunkAnchorCenter = RootNodes[i]->SphereCenter;
+
+        // Sample root corner densities before splitting so SplitToDepth can
+        // distribute them downward without extra full-tree resampling passes.
+        if (Compositor.IsValid())
+            RootNodes[i]->SampleCornerDensities();
     }
 
     for (int32 i = 0; i < 6; ++i)
@@ -86,6 +180,16 @@ void AOceanSphereActor::Initialize()
     }
 
     PopulateChunks();
+
+    // Record params so OnConstruction can detect actual structural changes
+    LastInitOceanRadius = OceanRadius;
+    LastInitFaceResolution = FaceResolution;
+    LastInitChunkDepth = ChunkDepth;
+    LastInitMinDepth = MinDepth;
+    LastInitMaxDepth = MaxDepth;
+    LastInitThreshold = OceanSurfaceThreshold;
+    LastInitStandalonePlanetRadius = StandalonePlanetRadius;
+    LastInitStandaloneNoiseAmplitudeRatio = StandaloneNoiseAmplitudeRatio;
 
     bInitialized = true;
     bIsInitializing = false;
@@ -104,7 +208,13 @@ void AOceanSphereActor::PopulateChunks()
             TSharedPtr<FOceanQuadTreeNode> Node = Stack.Pop(EAllowShrinking::No);
             if (!Node.IsValid()) continue;
             if (Node->GetDepth() == ChunkDepth)
+            {
+                // Skip chunks with no ocean surface — all corners below sea level threshold.
+                // These will never have visible geometry and don't need LOD updates.
+                if (Compositor.IsValid() && Node->IsFullySubmerged(OceanSurfaceThreshold))
+                    continue;
                 ChunkNodes.Add(Node);
+            }
             else
                 for (auto& Child : Node->Children)
                     if (Child.IsValid()) Stack.Add(Child);
@@ -127,6 +237,8 @@ void AOceanSphereActor::PopulateChunks()
         NewChunks[i]->IsDirty = true;
         ChunkMap.Add(ChunkNodes[i], NewChunks[i]);
     }
+
+    UE_LOG(LogTemp, Log, TEXT("[Ocean] PopulateChunks: %d chunks active (culled submerged)"), ChunkNodes.Num());
 }
 
 void AOceanSphereActor::RebuildChunkStreamData(
@@ -139,6 +251,12 @@ void AOceanSphereActor::RebuildChunkStreamData(
     TArray<TSharedPtr<FOceanQuadTreeNode>> Leaves;
     FOceanQuadTreeNode::CollectLeaves(ChunkNode, Leaves);
 
+    // Depth encoding range — negative values = below terrain surface, positive = above.
+    // These bounds should comfortably cover the planet's noise amplitude range.
+    // The planet actor can expose these as params and pass them down later.
+    constexpr float DepthRangeMin = -100000.f;
+    constexpr float DepthRangeMax = 100000.f;
+
     // Inner stream
     TSharedPtr<FOceanStreamData> NewInner = MakeShared<FOceanStreamData>();
     NewInner->MeshGroupKey = Chunk->InnerMeshData->MeshGroupKey;
@@ -147,6 +265,7 @@ void AOceanSphereActor::RebuildChunkStreamData(
     auto InnerPos = NewInner->GetPositionStream();
     auto InnerTan = NewInner->GetTangentStream();
     auto InnerTex = NewInner->GetTexCoordStream();
+    auto InnerCol = NewInner->GetColorStream();
     auto InnerTri = NewInner->GetTriangleStream();
     auto InnerPG = NewInner->GetPolygroupStream();
 
@@ -163,6 +282,8 @@ void AOceanSphereActor::RebuildChunkStreamData(
                 InnerTex.Add(Leaf->TexCoords[vi]);
                 FRealtimeMeshTangentsHighPrecision T; T.SetNormal(Leaf->Normals[vi]);
                 InnerTan.Add(T);
+                float Depth = Leaf->VertexDepths.IsValidIndex(vi) ? Leaf->VertexDepths[vi] : 0.f;
+                InnerCol.Add(FOceanQuadTreeNode::EncodeDepthToColor(Depth, DepthRangeMin, DepthRangeMax));
             }
             uint32 base = (uint32)InnerPos.Num() - 3;
             InnerTri.Add(FIndex3UI(base, base + 1, base + 2));
@@ -179,6 +300,7 @@ void AOceanSphereActor::RebuildChunkStreamData(
     auto EdgePos = NewEdge->GetPositionStream();
     auto EdgeTan = NewEdge->GetTangentStream();
     auto EdgeTex = NewEdge->GetTexCoordStream();
+    auto EdgeCol = NewEdge->GetColorStream();
     auto EdgeTri = NewEdge->GetTriangleStream();
     auto EdgePG = NewEdge->GetPolygroupStream();
 
@@ -195,6 +317,8 @@ void AOceanSphereActor::RebuildChunkStreamData(
                 EdgeTex.Add(Leaf->TexCoords[vi]);
                 FRealtimeMeshTangentsHighPrecision T; T.SetNormal(Leaf->Normals[vi]);
                 EdgeTan.Add(T);
+                float Depth = Leaf->VertexDepths.IsValidIndex(vi) ? Leaf->VertexDepths[vi] : 0.f;
+                EdgeCol.Add(FOceanQuadTreeNode::EncodeDepthToColor(Depth, DepthRangeMin, DepthRangeMax));
             }
             uint32 base = (uint32)EdgePos.Num() - 3;
             EdgeTri.Add(FIndex3UI(base, base + 1, base + 2));
@@ -207,11 +331,12 @@ void AOceanSphereActor::RebuildChunkStreamData(
 
 void AOceanSphereActor::CleanupComponents()
 {
-    TArray<USceneComponent*> SceneChildren;
-    GetRootComponent()->GetChildrenComponents(false, SceneChildren);
-    for (USceneComponent* Child : SceneChildren)
+    if (!MeshAttachmentRoot) return;
+    TArray<USceneComponent*> AttachedComponents;
+    MeshAttachmentRoot->GetChildrenComponents(false, AttachedComponents);
+    for (USceneComponent* Comp : AttachedComponents)
     {
-        if (URealtimeMeshComponent* RtComp = Cast<URealtimeMeshComponent>(Child))
+        if (URealtimeMeshComponent* RtComp = Cast<URealtimeMeshComponent>(Comp))
             RtComp->DestroyComponent();
     }
 }
@@ -234,13 +359,7 @@ void AOceanSphereActor::Tick(float DeltaTime)
 }
 
 // ---------------------------------------------------------------------------
-// LOD pipeline -- optimized: single CollectLeaves per chunk, dirty tracking
-//
-// ONE background task:
-//   1. Per-chunk: collect leaves ONCE, LOD pass, track if tree changed
-//   2. Neighbor stitch on pre-collected leaves, track if edges changed
-//   3. Rebuild stream data ONLY for chunks that changed
-//   4. Single game-thread dispatch for dirty chunk component updates
+// LOD pipeline
 // ---------------------------------------------------------------------------
 
 void AOceanSphereActor::RunLodUpdateTask()
@@ -269,7 +388,6 @@ void AOceanSphereActor::RunLodUpdateTask()
             double MergeThresholdSq =
                 (Self->ScreenSpaceThreshold * 0.5) * (Self->ScreenSpaceThreshold * 0.5);
 
-            // Snapshot chunk arrays
             TArray<TSharedPtr<FOceanQuadTreeNode>> ChunkNodes;
             TArray<TSharedPtr<FOceanMeshChunk>>    MeshChunks;
             Self->ChunkMap.GenerateKeyArray(ChunkNodes);
@@ -278,8 +396,6 @@ void AOceanSphereActor::RunLodUpdateTask()
 
             int32 NumChunks = ChunkNodes.Num();
 
-            // Per-chunk: collect leaves once, do LOD, collect leaves again only if changed
-            // Store leaves for reuse in neighbor stitch and stream rebuild
             TArray<TArray<TSharedPtr<FOceanQuadTreeNode>>> AllChunkLeaves;
             AllChunkLeaves.SetNum(NumChunks);
             TArray<bool> ChunkTreeChanged;
@@ -292,7 +408,6 @@ void AOceanSphereActor::RunLodUpdateTask()
                     TSharedPtr<FOceanQuadTreeNode> ChunkNode = ChunkNodes[idx];
                     if (!ChunkNode.IsValid()) return;
 
-                    // Early-out coarse test
                     FVector WorldCenter = ChunkNode->SphereCenter + Self->GetActorLocation();
                     double DistSq = FMath::Max(FVector::DistSquared(Predicted, WorldCenter), 1e-12);
 
@@ -307,17 +422,13 @@ void AOceanSphereActor::RunLodUpdateTask()
 
                     if (!CouldSplit && !CouldMerge)
                     {
-                        // Still need leaves for neighbor stitch
                         FOceanQuadTreeNode::CollectLeaves(ChunkNode, AllChunkLeaves[idx]);
                         return;
                     }
 
-                    // Collect leaves once
                     TArray<TSharedPtr<FOceanQuadTreeNode>> Leaves;
                     FOceanQuadTreeNode::CollectLeaves(ChunkNode, Leaves);
-                    int32 PreCount = Leaves.Num();
 
-                    // LOD evaluation
                     bool bAnyChanged = false;
                     for (auto& Leaf : Leaves)
                     {
@@ -327,21 +438,19 @@ void AOceanSphereActor::RunLodUpdateTask()
 
                     if (bAnyChanged)
                     {
-                        // Tree changed -- re-collect leaves for the updated structure
                         AllChunkLeaves[idx].Reset();
                         FOceanQuadTreeNode::CollectLeaves(ChunkNode, AllChunkLeaves[idx]);
                         ChunkTreeChanged[idx] = true;
                     }
                     else
                     {
-                        // No change -- reuse the leaves we already collected
                         AllChunkLeaves[idx] = MoveTemp(Leaves);
                     }
                 });
 
             if (Self->InitGeneration != CapturedGen) { Self->bLodUpdateRunning = false; return; }
 
-            // Phase 2: Neighbor stitch using pre-collected leaves (parallel per chunk)
+            // Phase 2: Neighbor stitch
             TArray<bool> ChunkEdgeChanged;
             ChunkEdgeChanged.SetNumZeroed(NumChunks);
 
@@ -362,7 +471,7 @@ void AOceanSphereActor::RunLodUpdateTask()
 
             if (Self->InitGeneration != CapturedGen) { Self->bLodUpdateRunning = false; return; }
 
-            // Phase 3: Rebuild stream data only for chunks where tree or edges changed (parallel)
+            // Phase 3: Rebuild stream data for changed chunks
             ParallelFor(NumChunks, [&](int32 idx)
                 {
                     if (Self->InitGeneration != CapturedGen) return;
@@ -372,7 +481,7 @@ void AOceanSphereActor::RunLodUpdateTask()
 
             Self->bLodUpdateRunning = false;
 
-            // Phase 4: Single game-thread dispatch for dirty chunks
+            // Phase 4: Game-thread component updates
             TArray<TSharedPtr<FOceanMeshChunk>> DirtyChunks;
             for (int32 idx = 0; idx < NumChunks; ++idx)
             {
@@ -430,7 +539,6 @@ void AOceanSphereActor::RunLodUpdateTask()
                         Chunk->IsDirty = false;
                     }
 
-                    // Reschedule
                     if (UWorld* W = Self->GetWorld())
                     {
                         W->GetTimerManager().SetTimer(
@@ -457,7 +565,7 @@ TSharedPtr<FOceanQuadTreeNode> AOceanSphereActor::GetNodeByIndex(
     {
         uint8 Quad = Index.GetQuadrantAtDepth(Level);
         if (Cur->IsLeaf()) return Cur;
-        if (Quad >= Cur->Children.Num()) return Cur;  // bounds safety
+        if (Quad >= (uint8)Cur->Children.Num()) return Cur;
         Cur = Cur->Children[Quad];
         if (!Cur.IsValid()) return nullptr;
     }
