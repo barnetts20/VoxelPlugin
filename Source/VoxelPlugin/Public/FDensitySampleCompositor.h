@@ -3,7 +3,7 @@
 #pragma once
 
 #include "CoreMinimal.h"
-#include "FastNoise/FastNoise.h"
+
 #include "FSparseEditStore.h"
 
 /**
@@ -94,8 +94,4 @@ public:
 
     FDensitySampleCompositor() {};
     FDensitySampleCompositor(TSharedPtr<FSparseEditStore> InEditStore) : EditStore(InEditStore) {};
-};
-
-struct VOXELPLUGIN_API FCompositorExamples {
-    static TFunction<void(const FSampleInput&, float*)> HeightMapLayer(double ActorPlanetRadius, double ActorNoiseAmplitude, FastNoise::SmartNode<> InNoise);
 };
