@@ -33,8 +33,13 @@ void FOceanMeshChunk::InitializeComponent(AOceanSphereActor* InOwner)
     ChunkRtComponent->RegisterComponent();
     ChunkRtComponent->SetMaterial(0, InOwner->OceanMaterial);
     ChunkRtComponent->SetCollisionEnabled(ECollisionEnabled::NoCollision);
-    ChunkRtComponent->AttachToComponent(InOwner->GetRootComponent(), FAttachmentTransformRules::KeepRelativeTransform);
-    ChunkRtComponent->SetWorldLocation(ChunkCenter + InOwner->GetActorLocation());
+
+    // Attach to MeshAttachmentRoot (absolute scale, inherits position + rotation).
+    // Use relative location so the component moves with the actor automatically —
+    // no world location bake needed, no re-init on actor movement.
+    ChunkRtComponent->AttachToComponent(InOwner->GetMeshAttachmentRoot(), FAttachmentTransformRules::KeepRelativeTransform);
+    ChunkRtComponent->SetRelativeLocation(ChunkCenter);
+
     ChunkRtComponent->SetRealtimeMesh(ChunkRtMesh.Get());
     ChunkRtComponent->SetRenderCustomDepth(true);
     ChunkRtComponent->SetVisibleInRayTracing(false);
@@ -136,22 +141,22 @@ bool FOceanQuadTreeNode::TrySetLod(FVector CameraPos, double ThresholdSq, double
 {
     if (!IsLeaf()) return false;
 
-    FVector ActorLoc = Owner->GetActorLocation();
-    FVector WorldSphereCenter = SphereCenter + ActorLoc;
-    double  DistSq = FMath::Max(FVector::DistSquared(CameraPos, WorldSphereCenter), 1e-12);
+    // CameraPos and SphereCenter are both in actor-local space — direct distance.
+    // No GetActorLocation() needed since Tick converts the camera before passing it here.
+    double DistSq = FMath::Max(FVector::DistSquared(CameraPos, SphereCenter), 1e-12);
 
-    // Back-face cull
-    double Dot = FVector::DotProduct(CameraPos - ActorLoc, SphereCenter);
+    // Back-face cull: dot product of camera direction vs node direction, both local.
+    double Dot = FVector::DotProduct(CameraPos, SphereCenter);
     if (Dot < 0.0 && GetDepth() >= MinDepth)
     {
-        double CamDistSq = FVector::DistSquared(CameraPos, ActorLoc);
+        double CamDistSq = CameraPos.SizeSquared();
         double NodeDistSq = SphereCenter.SizeSquared();
         if ((Dot * Dot) > (0.04 * CamDistSq * NodeDistSq))
         {
             CanMerge = true;
             if (Index.GetQuadrant() == 3 && Parent.IsValid())
                 Parent.Pin()->TryMerge();
-            return !IsLeaf(); // true if merge happened
+            return !IsLeaf();
         }
     }
 
@@ -159,7 +164,7 @@ bool FOceanQuadTreeNode::TrySetLod(FVector CameraPos, double ThresholdSq, double
     {
         CanMerge = false;
         FOceanQuadTreeNode::Split(AsShared());
-        return true; // tree changed
+        return true;
     }
     else if (ShouldMerge(DistSq, FOVScale, MergeThresholdSq))
     {
@@ -167,7 +172,7 @@ bool FOceanQuadTreeNode::TrySetLod(FVector CameraPos, double ThresholdSq, double
         if (Index.GetQuadrant() == 3 && Parent.IsValid())
         {
             Parent.Pin()->TryMerge();
-            return !Parent.Pin()->IsLeaf() ? false : true; // true if merge actually happened
+            return !Parent.Pin()->IsLeaf() ? false : true;
         }
     }
     else { CanMerge = false; }

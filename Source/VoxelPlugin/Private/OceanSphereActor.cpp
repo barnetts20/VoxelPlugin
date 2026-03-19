@@ -7,13 +7,29 @@ AOceanSphereActor::AOceanSphereActor()
 {
     PrimaryActorTick.bCanEverTick = true;
     PrimaryActorTick.bStartWithTickEnabled = true;
+
+    // Default scale = planet radius in world units (cm).
+    // 80,000,000 cm = 800 km radius, matching the default terrain actor.
+    SetActorScale3D(FVector(80000000.0));
+
+    // Mesh components attach here. Inherits actor position and rotation,
+    // absolute scale (1,1,1) so the sphere built at world-scale radius
+    // is never additionally scaled by the actor transform.
+    MeshAttachmentRoot = CreateDefaultSubobject<USceneComponent>(TEXT("MeshAttachmentRoot"));
+    MeshAttachmentRoot->SetupAttachment(GetRootComponent());
+    MeshAttachmentRoot->SetAbsolute(false, false, true);
 }
 
 void AOceanSphereActor::OnConstruction(const FTransform& Transform)
 {
     Super::OnConstruction(Transform);
     if (bIsInitializing) return;
-    if (GetWorld() && !GetWorld()->IsPreviewWorld() && bTickInEditor)
+    if (!GetWorld() || GetWorld()->IsPreviewWorld() || !bTickInEditor) return;
+
+    // Only reconstruct when scale changes — that's the only thing that requires
+    // rebuilding the sphere geometry. Position and rotation are handled live
+    // by MeshAttachmentRoot inheriting the actor transform.
+    if (!bInitialized || !GetActorScale3D().Equals(LastInitScale, 0.01))
         Initialize();
 }
 
@@ -52,16 +68,24 @@ void AOceanSphereActor::Initialize()
     for (int32 i = 0; i < 6; ++i)
         RootNodes[i].Reset();
 
+    // Derive ocean radius from actor scale — all axes kept uniform.
+    // Enforcing uniform scale here means the sphere is always a true sphere.
+    double ActorRadius = GetActorScale3D().GetMax();
+    OceanRadius = ActorRadius;
+
+    // The cube-sphere is built at world scale in actor-local space (origin 0,0,0).
+    // OceanRadius is the sphere radius in world units — same convention as the octree.
+    // The unit cube maps to a sphere of radius OceanRadius via cube-sphere projection.
     const double Size = 1000.0;
     const double HalfSize = Size * 0.5;
 
     const FVector FaceCenters[6] = {
-        FVector(HalfSize, 0, 0),
-        FVector(-HalfSize, 0, 0),
-        FVector(0,  HalfSize, 0),
-        FVector(0, -HalfSize, 0),
-        FVector(0, 0,  HalfSize),
-        FVector(0, 0, -HalfSize),
+        FVector(HalfSize,       0,       0),
+        FVector(-HalfSize,       0,       0),
+        FVector(0,  HalfSize,       0),
+        FVector(0, -HalfSize,       0),
+        FVector(0,       0,  HalfSize),
+        FVector(0,       0, -HalfSize),
     };
 
     for (int32 i = 0; i < 6; ++i)
@@ -87,6 +111,7 @@ void AOceanSphereActor::Initialize()
 
     PopulateChunks();
 
+    LastInitScale = GetActorScale3D();
     bInitialized = true;
     bIsInitializing = false;
     RunLodUpdateTask();
@@ -207,9 +232,10 @@ void AOceanSphereActor::RebuildChunkStreamData(
 
 void AOceanSphereActor::CleanupComponents()
 {
-    TArray<USceneComponent*> SceneChildren;
-    GetRootComponent()->GetChildrenComponents(false, SceneChildren);
-    for (USceneComponent* Child : SceneChildren)
+    if (!MeshAttachmentRoot) return;
+    TArray<USceneComponent*> Attached;
+    MeshAttachmentRoot->GetChildrenComponents(false, Attached);
+    for (USceneComponent* Child : Attached)
     {
         if (URealtimeMeshComponent* RtComp = Cast<URealtimeMeshComponent>(Child))
             RtComp->DestroyComponent();
@@ -225,7 +251,14 @@ void AOceanSphereActor::Tick(float DeltaTime)
     {
         const TArray<FVector>& Views = W->ViewLocationsRenderedLastFrame;
         if (Views.Num() > 0)
-            CameraPosition = Views[0];
+        {
+            // Convert world-space camera to actor-local space (position + rotation only).
+            // The sphere is built at world-scale in actor-local space — no scale division needed.
+            // This matches the octree convention exactly.
+            FVector WorldCamPos = Views[0];
+            FTransform NoScaleTransform(GetActorRotation(), GetActorLocation());
+            CameraPosition = NoScaleTransform.InverseTransformPosition(WorldCamPos);
+        }
 
         APlayerCameraManager* Cam = UGameplayStatics::GetPlayerCameraManager(W, 0);
         if (Cam)
@@ -234,13 +267,7 @@ void AOceanSphereActor::Tick(float DeltaTime)
 }
 
 // ---------------------------------------------------------------------------
-// LOD pipeline -- optimized: single CollectLeaves per chunk, dirty tracking
-//
-// ONE background task:
-//   1. Per-chunk: collect leaves ONCE, LOD pass, track if tree changed
-//   2. Neighbor stitch on pre-collected leaves, track if edges changed
-//   3. Rebuild stream data ONLY for chunks that changed
-//   4. Single game-thread dispatch for dirty chunk component updates
+// LOD pipeline
 // ---------------------------------------------------------------------------
 
 void AOceanSphereActor::RunLodUpdateTask()
@@ -269,7 +296,6 @@ void AOceanSphereActor::RunLodUpdateTask()
             double MergeThresholdSq =
                 (Self->ScreenSpaceThreshold * 0.5) * (Self->ScreenSpaceThreshold * 0.5);
 
-            // Snapshot chunk arrays
             TArray<TSharedPtr<FOceanQuadTreeNode>> ChunkNodes;
             TArray<TSharedPtr<FOceanMeshChunk>>    MeshChunks;
             Self->ChunkMap.GenerateKeyArray(ChunkNodes);
@@ -278,23 +304,22 @@ void AOceanSphereActor::RunLodUpdateTask()
 
             int32 NumChunks = ChunkNodes.Num();
 
-            // Per-chunk: collect leaves once, do LOD, collect leaves again only if changed
-            // Store leaves for reuse in neighbor stitch and stream rebuild
             TArray<TArray<TSharedPtr<FOceanQuadTreeNode>>> AllChunkLeaves;
             AllChunkLeaves.SetNum(NumChunks);
             TArray<bool> ChunkTreeChanged;
             ChunkTreeChanged.SetNumZeroed(NumChunks);
 
             // Phase 1: LOD pass (parallel per chunk)
+            // Camera (Predicted) and SphereCenter are both in actor-local space —
+            // no GetActorLocation() offset needed anywhere in the distance math.
             ParallelFor(NumChunks, [&](int32 idx)
                 {
                     if (Self->InitGeneration != CapturedGen) return;
                     TSharedPtr<FOceanQuadTreeNode> ChunkNode = ChunkNodes[idx];
                     if (!ChunkNode.IsValid()) return;
 
-                    // Early-out coarse test
-                    FVector WorldCenter = ChunkNode->SphereCenter + Self->GetActorLocation();
-                    double DistSq = FMath::Max(FVector::DistSquared(Predicted, WorldCenter), 1e-12);
+                    // SphereCenter is actor-local, Predicted is actor-local — direct distance.
+                    double DistSq = FMath::Max(FVector::DistSquared(ChunkNode->SphereCenter, Predicted), 1e-12);
 
                     double ChunkLhs = 2.0 * ChunkNode->WorldExtent * FOVScale;
                     bool CouldSplit = (ChunkLhs * ChunkLhs) > (ThresholdSq * DistSq)
@@ -307,17 +332,13 @@ void AOceanSphereActor::RunLodUpdateTask()
 
                     if (!CouldSplit && !CouldMerge)
                     {
-                        // Still need leaves for neighbor stitch
                         FOceanQuadTreeNode::CollectLeaves(ChunkNode, AllChunkLeaves[idx]);
                         return;
                     }
 
-                    // Collect leaves once
                     TArray<TSharedPtr<FOceanQuadTreeNode>> Leaves;
                     FOceanQuadTreeNode::CollectLeaves(ChunkNode, Leaves);
-                    int32 PreCount = Leaves.Num();
 
-                    // LOD evaluation
                     bool bAnyChanged = false;
                     for (auto& Leaf : Leaves)
                     {
@@ -327,21 +348,19 @@ void AOceanSphereActor::RunLodUpdateTask()
 
                     if (bAnyChanged)
                     {
-                        // Tree changed -- re-collect leaves for the updated structure
                         AllChunkLeaves[idx].Reset();
                         FOceanQuadTreeNode::CollectLeaves(ChunkNode, AllChunkLeaves[idx]);
                         ChunkTreeChanged[idx] = true;
                     }
                     else
                     {
-                        // No change -- reuse the leaves we already collected
                         AllChunkLeaves[idx] = MoveTemp(Leaves);
                     }
                 });
 
             if (Self->InitGeneration != CapturedGen) { Self->bLodUpdateRunning = false; return; }
 
-            // Phase 2: Neighbor stitch using pre-collected leaves (parallel per chunk)
+            // Phase 2: Neighbor stitch
             TArray<bool> ChunkEdgeChanged;
             ChunkEdgeChanged.SetNumZeroed(NumChunks);
 
@@ -362,7 +381,7 @@ void AOceanSphereActor::RunLodUpdateTask()
 
             if (Self->InitGeneration != CapturedGen) { Self->bLodUpdateRunning = false; return; }
 
-            // Phase 3: Rebuild stream data only for chunks where tree or edges changed (parallel)
+            // Phase 3: Rebuild stream data for changed chunks
             ParallelFor(NumChunks, [&](int32 idx)
                 {
                     if (Self->InitGeneration != CapturedGen) return;
@@ -372,7 +391,7 @@ void AOceanSphereActor::RunLodUpdateTask()
 
             Self->bLodUpdateRunning = false;
 
-            // Phase 4: Single game-thread dispatch for dirty chunks
+            // Phase 4: Game-thread component updates
             TArray<TSharedPtr<FOceanMeshChunk>> DirtyChunks;
             for (int32 idx = 0; idx < NumChunks; ++idx)
             {
@@ -430,7 +449,6 @@ void AOceanSphereActor::RunLodUpdateTask()
                         Chunk->IsDirty = false;
                     }
 
-                    // Reschedule
                     if (UWorld* W = Self->GetWorld())
                     {
                         W->GetTimerManager().SetTimer(
@@ -457,7 +475,7 @@ TSharedPtr<FOceanQuadTreeNode> AOceanSphereActor::GetNodeByIndex(
     {
         uint8 Quad = Index.GetQuadrantAtDepth(Level);
         if (Cur->IsLeaf()) return Cur;
-        if (Quad >= Cur->Children.Num()) return Cur;  // bounds safety
+        if (Quad >= Cur->Children.Num()) return Cur;
         Cur = Cur->Children[Quad];
         if (!Cur.IsValid()) return nullptr;
     }
