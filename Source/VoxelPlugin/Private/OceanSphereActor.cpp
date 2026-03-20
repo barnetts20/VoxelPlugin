@@ -10,7 +10,7 @@ AOceanSphereActor::AOceanSphereActor()
 
     // Default scale = planet radius in world units (cm).
     // 80,000,000 cm = 800 km radius, matching the default terrain actor.
-    SetActorScale3D(FVector(80000000.0));
+    SetActorScale3D(FVector(100000000.0));
 
     // Mesh components attach here. Inherits actor position and rotation,
     // absolute scale (1,1,1) so the sphere built at world-scale radius
@@ -28,7 +28,7 @@ void AOceanSphereActor::OnConstruction(const FTransform& Transform)
 
     // Only reconstruct when scale changes � position and rotation are handled
     // live by MeshAttachmentRoot inheriting the actor transform.
-    if (!bInitialized || !GetActorScale3D().Equals(LastInitScale, 0.01))
+    if (!bInitialized || !GetActorScale3D().Equals(LastInitScale, 0.01) || LastTerrainPlanetRadius != TerrainPlanetRadius)
         Initialize();
 }
 
@@ -67,18 +67,20 @@ void AOceanSphereActor::Initialize()
     for (int32 i = 0; i < 6; ++i)
         RootNodes[i].Reset();
 
-    // Derive ocean radius from actor scale � uniform across all axes.
+    // Derive ocean radius from actor scale -- uniform across all axes.
     double ActorRadius = GetActorScale3D().GetMax();
-    double ActorNoiseAmplitude = ActorRadius * NoiseAmplitudeRatio;
-    double ActorRootExtent = (ActorRadius + ActorNoiseAmplitude) * 1.05;
     OceanRadius = ActorRadius;
 
-    // Build the density compositor � identical heightmap layer to AAdaptiveVoxelActor
-    // so the ocean and terrain evaluate the same SDF. The tree pushes sampled densities
-    // down to child node corners at split time; nodes do not call the compositor directly.
+    // The compositor evaluates the terrain SDF, not the ocean SDF.
+    // PlanetRadius and NoiseAmplitude must match the terrain actor exactly
+    // so that: density = Dist - (TerrainPlanetRadius + NoiseHeight), giving:
+    //   positive = underwater (ocean surface above terrain)
+    //   negative = above water (terrain above ocean = land)
+    double TerrainNoiseAmplitude = TerrainPlanetRadius * NoiseAmplitudeRatio;
+
     Noise = FastNoise::NewFromEncodedNodeTree("GQAgAB8AEwCamRk+DQAMAAAAAAAAQAcAAAAAAD8AAAAAAAAAAAA/AAAAAD8AAAAAvwAAAAA/ARsAFwCamRk+AAAAPwAAAAAAAAA/IAAgABMAAABAQBsAJAACAAAADQAIAAAAAAAAQAsAAQAAAAAAAAABAAAAAAAAAAAAAIA/AAAAAD8AAAAAAAAAAIA/AAAAAAAAmpmZPgCamRk+AM3MTD4BEwDNzEw+IAAfABcAAACAvwAAgD8AAIDAAAAAPw8AAQAAAAAAAED//wEAAAAAAD8AAAAAAAAAAIA/AAAAAD8AAACAvwAAAAA/");
 
-    auto HeightmapLayer = [NoiseNode = Noise, PlanetRadius = ActorRadius, NoiseAmplitude = ActorNoiseAmplitude](const FSampleInput& Input, float* DensityOut)
+    auto HeightmapLayer = [NoiseNode = Noise, PlanetRadius = TerrainPlanetRadius, NoiseAmplitude = TerrainNoiseAmplitude](const FSampleInput& Input, float* DensityOut)
         {
             int32 Count = Input.Num();
             double InvNoiseAmplitude = 1.0 / NoiseAmplitude;
@@ -167,19 +169,18 @@ void AOceanSphereActor::Initialize()
     PopulateChunks();
 
     LastInitScale = GetActorScale3D();
+    LastTerrainPlanetRadius = TerrainPlanetRadius;
     bInitialized = true;
     bIsInitializing = false;
     RunLodUpdateTask();
 }
 
 // ---------------------------------------------------------------------------
-// Density sampling — does not touch mesh data, positions, or winding
+// Density sampling
 // ---------------------------------------------------------------------------
 
 void AOceanSphereActor::ComputeRootNodeDensities(TSharedPtr<FOceanQuadTreeNode> Node)
 {
-    // Sample the 4 sphere-projected corners of a root node before any splits.
-    // Corner layout: BL=0 (U-,V-), TL=1 (U-,V+), BR=2 (U+,V-), TR=3 (U+,V+).
     if (!Node.IsValid() || !Compositor.IsValid()) return;
 
     const double H = Node->HalfSize;
@@ -209,11 +210,6 @@ void AOceanSphereActor::ComputeRootNodeDensities(TSharedPtr<FOceanQuadTreeNode> 
 
 void AOceanSphereActor::PushDensityToChildren(TSharedPtr<FOceanQuadTreeNode> Node)
 {
-    // Recursive post-pass over an already-split subtree.
-    // If this node has density and its children don't yet, sample the 5 new
-    // grid positions (4 edge mids + 1 center) and distribute all 4 corner
-    // densities to each child. Does not touch mesh data at all.
-    //
     // 9-point grid (U right, V up):
     //   G6--G7--G8
     //   |   |   |
@@ -244,11 +240,11 @@ void AOceanSphereActor::PushDensityToChildren(TSharedPtr<FOceanQuadTreeNode> Nod
             };
 
         FVector NP[5] = {
-            ToSphere(0, -H),  // G1 bottom-edge mid
-            ToSphere(-H,  0),  // G3 left-edge mid
-            ToSphere(0,  0),  // G4 center
-            ToSphere(+H,  0),  // G5 right-edge mid
-            ToSphere(0, +H),  // G7 top-edge mid
+            ToSphere(0, -H),  // G1
+            ToSphere(-H,  0),  // G3
+            ToSphere(0,  0),  // G4
+            ToSphere(+H,  0),  // G5
+            ToSphere(0, +H),  // G7
         };
         float SX[5], SY[5], SZ[5], Out[5];
         for (int32 i = 0; i < 5; ++i)
@@ -262,22 +258,18 @@ void AOceanSphereActor::PushDensityToChildren(TSharedPtr<FOceanQuadTreeNode> Nod
         const float G2 = Node->CornerDensities[2], G8 = Node->CornerDensities[3];
         const float G1 = Out[0], G3 = Out[1], G4 = Out[2], G5 = Out[3], G7 = Out[4];
 
-        // Child 0 (BL quadrant): corners G0, G3, G1, G4
         Node->Children[0]->CornerDensities[0] = G0; Node->Children[0]->CornerDensities[1] = G3;
         Node->Children[0]->CornerDensities[2] = G1; Node->Children[0]->CornerDensities[3] = G4;
         Node->Children[0]->bDensitySampled = true;
 
-        // Child 1 (TL quadrant): corners G3, G6, G4, G7
         Node->Children[1]->CornerDensities[0] = G3; Node->Children[1]->CornerDensities[1] = G6;
         Node->Children[1]->CornerDensities[2] = G4; Node->Children[1]->CornerDensities[3] = G7;
         Node->Children[1]->bDensitySampled = true;
 
-        // Child 2 (BR quadrant): corners G1, G4, G2, G5
         Node->Children[2]->CornerDensities[0] = G1; Node->Children[2]->CornerDensities[1] = G4;
         Node->Children[2]->CornerDensities[2] = G2; Node->Children[2]->CornerDensities[3] = G5;
         Node->Children[2]->bDensitySampled = true;
 
-        // Child 3 (TR quadrant): corners G4, G7, G5, G8
         Node->Children[3]->CornerDensities[0] = G4; Node->Children[3]->CornerDensities[1] = G7;
         Node->Children[3]->CornerDensities[2] = G5; Node->Children[3]->CornerDensities[3] = G8;
         Node->Children[3]->bDensitySampled = true;
@@ -342,6 +334,7 @@ void AOceanSphereActor::RebuildChunkStreamData(
     auto InnerPos = NewInner->GetPositionStream();
     auto InnerTan = NewInner->GetTangentStream();
     auto InnerTex = NewInner->GetTexCoordStream();
+    auto InnerCol = NewInner->GetColorStream();
     auto InnerTri = NewInner->GetTriangleStream();
     auto InnerPG = NewInner->GetPolygroupStream();
 
@@ -356,6 +349,7 @@ void AOceanSphereActor::RebuildChunkStreamData(
                 uint32 vi = (v == 0) ? Tri.V0 : (v == 1) ? Tri.V1 : Tri.V2;
                 InnerPos.Add(Leaf->Vertices[vi]);
                 InnerTex.Add(Leaf->TexCoords[vi]);
+                InnerCol.Add(Leaf->VertexColors.IsValidIndex(vi) ? Leaf->VertexColors[vi] : FColor(128, 128, 128, 128));
                 FRealtimeMeshTangentsHighPrecision T; T.SetNormal(Leaf->Normals[vi]);
                 InnerTan.Add(T);
             }
@@ -374,6 +368,7 @@ void AOceanSphereActor::RebuildChunkStreamData(
     auto EdgePos = NewEdge->GetPositionStream();
     auto EdgeTan = NewEdge->GetTangentStream();
     auto EdgeTex = NewEdge->GetTexCoordStream();
+    auto EdgeCol = NewEdge->GetColorStream();
     auto EdgeTri = NewEdge->GetTriangleStream();
     auto EdgePG = NewEdge->GetPolygroupStream();
 
@@ -388,6 +383,7 @@ void AOceanSphereActor::RebuildChunkStreamData(
                 uint32 vi = (v == 0) ? Tri.V0 : (v == 1) ? Tri.V1 : Tri.V2;
                 EdgePos.Add(Leaf->Vertices[vi]);
                 EdgeTex.Add(Leaf->TexCoords[vi]);
+                EdgeCol.Add(Leaf->VertexColors.IsValidIndex(vi) ? Leaf->VertexColors[vi] : FColor(128, 128, 128, 128));
                 FRealtimeMeshTangentsHighPrecision T; T.SetNormal(Leaf->Normals[vi]);
                 EdgeTan.Add(T);
             }
@@ -526,9 +522,7 @@ void AOceanSphereActor::RunLodUpdateTask()
 
             if (Self->InitGeneration != CapturedGen) { Self->bLodUpdateRunning = false; return; }
 
-            // Density push-down: for any chunk where the tree structure changed,
-            // walk it and fill in CornerDensities for any newly-split children.
-            // Serial, safe — no other thread touches the tree at this point.
+            // Density push-down for any chunks where the tree structure changed.
             for (int32 idx = 0; idx < NumChunks; ++idx)
             {
                 if (ChunkTreeChanged[idx])

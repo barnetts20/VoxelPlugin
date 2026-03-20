@@ -1,4 +1,4 @@
-#include "FOceanQuadTreeNode.h"
+﻿#include "FOceanQuadTreeNode.h"
 #include "OceanSphereActor.h"
 #include "Async/Async.h"
 
@@ -35,7 +35,7 @@ void FOceanMeshChunk::InitializeComponent(AOceanSphereActor* InOwner)
     ChunkRtComponent->SetCollisionEnabled(ECollisionEnabled::NoCollision);
 
     // Attach to MeshAttachmentRoot (absolute scale, inherits position + rotation).
-    // Use relative location so the component moves with the actor automatically �
+    // Use relative location so the component moves with the actor automatically �
     // no world location bake needed, no re-init on actor movement.
     ChunkRtComponent->AttachToComponent(InOwner->GetMeshAttachmentRoot(), FAttachmentTransformRules::KeepRelativeTransform);
     ChunkRtComponent->SetRelativeLocation(ChunkCenter);
@@ -141,7 +141,7 @@ bool FOceanQuadTreeNode::TrySetLod(FVector CameraPos, double ThresholdSq, double
 {
     if (!IsLeaf()) return false;
 
-    // CameraPos and SphereCenter are both in actor-local space � direct distance.
+    // CameraPos and SphereCenter are both in actor-local space � direct distance.
     // No GetActorLocation() needed since Tick converts the camera before passing it here.
     double DistSq = FMath::Max(FVector::DistSquared(CameraPos, SphereCenter), 1e-12);
 
@@ -329,20 +329,41 @@ FVector FOceanQuadTreeNode::ProjectToSphere(FVector CubeOffset) const
     return WorldCube.GetSafeNormal() * OceanRadius - ChunkAnchorCenter;
 }
 
+float FOceanQuadTreeNode::InterpolateDensity(double normX, double normY) const
+{
+    // Bilinear interpolation of CornerDensities at face-local (normX, normY).
+    // normX and normY are in [-HalfSize, +HalfSize].
+    // u=0 at U- edge (BL/TL), u=1 at U+ edge (BR/TR).
+    // v=0 at V- edge (BL/BR), v=1 at V+ edge (TL/TR).
+    float u = (float)FMath::Clamp((normX + HalfSize) / Size, 0.0, 1.0);
+    float v = (float)FMath::Clamp((normY + HalfSize) / Size, 0.0, 1.0);
+
+    // BL=0 (u=0,v=0), TL=1 (u=0,v=1), BR=2 (u=1,v=0), TR=3 (u=1,v=1)
+    float bottom = FMath::Lerp(CornerDensities[0], CornerDensities[2], u); // lerp BL→BR
+    float top = FMath::Lerp(CornerDensities[1], CornerDensities[3], u); // lerp TL→TR
+    return FMath::Lerp(bottom, top, v);
+}
+
 void FOceanQuadTreeNode::GenerateMeshData()
 {
     const int32  Res = FaceResolution();
     const int32  ExtRes = Res + 2;
     const double Step = Size / (double)(Res - 1);
+    const int32  Total = ExtRes * ExtRes;
 
-    Vertices.Reset(); Normals.Reset(); TexCoords.Reset();
-    AllTriangles.Reset(); PatchTriangleIndices.Reset();
+    Vertices.Reset();    Normals.Reset();      TexCoords.Reset();
+    VertexColors.Reset(); AllTriangles.Reset(); PatchTriangleIndices.Reset();
     EdgeTriangles.Reset();
     NodeBoundRadius = 0.0;
 
-    Vertices.Reserve(ExtRes * ExtRes);
-    Normals.Reserve(ExtRes * ExtRes);
-    TexCoords.Reserve(ExtRes * ExtRes);
+    Vertices.Reserve(Total);
+    Normals.Reserve(Total);
+    TexCoords.Reserve(Total);
+    VertexColors.Reserve(Total);
+
+    // --- Stage 1: build vertex positions and collect sphere-space positions for density sampling ---
+    TArray<FVector> SpherePositions;
+    SpherePositions.Reserve(Total);
 
     for (int32 ix = 0; ix < ExtRes; ++ix)
     {
@@ -355,13 +376,16 @@ void FOceanQuadTreeNode::GenerateMeshData()
             CubeOffset[FaceTransform.AxisMap[0]] = FaceTransform.AxisDir[0] * normX;
             CubeOffset[FaceTransform.AxisMap[1]] = FaceTransform.AxisDir[1] * normY;
 
+            // ProjectToSphere gives chunk-local position. Add ChunkAnchorCenter
+            // to get the actual world-scale sphere position for compositor sampling.
             FVector LocalPos = ProjectToSphere(CubeOffset);
+            FVector SpherePos = LocalPos + ChunkAnchorCenter;
+            SpherePositions.Add(SpherePos);
+
             Vertices.Add(LocalPos);
+            Normals.Add(FVector3f(SpherePos.GetSafeNormal()));
 
-            FVector WorldPos = LocalPos + SphereCenter;
-            Normals.Add(FVector3f(WorldPos.GetSafeNormal()));
-
-            FVector Dir = WorldPos.GetSafeNormal();
+            FVector Dir = SpherePos.GetSafeNormal();
             TexCoords.Add(FVector2f(
                 (FMath::Atan2(Dir.Y, Dir.X) + PI) / (2.f * PI),
                 FMath::Acos(FMath::Clamp((float)Dir.Z, -1.f, 1.f)) / PI));
@@ -369,6 +393,51 @@ void FOceanQuadTreeNode::GenerateMeshData()
             if (ix > 0 && iy > 0 && ix < ExtRes - 1 && iy < ExtRes - 1)
                 NodeBoundRadius = FMath::Max(NodeBoundRadius, LocalPos.Size());
         }
+    }
+
+    // --- Stage 2: batch-sample density for all vertices via the compositor ---
+    // One compositor call per node — no per-vertex interpolation artifacts,
+    // no discontinuities at chunk or node boundaries.
+    FDensitySampleCompositor* Comp = Owner ? Owner->GetCompositor().Get() : nullptr;
+    if (Comp)
+    {
+        TArray<float> SX, SY, SZ, DensityOut;
+        SX.SetNumUninitialized(Total);
+        SY.SetNumUninitialized(Total);
+        SZ.SetNumUninitialized(Total);
+        DensityOut.SetNumUninitialized(Total);
+
+        for (int32 i = 0; i < Total; ++i)
+        {
+            SX[i] = (float)SpherePositions[i].X;
+            SY[i] = (float)SpherePositions[i].Y;
+            SZ[i] = (float)SpherePositions[i].Z;
+        }
+
+        FSampleInput Input(SX.GetData(), SY.GetData(), SZ.GetData(), Total);
+        Comp->Sample(Input, DensityOut.GetData());
+
+        for (int32 i = 0; i < Total; ++i)
+        {
+            float d = DensityOut[i];
+            uint32 Bits;
+            FMemory::Memcpy(&Bits, &d, sizeof(float));
+            VertexColors.Add(FColor(
+                (uint8)(Bits & 0xFF),
+                (uint8)((Bits >> 8) & 0xFF),
+                (uint8)((Bits >> 16) & 0xFF),
+                (uint8)((Bits >> 24) & 0xFF)
+            ));
+        }
+    }
+    else
+    {
+        // No compositor available — fill with zero density (sea level)
+        const float Zero = 0.f;
+        uint32 Bits; FMemory::Memcpy(&Bits, &Zero, sizeof(float));
+        FColor ZeroColor((uint8)(Bits & 0xFF), (uint8)((Bits >> 8) & 0xFF), (uint8)((Bits >> 16) & 0xFF), (uint8)((Bits >> 24) & 0xFF));
+        for (int32 i = 0; i < Total; ++i)
+            VertexColors.Add(ZeroColor);
     }
 
     const int32 tRes = ExtRes - 1;

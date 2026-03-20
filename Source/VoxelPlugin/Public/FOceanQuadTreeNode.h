@@ -25,6 +25,7 @@ struct VOXELPLUGIN_API FOceanStreamData
         MeshStream.AddStream(FRealtimeMeshStreams::Triangles, GetRealtimeMeshBufferLayout<TIndex3<uint32>>());
         MeshStream.AddStream(FRealtimeMeshStreams::PolyGroups, GetRealtimeMeshBufferLayout<uint16>());
         MeshStream.AddStream(FRealtimeMeshStreams::TexCoords, GetRealtimeMeshBufferLayout<FVector2DHalf>());
+        MeshStream.AddStream(FRealtimeMeshStreams::Color, GetRealtimeMeshBufferLayout<FColor>());
     }
 
     TRealtimeMeshStreamBuilder<FVector, FVector3f> GetPositionStream() {
@@ -41,6 +42,9 @@ struct VOXELPLUGIN_API FOceanStreamData
     }
     TRealtimeMeshStreamBuilder<FVector2f, FVector2DHalf> GetTexCoordStream() {
         return TRealtimeMeshStreamBuilder<FVector2f, FVector2DHalf>(*MeshStream.Find(FRealtimeMeshStreams::TexCoords));
+    }
+    TRealtimeMeshStreamBuilder<FColor> GetColorStream() {
+        return TRealtimeMeshStreamBuilder<FColor>(*MeshStream.Find(FRealtimeMeshStreams::Color));
     }
 };
 
@@ -110,10 +114,9 @@ public:
 
     int32 NeighborLods[4] = { 0, 0, 0, 0 };
 
-    // Density at each corner of this node's face quad.
-    // Populated by AOceanSphereActor::PushDensityToChildren after each split.
+    // Corner densities populated by AOceanSphereActor::PushDensityToChildren.
     // Layout: BL=0 (U-,V-), TL=1 (U-,V+), BR=2 (U+,V-), TR=3 (U+,V+).
-    // Sign convention: negative = above ocean surface, positive = below (underwater).
+    // Sign convention: negative = above ocean surface, positive = underwater.
     float CornerDensities[4] = { 0.f, 0.f, 0.f, 0.f };
     bool  bDensitySampled = false;
 
@@ -121,6 +124,7 @@ public:
     TArray<FVector>   Vertices;
     TArray<FVector3f> Normals;
     TArray<FVector2f> TexCoords;
+    TArray<FColor>    VertexColors;  // RGBA = density packed into all 4 channels
     TArray<FIndex3UI> AllTriangles;
     TArray<int32>     PatchTriangleIndices;
     TArray<FIndex3UI> EdgeTriangles;
@@ -159,4 +163,8 @@ public:
 private:
     FVector ProjectToSphere(FVector CubeOffset) const;
     int32   FaceResolution() const;
+
+    // Bilinear interpolation of CornerDensities at face-local (normX, normY).
+    // normX and normY are in [-HalfSize, +HalfSize].
+    float InterpolateDensity(double normX, double normY) const;
 };
