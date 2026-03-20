@@ -119,6 +119,10 @@ public:
     float CornerDensities[4] = { 0.f, 0.f, 0.f, 0.f };
     bool  bDensitySampled = false;
 
+    // Maximum depth (cm) across all vertices — set during GenerateMeshData.
+    // Positive = deepest underwater vertex. Used for chunk culling.
+    float MaxVertexDepth = 0.f;
+
     // Vertex data
     TArray<FVector>   Vertices;
     TArray<FVector3f> Normals;

@@ -63,6 +63,13 @@ public:
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Ocean|LOD")
     bool bTickInEditor = true;
 
+    // Chunks where the maximum vertex depth (cm) is below this threshold are culled.
+    // Negative values allow chunks that are somewhat above the ocean surface (land) to render.
+    // 0 = cull any chunk with no underwater vertices at all.
+    // e.g. -500000 = cull only chunks more than 5km above the ocean surface.
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Ocean|Culling")
+    float ChunkCullingDepthThreshold = 0.f;
+
     FVector GetCameraPosition() const { return CameraPosition; }
     double  GetCameraFOV()      const { return CameraFOV; }
     USceneComponent* GetMeshAttachmentRoot() const { return MeshAttachmentRoot; }

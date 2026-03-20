@@ -295,7 +295,32 @@ void AOceanSphereActor::RebuildChunkStreamData(
     TArray<TSharedPtr<FOceanQuadTreeNode>> Leaves;
     FOceanQuadTreeNode::CollectLeaves(ChunkNode, Leaves);
 
-    // Inner stream
+    // Culling: if the maximum vertex depth across all leaves is below the actor's threshold,
+    // output empty streams — the chunk is entirely above water or underground.
+    // We access the threshold via ChunkNode->Owner.
+    if (ChunkNode->Owner)
+    {
+        float ChunkMaxDepth = -FLT_MAX;
+        for (auto& Leaf : Leaves)
+            ChunkMaxDepth = FMath::Max(ChunkMaxDepth, Leaf->MaxVertexDepth);
+
+        if (ChunkMaxDepth < ChunkNode->Owner->ChunkCullingDepthThreshold)
+        {
+            // Emit empty streams — chunk is entirely above water / underground
+            TSharedPtr<FOceanStreamData> EmptyInner = MakeShared<FOceanStreamData>();
+            EmptyInner->MeshGroupKey = Chunk->InnerMeshData->MeshGroupKey;
+            EmptyInner->MeshSectionKey = Chunk->InnerMeshData->MeshSectionKey;
+            Chunk->InnerMeshData = EmptyInner;
+
+            TSharedPtr<FOceanStreamData> EmptyEdge = MakeShared<FOceanStreamData>();
+            EmptyEdge->MeshGroupKey = Chunk->EdgeMeshData->MeshGroupKey;
+            EmptyEdge->MeshSectionKey = Chunk->EdgeMeshData->MeshSectionKey;
+            Chunk->EdgeMeshData = EmptyEdge;
+
+            Chunk->IsDirty = true;
+            return;
+        }
+    }
     TSharedPtr<FOceanStreamData> NewInner = MakeShared<FOceanStreamData>();
     NewInner->MeshGroupKey = Chunk->InnerMeshData->MeshGroupKey;
     NewInner->MeshSectionKey = Chunk->InnerMeshData->MeshSectionKey;
