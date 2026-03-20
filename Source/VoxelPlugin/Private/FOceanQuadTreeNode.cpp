@@ -329,21 +329,6 @@ FVector FOceanQuadTreeNode::ProjectToSphere(FVector CubeOffset) const
     return WorldCube.GetSafeNormal() * OceanRadius - ChunkAnchorCenter;
 }
 
-float FOceanQuadTreeNode::InterpolateDensity(double normX, double normY) const
-{
-    // Bilinear interpolation of CornerDensities at face-local (normX, normY).
-    // normX and normY are in [-HalfSize, +HalfSize].
-    // u=0 at U- edge (BL/TL), u=1 at U+ edge (BR/TR).
-    // v=0 at V- edge (BL/BR), v=1 at V+ edge (TL/TR).
-    float u = (float)FMath::Clamp((normX + HalfSize) / Size, 0.0, 1.0);
-    float v = (float)FMath::Clamp((normY + HalfSize) / Size, 0.0, 1.0);
-
-    // BL=0 (u=0,v=0), TL=1 (u=0,v=1), BR=2 (u=1,v=0), TR=3 (u=1,v=1)
-    float bottom = FMath::Lerp(CornerDensities[0], CornerDensities[2], u); // lerp BL→BR
-    float top = FMath::Lerp(CornerDensities[1], CornerDensities[3], u); // lerp TL→TR
-    return FMath::Lerp(bottom, top, v);
-}
-
 void FOceanQuadTreeNode::GenerateMeshData()
 {
     const int32  Res = FaceResolution();
@@ -351,8 +336,8 @@ void FOceanQuadTreeNode::GenerateMeshData()
     const double Step = Size / (double)(Res - 1);
     const int32  Total = ExtRes * ExtRes;
 
-    Vertices.Reset();    Normals.Reset();      TexCoords.Reset();
-    VertexColors.Reset(); AllTriangles.Reset(); PatchTriangleIndices.Reset();
+    Vertices.Reset(); Normals.Reset(); TexCoords.Reset(); VertexColors.Reset();
+    AllTriangles.Reset(); PatchTriangleIndices.Reset();
     EdgeTriangles.Reset();
     NodeBoundRadius = 0.0;
 
@@ -361,9 +346,11 @@ void FOceanQuadTreeNode::GenerateMeshData()
     TexCoords.Reserve(Total);
     VertexColors.Reserve(Total);
 
-    // --- Stage 1: build vertex positions and collect sphere-space positions for density sampling ---
+    // Stage 1: build all vertex positions and collect world-space sphere positions for sampling.
+    // SpherePos = LocalPos + ChunkAnchorCenter — the actual position on the sphere
+    // at OceanRadius from the planet center, which is what the compositor expects.
     TArray<FVector> SpherePositions;
-    SpherePositions.Reserve(Total);
+    SpherePositions.SetNumUninitialized(Total);
 
     for (int32 ix = 0; ix < ExtRes; ++ix)
     {
@@ -376,16 +363,19 @@ void FOceanQuadTreeNode::GenerateMeshData()
             CubeOffset[FaceTransform.AxisMap[0]] = FaceTransform.AxisDir[0] * normX;
             CubeOffset[FaceTransform.AxisMap[1]] = FaceTransform.AxisDir[1] * normY;
 
-            // ProjectToSphere gives chunk-local position. Add ChunkAnchorCenter
-            // to get the actual world-scale sphere position for compositor sampling.
-            FVector LocalPos = ProjectToSphere(CubeOffset);
-            FVector SpherePos = LocalPos + ChunkAnchorCenter;
-            SpherePositions.Add(SpherePos);
+            // Project cube point to sphere — this is the true world-space position
+            // at OceanRadius from planet center, regardless of chunk depth.
+            FVector SpherePos = (CubeCenter + CubeOffset).GetSafeNormal() * OceanRadius;
+            SpherePositions[ix * ExtRes + iy] = SpherePos;
 
+            // Mesh vertex is chunk-local: subtract ChunkAnchorCenter
+            FVector LocalPos = SpherePos - ChunkAnchorCenter;
             Vertices.Add(LocalPos);
-            Normals.Add(FVector3f(SpherePos.GetSafeNormal()));
 
-            FVector Dir = SpherePos.GetSafeNormal();
+            FVector Normal = SpherePos.GetSafeNormal();
+            Normals.Add(FVector3f(Normal));
+
+            FVector Dir = Normal;
             TexCoords.Add(FVector2f(
                 (FMath::Atan2(Dir.Y, Dir.X) + PI) / (2.f * PI),
                 FMath::Acos(FMath::Clamp((float)Dir.Z, -1.f, 1.f)) / PI));
@@ -395,9 +385,14 @@ void FOceanQuadTreeNode::GenerateMeshData()
         }
     }
 
-    // --- Stage 2: batch-sample density for all vertices via the compositor ---
-    // One compositor call per node — no per-vertex interpolation artifacts,
-    // no discontinuities at chunk or node boundaries.
+    // Stage 2: batch-sample the compositor for all vertices at once.
+    // Depth encoding — same scheme as the old ocean mesh in the octree:
+    //   absDepth = max(density, 0) in world units (cm)
+    //   intDepth = (uint32)(absDepth * 1000)  — mm precision
+    //   R = bits[31:24], G = bits[23:16], B = bits[15:8], A = bits[7:0]
+    // Negative density (above water / land) encodes as 0,0,0,0.
+    // Material reconstruction: depth_mm = R<<24 | G<<16 | B<<8 | A
+    //                          depth_cm  = depth_mm / 1000.0
     FDensitySampleCompositor* Comp = Owner ? Owner->GetCompositor().Get() : nullptr;
     if (Comp)
     {
@@ -419,25 +414,23 @@ void FOceanQuadTreeNode::GenerateMeshData()
 
         for (int32 i = 0; i < Total; ++i)
         {
-            float d = DensityOut[i];
-            uint32 Bits;
-            FMemory::Memcpy(&Bits, &d, sizeof(float));
-            VertexColors.Add(FColor(
-                (uint8)(Bits & 0xFF),
-                (uint8)((Bits >> 8) & 0xFF),
-                (uint8)((Bits >> 16) & 0xFF),
-                (uint8)((Bits >> 24) & 0xFF)
-            ));
+            float depth = DensityOut[i]; // positive = underwater (cm), negative = above water
+            float absDepth = FMath::Max(depth, 0.0f);
+            // Store as decimeters (10cm units) for uint32 range.
+            // Max depth = 10,000,000 cm / 10 = 1,000,000 dm — fits in uint32 (max ~4.29B).
+            // Material: depth_cm = depth_dm * 10
+            uint32 intDepth = (uint32)FMath::Min(absDepth * 0.1f, (float)0xFFFFFFFFu);
+            uint8 R = (intDepth >> 24) & 0xFF;
+            uint8 G = (intDepth >> 16) & 0xFF;
+            uint8 B = (intDepth >> 8) & 0xFF;
+            uint8 A = intDepth & 0xFF;
+            VertexColors.Add(FColor(R, G, B, A));
         }
     }
     else
     {
-        // No compositor available — fill with zero density (sea level)
-        const float Zero = 0.f;
-        uint32 Bits; FMemory::Memcpy(&Bits, &Zero, sizeof(float));
-        FColor ZeroColor((uint8)(Bits & 0xFF), (uint8)((Bits >> 8) & 0xFF), (uint8)((Bits >> 16) & 0xFF), (uint8)((Bits >> 24) & 0xFF));
         for (int32 i = 0; i < Total; ++i)
-            VertexColors.Add(ZeroColor);
+            VertexColors.Add(FColor(0, 0, 0, 0));
     }
 
     const int32 tRes = ExtRes - 1;

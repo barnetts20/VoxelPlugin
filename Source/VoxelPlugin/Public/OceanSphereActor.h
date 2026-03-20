@@ -21,22 +21,18 @@ public:
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Ocean|Material")
     UMaterialInterface* OceanMaterial = nullptr;
 
-    // Ocean radius is driven by actor scale (uniform across all axes).
-    // Default scale 80,000,000 = 800 km radius, matching the default terrain actor.
-    // This property is read-only at runtime — adjust actor scale to resize.
+    // Driven by actor scale. Read-only at runtime — adjust scale to resize.
     UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Ocean|Shape")
     double OceanRadius = 100000000.0;
 
-    // The terrain planet's base radius — must match the terrain actor's scale (GetActorScale3D().GetMax()).
-    // Used to evaluate the same SDF as the terrain so depth values are meaningful:
-    // density = OceanRadius - (TerrainPlanetRadius + NoiseHeight).
-    // Positive = underwater, negative = above terrain (land).
+    // Must match the terrain actor's scale (GetActorScale3D().GetMax()).
+    // density = OceanRadius - (TerrainPlanetRadius + NoiseHeight):
+    //   positive = underwater, negative = above water (land).
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Ocean|Shape",
         meta = (ClampMin = "1.0"))
     double TerrainPlanetRadius = 90000000.0;
 
-    // Noise amplitude as a ratio of TerrainPlanetRadius.
-    // Must match the terrain actor's NoiseAmplitudeRatio so both evaluate the same heightfield.
+    // Must match the terrain actor's NoiseAmplitudeRatio.
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Ocean|Shape",
         meta = (ClampMin = "0.01", ClampMax = "1.0"))
     double NoiseAmplitudeRatio = 0.25;
@@ -48,7 +44,6 @@ public:
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Ocean|LOD")
     int32 ChunkDepth = 2;
 
-    // Must be >= ChunkDepth
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Ocean|LOD")
     int32 MinDepth = 2;
 
@@ -88,11 +83,7 @@ private:
     UPROPERTY()
     TObjectPtr<USceneComponent> MeshAttachmentRoot;
 
-    // Density compositor — built at Initialize() time with the same heightmap layer
-    // as AAdaptiveVoxelActor so the ocean evaluates the identical SDF.
     TSharedPtr<FDensitySampleCompositor> Compositor;
-
-    // Noise node kept alive for the compositor lambda lifetime.
     FastNoise::SmartNode<> Noise;
 
     FVector CameraPosition = FVector::ZeroVector;
@@ -113,17 +104,10 @@ private:
     void Initialize();
     void CleanupComponents();
     void PopulateChunks();
-
-    // Samples the 4 sphere-projected corners of a root node before any splits.
     void ComputeRootNodeDensities(TSharedPtr<FOceanQuadTreeNode> Node);
-
-    // Recursive post-pass: walks an already-split subtree and pushes density
-    // into every child node that doesn't yet have bDensitySampled.
-    // Does not touch mesh data, positions, winding, or ChunkAnchorCenter.
     void PushDensityToChildren(TSharedPtr<FOceanQuadTreeNode> Node);
 
     static void RebuildChunkStreamData(TSharedPtr<FOceanMeshChunk> Chunk,
         TSharedPtr<FOceanQuadTreeNode> ChunkNode);
-
     void RunLodUpdateTask();
 };

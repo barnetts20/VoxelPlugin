@@ -114,9 +114,8 @@ public:
 
     int32 NeighborLods[4] = { 0, 0, 0, 0 };
 
-    // Corner densities populated by AOceanSphereActor::PushDensityToChildren.
+    // Corner densities for this node's face quad — populated by PushDensityToChildren.
     // Layout: BL=0 (U-,V-), TL=1 (U-,V+), BR=2 (U+,V-), TR=3 (U+,V+).
-    // Sign convention: negative = above ocean surface, positive = underwater.
     float CornerDensities[4] = { 0.f, 0.f, 0.f, 0.f };
     bool  bDensitySampled = false;
 
@@ -124,7 +123,7 @@ public:
     TArray<FVector>   Vertices;
     TArray<FVector3f> Normals;
     TArray<FVector2f> TexCoords;
-    TArray<FColor>    VertexColors;  // RGBA = density packed into all 4 channels
+    TArray<FColor>    VertexColors; // depth encoded: R=bits[31:24], G=[23:16], B=[15:8], A=[7:0]
     TArray<FIndex3UI> AllTriangles;
     TArray<int32>     PatchTriangleIndices;
     TArray<FIndex3UI> EdgeTriangles;
@@ -133,15 +132,10 @@ public:
     bool IsRestructuring = false;
     bool CanMerge = false;
 
-    // Tree traversal
     static void CollectLeaves(TSharedPtr<FOceanQuadTreeNode> Root,
         TArray<TSharedPtr<FOceanQuadTreeNode>>& Out);
 
-    // LOD
-    // Returns true if the tree structure changed (split or merge occurred)
     bool TrySetLod(FVector CameraPos, double ThresholdSq, double MergeThresholdSq, double FOVScale);
-
-    // Neighbor stitching - returns true if any edge LOD changed
     bool CheckNeighbors();
 
     static void Split(TSharedPtr<FOceanQuadTreeNode> Node);
@@ -153,18 +147,13 @@ public:
     bool ShouldSplit(double DistSq, double FOVScale, double ThresholdSq) const;
     bool ShouldMerge(double ParentDistSq, double ParentFOVScale, double MergeThresholdSq) const;
 
-    // Mesh data
     void GenerateMeshData();
     void RebuildEdgeTriangles();
 
-    bool  IsLeaf()  const { return Children.Num() == 0; }
+    bool  IsLeaf()   const { return Children.Num() == 0; }
     int32 GetDepth() const { return Index.GetDepth(); }
 
 private:
     FVector ProjectToSphere(FVector CubeOffset) const;
     int32   FaceResolution() const;
-
-    // Bilinear interpolation of CornerDensities at face-local (normX, normY).
-    // normX and normY are in [-HalfSize, +HalfSize].
-    float InterpolateDensity(double normX, double normY) const;
 };
