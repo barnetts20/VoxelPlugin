@@ -63,6 +63,105 @@ void FOceanMeshChunk::DestroyComponent(AOceanSphereActor* InOwner)
 }
 
 // ===========================================================================
+// FOceanMeshGrid
+// ===========================================================================
+
+void FOceanMeshGrid::Build(int32 Res, bool bFlipWinding)
+{
+    const int32 ExtRes = Res + 2;
+    const int32 tRes = ExtRes - 1;
+
+    // --- Interior patch triangles ---
+    PatchTriangles.Reset();
+    for (int32 ix = 0; ix < tRes; ++ix)
+    {
+        for (int32 iy = 0; iy < tRes; ++iy)
+        {
+            bool bIsVirtual = (ix == 0 || iy == 0 || ix == tRes - 1 || iy == tRes - 1);
+            bool bIsEdge = (ix == 1 || iy == 1 || ix == tRes - 2 || iy == tRes - 2);
+            if (bIsVirtual || bIsEdge) continue;
+
+            int32 tl = ix * ExtRes + iy, tr = tl + 1, bl = tl + ExtRes, br = bl + 1;
+            if ((ix + iy) % 2 == 0)
+            {
+                if (bFlipWinding) { PatchTriangles.Add(FIndex3UI(tl, br, bl)); PatchTriangles.Add(FIndex3UI(tl, tr, br)); }
+                else { PatchTriangles.Add(FIndex3UI(tl, bl, br)); PatchTriangles.Add(FIndex3UI(tl, br, tr)); }
+            }
+            else
+            {
+                if (bFlipWinding) { PatchTriangles.Add(FIndex3UI(tl, tr, bl)); PatchTriangles.Add(FIndex3UI(tr, br, bl)); }
+                else { PatchTriangles.Add(FIndex3UI(tl, bl, tr)); PatchTriangles.Add(FIndex3UI(tr, bl, br)); }
+            }
+        }
+    }
+
+    // --- 16 edge stitch variants ---
+    for (uint8 flags = 0; flags < 16; ++flags)
+        BuildEdgeVariant(ExtRes, Res, flags, EdgeTriangles[flags]);
+}
+
+void FOceanMeshGrid::BuildEdgeVariant(int32 ExtRes, int32 tRes, uint8 Flags,
+    TArray<FIndex3UI>& Out)
+{
+    Out.Reset();
+
+    bool bLeft = (Flags & 0x1) != 0;
+    bool bRight = (Flags & 0x2) != 0;
+    bool bTop = (Flags & 0x4) != 0;
+    bool bBottom = (Flags & 0x8) != 0;
+
+    FIndex3UI topOdd, bottomOdd, leftOdd, rightOdd;
+
+    for (int32 i = 1; i < tRes; ++i)
+    {
+        { // TOP
+            int32 x = i, y = 1;
+            int32 tl = x * ExtRes + y, bl = (x + 1) * ExtRes + y;
+            int32 quad[4] = { tl, tl + 1, bl, bl + 1 };
+            if (x % 2 != 0) { topOdd = FIndex3UI(quad[3], quad[0], quad[2]); if (x != 1) Out.Add(FIndex3UI(quad[0], quad[3], quad[1])); }
+            else {
+                if (bTop) { topOdd[2] = quad[2]; Out.Add(topOdd); }
+                else { Out.Add(topOdd); Out.Add(FIndex3UI(quad[0], quad[2], quad[1])); }
+                if (x != tRes - 1) Out.Add(FIndex3UI(quad[1], quad[2], quad[3]));
+            }
+        }
+        { // BOTTOM
+            int32 x = i, y = tRes - 1;
+            int32 tl = x * ExtRes + y, bl = (x + 1) * ExtRes + y;
+            int32 quad[4] = { bl, bl + 1, tl, tl + 1 };
+            if (x % 2 != 0) { bottomOdd = FIndex3UI(quad[3], quad[0], quad[1]); if (x != 1) Out.Add(FIndex3UI(quad[3], quad[2], quad[0])); }
+            else {
+                if (bBottom) { bottomOdd[2] = quad[1]; Out.Add(bottomOdd); }
+                else { Out.Add(bottomOdd); Out.Add(FIndex3UI(quad[1], quad[3], quad[2])); }
+                if (x != tRes - 1) Out.Add(FIndex3UI(quad[0], quad[1], quad[2]));
+            }
+        }
+        { // LEFT
+            int32 y = i, x = 1;
+            int32 tl = x * ExtRes + y, bl = (x + 1) * ExtRes + y;
+            int32 quad[4] = { tl, bl, tl + 1, bl + 1 };
+            if (y % 2 != 0) { leftOdd = FIndex3UI(quad[0], quad[3], quad[2]); if (y != 1) Out.Add(FIndex3UI(quad[3], quad[0], quad[1])); }
+            else {
+                if (bLeft) { leftOdd[2] = quad[2]; Out.Add(leftOdd); }
+                else { Out.Add(leftOdd); Out.Add(FIndex3UI(quad[2], quad[0], quad[1])); }
+                if (y != tRes - 1) Out.Add(FIndex3UI(quad[2], quad[1], quad[3]));
+            }
+        }
+        { // RIGHT
+            int32 y = i, x = tRes - 1;
+            int32 tl = x * ExtRes + y, bl = (x + 1) * ExtRes + y;
+            int32 quad[4] = { tl + 1, bl + 1, tl, bl };
+            if (y % 2 != 0) { rightOdd = FIndex3UI(quad[0], quad[3], quad[1]); if (y != 1) Out.Add(FIndex3UI(quad[2], quad[3], quad[0])); }
+            else {
+                if (bRight) { rightOdd[2] = quad[1]; Out.Add(rightOdd); }
+                else { Out.Add(rightOdd); Out.Add(FIndex3UI(quad[3], quad[1], quad[2])); }
+                if (y != tRes - 1) Out.Add(FIndex3UI(quad[1], quad[0], quad[2]));
+            }
+        }
+    }
+}
+
+// ===========================================================================
 // FOceanQuadTreeNode
 // ===========================================================================
 
@@ -209,11 +308,9 @@ void FOceanQuadTreeNode::Split(TSharedPtr<FOceanQuadTreeNode> inNode)
 
         Child->Parent = inNode.ToWeakPtr();
         Child->ChunkAnchorCenter = inNode->ChunkAnchorCenter;
+        Child->SampleMaxDepth();
         inNode->Children.Add(Child);
     }
-
-    for (int32 i = 0; i < 4; ++i)
-        inNode->Children[i]->GenerateMeshData();
 
     inNode->IsRestructuring = false;
 }
@@ -274,14 +371,12 @@ void FOceanQuadTreeNode::SplitToDepth(int32 TargetDepth)
         else
             Child->ChunkAnchorCenter = ChunkAnchorCenter;
 
+        Child->SampleMaxDepth();
         Children.Add(Child);
     }
 
     for (auto& Child : Children)
-    {
-        Child->GenerateMeshData();
         Child->SplitToDepth(TargetDepth);
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -290,8 +385,6 @@ void FOceanQuadTreeNode::SplitToDepth(int32 TargetDepth)
 
 bool FOceanQuadTreeNode::CheckNeighbors()
 {
-    if (!HasGenerated) return false;
-
     uint8 myQuadrant = (uint8)Index.GetQuadrant();
     bool  bChanged = false;
 
@@ -315,213 +408,33 @@ bool FOceanQuadTreeNode::CheckNeighbors()
 }
 
 // ---------------------------------------------------------------------------
-// Mesh data generation
+// SampleMaxDepth
 // ---------------------------------------------------------------------------
 
-int32 FOceanQuadTreeNode::FaceResolution() const
+void FOceanQuadTreeNode::SampleMaxDepth()
 {
-    return Owner ? Owner->FaceResolution : 3;
-}
+    if (!Owner) return;
+    FDensitySampleCompositor* Comp = Owner->GetCompositor().Get();
+    if (!Comp) return;
 
-FVector FOceanQuadTreeNode::ProjectToSphere(FVector CubeOffset) const
-{
-    FVector WorldCube = CubeCenter + CubeOffset;
-    return WorldCube.GetSafeNormal() * OceanRadius - ChunkAnchorCenter;
-}
+    // Sample the 4 face corners — cheap proxy for MaxVertexDepth.
+    const int32  U = FaceTransform.AxisMap[0];
+    const int32  V = FaceTransform.AxisMap[1];
+    const int32  DU = FaceTransform.AxisDir[0];
+    const int32  DV = FaceTransform.AxisDir[1];
 
-void FOceanQuadTreeNode::GenerateMeshData()
-{
-    const int32  Res = FaceResolution();
-    const int32  ExtRes = Res + 2;
-    const double Step = Size / (double)(Res - 1);
-    const int32  Total = ExtRes * ExtRes;
-
-    Vertices.Reset(); Normals.Reset(); TexCoords.Reset(); VertexColors.Reset(); VertexDepths.Reset();
-    AllTriangles.Reset(); PatchTriangleIndices.Reset();
-    EdgeTriangles.Reset();
-    NodeBoundRadius = 0.0;
-
-    Vertices.Reserve(Total);
-    Normals.Reserve(Total);
-    TexCoords.Reserve(Total);
-    VertexColors.Reserve(Total);
-    VertexDepths.Reserve(Total);
-
-    // Stage 1: build all vertex positions and collect world-space sphere positions for sampling.
-    // SpherePos = LocalPos + ChunkAnchorCenter — the actual position on the sphere
-    // at OceanRadius from the planet center, which is what the compositor expects.
-    TArray<FVector> SpherePositions;
-    SpherePositions.SetNumUninitialized(Total);
-
-    for (int32 ix = 0; ix < ExtRes; ++ix)
+    float SX[4], SY[4], SZ[4], Out[4];
+    for (int32 c = 0; c < 4; ++c)
     {
-        for (int32 iy = 0; iy < ExtRes; ++iy)
-        {
-            double normX = -HalfSize + Step * (ix - 1);
-            double normY = -HalfSize + Step * (iy - 1);
-
-            FVector CubeOffset = FVector::ZeroVector;
-            CubeOffset[FaceTransform.AxisMap[0]] = FaceTransform.AxisDir[0] * normX;
-            CubeOffset[FaceTransform.AxisMap[1]] = FaceTransform.AxisDir[1] * normY;
-
-            // Project cube point to sphere — this is the true world-space position
-            // at OceanRadius from planet center, regardless of chunk depth.
-            FVector SpherePos = (CubeCenter + CubeOffset).GetSafeNormal() * OceanRadius;
-            SpherePositions[ix * ExtRes + iy] = SpherePos;
-
-            // Mesh vertex is chunk-local: subtract ChunkAnchorCenter
-            FVector LocalPos = SpherePos - ChunkAnchorCenter;
-            Vertices.Add(LocalPos);
-
-            FVector Normal = SpherePos.GetSafeNormal();
-            Normals.Add(FVector3f(Normal));
-
-            FVector Dir = Normal;
-            TexCoords.Add(FVector2f(
-                (FMath::Atan2(Dir.Y, Dir.X) + PI) / (2.f * PI),
-                FMath::Acos(FMath::Clamp((float)Dir.Z, -1.f, 1.f)) / PI));
-
-            if (ix > 0 && iy > 0 && ix < ExtRes - 1 && iy < ExtRes - 1)
-                NodeBoundRadius = FMath::Max(NodeBoundRadius, LocalPos.Size());
-        }
+        FVector Corner = CubeCenter;
+        Corner[U] += DU * HalfSize * ((c & 1) ? 1.0 : -1.0);
+        Corner[V] += DV * HalfSize * ((c & 2) ? 1.0 : -1.0);
+        FVector S = Corner.GetSafeNormal() * OceanRadius;
+        SX[c] = (float)S.X;
+        SY[c] = (float)S.Y;
+        SZ[c] = (float)S.Z;
     }
-
-    // Stage 2: batch-sample the compositor for all vertices at once.
-    // Depth encoding — same scheme as the old ocean mesh in the octree:
-    //   absDepth = max(density, 0) in world units (cm)
-    //   intDepth = (uint32)(absDepth * 1000)  — mm precision
-    //   R = bits[31:24], G = bits[23:16], B = bits[15:8], A = bits[7:0]
-    // Negative density (above water / land) encodes as 0,0,0,0.
-    // Material reconstruction: depth_mm = R<<24 | G<<16 | B<<8 | A
-    //                          depth_cm  = depth_mm / 1000.0
-    FDensitySampleCompositor* Comp = Owner ? Owner->GetCompositor().Get() : nullptr;
-    if (Comp)
-    {
-        TArray<float> SX, SY, SZ, DensityOut;
-        SX.SetNumUninitialized(Total);
-        SY.SetNumUninitialized(Total);
-        SZ.SetNumUninitialized(Total);
-        DensityOut.SetNumUninitialized(Total);
-
-        for (int32 i = 0; i < Total; ++i)
-        {
-            SX[i] = (float)SpherePositions[i].X;
-            SY[i] = (float)SpherePositions[i].Y;
-            SZ[i] = (float)SpherePositions[i].Z;
-        }
-
-        FSampleInput Input(SX.GetData(), SY.GetData(), SZ.GetData(), Total);
-        Comp->Sample(Input, DensityOut.GetData());
-
-        MaxVertexDepth = -FLT_MAX;
-        for (int32 i = 0; i < Total; ++i)
-        {
-            float depth = DensityOut[i];
-            MaxVertexDepth = FMath::Max(MaxVertexDepth, depth);
-            VertexDepths.Add(depth);
-            float absDepth = FMath::Max(depth, 0.0f);
-            uint32 intDepth = (uint32)FMath::Min(absDepth * 1000.0f, 4294967040.0f);
-            uint8 R = (intDepth >> 24) & 0xFF;
-            uint8 G = (intDepth >> 16) & 0xFF;
-            uint8 B = (intDepth >> 8) & 0xFF;
-            uint8 A = intDepth & 0xFF;
-            VertexColors.Add(FColor(R, G, B, A));
-        }
-    }
-    else
-    {
-        MaxVertexDepth = 0.f;
-        for (int32 i = 0; i < Total; ++i)
-        {
-            VertexDepths.Add(0.f);
-            VertexColors.Add(FColor(0, 0, 0, 0));
-        }
-    }
-
-    const int32 tRes = ExtRes - 1;
-    for (int32 ix = 0; ix < tRes; ++ix)
-    {
-        for (int32 iy = 0; iy < tRes; ++iy)
-        {
-            int32 tl = ix * ExtRes + iy, tr = tl + 1, bl = tl + ExtRes, br = bl + 1;
-            bool bIsVirtual = (ix == 0 || iy == 0 || ix == tRes - 1 || iy == tRes - 1);
-            bool bIsEdge = (ix == 1 || iy == 1 || ix == tRes - 2 || iy == tRes - 2);
-
-            TArray<FIndex3UI> Tris;
-            if ((ix + iy) % 2 == 0) { Tris.Add(FIndex3UI(tl, bl, br)); Tris.Add(FIndex3UI(tl, br, tr)); }
-            else { Tris.Add(FIndex3UI(tl, bl, tr)); Tris.Add(FIndex3UI(tr, bl, br)); }
-
-            for (FIndex3UI T : Tris)
-            {
-                int32 Idx = FaceTransform.bFlipWinding
-                    ? AllTriangles.Add(FIndex3UI(T.V0, T.V2, T.V1))
-                    : AllTriangles.Add(T);
-                if (!bIsVirtual && !bIsEdge) PatchTriangleIndices.Add(Idx);
-            }
-        }
-    }
-
-    HasGenerated = true;
-    RebuildEdgeTriangles();
-}
-
-void FOceanQuadTreeNode::RebuildEdgeTriangles()
-{
-    if (!HasGenerated) return;
-
-    const int32 Res = FaceResolution();
-    const int32 ExtRes = Res + 2;
-    const int32 tRes = Res;
-
-    bool bLeft = GetDepth() > NeighborLods[(uint8)EdgeOrientation::LEFT];
-    bool bRight = GetDepth() > NeighborLods[(uint8)EdgeOrientation::RIGHT];
-    bool bTop = GetDepth() > NeighborLods[(uint8)EdgeOrientation::UP];
-    bool bBottom = GetDepth() > NeighborLods[(uint8)EdgeOrientation::DOWN];
-
-    EdgeTriangles.Reset();
-    FIndex3UI topOdd, bottomOdd, leftOdd, rightOdd;
-
-    for (int32 i = 1; i < tRes; ++i)
-    {
-        { // TOP
-            int32 x = i, y = 1, tl = x * ExtRes + y, bl = (x + 1) * ExtRes + y;
-            int32 quad[4] = { tl,tl + 1,bl,bl + 1 };
-            if (x % 2 != 0) { topOdd = FIndex3UI(quad[3], quad[0], quad[2]); if (x != 1)EdgeTriangles.Add(FIndex3UI(quad[0], quad[3], quad[1])); }
-            else {
-                if (bTop) { topOdd[2] = quad[2]; EdgeTriangles.Add(topOdd); }
-                else { EdgeTriangles.Add(topOdd); EdgeTriangles.Add(FIndex3UI(quad[0], quad[2], quad[1])); }
-                if (x != tRes - 1)EdgeTriangles.Add(FIndex3UI(quad[1], quad[2], quad[3]));
-            }
-        }
-        { // BOTTOM
-            int32 x = i, y = tRes - 1, tl = x * ExtRes + y, bl = (x + 1) * ExtRes + y;
-            int32 quad[4] = { bl,bl + 1,tl,tl + 1 };
-            if (x % 2 != 0) { bottomOdd = FIndex3UI(quad[3], quad[0], quad[1]); if (x != 1)EdgeTriangles.Add(FIndex3UI(quad[3], quad[2], quad[0])); }
-            else {
-                if (bBottom) { bottomOdd[2] = quad[1]; EdgeTriangles.Add(bottomOdd); }
-                else { EdgeTriangles.Add(bottomOdd); EdgeTriangles.Add(FIndex3UI(quad[1], quad[3], quad[2])); }
-                if (x != tRes - 1)EdgeTriangles.Add(FIndex3UI(quad[0], quad[1], quad[2]));
-            }
-        }
-        { // LEFT
-            int32 y = i, x = 1, tl = x * ExtRes + y, bl = (x + 1) * ExtRes + y;
-            int32 quad[4] = { tl,bl,tl + 1,bl + 1 };
-            if (y % 2 != 0) { leftOdd = FIndex3UI(quad[0], quad[3], quad[2]); if (y != 1)EdgeTriangles.Add(FIndex3UI(quad[3], quad[0], quad[1])); }
-            else {
-                if (bLeft) { leftOdd[2] = quad[2]; EdgeTriangles.Add(leftOdd); }
-                else { EdgeTriangles.Add(leftOdd); EdgeTriangles.Add(FIndex3UI(quad[2], quad[0], quad[1])); }
-                if (y != tRes - 1)EdgeTriangles.Add(FIndex3UI(quad[2], quad[1], quad[3]));
-            }
-        }
-        { // RIGHT
-            int32 y = i, x = tRes - 1, tl = x * ExtRes + y, bl = (x + 1) * ExtRes + y;
-            int32 quad[4] = { tl + 1,bl + 1,tl,bl };
-            if (y % 2 != 0) { rightOdd = FIndex3UI(quad[0], quad[3], quad[1]); if (y != 1)EdgeTriangles.Add(FIndex3UI(quad[2], quad[3], quad[0])); }
-            else {
-                if (bRight) { rightOdd[2] = quad[1]; EdgeTriangles.Add(rightOdd); }
-                else { EdgeTriangles.Add(rightOdd); EdgeTriangles.Add(FIndex3UI(quad[3], quad[1], quad[2])); }
-                if (y != tRes - 1)EdgeTriangles.Add(FIndex3UI(quad[1], quad[0], quad[2]));
-            }
-        }
-    }
+    FSampleInput Input(SX, SY, SZ, 4);
+    Comp->Sample(Input, Out);
+    MaxVertexDepth = FMath::Max(FMath::Max(Out[0], Out[1]), FMath::Max(Out[2], Out[3]));
 }

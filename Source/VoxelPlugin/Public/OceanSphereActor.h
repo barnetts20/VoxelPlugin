@@ -1,8 +1,9 @@
-#pragma once
+﻿#pragma once
 
 #include "CoreMinimal.h"
 #include "RealtimeMeshActor.h"
 #include "FOceanSharedStructs.h"
+#include "FOceanQuadTreeNode.h"
 #include "FDensitySampleCompositor.h"
 #include "FastNoise/FastNoise.h"
 #include "OceanSphereActor.generated.h"
@@ -21,7 +22,7 @@ public:
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Ocean|Material")
     UMaterialInterface* OceanMaterial = nullptr;
 
-    // Driven by actor scale. Read-only at runtime � adjust scale to resize.
+    // Driven by actor scale. Read-only at runtime � adjust scale to resize.
     UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Ocean|Shape")
     double OceanRadius = 100000000.0;
 
@@ -75,6 +76,9 @@ public:
     USceneComponent* GetMeshAttachmentRoot() const { return MeshAttachmentRoot; }
     TSharedPtr<FDensitySampleCompositor> GetCompositor() const { return Compositor; }
 
+    // Returns the grid cache for a given resolution, building it if needed.
+    const FOceanMeshGrid& GetMeshGrid(int32 Res, bool bFlipWinding);
+
     TSharedPtr<FOceanQuadTreeNode> GetNodeByIndex(const FQuadIndex& Index) const;
 
     virtual void OnConstruction(const FTransform& Transform) override;
@@ -107,6 +111,9 @@ private:
     double  LastTerrainPlanetRadius = 0.0;
 
     FTimerHandle LodTimerHandle;
+
+    // Static mesh grid cache — keyed by Res*2 + bFlipWinding.
+    TMap<int32, FOceanMeshGrid> MeshGridCache;
 
     void Initialize();
     void CleanupComponents();

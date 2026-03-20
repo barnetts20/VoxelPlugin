@@ -1,5 +1,6 @@
 ﻿#include "OceanSphereActor.h"
 #include "FOceanQuadTreeNode.h"
+#include "FDensitySampleCompositor.h"
 #include "Kismet/GameplayStatics.h"
 #include "TimerManager.h"
 
@@ -8,13 +9,8 @@ AOceanSphereActor::AOceanSphereActor()
     PrimaryActorTick.bCanEverTick = true;
     PrimaryActorTick.bStartWithTickEnabled = true;
 
-    // Default scale = planet radius in world units (cm).
-    // 80,000,000 cm = 800 km radius, matching the default terrain actor.
-    SetActorScale3D(FVector(80000000.0));
+    SetActorScale3D(FVector(100000000.0));
 
-    // Mesh components attach here. Inherits actor position and rotation,
-    // absolute scale (1,1,1) so the sphere built at world-scale radius
-    // is never additionally scaled by the actor transform.
     MeshAttachmentRoot = CreateDefaultSubobject<USceneComponent>(TEXT("MeshAttachmentRoot"));
     MeshAttachmentRoot->SetupAttachment(GetRootComponent());
     MeshAttachmentRoot->SetAbsolute(false, false, true);
@@ -25,10 +21,9 @@ void AOceanSphereActor::OnConstruction(const FTransform& Transform)
     Super::OnConstruction(Transform);
     if (bIsInitializing) return;
     if (!GetWorld() || GetWorld()->IsPreviewWorld() || !bTickInEditor) return;
-
-    // Only reconstruct when scale changes � position and rotation are handled
-    // live by MeshAttachmentRoot inheriting the actor transform.
-    if (!bInitialized || !GetActorScale3D().Equals(LastInitScale, 0.01))
+    if (!bInitialized
+        || !GetActorScale3D().Equals(LastInitScale, 0.01)
+        || LastTerrainPlanetRadius != TerrainPlanetRadius)
         Initialize();
 }
 
@@ -51,6 +46,25 @@ bool AOceanSphereActor::ShouldTickIfViewportsOnly() const
     return bTickInEditor && bInitialized;
 }
 
+// ---------------------------------------------------------------------------
+// Mesh grid cache
+// ---------------------------------------------------------------------------
+
+const FOceanMeshGrid& AOceanSphereActor::GetMeshGrid(int32 Res, bool bFlipWinding)
+{
+    int32 Key = Res * 2 + (bFlipWinding ? 1 : 0);
+    FOceanMeshGrid* Existing = MeshGridCache.Find(Key);
+    if (Existing) return *Existing;
+
+    FOceanMeshGrid& Grid = MeshGridCache.Add(Key);
+    Grid.Build(Res, bFlipWinding);
+    return Grid;
+}
+
+// ---------------------------------------------------------------------------
+// Initialize
+// ---------------------------------------------------------------------------
+
 void AOceanSphereActor::Initialize()
 {
     bIsInitializing = true;
@@ -61,6 +75,7 @@ void AOceanSphereActor::Initialize()
         W->GetTimerManager().ClearTimer(LodTimerHandle);
 
     bLodUpdateRunning = false;
+    MeshGridCache.Empty();
 
     CleanupComponents();
     ChunkMap.Empty();
@@ -73,7 +88,8 @@ void AOceanSphereActor::Initialize()
 
     Noise = FastNoise::NewFromEncodedNodeTree("GQAgAB8AEwCamRk+DQAMAAAAAAAAQAcAAAAAAD8AAAAAAAAAAAA/AAAAAD8AAAAAvwAAAAA/ARsAFwCamRk+AAAAPwAAAAAAAAA/IAAgABMAAABAQBsAJAACAAAADQAIAAAAAAAAQAsAAQAAAAAAAAABAAAAAAAAAAAAAIA/AAAAAD8AAAAAAAAAAIA/AAAAAAAAmpmZPgCamRk+AM3MTD4BEwDNzEw+IAAfABcAAACAvwAAgD8AAIDAAAAAPw8AAQAAAAAAAED//wEAAAAAAD8AAAAAAAAAAIA/AAAAAD8AAACAvwAAAAA/");
 
-    auto HeightmapLayer = [NoiseNode = Noise, PlanetRadius = TerrainPlanetRadius, NoiseAmplitude = TerrainNoiseAmplitude](const FSampleInput& Input, float* DensityOut)
+    auto HeightmapLayer = [NoiseNode = Noise, PlanetRadius = TerrainPlanetRadius, NoiseAmplitude = TerrainNoiseAmplitude]
+    (const FSampleInput& Input, float* DensityOut)
         {
             int32 Count = Input.Num();
             double InvNoiseAmplitude = 1.0 / NoiseAmplitude;
@@ -123,39 +139,29 @@ void AOceanSphereActor::Initialize()
     Compositor = MakeShared<FDensitySampleCompositor>();
     Compositor->AddSampleLayer(HeightmapLayer);
 
-    // The cube-sphere is always built at world scale in actor-local space (origin 0,0,0).
     const double Size = 1000.0;
     const double HalfSize = Size * 0.5;
 
     const FVector FaceCenters[6] = {
-        FVector(HalfSize,       0,       0),
-        FVector(-HalfSize,       0,       0),
-        FVector(0,  HalfSize,       0),
-        FVector(0, -HalfSize,       0),
-        FVector(0,       0,  HalfSize),
-        FVector(0,       0, -HalfSize),
+        FVector(HalfSize,        0,        0),
+        FVector(-HalfSize,        0,        0),
+        FVector(0,  HalfSize,        0),
+        FVector(0, -HalfSize,        0),
+        FVector(0,        0,  HalfSize),
+        FVector(0,        0, -HalfSize),
     };
 
     for (int32 i = 0; i < 6; ++i)
     {
         RootNodes[i] = MakeShared<FOceanQuadTreeNode>(
-            this,
-            FCubeTransform::FaceTransforms[i],
-            FQuadIndex((uint8)i),
-            FaceCenters[i],
-            Size,
-            OceanRadius,
-            MinDepth,
-            MaxDepth,
-            ChunkDepth);
+            this, FCubeTransform::FaceTransforms[i], FQuadIndex((uint8)i),
+            FaceCenters[i], Size, OceanRadius, MinDepth, MaxDepth, ChunkDepth);
         RootNodes[i]->ChunkAnchorCenter = RootNodes[i]->SphereCenter;
+        RootNodes[i]->SampleMaxDepth();
     }
 
     for (int32 i = 0; i < 6; ++i)
-    {
-        RootNodes[i]->GenerateMeshData();
         RootNodes[i]->SplitToDepth(ChunkDepth);
-    }
 
     PopulateChunks();
 
@@ -165,6 +171,10 @@ void AOceanSphereActor::Initialize()
     bIsInitializing = false;
     RunLodUpdateTask();
 }
+
+// ---------------------------------------------------------------------------
+// PopulateChunks
+// ---------------------------------------------------------------------------
 
 void AOceanSphereActor::PopulateChunks()
 {
@@ -203,28 +213,46 @@ void AOceanSphereActor::PopulateChunks()
     }
 }
 
+// ---------------------------------------------------------------------------
+// RebuildChunkStreamData
+//
+// Generates vertex positions/normals/UVs/depths on the fly from node topology.
+// Triangle indices come from the static FOceanMeshGrid cache — no per-node
+// mesh arrays, no GenerateMeshData, no HasGenerated flag.
+//
+// Per-leaf vertex layout: (Res+2) x (Res+2) extended grid, row-major ix*ExtRes+iy.
+// SpherePos  = (CubeCenter + CubeOffset).GetSafeNormal() * OceanRadius
+// LocalPos   = SpherePos - ChunkAnchorCenter
+// ---------------------------------------------------------------------------
+
 void AOceanSphereActor::RebuildChunkStreamData(
-    TSharedPtr<FOceanMeshChunk> Chunk,
+    TSharedPtr<FOceanMeshChunk>    Chunk,
     TSharedPtr<FOceanQuadTreeNode> ChunkNode)
 {
     if (!Chunk.IsValid() || !ChunkNode.IsValid()) return;
     if (!Chunk->InnerMeshData.IsValid() || !Chunk->EdgeMeshData.IsValid()) return;
 
+    AOceanSphereActor* Actor = ChunkNode->Owner;
+    FDensitySampleCompositor* Comp = Actor ? Actor->GetCompositor().Get() : nullptr;
+
+    const float CullThreshold = Actor ? Actor->ChunkCullingDepthThreshold : 0.f;
+    const int32 Res = Actor ? Actor->FaceResolution : 3;
+    const int32 ExtRes = Res + 2;
+    const int32 Total = ExtRes * ExtRes;
+
     TArray<TSharedPtr<FOceanQuadTreeNode>> Leaves;
     FOceanQuadTreeNode::CollectLeaves(ChunkNode, Leaves);
 
-    // Culling: if the maximum vertex depth across all leaves is below the actor's threshold,
-    // output empty streams — the chunk is entirely above water or underground.
-    // We access the threshold via ChunkNode->Owner.
-    if (ChunkNode->Owner)
+    // ---------------------------------------------------------------------------
+    // Chunk-level cull: check max depth across all leaves before doing any work.
+    // ---------------------------------------------------------------------------
     {
         float ChunkMaxDepth = -FLT_MAX;
         for (auto& Leaf : Leaves)
             ChunkMaxDepth = FMath::Max(ChunkMaxDepth, Leaf->MaxVertexDepth);
 
-        if (ChunkMaxDepth < ChunkNode->Owner->ChunkCullingDepthThreshold)
+        if (ChunkMaxDepth < CullThreshold)
         {
-            // Chunk is entirely above water — emit empty streams and mark culled
             TSharedPtr<FOceanStreamData> EmptyInner = MakeShared<FOceanStreamData>();
             EmptyInner->MeshGroupKey = Chunk->InnerMeshData->MeshGroupKey;
             EmptyInner->MeshSectionKey = Chunk->InnerMeshData->MeshSectionKey;
@@ -240,8 +268,11 @@ void AOceanSphereActor::RebuildChunkStreamData(
             return;
         }
     }
-
     Chunk->IsCulled = false;
+
+    // ---------------------------------------------------------------------------
+    // Inner stream
+    // ---------------------------------------------------------------------------
     TSharedPtr<FOceanStreamData> NewInner = MakeShared<FOceanStreamData>();
     NewInner->MeshGroupKey = Chunk->InnerMeshData->MeshGroupKey;
     NewInner->MeshSectionKey = Chunk->InnerMeshData->MeshSectionKey;
@@ -253,40 +284,9 @@ void AOceanSphereActor::RebuildChunkStreamData(
     auto InnerTri = NewInner->GetTriangleStream();
     auto InnerPG = NewInner->GetPolygroupStream();
 
-    // Cache threshold for per-tri culling
-    const float TriCullThreshold = ChunkNode->Owner ? ChunkNode->Owner->ChunkCullingDepthThreshold : 0.f;
-
-    for (auto& Leaf : Leaves)
-    {
-        if (!Leaf->HasGenerated) continue;
-        for (int32 PatchIdx : Leaf->PatchTriangleIndices)
-        {
-            FIndex3UI Tri = Leaf->AllTriangles[PatchIdx];
-            // Skip tri if all 3 vertices are below the cull threshold
-            if (Leaf->VertexDepths.IsValidIndex(Tri.V0) &&
-                Leaf->VertexDepths.IsValidIndex(Tri.V1) &&
-                Leaf->VertexDepths.IsValidIndex(Tri.V2) &&
-                Leaf->VertexDepths[Tri.V0] < TriCullThreshold &&
-                Leaf->VertexDepths[Tri.V1] < TriCullThreshold &&
-                Leaf->VertexDepths[Tri.V2] < TriCullThreshold) continue;
-
-            for (int32 v = 0; v < 3; ++v)
-            {
-                uint32 vi = (v == 0) ? Tri.V0 : (v == 1) ? Tri.V1 : Tri.V2;
-                InnerPos.Add(Leaf->Vertices[vi]);
-                InnerTex.Add(Leaf->TexCoords[vi]);
-                InnerCol.Add(Leaf->VertexColors.IsValidIndex(vi) ? Leaf->VertexColors[vi] : FColor(0, 0, 0, 0));
-                FRealtimeMeshTangentsHighPrecision T; T.SetNormal(Leaf->Normals[vi]);
-                InnerTan.Add(T);
-            }
-            uint32 base = (uint32)InnerPos.Num() - 3;
-            InnerTri.Add(FIndex3UI(base, base + 1, base + 2));
-            InnerPG.Add(0);
-        }
-    }
-    Chunk->InnerMeshData = NewInner;
-
+    // ---------------------------------------------------------------------------
     // Edge stream
+    // ---------------------------------------------------------------------------
     TSharedPtr<FOceanStreamData> NewEdge = MakeShared<FOceanStreamData>();
     NewEdge->MeshGroupKey = Chunk->EdgeMeshData->MeshGroupKey;
     NewEdge->MeshSectionKey = Chunk->EdgeMeshData->MeshSectionKey;
@@ -298,37 +298,148 @@ void AOceanSphereActor::RebuildChunkStreamData(
     auto EdgeTri = NewEdge->GetTriangleStream();
     auto EdgePG = NewEdge->GetPolygroupStream();
 
+    // ---------------------------------------------------------------------------
+    // Per-leaf: generate vertex data on the fly, emit triangles from grid cache.
+    // ---------------------------------------------------------------------------
     for (auto& Leaf : Leaves)
     {
-        if (!Leaf->HasGenerated) continue;
-        for (FIndex3UI Tri : Leaf->EdgeTriangles)
+        const double Step = Leaf->Size / (double)(Res - 1);
+
+        // Build vertex data for this leaf's (Res+2)x(Res+2) extended grid.
+        TArray<FVector>   LeafPos;   LeafPos.SetNumUninitialized(Total);
+        TArray<FVector3f> LeafNorm;  LeafNorm.SetNumUninitialized(Total);
+        TArray<FVector2f> LeafUV;    LeafUV.SetNumUninitialized(Total);
+        TArray<float>     LeafDepth; LeafDepth.SetNumUninitialized(Total);
+        TArray<FColor>    LeafColor; LeafColor.SetNumUninitialized(Total);
+
+        // Stage 1: positions, normals, UVs, sphere positions for sampling
+        TArray<float> SX, SY, SZ;
+        SX.SetNumUninitialized(Total);
+        SY.SetNumUninitialized(Total);
+        SZ.SetNumUninitialized(Total);
+
+        for (int32 ix = 0; ix < ExtRes; ++ix)
         {
-            if (Leaf->FaceTransform.bFlipWinding) Tri = FIndex3UI(Tri.V0, Tri.V2, Tri.V1);
-            // Skip tri if all 3 vertices are below the cull threshold
-            if (Leaf->VertexDepths.IsValidIndex(Tri.V0) &&
-                Leaf->VertexDepths.IsValidIndex(Tri.V1) &&
-                Leaf->VertexDepths.IsValidIndex(Tri.V2) &&
-                Leaf->VertexDepths[Tri.V0] < TriCullThreshold &&
-                Leaf->VertexDepths[Tri.V1] < TriCullThreshold &&
-                Leaf->VertexDepths[Tri.V2] < TriCullThreshold) continue;
+            for (int32 iy = 0; iy < ExtRes; ++iy)
+            {
+                double normX = -Leaf->HalfSize + Step * (ix - 1);
+                double normY = -Leaf->HalfSize + Step * (iy - 1);
+
+                FVector CubeOffset = FVector::ZeroVector;
+                CubeOffset[Leaf->FaceTransform.AxisMap[0]] = Leaf->FaceTransform.AxisDir[0] * normX;
+                CubeOffset[Leaf->FaceTransform.AxisMap[1]] = Leaf->FaceTransform.AxisDir[1] * normY;
+
+                FVector SpherePos = (Leaf->CubeCenter + CubeOffset).GetSafeNormal() * Leaf->OceanRadius;
+                int32   vi = ix * ExtRes + iy;
+
+                LeafPos[vi] = SpherePos - Leaf->ChunkAnchorCenter;
+                FVector Normal = SpherePos.GetSafeNormal();
+                LeafNorm[vi] = FVector3f(Normal);
+                FVector Dir = Normal;
+                LeafUV[vi] = FVector2f(
+                    (FMath::Atan2(Dir.Y, Dir.X) + PI) / (2.f * PI),
+                    FMath::Acos(FMath::Clamp((float)Dir.Z, -1.f, 1.f)) / PI);
+
+                SX[vi] = (float)SpherePos.X;
+                SY[vi] = (float)SpherePos.Y;
+                SZ[vi] = (float)SpherePos.Z;
+            }
+        }
+
+        // Stage 2: batch compositor sample → depths + encoded colors
+        if (Comp)
+        {
+            TArray<float> DensityOut;
+            DensityOut.SetNumUninitialized(Total);
+            FSampleInput Input(SX.GetData(), SY.GetData(), SZ.GetData(), Total);
+            Comp->Sample(Input, DensityOut.GetData());
+
+            float NewMaxDepth = -FLT_MAX;
+            for (int32 i = 0; i < Total; ++i)
+            {
+                float depth = DensityOut[i];
+                NewMaxDepth = FMath::Max(NewMaxDepth, depth);
+                LeafDepth[i] = depth;
+                float absDepth = FMath::Max(depth, 0.0f);
+                uint32 id = (uint32)FMath::Min(absDepth * 1000.0f, 4294967040.0f);
+                LeafColor[i] = FColor((id >> 24) & 0xFF, (id >> 16) & 0xFF, (id >> 8) & 0xFF, id & 0xFF);
+            }
+            Leaf->MaxVertexDepth = NewMaxDepth;
+        }
+        else
+        {
+            for (int32 i = 0; i < Total; ++i)
+            {
+                LeafDepth[i] = 0.f;
+                LeafColor[i] = FColor(0, 0, 0, 0);
+            }
+            Leaf->MaxVertexDepth = 0.f;
+        }
+
+        // Stage 3: emit inner triangles from grid cache
+        const FOceanMeshGrid& Grid = Actor->GetMeshGrid(Res, Leaf->FaceTransform.bFlipWinding);
+
+        for (const FIndex3UI& Tri : Grid.PatchTriangles)
+        {
+            // Per-tri cull: skip if all 3 vertices are below threshold
+            if (LeafDepth[Tri.V0] < CullThreshold &&
+                LeafDepth[Tri.V1] < CullThreshold &&
+                LeafDepth[Tri.V2] < CullThreshold) continue;
 
             for (int32 v = 0; v < 3; ++v)
             {
                 uint32 vi = (v == 0) ? Tri.V0 : (v == 1) ? Tri.V1 : Tri.V2;
-                EdgePos.Add(Leaf->Vertices[vi]);
-                EdgeTex.Add(Leaf->TexCoords[vi]);
-                EdgeCol.Add(Leaf->VertexColors.IsValidIndex(vi) ? Leaf->VertexColors[vi] : FColor(0, 0, 0, 0));
-                FRealtimeMeshTangentsHighPrecision T; T.SetNormal(Leaf->Normals[vi]);
+                InnerPos.Add(LeafPos[vi]);
+                FRealtimeMeshTangentsHighPrecision T; T.SetNormal(LeafNorm[vi]);
+                InnerTan.Add(T);
+                InnerTex.Add(FVector2f(LeafDepth[vi], 0.f));
+                InnerCol.Add(LeafColor[vi]);
+            }
+            uint32 base = (uint32)InnerPos.Num() - 3;
+            InnerTri.Add(FIndex3UI(base, base + 1, base + 2));
+            InnerPG.Add(0);
+        }
+
+        // Stage 4: emit edge stitch triangles
+        // Edge variant index: bLeft|(bRight<<1)|(bTop<<2)|(bBottom<<3)
+        uint8 EdgeFlags =
+            (uint8)(Leaf->GetDepth() > Leaf->NeighborLods[(uint8)EdgeOrientation::LEFT]) |
+            (uint8)(Leaf->GetDepth() > Leaf->NeighborLods[(uint8)EdgeOrientation::RIGHT]) << 1 |
+            (uint8)(Leaf->GetDepth() > Leaf->NeighborLods[(uint8)EdgeOrientation::UP]) << 2 |
+            (uint8)(Leaf->GetDepth() > Leaf->NeighborLods[(uint8)EdgeOrientation::DOWN]) << 3;
+
+        for (FIndex3UI Tri : Grid.EdgeTriangles[EdgeFlags])
+        {
+            if (Leaf->FaceTransform.bFlipWinding)
+                Tri = FIndex3UI(Tri.V0, Tri.V2, Tri.V1);
+
+            if (LeafDepth[Tri.V0] < CullThreshold &&
+                LeafDepth[Tri.V1] < CullThreshold &&
+                LeafDepth[Tri.V2] < CullThreshold) continue;
+
+            for (int32 v = 0; v < 3; ++v)
+            {
+                uint32 vi = (v == 0) ? Tri.V0 : (v == 1) ? Tri.V1 : Tri.V2;
+                EdgePos.Add(LeafPos[vi]);
+                FRealtimeMeshTangentsHighPrecision T; T.SetNormal(LeafNorm[vi]);
                 EdgeTan.Add(T);
+                EdgeTex.Add(FVector2f(LeafDepth[vi], 0.f));
+                EdgeCol.Add(LeafColor[vi]);
             }
             uint32 base = (uint32)EdgePos.Num() - 3;
             EdgeTri.Add(FIndex3UI(base, base + 1, base + 2));
             EdgePG.Add(0);
         }
     }
+
+    Chunk->InnerMeshData = NewInner;
     Chunk->EdgeMeshData = NewEdge;
     Chunk->IsDirty = true;
 }
+
+// ---------------------------------------------------------------------------
+// CleanupComponents
+// ---------------------------------------------------------------------------
 
 void AOceanSphereActor::CleanupComponents()
 {
@@ -336,11 +447,13 @@ void AOceanSphereActor::CleanupComponents()
     TArray<USceneComponent*> Attached;
     MeshAttachmentRoot->GetChildrenComponents(false, Attached);
     for (USceneComponent* Child : Attached)
-    {
         if (URealtimeMeshComponent* RtComp = Cast<URealtimeMeshComponent>(Child))
             RtComp->DestroyComponent();
-    }
 }
+
+// ---------------------------------------------------------------------------
+// Tick
+// ---------------------------------------------------------------------------
 
 void AOceanSphereActor::Tick(float DeltaTime)
 {
@@ -352,15 +465,11 @@ void AOceanSphereActor::Tick(float DeltaTime)
         const TArray<FVector>& Views = W->ViewLocationsRenderedLastFrame;
         if (Views.Num() > 0)
         {
-            // Convert world-space camera to actor-local space (position + rotation only).
-            FVector WorldCamPos = Views[0];
             FTransform NoScaleTransform(GetActorRotation(), GetActorLocation());
-            CameraPosition = NoScaleTransform.InverseTransformPosition(WorldCamPos);
+            CameraPosition = NoScaleTransform.InverseTransformPosition(Views[0]);
         }
-
         APlayerCameraManager* Cam = UGameplayStatics::GetPlayerCameraManager(W, 0);
-        if (Cam)
-            CameraFOV = Cam->GetFOVAngle();
+        if (Cam) CameraFOV = Cam->GetFOVAngle();
     }
 }
 
@@ -391,8 +500,7 @@ void AOceanSphereActor::RunLodUpdateTask()
 
             double FOVScale = 1.0 / FMath::Tan(FMath::DegreesToRadians(Self->CameraFOV * 0.5));
             double ThresholdSq = Self->ScreenSpaceThreshold * Self->ScreenSpaceThreshold;
-            double MergeThresholdSq =
-                (Self->ScreenSpaceThreshold * 0.5) * (Self->ScreenSpaceThreshold * 0.5);
+            double MergeThresholdSq = (Self->ScreenSpaceThreshold * 0.5) * (Self->ScreenSpaceThreshold * 0.5);
 
             TArray<TSharedPtr<FOceanQuadTreeNode>> ChunkNodes;
             TArray<TSharedPtr<FOceanMeshChunk>>    MeshChunks;
@@ -407,19 +515,17 @@ void AOceanSphereActor::RunLodUpdateTask()
             TArray<bool> ChunkTreeChanged;
             ChunkTreeChanged.SetNumZeroed(NumChunks);
 
-            // Phase 1: LOD pass (parallel per chunk)
-            // Camera (Predicted) and SphereCenter are both actor-local � direct distance.
+            // Phase 1: LOD pass
             ParallelFor(NumChunks, [&](int32 idx)
                 {
                     if (Self->InitGeneration != CapturedGen) return;
                     TSharedPtr<FOceanQuadTreeNode> ChunkNode = ChunkNodes[idx];
                     if (!ChunkNode.IsValid()) return;
 
-                    // Skip LOD processing for culled chunks entirely
+                    // Skip culled chunks
                     if (MeshChunks[idx]->IsCulled) return;
 
                     double DistSq = FMath::Max(FVector::DistSquared(ChunkNode->SphereCenter, Predicted), 1e-12);
-
                     double ChunkLhs = 2.0 * ChunkNode->WorldExtent * FOVScale;
                     bool CouldSplit = (ChunkLhs * ChunkLhs) > (ThresholdSq * DistSq)
                         || ChunkNode->GetDepth() < ChunkNode->MinDepth;
@@ -440,10 +546,8 @@ void AOceanSphereActor::RunLodUpdateTask()
 
                     bool bAnyChanged = false;
                     for (auto& Leaf : Leaves)
-                    {
                         if (Leaf->TrySetLod(Predicted, ThresholdSq, MergeThresholdSq, FOVScale))
                             bAnyChanged = true;
-                    }
 
                     if (bAnyChanged)
                     {
@@ -459,22 +563,18 @@ void AOceanSphereActor::RunLodUpdateTask()
 
             if (Self->InitGeneration != CapturedGen) { Self->bLodUpdateRunning = false; return; }
 
-            // Phase 2: Neighbor stitch
+            // Phase 2: Neighbor stitch — CheckNeighbors now has no HasGenerated guard
             TArray<bool> ChunkEdgeChanged;
             ChunkEdgeChanged.SetNumZeroed(NumChunks);
 
             ParallelFor(NumChunks, [&](int32 idx)
                 {
                     if (Self->InitGeneration != CapturedGen) return;
+                    if (MeshChunks[idx]->IsCulled) return;
                     bool bAnyEdgeChanged = false;
                     for (auto& Leaf : AllChunkLeaves[idx])
-                    {
                         if (Leaf->CheckNeighbors())
-                        {
-                            Leaf->RebuildEdgeTriangles();
                             bAnyEdgeChanged = true;
-                        }
-                    }
                     ChunkEdgeChanged[idx] = bAnyEdgeChanged;
                 });
 
@@ -493,10 +593,8 @@ void AOceanSphereActor::RunLodUpdateTask()
             // Phase 4: Game-thread component updates
             TArray<TSharedPtr<FOceanMeshChunk>> DirtyChunks;
             for (int32 idx = 0; idx < NumChunks; ++idx)
-            {
                 if (MeshChunks[idx]->IsDirty)
                     DirtyChunks.Add(MeshChunks[idx]);
-            }
 
             AsyncTask(ENamedThreads::GameThread, [WeakThis, DirtyChunks, CapturedGen]()
                 {
@@ -522,7 +620,6 @@ void AOceanSphereActor::RunLodUpdateTask()
                         URealtimeMeshSimple* MeshPtr = Chunk->ChunkRtMesh.Get();
                         if (!MeshPtr || !Chunk->IsDirty) continue;
 
-                        // Inner
                         auto* InnerTriStream = Chunk->InnerMeshData->MeshStream.Find(FRealtimeMeshStreams::Triangles);
                         if (InnerTriStream && InnerTriStream->Num() > 0)
                         {
@@ -533,7 +630,6 @@ void AOceanSphereActor::RunLodUpdateTask()
                         else
                             MeshPtr->UpdateSectionGroup(Chunk->InnerMeshData->MeshGroupKey, FRealtimeMeshStreamSet());
 
-                        // Edge
                         auto* EdgeTriStream = Chunk->EdgeMeshData->MeshStream.Find(FRealtimeMeshStreams::Triangles);
                         if (EdgeTriStream && EdgeTriStream->Num() > 0)
                         {
@@ -549,21 +645,20 @@ void AOceanSphereActor::RunLodUpdateTask()
                     }
 
                     if (UWorld* W = Self->GetWorld())
-                    {
                         W->GetTimerManager().SetTimer(
-                            Self->LodTimerHandle,
-                            Self,
+                            Self->LodTimerHandle, Self,
                             &AOceanSphereActor::RunLodUpdateTask,
-                            (float)Self->MinLodInterval,
-                            false);
-                    }
+                            (float)Self->MinLodInterval, false);
                 });
 
         }, TStatId(), nullptr, ENamedThreads::AnyNormalThreadHiPriTask);
 }
 
-TSharedPtr<FOceanQuadTreeNode> AOceanSphereActor::GetNodeByIndex(
-    const FQuadIndex& Index) const
+// ---------------------------------------------------------------------------
+// GetNodeByIndex
+// ---------------------------------------------------------------------------
+
+TSharedPtr<FOceanQuadTreeNode> AOceanSphereActor::GetNodeByIndex(const FQuadIndex& Index) const
 {
     if (Index.FaceId >= 6) return nullptr;
     TSharedPtr<FOceanQuadTreeNode> Cur = RootNodes[Index.FaceId];
@@ -574,7 +669,7 @@ TSharedPtr<FOceanQuadTreeNode> AOceanSphereActor::GetNodeByIndex(
     {
         uint8 Quad = Index.GetQuadrantAtDepth(Level);
         if (Cur->IsLeaf()) return Cur;
-        if (Quad >= Cur->Children.Num()) return Cur;
+        if (Quad >= (uint8)Cur->Children.Num()) return Cur;
         Cur = Cur->Children[Quad];
         if (!Cur.IsValid()) return nullptr;
     }
