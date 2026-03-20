@@ -3,6 +3,8 @@
 #include "CoreMinimal.h"
 #include "RealtimeMeshActor.h"
 #include "FOceanSharedStructs.h"
+#include "FDensitySampleCompositor.h"
+#include "FastNoise/FastNoise.h"
 #include "OceanSphereActor.generated.h"
 
 class FOceanQuadTreeNode;
@@ -24,6 +26,12 @@ public:
     // This property is read-only at runtime — adjust actor scale to resize.
     UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Ocean|Shape")
     double OceanRadius = 80000000.0;
+
+    // Noise amplitude as a ratio of ocean radius.
+    // Must match the terrain actor's NoiseAmplitudeRatio so both evaluate the same heightfield.
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Ocean|Shape",
+        meta = (ClampMin = "0.01", ClampMax = "1.0"))
+    double NoiseAmplitudeRatio = 0.25;
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Ocean|Mesh",
         meta = (ClampMin = "3"))
@@ -57,6 +65,8 @@ public:
 
     USceneComponent* GetMeshAttachmentRoot() const { return MeshAttachmentRoot; }
 
+    TSharedPtr<FDensitySampleCompositor> GetCompositor() const { return Compositor; }
+
     TSharedPtr<FOceanQuadTreeNode> GetNodeByIndex(const FQuadIndex& Index) const;
 
     virtual void OnConstruction(const FTransform& Transform) override;
@@ -69,14 +79,17 @@ public:
     TMap<TSharedPtr<FOceanQuadTreeNode>, TSharedPtr<FOceanMeshChunk>> ChunkMap;
 
 private:
-    // Mesh components attach here. Inherits actor position and rotation,
-    // absolute scale (1,1,1) so the sphere built at world-scale OceanRadius
-    // is never additionally scaled by the actor transform.
     UPROPERTY()
     TObjectPtr<USceneComponent> MeshAttachmentRoot;
 
-    // Camera in actor-local space (position + rotation only, no scale).
-    // Matches the octree convention so LOD distances are in world units.
+    // Compositor built at Initialize() time with the same heightmap layer
+    // as AAdaptiveVoxelActor. The tree calls it at split time to push
+    // density down to child nodes — nodes do not call it directly.
+    TSharedPtr<FDensitySampleCompositor> Compositor;
+
+    // Noise node kept alive for the compositor lambda lifetime.
+    FastNoise::SmartNode<> Noise;
+
     FVector CameraPosition = FVector::ZeroVector;
     FVector LastLodCameraPos = FVector(FLT_MAX);
     double  CameraFOV = 90.0;
@@ -87,8 +100,6 @@ private:
     std::atomic<uint32> InitGeneration = 0;
     bool                bIsInitializing = false;
 
-    // Scale from last Initialize() — scale changes trigger reconstruction.
-    // Position/rotation changes are handled live via MeshAttachmentRoot.
     FVector LastInitScale = FVector::ZeroVector;
 
     FTimerHandle LodTimerHandle;

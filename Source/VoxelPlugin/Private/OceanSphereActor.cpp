@@ -26,9 +26,8 @@ void AOceanSphereActor::OnConstruction(const FTransform& Transform)
     if (bIsInitializing) return;
     if (!GetWorld() || GetWorld()->IsPreviewWorld() || !bTickInEditor) return;
 
-    // Only reconstruct when scale changes — that's the only thing that requires
-    // rebuilding the sphere geometry. Position and rotation are handled live
-    // by MeshAttachmentRoot inheriting the actor transform.
+    // Only reconstruct when scale changes — position and rotation are handled
+    // live by MeshAttachmentRoot inheriting the actor transform.
     if (!bInitialized || !GetActorScale3D().Equals(LastInitScale, 0.01))
         Initialize();
 }
@@ -68,14 +67,68 @@ void AOceanSphereActor::Initialize()
     for (int32 i = 0; i < 6; ++i)
         RootNodes[i].Reset();
 
-    // Derive ocean radius from actor scale — all axes kept uniform.
-    // Enforcing uniform scale here means the sphere is always a true sphere.
+    // Derive ocean radius from actor scale — uniform across all axes.
     double ActorRadius = GetActorScale3D().GetMax();
+    double ActorNoiseAmplitude = ActorRadius * NoiseAmplitudeRatio;
+    double ActorRootExtent = (ActorRadius + ActorNoiseAmplitude) * 1.05;
     OceanRadius = ActorRadius;
 
-    // The cube-sphere is built at world scale in actor-local space (origin 0,0,0).
-    // OceanRadius is the sphere radius in world units — same convention as the octree.
-    // The unit cube maps to a sphere of radius OceanRadius via cube-sphere projection.
+    // Build the density compositor — identical heightmap layer to AAdaptiveVoxelActor
+    // so the ocean and terrain evaluate the same SDF. The tree pushes sampled densities
+    // down to child node corners at split time; nodes do not call the compositor directly.
+    Noise = FastNoise::NewFromEncodedNodeTree("GQAgAB8AEwCamRk+DQAMAAAAAAAAQAcAAAAAAD8AAAAAAAAAAAA/AAAAAD8AAAAAvwAAAAA/ARsAFwCamRk+AAAAPwAAAAAAAAA/IAAgABMAAABAQBsAJAACAAAADQAIAAAAAAAAQAsAAQAAAAAAAAABAAAAAAAAAAAAAIA/AAAAAD8AAAAAAAAAAIA/AAAAAAAAmpmZPgCamRk+AM3MTD4BEwDNzEw+IAAfABcAAACAvwAAgD8AAIDAAAAAPw8AAQAAAAAAAED//wEAAAAAAD8AAAAAAAAAAIA/AAAAAD8AAACAvwAAAAA/");
+
+    auto HeightmapLayer = [NoiseNode = Noise, PlanetRadius = ActorRadius, NoiseAmplitude = ActorNoiseAmplitude](const FSampleInput& Input, float* DensityOut)
+        {
+            int32 Count = Input.Num();
+            double InvNoiseAmplitude = 1.0 / NoiseAmplitude;
+            double RootExtent = (PlanetRadius + NoiseAmplitude) * 1.05;
+
+            constexpr int32 StackLimit = 64;
+            float  StackPX[StackLimit], StackPY[StackLimit], StackPZ[StackLimit], StackNoise[StackLimit];
+            double StackDist[StackLimit];
+            TArray<float>  HeapPX, HeapPY, HeapPZ, HeapNoise;
+            TArray<double> HeapDist;
+
+            float* PX; float* PY; float* PZ; float* NoiseOut; double* Distances;
+            if (Count <= StackLimit)
+            {
+                PX = StackPX; PY = StackPY; PZ = StackPZ; NoiseOut = StackNoise; Distances = StackDist;
+            }
+            else
+            {
+                HeapPX.SetNumUninitialized(Count); HeapPY.SetNumUninitialized(Count);
+                HeapPZ.SetNumUninitialized(Count); HeapNoise.SetNumUninitialized(Count);
+                HeapDist.SetNumUninitialized(Count);
+                PX = HeapPX.GetData(); PY = HeapPY.GetData(); PZ = HeapPZ.GetData();
+                NoiseOut = HeapNoise.GetData(); Distances = HeapDist.GetData();
+            }
+
+            for (int32 i = 0; i < Count; i++)
+            {
+                double px = Input.X[i], py = Input.Y[i], pz = Input.Z[i];
+                double Dist = FMath::Sqrt(px * px + py * py + pz * pz);
+                Distances[i] = Dist;
+                double InvDist = (Dist > 1e-10) ? (RootExtent / Dist) : 0.0;
+                PX[i] = (float)(px * InvDist * InvNoiseAmplitude);
+                PY[i] = (float)(py * InvDist * InvNoiseAmplitude);
+                PZ[i] = (float)(pz * InvDist * InvNoiseAmplitude);
+            }
+
+            NoiseNode->GenPositionArray3D(NoiseOut, Count, PX, PY, PZ, 0, 0, 0, 0);
+
+            for (int32 i = 0; i < Count; i++)
+            {
+                double Clamped = FMath::Clamp((double)NoiseOut[i], -1.0, 1.0);
+                double Height = (Clamped + 1.0) * 0.5 * NoiseAmplitude;
+                DensityOut[i] = (float)(Distances[i] - (PlanetRadius + Height));
+            }
+        };
+
+    Compositor = MakeShared<FDensitySampleCompositor>();
+    Compositor->AddSampleLayer(HeightmapLayer);
+
+    // The cube-sphere is always built at world scale in actor-local space (origin 0,0,0).
     const double Size = 1000.0;
     const double HalfSize = Size * 0.5;
 
@@ -253,8 +306,6 @@ void AOceanSphereActor::Tick(float DeltaTime)
         if (Views.Num() > 0)
         {
             // Convert world-space camera to actor-local space (position + rotation only).
-            // The sphere is built at world-scale in actor-local space — no scale division needed.
-            // This matches the octree convention exactly.
             FVector WorldCamPos = Views[0];
             FTransform NoScaleTransform(GetActorRotation(), GetActorLocation());
             CameraPosition = NoScaleTransform.InverseTransformPosition(WorldCamPos);
@@ -310,15 +361,13 @@ void AOceanSphereActor::RunLodUpdateTask()
             ChunkTreeChanged.SetNumZeroed(NumChunks);
 
             // Phase 1: LOD pass (parallel per chunk)
-            // Camera (Predicted) and SphereCenter are both in actor-local space —
-            // no GetActorLocation() offset needed anywhere in the distance math.
+            // Camera (Predicted) and SphereCenter are both actor-local — direct distance.
             ParallelFor(NumChunks, [&](int32 idx)
                 {
                     if (Self->InitGeneration != CapturedGen) return;
                     TSharedPtr<FOceanQuadTreeNode> ChunkNode = ChunkNodes[idx];
                     if (!ChunkNode.IsValid()) return;
 
-                    // SphereCenter is actor-local, Predicted is actor-local — direct distance.
                     double DistSq = FMath::Max(FVector::DistSquared(ChunkNode->SphereCenter, Predicted), 1e-12);
 
                     double ChunkLhs = 2.0 * ChunkNode->WorldExtent * FOVScale;
