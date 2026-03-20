@@ -61,6 +61,7 @@ struct VOXELPLUGIN_API FOceanMeshChunk
 
     bool IsDirty = false;
     bool IsInitialized = false;
+    bool IsCulled = false;
 
     TWeakObjectPtr<URealtimeMeshSimple>    ChunkRtMesh;
     TWeakObjectPtr<URealtimeMeshComponent> ChunkRtComponent;
@@ -114,20 +115,16 @@ public:
 
     int32 NeighborLods[4] = { 0, 0, 0, 0 };
 
-    // Corner densities for this node's face quad — populated by PushDensityToChildren.
-    // Layout: BL=0 (U-,V-), TL=1 (U-,V+), BR=2 (U+,V-), TR=3 (U+,V+).
-    float CornerDensities[4] = { 0.f, 0.f, 0.f, 0.f };
-    bool  bDensitySampled = false;
-
     // Maximum depth (cm) across all vertices — set during GenerateMeshData.
-    // Positive = deepest underwater vertex. Used for chunk culling.
+    // Positive = deepest underwater vertex. Used for chunk and tri culling.
     float MaxVertexDepth = 0.f;
 
     // Vertex data
     TArray<FVector>   Vertices;
     TArray<FVector3f> Normals;
     TArray<FVector2f> TexCoords;
-    TArray<FColor>    VertexColors; // depth encoded: R=bits[31:24], G=[23:16], B=[15:8], A=[7:0]
+    TArray<FColor>    VertexColors; // depth encoded big-endian uint32 * 1000 into RGBA
+    TArray<float>     VertexDepths; // raw depth (cm) per vertex — same indexing as VertexColors
     TArray<FIndex3UI> AllTriangles;
     TArray<int32>     PatchTriangleIndices;
     TArray<FIndex3UI> EdgeTriangles;

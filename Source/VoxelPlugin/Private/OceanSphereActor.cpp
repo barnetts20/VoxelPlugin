@@ -166,88 +166,6 @@ void AOceanSphereActor::Initialize()
     RunLodUpdateTask();
 }
 
-// ---------------------------------------------------------------------------
-// Density sampling
-// ---------------------------------------------------------------------------
-
-void AOceanSphereActor::ComputeRootNodeDensities(TSharedPtr<FOceanQuadTreeNode> Node)
-{
-    if (!Node.IsValid() || !Compositor.IsValid()) return;
-
-    const double H = Node->HalfSize;
-    const int32  U = Node->FaceTransform.AxisMap[0];
-    const int32  V = Node->FaceTransform.AxisMap[1];
-    const int32  DU = Node->FaceTransform.AxisDir[0];
-    const int32  DV = Node->FaceTransform.AxisDir[1];
-
-    const double USigns[4] = { -1, -1, +1, +1 };
-    const double VSigns[4] = { -1, +1, -1, +1 };
-
-    float SX[4], SY[4], SZ[4], Out[4];
-    for (int32 i = 0; i < 4; ++i)
-    {
-        FVector P = Node->CubeCenter;
-        P[U] += DU * USigns[i] * H;
-        P[V] += DV * VSigns[i] * H;
-        FVector SP = P.GetSafeNormal() * Node->OceanRadius;
-        SX[i] = (float)SP.X; SY[i] = (float)SP.Y; SZ[i] = (float)SP.Z;
-    }
-    FSampleInput Input(SX, SY, SZ, 4);
-    Compositor->Sample(Input, Out);
-    for (int32 i = 0; i < 4; ++i)
-        Node->CornerDensities[i] = Out[i];
-    Node->bDensitySampled = true;
-}
-
-void AOceanSphereActor::PushDensityToChildren(TSharedPtr<FOceanQuadTreeNode> Node)
-{
-    if (!Node.IsValid() || Node->IsLeaf()) return;
-
-    if (Node->bDensitySampled && !Node->Children[0]->bDensitySampled)
-    {
-        if (!Compositor.IsValid()) return;
-
-        const double H = Node->HalfSize;
-        const int32  U = Node->FaceTransform.AxisMap[0];
-        const int32  V = Node->FaceTransform.AxisMap[1];
-        const int32  DU = Node->FaceTransform.AxisDir[0];
-        const int32  DV = Node->FaceTransform.AxisDir[1];
-
-        auto ToSphere = [&](double UOff, double VOff) -> FVector
-            {
-                FVector P = Node->CubeCenter;
-                P[U] += DU * UOff; P[V] += DV * VOff;
-                return P.GetSafeNormal() * Node->OceanRadius;
-            };
-
-        FVector NP[5] = { ToSphere(0,-H), ToSphere(-H,0), ToSphere(0,0), ToSphere(+H,0), ToSphere(0,+H) };
-        float SX[5], SY[5], SZ[5], Out[5];
-        for (int32 i = 0; i < 5; ++i) { SX[i] = (float)NP[i].X; SY[i] = (float)NP[i].Y; SZ[i] = (float)NP[i].Z; }
-        FSampleInput Input(SX, SY, SZ, 5);
-        Compositor->Sample(Input, Out);
-
-        const float G0 = Node->CornerDensities[0], G6 = Node->CornerDensities[1];
-        const float G2 = Node->CornerDensities[2], G8 = Node->CornerDensities[3];
-        const float G1 = Out[0], G3 = Out[1], G4 = Out[2], G5 = Out[3], G7 = Out[4];
-
-        Node->Children[0]->CornerDensities[0] = G0; Node->Children[0]->CornerDensities[1] = G3;
-        Node->Children[0]->CornerDensities[2] = G1; Node->Children[0]->CornerDensities[3] = G4;
-        Node->Children[0]->bDensitySampled = true;
-        Node->Children[1]->CornerDensities[0] = G3; Node->Children[1]->CornerDensities[1] = G6;
-        Node->Children[1]->CornerDensities[2] = G4; Node->Children[1]->CornerDensities[3] = G7;
-        Node->Children[1]->bDensitySampled = true;
-        Node->Children[2]->CornerDensities[0] = G1; Node->Children[2]->CornerDensities[1] = G4;
-        Node->Children[2]->CornerDensities[2] = G2; Node->Children[2]->CornerDensities[3] = G5;
-        Node->Children[2]->bDensitySampled = true;
-        Node->Children[3]->CornerDensities[0] = G4; Node->Children[3]->CornerDensities[1] = G7;
-        Node->Children[3]->CornerDensities[2] = G5; Node->Children[3]->CornerDensities[3] = G8;
-        Node->Children[3]->bDensitySampled = true;
-    }
-
-    for (auto& Child : Node->Children)
-        PushDensityToChildren(Child);
-}
-
 void AOceanSphereActor::PopulateChunks()
 {
     TArray<TSharedPtr<FOceanQuadTreeNode>> ChunkNodes;
@@ -306,7 +224,7 @@ void AOceanSphereActor::RebuildChunkStreamData(
 
         if (ChunkMaxDepth < ChunkNode->Owner->ChunkCullingDepthThreshold)
         {
-            // Emit empty streams — chunk is entirely above water / underground
+            // Chunk is entirely above water — emit empty streams and mark culled
             TSharedPtr<FOceanStreamData> EmptyInner = MakeShared<FOceanStreamData>();
             EmptyInner->MeshGroupKey = Chunk->InnerMeshData->MeshGroupKey;
             EmptyInner->MeshSectionKey = Chunk->InnerMeshData->MeshSectionKey;
@@ -317,10 +235,13 @@ void AOceanSphereActor::RebuildChunkStreamData(
             EmptyEdge->MeshSectionKey = Chunk->EdgeMeshData->MeshSectionKey;
             Chunk->EdgeMeshData = EmptyEdge;
 
+            Chunk->IsCulled = true;
             Chunk->IsDirty = true;
             return;
         }
     }
+
+    Chunk->IsCulled = false;
     TSharedPtr<FOceanStreamData> NewInner = MakeShared<FOceanStreamData>();
     NewInner->MeshGroupKey = Chunk->InnerMeshData->MeshGroupKey;
     NewInner->MeshSectionKey = Chunk->InnerMeshData->MeshSectionKey;
@@ -332,12 +253,23 @@ void AOceanSphereActor::RebuildChunkStreamData(
     auto InnerTri = NewInner->GetTriangleStream();
     auto InnerPG = NewInner->GetPolygroupStream();
 
+    // Cache threshold for per-tri culling
+    const float TriCullThreshold = ChunkNode->Owner ? ChunkNode->Owner->ChunkCullingDepthThreshold : 0.f;
+
     for (auto& Leaf : Leaves)
     {
         if (!Leaf->HasGenerated) continue;
         for (int32 PatchIdx : Leaf->PatchTriangleIndices)
         {
             FIndex3UI Tri = Leaf->AllTriangles[PatchIdx];
+            // Skip tri if all 3 vertices are below the cull threshold
+            if (Leaf->VertexDepths.IsValidIndex(Tri.V0) &&
+                Leaf->VertexDepths.IsValidIndex(Tri.V1) &&
+                Leaf->VertexDepths.IsValidIndex(Tri.V2) &&
+                Leaf->VertexDepths[Tri.V0] < TriCullThreshold &&
+                Leaf->VertexDepths[Tri.V1] < TriCullThreshold &&
+                Leaf->VertexDepths[Tri.V2] < TriCullThreshold) continue;
+
             for (int32 v = 0; v < 3; ++v)
             {
                 uint32 vi = (v == 0) ? Tri.V0 : (v == 1) ? Tri.V1 : Tri.V2;
@@ -372,6 +304,14 @@ void AOceanSphereActor::RebuildChunkStreamData(
         for (FIndex3UI Tri : Leaf->EdgeTriangles)
         {
             if (Leaf->FaceTransform.bFlipWinding) Tri = FIndex3UI(Tri.V0, Tri.V2, Tri.V1);
+            // Skip tri if all 3 vertices are below the cull threshold
+            if (Leaf->VertexDepths.IsValidIndex(Tri.V0) &&
+                Leaf->VertexDepths.IsValidIndex(Tri.V1) &&
+                Leaf->VertexDepths.IsValidIndex(Tri.V2) &&
+                Leaf->VertexDepths[Tri.V0] < TriCullThreshold &&
+                Leaf->VertexDepths[Tri.V1] < TriCullThreshold &&
+                Leaf->VertexDepths[Tri.V2] < TriCullThreshold) continue;
+
             for (int32 v = 0; v < 3; ++v)
             {
                 uint32 vi = (v == 0) ? Tri.V0 : (v == 1) ? Tri.V1 : Tri.V2;
@@ -474,6 +414,9 @@ void AOceanSphereActor::RunLodUpdateTask()
                     if (Self->InitGeneration != CapturedGen) return;
                     TSharedPtr<FOceanQuadTreeNode> ChunkNode = ChunkNodes[idx];
                     if (!ChunkNode.IsValid()) return;
+
+                    // Skip LOD processing for culled chunks entirely
+                    if (MeshChunks[idx]->IsCulled) return;
 
                     double DistSq = FMath::Max(FVector::DistSquared(ChunkNode->SphereCenter, Predicted), 1e-12);
 

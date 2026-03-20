@@ -111,8 +111,6 @@ private:
     void Initialize();
     void CleanupComponents();
     void PopulateChunks();
-    void ComputeRootNodeDensities(TSharedPtr<FOceanQuadTreeNode> Node);
-    void PushDensityToChildren(TSharedPtr<FOceanQuadTreeNode> Node);
 
     static void RebuildChunkStreamData(TSharedPtr<FOceanMeshChunk> Chunk,
         TSharedPtr<FOceanQuadTreeNode> ChunkNode);

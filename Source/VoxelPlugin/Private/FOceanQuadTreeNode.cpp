@@ -336,7 +336,7 @@ void FOceanQuadTreeNode::GenerateMeshData()
     const double Step = Size / (double)(Res - 1);
     const int32  Total = ExtRes * ExtRes;
 
-    Vertices.Reset(); Normals.Reset(); TexCoords.Reset(); VertexColors.Reset();
+    Vertices.Reset(); Normals.Reset(); TexCoords.Reset(); VertexColors.Reset(); VertexDepths.Reset();
     AllTriangles.Reset(); PatchTriangleIndices.Reset();
     EdgeTriangles.Reset();
     NodeBoundRadius = 0.0;
@@ -345,6 +345,7 @@ void FOceanQuadTreeNode::GenerateMeshData()
     Normals.Reserve(Total);
     TexCoords.Reserve(Total);
     VertexColors.Reserve(Total);
+    VertexDepths.Reserve(Total);
 
     // Stage 1: build all vertex positions and collect world-space sphere positions for sampling.
     // SpherePos = LocalPos + ChunkAnchorCenter — the actual position on the sphere
@@ -417,6 +418,7 @@ void FOceanQuadTreeNode::GenerateMeshData()
         {
             float depth = DensityOut[i];
             MaxVertexDepth = FMath::Max(MaxVertexDepth, depth);
+            VertexDepths.Add(depth);
             float absDepth = FMath::Max(depth, 0.0f);
             uint32 intDepth = (uint32)FMath::Min(absDepth * 1000.0f, 4294967040.0f);
             uint8 R = (intDepth >> 24) & 0xFF;
@@ -430,7 +432,10 @@ void FOceanQuadTreeNode::GenerateMeshData()
     {
         MaxVertexDepth = 0.f;
         for (int32 i = 0; i < Total; ++i)
+        {
+            VertexDepths.Add(0.f);
             VertexColors.Add(FColor(0, 0, 0, 0));
+        }
     }
 
     const int32 tRes = ExtRes - 1;
