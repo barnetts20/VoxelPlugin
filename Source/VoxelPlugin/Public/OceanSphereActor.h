@@ -21,14 +21,9 @@ public:
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Ocean|Material")
     UMaterialInterface* OceanMaterial = nullptr;
 
-    // Ocean radius is driven by actor scale (uniform across all axes).
-    // Default scale 80,000,000 = 800 km radius, matching the default terrain actor.
-    // This property is read-only at runtime — adjust actor scale to resize.
     UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Ocean|Shape")
     double OceanRadius = 80000000.0;
 
-    // Noise amplitude as a ratio of ocean radius.
-    // Must match the terrain actor's NoiseAmplitudeRatio so both evaluate the same heightfield.
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Ocean|Shape",
         meta = (ClampMin = "0.01", ClampMax = "1.0"))
     double NoiseAmplitudeRatio = 0.25;
@@ -40,7 +35,6 @@ public:
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Ocean|LOD")
     int32 ChunkDepth = 2;
 
-    // Must be >= ChunkDepth
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Ocean|LOD")
     int32 MinDepth = 2;
 
@@ -62,9 +56,7 @@ public:
 
     FVector GetCameraPosition() const { return CameraPosition; }
     double  GetCameraFOV()      const { return CameraFOV; }
-
     USceneComponent* GetMeshAttachmentRoot() const { return MeshAttachmentRoot; }
-
     TSharedPtr<FDensitySampleCompositor> GetCompositor() const { return Compositor; }
 
     TSharedPtr<FOceanQuadTreeNode> GetNodeByIndex(const FQuadIndex& Index) const;
@@ -82,12 +74,7 @@ private:
     UPROPERTY()
     TObjectPtr<USceneComponent> MeshAttachmentRoot;
 
-    // Compositor built at Initialize() time with the same heightmap layer
-    // as AAdaptiveVoxelActor. The tree calls it at split time to push
-    // density down to child nodes — nodes do not call it directly.
     TSharedPtr<FDensitySampleCompositor> Compositor;
-
-    // Noise node kept alive for the compositor lambda lifetime.
     FastNoise::SmartNode<> Noise;
 
     FVector CameraPosition = FVector::ZeroVector;
@@ -107,6 +94,14 @@ private:
     void Initialize();
     void CleanupComponents();
     void PopulateChunks();
+
+    // Samples the 4 sphere-projected corners of a root node before any splits.
+    void ComputeRootNodeDensities(TSharedPtr<FOceanQuadTreeNode> Node);
+
+    // Post-pass: walks an already-split subtree and pushes density into every
+    // child node that doesn't yet have bDensitySampled. Safe to call after
+    // SplitToDepth or after a runtime LOD split — does not touch mesh data.
+    void PushDensityToChildren(TSharedPtr<FOceanQuadTreeNode> Node);
 
     static void RebuildChunkStreamData(TSharedPtr<FOceanMeshChunk> Chunk,
         TSharedPtr<FOceanQuadTreeNode> ChunkNode);

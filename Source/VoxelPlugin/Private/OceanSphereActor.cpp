@@ -1,4 +1,4 @@
-#include "OceanSphereActor.h"
+ï»¿#include "OceanSphereActor.h"
 #include "FOceanQuadTreeNode.h"
 #include "Kismet/GameplayStatics.h"
 #include "TimerManager.h"
@@ -26,7 +26,7 @@ void AOceanSphereActor::OnConstruction(const FTransform& Transform)
     if (bIsInitializing) return;
     if (!GetWorld() || GetWorld()->IsPreviewWorld() || !bTickInEditor) return;
 
-    // Only reconstruct when scale changes — position and rotation are handled
+    // Only reconstruct when scale changes ï¿½ position and rotation are handled
     // live by MeshAttachmentRoot inheriting the actor transform.
     if (!bInitialized || !GetActorScale3D().Equals(LastInitScale, 0.01))
         Initialize();
@@ -67,13 +67,13 @@ void AOceanSphereActor::Initialize()
     for (int32 i = 0; i < 6; ++i)
         RootNodes[i].Reset();
 
-    // Derive ocean radius from actor scale — uniform across all axes.
+    // Derive ocean radius from actor scale ï¿½ uniform across all axes.
     double ActorRadius = GetActorScale3D().GetMax();
     double ActorNoiseAmplitude = ActorRadius * NoiseAmplitudeRatio;
     double ActorRootExtent = (ActorRadius + ActorNoiseAmplitude) * 1.05;
     OceanRadius = ActorRadius;
 
-    // Build the density compositor — identical heightmap layer to AAdaptiveVoxelActor
+    // Build the density compositor ï¿½ identical heightmap layer to AAdaptiveVoxelActor
     // so the ocean and terrain evaluate the same SDF. The tree pushes sampled densities
     // down to child node corners at split time; nodes do not call the compositor directly.
     Noise = FastNoise::NewFromEncodedNodeTree("GQAgAB8AEwCamRk+DQAMAAAAAAAAQAcAAAAAAD8AAAAAAAAAAAA/AAAAAD8AAAAAvwAAAAA/ARsAFwCamRk+AAAAPwAAAAAAAAA/IAAgABMAAABAQBsAJAACAAAADQAIAAAAAAAAQAsAAQAAAAAAAAABAAAAAAAAAAAAAIA/AAAAAD8AAAAAAAAAAIA/AAAAAAAAmpmZPgCamRk+AM3MTD4BEwDNzEw+IAAfABcAAACAvwAAgD8AAIDAAAAAPw8AAQAAAAAAAED//wEAAAAAAD8AAAAAAAAAAIA/AAAAAD8AAACAvwAAAAA/");
@@ -154,12 +154,14 @@ void AOceanSphereActor::Initialize()
             MaxDepth,
             ChunkDepth);
         RootNodes[i]->ChunkAnchorCenter = RootNodes[i]->SphereCenter;
+        ComputeRootNodeDensities(RootNodes[i]);
     }
 
     for (int32 i = 0; i < 6; ++i)
     {
         RootNodes[i]->GenerateMeshData();
         RootNodes[i]->SplitToDepth(ChunkDepth);
+        PushDensityToChildren(RootNodes[i]);
     }
 
     PopulateChunks();
@@ -168,6 +170,121 @@ void AOceanSphereActor::Initialize()
     bInitialized = true;
     bIsInitializing = false;
     RunLodUpdateTask();
+}
+
+// ---------------------------------------------------------------------------
+// Density sampling â€” does not touch mesh data, positions, or winding
+// ---------------------------------------------------------------------------
+
+void AOceanSphereActor::ComputeRootNodeDensities(TSharedPtr<FOceanQuadTreeNode> Node)
+{
+    // Sample the 4 sphere-projected corners of a root node before any splits.
+    // Corner layout: BL=0 (U-,V-), TL=1 (U-,V+), BR=2 (U+,V-), TR=3 (U+,V+).
+    if (!Node.IsValid() || !Compositor.IsValid()) return;
+
+    const double H = Node->HalfSize;
+    const int32  U = Node->FaceTransform.AxisMap[0];
+    const int32  V = Node->FaceTransform.AxisMap[1];
+    const int32  DU = Node->FaceTransform.AxisDir[0];
+    const int32  DV = Node->FaceTransform.AxisDir[1];
+
+    const double USigns[4] = { -1, -1, +1, +1 };
+    const double VSigns[4] = { -1, +1, -1, +1 };
+
+    float SX[4], SY[4], SZ[4], Out[4];
+    for (int32 i = 0; i < 4; ++i)
+    {
+        FVector P = Node->CubeCenter;
+        P[U] += DU * USigns[i] * H;
+        P[V] += DV * VSigns[i] * H;
+        FVector SP = P.GetSafeNormal() * Node->OceanRadius;
+        SX[i] = (float)SP.X; SY[i] = (float)SP.Y; SZ[i] = (float)SP.Z;
+    }
+    FSampleInput Input(SX, SY, SZ, 4);
+    Compositor->Sample(Input, Out);
+    for (int32 i = 0; i < 4; ++i)
+        Node->CornerDensities[i] = Out[i];
+    Node->bDensitySampled = true;
+}
+
+void AOceanSphereActor::PushDensityToChildren(TSharedPtr<FOceanQuadTreeNode> Node)
+{
+    // Recursive post-pass over an already-split subtree.
+    // If this node has density and its children don't yet, sample the 5 new
+    // grid positions (4 edge mids + 1 center) and distribute all 4 corner
+    // densities to each child. Does not touch mesh data at all.
+    //
+    // 9-point grid (U right, V up):
+    //   G6--G7--G8
+    //   |   |   |
+    //   G3--G4--G5
+    //   |   |   |
+    //   G0--G1--G2
+    //
+    // Parent corners: BL=0â†’G0, TL=1â†’G6, BR=2â†’G2, TR=3â†’G8
+    // New samples:    G1=bot-edge, G3=left-edge, G4=center, G5=right-edge, G7=top-edge
+
+    if (!Node.IsValid() || Node->IsLeaf()) return;
+
+    if (Node->bDensitySampled && !Node->Children[0]->bDensitySampled)
+    {
+        if (!Compositor.IsValid()) return;
+
+        const double H = Node->HalfSize;
+        const int32  U = Node->FaceTransform.AxisMap[0];
+        const int32  V = Node->FaceTransform.AxisMap[1];
+        const int32  DU = Node->FaceTransform.AxisDir[0];
+        const int32  DV = Node->FaceTransform.AxisDir[1];
+
+        auto ToSphere = [&](double UOff, double VOff) -> FVector
+            {
+                FVector P = Node->CubeCenter;
+                P[U] += DU * UOff; P[V] += DV * VOff;
+                return P.GetSafeNormal() * Node->OceanRadius;
+            };
+
+        FVector NP[5] = {
+            ToSphere(0, -H),  // G1 bottom-edge mid
+            ToSphere(-H,  0),  // G3 left-edge mid
+            ToSphere(0,  0),  // G4 center
+            ToSphere(+H,  0),  // G5 right-edge mid
+            ToSphere(0, +H),  // G7 top-edge mid
+        };
+        float SX[5], SY[5], SZ[5], Out[5];
+        for (int32 i = 0; i < 5; ++i)
+        {
+            SX[i] = (float)NP[i].X; SY[i] = (float)NP[i].Y; SZ[i] = (float)NP[i].Z;
+        }
+        FSampleInput Input(SX, SY, SZ, 5);
+        Compositor->Sample(Input, Out);
+
+        const float G0 = Node->CornerDensities[0], G6 = Node->CornerDensities[1];
+        const float G2 = Node->CornerDensities[2], G8 = Node->CornerDensities[3];
+        const float G1 = Out[0], G3 = Out[1], G4 = Out[2], G5 = Out[3], G7 = Out[4];
+
+        // Child 0 (BL quadrant): corners G0, G3, G1, G4
+        Node->Children[0]->CornerDensities[0] = G0; Node->Children[0]->CornerDensities[1] = G3;
+        Node->Children[0]->CornerDensities[2] = G1; Node->Children[0]->CornerDensities[3] = G4;
+        Node->Children[0]->bDensitySampled = true;
+
+        // Child 1 (TL quadrant): corners G3, G6, G4, G7
+        Node->Children[1]->CornerDensities[0] = G3; Node->Children[1]->CornerDensities[1] = G6;
+        Node->Children[1]->CornerDensities[2] = G4; Node->Children[1]->CornerDensities[3] = G7;
+        Node->Children[1]->bDensitySampled = true;
+
+        // Child 2 (BR quadrant): corners G1, G4, G2, G5
+        Node->Children[2]->CornerDensities[0] = G1; Node->Children[2]->CornerDensities[1] = G4;
+        Node->Children[2]->CornerDensities[2] = G2; Node->Children[2]->CornerDensities[3] = G5;
+        Node->Children[2]->bDensitySampled = true;
+
+        // Child 3 (TR quadrant): corners G4, G7, G5, G8
+        Node->Children[3]->CornerDensities[0] = G4; Node->Children[3]->CornerDensities[1] = G7;
+        Node->Children[3]->CornerDensities[2] = G5; Node->Children[3]->CornerDensities[3] = G8;
+        Node->Children[3]->bDensitySampled = true;
+    }
+
+    for (auto& Child : Node->Children)
+        PushDensityToChildren(Child);
 }
 
 void AOceanSphereActor::PopulateChunks()
@@ -361,7 +478,7 @@ void AOceanSphereActor::RunLodUpdateTask()
             ChunkTreeChanged.SetNumZeroed(NumChunks);
 
             // Phase 1: LOD pass (parallel per chunk)
-            // Camera (Predicted) and SphereCenter are both actor-local — direct distance.
+            // Camera (Predicted) and SphereCenter are both actor-local ï¿½ direct distance.
             ParallelFor(NumChunks, [&](int32 idx)
                 {
                     if (Self->InitGeneration != CapturedGen) return;
@@ -408,6 +525,15 @@ void AOceanSphereActor::RunLodUpdateTask()
                 });
 
             if (Self->InitGeneration != CapturedGen) { Self->bLodUpdateRunning = false; return; }
+
+            // Density push-down: for any chunk where the tree structure changed,
+            // walk it and fill in CornerDensities for any newly-split children.
+            // Serial, safe â€” no other thread touches the tree at this point.
+            for (int32 idx = 0; idx < NumChunks; ++idx)
+            {
+                if (ChunkTreeChanged[idx])
+                    Self->PushDensityToChildren(ChunkNodes[idx]);
+            }
 
             // Phase 2: Neighbor stitch
             TArray<bool> ChunkEdgeChanged;

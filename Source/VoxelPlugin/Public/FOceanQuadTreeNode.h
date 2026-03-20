@@ -110,6 +110,13 @@ public:
 
     int32 NeighborLods[4] = { 0, 0, 0, 0 };
 
+    // Density at each corner of this node's face quad.
+    // Populated by AOceanSphereActor::PushDensityToChildren after each split.
+    // Layout: BL=0 (U-,V-), TL=1 (U-,V+), BR=2 (U+,V-), TR=3 (U+,V+).
+    // Sign convention: negative = above ocean surface, positive = below (underwater).
+    float CornerDensities[4] = { 0.f, 0.f, 0.f, 0.f };
+    bool  bDensitySampled = false;
+
     // Vertex data
     TArray<FVector>   Vertices;
     TArray<FVector3f> Normals;
