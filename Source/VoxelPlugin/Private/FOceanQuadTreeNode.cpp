@@ -412,14 +412,20 @@ void FOceanQuadTreeNode::GenerateMeshData()
         FSampleInput Input(SX.GetData(), SY.GetData(), SZ.GetData(), Total);
         Comp->Sample(Input, DensityOut.GetData());
 
+        // Debug: log first vertex density to verify compositor is working
+        if (Total > 0)
+        {
+            UE_LOG(LogTemp, Log, TEXT("[Ocean] GenerateMeshData depth[0]=%.1f SpherePos=(%.0f,%.0f,%.0f)"),
+                DensityOut[0], SpherePositions[0].X, SpherePositions[0].Y, SpherePositions[0].Z);
+        }
+
         for (int32 i = 0; i < Total; ++i)
         {
-            float depth = DensityOut[i]; // positive = underwater (cm), negative = above water
+            float depth = DensityOut[i];
             float absDepth = FMath::Max(depth, 0.0f);
-            // Store as decimeters (10cm units) for uint32 range.
-            // Max depth = 10,000,000 cm / 10 = 1,000,000 dm — fits in uint32 (max ~4.29B).
-            // Material: depth_cm = depth_dm * 10
-            uint32 intDepth = (uint32)FMath::Min(absDepth * 0.1f, (float)0xFFFFFFFFu);
+            // Same encoding as old working ocean mesh code:
+            // absDepth in cm, * 1000 for mm precision, packed big-endian uint32 into RGBA.
+            uint32 intDepth = (uint32)FMath::Min(absDepth * 1000.0f, 4294967040.0f);
             uint8 R = (intDepth >> 24) & 0xFF;
             uint8 G = (intDepth >> 16) & 0xFF;
             uint8 B = (intDepth >> 8) & 0xFF;
