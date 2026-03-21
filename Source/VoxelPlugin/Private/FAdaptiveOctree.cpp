@@ -8,6 +8,7 @@ FAdaptiveOctree::FAdaptiveOctree(const FOctreeParams& Params)
     CachedSurfaceMaterial = Params.SurfaceMaterial;
     Compositor = Params.Compositor;
     ChunkDepth = Params.ChunkDepth;
+    PrecisionDepthFloor = Params.PrecisionDepthFloor;
 
     // Core terrain parameters from params
     PlanetRadius = Params.PlanetRadius;
@@ -154,7 +155,7 @@ void FAdaptiveOctree::ApplyEdit(FVector InEditCenter, double InEditRadius, doubl
 {
     int depth = Compositor->GetEditStore()->GetDepthForBrushRadius(InEditRadius, InEditResolution);
     TArray<FVector> AffectedChunkCenters = Compositor->GetEditStore()->ApplySphericalEdit(InEditCenter, InEditRadius, InEditStrength, depth);
-    double ReconstructRadius = InEditRadius * 2.5;
+    double ReconstructRadius = InEditRadius * 1.1;
 
     // Resolve chunk nodes -- collect as shared ptrs since we need them for ChunkMap operations
     TArray<TSharedPtr<FAdaptiveOctreeNode>> ChunkNodes;
@@ -630,24 +631,54 @@ void FAdaptiveOctree::SplitAndComputeChildren(FAdaptiveOctreeNode* Node)
     // G26: body center
     GridPositions[26] = Node->Center;
 
-    // --- Stage 2: Sample 19 new densities ---
-    const int32 Count = 19;
-    float SX[19], SY[19], SZ[19], SampleOut[19];
-
-    for (int32 i = 0; i < Count; i++)
+    // --- Stage 2: Compute 19 new densities ---
+    // Beyond PrecisionDepthFloor, noise lacks precision — interpolate from parent corners instead.
+    if (Node->Index.Depth >= PrecisionDepthFloor)
     {
-        FVector curPos = GridPositions[8 + i];
-        SX[i] = (float)curPos.X;
-        SY[i] = (float)curPos.Y;
-        SZ[i] = (float)curPos.Z;
+        // Edge midpoints: average of 2 endpoint densities
+        for (int i = 0; i < 12; i++)
+        {
+            int a = OctreeConstants::EdgePairs[i][0];
+            int b = OctreeConstants::EdgePairs[i][1];
+            GridDensities[8 + i] = (GridDensities[a] + GridDensities[b]) * 0.5;
+        }
+
+        // Face centers: average of 4 face corner densities
+        for (int i = 0; i < 6; i++)
+        {
+            GridDensities[20 + i] = (
+                GridDensities[OctreeConstants::FaceCorners[i][0]] +
+                GridDensities[OctreeConstants::FaceCorners[i][1]] +
+                GridDensities[OctreeConstants::FaceCorners[i][2]] +
+                GridDensities[OctreeConstants::FaceCorners[i][3]]) * 0.25;
+        }
+
+        // Body center: average of all 8 corner densities
+        GridDensities[26] = 0.0;
+        for (int i = 0; i < 8; i++)
+            GridDensities[26] += GridDensities[i];
+        GridDensities[26] *= 0.125;
     }
-
-    FSampleInput SampleIn(SX, SY, SZ, Count);
-    Compositor->Sample(SampleIn, SampleOut);
-
-    for (int32 i = 0; i < Count; i++)
+    else
     {
-        GridDensities[8 + i] = SampleOut[i];
+        const int32 Count = 19;
+        float SX[19], SY[19], SZ[19], SampleOut[19];
+
+        for (int32 i = 0; i < Count; i++)
+        {
+            FVector curPos = GridPositions[8 + i];
+            SX[i] = (float)curPos.X;
+            SY[i] = (float)curPos.Y;
+            SZ[i] = (float)curPos.Z;
+        }
+
+        FSampleInput SampleIn(SX, SY, SZ, Count);
+        Compositor->Sample(SampleIn, SampleOut);
+
+        for (int32 i = 0; i < Count; i++)
+        {
+            GridDensities[8 + i] = SampleOut[i];
+        }
     }
 
     // --- Stage 3: Compute 27 normals from grid gradients ---

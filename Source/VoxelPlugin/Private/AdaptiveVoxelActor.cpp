@@ -192,6 +192,7 @@ void AAdaptiveVoxelActor::Initialize()
     Params.ChunkDepth = ChunkDepth;
     Params.MinDepth = MinDepth;
     Params.MaxDepth = MaxDepth;
+    Params.PrecisionDepthFloor = PrecisionDepthFloor;
 
     AdaptiveOctree = MakeShared<FAdaptiveOctree>(Params);
 

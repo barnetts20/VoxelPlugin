@@ -82,6 +82,13 @@ public:
     // Hard limit imposed by FMortonIndex (3 bits per level, 126 bits across two uint64s).
     static constexpr int32 MaxKeyDepth = 42;
 
+    // Depth beyond which noise sampling is replaced by trilinear interpolation
+    // from parent corner densities. Noise loses float precision past this depth,
+    // but deeper splits still provide geometric detail for editing.
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Octree",
+        meta = (ClampMin = "1"))
+    int32 PrecisionDepthFloor = 21;
+
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "LOD")
     double ScreenSpaceThreshold = .075;
 

@@ -31,6 +31,11 @@ struct VOXELPLUGIN_API FOctreeParams {
     int ChunkDepth = 4;
     int MinDepth = 7;
     int MaxDepth = 21;
+
+    // Depth beyond which noise sampling is replaced by trilinear interpolation
+    // from parent corner densities. The noise loses precision past this depth,
+    // but deeper splits still provide geometric detail for editing.
+    int PrecisionDepthFloor = 21;
 };
 
 /**
@@ -59,6 +64,9 @@ private:
     double ChunkExtent;
 
     int ChunkDepth;
+
+    // Beyond this depth, noise sampling is replaced by interpolation from parent densities.
+    int PrecisionDepthFloor;
 
     // Centralized terrain parameters -- derived from FOctreeParams at construction
     double PlanetRadius;    // Minimum surface radius (noise only adds elevation)
