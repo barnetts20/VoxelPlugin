@@ -24,14 +24,14 @@ public:
 
     // Driven by actor scale. Read-only at runtime � adjust scale to resize.
     UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Ocean|Shape")
-    double OceanRadius = 9000000.0;
+    double OceanRadius = 8000000.0;
 
     // Must match the terrain actor's scale (GetActorScale3D().GetMax()).
     // density = OceanRadius - (TerrainPlanetRadius + NoiseHeight):
     //   positive = underwater, negative = above water (land).
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Ocean|Shape",
         meta = (ClampMin = "1.0"))
-    double TerrainPlanetRadius = 8000000.0;
+    double TerrainPlanetRadius = 7200000.0;
 
     // Must match the terrain actor's NoiseAmplitudeRatio.
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Ocean|Shape",
@@ -40,7 +40,7 @@ public:
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Ocean|Mesh",
         meta = (ClampMin = "3"))
-    int32 FaceResolution = 17;
+    int32 FaceResolution = 3;
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Ocean|LOD")
     int32 ChunkDepth = 2;
@@ -53,7 +53,7 @@ public:
     // this spacing between adjacent vertices on the sphere surface.
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Ocean|LOD",
         meta = (ClampMin = "1.0"))
-    double TargetPrecision = 50.0;
+    double TargetPrecision = 100.0;
 
     // Computed from TargetPrecision and OceanRadius at init time.
     // Clamped to [MinDepth, MaxKeyDepth].

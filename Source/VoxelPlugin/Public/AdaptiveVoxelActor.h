@@ -79,8 +79,8 @@ public:
     UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Octree")
     double ActualPrecision = 0.0;
 
-    // Hard limit imposed by FMortonIndex (3 bits per level, 63 bits in uint64).
-    static constexpr int32 MaxKeyDepth = 21;
+    // Hard limit imposed by FMortonIndex (3 bits per level, 126 bits across two uint64s).
+    static constexpr int32 MaxKeyDepth = 42;
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "LOD")
     double ScreenSpaceThreshold = .075;

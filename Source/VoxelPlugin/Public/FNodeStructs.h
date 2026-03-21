@@ -1,4 +1,4 @@
-// Fill out your copyright notice in the Description page of Project Settings.
+ï»¿// Fill out your copyright notice in the Description page of Project Settings.
 
 #pragma once
 
@@ -24,7 +24,7 @@ struct VOXELPLUGIN_API FEdgeKey
     uint32 CachedHash;
 
     // Set once by FAdaptiveOctree at construction.
-    // Value: 2^MaxDepth / RootExtent — maps the smallest possible edge to ~1 grid unit.
+    // Value: 2^MaxDepth / RootExtent ï¿½ maps the smallest possible edge to ~1 grid unit.
     static inline double InvGridSize = 1.0;
 
     static int32 Quantize(double V)
@@ -123,21 +123,27 @@ struct VOXELPLUGIN_API FNodeEdge
     }
 };
 
-// Single uint64 morton index -- supports up to depth 21 (3 bits * 21 = 63 bits)
-// TODO: double uint64 morton2 -- depth 42
-// TODO: triple uint64 morton3 -- depth 63
+// 128-bit morton index -- supports up to depth 42 (3 bits * 42 = 126 bits across two uint64s).
+// Lo holds depths 0-20, Hi holds depths 21-41. Both are always compared/hashed
+// so there is no branching in the hot path; Hi is simply 0 for shallow trees.
 struct VOXELPLUGIN_API FMortonIndex {
-    uint64 Code = 0;
+    uint64 Lo = 0;
+    uint64 Hi = 0;
     uint8 Depth = 0;
 
     void PushChild(uint8 ChildIndex) {
-        uint8 BitOffset = Depth * 3;
-        Code |= (uint64(ChildIndex & 0x7) << BitOffset);
+        if (Depth < 21)
+            Lo |= (uint64(ChildIndex & 0x7) << (Depth * 3));
+        else
+            Hi |= (uint64(ChildIndex & 0x7) << ((Depth - 21) * 3));
         Depth++;
     }
 
     uint8 GetChildAtLevel(uint8 Level) const {
-        return (Code >> (Level * 3)) & 0x7;
+        if (Level < 21)
+            return (Lo >> (Level * 3)) & 0x7;
+        else
+            return (Hi >> ((Level - 21) * 3)) & 0x7;
     }
 
     uint8 LastChild() const {
@@ -145,11 +151,12 @@ struct VOXELPLUGIN_API FMortonIndex {
     }
 
     bool operator==(const FMortonIndex& Other) const {
-        return Code == Other.Code && Depth == Other.Depth;
+        return Lo == Other.Lo && Hi == Other.Hi && Depth == Other.Depth;
     }
 
     friend uint32 GetTypeHash(const FMortonIndex& Index) {
-        uint32 Hash = ::GetTypeHash(Index.Code);
+        uint32 Hash = ::GetTypeHash(Index.Lo);
+        Hash = HashCombine(Hash, ::GetTypeHash(Index.Hi));
         Hash = HashCombine(Hash, ::GetTypeHash(Index.Depth));
         return Hash;
     }
