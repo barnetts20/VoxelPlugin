@@ -155,7 +155,7 @@ void FAdaptiveOctree::ApplyEdit(FVector InEditCenter, double InEditRadius, doubl
 {
     int depth = Compositor->GetEditStore()->GetDepthForBrushRadius(InEditRadius, InEditResolution);
     TArray<FVector> AffectedChunkCenters = Compositor->GetEditStore()->ApplySphericalEdit(InEditCenter, InEditRadius, InEditStrength, depth);
-    double ReconstructRadius = InEditRadius * 1.1;
+    double ReconstructRadius = InEditRadius * 2.5;
 
     // Resolve chunk nodes -- collect as shared ptrs since we need them for ChunkMap operations
     TArray<TSharedPtr<FAdaptiveOctreeNode>> ChunkNodes;
@@ -228,7 +228,7 @@ void FAdaptiveOctree::GatherUniqueCorners(FAdaptiveOctreeNode* Node, TArray<FCor
         }
     }
 
-    if (Node->IsLeaf()) return;
+    if (Node->IsLeaf() || Node->Index.Depth >= PrecisionDepthFloor) return;
 
     for (int i = 0; i < 8; i++)
         GatherUniqueCorners(Node->Children[i].Get(), Samples, CornerMap, QuantizeGrid, EditCenter, SearchRadius);
@@ -258,6 +258,127 @@ void FAdaptiveOctree::FinalizeSubtree(FAdaptiveOctreeNode* Node, FVector EditCen
 
     // Then this node
     Node->FinalizeFromExistingCorners();
+}
+
+void FAdaptiveOctree::PropagateDeepDensities(FAdaptiveOctreeNode* Node, FVector EditCenter, double SearchRadius)
+{
+    if (!Node || Node->IsLeaf()) return;
+
+    if (SearchRadius > 0)
+    {
+        FVector Closest;
+        Closest.X = FMath::Clamp(EditCenter.X, Node->Center.X - Node->Extent, Node->Center.X + Node->Extent);
+        Closest.Y = FMath::Clamp(EditCenter.Y, Node->Center.Y - Node->Extent, Node->Center.Y + Node->Extent);
+        Closest.Z = FMath::Clamp(EditCenter.Z, Node->Center.Z - Node->Extent, Node->Center.Z + Node->Extent);
+
+        if (FVector::DistSquared(Closest, EditCenter) > SearchRadius * SearchRadius)
+            return;
+    }
+
+    if (Node->Index.Depth >= PrecisionDepthFloor)
+    {
+        // This node is at or past the floor — interpolate its children's densities
+        // from this node's corners, then apply edit-store deltas on top.
+        InterpolateChildrenWithEdits(Node);
+
+        // Recurse into children that have their own children
+        for (int i = 0; i < 8; i++)
+            if (Node->Children[i].IsValid())
+                PropagateDeepDensities(Node->Children[i].Get(), EditCenter, SearchRadius);
+    }
+    else
+    {
+        // Haven't reached the floor yet — keep walking down
+        for (int i = 0; i < 8; i++)
+            PropagateDeepDensities(Node->Children[i].Get(), EditCenter, SearchRadius);
+    }
+}
+
+void FAdaptiveOctree::InterpolateChildrenWithEdits(FAdaptiveOctreeNode* Node)
+{
+    if (!Node || Node->IsLeaf()) return;
+
+    FVector GridPositions[27];
+    double  GridDensities[27];
+
+    // G0-G7: parent corners — strip edit contribution to get noise-only baseline
+    float ParentSX[8], ParentSY[8], ParentSZ[8], ParentEdits[8];
+    for (int i = 0; i < 8; i++)
+    {
+        GridPositions[i] = Node->Corners[i].Position;
+        ParentSX[i] = (float)GridPositions[i].X;
+        ParentSY[i] = (float)GridPositions[i].Y;
+        ParentSZ[i] = (float)GridPositions[i].Z;
+        ParentEdits[i] = 0.f;
+    }
+
+    if (Compositor.IsValid())
+    {
+        // Get edit-only values at parent positions so we can subtract them
+        FSampleInput ParentInput(ParentSX, ParentSY, ParentSZ, 8);
+        Compositor->SampleEditsOnly(ParentInput, ParentEdits);
+    }
+
+    // Noise-only baseline for parent corners
+    for (int i = 0; i < 8; i++)
+        GridDensities[i] = Node->Corners[i].Density - ParentEdits[i];
+
+    // Interpolate noise-only baseline to midpoints
+    for (int i = 0; i < 12; i++)
+    {
+        int a = OctreeConstants::EdgePairs[i][0];
+        int b = OctreeConstants::EdgePairs[i][1];
+        GridPositions[8 + i] = (Node->Corners[a].Position + Node->Corners[b].Position) * 0.5;
+        GridDensities[8 + i] = (GridDensities[a] + GridDensities[b]) * 0.5;
+    }
+
+    for (int i = 0; i < 6; i++)
+    {
+        GridPositions[20 + i] = (
+            Node->Corners[OctreeConstants::FaceCorners[i][0]].Position +
+            Node->Corners[OctreeConstants::FaceCorners[i][1]].Position +
+            Node->Corners[OctreeConstants::FaceCorners[i][2]].Position +
+            Node->Corners[OctreeConstants::FaceCorners[i][3]].Position) * 0.25;
+        GridDensities[20 + i] = (
+            GridDensities[OctreeConstants::FaceCorners[i][0]] +
+            GridDensities[OctreeConstants::FaceCorners[i][1]] +
+            GridDensities[OctreeConstants::FaceCorners[i][2]] +
+            GridDensities[OctreeConstants::FaceCorners[i][3]]) * 0.25;
+    }
+
+    GridPositions[26] = Node->Center;
+    GridDensities[26] = 0.0;
+    for (int i = 0; i < 8; i++)
+        GridDensities[26] += GridDensities[i];
+    GridDensities[26] *= 0.125;
+
+    // Sample edit store at full resolution for all 27 positions and add back
+    if (Compositor.IsValid())
+    {
+        float SX[27], SY[27], SZ[27], Edits[27];
+        for (int32 i = 0; i < 27; i++)
+        {
+            SX[i] = (float)GridPositions[i].X;
+            SY[i] = (float)GridPositions[i].Y;
+            SZ[i] = (float)GridPositions[i].Z;
+            Edits[i] = 0.f;
+        }
+        FSampleInput AllInput(SX, SY, SZ, 27);
+        Compositor->SampleEditsOnly(AllInput, Edits);
+        for (int32 i = 0; i < 27; i++)
+            GridDensities[i] += Edits[i];
+    }
+
+    // Assign to children
+    for (int ci = 0; ci < 8; ci++)
+    {
+        if (!Node->Children[ci].IsValid()) continue;
+        for (int k = 0; k < 8; k++)
+        {
+            int32 gi = OctreeConstants::ChildCornerSources[ci][k];
+            Node->Children[ci]->Corners[k].Density = (float)GridDensities[gi];
+        }
+    }
 }
 
 void FAdaptiveOctree::ReconstructSubtree(FAdaptiveOctreeNode* Node, FVector EditCenter, double SearchRadius)
@@ -303,7 +424,14 @@ void FAdaptiveOctree::ReconstructSubtree(FAdaptiveOctreeNode* Node, FVector Edit
             *Target = FinalDensity;
     }
 
-    // 5. Finalize edges/QEF
+    // 5. Propagate densities into children beyond the precision depth floor.
+    //    Floor-level nodes now have fresh noise+edit densities from step 4.
+    //    Deeper children are purely interpolated from parent corners — no noise
+    //    re-sampling, no edit-store re-sampling. The parent values already contain
+    //    both contributions baked in at the correct (floor-level) resolution.
+    PropagateDeepDensities(Node, EditCenter, SearchRadius);
+
+    // 6. Finalize edges/QEF
     FinalizeSubtree(Node, EditCenter, SearchRadius);
 }
 
@@ -632,18 +760,35 @@ void FAdaptiveOctree::SplitAndComputeChildren(FAdaptiveOctreeNode* Node)
     GridPositions[26] = Node->Center;
 
     // --- Stage 2: Compute 19 new densities ---
-    // Beyond PrecisionDepthFloor, noise lacks precision — interpolate from parent corners instead.
+    // Beyond PrecisionDepthFloor, noise lacks precision. Strip edit contributions
+    // from parent corners, interpolate noise-only baseline, then sample edit store
+    // at full resolution for all 27 grid positions.
     if (Node->Index.Depth >= PrecisionDepthFloor)
     {
-        // Edge midpoints: average of 2 endpoint densities
+        // Strip edit contribution from parent corners
+        float ParentSX[8], ParentSY[8], ParentSZ[8], ParentEdits[8];
+        for (int i = 0; i < 8; i++)
+        {
+            ParentSX[i] = (float)GridPositions[i].X;
+            ParentSY[i] = (float)GridPositions[i].Y;
+            ParentSZ[i] = (float)GridPositions[i].Z;
+            ParentEdits[i] = 0.f;
+        }
+        if (Compositor.IsValid())
+        {
+            FSampleInput ParentInput(ParentSX, ParentSY, ParentSZ, 8);
+            Compositor->SampleEditsOnly(ParentInput, ParentEdits);
+        }
+        for (int i = 0; i < 8; i++)
+            GridDensities[i] -= ParentEdits[i];
+
+        // Interpolate noise-only baseline
         for (int i = 0; i < 12; i++)
         {
             int a = OctreeConstants::EdgePairs[i][0];
             int b = OctreeConstants::EdgePairs[i][1];
             GridDensities[8 + i] = (GridDensities[a] + GridDensities[b]) * 0.5;
         }
-
-        // Face centers: average of 4 face corner densities
         for (int i = 0; i < 6; i++)
         {
             GridDensities[20 + i] = (
@@ -652,12 +797,27 @@ void FAdaptiveOctree::SplitAndComputeChildren(FAdaptiveOctreeNode* Node)
                 GridDensities[OctreeConstants::FaceCorners[i][2]] +
                 GridDensities[OctreeConstants::FaceCorners[i][3]]) * 0.25;
         }
-
-        // Body center: average of all 8 corner densities
         GridDensities[26] = 0.0;
         for (int i = 0; i < 8; i++)
             GridDensities[26] += GridDensities[i];
         GridDensities[26] *= 0.125;
+
+        // Sample edit store at full resolution for all 27 positions
+        if (Compositor.IsValid())
+        {
+            float SX[27], SY[27], SZ[27], Edits[27];
+            for (int32 i = 0; i < 27; i++)
+            {
+                SX[i] = (float)GridPositions[i].X;
+                SY[i] = (float)GridPositions[i].Y;
+                SZ[i] = (float)GridPositions[i].Z;
+                Edits[i] = 0.f;
+            }
+            FSampleInput AllInput(SX, SY, SZ, 27);
+            Compositor->SampleEditsOnly(AllInput, Edits);
+            for (int32 i = 0; i < 27; i++)
+                GridDensities[i] += Edits[i];
+        }
     }
     else
     {

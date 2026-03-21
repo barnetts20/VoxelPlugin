@@ -1,4 +1,4 @@
-// Fill out your copyright notice in the Description page of Project Settings.
+ï»¿// Fill out your copyright notice in the Description page of Project Settings.
 
 #pragma once
 
@@ -53,7 +53,7 @@ public:
         int32 Count = Input.Num();
         if (Count <= 0 || SampleLayers.Num() <= 0) return;
 
-        // Fast path: single layer — no temp allocation, no ParallelFor overhead
+        // Fast path: single layer ï¿½ no temp allocation, no ParallelFor overhead
         if (SampleLayers.Num() == 1)
         {
             SampleLayers[0](Input, DensityOut);
@@ -75,7 +75,7 @@ public:
                     DensityOut[i] += LayerOutputs[LayerIdx][i];
         }
 
-        // Edit store — scalar loop for small batches, parallel only when worth it
+        // Edit store ï¿½ scalar loop for small batches, parallel only when worth it
         if (EditStore.IsValid())
         {
             if (Count > 128)
@@ -89,6 +89,27 @@ public:
                 for (int32 i = 0; i < Count; i++)
                     DensityOut[i] += EditStore->Sample(Input.GetPosition(i));
             }
+        }
+    }
+
+    // Applies only edit-store deltas to existing density values (DensityInOut).
+    // Used for nodes beyond PrecisionDepthFloor where noise has insufficient precision
+    // but edits must still be applied on top of interpolated parent densities.
+    void SampleEditsOnly(const FSampleInput& Input, float* DensityInOut) const
+    {
+        int32 Count = Input.Num();
+        if (Count <= 0 || !EditStore.IsValid()) return;
+
+        if (Count > 128)
+        {
+            ParallelFor(Count, [&](int32 i) {
+                DensityInOut[i] += EditStore->Sample(Input.GetPosition(i));
+                });
+        }
+        else
+        {
+            for (int32 i = 0; i < Count; i++)
+                DensityInOut[i] += EditStore->Sample(Input.GetPosition(i));
         }
     }
 

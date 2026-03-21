@@ -84,6 +84,10 @@ private:
 
     void FinalizeSubtree(FAdaptiveOctreeNode* Node, FVector EditCenter, double SearchRadius);
 
+    void PropagateDeepDensities(FAdaptiveOctreeNode* Node, FVector EditCenter, double SearchRadius);
+
+    void InterpolateChildrenWithEdits(FAdaptiveOctreeNode* Node);
+
     void ReconstructSubtree(FAdaptiveOctreeNode* Node, FVector EditCenter, double SearchRadius);
 
     void UpdateMeshChunkStreamData(TSharedPtr<FMeshChunk> InChunk);
