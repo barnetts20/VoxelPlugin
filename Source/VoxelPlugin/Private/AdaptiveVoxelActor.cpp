@@ -13,7 +13,7 @@ AAdaptiveVoxelActor::AAdaptiveVoxelActor()
     PrimaryActorTick.bStartWithTickEnabled = true;
     CameraPosition = FVector(0, 0, 0);
     SurfaceMaterial = UMaterial::GetDefaultMaterial(EMaterialDomain::MD_Surface);
-    //ChunkDepth = FMath::Min(ChunkDepth, 5);
+
     // Default scale defines planet radius in world units (cm).
     // 80,000,000 cm = 800 km radius planet.
     SetActorScale3D(FVector(80000000.0));
@@ -115,6 +115,31 @@ void AAdaptiveVoxelActor::Initialize()
         int32 IdealDepth = (int32)FMath::CeilToInt(FMath::Log2(Ratio));
         MaxDepth = FMath::Clamp(IdealDepth, MinDepth, MaxKeyDepth);
         ActualPrecision = 2.0 * ActorRootExtent / FMath::Pow(2.0, (double)MaxDepth);
+        EffectiveScreenSpaceThreshold = ScreenSpaceThreshold * (TargetPrecision / FMath::Max(ActualPrecision, 1.0));
+    }
+
+    // Compute ChunkDepth from float precision requirements.
+    // Chunk-local vertex positions are FVector3f. The float precision at the
+    // chunk extent must be below a fixed threshold for artifact-free rendering.
+    // FloatPrecision = ChunkExtent * FLT_EPSILON ≈ (RootExtent / 2^D) * 1.19e-7
+    {
+        constexpr double FloatEps = 1.19e-7;
+        constexpr double MaxFloatError = 1.0; // cm — max acceptable vertex jitter
+        double Ratio = ActorRootExtent * FloatEps / MaxFloatError;
+        int32 IdealChunkDepth = (Ratio > 1.0) ? (int32)FMath::CeilToInt(FMath::Log2(Ratio)) : 2;
+        ChunkDepth = FMath::Clamp(IdealChunkDepth, 2, 5);
+
+        MinDepth = FMath::Max(MinDepth, ChunkDepth);
+
+        double ChunkExtent = ActorRootExtent / FMath::Pow(2.0, (double)ChunkDepth);
+        double FloatPrec = ChunkExtent * FloatEps;
+        if (FloatPrec > MaxFloatError)
+        {
+            UE_LOG(LogTemp, Warning,
+                TEXT("[Octree] Float precision (%.2fcm) exceeds %.0fcm at ChunkDepth %d. "
+                    "Reduce planet scale to avoid vertex jitter."),
+                FloatPrec, MaxFloatError, ChunkDepth);
+        }
     }
 
     //Composes a density sampling layer that treats the input noise node as if it was a heightmap
@@ -233,7 +258,7 @@ void AAdaptiveVoxelActor::RunDataUpdateTask()
                 FVector CurrentCamPos = Self->CameraPosition;
                 FVector Velocity = (CurrentCamPos - Self->LastLodUpdatePosition);
                 FVector PredictedPos = CurrentCamPos + (Velocity * Self->VelocityLookAheadFactor);
-                Self->AdaptiveOctree->UpdateLOD(PredictedPos, Self->ScreenSpaceThreshold, Self->CameraFOV);
+                Self->AdaptiveOctree->UpdateLOD(PredictedPos, Self->EffectiveScreenSpaceThreshold, Self->CameraFOV);
                 Self->LastLodUpdatePosition = Self->CameraPosition;
             }
             double elapsed = (FPlatformTime::Seconds() - t0) * 1000.0;

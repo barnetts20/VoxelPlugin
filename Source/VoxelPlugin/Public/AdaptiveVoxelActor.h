@@ -63,7 +63,7 @@ public:
     double NoiseAmplitudeRatio = 0.25;
 
     //UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Octree")
-    int ChunkDepth = 4;
+    int ChunkDepth = 5;
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Octree")
     int MinDepth = 7;
@@ -94,7 +94,12 @@ public:
     int32 PrecisionDepthFloor = 21;
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "LOD")
-    double ScreenSpaceThreshold = .075;
+    double ScreenSpaceThreshold = .065;
+
+    // Adjusted threshold that compensates for the delta between TargetPrecision
+    // and ActualPrecision. Keeps LOD ring distances consistent across scales.
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "LOD")
+    double EffectiveScreenSpaceThreshold = .075;
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "LOD")
     double MinDataUpdateInterval = .1;

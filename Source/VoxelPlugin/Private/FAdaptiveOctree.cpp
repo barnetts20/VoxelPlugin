@@ -1,4 +1,4 @@
-#include "FAdaptiveOctree.h"
+ï»¿#include "FAdaptiveOctree.h"
 #include <FOctreeConstants.h>
 
 FAdaptiveOctree::FAdaptiveOctree(const FOctreeParams& Params)
@@ -41,7 +41,7 @@ void FAdaptiveOctree::SplitToDepth(FAdaptiveOctreeNode* Node, int InMinDepth)
         SplitAndComputeChildren(Node);
         for (int i = 0; i < 8; i++)
         {
-            if (Node->Children[i])
+            if (Node->Children[i] && Node->Children[i]->IsSurfaceNode)
             {
                 SplitToDepth(Node->Children[i].Get(), InMinDepth);
             }
@@ -277,7 +277,7 @@ void FAdaptiveOctree::PropagateDeepDensities(FAdaptiveOctreeNode* Node, FVector 
 
     if (Node->Index.Depth >= PrecisionDepthFloor)
     {
-        // This node is at or past the floor — interpolate its children's densities
+        // This node is at or past the floor ï¿½ interpolate its children's densities
         // from this node's corners, then apply edit-store deltas on top.
         InterpolateChildrenWithEdits(Node);
 
@@ -288,7 +288,7 @@ void FAdaptiveOctree::PropagateDeepDensities(FAdaptiveOctreeNode* Node, FVector 
     }
     else
     {
-        // Haven't reached the floor yet — keep walking down
+        // Haven't reached the floor yet ï¿½ keep walking down
         for (int i = 0; i < 8; i++)
             PropagateDeepDensities(Node->Children[i].Get(), EditCenter, SearchRadius);
     }
@@ -301,7 +301,7 @@ void FAdaptiveOctree::InterpolateChildrenWithEdits(FAdaptiveOctreeNode* Node)
     FVector GridPositions[27];
     double  GridDensities[27];
 
-    // G0-G7: parent corners — strip edit contribution to get noise-only baseline
+    // G0-G7: parent corners ï¿½ strip edit contribution to get noise-only baseline
     float ParentSX[8], ParentSY[8], ParentSZ[8], ParentEdits[8];
     for (int i = 0; i < 8; i++)
     {
@@ -426,7 +426,7 @@ void FAdaptiveOctree::ReconstructSubtree(FAdaptiveOctreeNode* Node, FVector Edit
 
     // 5. Propagate densities into children beyond the precision depth floor.
     //    Floor-level nodes now have fresh noise+edit densities from step 4.
-    //    Deeper children are purely interpolated from parent corners — no noise
+    //    Deeper children are purely interpolated from parent corners ï¿½ no noise
     //    re-sampling, no edit-store re-sampling. The parent values already contain
     //    both contributions baked in at the correct (floor-level) resolution.
     PropagateDeepDensities(Node, EditCenter, SearchRadius);
