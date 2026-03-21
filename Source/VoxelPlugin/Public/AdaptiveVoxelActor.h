@@ -21,6 +21,10 @@ class VOXELPLUGIN_API AAdaptiveVoxelActor : public ARealtimeMeshActor
 private:
     TSharedPtr<FAdaptiveOctree> AdaptiveOctree;
 
+    // Deferred construction — params are stored on Initialize (game thread),
+    // octree is built on the first RunDataUpdateTask (background thread).
+    TSharedPtr<FOctreeParams> PendingParams;
+
     // Mesh chunks attach to this component. Inherits actor position and rotation
     // but uses absolute scale (1,1,1). Octree is built at world scale; scale changes
     // trigger full reconstruction via OnConstruction.
@@ -58,7 +62,7 @@ public:
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrain", meta = (ClampMin = "0.01", ClampMax = "1.0"))
     double NoiseAmplitudeRatio = 0.25;
 
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Octree")
+    //UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Octree")
     int ChunkDepth = 4;
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Octree")

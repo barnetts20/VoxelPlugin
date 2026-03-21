@@ -13,10 +13,10 @@ AAdaptiveVoxelActor::AAdaptiveVoxelActor()
     PrimaryActorTick.bStartWithTickEnabled = true;
     CameraPosition = FVector(0, 0, 0);
     SurfaceMaterial = UMaterial::GetDefaultMaterial(EMaterialDomain::MD_Surface);
-
+    //ChunkDepth = FMath::Min(ChunkDepth, 5);
     // Default scale defines planet radius in world units (cm).
-    // 8,000,000 cm = 80 km radius planet.
-    SetActorScale3D(FVector(8000000.0));
+    // 80,000,000 cm = 800 km radius planet.
+    SetActorScale3D(FVector(80000000.0));
 
     // Mesh chunks attach to this component.
     // Inherits actor position and rotation, but uses absolute scale (1,1,1)
@@ -182,19 +182,18 @@ void AAdaptiveVoxelActor::Initialize()
     TSharedPtr<FDensitySampleCompositor> Compositor = MakeShared<FDensitySampleCompositor>(EditStore);
     Compositor->AddSampleLayer(HeightmapLayer);
 
-    FOctreeParams Params;
-    Params.ParentActor = this;
-    Params.MeshAttachmentRoot = MeshAttachmentRoot;
-    Params.SurfaceMaterial = SurfaceMaterial;
-    Params.Compositor = Compositor;
-    Params.PlanetRadius = ActorPlanetRadius;
-    Params.NoiseAmplitude = ActorNoiseAmplitude;
-    Params.ChunkDepth = ChunkDepth;
-    Params.MinDepth = MinDepth;
-    Params.MaxDepth = MaxDepth;
-    Params.PrecisionDepthFloor = PrecisionDepthFloor;
-
-    AdaptiveOctree = MakeShared<FAdaptiveOctree>(Params);
+    // Store params for deferred construction on the background thread.
+    PendingParams = MakeShared<FOctreeParams>();
+    PendingParams->ParentActor = this;
+    PendingParams->MeshAttachmentRoot = MeshAttachmentRoot;
+    PendingParams->SurfaceMaterial = SurfaceMaterial;
+    PendingParams->Compositor = Compositor;
+    PendingParams->PlanetRadius = ActorPlanetRadius;
+    PendingParams->NoiseAmplitude = ActorNoiseAmplitude;
+    PendingParams->ChunkDepth = ChunkDepth;
+    PendingParams->MinDepth = MinDepth;
+    PendingParams->MaxDepth = MaxDepth;
+    PendingParams->PrecisionDepthFloor = PrecisionDepthFloor;
 
     LastInitScale = GetActorScale3D();
     Initialized = true;
@@ -213,6 +212,20 @@ void AAdaptiveVoxelActor::RunDataUpdateTask()
         {
             AAdaptiveVoxelActor* Self = WeakThis.Get();
             if (!Self || Self->IsDestroyed) return;
+
+            // Deferred construction — build octree on the background thread
+            if (Self->PendingParams.IsValid())
+            {
+                FRWScopeLock WriteLock(Self->OctreeLock, SLT_Write);
+                Self->AdaptiveOctree = MakeShared<FAdaptiveOctree>(*Self->PendingParams);
+                Self->PendingParams.Reset();
+            }
+
+            if (!Self->AdaptiveOctree.IsValid())
+            {
+                Self->DataUpdateIsRunning = false;
+                return;
+            }
 
             double t0 = FPlatformTime::Seconds();
             {
