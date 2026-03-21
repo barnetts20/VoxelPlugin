@@ -15,8 +15,8 @@ AAdaptiveVoxelActor::AAdaptiveVoxelActor()
     SurfaceMaterial = UMaterial::GetDefaultMaterial(EMaterialDomain::MD_Surface);
 
     // Default scale defines planet radius in world units (cm).
-    // 80,000,000 cm = 800 km radius planet.
-    SetActorScale3D(FVector(80000000.0));
+    // 8,000,000 cm = 80 km radius planet.
+    SetActorScale3D(FVector(8000000.0));
 
     // Mesh chunks attach to this component.
     // Inherits actor position and rotation, but uses absolute scale (1,1,1)
@@ -106,7 +106,17 @@ void AAdaptiveVoxelActor::Initialize()
     double ActorPlanetRadius = GetActorScale3D().GetMax();
     double ActorNoiseAmplitude = ActorPlanetRadius * NoiseAmplitudeRatio;
     double ActorRootExtent = (ActorPlanetRadius + ActorNoiseAmplitude) * 1.05;
-    
+
+    // Compute MaxDepth from TargetPrecision.
+    // At depth D, voxel extent = RootExtent / 2^D, vertex spacing ≈ 2 * extent.
+    // Solve for D: D = ceil(log2(2 * RootExtent / TargetPrecision))
+    {
+        double Ratio = 2.0 * ActorRootExtent / TargetPrecision;
+        int32 IdealDepth = (int32)FMath::CeilToInt(FMath::Log2(Ratio));
+        MaxDepth = FMath::Clamp(IdealDepth, MinDepth, MaxKeyDepth);
+        ActualPrecision = 2.0 * ActorRootExtent / FMath::Pow(2.0, (double)MaxDepth);
+    }
+
     //Composes a density sampling layer that treats the input noise node as if it was a heightmap
     Noise = FastNoise::NewFromEncodedNodeTree("GQAgAB8AEwCamRk+DQAMAAAAAAAAQAcAAAAAAD8AAAAAAAAAAAA/AAAAAD8AAAAAvwAAAAA/ARsAFwCamRk+AAAAPwAAAAAAAAA/IAAgABMAAABAQBsAJAACAAAADQAIAAAAAAAAQAsAAQAAAAAAAAABAAAAAAAAAAAAAIA/AAAAAD8AAAAAAAAAAIA/AAAAAAAAmpmZPgCamRk+AM3MTD4BEwDNzEw+IAAfABcAAACAvwAAgD8AAIDAAAAAPw8AAQAAAAAAAED//wEAAAAAAD8AAAAAAAAAAIA/AAAAAD8AAACAvwAAAAA/");
     auto HeightmapLayer = [NoiseNode = Noise, PlanetRadius = ActorPlanetRadius, NoiseAmplitude = ActorNoiseAmplitude](const FSampleInput& Input, float* DensityOut) {
@@ -165,7 +175,7 @@ void AAdaptiveVoxelActor::Initialize()
             double Height = (Clamped + 1.0) * 0.5 * NoiseAmplitude;
             DensityOut[i] = (float)(Distances[i] - (PlanetRadius + Height));
         }
-    };
+        };
 
     TSharedPtr<FSparseEditStore> EditStore = MakeShared<FSparseEditStore>(FVector::ZeroVector, ActorRootExtent, ChunkDepth, MaxDepth);
 

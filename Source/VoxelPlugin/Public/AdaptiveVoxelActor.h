@@ -64,8 +64,23 @@ public:
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Octree")
     int MinDepth = 7;
 
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Octree")
+    // Target voxel spacing in world units (cm). MaxDepth is computed automatically
+    // so the finest LOD voxel cells are approximately this size.
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Octree",
+        meta = (ClampMin = "1.0"))
+    double TargetPrecision = 100.0;
+
+    // Computed from TargetPrecision and planet radius at init time.
+    // Clamped to [MinDepth, MaxKeyDepth].
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Octree")
     int MaxDepth = 18;
+
+    // The actual voxel spacing (cm) achieved at MaxDepth after key-limit clamping.
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Octree")
+    double ActualPrecision = 0.0;
+
+    // Hard limit imposed by FMortonIndex (3 bits per level, 63 bits in uint64).
+    static constexpr int32 MaxKeyDepth = 21;
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "LOD")
     double ScreenSpaceThreshold = .075;

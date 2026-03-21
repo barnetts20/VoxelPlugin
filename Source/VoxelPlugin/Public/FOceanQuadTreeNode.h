@@ -93,7 +93,7 @@ struct VOXELPLUGIN_API FOceanMeshGrid
     // Edge stitch triangles for each of the 16 neighbor LOD flag combinations.
     TArray<FIndex3UI> EdgeTriangles[16];
 
-    void Build(int32 Res, bool bFlipWinding);
+    void Build(int32 Res);
 
 private:
     static void BuildEdgeVariant(int32 ExtRes, int32 tRes, uint8 Flags,

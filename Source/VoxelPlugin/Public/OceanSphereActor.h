@@ -24,14 +24,14 @@ public:
 
     // Driven by actor scale. Read-only at runtime � adjust scale to resize.
     UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Ocean|Shape")
-    double OceanRadius = 100000000.0;
+    double OceanRadius = 9000000.0;
 
     // Must match the terrain actor's scale (GetActorScale3D().GetMax()).
     // density = OceanRadius - (TerrainPlanetRadius + NoiseHeight):
     //   positive = underwater, negative = above water (land).
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Ocean|Shape",
         meta = (ClampMin = "1.0"))
-    double TerrainPlanetRadius = 90000000.0;
+    double TerrainPlanetRadius = 8000000.0;
 
     // Must match the terrain actor's NoiseAmplitudeRatio.
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Ocean|Shape",
@@ -48,8 +48,24 @@ public:
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Ocean|LOD")
     int32 MinDepth = 2;
 
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Ocean|LOD")
+    // Target vertex spacing in world units (cm). MaxDepth is computed automatically
+    // from this value and the ocean radius so that the finest LOD achieves roughly
+    // this spacing between adjacent vertices on the sphere surface.
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Ocean|LOD",
+        meta = (ClampMin = "1.0"))
+    double TargetPrecision = 50.0;
+
+    // Computed from TargetPrecision and OceanRadius at init time.
+    // Clamped to [MinDepth, MaxKeyDepth].
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Ocean|LOD")
     int32 MaxDepth = 6;
+
+    // The actual vertex spacing (cm) achieved at MaxDepth after key-limit clamping.
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Ocean|LOD")
+    double ActualPrecision = 0.0;
+
+    // Hard limit imposed by FQuadIndex (2 bits per level, 62 path bits + 2 sentinel = 64).
+    static constexpr int32 MaxKeyDepth = 31;
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Ocean|LOD",
         meta = (ClampMin = "0.001"))
@@ -77,7 +93,7 @@ public:
     TSharedPtr<FDensitySampleCompositor> GetCompositor() const { return Compositor; }
 
     // Returns the grid cache for a given resolution, building it if needed.
-    const FOceanMeshGrid& GetMeshGrid(int32 Res, bool bFlipWinding);
+    const FOceanMeshGrid& GetMeshGrid(int32 Res);
 
     TSharedPtr<FOceanQuadTreeNode> GetNodeByIndex(const FQuadIndex& Index) const;
 
@@ -112,7 +128,7 @@ private:
 
     FTimerHandle LodTimerHandle;
 
-    // Static mesh grid cache — keyed by Res*2 + bFlipWinding.
+    // Static mesh grid cache — keyed by resolution.
     TMap<int32, FOceanMeshGrid> MeshGridCache;
 
     void Initialize();

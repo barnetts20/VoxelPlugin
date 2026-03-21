@@ -9,7 +9,7 @@ AOceanSphereActor::AOceanSphereActor()
     PrimaryActorTick.bCanEverTick = true;
     PrimaryActorTick.bStartWithTickEnabled = true;
 
-    SetActorScale3D(FVector(100000000.0));
+    SetActorScale3D(FVector(8000000.0));
 
     MeshAttachmentRoot = CreateDefaultSubobject<USceneComponent>(TEXT("MeshAttachmentRoot"));
     MeshAttachmentRoot->SetupAttachment(GetRootComponent());
@@ -50,14 +50,13 @@ bool AOceanSphereActor::ShouldTickIfViewportsOnly() const
 // Mesh grid cache
 // ---------------------------------------------------------------------------
 
-const FOceanMeshGrid& AOceanSphereActor::GetMeshGrid(int32 Res, bool bFlipWinding)
+const FOceanMeshGrid& AOceanSphereActor::GetMeshGrid(int32 Res)
 {
-    int32 Key = Res * 2 + (bFlipWinding ? 1 : 0);
-    FOceanMeshGrid* Existing = MeshGridCache.Find(Key);
+    FOceanMeshGrid* Existing = MeshGridCache.Find(Res);
     if (Existing) return *Existing;
 
-    FOceanMeshGrid& Grid = MeshGridCache.Add(Key);
-    Grid.Build(Res, bFlipWinding);
+    FOceanMeshGrid& Grid = MeshGridCache.Add(Res);
+    Grid.Build(Res);
     return Grid;
 }
 
@@ -85,6 +84,18 @@ void AOceanSphereActor::Initialize()
     double ActorRadius = GetActorScale3D().GetMax();
     OceanRadius = ActorRadius;
     double TerrainNoiseAmplitude = TerrainPlanetRadius * NoiseAmplitudeRatio;
+
+    // Compute MaxDepth from TargetPrecision.
+    // At depth D, a leaf has cube-space size 1000/2^D with FaceResolution vertices,
+    // giving world-space vertex spacing ≈ (1000 / 2^D) / (FaceResolution - 1) * (OceanRadius / 500).
+    // Solve for D: D = ceil(log2(2 * OceanRadius / ((FaceResolution - 1) * TargetPrecision)))
+    {
+        double EffectiveRes = FMath::Max((double)(FaceResolution - 1), 1.0);
+        double Ratio = 2.0 * OceanRadius / (EffectiveRes * TargetPrecision);
+        int32 IdealDepth = (int32)FMath::CeilToInt(FMath::Log2(Ratio));
+        MaxDepth = FMath::Clamp(IdealDepth, MinDepth, MaxKeyDepth);
+        ActualPrecision = 2.0 * OceanRadius / (EffectiveRes * FMath::Pow(2.0, (double)MaxDepth));
+    }
 
     Noise = FastNoise::NewFromEncodedNodeTree("GQAgAB8AEwCamRk+DQAMAAAAAAAAQAcAAAAAAD8AAAAAAAAAAAA/AAAAAD8AAAAAvwAAAAA/ARsAFwCamRk+AAAAPwAAAAAAAAA/IAAgABMAAABAQBsAJAACAAAADQAIAAAAAAAAQAsAAQAAAAAAAAABAAAAAAAAAAAAAIA/AAAAAD8AAAAAAAAAAIA/AAAAAAAAmpmZPgCamRk+AM3MTD4BEwDNzEw+IAAfABcAAACAvwAAgD8AAIDAAAAAPw8AAQAAAAAAAED//wEAAAAAAD8AAAAAAAAAAIA/AAAAAD8AAACAvwAAAAA/");
 
@@ -198,6 +209,9 @@ void AOceanSphereActor::PopulateChunks()
     TArray<TSharedPtr<FOceanMeshChunk>> NewChunks;
     NewChunks.SetNum(ChunkNodes.Num());
 
+    // Pre-build the grid cache before parallel work to avoid thread-unsafe lazy init.
+    GetMeshGrid(FaceResolution);
+
     ParallelFor(ChunkNodes.Num(), [&](int32 i)
         {
             NewChunks[i] = MakeShared<FOceanMeshChunk>();
@@ -308,7 +322,6 @@ void AOceanSphereActor::RebuildChunkStreamData(
         // Build vertex data for this leaf's (Res+2)x(Res+2) extended grid.
         TArray<FVector>   LeafPos;   LeafPos.SetNumUninitialized(Total);
         TArray<FVector3f> LeafNorm;  LeafNorm.SetNumUninitialized(Total);
-        TArray<FVector2f> LeafUV;    LeafUV.SetNumUninitialized(Total);
         TArray<float>     LeafDepth; LeafDepth.SetNumUninitialized(Total);
         TArray<FColor>    LeafColor; LeafColor.SetNumUninitialized(Total);
 
@@ -335,10 +348,6 @@ void AOceanSphereActor::RebuildChunkStreamData(
                 LeafPos[vi] = SpherePos - Leaf->ChunkAnchorCenter;
                 FVector Normal = SpherePos.GetSafeNormal();
                 LeafNorm[vi] = FVector3f(Normal);
-                FVector Dir = Normal;
-                LeafUV[vi] = FVector2f(
-                    (FMath::Atan2(Dir.Y, Dir.X) + PI) / (2.f * PI),
-                    FMath::Acos(FMath::Clamp((float)Dir.Z, -1.f, 1.f)) / PI);
 
                 SX[vi] = (float)SpherePos.X;
                 SY[vi] = (float)SpherePos.Y;
@@ -377,14 +386,13 @@ void AOceanSphereActor::RebuildChunkStreamData(
         }
 
         // Stage 3: emit inner triangles from grid cache
-        const FOceanMeshGrid& Grid = Actor->GetMeshGrid(Res, Leaf->FaceTransform.bFlipWinding);
+        const FOceanMeshGrid& Grid = Actor->GetMeshGrid(Res);
+        const bool bFlip = Leaf->FaceTransform.bFlipWinding;
 
-        for (const FIndex3UI& Tri : Grid.PatchTriangles)
+        for (FIndex3UI Tri : Grid.PatchTriangles)
         {
-            // Per-tri cull: skip if all 3 vertices are below threshold
-            if (LeafDepth[Tri.V0] < CullThreshold &&
-                LeafDepth[Tri.V1] < CullThreshold &&
-                LeafDepth[Tri.V2] < CullThreshold) continue;
+            if (bFlip)
+                Tri = FIndex3UI(Tri.V0, Tri.V2, Tri.V1);
 
             for (int32 v = 0; v < 3; ++v)
             {
@@ -403,19 +411,15 @@ void AOceanSphereActor::RebuildChunkStreamData(
         // Stage 4: emit edge stitch triangles
         // Edge variant index: bLeft|(bRight<<1)|(bTop<<2)|(bBottom<<3)
         uint8 EdgeFlags =
-            (uint8)(Leaf->GetDepth() > Leaf->NeighborLods[(uint8)EdgeOrientation::LEFT]) |
-            (uint8)(Leaf->GetDepth() > Leaf->NeighborLods[(uint8)EdgeOrientation::RIGHT]) << 1 |
-            (uint8)(Leaf->GetDepth() > Leaf->NeighborLods[(uint8)EdgeOrientation::UP]) << 2 |
-            (uint8)(Leaf->GetDepth() > Leaf->NeighborLods[(uint8)EdgeOrientation::DOWN]) << 3;
+            ((Leaf->GetDepth() > Leaf->NeighborLods[(uint8)EdgeOrientation::LEFT]) ? 0x1 : 0) |
+            ((Leaf->GetDepth() > Leaf->NeighborLods[(uint8)EdgeOrientation::RIGHT]) ? 0x2 : 0) |
+            ((Leaf->GetDepth() > Leaf->NeighborLods[(uint8)EdgeOrientation::UP]) ? 0x4 : 0) |
+            ((Leaf->GetDepth() > Leaf->NeighborLods[(uint8)EdgeOrientation::DOWN]) ? 0x8 : 0);
 
         for (FIndex3UI Tri : Grid.EdgeTriangles[EdgeFlags])
         {
-            if (Leaf->FaceTransform.bFlipWinding)
+            if (bFlip)
                 Tri = FIndex3UI(Tri.V0, Tri.V2, Tri.V1);
-
-            if (LeafDepth[Tri.V0] < CullThreshold &&
-                LeafDepth[Tri.V1] < CullThreshold &&
-                LeafDepth[Tri.V2] < CullThreshold) continue;
 
             for (int32 v = 0; v < 3; ++v)
             {

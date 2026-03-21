@@ -23,7 +23,7 @@ void FOceanMeshChunk::InitializeComponent(AOceanSphereActor* InOwner)
     CConfig.bShouldFastCookMeshes = false;
     CConfig.bUseComplexAsSimpleCollision = false;
     CConfig.bDeformableMesh = false;
-    CConfig.bUseAsyncCook = true;
+    CConfig.bUseAsyncCook = false;
 
     ChunkRtMesh = NewObject<URealtimeMeshSimple>(InOwner);
     ChunkRtMesh->SetCollisionConfig(CConfig);
@@ -66,12 +66,12 @@ void FOceanMeshChunk::DestroyComponent(AOceanSphereActor* InOwner)
 // FOceanMeshGrid
 // ===========================================================================
 
-void FOceanMeshGrid::Build(int32 Res, bool bFlipWinding)
+void FOceanMeshGrid::Build(int32 Res)
 {
     const int32 ExtRes = Res + 2;
     const int32 tRes = ExtRes - 1;
 
-    // --- Interior patch triangles ---
+    // --- Interior patch triangles (default winding, flipped at emit time if needed) ---
     PatchTriangles.Reset();
     for (int32 ix = 0; ix < tRes; ++ix)
     {
@@ -84,13 +84,13 @@ void FOceanMeshGrid::Build(int32 Res, bool bFlipWinding)
             int32 tl = ix * ExtRes + iy, tr = tl + 1, bl = tl + ExtRes, br = bl + 1;
             if ((ix + iy) % 2 == 0)
             {
-                if (bFlipWinding) { PatchTriangles.Add(FIndex3UI(tl, br, bl)); PatchTriangles.Add(FIndex3UI(tl, tr, br)); }
-                else { PatchTriangles.Add(FIndex3UI(tl, bl, br)); PatchTriangles.Add(FIndex3UI(tl, br, tr)); }
+                PatchTriangles.Add(FIndex3UI(tl, bl, br));
+                PatchTriangles.Add(FIndex3UI(tl, br, tr));
             }
             else
             {
-                if (bFlipWinding) { PatchTriangles.Add(FIndex3UI(tl, tr, bl)); PatchTriangles.Add(FIndex3UI(tr, br, bl)); }
-                else { PatchTriangles.Add(FIndex3UI(tl, bl, tr)); PatchTriangles.Add(FIndex3UI(tr, bl, br)); }
+                PatchTriangles.Add(FIndex3UI(tl, bl, tr));
+                PatchTriangles.Add(FIndex3UI(tr, bl, br));
             }
         }
     }
@@ -178,10 +178,10 @@ FOceanQuadTreeNode::FOceanQuadTreeNode(
     : Owner(InOwner)
     , Index(InIndex)
     , FaceTransform(InFaceTransform)
-    , CubeCenter(InCubeCenter)
     , MinDepth(InMinDepth)
     , MaxDepth(InMaxDepth)
     , ChunkDepth(InChunkDepth)
+    , CubeCenter(InCubeCenter)
     , OceanRadius(InOceanRadius)
     , Size(InSize)
 {
