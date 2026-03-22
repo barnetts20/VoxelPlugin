@@ -1,4 +1,5 @@
 ﻿#include "AdaptiveVoxelActor.h"
+#include "PlanetActor.h"
 #include "DrawDebugHelpers.h"
 #include "Kismet/GameplayStatics.h"
 #include "TimerManager.h"
@@ -44,10 +45,11 @@ void AAdaptiveVoxelActor::OnConstruction(const FTransform& Transform)
 {
     Super::OnConstruction(Transform);
 
+    // When owned by a PlanetActor, skip self-init — planet calls InitializeFromPlanet.
+    if (GetOwner() && GetOwner()->IsA<APlanetActor>()) return;
+
     if (GetWorld() && !GetWorld()->IsPreviewWorld() && bTickInEditor)
     {
-        // Only reconstruct if not yet initialized or scale changed.
-        // Position/rotation are handled live by the actor transform.
         if (!Initialized || !GetActorScale3D().Equals(LastInitScale, 0.01))
         {
             Initialize();
@@ -58,6 +60,7 @@ void AAdaptiveVoxelActor::OnConstruction(const FTransform& Transform)
 void AAdaptiveVoxelActor::BeginPlay()
 {
     Super::BeginPlay();
+    if (GetOwner() && GetOwner()->IsA<APlanetActor>()) return;
     Initialize();
 }
 
@@ -225,6 +228,67 @@ void AAdaptiveVoxelActor::Initialize()
     LastInitScale = GetActorScale3D();
     Initialized = true;
 
+    RunDataUpdateTask();
+}
+
+void AAdaptiveVoxelActor::InitializeFromPlanet(TSharedPtr<FDensitySampleCompositor> InCompositor)
+{
+    // Same teardown as Initialize
+    Initialized = false;
+    while (DataUpdateIsRunning || MeshUpdateIsRunning || EditUpdateIsRunning)
+        FPlatformProcess::Sleep(0.001f);
+
+    if (UWorld* World = GetWorld())
+        World->GetTimerManager().ClearTimer(DataUpdateTimerHandle);
+
+    if (AdaptiveOctree.IsValid())
+    {
+        AdaptiveOctree->Clear();
+        AdaptiveOctree.Reset();
+    }
+    CleanSceneRoot();
+
+    // Scale = planet radius, same as standalone Initialize
+    double ActorPlanetRadius = GetActorScale3D().GetMax();
+    double ActorNoiseAmplitude = ActorPlanetRadius * NoiseAmplitudeRatio;
+    double ActorRootExtent = (ActorPlanetRadius + ActorNoiseAmplitude) * 1.05;
+
+    // Auto-derive MaxDepth
+    {
+        double Ratio = 2.0 * ActorRootExtent / TargetPrecision;
+        int32 IdealDepth = (int32)FMath::CeilToInt(FMath::Log2(Ratio));
+        MaxDepth = FMath::Clamp(IdealDepth, MinDepth, MaxKeyDepth);
+        ActualPrecision = 2.0 * ActorRootExtent / FMath::Pow(2.0, (double)MaxDepth);
+    }
+
+    // Auto-derive ChunkDepth
+    {
+        constexpr double FloatEps = 1.19e-7;
+        constexpr double MaxFloatError = 1.0;
+        double Ratio = ActorRootExtent * FloatEps / MaxFloatError;
+        int32 IdealChunkDepth = (Ratio > 1.0) ? (int32)FMath::CeilToInt(FMath::Log2(Ratio)) : 2;
+        ChunkDepth = FMath::Clamp(IdealChunkDepth, 2, 5);
+        MinDepth = FMath::Max(MinDepth, ChunkDepth);
+    }
+
+    // Use the planet-provided compositor (shared noise + edit store)
+    PendingParams = MakeShared<FOctreeParams>();
+    PendingParams->ParentActor = this;
+    PendingParams->MeshAttachmentRoot = MeshAttachmentRoot;
+    PendingParams->SurfaceMaterial = SurfaceMaterial;
+    PendingParams->Compositor = InCompositor;
+    PendingParams->PlanetRadius = ActorPlanetRadius;
+    PendingParams->NoiseAmplitude = ActorNoiseAmplitude;
+    PendingParams->ChunkDepth = ChunkDepth;
+    PendingParams->MinDepth = MinDepth;
+    PendingParams->MaxDepth = MaxDepth;
+    PendingParams->PrecisionDepthFloor = PrecisionDepthFloor;
+    PendingParams->ChunkCullingMode = (ChunkCullingMode == EChunkCullingMode::Volume)
+        ? EOctreeChunkCulling::Volume : EOctreeChunkCulling::Surface;
+    PendingParams->VolumeSdfRadius = VolumeSdfRadius;
+
+    LastInitScale = GetActorScale3D();
+    Initialized = true;
     RunDataUpdateTask();
 }
 

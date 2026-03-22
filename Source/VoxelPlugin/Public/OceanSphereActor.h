@@ -102,6 +102,11 @@ public:
     virtual bool ShouldTickIfViewportsOnly() const override;
     virtual void Tick(float DeltaTime) override;
 
+    // Called by APlanetActor — uses the provided compositor instead of creating one.
+    // The actor's own scale must already be set to the desired ocean radius.
+    // TerrainPlanetRadius and NoiseAmplitudeRatio must be set before calling.
+    void InitializeFromPlanet(TSharedPtr<FDensitySampleCompositor> InCompositor);
+
 private:
     TSharedPtr<FOceanQuadTreeNode> RootNodes[6];
     TMap<TSharedPtr<FOceanQuadTreeNode>, TSharedPtr<FOceanMeshChunk>> ChunkMap;

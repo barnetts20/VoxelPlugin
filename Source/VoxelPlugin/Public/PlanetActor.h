@@ -1,41 +1,89 @@
-// Fill out your copyright notice in the Description page of Project Settings.
-
 #pragma once
 
 #include "CoreMinimal.h"
 #include "GameFramework/Actor.h"
 #include "AdaptiveVoxelActor.h"
 #include "OceanSphereActor.h"
+#include "FDensitySampleCompositor.h"
 #include "FSparseEditStore.h"
-
+#include "FastNoise/FastNoise.h"
 #include "PlanetActor.generated.h"
 
 UCLASS()
 class VOXELPLUGIN_API APlanetActor : public AActor
 {
-	GENERATED_BODY()
-	
-public:	
-	// Sets default values for this actor's properties
-	APlanetActor();
-	double PlanetRadius;
-	double NoiseScale;
-	double NoiseAmplitude;
-	double SeaLevel;
+    GENERATED_BODY()
 
-protected:
+public:
+    APlanetActor();
 
-	AAdaptiveVoxelActor* PlanetSurfaceActor;
-	AOceanSphereActor* OceanSurfaceActor;
-	TSharedPtr<FSparseEditStore> EditStore;
-	
-	TFunction<void(int streamSize, const float* xStream, const float* yStream, const float* zStream, float* sampleOut)> NoiseFunction;
-	TFunction<void(int streamSize, const float* xStream, const float* yStream, const float* zStream, float* densityOut)> DensityFunction;
-	// Called when the game starts or when spawned
-	virtual void BeginPlay() override;
+    // Root component — provides the transform gizmo in the editor.
+    // Scale.GetMax() = planet radius in cm.
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Planet")
+    TObjectPtr<USceneComponent> PlanetRoot;
 
-public:	
-	// Called every frame
-	virtual void Tick(float DeltaTime) override;
+    // ------- Shape -------
 
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Planet|Shape",
+        meta = (ClampMin = "0.01", ClampMax = "1.0"))
+    double NoiseAmplitudeRatio = 0.25;
+
+    // Sea level as a fraction of the noise distribution [0, 1].
+    // 0 = ocean at PlanetRadius (lowest terrain), 1 = ocean at PlanetRadius + NoiseAmplitude.
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Planet|Shape",
+        meta = (ClampMin = "0.0", ClampMax = "1.0"))
+    double SeaLevel = 0.5;
+
+    // ------- Ocean -------
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Planet|Ocean")
+    bool bEnableOcean = true;
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Planet|Ocean")
+    UMaterialInterface* OceanMaterial = nullptr;
+
+    // ------- Terrain -------
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Planet|Terrain")
+    UMaterialInterface* TerrainMaterial = nullptr;
+
+    // ------- Accessors -------
+
+    UFUNCTION(BlueprintCallable, Category = "Planet")
+    AAdaptiveVoxelActor* GetTerrainActor() const { return TerrainActor; }
+
+    UFUNCTION(BlueprintCallable, Category = "Planet")
+    AOceanSphereActor* GetOceanActor() const { return OceanActor; }
+
+    virtual void OnConstruction(const FTransform& Transform) override;
+    virtual void BeginPlay() override;
+    virtual void BeginDestroy() override;
+    virtual bool ShouldTickIfViewportsOnly() const override { return true; }
+    virtual void Tick(float DeltaTime) override;
+
+private:
+    UPROPERTY()
+    AAdaptiveVoxelActor* TerrainActor = nullptr;
+
+    UPROPERTY()
+    AOceanSphereActor* OceanActor = nullptr;
+
+    FastNoise::SmartNode<> Noise;
+
+    FVector LastInitScale = FVector::ZeroVector;
+    double LastSeaLevel = -1.0;
+    double LastNoiseAmplitudeRatio = -1.0;
+    bool bLastEnableOcean = true;
+    bool bInitialized = false;
+    bool bPendingInitialize = true;
+    bool bPendingOceanUpdate = false;
+
+    void Initialize();
+    void SpawnChildActors();
+    void DestroyChildActors();
+
+    TSharedPtr<FDensitySampleCompositor> BuildCompositor(double PlanetRadius,
+        double NoiseAmplitude, double RootExtent, int32 ChunkDepth, int32 MaxDepth);
+
+    double ComputeOceanRadius(double PlanetRadius, double NoiseAmplitude) const;
 };

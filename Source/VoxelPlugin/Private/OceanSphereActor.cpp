@@ -1,4 +1,5 @@
 ﻿#include "OceanSphereActor.h"
+#include "PlanetActor.h"
 #include "FOceanQuadTreeNode.h"
 #include "FDensitySampleCompositor.h"
 #include "Kismet/GameplayStatics.h"
@@ -19,6 +20,7 @@ AOceanSphereActor::AOceanSphereActor()
 void AOceanSphereActor::OnConstruction(const FTransform& Transform)
 {
     Super::OnConstruction(Transform);
+    if (GetOwner() && GetOwner()->IsA<APlanetActor>()) return;
     if (bIsInitializing) return;
     if (!GetWorld() || GetWorld()->IsPreviewWorld() || !bTickInEditor) return;
     if (!bInitialized
@@ -30,6 +32,7 @@ void AOceanSphereActor::OnConstruction(const FTransform& Transform)
 void AOceanSphereActor::BeginPlay()
 {
     Super::BeginPlay();
+    if (GetOwner() && GetOwner()->IsA<APlanetActor>()) return;
     Initialize();
 }
 
@@ -154,6 +157,57 @@ void AOceanSphereActor::Initialize()
     // All 6 faces are built together so the ocean appears all at once.
     bPendingBuild = true;
 
+    LastInitScale = GetActorScale3D();
+    LastTerrainPlanetRadius = TerrainPlanetRadius;
+    bInitialized = true;
+    bIsInitializing = false;
+    RunLodUpdateTask();
+}
+
+void AOceanSphereActor::InitializeFromPlanet(TSharedPtr<FDensitySampleCompositor> InCompositor)
+{
+    // Same teardown as Initialize
+    bIsInitializing = true;
+    bInitialized = false;
+    ++InitGeneration;
+
+    if (UWorld* W = GetWorld())
+        W->GetTimerManager().ClearTimer(LodTimerHandle);
+
+    bLodUpdateRunning = false;
+    MeshGridCache.Empty();
+    CleanupComponents();
+    ChunkMap.Empty();
+    for (int32 i = 0; i < 6; ++i)
+        RootNodes[i].Reset();
+
+    // Scale = ocean radius, same as standalone Initialize
+    double ActorRadius = GetActorScale3D().GetMax();
+    OceanRadius = ActorRadius;
+
+    // Auto-derive MaxDepth
+    {
+        double EffectiveRes = FMath::Max((double)(FaceResolution - 1), 1.0);
+        double Ratio = 2.0 * OceanRadius / (EffectiveRes * TargetPrecision);
+        int32 IdealDepth = (int32)FMath::CeilToInt(FMath::Log2(Ratio));
+        MaxDepth = FMath::Clamp(IdealDepth, MinDepth, MaxKeyDepth);
+        ActualPrecision = 2.0 * OceanRadius / (EffectiveRes * FMath::Pow(2.0, (double)MaxDepth));
+    }
+
+    // Auto-derive ChunkDepth
+    {
+        constexpr double FloatEps = 1.19e-7;
+        constexpr double MaxFloatError = 1.0;
+        double Ratio = 2.0 * OceanRadius * FloatEps / MaxFloatError;
+        int32 IdealChunkDepth = (Ratio > 1.0) ? (int32)FMath::CeilToInt(FMath::Log2(Ratio)) : 2;
+        ChunkDepth = FMath::Clamp(IdealChunkDepth, 2, 5);
+        MinDepth = FMath::Max(MinDepth, ChunkDepth);
+    }
+
+    // Use the planet-provided compositor (shared noise + edit store)
+    Compositor = InCompositor;
+
+    bPendingBuild = true;
     LastInitScale = GetActorScale3D();
     LastTerrainPlanetRadius = TerrainPlanetRadius;
     bInitialized = true;

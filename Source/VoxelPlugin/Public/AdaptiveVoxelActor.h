@@ -134,6 +134,10 @@ public:
 
     virtual void Tick(float DeltaTime) override;
 
+    // Called by APlanetActor — uses the provided compositor instead of creating one.
+    // The actor's own scale must already be set to the desired planet radius.
+    void InitializeFromPlanet(TSharedPtr<FDensitySampleCompositor> InCompositor);
+
 protected:
     std::atomic<bool> DataUpdateIsRunning = false;
 
