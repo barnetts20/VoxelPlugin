@@ -6,6 +6,19 @@
 #include "FAdaptiveOctreeNode.h"
 #include <FDensitySampleCompositor.h>
 
+// Controls how SplitToDepth decides which nodes to recurse into.
+enum class EOctreeChunkCulling : uint8
+{
+    // Only split nodes with density sign changes at their corners.
+    // Optimal for continuous surfaces (planets, terrain).
+    Surface,
+
+    // Split all nodes whose AABB overlaps a control volume (sphere SDF).
+    // Required for discontinuous/scattered surfaces (debris fields, asteroid clusters)
+    // where features may be smaller than the coarse node size.
+    Volume
+};
+
 struct VOXELPLUGIN_API FOctreeParams {
     // --- Rendering ---
     ARealtimeMeshActor* ParentActor = nullptr;
@@ -36,6 +49,16 @@ struct VOXELPLUGIN_API FOctreeParams {
     // from parent corner densities. The noise loses precision past this depth,
     // but deeper splits still provide geometric detail for editing.
     int PrecisionDepthFloor = 21;
+
+    // --- Chunk Culling ---
+    EOctreeChunkCulling ChunkCullingMode = EOctreeChunkCulling::Surface;
+
+    // Center of the control volume for Volume culling mode.
+    // Defaults to origin (root center).
+    FVector VolumeSdfCenter = FVector::ZeroVector;
+
+    // Radius of the control volume sphere SDF. 0 = use RootExtent.
+    double VolumeSdfRadius = 0.0;
 };
 
 /**
@@ -68,6 +91,11 @@ private:
     // Beyond this depth, noise sampling is replaced by interpolation from parent densities.
     int PrecisionDepthFloor;
 
+    // Chunk culling strategy
+    EOctreeChunkCulling ChunkCullingMode;
+    FVector VolumeSdfCenter;
+    double VolumeSdfRadius;
+
     // Centralized terrain parameters -- derived from FOctreeParams at construction
     double PlanetRadius;    // Minimum surface radius (noise only adds elevation)
     double NoiseAmplitude;  // Maximum noise displacement above PlanetRadius
@@ -79,6 +107,8 @@ private:
     void SplitToDepth(FAdaptiveOctreeNode* Node, int InMinDepth);
 
     void PopulateChunks();
+
+    void CollectVolumeChunks(FAdaptiveOctreeNode* Node, TArray<TSharedPtr<FAdaptiveOctreeNode>>& Out);
 
     void UpdateChunkMap(TSharedPtr<FAdaptiveOctreeNode> ChunkNode, TArray<TPair<TSharedPtr<FAdaptiveOctreeNode>, TSharedPtr<FMeshChunk>>>& OutDirtyChunks);
 

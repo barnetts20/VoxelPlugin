@@ -9,6 +9,9 @@ FAdaptiveOctree::FAdaptiveOctree(const FOctreeParams& Params)
     Compositor = Params.Compositor;
     ChunkDepth = Params.ChunkDepth;
     PrecisionDepthFloor = Params.PrecisionDepthFloor;
+    ChunkCullingMode = Params.ChunkCullingMode;
+    VolumeSdfCenter = Params.VolumeSdfCenter;
+    VolumeSdfRadius = (Params.VolumeSdfRadius > 0.0) ? Params.VolumeSdfRadius : RootExtent;
 
     // Core terrain parameters from params
     PlanetRadius = Params.PlanetRadius;
@@ -41,38 +44,87 @@ void FAdaptiveOctree::SplitToDepth(FAdaptiveOctreeNode* Node, int InMinDepth)
         SplitAndComputeChildren(Node);
         for (int i = 0; i < 8; i++)
         {
-            // Only recurse into children that contain the surface.
-            // NOTE: This can miss thin features where the surface passes through
-            // a node without crossing any of its 8 corners. For planet-scale terrain
-            // this is fine (surface is continuous), but for small structures like
-            // asteroids, an exhaustive split mode may be needed.
-            if (Node->Children[i] && Node->Children[i]->IsSurfaceNode)
+            if (!Node->Children[i]) continue;
+
+            bool bShouldRecurse = false;
+            if (ChunkCullingMode == EOctreeChunkCulling::Surface)
             {
-                SplitToDepth(Node->Children[i].Get(), InMinDepth);
+                // Only recurse into children that contain the surface.
+                // Can miss thin features smaller than the node size — use Volume
+                // mode for scattered/discontinuous surfaces like debris fields.
+                bShouldRecurse = Node->Children[i]->IsSurfaceNode;
             }
+            else // Volume
+            {
+                // Recurse if the child's AABB overlaps the control sphere SDF.
+                FVector CC = Node->Children[i]->Center;
+                double CE = Node->Children[i]->Extent;
+                FVector Closest(
+                    FMath::Clamp(VolumeSdfCenter.X, CC.X - CE, CC.X + CE),
+                    FMath::Clamp(VolumeSdfCenter.Y, CC.Y - CE, CC.Y + CE),
+                    FMath::Clamp(VolumeSdfCenter.Z, CC.Z - CE, CC.Z + CE));
+                bShouldRecurse = FVector::DistSquared(Closest, VolumeSdfCenter) <= VolumeSdfRadius * VolumeSdfRadius;
+            }
+
+            if (bShouldRecurse)
+                SplitToDepth(Node->Children[i].Get(), InMinDepth);
         }
     }
 }
 
+void FAdaptiveOctree::CollectVolumeChunks(FAdaptiveOctreeNode* Node, TArray<TSharedPtr<FAdaptiveOctreeNode>>& Out)
+{
+    if (!Node) return;
+
+    // AABB-sphere overlap test
+    FVector Closest(
+        FMath::Clamp(VolumeSdfCenter.X, Node->Center.X - Node->Extent, Node->Center.X + Node->Extent),
+        FMath::Clamp(VolumeSdfCenter.Y, Node->Center.Y - Node->Extent, Node->Center.Y + Node->Extent),
+        FMath::Clamp(VolumeSdfCenter.Z, Node->Center.Z - Node->Extent, Node->Center.Z + Node->Extent));
+    if (FVector::DistSquared(Closest, VolumeSdfCenter) > VolumeSdfRadius * VolumeSdfRadius)
+        return;
+
+    if (Node->Index.Depth == ChunkDepth)
+    {
+        Out.Add(Node->AsShared());
+        return;
+    }
+
+    if (Node->IsLeaf()) return;
+
+    for (int i = 0; i < 8; i++)
+        CollectVolumeChunks(Node->Children[i].Get(), Out);
+}
+
 void FAdaptiveOctree::PopulateChunks()
 {
-    TArray<TSharedPtr<FAdaptiveOctreeNode>> Chunks = Root->GetSurfaceChunks();
-    TArray<TSharedPtr<FAdaptiveOctreeNode>> NeighborChunks;
-    for (auto& ChunkNode : Chunks)
-    {
-        if (!ChunkNode.IsValid()) continue;
+    TArray<TSharedPtr<FAdaptiveOctreeNode>> Chunks;
 
-        const double Offset = ChunkNode->Extent * 2.0;
-        for (int i = 0; i < 6; i++)
+    if (ChunkCullingMode == EOctreeChunkCulling::Surface)
+    {
+        // Surface mode: collect surface chunks + neighbor buffers
+        Chunks = Root->GetSurfaceChunks();
+        TArray<TSharedPtr<FAdaptiveOctreeNode>> NeighborChunks;
+        for (auto& ChunkNode : Chunks)
         {
-            FVector NeighborPos = ChunkNode->Center + OctreeConstants::Directions[i] * Offset;
-            FAdaptiveOctreeNode* NeighborNode = GetLeafNodeByPoint(NeighborPos);
-            if (!NeighborNode) continue;
-            if (!NeighborNode->IsSurfaceNode)
-                NeighborChunks.AddUnique(NeighborNode->AsShared());
+            if (!ChunkNode.IsValid()) continue;
+            const double Offset = ChunkNode->Extent * 2.0;
+            for (int i = 0; i < 6; i++)
+            {
+                FVector NeighborPos = ChunkNode->Center + OctreeConstants::Directions[i] * Offset;
+                FAdaptiveOctreeNode* NeighborNode = GetLeafNodeByPoint(NeighborPos);
+                if (!NeighborNode) continue;
+                if (!NeighborNode->IsSurfaceNode)
+                    NeighborChunks.AddUnique(NeighborNode->AsShared());
+            }
         }
+        Chunks.Append(NeighborChunks);
     }
-    Chunks.Append(NeighborChunks);
+    else // Volume
+    {
+        // Volume mode: collect all chunk-depth nodes whose AABB overlaps the control sphere.
+        CollectVolumeChunks(Root.Get(), Chunks);
+    }
 
     // Process all chunk data in bulk -- parallel
     ParallelFor(Chunks.Num(), [&](int32 i) {
@@ -431,8 +483,9 @@ void FAdaptiveOctree::ReconstructSubtree(FAdaptiveOctreeNode* Node, FVector Edit
 
     // 5. Propagate densities into children beyond the precision depth floor.
     //    Floor-level nodes now have fresh noise+edit densities from step 4.
-    //    Deeper children get noise interpolated from parent corners, with edit-store
-    //    contributions stripped before interpolation and re-sampled at full resolution.
+    //    Deeper children are purely interpolated from parent corners � no noise
+    //    re-sampling, no edit-store re-sampling. The parent values already contain
+    //    both contributions baked in at the correct (floor-level) resolution.
     PropagateDeepDensities(Node, EditCenter, SearchRadius);
 
     // 6. Finalize edges/QEF
@@ -466,6 +519,7 @@ void FAdaptiveOctree::UpdateMeshChunkStreamData(TSharedPtr<FMeshChunk> InChunk)
     TMap<FMeshVertex, int32> VertexMap;
     TArray<FMeshVertex> UniqueVertices;
     TArray<FIndex3UI> SrfTriangles;
+    TArray<FIndex3UI> OcnTriangles;
 
     VertexMap.Reserve(1024);
     UniqueVertices.Reserve(1024);
@@ -473,6 +527,8 @@ void FAdaptiveOctree::UpdateMeshChunkStreamData(TSharedPtr<FMeshChunk> InChunk)
 
     TArray<FEdgeVertexData> AllEdgeData;
     AllEdgeData.SetNum(InChunk->ChunkEdges.Num());
+
+    double OceanTriThreshold = -NoiseAmplitude;
 
     ParallelFor(InChunk->ChunkEdges.Num(), [&](int32 edgeIdx) {
         const FNodeEdge currentEdge = InChunk->ChunkEdges[edgeIdx];

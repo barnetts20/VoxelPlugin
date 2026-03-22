@@ -21,10 +21,9 @@ struct VOXELPLUGIN_API FMeshVertex
 
     bool operator==(const FMeshVertex& Other) const
     {
-        // Quantize to the same grid as FEdgeKey for consistent deduplication
-        return FEdgeKey::Quantize(Position.X) == FEdgeKey::Quantize(Other.Position.X)
-            && FEdgeKey::Quantize(Position.Y) == FEdgeKey::Quantize(Other.Position.Y)
-            && FEdgeKey::Quantize(Position.Z) == FEdgeKey::Quantize(Other.Position.Z);
+        // Exact comparison on position -- no epsilon needed since vertices
+        // at the same dual contour point have identical double values.
+        return Position == Other.Position;
     }
 };
 
@@ -192,11 +191,5 @@ struct VOXELPLUGIN_API FMeshChunk {
 
 FORCEINLINE uint32 GetTypeHash(const FMeshVertex& Vertex)
 {
-    int32 QX = FEdgeKey::Quantize(Vertex.Position.X);
-    int32 QY = FEdgeKey::Quantize(Vertex.Position.Y);
-    int32 QZ = FEdgeKey::Quantize(Vertex.Position.Z);
-    uint32 Hash = ::GetTypeHash(QX);
-    Hash = HashCombine(Hash, ::GetTypeHash(QY));
-    Hash = HashCombine(Hash, ::GetTypeHash(QZ));
-    return Hash;
+    return FCrc::MemCrc32(&Vertex.Position, sizeof(FVector));
 }

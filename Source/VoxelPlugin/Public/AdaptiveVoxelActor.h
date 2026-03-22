@@ -13,6 +13,15 @@
 
 using namespace RealtimeMesh;
 
+UENUM(BlueprintType)
+enum class EChunkCullingMode : uint8
+{
+    // Only process nodes with density sign changes. Optimal for continuous surfaces (planets).
+    Surface     UMETA(DisplayName = "Surface"),
+    // Process all nodes within a control volume sphere. Required for scattered surfaces (debris fields).
+    Volume      UMETA(DisplayName = "Volume")
+};
+
 UCLASS()
 class VOXELPLUGIN_API AAdaptiveVoxelActor : public ARealtimeMeshActor
 {
@@ -39,6 +48,8 @@ private:
 
     FRWLock OctreeLock;
 
+    bool TickInEditor = true;
+
     std::atomic<bool> Initialized = false;
 
     std::atomic<bool> IsDestroyed = false;
@@ -49,8 +60,8 @@ private:
 public:
     AAdaptiveVoxelActor();
 
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrain|Materials")
-    UMaterialInterface* SurfaceMaterial = nullptr;
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Materials")
+    UMaterialInterface* SurfaceMaterial;
 
     // Planet radius in world units is determined by actor scale (max component).
     // The octree is built at world scale in actor-local space (origin 0,0,0).
@@ -60,28 +71,25 @@ public:
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrain", meta = (ClampMin = "0.01", ClampMax = "1.0"))
     double NoiseAmplitudeRatio = 0.25;
 
-    // Computed at init time from float precision requirements.
-    // Deep enough that FVector3f vertex offsets from chunk center have < 1cm error.
-    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Terrain|Octree")
+    //UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Octree")
     int ChunkDepth = 5;
 
-    // Minimum LOD depth. Clamped to at least ChunkDepth at init time.
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrain|Octree")
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Octree")
     int MinDepth = 7;
 
     // Target voxel spacing in world units (cm). MaxDepth is computed automatically
     // so the finest LOD voxel cells are approximately this size.
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrain|Octree",
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Octree",
         meta = (ClampMin = "1.0"))
     double TargetPrecision = 100.0;
 
     // Computed from TargetPrecision and planet radius at init time.
     // Clamped to [MinDepth, MaxKeyDepth].
-    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Terrain|Octree")
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Octree")
     int MaxDepth = 18;
 
     // The actual voxel spacing (cm) achieved at MaxDepth after key-limit clamping.
-    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Terrain|Octree")
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Octree")
     double ActualPrecision = 0.0;
 
     // Hard limit imposed by FMortonIndex (3 bits per level, 126 bits across two uint64s).
@@ -90,21 +98,35 @@ public:
     // Depth beyond which noise sampling is replaced by trilinear interpolation
     // from parent corner densities. Noise loses float precision past this depth,
     // but deeper splits still provide geometric detail for editing.
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrain|Octree",
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Octree",
         meta = (ClampMin = "1"))
     int32 PrecisionDepthFloor = 21;
 
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrain|LOD")
+    // Controls how the octree decides which nodes to split to chunk depth.
+    // Surface: only split where the surface crosses node corners (planets).
+    // Volume: split all nodes within a control sphere (debris fields, asteroids).
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrain|Octree")
+    EChunkCullingMode ChunkCullingMode = EChunkCullingMode::Surface;
+
+    // Radius of the control volume for Volume culling mode.
+    // 0 = use the full octree root extent. Only relevant when ChunkCullingMode = Volume.
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrain|Octree",
+        meta = (EditCondition = "ChunkCullingMode == EChunkCullingMode::Volume", ClampMin = "0.0"))
+    double VolumeSdfRadius = 0.0;
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "LOD")
     double ScreenSpaceThreshold = .065;
 
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrain|LOD")
+    // Adjusted threshold that compensates for the delta between TargetPrecision
+    // and ActualPrecision. Keeps LOD ring distances consistent across scales.
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "LOD")
+    double EffectiveScreenSpaceThreshold = .075;
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "LOD")
     double MinDataUpdateInterval = .1;
 
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrain|LOD")
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "LOD")
     double VelocityLookAheadFactor = 8;
-
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrain|LOD")
-    bool bTickInEditor = true;
 
     virtual void OnConstruction(const FTransform& Transform) override;
 

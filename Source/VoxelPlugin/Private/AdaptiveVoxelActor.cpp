@@ -44,7 +44,7 @@ void AAdaptiveVoxelActor::OnConstruction(const FTransform& Transform)
 {
     Super::OnConstruction(Transform);
 
-    if (GetWorld() && !GetWorld()->IsPreviewWorld() && bTickInEditor)
+    if (GetWorld() && !GetWorld()->IsPreviewWorld() && TickInEditor)
     {
         // Only reconstruct if not yet initialized or scale changed.
         // Position/rotation are handled live by the actor transform.
@@ -218,6 +218,9 @@ void AAdaptiveVoxelActor::Initialize()
     PendingParams->MinDepth = MinDepth;
     PendingParams->MaxDepth = MaxDepth;
     PendingParams->PrecisionDepthFloor = PrecisionDepthFloor;
+    PendingParams->ChunkCullingMode = (ChunkCullingMode == EChunkCullingMode::Volume)
+        ? EOctreeChunkCulling::Volume : EOctreeChunkCulling::Surface;
+    PendingParams->VolumeSdfRadius = VolumeSdfRadius;
 
     LastInitScale = GetActorScale3D();
     Initialized = true;
@@ -334,7 +337,7 @@ void AAdaptiveVoxelActor::RunEditUpdateTask(FVector InEditCenter, double InEditR
 
 bool AAdaptiveVoxelActor::ShouldTickIfViewportsOnly() const
 {
-    return bTickInEditor && Initialized;
+    return TickInEditor && Initialized;
 }
 
 void AAdaptiveVoxelActor::Tick(float DeltaTime)
