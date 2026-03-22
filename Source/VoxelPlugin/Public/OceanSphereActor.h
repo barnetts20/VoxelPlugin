@@ -39,7 +39,9 @@ public:
         meta = (ClampMin = "3"))
     int32 FaceResolution = 3;
 
-    // Chunk depth for the ocean quadtree. Will be auto-derived in a future pass.
+    // Computed at init time from float precision requirements.
+    // Deep enough that FVector3f vertex offsets from ChunkAnchorCenter have < 1cm error.
+    // Clamped to [2, 5].
     int32 ChunkDepth = 4;
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Ocean|LOD")

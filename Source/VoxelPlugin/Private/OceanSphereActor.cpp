@@ -97,6 +97,19 @@ void AOceanSphereActor::Initialize()
         ActualPrecision = 2.0 * OceanRadius / (EffectiveRes * FMath::Pow(2.0, (double)MaxDepth));
     }
 
+    // Compute ChunkDepth from float precision requirements.
+    // Vertex positions are FVector3f relative to ChunkAnchorCenter.
+    // ChunkWorldExtent = 2 * OceanRadius / 2^ChunkDepth.
+    // Need: ChunkWorldExtent * FLT_EPSILON < 1cm
+    {
+        constexpr double FloatEps = 1.19e-7;
+        constexpr double MaxFloatError = 1.0;
+        double Ratio = 2.0 * OceanRadius * FloatEps / MaxFloatError;
+        int32 IdealChunkDepth = (Ratio > 1.0) ? (int32)FMath::CeilToInt(FMath::Log2(Ratio)) : 2;
+        ChunkDepth = FMath::Clamp(IdealChunkDepth, 2, 5);
+        MinDepth = FMath::Max(MinDepth, ChunkDepth);
+    }
+
     Noise = FastNoise::NewFromEncodedNodeTree("GQAgAB8AEwCamRk+DQAMAAAAAAAAQAcAAAAAAD8AAAAAAAAAAAA/AAAAAD8AAAAAvwAAAAA/ARsAFwCamRk+AAAAPwAAAAAAAAA/IAAgABMAAABAQBsAJAACAAAADQAIAAAAAAAAQAsAAQAAAAAAAAABAAAAAAAAAAAAAIA/AAAAAD8AAAAAAAAAAIA/AAAAAAAAmpmZPgCamRk+AM3MTD4BEwDNzEw+IAAfABcAAACAvwAAgD8AAIDAAAAAPw8AAQAAAAAAAED//wEAAAAAAD8AAAAAAAAAAIA/AAAAAD8AAACAvwAAAAA/");
 
     auto HeightmapLayer = [NoiseNode = Noise, PlanetRadius = TerrainPlanetRadius, NoiseAmplitude = TerrainNoiseAmplitude]
