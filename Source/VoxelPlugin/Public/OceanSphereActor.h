@@ -41,7 +41,7 @@ public:
 
     // Computed at init time from float precision requirements.
     // Deep enough that FVector3f vertex offsets from ChunkAnchorCenter have < 1cm error.
-    // Clamped to [2, 5].
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Ocean|LOD")
     int32 ChunkDepth = 4;
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Ocean|LOD")
@@ -79,12 +79,12 @@ public:
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Ocean|LOD")
     bool bTickInEditor = true;
 
-    // Chunks where the maximum vertex depth (cm) is below this threshold are culled.
-    // Negative values allow chunks that are somewhat above the ocean surface (land) to render.
-    // 0 = cull any chunk with no underwater vertices at all.
-    // e.g. -500000 = cull only chunks more than 5km above the ocean surface.
+    // Per-triangle depth threshold for culling. Triangles where all 3 vertices
+    // have depth below this value are culled. Negative values extend the ocean
+    // mesh skirt above the waterline to prevent WPO waves from exposing gaps.
+    // e.g. -50000 = keep triangles up to 500m above the ocean surface.
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Ocean|Culling")
-    float ChunkCullingDepthThreshold = 0.f;
+    float TriangleCullDepthThreshold = -10000.f;
 
     FVector GetCameraPosition() const { return CameraPosition; }
     double  GetCameraFOV()      const { return CameraFOV; }

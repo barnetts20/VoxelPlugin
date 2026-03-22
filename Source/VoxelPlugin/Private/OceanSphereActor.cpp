@@ -97,19 +97,6 @@ void AOceanSphereActor::Initialize()
         ActualPrecision = 2.0 * OceanRadius / (EffectiveRes * FMath::Pow(2.0, (double)MaxDepth));
     }
 
-    // Compute ChunkDepth from float precision requirements.
-    // Vertex positions are FVector3f relative to ChunkAnchorCenter.
-    // ChunkWorldExtent = 2 * OceanRadius / 2^ChunkDepth.
-    // Need: ChunkWorldExtent * FLT_EPSILON < 1cm
-    {
-        constexpr double FloatEps = 1.19e-7;
-        constexpr double MaxFloatError = 1.0;
-        double Ratio = 2.0 * OceanRadius * FloatEps / MaxFloatError;
-        int32 IdealChunkDepth = (Ratio > 1.0) ? (int32)FMath::CeilToInt(FMath::Log2(Ratio)) : 2;
-        ChunkDepth = FMath::Clamp(IdealChunkDepth, 2, 5);
-        MinDepth = FMath::Max(MinDepth, ChunkDepth);
-    }
-
     Noise = FastNoise::NewFromEncodedNodeTree("GQAgAB8AEwCamRk+DQAMAAAAAAAAQAcAAAAAAD8AAAAAAAAAAAA/AAAAAD8AAAAAvwAAAAA/ARsAFwCamRk+AAAAPwAAAAAAAAA/IAAgABMAAABAQBsAJAACAAAADQAIAAAAAAAAQAsAAQAAAAAAAAABAAAAAAAAAAAAAIA/AAAAAD8AAAAAAAAAAIA/AAAAAAAAmpmZPgCamRk+AM3MTD4BEwDNzEw+IAAfABcAAACAvwAAgD8AAIDAAAAAPw8AAQAAAAAAAED//wEAAAAAAD8AAAAAAAAAAIA/AAAAAD8AAACAvwAAAAA/");
 
     auto HeightmapLayer = [NoiseNode = Noise, PlanetRadius = TerrainPlanetRadius, NoiseAmplitude = TerrainNoiseAmplitude]
@@ -261,40 +248,13 @@ void AOceanSphereActor::RebuildChunkStreamData(
     AOceanSphereActor* Actor = ChunkNode->Owner;
     FDensitySampleCompositor* Comp = Actor ? Actor->GetCompositor().Get() : nullptr;
 
-    const float CullThreshold = Actor ? Actor->ChunkCullingDepthThreshold : 0.f;
+    const float TriCullThreshold = Actor ? Actor->TriangleCullDepthThreshold : -10000.f;
     const int32 Res = Actor ? Actor->FaceResolution : 3;
     const int32 ExtRes = Res + 2;
     const int32 Total = ExtRes * ExtRes;
 
     TArray<TSharedPtr<FOceanQuadTreeNode>> Leaves;
     FOceanQuadTreeNode::CollectLeaves(ChunkNode, Leaves);
-
-    // ---------------------------------------------------------------------------
-    // Chunk-level cull: check max depth across all leaves before doing any work.
-    // ---------------------------------------------------------------------------
-    {
-        float ChunkMaxDepth = -FLT_MAX;
-        for (auto& Leaf : Leaves)
-            ChunkMaxDepth = FMath::Max(ChunkMaxDepth, Leaf->MaxVertexDepth);
-
-        if (ChunkMaxDepth < CullThreshold)
-        {
-            TSharedPtr<FOceanStreamData> EmptyInner = MakeShared<FOceanStreamData>();
-            EmptyInner->MeshGroupKey = Chunk->InnerMeshData->MeshGroupKey;
-            EmptyInner->MeshSectionKey = Chunk->InnerMeshData->MeshSectionKey;
-            Chunk->InnerMeshData = EmptyInner;
-
-            TSharedPtr<FOceanStreamData> EmptyEdge = MakeShared<FOceanStreamData>();
-            EmptyEdge->MeshGroupKey = Chunk->EdgeMeshData->MeshGroupKey;
-            EmptyEdge->MeshSectionKey = Chunk->EdgeMeshData->MeshSectionKey;
-            Chunk->EdgeMeshData = EmptyEdge;
-
-            Chunk->IsCulled = true;
-            Chunk->IsDirty = true;
-            return;
-        }
-    }
-    Chunk->IsCulled = false;
 
     // ---------------------------------------------------------------------------
     // Inner stream
@@ -326,6 +286,7 @@ void AOceanSphereActor::RebuildChunkStreamData(
 
     // ---------------------------------------------------------------------------
     // Per-leaf: generate vertex data on the fly, emit triangles from grid cache.
+    // Triangles where all 3 vertices are above water (depth < 0) are culled.
     // ---------------------------------------------------------------------------
     for (auto& Leaf : Leaves)
     {
@@ -337,7 +298,7 @@ void AOceanSphereActor::RebuildChunkStreamData(
         TArray<float>     LeafDepth; LeafDepth.SetNumUninitialized(Total);
         TArray<FColor>    LeafColor; LeafColor.SetNumUninitialized(Total);
 
-        // Stage 1: positions, normals, UVs, sphere positions for sampling
+        // Stage 1: positions, normals, sphere positions for sampling
         TArray<float> SX, SY, SZ;
         SX.SetNumUninitialized(Total);
         SY.SetNumUninitialized(Total);
@@ -397,7 +358,7 @@ void AOceanSphereActor::RebuildChunkStreamData(
             Leaf->MaxVertexDepth = 0.f;
         }
 
-        // Stage 3: emit inner triangles from grid cache
+        // Stage 3: emit inner triangles — cull if all 3 verts above water
         const FOceanMeshGrid& Grid = Actor->GetMeshGrid(Res);
         const bool bFlip = Leaf->FaceTransform.bFlipWinding;
 
@@ -405,6 +366,9 @@ void AOceanSphereActor::RebuildChunkStreamData(
         {
             if (bFlip)
                 Tri = FIndex3UI(Tri.V0, Tri.V2, Tri.V1);
+
+            if (LeafDepth[Tri.V0] < TriCullThreshold && LeafDepth[Tri.V1] < TriCullThreshold && LeafDepth[Tri.V2] < TriCullThreshold)
+                continue;
 
             for (int32 v = 0; v < 3; ++v)
             {
@@ -420,8 +384,7 @@ void AOceanSphereActor::RebuildChunkStreamData(
             InnerPG.Add(0);
         }
 
-        // Stage 4: emit edge stitch triangles
-        // Edge variant index: bLeft|(bRight<<1)|(bTop<<2)|(bBottom<<3)
+        // Stage 4: emit edge stitch triangles — same per-tri cull
         uint8 EdgeFlags =
             ((Leaf->GetDepth() > Leaf->NeighborLods[(uint8)EdgeOrientation::LEFT]) ? 0x1 : 0) |
             ((Leaf->GetDepth() > Leaf->NeighborLods[(uint8)EdgeOrientation::RIGHT]) ? 0x2 : 0) |
@@ -432,6 +395,9 @@ void AOceanSphereActor::RebuildChunkStreamData(
         {
             if (bFlip)
                 Tri = FIndex3UI(Tri.V0, Tri.V2, Tri.V1);
+
+            if (LeafDepth[Tri.V0] < TriCullThreshold && LeafDepth[Tri.V1] < TriCullThreshold && LeafDepth[Tri.V2] < TriCullThreshold)
+                continue;
 
             for (int32 v = 0; v < 3; ++v)
             {
@@ -538,8 +504,20 @@ void AOceanSphereActor::RunLodUpdateTask()
                     TSharedPtr<FOceanQuadTreeNode> ChunkNode = ChunkNodes[idx];
                     if (!ChunkNode.IsValid()) return;
 
-                    // Skip culled chunks
-                    if (MeshChunks[idx]->IsCulled) return;
+                    // Back-face cull: skip chunks on the far side of the planet.
+                    // If the chunk center and camera are on opposite sides of the origin,
+                    // and the angle between them exceeds ~78 degrees, skip LOD work.
+                    double Dot = FVector::DotProduct(Predicted, ChunkNode->SphereCenter);
+                    if (Dot < 0.0)
+                    {
+                        double CamDistSq = Predicted.SizeSquared();
+                        double NodeDistSq = ChunkNode->SphereCenter.SizeSquared();
+                        if ((Dot * Dot) > (0.04 * CamDistSq * NodeDistSq))
+                        {
+                            FOceanQuadTreeNode::CollectLeaves(ChunkNode, AllChunkLeaves[idx]);
+                            return;
+                        }
+                    }
 
                     double DistSq = FMath::Max(FVector::DistSquared(ChunkNode->SphereCenter, Predicted), 1e-12);
                     double ChunkLhs = 2.0 * ChunkNode->WorldExtent * FOVScale;
@@ -586,7 +564,6 @@ void AOceanSphereActor::RunLodUpdateTask()
             ParallelFor(NumChunks, [&](int32 idx)
                 {
                     if (Self->InitGeneration != CapturedGen) return;
-                    if (MeshChunks[idx]->IsCulled) return;
                     bool bAnyEdgeChanged = false;
                     for (auto& Leaf : AllChunkLeaves[idx])
                         if (Leaf->CheckNeighbors())
