@@ -1,7 +1,6 @@
 #pragma once
 
 #include "CoreMinimal.h"
-#include "CoreMinimal.h"
 #include <RealtimeMeshCore.h>
 #include <RealtimeMeshSimple.h>
 #include "FOceanSharedStructs.generated.h"
@@ -14,24 +13,6 @@ using namespace RealtimeMesh;
 // AOceanSphereActor.  Extracted from PlanetSharedStructs; all planet-
 // specific noise / parameter structs have been removed.
 // ---------------------------------------------------------------------------
-
-// ---------------------------------------------------------------------------
-// Mesh stream builder bundle
-// ---------------------------------------------------------------------------
-
-struct VOXELPLUGIN_API FMeshStreamBuilders
-{
-    TRealtimeMeshStreamBuilder<FVector, FVector3f>* PositionBuilder = nullptr;
-    TRealtimeMeshStreamBuilder<FRealtimeMeshTangentsHighPrecision,
-        FRealtimeMeshTangentsNormalPrecision>* TangentBuilder = nullptr;
-    TRealtimeMeshStreamBuilder<FVector2f, FVector2DHalf>* TexCoordsBuilder = nullptr;
-    TRealtimeMeshStreamBuilder<FColor>* ColorBuilder = nullptr;
-    TRealtimeMeshStreamBuilder<TIndex3<uint32>>* TrianglesBuilder = nullptr;
-    TRealtimeMeshStreamBuilder<uint32, uint16>* PolygroupsBuilder = nullptr;
-
-    int32 NumVerts = 0;
-    int32 NumTriangles = 0;
-};
 
 // ---------------------------------------------------------------------------
 // Edge / face orientation enums
@@ -237,17 +218,6 @@ struct VOXELPLUGIN_API FQuadIndex
         FQuadIndex neighborParent = parent.GetNeighborIndex(Direction);
         uint8      reflected = ReflectQuadrant(quadrant, Direction);
         return neighborParent.GetChildIndex(reflected);
-    }
-
-    FQuadIndex GetCrossFaceNeighbor(EdgeOrientation Direction) const
-    {
-        const FaceTransition& transition =
-            FCubeTransform::FaceTransforms[FaceId].FaceTransitions[(uint8)Direction];
-        uint64 newQuadrantPath = 0;
-        uint8  depth = GetDepth();
-        for (uint8 level = 0; level < depth; ++level)
-            newQuadrantPath = (newQuadrantPath << 2) | transition.QuadrantRemap[GetQuadrantAtDepth(level)];
-        return FQuadIndex((newQuadrantPath << 2) | SentinelBits, transition.TargetFace);
     }
 
     bool operator==(const FQuadIndex& Other) const

@@ -8,9 +8,6 @@
 #include "FastNoise/FastNoise.h"
 #include "OceanSphereActor.generated.h"
 
-class FOceanQuadTreeNode;
-struct FOceanMeshChunk;
-
 UCLASS()
 class VOXELPLUGIN_API AOceanSphereActor : public ARealtimeMeshActor
 {
@@ -42,7 +39,7 @@ public:
         meta = (ClampMin = "3"))
     int32 FaceResolution = 3;
 
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Ocean|LOD")
+    // Chunk depth for the ocean quadtree. Will be auto-derived in a future pass.
     int32 ChunkDepth = 2;
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Ocean|LOD")
@@ -103,10 +100,10 @@ public:
     virtual bool ShouldTickIfViewportsOnly() const override;
     virtual void Tick(float DeltaTime) override;
 
+private:
     TSharedPtr<FOceanQuadTreeNode> RootNodes[6];
     TMap<TSharedPtr<FOceanQuadTreeNode>, TSharedPtr<FOceanMeshChunk>> ChunkMap;
 
-private:
     UPROPERTY()
     TObjectPtr<USceneComponent> MeshAttachmentRoot;
 

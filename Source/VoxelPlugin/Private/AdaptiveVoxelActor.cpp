@@ -258,7 +258,7 @@ void AAdaptiveVoxelActor::RunDataUpdateTask()
                 FVector CurrentCamPos = Self->CameraPosition;
                 FVector Velocity = (CurrentCamPos - Self->LastLodUpdatePosition);
                 FVector PredictedPos = CurrentCamPos + (Velocity * Self->VelocityLookAheadFactor);
-                Self->AdaptiveOctree->UpdateLOD(PredictedPos, Self->EffectiveScreenSpaceThreshold, Self->CameraFOV);
+                Self->AdaptiveOctree->UpdateLOD(PredictedPos, Self->ScreenSpaceThreshold, Self->CameraFOV);
                 Self->LastLodUpdatePosition = Self->CameraPosition;
             }
             double elapsed = (FPlatformTime::Seconds() - t0) * 1000.0;
