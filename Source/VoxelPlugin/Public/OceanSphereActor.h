@@ -119,6 +119,7 @@ private:
     std::atomic<bool>   bInitialized = false;
     std::atomic<bool>   bIsDestroyed = false;
     std::atomic<bool>   bLodUpdateRunning = false;
+    std::atomic<bool>   bPendingBuild = false;
     std::atomic<uint32> InitGeneration = 0;
     bool                bIsInitializing = false;
 

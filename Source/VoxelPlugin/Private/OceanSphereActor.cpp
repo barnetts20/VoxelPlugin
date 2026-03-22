@@ -150,30 +150,9 @@ void AOceanSphereActor::Initialize()
     Compositor = MakeShared<FDensitySampleCompositor>();
     Compositor->AddSampleLayer(HeightmapLayer);
 
-    const double Size = 1000.0;
-    const double HalfSize = Size * 0.5;
-
-    const FVector FaceCenters[6] = {
-        FVector(HalfSize,        0,        0),
-        FVector(-HalfSize,        0,        0),
-        FVector(0,  HalfSize,        0),
-        FVector(0, -HalfSize,        0),
-        FVector(0,        0,  HalfSize),
-        FVector(0,        0, -HalfSize),
-    };
-
-    for (int32 i = 0; i < 6; ++i)
-    {
-        RootNodes[i] = MakeShared<FOceanQuadTreeNode>(
-            this, FCubeTransform::FaceTransforms[i], FQuadIndex((uint8)i),
-            FaceCenters[i], Size, OceanRadius, MinDepth, MaxDepth, ChunkDepth);
-        RootNodes[i]->ChunkAnchorCenter = RootNodes[i]->SphereCenter;
-    }
-
-    for (int32 i = 0; i < 6; ++i)
-        RootNodes[i]->SplitToDepth(ChunkDepth);
-
-    PopulateChunks();
+    // Deferred — heavy tree construction happens on the first LOD tick (background thread).
+    // All 6 faces are built together so the ocean appears all at once.
+    bPendingBuild = true;
 
     LastInitScale = GetActorScale3D();
     LastTerrainPlanetRadius = TerrainPlanetRadius;
@@ -474,6 +453,38 @@ void AOceanSphereActor::RunLodUpdateTask()
             {
                 if (Self) Self->bLodUpdateRunning = false;
                 return;
+            }
+
+            // Deferred construction — build all 6 face trees and populate chunks
+            // on the background thread so the ocean appears all at once.
+            if (Self->bPendingBuild)
+            {
+                const double Size = 1000.0;
+                const double HalfSize = Size * 0.5;
+
+                const FVector FaceCenters[6] = {
+                    FVector(HalfSize,        0,        0),
+                    FVector(-HalfSize,        0,        0),
+                    FVector(0,  HalfSize,        0),
+                    FVector(0, -HalfSize,        0),
+                    FVector(0,        0,  HalfSize),
+                    FVector(0,        0, -HalfSize),
+                };
+
+                for (int32 i = 0; i < 6; ++i)
+                {
+                    Self->RootNodes[i] = MakeShared<FOceanQuadTreeNode>(
+                        Self, FCubeTransform::FaceTransforms[i], FQuadIndex((uint8)i),
+                        FaceCenters[i], Size, Self->OceanRadius,
+                        Self->MinDepth, Self->MaxDepth, Self->ChunkDepth);
+                    Self->RootNodes[i]->ChunkAnchorCenter = Self->RootNodes[i]->SphereCenter;
+                }
+
+                for (int32 i = 0; i < 6; ++i)
+                    Self->RootNodes[i]->SplitToDepth(Self->ChunkDepth);
+
+                Self->PopulateChunks();
+                Self->bPendingBuild = false;
             }
 
             FVector Velocity = Self->CameraPosition - Self->LastLodCameraPos;
