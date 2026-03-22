@@ -40,7 +40,7 @@ public:
     int32 FaceResolution = 3;
 
     // Chunk depth for the ocean quadtree. Will be auto-derived in a future pass.
-    int32 ChunkDepth = 2;
+    int32 ChunkDepth = 4;
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Ocean|LOD")
     int32 MinDepth = 2;
