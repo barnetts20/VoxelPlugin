@@ -308,7 +308,6 @@ void FOceanQuadTreeNode::Split(TSharedPtr<FOceanQuadTreeNode> inNode)
 
         Child->Parent = inNode.ToWeakPtr();
         Child->ChunkAnchorCenter = inNode->ChunkAnchorCenter;
-        Child->SampleMaxDepth();
         inNode->Children.Add(Child);
     }
 
@@ -371,7 +370,6 @@ void FOceanQuadTreeNode::SplitToDepth(int32 TargetDepth)
         else
             Child->ChunkAnchorCenter = ChunkAnchorCenter;
 
-        Child->SampleMaxDepth();
         Children.Add(Child);
     }
 

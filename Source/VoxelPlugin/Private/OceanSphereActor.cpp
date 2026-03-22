@@ -168,7 +168,6 @@ void AOceanSphereActor::Initialize()
             this, FCubeTransform::FaceTransforms[i], FQuadIndex((uint8)i),
             FaceCenters[i], Size, OceanRadius, MinDepth, MaxDepth, ChunkDepth);
         RootNodes[i]->ChunkAnchorCenter = RootNodes[i]->SphereCenter;
-        RootNodes[i]->SampleMaxDepth();
     }
 
     for (int32 i = 0; i < 6; ++i)

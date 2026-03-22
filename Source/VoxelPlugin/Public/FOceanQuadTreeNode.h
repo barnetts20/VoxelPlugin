@@ -143,7 +143,9 @@ public:
 
     // Max compositor depth (cm) sampled at the corners of this node's face.
     // Cheap proxy for culling � avoids full vertex rebuild just to check visibility.
-    float MaxVertexDepth = 0.f;
+    // Starts at FLT_MAX so chunks are never culled before their first real mesh build.
+    // Updated with actual vertex data during RebuildChunkStreamData.
+    float MaxVertexDepth = FLT_MAX;
 
     bool CanMerge = false;
     bool IsRestructuring = false;
