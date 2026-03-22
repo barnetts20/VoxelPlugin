@@ -134,9 +134,13 @@ public:
 
     virtual void Tick(float DeltaTime) override;
 
+    USceneComponent* GetMeshAttachmentRoot() const { return MeshAttachmentRoot; }
+
     // Called by APlanetActor — uses the provided compositor instead of creating one.
     // The actor's own scale must already be set to the desired planet radius.
-    void InitializeFromPlanet(TSharedPtr<FDensitySampleCompositor> InCompositor);
+    // If InAttachParent is provided, MeshAttachmentRoot is re-parented to it.
+    void InitializeFromPlanet(TSharedPtr<FDensitySampleCompositor> InCompositor,
+        USceneComponent* InAttachParent = nullptr);
 
 protected:
     std::atomic<bool> DataUpdateIsRunning = false;

@@ -164,7 +164,8 @@ void AOceanSphereActor::Initialize()
     RunLodUpdateTask();
 }
 
-void AOceanSphereActor::InitializeFromPlanet(TSharedPtr<FDensitySampleCompositor> InCompositor)
+void AOceanSphereActor::InitializeFromPlanet(TSharedPtr<FDensitySampleCompositor> InCompositor,
+    USceneComponent* InAttachParent)
 {
     // Same teardown as Initialize
     bIsInitializing = true;
@@ -180,6 +181,13 @@ void AOceanSphereActor::InitializeFromPlanet(TSharedPtr<FDensitySampleCompositor
     ChunkMap.Empty();
     for (int32 i = 0; i < 6; ++i)
         RootNodes[i].Reset();
+
+    // Re-parent MeshAttachmentRoot to the planet's component hierarchy.
+    if (InAttachParent && MeshAttachmentRoot)
+    {
+        MeshAttachmentRoot->AttachToComponent(InAttachParent,
+            FAttachmentTransformRules::KeepWorldTransform);
+    }
 
     // Scale = ocean radius, same as standalone Initialize
     double ActorRadius = GetActorScale3D().GetMax();

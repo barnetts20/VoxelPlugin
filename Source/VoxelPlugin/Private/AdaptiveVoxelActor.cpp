@@ -231,7 +231,8 @@ void AAdaptiveVoxelActor::Initialize()
     RunDataUpdateTask();
 }
 
-void AAdaptiveVoxelActor::InitializeFromPlanet(TSharedPtr<FDensitySampleCompositor> InCompositor)
+void AAdaptiveVoxelActor::InitializeFromPlanet(TSharedPtr<FDensitySampleCompositor> InCompositor,
+    USceneComponent* InAttachParent)
 {
     // Same teardown as Initialize
     Initialized = false;
@@ -247,6 +248,14 @@ void AAdaptiveVoxelActor::InitializeFromPlanet(TSharedPtr<FDensitySampleComposit
         AdaptiveOctree.Reset();
     }
     CleanSceneRoot();
+
+    // Re-parent MeshAttachmentRoot to the planet's component hierarchy.
+    // This ensures mesh chunks follow the planet's position/rotation directly.
+    if (InAttachParent && MeshAttachmentRoot)
+    {
+        MeshAttachmentRoot->AttachToComponent(InAttachParent,
+            FAttachmentTransformRules::KeepWorldTransform);
+    }
 
     // Scale = planet radius, same as standalone Initialize
     double ActorPlanetRadius = GetActorScale3D().GetMax();

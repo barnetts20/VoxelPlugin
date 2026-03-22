@@ -1,4 +1,4 @@
-#include "PlanetActor.h"
+ï»¿#include "PlanetActor.h"
 #include "Kismet/GameplayStatics.h"
 
 APlanetActor::APlanetActor()
@@ -16,7 +16,7 @@ APlanetActor::APlanetActor()
 void APlanetActor::BeginPlay()
 {
     Super::BeginPlay();
-    // bPendingInitialize defaults to true — first Tick calls Initialize.
+    // bPendingInitialize defaults to true ï¿½ first Tick calls Initialize.
 }
 
 void APlanetActor::BeginDestroy()
@@ -30,7 +30,7 @@ void APlanetActor::OnConstruction(const FTransform& Transform)
     Super::OnConstruction(Transform);
     if (!GetWorld() || GetWorld()->IsPreviewWorld()) return;
 
-    // Flag for deferred work in Tick — never spawn actors during OnConstruction.
+    // Flag for deferred work in Tick ï¿½ never spawn actors during OnConstruction.
     if (!bInitialized
         || !GetActorScale3D().Equals(LastInitScale, 0.01)
         || NoiseAmplitudeRatio != LastNoiseAmplitudeRatio)
@@ -47,7 +47,7 @@ void APlanetActor::Tick(float DeltaTime)
 {
     Super::Tick(DeltaTime);
 
-    // Deferred init — safe to spawn actors here.
+    // Deferred init ï¿½ safe to spawn actors here.
     if (bPendingInitialize)
     {
         bPendingInitialize = false;
@@ -68,7 +68,7 @@ void APlanetActor::Tick(float DeltaTime)
             OceanActor->SetActorScale3D(FVector(NewOceanRadius));
             OceanActor->TerrainPlanetRadius = PlanetRadius;
             OceanActor->NoiseAmplitudeRatio = NoiseAmplitudeRatio;
-            OceanActor->InitializeFromPlanet(OceanActor->GetCompositor());
+            OceanActor->InitializeFromPlanet(OceanActor->GetCompositor(), PlanetRoot);
             OceanActor->SetActorHiddenInGame(false);
             OceanActor->SetActorTickEnabled(true);
         }
@@ -122,20 +122,21 @@ void APlanetActor::Initialize()
         BuildCompositor(PlanetRadius, NoiseAmplitude, RootExtent, TempChunkDepth, TempMaxDepth);
 
     // --- Terrain actor ---
-    // Set its scale = actual planet radius. Its Initialize reads GetActorScale3D().
     TerrainActor->SetActorScale3D(FVector(PlanetRadius));
-    TerrainActor->SurfaceMaterial = TerrainMaterial;
+    if (TerrainMaterial)
+        TerrainActor->SurfaceMaterial = TerrainMaterial;
     TerrainActor->NoiseAmplitudeRatio = NoiseAmplitudeRatio;
-    TerrainActor->InitializeFromPlanet(SharedCompositor);
+    TerrainActor->InitializeFromPlanet(SharedCompositor, PlanetRoot);
 
     // --- Ocean actor ---
     if (bEnableOcean && OceanActor)
     {
         OceanActor->SetActorScale3D(FVector(OceanRadiusValue));
-        OceanActor->OceanMaterial = OceanMaterial;
+        if (OceanMaterial)
+            OceanActor->OceanMaterial = OceanMaterial;
         OceanActor->TerrainPlanetRadius = PlanetRadius;
         OceanActor->NoiseAmplitudeRatio = NoiseAmplitudeRatio;
-        OceanActor->InitializeFromPlanet(SharedCompositor);
+        OceanActor->InitializeFromPlanet(SharedCompositor, PlanetRoot);
         OceanActor->SetActorHiddenInGame(false);
         OceanActor->SetActorTickEnabled(true);
     }
@@ -235,11 +236,6 @@ void APlanetActor::SpawnChildActors()
             AAdaptiveVoxelActor::StaticClass(),
             FTransform(GetActorRotation(), GetActorLocation()),
             SpawnParams);
-        // Position/rotation inherit from planet. Scale is absolute so
-        // SetActorScale3D sets the actual world-space radius, not relative to parent.
-        if (USceneComponent* Root = TerrainActor->GetRootComponent())
-            Root->SetAbsolute(false, false, true);
-        TerrainActor->AttachToActor(this, FAttachmentTransformRules::KeepWorldTransform);
     }
 
     if (!OceanActor)
@@ -248,23 +244,20 @@ void APlanetActor::SpawnChildActors()
             AOceanSphereActor::StaticClass(),
             FTransform(GetActorRotation(), GetActorLocation()),
             SpawnParams);
-        if (USceneComponent* Root = OceanActor->GetRootComponent())
-            Root->SetAbsolute(false, false, true);
-        OceanActor->AttachToActor(this, FAttachmentTransformRules::KeepWorldTransform);
     }
 
-    // Load default materials if none set
+    // Load default materials if none set â€” paths reference plugin Content folder
     if (!TerrainMaterial)
     {
         TerrainMaterial = Cast<UMaterialInterface>(
             StaticLoadObject(UMaterialInterface::StaticClass(), nullptr,
-                TEXT("/Game/Materials/MT_TriPlanar.MT_TriPlanar")));
+                TEXT("/VoxelPlugin/MT_TriPlanar.MT_TriPlanar")));
     }
     if (!OceanMaterial)
     {
         OceanMaterial = Cast<UMaterialInterface>(
             StaticLoadObject(UMaterialInterface::StaticClass(), nullptr,
-                TEXT("/Game/Materials/MT_Ocean.MT_Ocean")));
+                TEXT("/VoxelPlugin/MT_Ocean.MT_Ocean")));
     }
 }
 

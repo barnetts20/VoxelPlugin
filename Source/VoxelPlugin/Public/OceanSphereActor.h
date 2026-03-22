@@ -103,9 +103,9 @@ public:
     virtual void Tick(float DeltaTime) override;
 
     // Called by APlanetActor — uses the provided compositor instead of creating one.
-    // The actor's own scale must already be set to the desired ocean radius.
-    // TerrainPlanetRadius and NoiseAmplitudeRatio must be set before calling.
-    void InitializeFromPlanet(TSharedPtr<FDensitySampleCompositor> InCompositor);
+    // If InAttachParent is provided, MeshAttachmentRoot is re-parented to it.
+    void InitializeFromPlanet(TSharedPtr<FDensitySampleCompositor> InCompositor,
+        USceneComponent* InAttachParent = nullptr);
 
 private:
     TSharedPtr<FOceanQuadTreeNode> RootNodes[6];
