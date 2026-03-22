@@ -41,6 +41,11 @@ void FAdaptiveOctree::SplitToDepth(FAdaptiveOctreeNode* Node, int InMinDepth)
         SplitAndComputeChildren(Node);
         for (int i = 0; i < 8; i++)
         {
+            // Only recurse into children that contain the surface.
+            // NOTE: This can miss thin features where the surface passes through
+            // a node without crossing any of its 8 corners. For planet-scale terrain
+            // this is fine (surface is continuous), but for small structures like
+            // asteroids, an exhaustive split mode may be needed.
             if (Node->Children[i] && Node->Children[i]->IsSurfaceNode)
             {
                 SplitToDepth(Node->Children[i].Get(), InMinDepth);
@@ -426,9 +431,8 @@ void FAdaptiveOctree::ReconstructSubtree(FAdaptiveOctreeNode* Node, FVector Edit
 
     // 5. Propagate densities into children beyond the precision depth floor.
     //    Floor-level nodes now have fresh noise+edit densities from step 4.
-    //    Deeper children are purely interpolated from parent corners � no noise
-    //    re-sampling, no edit-store re-sampling. The parent values already contain
-    //    both contributions baked in at the correct (floor-level) resolution.
+    //    Deeper children get noise interpolated from parent corners, with edit-store
+    //    contributions stripped before interpolation and re-sampled at full resolution.
     PropagateDeepDensities(Node, EditCenter, SearchRadius);
 
     // 6. Finalize edges/QEF
@@ -462,7 +466,6 @@ void FAdaptiveOctree::UpdateMeshChunkStreamData(TSharedPtr<FMeshChunk> InChunk)
     TMap<FMeshVertex, int32> VertexMap;
     TArray<FMeshVertex> UniqueVertices;
     TArray<FIndex3UI> SrfTriangles;
-    TArray<FIndex3UI> OcnTriangles;
 
     VertexMap.Reserve(1024);
     UniqueVertices.Reserve(1024);
@@ -470,8 +473,6 @@ void FAdaptiveOctree::UpdateMeshChunkStreamData(TSharedPtr<FMeshChunk> InChunk)
 
     TArray<FEdgeVertexData> AllEdgeData;
     AllEdgeData.SetNum(InChunk->ChunkEdges.Num());
-
-    double OceanTriThreshold = -NoiseAmplitude;
 
     ParallelFor(InChunk->ChunkEdges.Num(), [&](int32 edgeIdx) {
         const FNodeEdge currentEdge = InChunk->ChunkEdges[edgeIdx];

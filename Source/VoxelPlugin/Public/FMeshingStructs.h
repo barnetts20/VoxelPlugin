@@ -15,17 +15,16 @@ struct VOXELPLUGIN_API FCornerSample {
 
 struct VOXELPLUGIN_API FMeshVertex
 {
-    FVector Position;       // Quantized position (chunk-local)
-    FVector NormalizedPosition; // Projected onto planet radius sphere surface
+    FVector Position;       // Chunk-local position
     FVector Normal;
     FColor Color;
-    double Depth;
-    FVector2f UV;
 
     bool operator==(const FMeshVertex& Other) const
     {
-        // Exact comparison on quantized position -- no epsilon needed
-        return Position == Other.Position;
+        // Quantize to the same grid as FEdgeKey for consistent deduplication
+        return FEdgeKey::Quantize(Position.X) == FEdgeKey::Quantize(Other.Position.X)
+            && FEdgeKey::Quantize(Position.Y) == FEdgeKey::Quantize(Other.Position.Y)
+            && FEdgeKey::Quantize(Position.Z) == FEdgeKey::Quantize(Other.Position.Z);
     }
 };
 
@@ -193,5 +192,11 @@ struct VOXELPLUGIN_API FMeshChunk {
 
 FORCEINLINE uint32 GetTypeHash(const FMeshVertex& Vertex)
 {
-    return FCrc::MemCrc32(&Vertex.Position, sizeof(FVector));
+    int32 QX = FEdgeKey::Quantize(Vertex.Position.X);
+    int32 QY = FEdgeKey::Quantize(Vertex.Position.Y);
+    int32 QZ = FEdgeKey::Quantize(Vertex.Position.Z);
+    uint32 Hash = ::GetTypeHash(QX);
+    Hash = HashCombine(Hash, ::GetTypeHash(QY));
+    Hash = HashCombine(Hash, ::GetTypeHash(QZ));
+    return Hash;
 }

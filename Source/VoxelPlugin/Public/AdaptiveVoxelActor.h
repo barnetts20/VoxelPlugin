@@ -1,4 +1,4 @@
-#pragma once
+ï»¿#pragma once
 
 #include "CoreMinimal.h"
 #include "FastNoise/FastNoise.h"
@@ -21,7 +21,7 @@ class VOXELPLUGIN_API AAdaptiveVoxelActor : public ARealtimeMeshActor
 private:
     TSharedPtr<FAdaptiveOctree> AdaptiveOctree;
 
-    // Deferred construction — params are stored on Initialize (game thread),
+    // Deferred construction ï¿½ params are stored on Initialize (game thread),
     // octree is built on the first RunDataUpdateTask (background thread).
     TSharedPtr<FOctreeParams> PendingParams;
 
@@ -39,8 +39,6 @@ private:
 
     FRWLock OctreeLock;
 
-    bool TickInEditor = true;
-
     std::atomic<bool> Initialized = false;
 
     std::atomic<bool> IsDestroyed = false;
@@ -51,8 +49,8 @@ private:
 public:
     AAdaptiveVoxelActor();
 
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Materials")
-    UMaterialInterface* SurfaceMaterial;
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrain|Materials")
+    UMaterialInterface* SurfaceMaterial = nullptr;
 
     // Planet radius in world units is determined by actor scale (max component).
     // The octree is built at world scale in actor-local space (origin 0,0,0).
@@ -62,25 +60,28 @@ public:
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrain", meta = (ClampMin = "0.01", ClampMax = "1.0"))
     double NoiseAmplitudeRatio = 0.25;
 
-    //UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Octree")
+    // Computed at init time from float precision requirements.
+    // Deep enough that FVector3f vertex offsets from chunk center have < 1cm error.
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Terrain|Octree")
     int ChunkDepth = 5;
 
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Octree")
+    // Minimum LOD depth. Clamped to at least ChunkDepth at init time.
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrain|Octree")
     int MinDepth = 7;
 
     // Target voxel spacing in world units (cm). MaxDepth is computed automatically
     // so the finest LOD voxel cells are approximately this size.
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Octree",
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrain|Octree",
         meta = (ClampMin = "1.0"))
     double TargetPrecision = 100.0;
 
     // Computed from TargetPrecision and planet radius at init time.
     // Clamped to [MinDepth, MaxKeyDepth].
-    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Octree")
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Terrain|Octree")
     int MaxDepth = 18;
 
     // The actual voxel spacing (cm) achieved at MaxDepth after key-limit clamping.
-    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Octree")
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Terrain|Octree")
     double ActualPrecision = 0.0;
 
     // Hard limit imposed by FMortonIndex (3 bits per level, 126 bits across two uint64s).
@@ -89,23 +90,21 @@ public:
     // Depth beyond which noise sampling is replaced by trilinear interpolation
     // from parent corner densities. Noise loses float precision past this depth,
     // but deeper splits still provide geometric detail for editing.
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Octree",
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrain|Octree",
         meta = (ClampMin = "1"))
     int32 PrecisionDepthFloor = 21;
 
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "LOD")
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrain|LOD")
     double ScreenSpaceThreshold = .065;
 
-    // Adjusted threshold that compensates for the delta between TargetPrecision
-    // and ActualPrecision. Keeps LOD ring distances consistent across scales.
-    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "LOD")
-    double EffectiveScreenSpaceThreshold = .075;
-
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "LOD")
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrain|LOD")
     double MinDataUpdateInterval = .1;
 
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "LOD")
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrain|LOD")
     double VelocityLookAheadFactor = 8;
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrain|LOD")
+    bool bTickInEditor = true;
 
     virtual void OnConstruction(const FTransform& Transform) override;
 

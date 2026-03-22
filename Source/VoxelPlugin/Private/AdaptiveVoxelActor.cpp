@@ -44,7 +44,7 @@ void AAdaptiveVoxelActor::OnConstruction(const FTransform& Transform)
 {
     Super::OnConstruction(Transform);
 
-    if (GetWorld() && !GetWorld()->IsPreviewWorld() && TickInEditor)
+    if (GetWorld() && !GetWorld()->IsPreviewWorld() && bTickInEditor)
     {
         // Only reconstruct if not yet initialized or scale changed.
         // Position/rotation are handled live by the actor transform.
@@ -115,7 +115,6 @@ void AAdaptiveVoxelActor::Initialize()
         int32 IdealDepth = (int32)FMath::CeilToInt(FMath::Log2(Ratio));
         MaxDepth = FMath::Clamp(IdealDepth, MinDepth, MaxKeyDepth);
         ActualPrecision = 2.0 * ActorRootExtent / FMath::Pow(2.0, (double)MaxDepth);
-        EffectiveScreenSpaceThreshold = ScreenSpaceThreshold * (TargetPrecision / FMath::Max(ActualPrecision, 1.0));
     }
 
     // Compute ChunkDepth from float precision requirements.
@@ -335,7 +334,7 @@ void AAdaptiveVoxelActor::RunEditUpdateTask(FVector InEditCenter, double InEditR
 
 bool AAdaptiveVoxelActor::ShouldTickIfViewportsOnly() const
 {
-    return TickInEditor && Initialized;
+    return bTickInEditor && Initialized;
 }
 
 void AAdaptiveVoxelActor::Tick(float DeltaTime)
