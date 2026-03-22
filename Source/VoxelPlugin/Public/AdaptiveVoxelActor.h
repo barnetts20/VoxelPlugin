@@ -48,7 +48,7 @@ private:
 
     FRWLock OctreeLock;
 
-    bool TickInEditor = true;
+    bool bTickInEditor = true;
 
     std::atomic<bool> Initialized = false;
 
@@ -60,8 +60,8 @@ private:
 public:
     AAdaptiveVoxelActor();
 
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Materials")
-    UMaterialInterface* SurfaceMaterial;
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrain|Materials")
+    UMaterialInterface* SurfaceMaterial = nullptr;
 
     // Planet radius in world units is determined by actor scale (max component).
     // The octree is built at world scale in actor-local space (origin 0,0,0).
@@ -71,25 +71,26 @@ public:
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrain", meta = (ClampMin = "0.01", ClampMax = "1.0"))
     double NoiseAmplitudeRatio = 0.25;
 
-    //UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Octree")
+    // Computed at init time from float precision requirements.
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Terrain|Octree")
     int ChunkDepth = 5;
 
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Octree")
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrain|Octree")
     int MinDepth = 7;
 
     // Target voxel spacing in world units (cm). MaxDepth is computed automatically
     // so the finest LOD voxel cells are approximately this size.
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Octree",
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrain|Octree",
         meta = (ClampMin = "1.0"))
     double TargetPrecision = 100.0;
 
     // Computed from TargetPrecision and planet radius at init time.
     // Clamped to [MinDepth, MaxKeyDepth].
-    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Octree")
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Terrain|Octree")
     int MaxDepth = 18;
 
     // The actual voxel spacing (cm) achieved at MaxDepth after key-limit clamping.
-    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Octree")
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Terrain|Octree")
     double ActualPrecision = 0.0;
 
     // Hard limit imposed by FMortonIndex (3 bits per level, 126 bits across two uint64s).
@@ -98,7 +99,7 @@ public:
     // Depth beyond which noise sampling is replaced by trilinear interpolation
     // from parent corner densities. Noise loses float precision past this depth,
     // but deeper splits still provide geometric detail for editing.
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Octree",
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrain|Octree",
         meta = (ClampMin = "1"))
     int32 PrecisionDepthFloor = 21;
 
@@ -114,18 +115,13 @@ public:
         meta = (EditCondition = "ChunkCullingMode == EChunkCullingMode::Volume", ClampMin = "0.0"))
     double VolumeSdfRadius = 0.0;
 
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "LOD")
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrain|LOD")
     double ScreenSpaceThreshold = .065;
 
-    // Adjusted threshold that compensates for the delta between TargetPrecision
-    // and ActualPrecision. Keeps LOD ring distances consistent across scales.
-    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "LOD")
-    double EffectiveScreenSpaceThreshold = .075;
-
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "LOD")
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrain|LOD")
     double MinDataUpdateInterval = .1;
 
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "LOD")
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrain|LOD")
     double VelocityLookAheadFactor = 8;
 
     virtual void OnConstruction(const FTransform& Transform) override;

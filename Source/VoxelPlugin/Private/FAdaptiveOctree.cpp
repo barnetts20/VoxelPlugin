@@ -11,7 +11,6 @@ FAdaptiveOctree::FAdaptiveOctree(const FOctreeParams& Params)
     PrecisionDepthFloor = Params.PrecisionDepthFloor;
     ChunkCullingMode = Params.ChunkCullingMode;
     VolumeSdfCenter = Params.VolumeSdfCenter;
-    VolumeSdfRadius = (Params.VolumeSdfRadius > 0.0) ? Params.VolumeSdfRadius : RootExtent;
 
     // Core terrain parameters from params
     PlanetRadius = Params.PlanetRadius;
@@ -20,6 +19,9 @@ FAdaptiveOctree::FAdaptiveOctree(const FOctreeParams& Params)
     // Derive root extent: must contain all possible surface points
     RootExtent = (PlanetRadius + NoiseAmplitude) * Params.RootExtentBuffer;
     ChunkExtent = RootExtent / FMath::Pow(2.0, (double)Params.ChunkDepth);
+
+    // Must be set after RootExtent is computed
+    VolumeSdfRadius = (Params.VolumeSdfRadius > 0.0) ? Params.VolumeSdfRadius : RootExtent;
 
     // Configure edge key quantization for this tree's scale.
     // Maps the smallest possible corner spacing to ~1 grid unit.
@@ -483,9 +485,8 @@ void FAdaptiveOctree::ReconstructSubtree(FAdaptiveOctreeNode* Node, FVector Edit
 
     // 5. Propagate densities into children beyond the precision depth floor.
     //    Floor-level nodes now have fresh noise+edit densities from step 4.
-    //    Deeper children are purely interpolated from parent corners � no noise
-    //    re-sampling, no edit-store re-sampling. The parent values already contain
-    //    both contributions baked in at the correct (floor-level) resolution.
+    //    Deeper children get noise interpolated from parent corners, with edit-store
+    //    contributions stripped before interpolation and re-sampled at full resolution.
     PropagateDeepDensities(Node, EditCenter, SearchRadius);
 
     // 6. Finalize edges/QEF
@@ -519,7 +520,6 @@ void FAdaptiveOctree::UpdateMeshChunkStreamData(TSharedPtr<FMeshChunk> InChunk)
     TMap<FMeshVertex, int32> VertexMap;
     TArray<FMeshVertex> UniqueVertices;
     TArray<FIndex3UI> SrfTriangles;
-    TArray<FIndex3UI> OcnTriangles;
 
     VertexMap.Reserve(1024);
     UniqueVertices.Reserve(1024);
@@ -527,8 +527,6 @@ void FAdaptiveOctree::UpdateMeshChunkStreamData(TSharedPtr<FMeshChunk> InChunk)
 
     TArray<FEdgeVertexData> AllEdgeData;
     AllEdgeData.SetNum(InChunk->ChunkEdges.Num());
-
-    double OceanTriThreshold = -NoiseAmplitude;
 
     ParallelFor(InChunk->ChunkEdges.Num(), [&](int32 edgeIdx) {
         const FNodeEdge currentEdge = InChunk->ChunkEdges[edgeIdx];

@@ -44,7 +44,7 @@ void AAdaptiveVoxelActor::OnConstruction(const FTransform& Transform)
 {
     Super::OnConstruction(Transform);
 
-    if (GetWorld() && !GetWorld()->IsPreviewWorld() && TickInEditor)
+    if (GetWorld() && !GetWorld()->IsPreviewWorld() && bTickInEditor)
     {
         // Only reconstruct if not yet initialized or scale changed.
         // Position/rotation are handled live by the actor transform.
@@ -337,7 +337,7 @@ void AAdaptiveVoxelActor::RunEditUpdateTask(FVector InEditCenter, double InEditR
 
 bool AAdaptiveVoxelActor::ShouldTickIfViewportsOnly() const
 {
-    return TickInEditor && Initialized;
+    return bTickInEditor && Initialized;
 }
 
 void AAdaptiveVoxelActor::Tick(float DeltaTime)
