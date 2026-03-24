@@ -1,5 +1,4 @@
 ﻿#include "OceanSphereActor.h"
-#include "PlanetActor.h"
 #include "FOceanQuadTreeNode.h"
 #include "FDensitySampleCompositor.h"
 #include "Kismet/GameplayStatics.h"
@@ -20,7 +19,6 @@ AOceanSphereActor::AOceanSphereActor()
 void AOceanSphereActor::OnConstruction(const FTransform& Transform)
 {
     Super::OnConstruction(Transform);
-    if (GetOwner() && GetOwner()->IsA<APlanetActor>()) return;
     if (bIsInitializing) return;
     if (!GetWorld() || GetWorld()->IsPreviewWorld() || !bTickInEditor) return;
     if (!bInitialized
@@ -32,7 +30,6 @@ void AOceanSphereActor::OnConstruction(const FTransform& Transform)
 void AOceanSphereActor::BeginPlay()
 {
     Super::BeginPlay();
-    if (GetOwner() && GetOwner()->IsA<APlanetActor>()) return;
     Initialize();
 }
 
@@ -69,6 +66,25 @@ const FOceanMeshGrid& AOceanSphereActor::GetMeshGrid(int32 Res)
 
 void AOceanSphereActor::Initialize()
 {
+    InitializeInternal(nullptr);
+}
+
+void AOceanSphereActor::InitializeFromPlanet(TSharedPtr<FDensitySampleCompositor> InCompositor,
+    USceneComponent* InAttachParent)
+{
+    // Re-parent MeshAttachmentRoot to the planet's component hierarchy
+    // so mesh chunks follow the planet's position/rotation.
+    if (InAttachParent && MeshAttachmentRoot)
+    {
+        MeshAttachmentRoot->AttachToComponent(InAttachParent,
+            FAttachmentTransformRules::KeepWorldTransform);
+    }
+
+    InitializeInternal(InCompositor);
+}
+
+void AOceanSphereActor::InitializeInternal(TSharedPtr<FDensitySampleCompositor> InCompositor)
+{
     bIsInitializing = true;
     bInitialized = false;
     ++InitGeneration;
@@ -89,9 +105,6 @@ void AOceanSphereActor::Initialize()
     double TerrainNoiseAmplitude = TerrainPlanetRadius * NoiseAmplitudeRatio;
 
     // Compute MaxDepth from TargetPrecision.
-    // At depth D, a leaf has cube-space size 1000/2^D with FaceResolution vertices,
-    // giving world-space vertex spacing ≈ (1000 / 2^D) / (FaceResolution - 1) * (OceanRadius / 500).
-    // Solve for D: D = ceil(log2(2 * OceanRadius / ((FaceResolution - 1) * TargetPrecision)))
     {
         double EffectiveRes = FMath::Max((double)(FaceResolution - 1), 1.0);
         double Ratio = 2.0 * OceanRadius / (EffectiveRes * TargetPrecision);
@@ -100,122 +113,93 @@ void AOceanSphereActor::Initialize()
         ActualPrecision = 2.0 * OceanRadius / (EffectiveRes * FMath::Pow(2.0, (double)MaxDepth));
     }
 
-    Noise = FastNoise::NewFromEncodedNodeTree("GQAgAB8AEwCamRk+DQAMAAAAAAAAQAcAAAAAAD8AAAAAAAAAAAA/AAAAAD8AAAAAvwAAAAA/ARsAFwCamRk+AAAAPwAAAAAAAAA/IAAgABMAAABAQBsAJAACAAAADQAIAAAAAAAAQAsAAQAAAAAAAAABAAAAAAAAAAAAAIA/AAAAAD8AAAAAAAAAAIA/AAAAAAAAmpmZPgCamRk+AM3MTD4BEwDNzEw+IAAfABcAAACAvwAAgD8AAIDAAAAAPw8AAQAAAAAAAED//wEAAAAAAD8AAAAAAAAAAIA/AAAAAD8AAACAvwAAAAA/");
+    if (InCompositor.IsValid())
+    {
+        // Use planet-provided compositor
+        Compositor = InCompositor;
+    }
+    else
+    {
+        // Standalone — build our own noise + compositor
+        Noise = FastNoise::NewFromEncodedNodeTree("GQAgAB8AEwCamRk+DQAMAAAAAAAAQAcAAAAAAD8AAAAAAAAAAAA/AAAAAD8AAAAAvwAAAAA/ARsAFwCamRk+AAAAPwAAAAAAAAA/IAAgABMAAABAQBsAJAACAAAADQAIAAAAAAAAQAsAAQAAAAAAAAABAAAAAAAAAAAAAIA/AAAAAD8AAAAAAAAAAIA/AAAAAAAAmpmZPgCamRk+AM3MTD4BEwDNzEw+IAAfABcAAACAvwAAgD8AAIDAAAAAPw8AAQAAAAAAAED//wEAAAAAAD8AAAAAAAAAAIA/AAAAAD8AAACAvwAAAAA/");
 
-    auto HeightmapLayer = [NoiseNode = Noise, PlanetRadius = TerrainPlanetRadius, NoiseAmplitude = TerrainNoiseAmplitude]
-    (const FSampleInput& Input, float* DensityOut)
-        {
-            int32 Count = Input.Num();
-            double InvNoiseAmplitude = 1.0 / NoiseAmplitude;
-            double RootExtent = (PlanetRadius + NoiseAmplitude) * 1.05;
-
-            constexpr int32 StackLimit = 64;
-            float  StackPX[StackLimit], StackPY[StackLimit], StackPZ[StackLimit], StackNoise[StackLimit];
-            double StackDist[StackLimit];
-            TArray<float>  HeapPX, HeapPY, HeapPZ, HeapNoise;
-            TArray<double> HeapDist;
-
-            float* PX; float* PY; float* PZ; float* NoiseOut; double* Distances;
-            if (Count <= StackLimit)
+        auto HeightmapLayer = [NoiseNode = Noise, PlanetRadius = TerrainPlanetRadius, NoiseAmplitude = TerrainNoiseAmplitude]
+        (const FSampleInput& Input, float* DensityOut)
             {
-                PX = StackPX; PY = StackPY; PZ = StackPZ; NoiseOut = StackNoise; Distances = StackDist;
-            }
-            else
-            {
-                HeapPX.SetNumUninitialized(Count); HeapPY.SetNumUninitialized(Count);
-                HeapPZ.SetNumUninitialized(Count); HeapNoise.SetNumUninitialized(Count);
-                HeapDist.SetNumUninitialized(Count);
-                PX = HeapPX.GetData(); PY = HeapPY.GetData(); PZ = HeapPZ.GetData();
-                NoiseOut = HeapNoise.GetData(); Distances = HeapDist.GetData();
-            }
+                int32 Count = Input.Num();
+                double InvNoiseAmplitude = 1.0 / NoiseAmplitude;
+                double RootExtent = (PlanetRadius + NoiseAmplitude) * 1.05;
 
-            for (int32 i = 0; i < Count; i++)
-            {
-                double px = Input.X[i], py = Input.Y[i], pz = Input.Z[i];
-                double Dist = FMath::Sqrt(px * px + py * py + pz * pz);
-                Distances[i] = Dist;
-                double InvDist = (Dist > 1e-10) ? (RootExtent / Dist) : 0.0;
-                PX[i] = (float)(px * InvDist * InvNoiseAmplitude);
-                PY[i] = (float)(py * InvDist * InvNoiseAmplitude);
-                PZ[i] = (float)(pz * InvDist * InvNoiseAmplitude);
-            }
+                constexpr int32 StackLimit = 64;
+                float  StackPX[StackLimit], StackPY[StackLimit], StackPZ[StackLimit], StackNoise[StackLimit];
+                double StackDist[StackLimit];
+                TArray<float>  HeapPX, HeapPY, HeapPZ, HeapNoise;
+                TArray<double> HeapDist;
 
-            NoiseNode->GenPositionArray3D(NoiseOut, Count, PX, PY, PZ, 0, 0, 0, 0);
+                float* PX; float* PY; float* PZ; float* NoiseOut; double* Distances;
+                if (Count <= StackLimit)
+                {
+                    PX = StackPX; PY = StackPY; PZ = StackPZ; NoiseOut = StackNoise; Distances = StackDist;
+                }
+                else
+                {
+                    HeapPX.SetNumUninitialized(Count); HeapPY.SetNumUninitialized(Count);
+                    HeapPZ.SetNumUninitialized(Count); HeapNoise.SetNumUninitialized(Count);
+                    HeapDist.SetNumUninitialized(Count);
+                    PX = HeapPX.GetData(); PY = HeapPY.GetData(); PZ = HeapPZ.GetData();
+                    NoiseOut = HeapNoise.GetData(); Distances = HeapDist.GetData();
+                }
 
-            for (int32 i = 0; i < Count; i++)
-            {
-                double Clamped = FMath::Clamp((double)NoiseOut[i], -1.0, 1.0);
-                double Height = (Clamped + 1.0) * 0.5 * NoiseAmplitude;
-                DensityOut[i] = (float)(Distances[i] - (PlanetRadius + Height));
-            }
-        };
+                for (int32 i = 0; i < Count; i++)
+                {
+                    double px = Input.X[i], py = Input.Y[i], pz = Input.Z[i];
+                    double Dist = FMath::Sqrt(px * px + py * py + pz * pz);
+                    Distances[i] = Dist;
+                    double InvDist = (Dist > 1e-10) ? (RootExtent / Dist) : 0.0;
+                    PX[i] = (float)(px * InvDist * InvNoiseAmplitude);
+                    PY[i] = (float)(py * InvDist * InvNoiseAmplitude);
+                    PZ[i] = (float)(pz * InvDist * InvNoiseAmplitude);
+                }
 
-    Compositor = MakeShared<FDensitySampleCompositor>();
-    Compositor->AddSampleLayer(HeightmapLayer);
+                NoiseNode->GenPositionArray3D(NoiseOut, Count, PX, PY, PZ, 0, 0, 0, 0);
 
-    // Deferred — heavy tree construction happens on the first LOD tick (background thread).
-    // All 6 faces are built together so the ocean appears all at once.
-    bPendingBuild = true;
+                for (int32 i = 0; i < Count; i++)
+                {
+                    double Clamped = FMath::Clamp((double)NoiseOut[i], -1.0, 1.0);
+                    double Height = (Clamped + 1.0) * 0.5 * NoiseAmplitude;
+                    DensityOut[i] = (float)(Distances[i] - (PlanetRadius + Height));
+                }
+            };
 
-    LastInitScale = GetActorScale3D();
-    LastTerrainPlanetRadius = TerrainPlanetRadius;
-    bInitialized = true;
-    bIsInitializing = false;
-    RunLodUpdateTask();
-}
+        Compositor = MakeShared<FDensitySampleCompositor>();
+        Compositor->AddSampleLayer(HeightmapLayer);
+    }
 
-void AOceanSphereActor::InitializeFromPlanet(TSharedPtr<FDensitySampleCompositor> InCompositor,
-    USceneComponent* InAttachParent)
-{
-    // Same teardown as Initialize
-    bIsInitializing = true;
-    bInitialized = false;
-    ++InitGeneration;
+    const double Size = 1000.0;
+    const double HalfSize = Size * 0.5;
 
-    if (UWorld* W = GetWorld())
-        W->GetTimerManager().ClearTimer(LodTimerHandle);
+    const FVector FaceCenters[6] = {
+        FVector(HalfSize,        0,        0),
+        FVector(-HalfSize,        0,        0),
+        FVector(0,  HalfSize,        0),
+        FVector(0, -HalfSize,        0),
+        FVector(0,        0,  HalfSize),
+        FVector(0,        0, -HalfSize),
+    };
 
-    bLodUpdateRunning = false;
-    MeshGridCache.Empty();
-    CleanupComponents();
-    ChunkMap.Empty();
     for (int32 i = 0; i < 6; ++i)
-        RootNodes[i].Reset();
-
-    // Re-parent MeshAttachmentRoot to the planet's component hierarchy.
-    if (InAttachParent && MeshAttachmentRoot)
     {
-        MeshAttachmentRoot->AttachToComponent(InAttachParent,
-            FAttachmentTransformRules::KeepWorldTransform);
+        RootNodes[i] = MakeShared<FOceanQuadTreeNode>(
+            this, FCubeTransform::FaceTransforms[i], FQuadIndex((uint8)i),
+            FaceCenters[i], Size, OceanRadius, MinDepth, MaxDepth, ChunkDepth);
+        RootNodes[i]->ChunkAnchorCenter = RootNodes[i]->SphereCenter;
     }
 
-    // Scale = ocean radius, same as standalone Initialize
-    double ActorRadius = GetActorScale3D().GetMax();
-    OceanRadius = ActorRadius;
+    for (int32 i = 0; i < 6; ++i)
+        RootNodes[i]->SplitToDepth(ChunkDepth);
 
-    // Auto-derive MaxDepth
-    {
-        double EffectiveRes = FMath::Max((double)(FaceResolution - 1), 1.0);
-        double Ratio = 2.0 * OceanRadius / (EffectiveRes * TargetPrecision);
-        int32 IdealDepth = (int32)FMath::CeilToInt(FMath::Log2(Ratio));
-        MaxDepth = FMath::Clamp(IdealDepth, MinDepth, MaxKeyDepth);
-        ActualPrecision = 2.0 * OceanRadius / (EffectiveRes * FMath::Pow(2.0, (double)MaxDepth));
-    }
+    PopulateChunks();
 
-    // Auto-derive ChunkDepth
-    {
-        constexpr double FloatEps = 1.19e-7;
-        constexpr double MaxFloatError = 1.0;
-        double Ratio = 2.0 * OceanRadius * FloatEps / MaxFloatError;
-        int32 IdealChunkDepth = (Ratio > 1.0) ? (int32)FMath::CeilToInt(FMath::Log2(Ratio)) : 2;
-        ChunkDepth = FMath::Clamp(IdealChunkDepth, 2, 5);
-        MinDepth = FMath::Max(MinDepth, ChunkDepth);
-    }
-
-    // Use the planet-provided compositor (shared noise + edit store)
-    Compositor = InCompositor;
-
-    bPendingBuild = true;
     LastInitScale = GetActorScale3D();
     LastTerrainPlanetRadius = TerrainPlanetRadius;
     bInitialized = true;
@@ -515,38 +499,6 @@ void AOceanSphereActor::RunLodUpdateTask()
             {
                 if (Self) Self->bLodUpdateRunning = false;
                 return;
-            }
-
-            // Deferred construction — build all 6 face trees and populate chunks
-            // on the background thread so the ocean appears all at once.
-            if (Self->bPendingBuild)
-            {
-                const double Size = 1000.0;
-                const double HalfSize = Size * 0.5;
-
-                const FVector FaceCenters[6] = {
-                    FVector(HalfSize,        0,        0),
-                    FVector(-HalfSize,        0,        0),
-                    FVector(0,  HalfSize,        0),
-                    FVector(0, -HalfSize,        0),
-                    FVector(0,        0,  HalfSize),
-                    FVector(0,        0, -HalfSize),
-                };
-
-                for (int32 i = 0; i < 6; ++i)
-                {
-                    Self->RootNodes[i] = MakeShared<FOceanQuadTreeNode>(
-                        Self, FCubeTransform::FaceTransforms[i], FQuadIndex((uint8)i),
-                        FaceCenters[i], Size, Self->OceanRadius,
-                        Self->MinDepth, Self->MaxDepth, Self->ChunkDepth);
-                    Self->RootNodes[i]->ChunkAnchorCenter = Self->RootNodes[i]->SphereCenter;
-                }
-
-                for (int32 i = 0; i < 6; ++i)
-                    Self->RootNodes[i]->SplitToDepth(Self->ChunkDepth);
-
-                Self->PopulateChunks();
-                Self->bPendingBuild = false;
             }
 
             FVector Velocity = Self->CameraPosition - Self->LastLodCameraPos;

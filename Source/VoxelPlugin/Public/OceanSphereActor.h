@@ -42,7 +42,7 @@ public:
     // Computed at init time from float precision requirements.
     // Deep enough that FVector3f vertex offsets from ChunkAnchorCenter have < 1cm error.
     UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Ocean|LOD")
-    int32 ChunkDepth = 4;
+    int32 ChunkDepth = 3;
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Ocean|LOD")
     int32 MinDepth = 2;
@@ -52,7 +52,7 @@ public:
     // this spacing between adjacent vertices on the sphere surface.
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Ocean|LOD",
         meta = (ClampMin = "1.0"))
-    double TargetPrecision = 100.0;
+    double TargetPrecision = 200.0;
 
     // Computed from TargetPrecision and OceanRadius at init time.
     // Clamped to [MinDepth, MaxKeyDepth].
@@ -66,9 +66,12 @@ public:
     // Hard limit imposed by FQuadIndex (2 bits per level, 62 path bits + 2 sentinel = 64).
     static constexpr int32 MaxKeyDepth = 31;
 
+    // LOD screen-space threshold. The node is subdivided by FaceResolution, so
+    // the effective vertex threshold is ScreenSpaceThreshold / (FaceResolution - 1).
+    // Default 0.15 with FaceResolution=3 gives ~0.075 per-vertex threshold.
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Ocean|LOD",
         meta = (ClampMin = "0.001"))
-    double ScreenSpaceThreshold = 0.075;
+    double ScreenSpaceThreshold = 0.15;
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Ocean|LOD")
     double MinLodInterval = 0.1;
@@ -102,8 +105,6 @@ public:
     virtual bool ShouldTickIfViewportsOnly() const override;
     virtual void Tick(float DeltaTime) override;
 
-    // Called by APlanetActor — uses the provided compositor instead of creating one.
-    // If InAttachParent is provided, MeshAttachmentRoot is re-parented to it.
     void InitializeFromPlanet(TSharedPtr<FDensitySampleCompositor> InCompositor,
         USceneComponent* InAttachParent = nullptr);
 
@@ -124,7 +125,6 @@ private:
     std::atomic<bool>   bInitialized = false;
     std::atomic<bool>   bIsDestroyed = false;
     std::atomic<bool>   bLodUpdateRunning = false;
-    std::atomic<bool>   bPendingBuild = false;
     std::atomic<uint32> InitGeneration = 0;
     bool                bIsInitializing = false;
 
@@ -137,6 +137,7 @@ private:
     TMap<int32, FOceanMeshGrid> MeshGridCache;
 
     void Initialize();
+    void InitializeInternal(TSharedPtr<FDensitySampleCompositor> InCompositor);
     void CleanupComponents();
     void PopulateChunks();
 

@@ -236,6 +236,12 @@ void APlanetActor::SpawnChildActors()
             AAdaptiveVoxelActor::StaticClass(),
             FTransform(GetActorRotation(), GetActorLocation()),
             SpawnParams);
+        if (USceneComponent* ChildRoot = TerrainActor->GetRootComponent())
+        {
+            ChildRoot->SetAbsolute(false, false, true);
+            ChildRoot->AttachToComponent(PlanetRoot,
+                FAttachmentTransformRules::KeepWorldTransform);
+        }
     }
 
     if (!OceanActor)
@@ -244,6 +250,12 @@ void APlanetActor::SpawnChildActors()
             AOceanSphereActor::StaticClass(),
             FTransform(GetActorRotation(), GetActorLocation()),
             SpawnParams);
+        if (USceneComponent* ChildRoot = OceanActor->GetRootComponent())
+        {
+            ChildRoot->SetAbsolute(false, false, true);
+            ChildRoot->AttachToComponent(PlanetRoot,
+                FAttachmentTransformRules::KeepWorldTransform);
+        }
     }
 
     // Load default materials if none set — paths reference plugin Content folder
