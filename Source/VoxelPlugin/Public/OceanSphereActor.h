@@ -42,10 +42,10 @@ public:
     // Computed at init time from float precision requirements.
     // Deep enough that FVector3f vertex offsets from ChunkAnchorCenter have < 1cm error.
     UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Ocean|LOD")
-    int32 ChunkDepth = 4;
+    int32 ChunkDepth = 3;
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Ocean|LOD")
-    int32 MinDepth = 2;
+    int32 MinDepth = 4;
 
     // Target vertex spacing in world units (cm). MaxDepth is computed automatically
     // from this value and the ocean radius so that the finest LOD achieves roughly
