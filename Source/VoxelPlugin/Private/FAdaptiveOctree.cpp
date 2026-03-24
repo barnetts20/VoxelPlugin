@@ -712,7 +712,7 @@ void FAdaptiveOctree::UpdateLOD(FVector CameraPosition, double InScreenSpaceThre
     double ThresholdSq = InScreenSpaceThreshold * InScreenSpaceThreshold;
     double MergeThresholdSq = (InScreenSpaceThreshold * 0.5) * (InScreenSpaceThreshold * 0.5);
 
-    double t0 = FPlatformTime::Seconds();
+    //double t0 = FPlatformTime::Seconds();
     ParallelFor(NumChunks, [&](int32 idx) {
         FAdaptiveOctreeNode* ChunkNode = Chunks[idx].Get();
         double DistSq = FMath::Max(FVector::DistSquared(ChunkNode->Center, CameraPosition), 1e-12);
@@ -740,12 +740,12 @@ void FAdaptiveOctree::UpdateLOD(FVector CameraPosition, double InScreenSpaceThre
                 UpdateMeshChunkStreamData(ModifiedChunks[idx]);
         });
 
-    double t1 = FPlatformTime::Seconds();
-    if ((t1 - t0) * 1000.0 > 100.0)
-    {
-        UE_LOG(LogTemp, Log, TEXT("[LOD] LODPass: %.2fms"),
-            (t1 - t0) * 1000.0);
-    }
+    //double t1 = FPlatformTime::Seconds();
+    //if ((t1 - t0) * 1000.0 > 100.0)
+    //{
+    //    UE_LOG(LogTemp, Log, TEXT("[LOD] LODPass: %.2fms"),
+    //        (t1 - t0) * 1000.0);
+    //}
 }
 
 void FAdaptiveOctree::UpdateMesh()
