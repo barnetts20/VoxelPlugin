@@ -1,4 +1,5 @@
 ﻿#include "PlanetActor.h"
+#include "PlanetAtmosphereActor.h"
 #include "Kismet/GameplayStatics.h"
 
 APlanetActor::APlanetActor()
@@ -16,7 +17,7 @@ APlanetActor::APlanetActor()
 void APlanetActor::BeginPlay()
 {
     Super::BeginPlay();
-    // bPendingInitialize defaults to true � first Tick calls Initialize.
+    // bPendingInitialize defaults to true — first Tick calls Initialize.
 }
 
 void APlanetActor::BeginDestroy()
@@ -30,14 +31,16 @@ void APlanetActor::OnConstruction(const FTransform& Transform)
     Super::OnConstruction(Transform);
     if (!GetWorld() || GetWorld()->IsPreviewWorld()) return;
 
-    // Flag for deferred work in Tick � never spawn actors during OnConstruction.
+    // Flag for deferred work in Tick — never spawn actors during OnConstruction.
     if (!bInitialized
         || !GetActorScale3D().Equals(LastInitScale, 0.01)
         || NoiseAmplitudeRatio != LastNoiseAmplitudeRatio)
     {
         bPendingInitialize = true;
     }
-    else if (SeaLevel != LastSeaLevel || bEnableOcean != bLastEnableOcean)
+    else if (SeaLevel != LastSeaLevel
+        || bEnableOcean != bLastEnableOcean
+        || bEnableAtmosphere != bLastEnableAtmosphere)
     {
         bPendingOceanUpdate = true;
     }
@@ -47,7 +50,7 @@ void APlanetActor::Tick(float DeltaTime)
 {
     Super::Tick(DeltaTime);
 
-    // Deferred init � safe to spawn actors here.
+    // Deferred init — safe to spawn actors here.
     if (bPendingInitialize)
     {
         bPendingInitialize = false;
@@ -78,8 +81,21 @@ void APlanetActor::Tick(float DeltaTime)
             OceanActor->SetActorTickEnabled(false);
         }
 
+        // Toggle atmosphere visibility
+        if (bEnableAtmosphere && AtmosphereActor)
+        {
+            AtmosphereActor->SetActorHiddenInGame(false);
+            AtmosphereActor->SetActorTickEnabled(true);
+        }
+        else if (AtmosphereActor)
+        {
+            AtmosphereActor->SetActorHiddenInGame(true);
+            AtmosphereActor->SetActorTickEnabled(false);
+        }
+
         LastSeaLevel = SeaLevel;
         bLastEnableOcean = bEnableOcean;
+        bLastEnableAtmosphere = bEnableAtmosphere;
     }
 }
 
@@ -146,10 +162,27 @@ void APlanetActor::Initialize()
         OceanActor->SetActorTickEnabled(false);
     }
 
+    // --- Atmosphere actor ---
+    if (bEnableAtmosphere && AtmosphereActor)
+    {
+        // Scale = max(OceanRadius, PlanetRadius) — the visible surface floor
+        double AtmosphereScale = FMath::Max(OceanRadiusValue, PlanetRadius);
+        AtmosphereActor->SetActorScale3D(FVector(AtmosphereScale));
+        AtmosphereActor->InitializeFromPlanet(PlanetRoot);
+        AtmosphereActor->SetActorHiddenInGame(false);
+        AtmosphereActor->SetActorTickEnabled(true);
+    }
+    else if (AtmosphereActor)
+    {
+        AtmosphereActor->SetActorHiddenInGame(true);
+        AtmosphereActor->SetActorTickEnabled(false);
+    }
+
     LastInitScale = GetActorScale3D();
     LastSeaLevel = SeaLevel;
     LastNoiseAmplitudeRatio = NoiseAmplitudeRatio;
     bLastEnableOcean = bEnableOcean;
+    bLastEnableAtmosphere = bEnableAtmosphere;
     bInitialized = true;
 }
 
@@ -258,6 +291,20 @@ void APlanetActor::SpawnChildActors()
         }
     }
 
+    if (!AtmosphereActor)
+    {
+        AtmosphereActor = World->SpawnActor<APlanetAtmosphereActor>(
+            APlanetAtmosphereActor::StaticClass(),
+            FTransform(GetActorRotation(), GetActorLocation()),
+            SpawnParams);
+        if (USceneComponent* ChildRoot = AtmosphereActor->GetRootComponent())
+        {
+            ChildRoot->SetAbsolute(false, false, true);
+            ChildRoot->AttachToComponent(PlanetRoot,
+                FAttachmentTransformRules::KeepWorldTransform);
+        }
+    }
+
     // Load default materials if none set — paths reference plugin Content folder
     if (!TerrainMaterial)
     {
@@ -284,6 +331,11 @@ void APlanetActor::DestroyChildActors()
     {
         OceanActor->Destroy();
         OceanActor = nullptr;
+    }
+    if (AtmosphereActor)
+    {
+        AtmosphereActor->Destroy();
+        AtmosphereActor = nullptr;
     }
 }
 

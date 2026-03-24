@@ -121,16 +121,16 @@ public:
     // ───────────────────────── Ray Marching ──────────────────────────────────
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Atmosphere|Ray Marching")
-    float AtmosphereSteps = 32.0f;
+    float AtmosphereSteps = 64.0f;
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Atmosphere|Ray Marching")
-    float CloudSteps = 32.0f;
+    float CloudSteps = 64.0f;
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Atmosphere|Ray Marching")
     float AtmosphereLightSteps = 8.0f;
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Atmosphere|Ray Marching")
-    float CloudLightSteps = 8.0f;
+    float CloudLightSteps = 16.0f;
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Atmosphere|Ray Marching")
     float StepScaleFactor = 2.0f;

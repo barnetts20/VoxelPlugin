@@ -21,14 +21,14 @@ public:
 
     // Driven by actor scale. Read-only at runtime � adjust scale to resize.
     UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Ocean|Shape")
-    double OceanRadius = 8000000.0;
+    double OceanRadius = 112500000.0;
 
     // Must match the terrain actor's scale (GetActorScale3D().GetMax()).
     // density = OceanRadius - (TerrainPlanetRadius + NoiseHeight):
     //   positive = underwater, negative = above water (land).
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Ocean|Shape",
         meta = (ClampMin = "1.0"))
-    double TerrainPlanetRadius = 7200000.0;
+    double TerrainPlanetRadius = 100000000.0;
 
     // Must match the terrain actor's NoiseAmplitudeRatio.
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Ocean|Shape",
@@ -42,7 +42,7 @@ public:
     // Computed at init time from float precision requirements.
     // Deep enough that FVector3f vertex offsets from ChunkAnchorCenter have < 1cm error.
     UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Ocean|LOD")
-    int32 ChunkDepth = 3;
+    int32 ChunkDepth = 4;
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Ocean|LOD")
     int32 MinDepth = 2;

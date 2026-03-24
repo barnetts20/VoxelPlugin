@@ -25,6 +25,10 @@ APlanetAtmosphereActor::APlanetAtmosphereActor()
 
     AtmosphereRoot = CreateDefaultSubobject<USceneComponent>(TEXT("AtmosphereRoot"));
     SetRootComponent(AtmosphereRoot);
+
+    // Default radius = max(OceanRadius, PlanetRadius) at planet defaults:
+    // PlanetRadius(100M) + SeaLevel(0.5) * NoiseAmplitude(25M) = 112,500,000 cm
+    SetActorScale3D(FVector(112500000.0));
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -233,8 +237,9 @@ void APlanetAtmosphereActor::UpdateMaterialParameters()
     const FVector PlanetCenter = GetActorLocation();
     const float PlanetRadius = static_cast<float>(GetActorScale3D().GetMax());
 
-    // Compute light direction from actor rotation (forward vector)
-    const FVector LightDir = GetActorRotation().Vector();
+    // Light direction from relative rotation — treated as world-space direction
+    // regardless of parent rotation. The user/gizmo sets relative rotation directly.
+    const FVector LightDir = GetRootComponent()->GetRelativeRotation().Vector();
 
     // ── Atmosphere material (slot 1) ──
 
@@ -319,9 +324,9 @@ void APlanetAtmosphereActor::UpdateLightFromRotation()
     UDirectionalLightComponent* LightComp = SunLight->GetComponent();
     if (!LightComp) return;
 
-    // Directional light should face the opposite of the "light direction" vector
-    // (light direction = direction TO the sun, light actor points FROM the sun)
-    const FRotator SunRotation = (-GetActorRotation().Vector()).Rotation();
+    // Directional light faces opposite the light direction vector
+    const FVector LightDir = GetRootComponent()->GetRelativeRotation().Vector();
+    const FRotator SunRotation = (-LightDir).Rotation();
     SunLight->SetActorRotation(SunRotation);
 
     // Extract color and intensity from LightColor.

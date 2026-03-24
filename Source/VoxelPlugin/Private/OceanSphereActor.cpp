@@ -9,7 +9,9 @@ AOceanSphereActor::AOceanSphereActor()
     PrimaryActorTick.bCanEverTick = true;
     PrimaryActorTick.bStartWithTickEnabled = true;
 
-    SetActorScale3D(FVector(8000000.0));
+    // Default scale = ocean radius matching APlanetActor defaults:
+    // PlanetRadius(100M) + SeaLevel(0.5) * NoiseAmplitude(25M) = 112,500,000 cm
+    SetActorScale3D(FVector(112500000.0));
 
     MeshAttachmentRoot = CreateDefaultSubobject<USceneComponent>(TEXT("MeshAttachmentRoot"));
     MeshAttachmentRoot->SetupAttachment(GetRootComponent());

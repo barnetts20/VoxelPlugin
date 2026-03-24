@@ -16,8 +16,8 @@ AAdaptiveVoxelActor::AAdaptiveVoxelActor()
     SurfaceMaterial = UMaterial::GetDefaultMaterial(EMaterialDomain::MD_Surface);
 
     // Default scale defines planet radius in world units (cm).
-    // 80,000,000 cm = 800 km radius planet.
-    SetActorScale3D(FVector(80000000.0));
+    // 100,000,000 cm = 1000 km radius planet (matches APlanetActor default).
+    SetActorScale3D(FVector(100000000.0));
 
     // Mesh chunks attach to this component.
     // Inherits actor position and rotation, but uses absolute scale (1,1,1)

@@ -9,6 +9,8 @@
 #include "FastNoise/FastNoise.h"
 #include "PlanetActor.generated.h"
 
+class APlanetAtmosphereActor;
+
 UCLASS()
 class VOXELPLUGIN_API APlanetActor : public AActor
 {
@@ -47,6 +49,11 @@ public:
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Planet|Terrain")
     UMaterialInterface* TerrainMaterial = nullptr;
 
+    // ------- Atmosphere -------
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Planet|Atmosphere")
+    bool bEnableAtmosphere = true;
+
     // ------- Accessors -------
 
     UFUNCTION(BlueprintCallable, Category = "Planet")
@@ -54,6 +61,9 @@ public:
 
     UFUNCTION(BlueprintCallable, Category = "Planet")
     AOceanSphereActor* GetOceanActor() const { return OceanActor; }
+
+    UFUNCTION(BlueprintCallable, Category = "Planet")
+    APlanetAtmosphereActor* GetAtmosphereActor() const { return AtmosphereActor; }
 
     virtual void OnConstruction(const FTransform& Transform) override;
     virtual void BeginPlay() override;
@@ -68,12 +78,16 @@ private:
     UPROPERTY()
     AOceanSphereActor* OceanActor = nullptr;
 
+    UPROPERTY()
+    APlanetAtmosphereActor* AtmosphereActor = nullptr;
+
     FastNoise::SmartNode<> Noise;
 
     FVector LastInitScale = FVector::ZeroVector;
     double LastSeaLevel = -1.0;
     double LastNoiseAmplitudeRatio = -1.0;
     bool bLastEnableOcean = true;
+    bool bLastEnableAtmosphere = true;
     bool bInitialized = false;
     bool bPendingInitialize = true;
     bool bPendingOceanUpdate = false;
