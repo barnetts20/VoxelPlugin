@@ -223,6 +223,46 @@ void FAdaptiveOctree::ApplyEdit(FVector InEditCenter, double InEditRadius, doubl
             ChunkNodes.Add(ChunkNodeRaw->AsShared());
     }
 
+    // Propagate bHasEditedDescendants through the main tree using the brush
+    // sphere as the spatial filter. Only nodes whose AABB overlaps the brush
+    // get flagged. This replaces the per-node HasEditsAlongPath queries in
+    // the reconstruction pipeline with a single up-front pass.
+    double BrushRadiusSq = InEditRadius * InEditRadius;
+    TFunction<void(FAdaptiveOctreeNode*)> FlagEditedNodes = [&](FAdaptiveOctreeNode* N)
+        {
+            if (!N) return;
+
+            // Sphere-AABB overlap test
+            FVector Closest(
+                FMath::Clamp(InEditCenter.X, N->Center.X - N->Extent, N->Center.X + N->Extent),
+                FMath::Clamp(InEditCenter.Y, N->Center.Y - N->Extent, N->Center.Y + N->Extent),
+                FMath::Clamp(InEditCenter.Z, N->Center.Z - N->Extent, N->Center.Z + N->Extent));
+            if (FVector::DistSquared(Closest, InEditCenter) > BrushRadiusSq)
+                return;
+
+            N->bHasEditedDescendants = true;
+
+            if (!N->IsLeaf())
+            {
+                for (int i = 0; i < 8; i++)
+                    FlagEditedNodes(N->Children[i].Get());
+            }
+        };
+
+    for (auto& ChunkNode : ChunkNodes)
+        FlagEditedNodes(ChunkNode.Get());
+
+    // Also flag ancestors up to root so EnforceSplitsInSubtree can enter.
+    for (auto& ChunkNode : ChunkNodes)
+    {
+        FAdaptiveOctreeNode* Current = ChunkNode->Parent.IsValid() ? ChunkNode->Parent.Pin().Get() : nullptr;
+        while (Current && !Current->bHasEditedDescendants)
+        {
+            Current->bHasEditedDescendants = true;
+            Current = Current->Parent.IsValid() ? Current->Parent.Pin().Get() : nullptr;
+        }
+    }
+
     // Stage 1: Parallel -- recompute all node data (densities, normals, surface flags)
     ParallelFor(ChunkNodes.Num(), [&](int32 i) {
         ReconstructSubtree(ChunkNodes[i].Get());
@@ -257,12 +297,8 @@ void FAdaptiveOctree::GatherUniqueCorners(FAdaptiveOctreeNode* Node, TArray<FCor
 {
     if (!Node) return;
 
-    // Skip nodes that don't overlap any edits in the edit store
-    if (Compositor.IsValid() && Compositor->GetEditStore().IsValid())
-    {
-        if (!Compositor->GetEditStore()->HasEditsAlongPath(Node->Index))
-            return;
-    }
+    if (!Node->bHasEditedDescendants)
+        return;
 
     // Collect corners at ALL depths
     for (int i = 0; i < 8; i++)
@@ -299,12 +335,8 @@ void FAdaptiveOctree::FinalizeSubtree(FAdaptiveOctreeNode* Node)
 {
     if (!Node) return;
 
-    // Skip nodes that don't overlap any edits
-    if (Compositor.IsValid() && Compositor->GetEditStore().IsValid())
-    {
-        if (!Compositor->GetEditStore()->HasEditsAlongPath(Node->Index))
-            return;
-    }
+    if (!Node->bHasEditedDescendants)
+        return;
 
     // Children first
     if (!Node->IsLeaf())
@@ -321,12 +353,8 @@ void FAdaptiveOctree::PropagateDeepDensities(FAdaptiveOctreeNode* Node)
 {
     if (!Node || Node->IsLeaf()) return;
 
-    // Skip nodes that don't overlap any edits
-    if (Compositor.IsValid() && Compositor->GetEditStore().IsValid())
-    {
-        if (!Compositor->GetEditStore()->HasEditsAlongPath(Node->Index))
-            return;
-    }
+    if (!Node->bHasEditedDescendants)
+        return;
 
     if (Node->Index.Depth >= PrecisionDepthFloor)
     {
@@ -491,21 +519,14 @@ void FAdaptiveOctree::EnforceSplitsInSubtree(FAdaptiveOctreeNode* Node)
 {
     if (!Node) return;
 
-    // Skip nodes that don't overlap any edits in the edit store
-    if (Compositor.IsValid() && Compositor->GetEditStore().IsValid())
-    {
-        if (!Compositor->GetEditStore()->HasEditsAlongPath(Node->Index))
-            return;
-    }
+    if (!Node->bHasEditedDescendants)
+        return;
 
     if (Node->IsLeaf())
     {
-        bool bHasEdits = Compositor.IsValid() && Compositor->GetEditStore().IsValid()
-            && Compositor->GetEditStore()->HasEditsAlongPath(Node->Index);
-
         bool bNeedsSplit = false;
 
-        if (bHasEdits || Node->CouldContainSurface)
+        if (Node->bHasEditedDescendants || Node->CouldContainSurface)
         {
             bool bLodWantsSplit = Node->ShouldSplit(CachedCameraPosition, CachedThresholdSq, CachedFOVScale);
             bool bBelowMinDepth = Node->Index.Depth < Node->DepthBounds[1];
@@ -779,7 +800,7 @@ void FAdaptiveOctree::UpdateLOD(FVector CameraPosition, double InScreenSpaceThre
     CachedFOVScale = FOVScale;
     CachedThresholdSq = ThresholdSq;
 
-    //double t0 = FPlatformTime::Seconds();
+    double t0 = FPlatformTime::Seconds();
     ParallelFor(NumChunks, [&](int32 idx) {
         FAdaptiveOctreeNode* ChunkNode = Chunks[idx].Get();
         double DistSq = FMath::Max(FVector::DistSquared(ChunkNode->Center, CameraPosition), 1e-12);
@@ -807,12 +828,12 @@ void FAdaptiveOctree::UpdateLOD(FVector CameraPosition, double InScreenSpaceThre
                 UpdateMeshChunkStreamData(ModifiedChunks[idx]);
         });
 
-    //double t1 = FPlatformTime::Seconds();
-    //if ((t1 - t0) * 1000.0 > 25.0)
-    //{
-    //    UE_LOG(LogTemp, Log, TEXT("[LOD] LODPass: %.2fms"),
-    //        (t1 - t0) * 1000.0);
-    //}
+    double t1 = FPlatformTime::Seconds();
+    if ((t1 - t0) * 1000.0 > 25.0)
+    {
+        UE_LOG(LogTemp, Log, TEXT("[LOD] LODPass: %.2fms"),
+            (t1 - t0) * 1000.0);
+    }
 }
 
 void FAdaptiveOctree::UpdateMesh()
