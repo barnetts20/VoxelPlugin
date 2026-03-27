@@ -1,5 +1,6 @@
-#include "FastNoise/FastNoise.h"
 #include "FDensitySampleCompositor.h"
+#include "FastNoise/FastNoise.h"
+
 
 //TFunction<void(const FSampleInput&, float*)> FCompositorExamples::GetHeightMapExample(double ActorPlanetRadius, double ActorNoiseAmplitude, FastNoise::SmartNode<> InNoise)
 //{

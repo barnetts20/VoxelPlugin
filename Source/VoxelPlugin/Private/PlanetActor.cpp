@@ -46,6 +46,42 @@ void APlanetActor::OnConstruction(const FTransform& Transform)
     }
 }
 
+#if WITH_EDITOR
+void APlanetActor::PostEditChangeProperty(FPropertyChangedEvent& PropertyChangedEvent)
+{
+    Super::PostEditChangeProperty(PropertyChangedEvent);
+    if (!bInitialized) return;
+
+    FName PropName = PropertyChangedEvent.GetPropertyName();
+
+    // Material swaps — push to child actor and reinitialize via the public
+    // InitializeFromPlanet entry point (reuses existing compositor).
+    if (PropName == GET_MEMBER_NAME_CHECKED(APlanetActor, TerrainMaterial))
+    {
+        if (TerrainActor && TerrainMaterial)
+        {
+            TerrainActor->SurfaceMaterial = TerrainMaterial;
+            TerrainActor->InitializeFromPlanet(SharedCompositor, PlanetRoot);
+        }
+        return;
+    }
+
+    if (PropName == GET_MEMBER_NAME_CHECKED(APlanetActor, OceanMaterial))
+    {
+        if (OceanActor && OceanMaterial)
+        {
+            OceanActor->OceanMaterial = OceanMaterial;
+            OceanActor->InitializeFromPlanet(SharedCompositor, PlanetRoot);
+        }
+        return;
+    }
+
+    // Scale, NoiseAmplitudeRatio, SeaLevel, and toggle changes are handled
+    // by OnConstruction (which also fires on property edits) via the
+    // bPendingInitialize / bPendingOceanUpdate flags.
+}
+#endif
+
 void APlanetActor::Tick(float DeltaTime)
 {
     Super::Tick(DeltaTime);
@@ -71,7 +107,7 @@ void APlanetActor::Tick(float DeltaTime)
             OceanActor->SetActorScale3D(FVector(NewOceanRadius));
             OceanActor->TerrainPlanetRadius = PlanetRadius;
             OceanActor->NoiseAmplitudeRatio = NoiseAmplitudeRatio;
-            OceanActor->InitializeFromPlanet(OceanActor->GetCompositor(), PlanetRoot);
+            OceanActor->InitializeFromPlanet(SharedCompositor, PlanetRoot);
             OceanActor->SetActorHiddenInGame(false);
             OceanActor->SetActorTickEnabled(true);
         }
@@ -134,8 +170,9 @@ void APlanetActor::Initialize()
             (ChunkRatio > 1.0) ? (int32)FMath::CeilToInt(FMath::Log2(ChunkRatio)) : 2, 2, 5);
     }
 
-    TSharedPtr<FDensitySampleCompositor> SharedCompositor =
+    TSharedPtr<FDensitySampleCompositor> NewCompositor =
         BuildCompositor(PlanetRadius, NoiseAmplitude, RootExtent, TempChunkDepth, TempMaxDepth);
+    SharedCompositor = NewCompositor;
 
     // --- Terrain actor ---
     TerrainActor->SetActorScale3D(FVector(PlanetRadius));

@@ -71,6 +71,10 @@ public:
     virtual bool ShouldTickIfViewportsOnly() const override { return true; }
     virtual void Tick(float DeltaTime) override;
 
+#if WITH_EDITOR
+    virtual void PostEditChangeProperty(FPropertyChangedEvent& PropertyChangedEvent) override;
+#endif
+
 private:
     UPROPERTY()
     AAdaptiveVoxelActor* TerrainActor = nullptr;
@@ -82,6 +86,10 @@ private:
     APlanetAtmosphereActor* AtmosphereActor = nullptr;
 
     FastNoise::SmartNode<> Noise;
+
+    // Shared compositor (noise + edit store) built during Initialize and reused
+    // for child actor re-initialization (e.g. material swaps, ocean radius updates).
+    TSharedPtr<FDensitySampleCompositor> SharedCompositor;
 
     FVector LastInitScale = FVector::ZeroVector;
     double LastSeaLevel = -1.0;

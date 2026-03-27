@@ -43,6 +43,35 @@ void AOceanSphereActor::BeginDestroy()
     Super::BeginDestroy();
 }
 
+#if WITH_EDITOR
+void AOceanSphereActor::PostEditChangeProperty(FPropertyChangedEvent& PropertyChangedEvent)
+{
+    Super::PostEditChangeProperty(PropertyChangedEvent);
+    if (!bInitialized) return;
+
+    FName PropName = PropertyChangedEvent.GetPropertyName();
+
+    // Level 0 — LOD params read live each tick, no rebuild needed:
+    // ScreenSpaceThreshold, VelocityLookAheadFactor, MinLodInterval, bTickInEditor
+
+    // Level 3 — structural changes require quadtree rebuild:
+    static const TSet<FName> RebuildProps = {
+        GET_MEMBER_NAME_CHECKED(AOceanSphereActor, FaceResolution),
+        GET_MEMBER_NAME_CHECKED(AOceanSphereActor, TargetPrecision),
+        GET_MEMBER_NAME_CHECKED(AOceanSphereActor, MinDepth),
+        GET_MEMBER_NAME_CHECKED(AOceanSphereActor, NoiseAmplitudeRatio),
+        GET_MEMBER_NAME_CHECKED(AOceanSphereActor, TerrainPlanetRadius),
+        GET_MEMBER_NAME_CHECKED(AOceanSphereActor, TriangleCullDepthThreshold),
+        GET_MEMBER_NAME_CHECKED(AOceanSphereActor, OceanMaterial),
+    };
+
+    if (RebuildProps.Contains(PropName))
+    {
+        Initialize();
+    }
+}
+#endif
+
 bool AOceanSphereActor::ShouldTickIfViewportsOnly() const
 {
     return bTickInEditor && bInitialized;

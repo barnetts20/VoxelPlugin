@@ -107,8 +107,16 @@ public:
     virtual bool ShouldTickIfViewportsOnly() const override;
     virtual void Tick(float DeltaTime) override;
 
+#if WITH_EDITOR
+    virtual void PostEditChangeProperty(FPropertyChangedEvent& PropertyChangedEvent) override;
+#endif
+
     void InitializeFromPlanet(TSharedPtr<FDensitySampleCompositor> InCompositor,
         USceneComponent* InAttachParent = nullptr);
+
+    // Tears down the current quadtree and rebuilds from scratch using current property values.
+    // Called by OnConstruction, PostEditChangeProperty, InitializeFromPlanet, and BeginPlay.
+    void Initialize();
 
 private:
     TSharedPtr<FOceanQuadTreeNode> RootNodes[6];
@@ -138,7 +146,6 @@ private:
     // Static mesh grid cache — keyed by resolution.
     TMap<int32, FOceanMeshGrid> MeshGridCache;
 
-    void Initialize();
     void InitializeInternal(TSharedPtr<FDensitySampleCompositor> InCompositor);
     void CleanupComponents();
     void PopulateChunks();

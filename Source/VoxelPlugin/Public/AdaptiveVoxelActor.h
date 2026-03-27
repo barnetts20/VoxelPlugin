@@ -136,6 +136,10 @@ public:
 
     virtual void Tick(float DeltaTime) override;
 
+#if WITH_EDITOR
+    virtual void PostEditChangeProperty(FPropertyChangedEvent& PropertyChangedEvent) override;
+#endif
+
     USceneComponent* GetMeshAttachmentRoot() const { return MeshAttachmentRoot; }
 
     // Called by APlanetActor — uses the provided compositor instead of creating one.
@@ -143,6 +147,11 @@ public:
     // If InAttachParent is provided, MeshAttachmentRoot is re-parented to it.
     void InitializeFromPlanet(TSharedPtr<FDensitySampleCompositor> InCompositor,
         USceneComponent* InAttachParent = nullptr);
+
+    // Tears down the current octree and rebuilds from scratch using current property values.
+    // Called by OnConstruction (scale change), PostEditChangeProperty (structural param change),
+    // InitializeFromPlanet (planet-driven init), and BeginPlay.
+    void Initialize();
 
 protected:
     std::atomic<bool> DataUpdateIsRunning = false;
@@ -154,8 +163,6 @@ protected:
     FTimerHandle DataUpdateTimerHandle;
 
     void CleanSceneRoot();
-
-    void Initialize();
 
     void RunDataUpdateTask();
 
