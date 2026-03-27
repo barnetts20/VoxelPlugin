@@ -744,14 +744,17 @@ void FAdaptiveOctree::UpdateLodRecursive(FAdaptiveOctreeNode* Node, FVector Came
 {
     if (Node->IsLeaf())
     {
-        // Only nodes near the surface can split — deep interior/exterior nodes are skipped
-        // but all leaves still contribute edges and participate in merge checks
-        if (Node->CouldContainSurface && Node->ShouldSplit(CameraPosition, ThresholdSq, InFOVScale))
+        // Only nodes near the surface or with edit history can split —
+        // deep interior/exterior nodes are skipped but all leaves still
+        // contribute edges and participate in merge checks
+        if ((Node->CouldContainSurface || Node->bHasEditedDescendants) && Node->ShouldSplit(CameraPosition, ThresholdSq, InFOVScale))
         {
             OutChanged = true;
             SplitAndComputeChildren(Node);
+            // Gather from full subtree in case children inherited CouldContainSurface
+            // and will be split further on subsequent LOD passes
             for (int i = 0; i < 8; i++)
-                AppendUniqueEdges(Node->Children[i]->GetSignChangeEdges(), OutNodeEdges, EdgeMap);
+                GatherLeafEdges(Node->Children[i].Get(), OutNodeEdges, EdgeMap);
             return;
         }
         else if (Node->Index.LastChild() == 7 && Node->Parent.IsValid())
@@ -1046,6 +1049,8 @@ void FAdaptiveOctree::SplitAndComputeChildren(FAdaptiveOctreeNode* Node)
     }
 
     // --- Stage 4: Assign to children and finalize ---
+    bool bParentHasEditedDescendants = Node->bHasEditedDescendants;
+
     for (int ci = 0; ci < 8; ci++)
     {
         for (int k = 0; k < 8; k++)
@@ -1056,6 +1061,18 @@ void FAdaptiveOctree::SplitAndComputeChildren(FAdaptiveOctreeNode* Node)
             Node->Children[ci]->Corners[k].Normal = FVector3f(GridNormals[gi]);
         }
         Node->Children[ci]->FinalizeFromExistingCorners(true); // normals already computed from grid
+
+        // If the parent had edited descendants, check each child against the edit
+        // store directly — only flag children whose region actually contains edits.
+        if (bParentHasEditedDescendants && Compositor.IsValid())
+        {
+            auto EditStore = Compositor->GetEditStore();
+            if (EditStore.IsValid() && EditStore->HasEditsAlongPath(Node->Children[ci]->Index))
+            {
+                Node->Children[ci]->bHasEditedDescendants = true;
+                Node->Children[ci]->CouldContainSurface = true;
+            }
+        }
     }
 }
 

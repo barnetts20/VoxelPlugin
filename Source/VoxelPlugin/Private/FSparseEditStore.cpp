@@ -28,6 +28,37 @@ double FSparseEditStore::Sample(FVector Position) const
     return Sum;
 }
 
+bool FSparseEditStore::HasEditsAlongPath(const FMortonIndex& Index) const
+{
+    if (!Root) return false;
+
+    TSharedPtr<FSparseEditNode> Current = Root;
+
+    // Walk the edit tree using the morton index child path
+    for (uint8 Level = 0; Level < Index.Depth; Level++)
+    {
+        // If any node along the path has edits, this region was edited
+        if (Current->HasEdits) return true;
+
+        uint8 ChildIdx = Index.GetChildAtLevel(Level);
+        if (!Current->Children[ChildIdx]) return false;
+
+        Current = Current->Children[ChildIdx];
+    }
+
+    // Check the final node at the target depth
+    if (Current->HasEdits) return true;
+
+    // Also check if this node has any children at all — if so,
+    // edits exist at finer resolution within this region
+    for (int i = 0; i < 8; i++)
+    {
+        if (Current->Children[i]) return true;
+    }
+
+    return false;
+}
+
 TArray<FVector> FSparseEditStore::ApplySphericalEdit(FVector BrushCenter, double Radius, double Strength, int Depth)
 {
     Depth = FMath::Clamp(Depth, 0, MaxDepth);

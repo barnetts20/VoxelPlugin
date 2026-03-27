@@ -42,6 +42,11 @@ public:
     // finer resolution. Used by the LOD system to avoid skipping near-surface nodes.
     bool CouldContainSurface = false;
 
+    // True if this node once had descendants with edit-created surface that
+    // its own corners can't resolve. Set during merge, inherited during split,
+    // so the LOD system re-splits to the correct depth when the camera returns.
+    bool bHasEditedDescendants = false;
+
     bool LodOverride = false;
 
     const bool IsLeaf() const;
@@ -53,7 +58,7 @@ public:
     bool IsNearSurface() const
     {
         if (IsSurfaceNode) return true;
-        const float Threshold = (float)(Extent * 3);
+        const float Threshold = (float)(Extent * 1.74);
         for (int i = 0; i < 8; i++)
         {
             if (FMath::Abs(Corners[i].Density) < Threshold)

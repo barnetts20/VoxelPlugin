@@ -108,10 +108,9 @@ void FAdaptiveOctreeNode::FinalizeFromExistingCorners(bool bSkipNormals)
 
     ComputeDualContourPosition();
 
-    // Update CouldContainSurface: OR with current state so merge-inherited
-    // flags survive re-finalization (parent corners may be too coarse to detect
-    // edit-created surface that children contained before merging)
-    CouldContainSurface = CouldContainSurface || IsNearSurface();
+    // CouldContainSurface: true if this node has sign changes or corners near zero.
+    // Edit persistence is handled separately by bHasEditedDescendants.
+    CouldContainSurface = IsNearSurface();
 
     if (IsSurfaceNode)
     {
@@ -151,18 +150,15 @@ void FAdaptiveOctreeNode::Merge()
 {
     if (bIsLeaf) return;
 
-    // Before destroying children, inherit their surface flags.
-    // If any child had surface or near-surface data (possibly from edits
-    // at finer resolution than our corners can detect), preserve that
-    // knowledge so the LOD system re-splits us when the camera returns.
+    // Before destroying children, check if any had edit-created surface
+    // that this node's corners can't resolve. Preserve that knowledge
+    // so the LOD system re-splits when the camera returns.
     for (int i = 0; i < 8; i++)
     {
         if (Children[i].IsValid())
         {
-            if (Children[i]->CouldContainSurface)
-                CouldContainSurface = true;
-            if (Children[i]->IsSurfaceNode)
-                IsSurfaceNode = true;
+            if (Children[i]->bHasEditedDescendants || Children[i]->CouldContainSurface)
+                bHasEditedDescendants = true;
             Children[i]->Merge();
             Children[i].Reset();
         }
@@ -239,8 +235,7 @@ void FAdaptiveOctreeNode::ComputeDualContourPosition()
     {
         DualContourNormal = FVector3f::ZeroVector;
         DualContourPosition = Center;
-        // Don't clear IsSurfaceNode — it may have been inherited from merged children
-        // that contained edit-created surface too fine for this node's corners to detect
+        IsSurfaceNode = false;
         return;
     }
 
