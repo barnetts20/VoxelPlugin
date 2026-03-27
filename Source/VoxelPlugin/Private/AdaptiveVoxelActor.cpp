@@ -450,7 +450,7 @@ void AAdaptiveVoxelActor::RunDataUpdateTask()
                 return;
             }
 
-            double t0 = FPlatformTime::Seconds();
+            //double t0 = FPlatformTime::Seconds();
             {
                 FRWScopeLock WriteLock(Self->OctreeLock, SLT_Write);
                 FVector CurrentCamPos = Self->CameraPosition;
@@ -459,9 +459,9 @@ void AAdaptiveVoxelActor::RunDataUpdateTask()
                 Self->AdaptiveOctree->UpdateLOD(PredictedPos, Self->ScreenSpaceThreshold, Self->CameraFOV);
                 Self->LastLodUpdatePosition = Self->CameraPosition;
             }
-            double elapsed = (FPlatformTime::Seconds() - t0) * 1000.0;
-            if (elapsed > 30.0)
-                UE_LOG(LogTemp, Log, TEXT("[Pipeline] DataUpdate (UpdateLOD): %.2fms"), elapsed);
+            //double elapsed = (FPlatformTime::Seconds() - t0) * 1000.0;
+            //if (elapsed > 30.0)
+            //    UE_LOG(LogTemp, Log, TEXT("[Pipeline] DataUpdate (UpdateLOD): %.2fms"), elapsed);
 
             Self->DataUpdateIsRunning = false;
             Self->RunMeshUpdateTask();
@@ -481,14 +481,14 @@ void AAdaptiveVoxelActor::RunMeshUpdateTask()
             AAdaptiveVoxelActor* Self = WeakThis.Get();
             if (!Self || Self->IsDestroyed) return;
 
-            double t0 = FPlatformTime::Seconds();
+            //double t0 = FPlatformTime::Seconds();
             {
                 FRWScopeLock ReadLock(Self->OctreeLock, SLT_ReadOnly);
                 Self->AdaptiveOctree->UpdateMesh();
             }
-            double elapsed = (FPlatformTime::Seconds() - t0) * 1000.0;
-            if (elapsed > 10.0)
-                UE_LOG(LogTemp, Log, TEXT("[Pipeline] MeshUpdate (UpdateMesh): %.2fms"), elapsed);
+            //double elapsed = (FPlatformTime::Seconds() - t0) * 1000.0;
+            //if (elapsed > 10.0)
+            //    UE_LOG(LogTemp, Log, TEXT("[Pipeline] MeshUpdate (UpdateMesh): %.2fms"), elapsed);
 
             Self->MeshUpdateIsRunning = false;
 
@@ -520,6 +520,7 @@ void AAdaptiveVoxelActor::RunEditUpdateTask(FVector InEditCenter, double InEditR
     TWeakObjectPtr<AAdaptiveVoxelActor> WeakThis(this);
     FFunctionGraphTask::CreateAndDispatchWhenReady([WeakThis, InEditCenter, InEditRadius, InEditStrength, InEditResolution]()
         {
+            double t0 = FPlatformTime::Seconds();
             AAdaptiveVoxelActor* Self = WeakThis.Get();
             if (!Self || Self->IsDestroyed) return;
             {
@@ -527,7 +528,13 @@ void AAdaptiveVoxelActor::RunEditUpdateTask(FVector InEditCenter, double InEditR
                 Self->AdaptiveOctree->ApplyEdit(InEditCenter, InEditRadius, InEditStrength, InEditResolution);
                 Self->AdaptiveOctree->UpdateMesh();
             }
+
+            double elapsed = (FPlatformTime::Seconds() - t0) * 1000.0;
+            //if (elapsed > 10.0)
+                UE_LOG(LogTemp, Log, TEXT("[Pipeline] EditUpdate (ApplyEdit): %.2fms"), elapsed);
+
             Self->EditUpdateIsRunning = false;
+
         }, TStatId(), nullptr, ENamedThreads::AnyNormalThreadHiPriTask);
 }
 
