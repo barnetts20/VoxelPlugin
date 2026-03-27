@@ -85,14 +85,85 @@ void APlanetAtmosphereActor::PostEditChangeProperty(FPropertyChangedEvent& Prope
         UpdateLightFromRotation();
     }
 }
+
+bool APlanetAtmosphereActor::CanEditChange(const FProperty* InProperty) const
+{
+    if (!Super::CanEditChange(InProperty))
+        return false;
+
+    if (bIsPlanetOwned && InProperty)
+    {
+        const FName PropName = InProperty->GetFName();
+        // Lock location and scale — driven by the planet.
+        // Rotation remains editable (controls light direction).
+        if (PropName == TEXT("RelativeLocation") || PropName == TEXT("RelativeScale3D"))
+            return false;
+    }
+
+    return true;
+}
+
+void APlanetAtmosphereActor::EditorApplyTranslation(const FVector& DeltaTranslation, bool bAltDown, bool bShiftDown, bool bCtrlDown)
+{
+    if (bIsPlanetOwned) return;
+    Super::EditorApplyTranslation(DeltaTranslation, bAltDown, bShiftDown, bCtrlDown);
+}
+
+void APlanetAtmosphereActor::EditorApplyScale(const FVector& DeltaScale, const FVector* PivotLocation, bool bAltDown, bool bShiftDown, bool bCtrlDown)
+{
+    if (bIsPlanetOwned) return;
+    Super::EditorApplyScale(DeltaScale, PivotLocation, bAltDown, bShiftDown, bCtrlDown);
+}
+
+void APlanetAtmosphereActor::PostEditMove(bool bFinished)
+{
+    if (bIsPlanetOwned)
+    {
+        // Snap location back — it follows the planet. Rotation is intentionally left alone
+        // (controls light direction). Scale is absolute and planet-driven.
+        if (USceneComponent* Root = GetRootComponent())
+        {
+            Root->SetRelativeLocation(FVector::ZeroVector);
+        }
+    }
+    Super::PostEditMove(bFinished);
+}
 #endif
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Planet integration
 // ─────────────────────────────────────────────────────────────────────────────
 
+void APlanetAtmosphereActor::OnTransformUpdated(USceneComponent* Component, EUpdateTransformFlags Flags, ETeleportType Teleport)
+{
+    if (!bIsPlanetOwned) return;
+
+    if (USceneComponent* Root = GetRootComponent())
+    {
+        // Lock location and scale. Rotation is intentionally left alone (light direction).
+        bool bLocationDirty = !Root->GetRelativeLocation().IsNearlyZero(0.01);
+        bool bScaleDirty = !Root->GetComponentScale().Equals(PlanetDrivenScale, 0.01);
+
+        if (bLocationDirty || bScaleDirty)
+        {
+            Root->SetRelativeLocation_Direct(FVector::ZeroVector);
+            Root->SetRelativeScale3D_Direct(PlanetDrivenScale);
+            Root->UpdateComponentToWorld();
+        }
+    }
+}
+
 void APlanetAtmosphereActor::InitializeFromPlanet(USceneComponent* InAttachParent)
 {
+    bIsPlanetOwned = true;
+    PlanetDrivenScale = GetActorScale3D();
+
+    if (USceneComponent* Root = GetRootComponent())
+    {
+        Root->TransformUpdated.RemoveAll(this);
+        Root->TransformUpdated.AddUObject(this, &APlanetAtmosphereActor::OnTransformUpdated);
+    }
+
     // Planet actor handles spawn + attach. Just run our init.
     bPendingInitialize = false;
     Initialize();

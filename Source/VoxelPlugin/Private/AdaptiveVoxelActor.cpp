@@ -85,6 +85,59 @@ void AAdaptiveVoxelActor::PostEditChangeProperty(FPropertyChangedEvent& Property
         Initialize();
     }
 }
+
+bool AAdaptiveVoxelActor::CanEditChange(const FProperty* InProperty) const
+{
+    if (!Super::CanEditChange(InProperty))
+        return false;
+
+    if (bIsPlanetOwned && InProperty)
+    {
+        const FName PropName = InProperty->GetFName();
+        // Lock all transform components — position, rotation, scale are driven by the planet.
+        static const FName TransformNames[] = {
+            TEXT("RelativeLocation"), TEXT("RelativeRotation"), TEXT("RelativeScale3D"),
+        };
+        for (const FName& Name : TransformNames)
+        {
+            if (PropName == Name) return false;
+        }
+    }
+
+    return true;
+}
+
+void AAdaptiveVoxelActor::EditorApplyTranslation(const FVector& DeltaTranslation, bool bAltDown, bool bShiftDown, bool bCtrlDown)
+{
+    if (bIsPlanetOwned) return;
+    Super::EditorApplyTranslation(DeltaTranslation, bAltDown, bShiftDown, bCtrlDown);
+}
+
+void AAdaptiveVoxelActor::EditorApplyRotation(const FRotator& DeltaRotation, bool bAltDown, bool bShiftDown, bool bCtrlDown)
+{
+    if (bIsPlanetOwned) return;
+    Super::EditorApplyRotation(DeltaRotation, bAltDown, bShiftDown, bCtrlDown);
+}
+
+void AAdaptiveVoxelActor::EditorApplyScale(const FVector& DeltaScale, const FVector* PivotLocation, bool bAltDown, bool bShiftDown, bool bCtrlDown)
+{
+    if (bIsPlanetOwned) return;
+    Super::EditorApplyScale(DeltaScale, PivotLocation, bAltDown, bShiftDown, bCtrlDown);
+}
+
+void AAdaptiveVoxelActor::PostEditMove(bool bFinished)
+{
+    if (bIsPlanetOwned)
+    {
+        // Snap all transforms back — location and rotation follow parent, scale is planet-driven.
+        if (USceneComponent* Root = GetRootComponent())
+        {
+            Root->SetRelativeLocation(FVector::ZeroVector);
+            Root->SetRelativeRotation(FRotator::ZeroRotator);
+        }
+    }
+    Super::PostEditMove(bFinished);
+}
 #endif
 
 void AAdaptiveVoxelActor::BeginPlay()
@@ -273,12 +326,39 @@ void AAdaptiveVoxelActor::Initialize()
     RunDataUpdateTask();
 }
 
+void AAdaptiveVoxelActor::OnTransformUpdated(USceneComponent* Component, EUpdateTransformFlags Flags, ETeleportType Teleport)
+{
+    if (!bIsPlanetOwned) return;
+
+    // Snap everything back: location and rotation follow parent, scale is planet-driven.
+    if (USceneComponent* Root = GetRootComponent())
+    {
+        if (!Root->GetRelativeLocation().IsNearlyZero(0.01)
+            || !Root->GetRelativeRotation().IsNearlyZero(0.01)
+            || !Root->GetComponentScale().Equals(PlanetDrivenScale, 0.01))
+        {
+            Root->SetRelativeLocation_Direct(FVector::ZeroVector);
+            Root->SetRelativeRotation_Direct(FRotator::ZeroRotator);
+            Root->SetRelativeScale3D_Direct(PlanetDrivenScale);
+            Root->UpdateComponentToWorld();
+        }
+    }
+}
+
 void AAdaptiveVoxelActor::InitializeFromPlanet(TSharedPtr<FDensitySampleCompositor> InCompositor,
     USceneComponent* InAttachParent)
 {
     // Same teardown as Initialize
     Initialized = false;
     bIsPlanetOwned = true;
+    PlanetDrivenScale = GetActorScale3D();
+
+    // Guard transforms — bind once to snap back any editor-driven changes.
+    if (USceneComponent* Root = GetRootComponent())
+    {
+        Root->TransformUpdated.RemoveAll(this);
+        Root->TransformUpdated.AddUObject(this, &AAdaptiveVoxelActor::OnTransformUpdated);
+    }
     while (DataUpdateIsRunning || MeshUpdateIsRunning || EditUpdateIsRunning)
         FPlatformProcess::Sleep(0.001f);
 

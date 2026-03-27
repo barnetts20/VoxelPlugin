@@ -29,6 +29,12 @@ class VOXELPLUGIN_API APlanetAtmosphereActor : public AActor
 public:
     APlanetAtmosphereActor();
 
+    // True when this actor is spawned and driven by an APlanetActor.
+    // Location and scale become read-only; rotation remains editable
+    // (controls the light direction).
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Atmosphere")
+    bool bIsPlanetOwned = false;
+
     // ───────────────────────── Atmosphere Scattering ─────────────────────────
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Atmosphere|Scattering")
@@ -170,6 +176,10 @@ public:
 
 #if WITH_EDITOR
     virtual void PostEditChangeProperty(FPropertyChangedEvent& PropertyChangedEvent) override;
+    virtual bool CanEditChange(const FProperty* InProperty) const override;
+    virtual void PostEditMove(bool bFinished) override;
+    virtual void EditorApplyTranslation(const FVector& DeltaTranslation, bool bAltDown, bool bShiftDown, bool bCtrlDown) override;
+    virtual void EditorApplyScale(const FVector& DeltaScale, const FVector* PivotLocation, bool bAltDown, bool bShiftDown, bool bCtrlDown) override;
 #endif
 
     /** Called by PlanetActor after spawn + attach. Skips self-init path. */
@@ -196,6 +206,10 @@ private:
 
     bool bInitialized = false;
     bool bPendingInitialize = true;
+
+    FVector PlanetDrivenScale = FVector::OneVector;
+
+    void OnTransformUpdated(USceneComponent* Component, EUpdateTransformFlags Flags, ETeleportType Teleport);
 
     void Initialize();
     void SpawnChildActors();

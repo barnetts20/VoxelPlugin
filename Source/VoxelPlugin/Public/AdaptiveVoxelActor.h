@@ -57,6 +57,14 @@ private:
     FVector LastInitScale = FVector::ZeroVector;
 
     FastNoise::SmartNode<> Noise;
+
+    // Cached scale set by the planet actor, used by the transform guard to restore on edits.
+    FVector PlanetDrivenScale = FVector::OneVector;
+
+    // Bound to RootComponent->TransformUpdated when planet-owned.
+    // Reverts any editor-driven transform changes on locked components.
+    void OnTransformUpdated(USceneComponent* Component, EUpdateTransformFlags Flags, ETeleportType Teleport);
+
 public:
     AAdaptiveVoxelActor();
 
@@ -146,6 +154,11 @@ public:
 
 #if WITH_EDITOR
     virtual void PostEditChangeProperty(FPropertyChangedEvent& PropertyChangedEvent) override;
+    virtual bool CanEditChange(const FProperty* InProperty) const override;
+    virtual void PostEditMove(bool bFinished) override;
+    virtual void EditorApplyTranslation(const FVector& DeltaTranslation, bool bAltDown, bool bShiftDown, bool bCtrlDown) override;
+    virtual void EditorApplyRotation(const FRotator& DeltaRotation, bool bAltDown, bool bShiftDown, bool bCtrlDown) override;
+    virtual void EditorApplyScale(const FVector& DeltaScale, const FVector* PivotLocation, bool bAltDown, bool bShiftDown, bool bCtrlDown) override;
 #endif
 
     USceneComponent* GetMeshAttachmentRoot() const { return MeshAttachmentRoot; }

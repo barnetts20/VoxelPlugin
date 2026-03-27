@@ -115,6 +115,11 @@ public:
 
 #if WITH_EDITOR
     virtual void PostEditChangeProperty(FPropertyChangedEvent& PropertyChangedEvent) override;
+    virtual bool CanEditChange(const FProperty* InProperty) const override;
+    virtual void PostEditMove(bool bFinished) override;
+    virtual void EditorApplyTranslation(const FVector& DeltaTranslation, bool bAltDown, bool bShiftDown, bool bCtrlDown) override;
+    virtual void EditorApplyRotation(const FRotator& DeltaRotation, bool bAltDown, bool bShiftDown, bool bCtrlDown) override;
+    virtual void EditorApplyScale(const FVector& DeltaScale, const FVector* PivotLocation, bool bAltDown, bool bShiftDown, bool bCtrlDown) override;
 #endif
 
     void InitializeFromPlanet(TSharedPtr<FDensitySampleCompositor> InCompositor,
@@ -148,6 +153,10 @@ private:
     double  LastTerrainPlanetRadius = 0.0;
 
     FTimerHandle LodTimerHandle;
+
+    FVector PlanetDrivenScale = FVector::OneVector;
+
+    void OnTransformUpdated(USceneComponent* Component, EUpdateTransformFlags Flags, ETeleportType Teleport);
 
     // Static mesh grid cache — keyed by resolution.
     TMap<int32, FOceanMeshGrid> MeshGridCache;

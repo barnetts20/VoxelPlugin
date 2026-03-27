@@ -71,6 +71,57 @@ void AOceanSphereActor::PostEditChangeProperty(FPropertyChangedEvent& PropertyCh
         Initialize();
     }
 }
+
+bool AOceanSphereActor::CanEditChange(const FProperty* InProperty) const
+{
+    if (!Super::CanEditChange(InProperty))
+        return false;
+
+    if (bIsPlanetOwned && InProperty)
+    {
+        const FName PropName = InProperty->GetFName();
+        static const FName TransformNames[] = {
+            TEXT("RelativeLocation"), TEXT("RelativeRotation"), TEXT("RelativeScale3D"),
+        };
+        for (const FName& Name : TransformNames)
+        {
+            if (PropName == Name) return false;
+        }
+    }
+
+    return true;
+}
+
+void AOceanSphereActor::EditorApplyTranslation(const FVector& DeltaTranslation, bool bAltDown, bool bShiftDown, bool bCtrlDown)
+{
+    if (bIsPlanetOwned) return;
+    Super::EditorApplyTranslation(DeltaTranslation, bAltDown, bShiftDown, bCtrlDown);
+}
+
+void AOceanSphereActor::EditorApplyRotation(const FRotator& DeltaRotation, bool bAltDown, bool bShiftDown, bool bCtrlDown)
+{
+    if (bIsPlanetOwned) return;
+    Super::EditorApplyRotation(DeltaRotation, bAltDown, bShiftDown, bCtrlDown);
+}
+
+void AOceanSphereActor::EditorApplyScale(const FVector& DeltaScale, const FVector* PivotLocation, bool bAltDown, bool bShiftDown, bool bCtrlDown)
+{
+    if (bIsPlanetOwned) return;
+    Super::EditorApplyScale(DeltaScale, PivotLocation, bAltDown, bShiftDown, bCtrlDown);
+}
+
+void AOceanSphereActor::PostEditMove(bool bFinished)
+{
+    if (bIsPlanetOwned)
+    {
+        if (USceneComponent* Root = GetRootComponent())
+        {
+            Root->SetRelativeLocation(FVector::ZeroVector);
+            Root->SetRelativeRotation(FRotator::ZeroRotator);
+        }
+    }
+    Super::PostEditMove(bFinished);
+}
 #endif
 
 bool AOceanSphereActor::ShouldTickIfViewportsOnly() const
@@ -101,10 +152,35 @@ void AOceanSphereActor::Initialize()
     InitializeInternal(nullptr);
 }
 
+void AOceanSphereActor::OnTransformUpdated(USceneComponent* Component, EUpdateTransformFlags Flags, ETeleportType Teleport)
+{
+    if (!bIsPlanetOwned) return;
+
+    if (USceneComponent* Root = GetRootComponent())
+    {
+        if (!Root->GetRelativeLocation().IsNearlyZero(0.01)
+            || !Root->GetRelativeRotation().IsNearlyZero(0.01)
+            || !Root->GetComponentScale().Equals(PlanetDrivenScale, 0.01))
+        {
+            Root->SetRelativeLocation_Direct(FVector::ZeroVector);
+            Root->SetRelativeRotation_Direct(FRotator::ZeroRotator);
+            Root->SetRelativeScale3D_Direct(PlanetDrivenScale);
+            Root->UpdateComponentToWorld();
+        }
+    }
+}
+
 void AOceanSphereActor::InitializeFromPlanet(TSharedPtr<FDensitySampleCompositor> InCompositor,
     USceneComponent* InAttachParent)
 {
     bIsPlanetOwned = true;
+    PlanetDrivenScale = GetActorScale3D();
+
+    if (USceneComponent* Root = GetRootComponent())
+    {
+        Root->TransformUpdated.RemoveAll(this);
+        Root->TransformUpdated.AddUObject(this, &AOceanSphereActor::OnTransformUpdated);
+    }
 
     // Re-parent MeshAttachmentRoot to the planet's component hierarchy
     // so mesh chunks follow the planet's position/rotation.
