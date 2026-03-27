@@ -128,10 +128,9 @@ void FAdaptiveOctree::PopulateChunks()
         CollectVolumeChunks(Root.Get(), Chunks);
     }
 
-    // Process all chunk data in bulk -- parallel
-    ParallelFor(Chunks.Num(), [&](int32 i) {
-        ReconstructSubtree(Chunks[i].Get(), FVector::ZeroVector, 0);
-        });
+    // Note: densities, normals, edges, QEF, and surface flags are already computed
+    // by SplitToDepth -> SplitAndComputeChildren -> FinalizeFromExistingCorners.
+    // No reconstruction pass needed for initial build.
 
     // Build mesh chunks -- parallel edge gather + stream build
     TArray<TSharedPtr<FMeshChunk>> NewChunks;
@@ -214,7 +213,6 @@ void FAdaptiveOctree::ApplyEdit(FVector InEditCenter, double InEditRadius, doubl
 {
     int depth = Compositor->GetEditStore()->GetDepthForBrushRadius(InEditRadius, InEditResolution);
     TArray<FVector> AffectedChunkCenters = Compositor->GetEditStore()->ApplySphericalEdit(InEditCenter, InEditRadius, InEditStrength, depth);
-    double ReconstructRadius = InEditRadius * 2.5;
 
     // Resolve chunk nodes -- collect as shared ptrs since we need them for ChunkMap operations
     TArray<TSharedPtr<FAdaptiveOctreeNode>> ChunkNodes;
@@ -227,7 +225,7 @@ void FAdaptiveOctree::ApplyEdit(FVector InEditCenter, double InEditRadius, doubl
 
     // Stage 1: Parallel -- recompute all node data (densities, normals, surface flags)
     ParallelFor(ChunkNodes.Num(), [&](int32 i) {
-        ReconstructSubtree(ChunkNodes[i].Get(), InEditCenter, ReconstructRadius);
+        ReconstructSubtree(ChunkNodes[i].Get());
         });
 
     // Stage 2: Enforce splits -- edits may create surface in previously empty nodes.
@@ -235,7 +233,7 @@ void FAdaptiveOctree::ApplyEdit(FVector InEditCenter, double InEditRadius, doubl
     // so the chunk map sees the complete tree state including new nodes.
     for (auto& ChunkNode : ChunkNodes)
     {
-        EnforceSplitsInSubtree(ChunkNode.Get(), InEditCenter, ReconstructRadius);
+        EnforceSplitsInSubtree(ChunkNode.Get());
     }
 
     // Stage 3: Serial -- update chunk map (picks up newly surfaced chunks)
@@ -255,18 +253,14 @@ void FAdaptiveOctree::ApplyEdit(FVector InEditCenter, double InEditRadius, doubl
         });
 }
 
-void FAdaptiveOctree::GatherUniqueCorners(FAdaptiveOctreeNode* Node, TArray<FCornerSample>& Samples, TMap<FIntVector, int32>& CornerMap, double QuantizeGrid, FVector EditCenter, double SearchRadius)
+void FAdaptiveOctree::GatherUniqueCorners(FAdaptiveOctreeNode* Node, TArray<FCornerSample>& Samples, TMap<FIntVector, int32>& CornerMap, double QuantizeGrid)
 {
     if (!Node) return;
 
-    if (SearchRadius > 0)
+    // Skip nodes that don't overlap any edits in the edit store
+    if (Compositor.IsValid() && Compositor->GetEditStore().IsValid())
     {
-        FVector Closest;
-        Closest.X = FMath::Clamp(EditCenter.X, Node->Center.X - Node->Extent, Node->Center.X + Node->Extent);
-        Closest.Y = FMath::Clamp(EditCenter.Y, Node->Center.Y - Node->Extent, Node->Center.Y + Node->Extent);
-        Closest.Z = FMath::Clamp(EditCenter.Z, Node->Center.Z - Node->Extent, Node->Center.Z + Node->Extent);
-
-        if (FVector::DistSquared(Closest, EditCenter) > SearchRadius * SearchRadius)
+        if (!Compositor->GetEditStore()->HasEditsAlongPath(Node->Index))
             return;
     }
 
@@ -298,21 +292,17 @@ void FAdaptiveOctree::GatherUniqueCorners(FAdaptiveOctreeNode* Node, TArray<FCor
     if (Node->IsLeaf() || Node->Index.Depth >= PrecisionDepthFloor) return;
 
     for (int i = 0; i < 8; i++)
-        GatherUniqueCorners(Node->Children[i].Get(), Samples, CornerMap, QuantizeGrid, EditCenter, SearchRadius);
+        GatherUniqueCorners(Node->Children[i].Get(), Samples, CornerMap, QuantizeGrid);
 }
 
-void FAdaptiveOctree::FinalizeSubtree(FAdaptiveOctreeNode* Node, FVector EditCenter, double SearchRadius)
+void FAdaptiveOctree::FinalizeSubtree(FAdaptiveOctreeNode* Node)
 {
     if (!Node) return;
 
-    if (SearchRadius > 0)
+    // Skip nodes that don't overlap any edits
+    if (Compositor.IsValid() && Compositor->GetEditStore().IsValid())
     {
-        FVector Closest;
-        Closest.X = FMath::Clamp(EditCenter.X, Node->Center.X - Node->Extent, Node->Center.X + Node->Extent);
-        Closest.Y = FMath::Clamp(EditCenter.Y, Node->Center.Y - Node->Extent, Node->Center.Y + Node->Extent);
-        Closest.Z = FMath::Clamp(EditCenter.Z, Node->Center.Z - Node->Extent, Node->Center.Z + Node->Extent);
-
-        if (FVector::DistSquared(Closest, EditCenter) > SearchRadius * SearchRadius)
+        if (!Compositor->GetEditStore()->HasEditsAlongPath(Node->Index))
             return;
     }
 
@@ -320,25 +310,21 @@ void FAdaptiveOctree::FinalizeSubtree(FAdaptiveOctreeNode* Node, FVector EditCen
     if (!Node->IsLeaf())
     {
         for (int i = 0; i < 8; i++)
-            FinalizeSubtree(Node->Children[i].Get(), EditCenter, SearchRadius);
+            FinalizeSubtree(Node->Children[i].Get());
     }
 
     // Then this node
     Node->FinalizeFromExistingCorners();
 }
 
-void FAdaptiveOctree::PropagateDeepDensities(FAdaptiveOctreeNode* Node, FVector EditCenter, double SearchRadius)
+void FAdaptiveOctree::PropagateDeepDensities(FAdaptiveOctreeNode* Node)
 {
     if (!Node || Node->IsLeaf()) return;
 
-    if (SearchRadius > 0)
+    // Skip nodes that don't overlap any edits
+    if (Compositor.IsValid() && Compositor->GetEditStore().IsValid())
     {
-        FVector Closest;
-        Closest.X = FMath::Clamp(EditCenter.X, Node->Center.X - Node->Extent, Node->Center.X + Node->Extent);
-        Closest.Y = FMath::Clamp(EditCenter.Y, Node->Center.Y - Node->Extent, Node->Center.Y + Node->Extent);
-        Closest.Z = FMath::Clamp(EditCenter.Z, Node->Center.Z - Node->Extent, Node->Center.Z + Node->Extent);
-
-        if (FVector::DistSquared(Closest, EditCenter) > SearchRadius * SearchRadius)
+        if (!Compositor->GetEditStore()->HasEditsAlongPath(Node->Index))
             return;
     }
 
@@ -351,13 +337,13 @@ void FAdaptiveOctree::PropagateDeepDensities(FAdaptiveOctreeNode* Node, FVector 
         // Recurse into children that have their own children
         for (int i = 0; i < 8; i++)
             if (Node->Children[i].IsValid())
-                PropagateDeepDensities(Node->Children[i].Get(), EditCenter, SearchRadius);
+                PropagateDeepDensities(Node->Children[i].Get());
     }
     else
     {
         // Haven't reached the floor yet � keep walking down
         for (int i = 0; i < 8; i++)
-            PropagateDeepDensities(Node->Children[i].Get(), EditCenter, SearchRadius);
+            PropagateDeepDensities(Node->Children[i].Get());
     }
 }
 
@@ -448,7 +434,7 @@ void FAdaptiveOctree::InterpolateChildrenWithEdits(FAdaptiveOctreeNode* Node)
     }
 }
 
-void FAdaptiveOctree::ReconstructSubtree(FAdaptiveOctreeNode* Node, FVector EditCenter, double SearchRadius)
+void FAdaptiveOctree::ReconstructSubtree(FAdaptiveOctreeNode* Node)
 {
     // 1. Gather unique corners from affected nodes
     TMap<FIntVector, int32> CornerMap;
@@ -457,7 +443,7 @@ void FAdaptiveOctree::ReconstructSubtree(FAdaptiveOctreeNode* Node, FVector Edit
     CornerMap.Reserve(4096);
     double QuantizeGrid = ChunkExtent * 1e-8;
 
-    GatherUniqueCorners(Node, Samples, CornerMap, QuantizeGrid, EditCenter, SearchRadius);
+    GatherUniqueCorners(Node, Samples, CornerMap, QuantizeGrid);
 
     if (Samples.Num() == 0) return;
 
@@ -495,52 +481,31 @@ void FAdaptiveOctree::ReconstructSubtree(FAdaptiveOctreeNode* Node, FVector Edit
     //    Floor-level nodes now have fresh noise+edit densities from step 4.
     //    Deeper children get noise interpolated from parent corners, with edit-store
     //    contributions stripped before interpolation and re-sampled at full resolution.
-    PropagateDeepDensities(Node, EditCenter, SearchRadius);
+    PropagateDeepDensities(Node);
 
     // 6. Finalize edges/QEF
-    FinalizeSubtree(Node, EditCenter, SearchRadius);
+    FinalizeSubtree(Node);
 }
 
-void FAdaptiveOctree::EnforceSplitsInSubtree(FAdaptiveOctreeNode* Node, FVector EditCenter, double SearchRadius)
+void FAdaptiveOctree::EnforceSplitsInSubtree(FAdaptiveOctreeNode* Node)
 {
     if (!Node) return;
 
-    // Spatial cull — skip nodes outside the edit's influence
-    if (SearchRadius > 0)
+    // Skip nodes that don't overlap any edits in the edit store
+    if (Compositor.IsValid() && Compositor->GetEditStore().IsValid())
     {
-        FVector Closest;
-        Closest.X = FMath::Clamp(EditCenter.X, Node->Center.X - Node->Extent, Node->Center.X + Node->Extent);
-        Closest.Y = FMath::Clamp(EditCenter.Y, Node->Center.Y - Node->Extent, Node->Center.Y + Node->Extent);
-        Closest.Z = FMath::Clamp(EditCenter.Z, Node->Center.Z - Node->Extent, Node->Center.Z + Node->Extent);
-
-        if (FVector::DistSquared(Closest, EditCenter) > SearchRadius * SearchRadius)
+        if (!Compositor->GetEditStore()->HasEditsAlongPath(Node->Index))
             return;
     }
 
     if (Node->IsLeaf())
     {
-        // Check if the edit sphere overlaps this node's AABB — the surface wall
-        // of the edit can be in any child that intersects the edit volume, not just
-        // the one containing the edit center
-        FVector Closest;
-        Closest.X = FMath::Clamp(EditCenter.X, Node->Center.X - Node->Extent, Node->Center.X + Node->Extent);
-        Closest.Y = FMath::Clamp(EditCenter.Y, Node->Center.Y - Node->Extent, Node->Center.Y + Node->Extent);
-        Closest.Z = FMath::Clamp(EditCenter.Z, Node->Center.Z - Node->Extent, Node->Center.Z + Node->Extent);
-        bool bEditOverlaps = FVector::DistSquared(Closest, EditCenter) <= SearchRadius * SearchRadius;
+        bool bHasEdits = Compositor.IsValid() && Compositor->GetEditStore().IsValid()
+            && Compositor->GetEditStore()->HasEditsAlongPath(Node->Index);
 
         bool bNeedsSplit = false;
 
-        // Edit-driven split: if the edit sphere overlaps this node, keep splitting
-        // until the node is fine enough to resolve the edit. The edit store may have
-        // created surface between corners that are too far apart to detect it.
-        bool bEditNeedsFiner = bEditOverlaps && (Node->Extent > SearchRadius * 0.5);
-
-        if (bEditNeedsFiner)
-        {
-            // Unconditionally split — corners can't see the edit at this resolution
-            bNeedsSplit = true;
-        }
-        else if (Node->CouldContainSurface || bEditOverlaps)
+        if (bHasEdits || Node->CouldContainSurface)
         {
             bool bLodWantsSplit = Node->ShouldSplit(CachedCameraPosition, CachedThresholdSq, CachedFOVScale);
             bool bBelowMinDepth = Node->Index.Depth < Node->DepthBounds[1];
@@ -556,7 +521,7 @@ void FAdaptiveOctree::EnforceSplitsInSubtree(FAdaptiveOctreeNode* Node, FVector 
             for (int i = 0; i < 8; i++)
             {
                 if (Node->Children[i].IsValid())
-                    EnforceSplitsInSubtree(Node->Children[i].Get(), EditCenter, SearchRadius);
+                    EnforceSplitsInSubtree(Node->Children[i].Get());
             }
         }
         return;
@@ -566,7 +531,7 @@ void FAdaptiveOctree::EnforceSplitsInSubtree(FAdaptiveOctreeNode* Node, FVector 
     for (int i = 0; i < 8; i++)
     {
         if (Node->Children[i].IsValid())
-            EnforceSplitsInSubtree(Node->Children[i].Get(), EditCenter, SearchRadius);
+            EnforceSplitsInSubtree(Node->Children[i].Get());
     }
 }
 

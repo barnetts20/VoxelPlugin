@@ -117,18 +117,18 @@ private:
 
     void UpdateChunkMap(TSharedPtr<FAdaptiveOctreeNode> ChunkNode, TArray<TPair<TSharedPtr<FAdaptiveOctreeNode>, TSharedPtr<FMeshChunk>>>& OutDirtyChunks);
 
-    void FinalizeSubtree(FAdaptiveOctreeNode* Node, FVector EditCenter, double SearchRadius);
+    void FinalizeSubtree(FAdaptiveOctreeNode* Node);
 
-    void PropagateDeepDensities(FAdaptiveOctreeNode* Node, FVector EditCenter, double SearchRadius);
+    void PropagateDeepDensities(FAdaptiveOctreeNode* Node);
 
     void InterpolateChildrenWithEdits(FAdaptiveOctreeNode* Node);
 
-    void ReconstructSubtree(FAdaptiveOctreeNode* Node, FVector EditCenter, double SearchRadius);
+    void ReconstructSubtree(FAdaptiveOctreeNode* Node);
 
     // After an edit, walks the affected region and splits any leaf that is now
     // CouldContainSurface but wasn't previously split. Uses cached LOD state
     // from the last UpdateLOD pass to determine appropriate split depth.
-    void EnforceSplitsInSubtree(FAdaptiveOctreeNode* Node, FVector EditCenter, double SearchRadius);
+    void EnforceSplitsInSubtree(FAdaptiveOctreeNode* Node);
 
     void UpdateMeshChunkStreamData(TSharedPtr<FMeshChunk> InChunk);
 
@@ -149,7 +149,7 @@ public:
 
     void ApplyEdit(FVector InEditCenter, double InEditRadius, double InEditStrength, int InEditResolution);
 
-    void GatherUniqueCorners(FAdaptiveOctreeNode* Node, TArray<FCornerSample>& Samples, TMap<FIntVector, int32>& CornerMap, double QuantizeGrid, FVector EditCenter, double SearchRadius);
+    void GatherUniqueCorners(FAdaptiveOctreeNode* Node, TArray<FCornerSample>& Samples, TMap<FIntVector, int32>& CornerMap, double QuantizeGrid);
 
     void UpdateLodRecursive(FAdaptiveOctreeNode* Node, FVector CameraPosition, double ThresholdSq, double MergeThresholdSq, double InFOVScale, TArray<FNodeEdge>& OutNodeEdges, TMap<FEdgeKey, int32>& EdgeMap, bool& OutChanged);
 
