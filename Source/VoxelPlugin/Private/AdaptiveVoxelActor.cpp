@@ -7,6 +7,11 @@
 
 using namespace RealtimeMesh;
 
+//Pipeline log thresholds... log if the pipelines take longer than the set value in MS
+const float DATA_LOG_THRESHOLD = 100;
+const float MESH_LOG_THRESHOLD = 50;
+const float EDIT_LOG_THRESHOLD = 0;
+
 // Sets default values
 AAdaptiveVoxelActor::AAdaptiveVoxelActor()
 {
@@ -460,8 +465,7 @@ void AAdaptiveVoxelActor::RunDataUpdateTask()
                 Self->LastLodUpdatePosition = Self->CameraPosition;
             }
             double elapsed = (FPlatformTime::Seconds() - t0) * 1000.0;
-            if (elapsed > 30.0)
-                UE_LOG(LogTemp, Log, TEXT("[Pipeline] DataUpdate (UpdateLOD): %.2fms"), elapsed);
+            if (elapsed > DATA_LOG_THRESHOLD) UE_LOG(LogTemp, Log, TEXT("[Pipeline] DataUpdate: %.2fms"), elapsed);
 
             Self->DataUpdateIsRunning = false;
             Self->RunMeshUpdateTask();
@@ -487,8 +491,7 @@ void AAdaptiveVoxelActor::RunMeshUpdateTask()
                 Self->AdaptiveOctree->UpdateMesh();
             }
             double elapsed = (FPlatformTime::Seconds() - t0) * 1000.0;
-            if (elapsed > 10.0)
-                UE_LOG(LogTemp, Log, TEXT("[Pipeline] MeshUpdate (UpdateMesh): %.2fms"), elapsed);
+            if (elapsed > MESH_LOG_THRESHOLD) UE_LOG(LogTemp, Log, TEXT("[Pipeline] MeshUpdate: %.2fms"), elapsed);
 
             Self->MeshUpdateIsRunning = false;
 
@@ -520,6 +523,7 @@ void AAdaptiveVoxelActor::RunEditUpdateTask(FVector InEditCenter, double InEditR
     TWeakObjectPtr<AAdaptiveVoxelActor> WeakThis(this);
     FFunctionGraphTask::CreateAndDispatchWhenReady([WeakThis, InEditCenter, InEditRadius, InEditStrength, InEditResolution]()
         {
+            double t0 = FPlatformTime::Seconds();
             AAdaptiveVoxelActor* Self = WeakThis.Get();
             if (!Self || Self->IsDestroyed) return;
             {
@@ -527,7 +531,12 @@ void AAdaptiveVoxelActor::RunEditUpdateTask(FVector InEditCenter, double InEditR
                 Self->AdaptiveOctree->ApplyEdit(InEditCenter, InEditRadius, InEditStrength, InEditResolution);
                 Self->AdaptiveOctree->UpdateMesh();
             }
+
+            double elapsed = (FPlatformTime::Seconds() - t0) * 1000.0;
+            if (elapsed > EDIT_LOG_THRESHOLD) UE_LOG(LogTemp, Log, TEXT("[Pipeline] EditUpdate: %.2fms"), elapsed);
+
             Self->EditUpdateIsRunning = false;
+
         }, TStatId(), nullptr, ENamedThreads::AnyNormalThreadHiPriTask);
 }
 
