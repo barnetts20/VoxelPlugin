@@ -104,6 +104,11 @@ private:
     // Calibrated so that ~8000 UV wraps occur across the planet diameter.
     double TriplanarUVScale;
 
+    // Cached from last UpdateLOD pass — used by edit pipeline to split newly-surfaced nodes
+    FVector CachedCameraPosition = FVector::ZeroVector;
+    double CachedFOVScale = 1.0;
+    double CachedThresholdSq = 0.004;
+
     void SplitToDepth(FAdaptiveOctreeNode* Node, int InMinDepth);
 
     void PopulateChunks();
@@ -119,6 +124,11 @@ private:
     void InterpolateChildrenWithEdits(FAdaptiveOctreeNode* Node);
 
     void ReconstructSubtree(FAdaptiveOctreeNode* Node, FVector EditCenter, double SearchRadius);
+
+    // After an edit, walks the affected region and splits any leaf that is now
+    // CouldContainSurface but wasn't previously split. Uses cached LOD state
+    // from the last UpdateLOD pass to determine appropriate split depth.
+    void EnforceSplitsInSubtree(FAdaptiveOctreeNode* Node, FVector EditCenter, double SearchRadius);
 
     void UpdateMeshChunkStreamData(TSharedPtr<FMeshChunk> InChunk);
 

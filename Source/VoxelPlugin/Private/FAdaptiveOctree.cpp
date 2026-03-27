@@ -225,19 +225,27 @@ void FAdaptiveOctree::ApplyEdit(FVector InEditCenter, double InEditRadius, doubl
             ChunkNodes.Add(ChunkNodeRaw->AsShared());
     }
 
-    // Stage 1: Parallel -- recompute all node data
+    // Stage 1: Parallel -- recompute all node data (densities, normals, surface flags)
     ParallelFor(ChunkNodes.Num(), [&](int32 i) {
         ReconstructSubtree(ChunkNodes[i].Get(), InEditCenter, ReconstructRadius);
         });
 
-    // Stage 2: Serial -- update chunk map
+    // Stage 2: Enforce splits -- edits may create surface in previously empty nodes.
+    // Must run after ReconstructSubtree (densities updated) but before UpdateChunkMap
+    // so the chunk map sees the complete tree state including new nodes.
+    for (auto& ChunkNode : ChunkNodes)
+    {
+        EnforceSplitsInSubtree(ChunkNode.Get(), InEditCenter, ReconstructRadius);
+    }
+
+    // Stage 3: Serial -- update chunk map (picks up newly surfaced chunks)
     TArray<TPair<TSharedPtr<FAdaptiveOctreeNode>, TSharedPtr<FMeshChunk>>> DirtyChunks;
     for (auto& ChunkNode : ChunkNodes)
     {
         UpdateChunkMap(ChunkNode, DirtyChunks);
     }
 
-    // Stage 3: Parallel -- gather edges + rebuild mesh streams
+    // Stage 4: Parallel -- gather edges + rebuild mesh streams
     ParallelFor(DirtyChunks.Num(), [&](int32 i) {
         TArray<FNodeEdge> NewEdges;
         TMap<FEdgeKey, int32> EdgeMap;
@@ -493,6 +501,75 @@ void FAdaptiveOctree::ReconstructSubtree(FAdaptiveOctreeNode* Node, FVector Edit
     FinalizeSubtree(Node, EditCenter, SearchRadius);
 }
 
+void FAdaptiveOctree::EnforceSplitsInSubtree(FAdaptiveOctreeNode* Node, FVector EditCenter, double SearchRadius)
+{
+    if (!Node) return;
+
+    // Spatial cull — skip nodes outside the edit's influence
+    if (SearchRadius > 0)
+    {
+        FVector Closest;
+        Closest.X = FMath::Clamp(EditCenter.X, Node->Center.X - Node->Extent, Node->Center.X + Node->Extent);
+        Closest.Y = FMath::Clamp(EditCenter.Y, Node->Center.Y - Node->Extent, Node->Center.Y + Node->Extent);
+        Closest.Z = FMath::Clamp(EditCenter.Z, Node->Center.Z - Node->Extent, Node->Center.Z + Node->Extent);
+
+        if (FVector::DistSquared(Closest, EditCenter) > SearchRadius * SearchRadius)
+            return;
+    }
+
+    if (Node->IsLeaf())
+    {
+        // Check if the edit sphere overlaps this node's AABB — the surface wall
+        // of the edit can be in any child that intersects the edit volume, not just
+        // the one containing the edit center
+        FVector Closest;
+        Closest.X = FMath::Clamp(EditCenter.X, Node->Center.X - Node->Extent, Node->Center.X + Node->Extent);
+        Closest.Y = FMath::Clamp(EditCenter.Y, Node->Center.Y - Node->Extent, Node->Center.Y + Node->Extent);
+        Closest.Z = FMath::Clamp(EditCenter.Z, Node->Center.Z - Node->Extent, Node->Center.Z + Node->Extent);
+        bool bEditOverlaps = FVector::DistSquared(Closest, EditCenter) <= SearchRadius * SearchRadius;
+
+        bool bNeedsSplit = false;
+
+        // Edit-driven split: if the edit sphere overlaps this node, keep splitting
+        // until the node is fine enough to resolve the edit. The edit store may have
+        // created surface between corners that are too far apart to detect it.
+        bool bEditNeedsFiner = bEditOverlaps && (Node->Extent > SearchRadius * 0.5);
+
+        if (bEditNeedsFiner)
+        {
+            // Unconditionally split — corners can't see the edit at this resolution
+            bNeedsSplit = true;
+        }
+        else if (Node->CouldContainSurface || bEditOverlaps)
+        {
+            bool bLodWantsSplit = Node->ShouldSplit(CachedCameraPosition, CachedThresholdSq, CachedFOVScale);
+            bool bBelowMinDepth = Node->Index.Depth < Node->DepthBounds[1];
+            bNeedsSplit = bLodWantsSplit || bBelowMinDepth;
+        }
+
+        // Respect max depth
+        if (bNeedsSplit && Node->Index.Depth < Node->DepthBounds[2])
+        {
+            SplitAndComputeChildren(Node);
+
+            // Recurse into new children — they might need further splitting
+            for (int i = 0; i < 8; i++)
+            {
+                if (Node->Children[i].IsValid())
+                    EnforceSplitsInSubtree(Node->Children[i].Get(), EditCenter, SearchRadius);
+            }
+        }
+        return;
+    }
+
+    // Non-leaf: recurse into children
+    for (int i = 0; i < 8; i++)
+    {
+        if (Node->Children[i].IsValid())
+            EnforceSplitsInSubtree(Node->Children[i].Get(), EditCenter, SearchRadius);
+    }
+}
+
 FVector2f FAdaptiveOctree::ComputeTriplanarUV(FVector Position, FVector Normal) const
 {
     FVector2f UV;
@@ -728,6 +805,11 @@ void FAdaptiveOctree::UpdateLOD(FVector CameraPosition, double InScreenSpaceThre
     double FOVScale = 1.0 / FMath::Tan(FMath::DegreesToRadians(InCameraFOV * 0.5));
     double ThresholdSq = InScreenSpaceThreshold * InScreenSpaceThreshold;
     double MergeThresholdSq = (InScreenSpaceThreshold * 0.5) * (InScreenSpaceThreshold * 0.5);
+
+    // Cache for edit pipeline — EnforceSplitsInSubtree needs these
+    CachedCameraPosition = CameraPosition;
+    CachedFOVScale = FOVScale;
+    CachedThresholdSq = ThresholdSq;
 
     double t0 = FPlatformTime::Seconds();
     ParallelFor(NumChunks, [&](int32 idx) {
