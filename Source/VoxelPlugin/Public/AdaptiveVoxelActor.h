@@ -60,7 +60,14 @@ private:
 public:
     AAdaptiveVoxelActor();
 
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrain|Materials")
+    // True when this actor is spawned and driven by an APlanetActor.
+    // Planet-driven properties (NoiseAmplitudeRatio, SurfaceMaterial) become
+    // read-only on this actor — edit them on the planet instead.
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Terrain")
+    bool bIsPlanetOwned = false;
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrain|Materials",
+        meta = (EditCondition = "!bIsPlanetOwned"))
     UMaterialInterface* SurfaceMaterial = nullptr;
 
     // Planet radius in world units is determined by actor scale (max component).
@@ -68,7 +75,8 @@ public:
     // Position and rotation changes are handled live by the actor transform.
     // Scale changes trigger full reconstruction.
 
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrain", meta = (ClampMin = "0.01", ClampMax = "1.0"))
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrain",
+        meta = (ClampMin = "0.01", ClampMax = "1.0", EditCondition = "!bIsPlanetOwned"))
     double NoiseAmplitudeRatio = 0.15;
 
     // Computed at init time from float precision requirements.

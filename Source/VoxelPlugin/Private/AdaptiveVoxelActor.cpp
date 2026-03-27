@@ -61,17 +61,14 @@ void AAdaptiveVoxelActor::OnConstruction(const FTransform& Transform)
 void AAdaptiveVoxelActor::PostEditChangeProperty(FPropertyChangedEvent& PropertyChangedEvent)
 {
     Super::PostEditChangeProperty(PropertyChangedEvent);
-
-    // When owned by a PlanetActor, the planet handles rebuild coordination.
-    if (GetOwner() && GetOwner()->IsA<APlanetActor>()) return;
     if (!Initialized) return;
 
     FName PropName = PropertyChangedEvent.GetPropertyName();
 
     // Level 0 — LOD params read live each tick, no rebuild needed:
-    // ScreenSpaceThreshold, VelocityLookAheadFactor, MinDataUpdateInterval
+    // VelocityLookAheadFactor, MinDataUpdateInterval
 
-    // Level 4 — structural changes require full octree rebuild:
+    // Structural changes require full octree rebuild:
     static const TSet<FName> RebuildProps = {
         GET_MEMBER_NAME_CHECKED(AAdaptiveVoxelActor, NoiseAmplitudeRatio),
         GET_MEMBER_NAME_CHECKED(AAdaptiveVoxelActor, MinDepth),
@@ -80,6 +77,7 @@ void AAdaptiveVoxelActor::PostEditChangeProperty(FPropertyChangedEvent& Property
         GET_MEMBER_NAME_CHECKED(AAdaptiveVoxelActor, ChunkCullingMode),
         GET_MEMBER_NAME_CHECKED(AAdaptiveVoxelActor, VolumeSdfRadius),
         GET_MEMBER_NAME_CHECKED(AAdaptiveVoxelActor, SurfaceMaterial),
+        GET_MEMBER_NAME_CHECKED(AAdaptiveVoxelActor, ScreenSpaceThreshold),
     };
 
     if (RebuildProps.Contains(PropName))
@@ -280,6 +278,7 @@ void AAdaptiveVoxelActor::InitializeFromPlanet(TSharedPtr<FDensitySampleComposit
 {
     // Same teardown as Initialize
     Initialized = false;
+    bIsPlanetOwned = true;
     while (DataUpdateIsRunning || MeshUpdateIsRunning || EditUpdateIsRunning)
         FPlatformProcess::Sleep(0.001f);
 

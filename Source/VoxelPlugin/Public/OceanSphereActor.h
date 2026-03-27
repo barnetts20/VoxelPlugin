@@ -16,10 +16,16 @@ class VOXELPLUGIN_API AOceanSphereActor : public ARealtimeMeshActor
 public:
     AOceanSphereActor();
 
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Ocean|Material")
+    // True when this actor is spawned and driven by an APlanetActor.
+    // Planet-driven properties become read-only — edit them on the planet instead.
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Ocean")
+    bool bIsPlanetOwned = false;
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Ocean|Material",
+        meta = (EditCondition = "!bIsPlanetOwned"))
     UMaterialInterface* OceanMaterial = nullptr;
 
-    // Driven by actor scale. Read-only at runtime � adjust scale to resize.
+    // Driven by actor scale. Read-only at runtime — adjust scale to resize.
     UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Ocean|Shape")
     double OceanRadius = 107500000.0;
 
@@ -27,12 +33,12 @@ public:
     // density = OceanRadius - (TerrainPlanetRadius + NoiseHeight):
     //   positive = underwater, negative = above water (land).
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Ocean|Shape",
-        meta = (ClampMin = "1.0"))
+        meta = (ClampMin = "1.0", EditCondition = "!bIsPlanetOwned"))
     double TerrainPlanetRadius = 100000000.0;
 
     // Must match the terrain actor's NoiseAmplitudeRatio.
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Ocean|Shape",
-        meta = (ClampMin = "0.01", ClampMax = "1.0"))
+        meta = (ClampMin = "0.01", ClampMax = "1.0", EditCondition = "!bIsPlanetOwned"))
     double NoiseAmplitudeRatio = 0.15;
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Ocean|Mesh",

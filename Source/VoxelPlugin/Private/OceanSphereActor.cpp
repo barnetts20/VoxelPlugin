@@ -52,9 +52,9 @@ void AOceanSphereActor::PostEditChangeProperty(FPropertyChangedEvent& PropertyCh
     FName PropName = PropertyChangedEvent.GetPropertyName();
 
     // Level 0 — LOD params read live each tick, no rebuild needed:
-    // ScreenSpaceThreshold, VelocityLookAheadFactor, MinLodInterval, bTickInEditor
+    // VelocityLookAheadFactor, MinLodInterval, bTickInEditor
 
-    // Level 3 — structural changes require quadtree rebuild:
+    // Structural changes require quadtree rebuild:
     static const TSet<FName> RebuildProps = {
         GET_MEMBER_NAME_CHECKED(AOceanSphereActor, FaceResolution),
         GET_MEMBER_NAME_CHECKED(AOceanSphereActor, TargetPrecision),
@@ -63,6 +63,7 @@ void AOceanSphereActor::PostEditChangeProperty(FPropertyChangedEvent& PropertyCh
         GET_MEMBER_NAME_CHECKED(AOceanSphereActor, TerrainPlanetRadius),
         GET_MEMBER_NAME_CHECKED(AOceanSphereActor, TriangleCullDepthThreshold),
         GET_MEMBER_NAME_CHECKED(AOceanSphereActor, OceanMaterial),
+        GET_MEMBER_NAME_CHECKED(AOceanSphereActor, ScreenSpaceThreshold),
     };
 
     if (RebuildProps.Contains(PropName))
@@ -103,6 +104,8 @@ void AOceanSphereActor::Initialize()
 void AOceanSphereActor::InitializeFromPlanet(TSharedPtr<FDensitySampleCompositor> InCompositor,
     USceneComponent* InAttachParent)
 {
+    bIsPlanetOwned = true;
+
     // Re-parent MeshAttachmentRoot to the planet's component hierarchy
     // so mesh chunks follow the planet's position/rotation.
     if (InAttachParent && MeshAttachmentRoot)
