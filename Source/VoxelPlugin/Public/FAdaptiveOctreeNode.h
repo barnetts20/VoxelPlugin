@@ -37,11 +37,30 @@ public:
 
     bool IsSurfaceNode = false;
 
+    // True if the node has sign changes (IsSurfaceNode) OR if any corner density
+    // is close enough to zero that the surface could exist between corners at
+    // finer resolution. Used by the LOD system to avoid skipping near-surface nodes.
+    bool CouldContainSurface = false;
+
     bool LodOverride = false;
 
     const bool IsLeaf() const;
 
     const bool IsRoot() const;
+
+    // Returns true if the node has sign changes or any corner is within
+    // proximity of the zero crossing. Threshold scales with node extent.
+    bool IsNearSurface() const
+    {
+        if (IsSurfaceNode) return true;
+        const float Threshold = (float)(Extent * 3);
+        for (int i = 0; i < 8; i++)
+        {
+            if (FMath::Abs(Corners[i].Density) < Threshold)
+                return true;
+        }
+        return false;
+    }
 
     static bool EvaluateSplit(double Extent, double DistSq, double FOVScale, double ThresholdSq, int Depth, int MaxDepth, int MinDepth)
     {

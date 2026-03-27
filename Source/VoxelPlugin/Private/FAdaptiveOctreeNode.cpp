@@ -108,12 +108,26 @@ void FAdaptiveOctreeNode::FinalizeFromExistingCorners(bool bSkipNormals)
 
     ComputeDualContourPosition();
 
+    // Update CouldContainSurface: true if sign changes exist or any corner
+    // is near-zero (surface could be hiding between corners at this resolution)
+    CouldContainSurface = IsNearSurface();
+
     if (IsSurfaceNode)
     {
         TSharedPtr<FAdaptiveOctreeNode> Ancestor = Parent.Pin();
         while (Ancestor.IsValid() && !Ancestor->IsSurfaceNode)
         {
             Ancestor->IsSurfaceNode = true;
+            Ancestor->CouldContainSurface = true;
+            Ancestor = Ancestor->Parent.Pin();
+        }
+    }
+    else if (CouldContainSurface)
+    {
+        TSharedPtr<FAdaptiveOctreeNode> Ancestor = Parent.Pin();
+        while (Ancestor.IsValid() && !Ancestor->CouldContainSurface)
+        {
+            Ancestor->CouldContainSurface = true;
             Ancestor = Ancestor->Parent.Pin();
         }
     }

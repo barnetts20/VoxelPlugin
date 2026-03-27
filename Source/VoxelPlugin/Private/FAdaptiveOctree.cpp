@@ -667,7 +667,9 @@ void FAdaptiveOctree::UpdateLodRecursive(FAdaptiveOctreeNode* Node, FVector Came
 {
     if (Node->IsLeaf())
     {
-        if (Node->ShouldSplit(CameraPosition, ThresholdSq, InFOVScale))
+        // Only nodes near the surface can split — deep interior/exterior nodes are skipped
+        // but all leaves still contribute edges and participate in merge checks
+        if (Node->CouldContainSurface && Node->ShouldSplit(CameraPosition, ThresholdSq, InFOVScale))
         {
             OutChanged = true;
             SplitAndComputeChildren(Node);
@@ -680,13 +682,28 @@ void FAdaptiveOctree::UpdateLodRecursive(FAdaptiveOctreeNode* Node, FVector Came
             FAdaptiveOctreeNode* ParentPtr = Node->Parent.Pin().Get();
             if (ParentPtr && ParentPtr->ShouldMerge(CameraPosition, MergeThresholdSq, InFOVScale))
             {
-                OutChanged = true;
-                ParentPtr->Merge();
-                AppendUniqueEdges(ParentPtr->GetSignChangeEdges(), OutNodeEdges, EdgeMap);
-                return;
+                // Verify ALL siblings are leaves before merging
+                bool bAllSiblingsLeaves = true;
+                for (int i = 0; i < 8; i++)
+                {
+                    if (ParentPtr->Children[i].IsValid() && !ParentPtr->Children[i]->IsLeaf())
+                    {
+                        bAllSiblingsLeaves = false;
+                        break;
+                    }
+                }
+
+                if (bAllSiblingsLeaves)
+                {
+                    OutChanged = true;
+                    ParentPtr->Merge();
+                    AppendUniqueEdges(ParentPtr->GetSignChangeEdges(), OutNodeEdges, EdgeMap);
+                    return;
+                }
             }
         }
 
+        // ALL leaves contribute edges — not just surface ones
         AppendUniqueEdges(Node->GetSignChangeEdges(), OutNodeEdges, EdgeMap);
         return;
     }
@@ -712,7 +729,7 @@ void FAdaptiveOctree::UpdateLOD(FVector CameraPosition, double InScreenSpaceThre
     double ThresholdSq = InScreenSpaceThreshold * InScreenSpaceThreshold;
     double MergeThresholdSq = (InScreenSpaceThreshold * 0.5) * (InScreenSpaceThreshold * 0.5);
 
-    //double t0 = FPlatformTime::Seconds();
+    double t0 = FPlatformTime::Seconds();
     ParallelFor(NumChunks, [&](int32 idx) {
         FAdaptiveOctreeNode* ChunkNode = Chunks[idx].Get();
         double DistSq = FMath::Max(FVector::DistSquared(ChunkNode->Center, CameraPosition), 1e-12);
@@ -740,12 +757,12 @@ void FAdaptiveOctree::UpdateLOD(FVector CameraPosition, double InScreenSpaceThre
                 UpdateMeshChunkStreamData(ModifiedChunks[idx]);
         });
 
-    //double t1 = FPlatformTime::Seconds();
-    //if ((t1 - t0) * 1000.0 > 100.0)
-    //{
-    //    UE_LOG(LogTemp, Log, TEXT("[LOD] LODPass: %.2fms"),
-    //        (t1 - t0) * 1000.0);
-    //}
+    double t1 = FPlatformTime::Seconds();
+    if ((t1 - t0) * 1000.0 > 25.0)
+    {
+        UE_LOG(LogTemp, Log, TEXT("[LOD] LODPass: %.2fms"),
+            (t1 - t0) * 1000.0);
+    }
 }
 
 void FAdaptiveOctree::UpdateMesh()
