@@ -150,10 +150,18 @@ void FAdaptiveOctreeNode::Merge()
 {
     if (bIsLeaf) return;
 
+    // Before destroying children, inherit their surface flags.
+    // If any child had surface or near-surface data (possibly from edits
+    // at finer resolution than our corners can detect), preserve that
+    // knowledge so the LOD system re-splits us when the camera returns.
     for (int i = 0; i < 8; i++)
     {
         if (Children[i].IsValid())
         {
+            if (Children[i]->CouldContainSurface)
+                CouldContainSurface = true;
+            if (Children[i]->IsSurfaceNode)
+                IsSurfaceNode = true;
             Children[i]->Merge();
             Children[i].Reset();
         }
