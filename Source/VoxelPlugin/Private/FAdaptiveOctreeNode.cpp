@@ -108,9 +108,10 @@ void FAdaptiveOctreeNode::FinalizeFromExistingCorners(bool bSkipNormals)
 
     ComputeDualContourPosition();
 
-    // Update CouldContainSurface: true if sign changes exist or any corner
-    // is near-zero (surface could be hiding between corners at this resolution)
-    CouldContainSurface = IsNearSurface();
+    // Update CouldContainSurface: OR with current state so merge-inherited
+    // flags survive re-finalization (parent corners may be too coarse to detect
+    // edit-created surface that children contained before merging)
+    CouldContainSurface = CouldContainSurface || IsNearSurface();
 
     if (IsSurfaceNode)
     {
@@ -238,7 +239,8 @@ void FAdaptiveOctreeNode::ComputeDualContourPosition()
     {
         DualContourNormal = FVector3f::ZeroVector;
         DualContourPosition = Center;
-        IsSurfaceNode = false;
+        // Don't clear IsSurfaceNode — it may have been inherited from merged children
+        // that contained edit-created surface too fine for this node's corners to detect
         return;
     }
 
