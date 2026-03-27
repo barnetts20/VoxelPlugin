@@ -8,9 +8,10 @@
 using namespace RealtimeMesh;
 
 //Pipeline log thresholds... log if the pipelines take longer than the set value in MS
+//0 will always log pipeline execution times.
 const float DATA_LOG_THRESHOLD = 100;
 const float MESH_LOG_THRESHOLD = 50;
-const float EDIT_LOG_THRESHOLD = 0;
+const float EDIT_LOG_THRESHOLD = 50; 
 
 // Sets default values
 AAdaptiveVoxelActor::AAdaptiveVoxelActor()
