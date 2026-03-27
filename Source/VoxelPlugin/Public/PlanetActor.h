@@ -1,4 +1,4 @@
-#pragma once
+ï»¿#pragma once
 
 #include "CoreMinimal.h"
 #include "GameFramework/Actor.h"
@@ -19,7 +19,7 @@ class VOXELPLUGIN_API APlanetActor : public AActor
 public:
     APlanetActor();
 
-    // Root component — provides the transform gizmo in the editor.
+    // Root component ï¿½ provides the transform gizmo in the editor.
     // Scale.GetMax() = planet radius in cm.
     UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Planet")
     TObjectPtr<USceneComponent> PlanetRoot;
@@ -28,7 +28,7 @@ public:
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Planet|Shape",
         meta = (ClampMin = "0.01", ClampMax = "1.0"))
-    double NoiseAmplitudeRatio = 0.25;
+    double NoiseAmplitudeRatio = 0.15;
 
     // Sea level as a fraction of the noise distribution [0, 1].
     // 0 = ocean at PlanetRadius (lowest terrain), 1 = ocean at PlanetRadius + NoiseAmplitude.

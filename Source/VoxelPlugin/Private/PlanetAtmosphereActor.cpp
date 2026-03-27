@@ -27,8 +27,8 @@ APlanetAtmosphereActor::APlanetAtmosphereActor()
     SetRootComponent(AtmosphereRoot);
 
     // Default radius = max(OceanRadius, PlanetRadius) at planet defaults:
-    // PlanetRadius(100M) + SeaLevel(0.5) * NoiseAmplitude(25M) = 112,500,000 cm
-    SetActorScale3D(FVector(112500000.0));
+    // PlanetRadius(100M) + SeaLevel(0.5) * NoiseAmplitude(15M) = 107,500,000 cm
+    SetActorScale3D(FVector(107500000.0));
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

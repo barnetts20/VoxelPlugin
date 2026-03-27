@@ -21,7 +21,7 @@ public:
 
     // Driven by actor scale. Read-only at runtime � adjust scale to resize.
     UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Ocean|Shape")
-    double OceanRadius = 112500000.0;
+    double OceanRadius = 107500000.0;
 
     // Must match the terrain actor's scale (GetActorScale3D().GetMax()).
     // density = OceanRadius - (TerrainPlanetRadius + NoiseHeight):
@@ -33,14 +33,15 @@ public:
     // Must match the terrain actor's NoiseAmplitudeRatio.
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Ocean|Shape",
         meta = (ClampMin = "0.01", ClampMax = "1.0"))
-    double NoiseAmplitudeRatio = 0.25;
+    double NoiseAmplitudeRatio = 0.15;
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Ocean|Mesh",
         meta = (ClampMin = "3"))
     int32 FaceResolution = 3;
 
-    // Computed at init time from float precision requirements.
-    // Deep enough that FVector3f vertex offsets from ChunkAnchorCenter have < 1cm error.
+    // Quadtree depth at which nodes become mesh chunks.
+    // Fixed at 3 for the ocean quadtree — cube-sphere faces have coarser
+    // float precision requirements than the voxel octree.
     UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Ocean|LOD")
     int32 ChunkDepth = 3;
 
@@ -56,8 +57,9 @@ public:
 
     // Computed from TargetPrecision and OceanRadius at init time.
     // Clamped to [MinDepth, MaxKeyDepth].
+    // At default scale (107.5M radius, FaceRes=3, TargetPrecision=200): MaxDepth=20.
     UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Ocean|LOD")
-    int32 MaxDepth = 6;
+    int32 MaxDepth = 20;
 
     // The actual vertex spacing (cm) achieved at MaxDepth after key-limit clamping.
     UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Ocean|LOD")
@@ -68,13 +70,13 @@ public:
 
     // LOD screen-space threshold. The node is subdivided by FaceResolution, so
     // the effective vertex threshold is ScreenSpaceThreshold / (FaceResolution - 1).
-    // Default 0.15 with FaceResolution=3 gives ~0.075 per-vertex threshold.
+    // Default 0.225 with FaceResolution=3 gives ~0.1125 per-vertex threshold.
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Ocean|LOD",
         meta = (ClampMin = "0.001"))
-    double ScreenSpaceThreshold = 0.15;
+    double ScreenSpaceThreshold = 0.225;
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Ocean|LOD")
-    double MinLodInterval = 0.1;
+    double MinLodInterval = 0.05;
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Ocean|LOD")
     double VelocityLookAheadFactor = 8.0;

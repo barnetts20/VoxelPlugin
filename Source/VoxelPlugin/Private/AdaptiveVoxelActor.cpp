@@ -103,6 +103,18 @@ void AAdaptiveVoxelActor::Initialize()
     // Now clean up any components that were already attached
     CleanSceneRoot();
 
+    // Load default plugin material if none assigned by the user.
+    // The constructor sets SurfaceMaterial to the engine default as a safe fallback;
+    // here we upgrade to the plugin's triplanar material for standalone use.
+    if (!SurfaceMaterial || SurfaceMaterial == UMaterial::GetDefaultMaterial(EMaterialDomain::MD_Surface))
+    {
+        UMaterialInterface* PluginMaterial = Cast<UMaterialInterface>(
+            StaticLoadObject(UMaterialInterface::StaticClass(), nullptr,
+                TEXT("/VoxelPlugin/MT_TriPlanar.MT_TriPlanar")));
+        if (PluginMaterial)
+            SurfaceMaterial = PluginMaterial;
+    }
+
     // Octree is built at world scale in actor-local space (origin 0,0,0).
     // Actor scale determines planet radius. Collision data is baked at this scale.
     // MeshAttachmentRoot handles world placement via position/rotation only (absolute scale).

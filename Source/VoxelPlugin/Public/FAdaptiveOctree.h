@@ -1,4 +1,4 @@
-#pragma once
+ï»¿#pragma once
 
 #include "CoreMinimal.h"
 #include "FMeshingStructs.h"
@@ -42,13 +42,13 @@ struct VOXELPLUGIN_API FOctreeParams {
 
     // --- Tree Structure ---
     int ChunkDepth = 4;
-    int MinDepth = 7;
-    int MaxDepth = 21;
+    int MinDepth = 8;
+    int MaxDepth = 22;
 
     // Depth beyond which noise sampling is replaced by trilinear interpolation
     // from parent corner densities. The noise loses precision past this depth,
     // but deeper splits still provide geometric detail for editing.
-    int PrecisionDepthFloor = 21;
+    int PrecisionDepthFloor = 19;
 
     // --- Chunk Culling ---
     EOctreeChunkCulling ChunkCullingMode = EOctreeChunkCulling::Surface;
@@ -104,7 +104,7 @@ private:
     // Calibrated so that ~8000 UV wraps occur across the planet diameter.
     double TriplanarUVScale;
 
-    // Cached from last UpdateLOD pass — used by edit pipeline to split newly-surfaced nodes
+    // Cached from last UpdateLOD pass ï¿½ used by edit pipeline to split newly-surfaced nodes
     FVector CachedCameraPosition = FVector::ZeroVector;
     double CachedFOVScale = 1.0;
     double CachedThresholdSq = 0.004;

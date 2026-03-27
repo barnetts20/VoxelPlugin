@@ -10,8 +10,8 @@ AOceanSphereActor::AOceanSphereActor()
     PrimaryActorTick.bStartWithTickEnabled = true;
 
     // Default scale = ocean radius matching APlanetActor defaults:
-    // PlanetRadius(100M) + SeaLevel(0.5) * NoiseAmplitude(25M) = 112,500,000 cm
-    SetActorScale3D(FVector(112500000.0));
+    // PlanetRadius(100M) + SeaLevel(0.5) * NoiseAmplitude(15M) = 107,500,000 cm
+    SetActorScale3D(FVector(107500000.0));
 
     MeshAttachmentRoot = CreateDefaultSubobject<USceneComponent>(TEXT("MeshAttachmentRoot"));
     MeshAttachmentRoot->SetupAttachment(GetRootComponent());
@@ -101,6 +101,14 @@ void AOceanSphereActor::InitializeInternal(TSharedPtr<FDensitySampleCompositor> 
     ChunkMap.Empty();
     for (int32 i = 0; i < 6; ++i)
         RootNodes[i].Reset();
+
+    // Load default plugin material if none assigned by the user.
+    if (!OceanMaterial)
+    {
+        OceanMaterial = Cast<UMaterialInterface>(
+            StaticLoadObject(UMaterialInterface::StaticClass(), nullptr,
+                TEXT("/VoxelPlugin/MT_Ocean.MT_Ocean")));
+    }
 
     double ActorRadius = GetActorScale3D().GetMax();
     OceanRadius = ActorRadius;

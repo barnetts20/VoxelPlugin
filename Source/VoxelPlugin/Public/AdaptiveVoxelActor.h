@@ -69,14 +69,15 @@ public:
     // Scale changes trigger full reconstruction.
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrain", meta = (ClampMin = "0.01", ClampMax = "1.0"))
-    double NoiseAmplitudeRatio = 0.25;
+    double NoiseAmplitudeRatio = 0.15;
 
     // Computed at init time from float precision requirements.
+    // At default scale (100M radius, 0.15 NAR): RootExtent=120.75M → ChunkDepth=4.
     UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Terrain|Octree")
-    int ChunkDepth = 5;
+    int ChunkDepth = 4;
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrain|Octree")
-    int MinDepth = 7;
+    int MinDepth = 8;
 
     // Target voxel spacing in world units (cm). MaxDepth is computed automatically
     // so the finest LOD voxel cells are approximately this size.
@@ -86,8 +87,9 @@ public:
 
     // Computed from TargetPrecision and planet radius at init time.
     // Clamped to [MinDepth, MaxKeyDepth].
+    // At default scale (100M radius, 0.15 NAR, TargetPrecision=100): MaxDepth=22.
     UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Terrain|Octree")
-    int MaxDepth = 18;
+    int MaxDepth = 22;
 
     // The actual voxel spacing (cm) achieved at MaxDepth after key-limit clamping.
     UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Terrain|Octree")
@@ -101,7 +103,7 @@ public:
     // but deeper splits still provide geometric detail for editing.
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrain|Octree",
         meta = (ClampMin = "1"))
-    int32 PrecisionDepthFloor = 21;
+    int32 PrecisionDepthFloor = 19;
 
     // Controls how the octree decides which nodes to split to chunk depth.
     // Surface: only split where the surface crosses node corners (planets).
@@ -116,13 +118,13 @@ public:
     double VolumeSdfRadius = 0.0;
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrain|LOD")
-    double ScreenSpaceThreshold = .065;
+    double ScreenSpaceThreshold = 0.075;
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrain|LOD")
-    double MinDataUpdateInterval = .1;
+    double MinDataUpdateInterval = 0.05;
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrain|LOD")
-    double VelocityLookAheadFactor = 8;
+    double VelocityLookAheadFactor = 2.0;
 
     virtual void OnConstruction(const FTransform& Transform) override;
 
