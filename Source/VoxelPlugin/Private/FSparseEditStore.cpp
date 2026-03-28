@@ -21,7 +21,7 @@ double FSparseEditStore::Sample(FVector Position) const
         if (!Current->Children[ChildIndex]) break;
 
         NodeExtent *= 0.5;
-        NodeCenter = NodeCenter + Offsets[ChildIndex] * NodeExtent;
+        NodeCenter = NodeCenter + OctreeConstants::Offsets[ChildIndex] * NodeExtent;
         Current = Current->Children[ChildIndex];
     }
 
@@ -104,7 +104,7 @@ void FSparseEditStore::ApplyEditRecursive(TSharedPtr<FSparseEditNode> Node, FVec
     double ChildExtent = NodeExtent * 0.5;
     for (int i = 0; i < 8; i++)
     {
-        FVector ChildCenter = NodeCenter + Offsets[i] * ChildExtent;
+        FVector ChildCenter = NodeCenter + OctreeConstants::Offsets[i] * ChildExtent;
 
         FVector ChildClosest;
         ChildClosest.X = FMath::Clamp(BrushCenter.X, ChildCenter.X - ChildExtent, ChildCenter.X + ChildExtent);
@@ -145,7 +145,7 @@ int FSparseEditStore::GetChildIndex(FVector Position, FVector NodeCenter) const
 
 FVector FSparseEditStore::GetCornerPosition(FVector NodeCenter, double NodeExtent, int CornerIndex) const
 {
-    return NodeCenter + Offsets[CornerIndex] * NodeExtent;
+    return NodeCenter + OctreeConstants::Offsets[CornerIndex] * NodeExtent;
 }
 
 double FSparseEditStore::InterpolateCorners(const TSharedPtr<FSparseEditNode>& Node, FVector NodeCenter, double NodeExtent, FVector Position) const

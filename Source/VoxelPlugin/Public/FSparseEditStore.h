@@ -1,6 +1,7 @@
 // FSparseEditStore.h
 #pragma once
 #include "CoreMinimal.h"
+#include "FOctreeConstants.h"
 #include "FNodeStructs.h"
 
 struct FSparseEditNode
@@ -30,13 +31,6 @@ public:
     void Clear();
 
 private:
-    static inline const FVector Offsets[8] = {
-        FVector(-1, -1, -1), FVector(1, -1, -1),
-        FVector(-1,  1, -1), FVector(1,  1, -1),
-        FVector(-1, -1,  1), FVector(1, -1,  1),
-        FVector(-1,  1,  1), FVector(1,  1,  1)
-    };
-
     TSharedPtr<FSparseEditNode> Root;
 
     int MaxDepth;
