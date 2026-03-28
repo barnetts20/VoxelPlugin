@@ -132,7 +132,7 @@ private:
 
     void UpdateMeshChunkStreamData(TSharedPtr<FMeshChunk> InChunk);
 
-    FVector2f ComputeTriplanarUV(FVector Position, FVector Normal) const;
+    FVector2f ComputeTriplanarUV(FVector Position, FVector3f Normal) const;
 
     FEdgeNeighbors SampleNodesAroundEdge(const FNodeEdge& Edge);
 

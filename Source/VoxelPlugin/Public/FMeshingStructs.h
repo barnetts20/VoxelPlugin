@@ -1,3 +1,7 @@
+// FMeshingStructs.h - Data structures for dual-contour mesh generation: per-corner
+// sample batching, mesh vertex/edge data, RealtimeMesh stream wrappers, and chunk
+// component management.
+
 #pragma once
 
 #include "FAdaptiveOctreeNode.h"
@@ -5,34 +9,50 @@
 #include <RealtimeMeshCore.h>
 #include <RealtimeMeshSimple.h>
 
+// Required by RealtimeMesh stream builder types. Narrower scoping is not feasible
+// due to the template-heavy API surface used throughout this file.
 using namespace RealtimeMesh;
 
+/** A single corner sample for batched density evaluation.
+ *  Position is the world-space location to sample. Density receives the computed
+ *  SDF value. Targets holds pointers to all FNodeCorner::Density fields that share
+ *  this position, allowing a single sample to update multiple nodes at once
+ *  during GatherUniqueCorners. */
 struct VOXELPLUGIN_API FCornerSample {
-    FVector Position;           // World position
-    double Density;             // Final SDF density (computed in double, truncated to float on writeback)
-    TArray<float*> Targets;     // Pointers to all Corners[i].Density that share this position
+    FVector Position;
+    double Density;
+    TArray<float*> Targets;
 };
 
+/** A mesh vertex produced by dual contouring. Position is chunk-local (relative to
+ *  FMeshChunk::ChunkCenter). Equality is exact on position since vertices sharing
+ *  a dual contour point have identical double-precision values. */
 struct VOXELPLUGIN_API FMeshVertex
 {
-    FVector Position;       // Chunk-local position
-    FVector Normal;
+    FVector Position;
+    FVector3f Normal;
     FColor Color;
 
     bool operator==(const FMeshVertex& Other) const
     {
-        // Exact comparison on position -- no epsilon needed since vertices
-        // at the same dual contour point have identical double values.
         return Position == Other.Position;
     }
 };
 
+/** Per-edge output from the parallel meshing pass. Stores the vertices (one per
+ *  neighboring leaf node) that will form a quad or tri across a sign-change edge,
+ *  along with the edge itself. IsValid is false if the edge was filtered out by
+ *  ShouldProcessEdge. */
 struct VOXELPLUGIN_API FEdgeVertexData {
     TArray<FMeshVertex> Vertices;
     TOptional<FNodeEdge> Edge;
-    bool IsValid;
+    bool IsValid = false;
 };
 
+/** Wrapper around a RealtimeMesh FRealtimeMeshStreamSet, pre-configured with
+ *  the six vertex streams needed for rendering: position, tangents, triangles,
+ *  polygroups, texcoords, and vertex color. Provides typed stream builder
+ *  accessors for each. */
 struct VOXELPLUGIN_API FMeshStreamData {
     FRealtimeMeshSectionGroupKey MeshGroupKey;
     FRealtimeMeshSectionKey MeshSectionKey;
@@ -76,32 +96,34 @@ struct VOXELPLUGIN_API FMeshStreamData {
     }
 };
 
+/** A spatial subdivision of the octree used for mesh generation. Each chunk corresponds
+ *  to a node at ChunkDepth and owns a RealtimeMesh component that renders the dual-contour
+ *  surface within its bounds.
+ *
+ *  Lifecycle: InitializeData sets the spatial bounds and stream keys. The RealtimeMesh
+ *  component is lazily created on the game thread during the first UpdateComponent call
+ *  (via InitializeComponent). Subsequent updates push new stream data when IsDirty is set. */
 struct VOXELPLUGIN_API FMeshChunk {
     TWeakObjectPtr<ARealtimeMeshActor> CachedParentActor;
     TWeakObjectPtr<USceneComponent> CachedMeshAttachRoot;
+    TWeakObjectPtr<UMaterialInterface> CachedSurfaceMaterial;
 
-    TWeakObjectPtr <UMaterialInterface> CachedSurfaceMaterial;
-
-    //Data Model Info
     FVector ChunkCenter;
-
     double ChunkExtent;
 
+    /** All sign-change edges within this chunk's leaf nodes, collected during LOD updates. */
     TArray<FNodeEdge> ChunkEdges;
 
     TSharedPtr<FMeshStreamData> SurfaceMeshData;
 
-    //Mesh Stuff
     bool IsDirty = false;
-
     bool IsInitialized = false;
 
     TWeakObjectPtr<URealtimeMeshSimple> ChunkRtMesh;
-
     TWeakObjectPtr<URealtimeMeshComponent> ChunkRtComponent;
+    FRealtimeMeshLODKey LODKey = FRealtimeMeshLODKey(0);
 
-    FRealtimeMeshLODKey LODKey = FRealtimeMeshLODKey::FRealtimeMeshLODKey(0);
-
+    /** Sets spatial bounds and creates the stream data with section group/section keys. */
     void InitializeData(FVector InCenter, double InExtent) {
         SurfaceMeshData = MakeShared<FMeshStreamData>();
 
@@ -112,6 +134,8 @@ struct VOXELPLUGIN_API FMeshChunk {
         SurfaceMeshData->MeshSectionKey = FRealtimeMeshSectionKey::CreateForPolyGroup(SurfaceMeshData->MeshGroupKey, 0);
     };
 
+    /** Creates the RealtimeMesh UObject and component, attaches to the parent actor,
+     *  and configures collision. Called lazily from UpdateComponent on the game thread. */
     void InitializeComponent(ARealtimeMeshActor* InParentActor, USceneComponent* InAttachRoot, UMaterialInterface* InSurfaceMaterial) {
         FRealtimeMeshCollisionConfiguration cConfig;
         cConfig.bShouldFastCookMeshes = false;
@@ -141,6 +165,12 @@ struct VOXELPLUGIN_API FMeshChunk {
         IsInitialized = true;
     }
 
+    /** Filters edges that should not produce mesh faces in this chunk.
+     *  Rejects edges with fewer than 3 neighbors (incomplete face on chunk boundary),
+     *  and edges where any neighbor node is smaller than the edge's owner node.
+     *  The size check prevents T-junctions: when a coarse node borders finer neighbors,
+     *  the finer nodes will handle meshing at their own resolution instead.
+     *  The 0.9 multiplier is a floating-point tolerance on the extent comparison. */
     bool ShouldProcessEdge(const FNodeEdge& Edge, const FEdgeNeighbors& Neighbors) {
         if (Neighbors.Count < 3) return false;
 
@@ -153,6 +183,10 @@ struct VOXELPLUGIN_API FMeshChunk {
         return true;
     }
 
+    /** Pushes current stream data to the RealtimeMesh component on the game thread.
+     *  Takes a TSharedPtr to Self to prevent destruction while the async task is in flight.
+     *  Lazily initializes the component on first call. Clears the section group if there
+     *  are no triangles to render. */
     void UpdateComponent(TSharedPtr<FMeshChunk> Self) {
         AsyncTask(ENamedThreads::GameThread, [Self]() {
             // 1. Lazy Init

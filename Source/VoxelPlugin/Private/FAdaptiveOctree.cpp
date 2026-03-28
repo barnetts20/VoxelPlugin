@@ -556,10 +556,10 @@ void FAdaptiveOctree::EnforceSplitsInSubtree(FAdaptiveOctreeNode* Node)
     }
 }
 
-FVector2f FAdaptiveOctree::ComputeTriplanarUV(FVector Position, FVector Normal) const
+FVector2f FAdaptiveOctree::ComputeTriplanarUV(FVector Position, FVector3f Normal) const
 {
     FVector2f UV;
-    FVector AbsNormal = Normal.GetAbs();
+    FVector3f AbsNormal = Normal.GetAbs();
     float Scale = (float)TriplanarUVScale;
 
     if (AbsNormal.X > AbsNormal.Y && AbsNormal.X > AbsNormal.Z)
@@ -610,7 +610,7 @@ void FAdaptiveOctree::UpdateMeshChunkStreamData(TSharedPtr<FMeshChunk> InChunk)
             FVector LocalPos(NodePtr->DualContourPosition - InChunk->ChunkCenter);
 
             AllEdgeData[edgeIdx].Vertices[i].Position = LocalPos;
-            AllEdgeData[edgeIdx].Vertices[i].Normal = FVector(NodePtr->DualContourNormal);
+            AllEdgeData[edgeIdx].Vertices[i].Normal = NodePtr->DualContourNormal;
             AllEdgeData[edgeIdx].Vertices[i].Color = FColor::Green;
         }
         });
@@ -687,7 +687,7 @@ void FAdaptiveOctree::UpdateMeshChunkStreamData(TSharedPtr<FMeshChunk> InChunk)
 
         SrfPositionStream.Set(VertIdx, Vertex.Position);
         FRealtimeMeshTangentsHighPrecision Tangent;
-        Tangent.SetNormal(FVector3f(Vertex.Normal));
+        Tangent.SetNormal(Vertex.Normal);
         SrfTangentStream.Set(VertIdx, Tangent);
         SrfColorStream.Set(VertIdx, Vertex.Color);
         SrfTexCoordStream.Set(VertIdx, ComputeTriplanarUV(WorldPos, Vertex.Normal));
