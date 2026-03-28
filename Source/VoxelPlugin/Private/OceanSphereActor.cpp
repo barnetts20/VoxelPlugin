@@ -293,8 +293,11 @@ void AOceanSphereActor::InitializeInternal(TSharedPtr<FDensitySampleCompositor> 
         Compositor->AddSampleLayer(HeightmapLayer);
     }
 
-    const double Size = 1000.0;
-    const double HalfSize = Size * 0.5;
+    // Unit cube: each face spans [-1, +1] in its two local axes. The absolute
+    // magnitude doesn't matter -- positions are normalized before sphere projection.
+    // HalfSize=1.0 at root means WorldExtent = HalfSize * OceanRadius = OceanRadius.
+    const double Size = 2.0;
+    const double HalfSize = 1.0;
 
     const FVector FaceCenters[6] = {
         FVector(HalfSize,        0,        0),

@@ -35,7 +35,7 @@ void FOceanMeshChunk::InitializeComponent(AOceanSphereActor* InOwner)
     ChunkRtComponent->SetCollisionEnabled(ECollisionEnabled::NoCollision);
 
     // Attach to MeshAttachmentRoot (absolute scale, inherits position + rotation).
-    // Use relative location so the component moves with the actor automatically �
+    // Use relative location so the component moves with the actor automatically --
     // no world location bake needed, no re-init on actor movement.
     ChunkRtComponent->AttachToComponent(InOwner->GetMeshAttachmentRoot(), FAttachmentTransformRules::KeepRelativeTransform);
     ChunkRtComponent->SetRelativeLocation(ChunkCenter);
@@ -188,7 +188,7 @@ FOceanQuadTreeNode::FOceanQuadTreeNode(
     HalfSize = Size * 0.5;
     QuarterSize = HalfSize * 0.5;
     SphereCenter = CubeCenter.GetSafeNormal() * OceanRadius;
-    WorldExtent = HalfSize * (OceanRadius / 500.0);
+    WorldExtent = HalfSize * OceanRadius;
 
     int32 d = Index.GetDepth();
     NeighborLods[0] = d; NeighborLods[1] = d; NeighborLods[2] = d; NeighborLods[3] = d;
@@ -240,7 +240,7 @@ bool FOceanQuadTreeNode::TrySetLod(FVector CameraPos, double ThresholdSq, double
 {
     if (!IsLeaf()) return false;
 
-    // CameraPos and SphereCenter are both in actor-local space � direct distance.
+    // CameraPos and SphereCenter are both in actor-local space -- direct distance.
     // No GetActorLocation() needed since Tick converts the camera before passing it here.
     double DistSq = FMath::Max(FVector::DistSquared(CameraPos, SphereCenter), 1e-12);
 

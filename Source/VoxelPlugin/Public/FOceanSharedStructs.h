@@ -1,23 +1,13 @@
+// FOceanSharedStructs.h — Cube-sphere topology types shared between
+// FOceanQuadTreeNode and AOceanSphereActor: face/edge enums, cube-face
+// transform tables, and the FQuadIndex path encoding for quadtree traversal.
+
 #pragma once
 
 #include "CoreMinimal.h"
-#include <RealtimeMeshCore.h>
-#include <RealtimeMeshSimple.h>
 #include "FOceanSharedStructs.generated.h"
 
-using namespace RealtimeMesh;
-// ---------------------------------------------------------------------------
-// FOceanSharedStructs.h
-//
-// Cube-sphere topology types shared between FOceanQuadTreeNode and
-// AOceanSphereActor.  Extracted from PlanetSharedStructs; all planet-
-// specific noise / parameter structs have been removed.
-// ---------------------------------------------------------------------------
-
-// ---------------------------------------------------------------------------
-// Edge / face orientation enums
-// ---------------------------------------------------------------------------
-
+/** Edge direction within a quadtree face (2D local space). */
 UENUM(BlueprintType)
 enum class EdgeOrientation : uint8
 {
@@ -27,6 +17,7 @@ enum class EdgeOrientation : uint8
     DOWN = 3
 };
 
+/** Identifies one of the 6 cube faces that tile the sphere. */
 UENUM(BlueprintType)
 enum class EFaceDirection : uint8
 {
@@ -38,6 +29,8 @@ enum class EFaceDirection : uint8
     Z_NEG = 5  UMETA(DisplayName = "Z-")
 };
 
+/** Quadrant position of a child within its parent quad.
+ *  Bit 0 = Y (0=bottom, 1=top), bit 1 = X (0=left, 1=right). */
 enum VOXELPLUGIN_API EChildPosition
 {
     BOTTOM_LEFT = 0,   // 0b00
@@ -46,10 +39,9 @@ enum VOXELPLUGIN_API EChildPosition
     TOP_RIGHT = 3    // 0b11
 };
 
-// ---------------------------------------------------------------------------
-// Face topology
-// ---------------------------------------------------------------------------
-
+/** Describes how a quadtree path maps when crossing from one cube face to
+ *  an adjacent face. QuadrantRemap permutes the 4 child indices; FlipX/FlipY
+ *  mirror coordinates to maintain consistent winding across the seam. */
 struct VOXELPLUGIN_API FaceTransition
 {
     uint8 TargetFace;
@@ -58,25 +50,32 @@ struct VOXELPLUGIN_API FaceTransition
     bool  bFlipY = false;
 };
 
+/** Per-face transform that maps 2D quadtree coordinates to 3D cube/world space.
+ *  AxisMap selects which world axes correspond to the face's local U, V, and normal.
+ *  AxisDir flips axes as needed. NeighborEdgeMap and FaceTransitions define the
+ *  topology for cross-face neighbor lookups. bFlipWinding controls triangle winding
+ *  so outward-facing normals are consistent across all 6 faces.
+ *
+ *  The static FaceTransforms[6] table is defined in FOceanSharedStructs.cpp. */
 struct VOXELPLUGIN_API FCubeTransform
 {
-    FIntVector3      AxisMap;
-    FIntVector3      AxisDir;
-    EdgeOrientation  NeighborEdgeMap[4];
-    FaceTransition   FaceTransitions[4];
-    bool             bFlipWinding;
+    FIntVector3      AxisMap;           // [0]=U axis, [1]=V axis, [2]=normal axis in world space
+    FIntVector3      AxisDir;           // Sign (+1/-1) for each mapped axis
+    EdgeOrientation  NeighborEdgeMap[4]; // Which edge the neighbor sees when looking back
+    FaceTransition   FaceTransitions[4]; // Cross-face transition for LEFT, RIGHT, UP, DOWN
+    bool             bFlipWinding;      // True if this face needs reversed triangle winding
 
     static const FCubeTransform FaceTransforms[6];
 };
 
-// ---------------------------------------------------------------------------
-// FQuadIndex
-//
-// Encodes a path through the quadtree as a packed uint64.
-// Sentinel bits 0b11 sit at the bottom; each depth level appends 2 bits.
-// Supports up to depth 31 (62 path bits + 2 sentinel bits = 64 bits).
-// ---------------------------------------------------------------------------
-
+/** Encodes a path through the quadtree as a packed uint64.
+ *
+ *  Layout: sentinel bits 0b11 sit at the bottom; each depth level prepends 2 bits
+ *  (child quadrant index 0-3). Supports up to depth 31 (62 path bits + 2 sentinel).
+ *  Combined with a FaceId to uniquely identify any node across all 6 cube faces.
+ *
+ *  Provides navigation: GetChildIndex, GetParentIndex, GetNeighborIndex (including
+ *  cross-face transitions via FCubeTransform::FaceTransitions). */
 struct VOXELPLUGIN_API FQuadIndex
 {
     uint64 EncodedPath;
@@ -89,6 +88,7 @@ struct VOXELPLUGIN_API FQuadIndex
     FQuadIndex(uint64 InPath, uint8 InFaceId)
         : EncodedPath(InPath), FaceId(InFaceId) {}
 
+    /** Returns the depth by counting 2-bit groups above the sentinel. */
     uint8 GetDepth() const
     {
         uint64 path = EncodedPath >> 2;
@@ -99,6 +99,7 @@ struct VOXELPLUGIN_API FQuadIndex
 
     bool IsRoot() const { return GetDepth() == 0; }
 
+    /** Returns the quadrant index (0-3) at the given level of the path. */
     uint8 GetQuadrantAtDepth(uint8 Level) const
     {
         uint8 depth = GetDepth();
@@ -107,12 +108,14 @@ struct VOXELPLUGIN_API FQuadIndex
         return (EncodedPath >> shiftAmount) & 0x3;
     }
 
+    /** Returns the quadrant of this node within its parent. */
     uint8 GetQuadrant() const
     {
         if (IsRoot()) return 0;
         return GetQuadrantAtDepth(GetDepth() - 1);
     }
 
+    /** Returns the index of a child at the given quadrant. */
     FQuadIndex GetChildIndex(uint8 InChildIndex) const
     {
         if (GetDepth() >= 31) return *this;
@@ -120,6 +123,7 @@ struct VOXELPLUGIN_API FQuadIndex
         return FQuadIndex(newPath, FaceId);
     }
 
+    /** Returns the index of this node's parent. */
     FQuadIndex GetParentIndex() const
     {
         if (IsRoot()) return *this;
@@ -129,6 +133,7 @@ struct VOXELPLUGIN_API FQuadIndex
     uint64 GetQuadrantPath()                       const { return EncodedPath >> 2; }
     uint64 MakeEncodedPath(uint64 QuadrantPath)    const { return (QuadrantPath << 2) | SentinelBits; }
 
+    /** Mirrors a quadrant across the given edge (flips the X or Y bit). */
     uint8 ReflectQuadrant(uint8 quadrant, EdgeOrientation Direction) const
     {
         switch (Direction)
@@ -141,6 +146,7 @@ struct VOXELPLUGIN_API FQuadIndex
         }
     }
 
+    /** Applies X/Y flip to a quadrant index for cross-face remapping. */
     uint8 ApplyFlip(uint8 quadrant, bool FlipX, bool FlipY) const
     {
         if (FlipX) quadrant ^= 0x2;
@@ -148,6 +154,11 @@ struct VOXELPLUGIN_API FQuadIndex
         return quadrant;
     }
 
+    /** Finds the neighbor node in the given direction. Walks up the tree until
+     *  finding a non-edge ancestor, reflects the quadrant, then walks back down.
+     *  If the edge is at the cube face boundary, applies the cross-face transition
+     *  from FCubeTransform::FaceTransitions to remap the entire path onto the
+     *  adjacent face. */
     FQuadIndex GetNeighborIndex(EdgeOrientation Direction) const
     {
         bool isFaceEdge = false;

@@ -3,9 +3,8 @@
 // ---------------------------------------------------------------------------
 // FCubeTransform::FaceTransforms
 //
-// Copied verbatim from PlanetSharedStructs.cpp.
 // Defines the axis mapping, winding, and face-crossing transition table for
-// each of the six cube faces used by the quadtree topology.
+// each of the six cube faces used by the cube-sphere quadtree topology.
 // ---------------------------------------------------------------------------
 
 const FCubeTransform FCubeTransform::FaceTransforms[6] =
