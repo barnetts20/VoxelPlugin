@@ -34,10 +34,8 @@ bool FSparseEditStore::HasEditsAlongPath(const FMortonIndex& Index) const
 
     TSharedPtr<FSparseEditNode> Current = Root;
 
-    // Walk the edit tree using the morton index child path
     for (uint8 Level = 0; Level < Index.Depth; Level++)
     {
-        // If any node along the path has edits, this region was edited
         if (Current->HasEdits) return true;
 
         uint8 ChildIdx = Index.GetChildAtLevel(Level);
@@ -46,10 +44,9 @@ bool FSparseEditStore::HasEditsAlongPath(const FMortonIndex& Index) const
         Current = Current->Children[ChildIdx];
     }
 
-    // Check the final node at the target depth
     if (Current->HasEdits) return true;
 
-    // Also check if this node has any children at all — if so,
+    // Check if this node has any children — if so,
     // edits exist at finer resolution within this region
     for (int i = 0; i < 8; i++)
     {
@@ -62,16 +59,19 @@ bool FSparseEditStore::HasEditsAlongPath(const FMortonIndex& Index) const
 TArray<FVector> FSparseEditStore::ApplySphericalEdit(FVector BrushCenter, double Radius, double Strength, int Depth)
 {
     Depth = FMath::Clamp(Depth, 0, MaxDepth);
-    AffectedChunkCenters.Empty();
 
     if (!Root)
         Root = MakeShared<FSparseEditNode>();
 
-    ApplyEditRecursive(Root, Center, Extent, BrushCenter, Radius, Strength, 0, Depth);
-    return AffectedChunkCenters;
+    TArray<FVector> AffectedChunks;
+    ApplyEditRecursive(Root, Center, Extent, BrushCenter, Radius, Strength, 0, Depth, AffectedChunks);
+    return AffectedChunks;
 }
 
-void FSparseEditStore::ApplyEditRecursive(TSharedPtr<FSparseEditNode> Node, FVector NodeCenter, double NodeExtent, FVector BrushCenter, double BrushRadius, double Strength, int CurrentDepth, int TargetDepth) {
+void FSparseEditStore::ApplyEditRecursive(TSharedPtr<FSparseEditNode> Node, FVector NodeCenter, double NodeExtent,
+    FVector BrushCenter, double BrushRadius, double Strength,
+    int CurrentDepth, int TargetDepth, TArray<FVector>& OutAffectedChunks)
+{
     // AABB-sphere overlap check
     FVector ClosestPoint;
     ClosestPoint.X = FMath::Clamp(BrushCenter.X, NodeCenter.X - NodeExtent, NodeCenter.X + NodeExtent);
@@ -83,7 +83,7 @@ void FSparseEditStore::ApplyEditRecursive(TSharedPtr<FSparseEditNode> Node, FVec
 
     // Record chunk-depth nodes for affected chunk tracking
     if (CurrentDepth == ChunkDepth)
-        AffectedChunkCenters.AddUnique(NodeCenter);
+        OutAffectedChunks.AddUnique(NodeCenter);
 
     // Write edit at target depth
     if (CurrentDepth == TargetDepth)
@@ -118,7 +118,7 @@ void FSparseEditStore::ApplyEditRecursive(TSharedPtr<FSparseEditNode> Node, FVec
             Node->Children[i] = MakeShared<FSparseEditNode>();
 
         ApplyEditRecursive(Node->Children[i], ChildCenter, ChildExtent,
-            BrushCenter, BrushRadius, Strength, CurrentDepth + 1, TargetDepth);
+            BrushCenter, BrushRadius, Strength, CurrentDepth + 1, TargetDepth, OutAffectedChunks);
     }
 }
 
@@ -172,5 +172,4 @@ double FSparseEditStore::InterpolateCorners(const TSharedPtr<FSparseEditNode>& N
 void FSparseEditStore::Clear()
 {
     Root.Reset();
-    AffectedChunkCenters.Empty();
 }
