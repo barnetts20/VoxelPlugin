@@ -529,12 +529,12 @@ void FAdaptiveOctree::EnforceSplitsInSubtree(FAdaptiveOctreeNode* Node)
         if (Node->bHasEditedDescendants || Node->CouldContainSurface)
         {
             bool bLodWantsSplit = Node->ShouldSplit(CachedCameraPosition, CachedThresholdSq, CachedFOVScale);
-            bool bBelowMinDepth = Node->Index.Depth < Node->DepthBounds[1];
+            bool bBelowMinDepth = Node->Index.Depth < Node->DepthBounds[EDepthBound::MinDepth];
             bNeedsSplit = bLodWantsSplit || bBelowMinDepth;
         }
 
         // Respect max depth
-        if (bNeedsSplit && Node->Index.Depth < Node->DepthBounds[2])
+        if (bNeedsSplit && Node->Index.Depth < Node->DepthBounds[EDepthBound::MaxDepth])
         {
             SplitAndComputeChildren(Node);
 
@@ -804,9 +804,9 @@ void FAdaptiveOctree::UpdateLOD(FVector CameraPosition, double InScreenSpaceThre
     ParallelFor(NumChunks, [&](int32 idx) {
         FAdaptiveOctreeNode* ChunkNode = Chunks[idx].Get();
         double DistSq = FMath::Max(FVector::DistSquared(ChunkNode->Center, CameraPosition), 1e-12);
-        bool CouldSplit = FAdaptiveOctreeNode::EvaluateSplit(ChunkNode->Extent, DistSq, FOVScale, ThresholdSq, ChunkNode->Index.Depth, ChunkNode->DepthBounds[1], ChunkNode->DepthBounds[2]);
-        double SmallestExtent = ChunkNode->Extent / (double)(1 << (ChunkNode->DepthBounds[1] - ChunkNode->Index.Depth));
-        bool CouldMerge = FAdaptiveOctreeNode::EvaluateMerge(SmallestExtent, DistSq, FOVScale, MergeThresholdSq, ChunkNode->DepthBounds[1], ChunkNode->DepthBounds[0], ChunkNode->DepthBounds[2]);
+        bool CouldSplit = FAdaptiveOctreeNode::EvaluateSplit(ChunkNode->Extent, DistSq, FOVScale, ThresholdSq, ChunkNode->Index.Depth, ChunkNode->DepthBounds[EDepthBound::MinDepth], ChunkNode->DepthBounds[EDepthBound::MaxDepth]);
+        double SmallestExtent = ChunkNode->Extent / (double)(1 << (ChunkNode->DepthBounds[EDepthBound::MinDepth] - ChunkNode->Index.Depth));
+        bool CouldMerge = FAdaptiveOctreeNode::EvaluateMerge(SmallestExtent, DistSq, FOVScale, MergeThresholdSq, ChunkNode->DepthBounds[EDepthBound::MinDepth], ChunkNode->DepthBounds[EDepthBound::ChunkDepth], ChunkNode->DepthBounds[EDepthBound::MaxDepth]);
 
         if (!CouldSplit && !CouldMerge) return; //Early out
 

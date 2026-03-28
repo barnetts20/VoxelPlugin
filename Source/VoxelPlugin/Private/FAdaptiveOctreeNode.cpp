@@ -1,14 +1,14 @@
 ﻿#include "FAdaptiveOctreeNode.h"
 #include "FAdaptiveOctree.h"
-#include <FQEF.h>
-#include <FOctreeConstants.h>
+#include "FQEF.h"
+#include "FOctreeConstants.h"
 
-const bool FAdaptiveOctreeNode::IsLeaf() const
+bool FAdaptiveOctreeNode::IsLeaf() const
 {
     return bIsLeaf;
 }
 
-const bool FAdaptiveOctreeNode::IsRoot() const
+bool FAdaptiveOctreeNode::IsRoot() const
 {
     return !Parent.IsValid();
 }
@@ -21,9 +21,9 @@ FAdaptiveOctreeNode::FAdaptiveOctreeNode(double InExtent, int InChunkDepth, int 
 
     Extent = FMath::Max(InExtent, 0.0);
 
-    DepthBounds[0] = (uint8)InChunkDepth;
-    DepthBounds[1] = (uint8)InMinDepth;
-    DepthBounds[2] = (uint8)InMaxDepth;
+    DepthBounds[EDepthBound::ChunkDepth] = (uint8)InChunkDepth;
+    DepthBounds[EDepthBound::MinDepth] = (uint8)InMinDepth;
+    DepthBounds[EDepthBound::MaxDepth] = (uint8)InMaxDepth;
 
     for (int i = 0; i < 8; i++)
     {
@@ -43,9 +43,9 @@ FAdaptiveOctreeNode::FAdaptiveOctreeNode(TSharedPtr<FAdaptiveOctreeNode> InParen
     Center = InParent->Center + OctreeConstants::Offsets[ChildIndex] * Extent;
     DualContourPosition = Center;
 
-    DepthBounds[0] = InParent->DepthBounds[0];
-    DepthBounds[1] = InParent->DepthBounds[1];
-    DepthBounds[2] = InParent->DepthBounds[2];
+    DepthBounds[EDepthBound::ChunkDepth] = InParent->DepthBounds[EDepthBound::ChunkDepth];
+    DepthBounds[EDepthBound::MinDepth] = InParent->DepthBounds[EDepthBound::MinDepth];
+    DepthBounds[EDepthBound::MaxDepth] = InParent->DepthBounds[EDepthBound::MaxDepth];
 
     for (int i = 0; i < 8; i++)
     {
@@ -63,6 +63,8 @@ FVector FAdaptiveOctreeNode::GetInterpolatedNormal(FVector P)
     float fty = (float)FMath::Clamp(ty, 0.0, 1.0);
     float ftz = (float)FMath::Clamp(tz, 0.0, 1.0);
 
+    // Trilinear interpolation of corner normals (FVector3f), then widen to
+    // FVector for the QEF which operates in double precision.
     FVector3f n00 = FMath::Lerp(Corners[0].Normal, Corners[1].Normal, ftx);
     FVector3f n01 = FMath::Lerp(Corners[2].Normal, Corners[3].Normal, ftx);
     FVector3f n10 = FMath::Lerp(Corners[4].Normal, Corners[5].Normal, ftx);
@@ -79,6 +81,9 @@ void FAdaptiveOctreeNode::FinalizeFromExistingCorners(bool bSkipNormals)
 {
     SignChangeEdges.Reset();
 
+    // Compute per-corner normals from finite differences of neighbor densities.
+    // Each corner's gradient is estimated using the three axis-adjacent corners
+    // (found by flipping one bit of the corner index).
     if (!bSkipNormals)
     {
         for (int i = 0; i < 8; i++)
@@ -99,6 +104,7 @@ void FAdaptiveOctreeNode::FinalizeFromExistingCorners(bool bSkipNormals)
         }
     }
 
+    // Build sign-change edges from all 12 cube edges
     for (int i = 0; i < 12; i++)
     {
         FNodeEdge NewEdge(Corners[OctreeConstants::EdgePairs[i][0]], Corners[OctreeConstants::EdgePairs[i][1]]);
@@ -112,6 +118,8 @@ void FAdaptiveOctreeNode::FinalizeFromExistingCorners(bool bSkipNormals)
     // Edit persistence is handled separately by bHasEditedDescendants.
     CouldContainSurface = IsNearSurface();
 
+    // Propagate surface flags up to ancestors so the LOD system knows
+    // which subtrees contain geometry without traversing them.
     if (IsSurfaceNode)
     {
         TSharedPtr<FAdaptiveOctreeNode> Ancestor = Parent.Pin();
@@ -137,7 +145,9 @@ void FAdaptiveOctreeNode::Split()
 {
     if (!bIsLeaf) return;
 
-    FVector NextAnchor = (Index.Depth == DepthBounds[0]) ? Center : ChunkCenter;
+    // At chunk depth, children start a new chunk — anchor to this node's center.
+    // Otherwise inherit the existing chunk center from the parent.
+    FVector NextAnchor = (Index.Depth == DepthBounds[EDepthBound::ChunkDepth]) ? Center : ChunkCenter;
 
     for (uint8 i = 0; i < 8; i++)
     {
@@ -168,7 +178,9 @@ void FAdaptiveOctreeNode::Merge()
 
 bool FAdaptiveOctreeNode::ShouldSplit(FVector InCameraPosition, double ThresholdSq, double InFOVScale)
 {
-    // Back-face cull: skip nodes on the far side of the planet
+    // Back-face cull: skip nodes on the far side of the planet.
+    // The dot product is negative when the node is behind the planet center
+    // relative to the camera. The threshold (0.04) allows a ~11 degree margin.
     double Dot = FVector::DotProduct(InCameraPosition, Center);
     if (Dot < 0.0)
     {
@@ -179,7 +191,7 @@ bool FAdaptiveOctreeNode::ShouldSplit(FVector InCameraPosition, double Threshold
 
     double SurfaceDistSq = FVector::DistSquared(DualContourPosition, InCameraPosition);
 
-    return EvaluateSplit(Extent, SurfaceDistSq, InFOVScale, ThresholdSq, Index.Depth, DepthBounds[2], DepthBounds[1]);
+    return EvaluateSplit(Extent, SurfaceDistSq, InFOVScale, ThresholdSq, Index.Depth, DepthBounds[EDepthBound::MaxDepth], DepthBounds[EDepthBound::MinDepth]);
 }
 
 bool FAdaptiveOctreeNode::ShouldMerge(FVector InCameraPosition, double MergeThresholdSq, double InFOVScale)
@@ -187,7 +199,7 @@ bool FAdaptiveOctreeNode::ShouldMerge(FVector InCameraPosition, double MergeThre
     if (LodOverride) return false;
 
     double SurfaceDistSq = FVector::DistSquared(DualContourPosition, InCameraPosition);
-    return EvaluateMerge(Extent, SurfaceDistSq, InFOVScale, MergeThresholdSq, Index.Depth, DepthBounds[0], DepthBounds[1]);
+    return EvaluateMerge(Extent, SurfaceDistSq, InFOVScale, MergeThresholdSq, Index.Depth, DepthBounds[EDepthBound::ChunkDepth], DepthBounds[EDepthBound::MinDepth]);
 }
 
 TArray<FNodeEdge>& FAdaptiveOctreeNode::GetSignChangeEdges()
@@ -206,9 +218,9 @@ TArray<TSharedPtr<FAdaptiveOctreeNode>> FAdaptiveOctreeNode::GetSurfaceChunks()
     {
         TSharedPtr<FAdaptiveOctreeNode> CurrentNode = Stack.Pop(EAllowShrinking::No);
 
-        if (!CurrentNode || CurrentNode->Index.Depth > DepthBounds[0]) continue;
+        if (!CurrentNode || CurrentNode->Index.Depth > DepthBounds[EDepthBound::ChunkDepth]) continue;
 
-        if (CurrentNode->Index.Depth == DepthBounds[0] && CurrentNode->IsSurfaceNode)
+        if (CurrentNode->Index.Depth == DepthBounds[EDepthBound::ChunkDepth] && CurrentNode->IsSurfaceNode)
         {
             SurfaceNodes.Add(CurrentNode);
         }
@@ -254,38 +266,43 @@ void FAdaptiveOctreeNode::ComputeDualContourPosition()
         ValidEdges++;
     }
 
-
     MassPoint /= (double)ValidEdges;
 
-    //TODO: BRING BACK ERROR INTEGRATION, PROBLEM WAS VERTICALITY IN SURFACE DRIVING WAY TO MANY SPLITS WHEN THE LOD FLATTENS THE ELEVATION AXIS
     double Error = 0.0;
     FVector CalculatedPos = Qef.Solve(Center, Extent, &Error);
+
     double QefDistSq = FVector::DistSquared(CalculatedPos, MassPoint);
     double MaxDistSq = Extent * Extent;
+
+    // Blend factor from spatial drift (existing logic)
+    double tDist = 0.0;
     if (QefDistSq > MaxDistSq)
     {
-        DualContourPosition = MassPoint;
+        tDist = 1.0;
     }
-    else if (QefDistSq > MaxDistSq * 0.25) // Start blending at 50% of max distance
+    else if (QefDistSq > MaxDistSq * 0.25)
     {
-        // Smoothly lerp from QEF to MassPoint over the 0.25-1.0 range
-        double t = (QefDistSq - MaxDistSq * 0.25) / (MaxDistSq * 0.75);
-        t = t * t * (3.0 - 2.0 * t); // Smoothstep
-        DualContourPosition = FMath::Lerp(CalculatedPos, MassPoint, t);
-    }
-    else
-    {
-        DualContourPosition = CalculatedPos;
+        tDist = (QefDistSq - MaxDistSq * 0.25) / (MaxDistSq * 0.75);
+        tDist = tDist * tDist * (3.0 - 2.0 * tDist);
     }
 
+    // Blend factor from QEF error (surface too complex for this LOD).
+    // Normalized error > 1.0 means the half-planes disagree by more than
+    // the node's own extent — a strong signal that the vertex is unreliable.
+    double ErrorIntolerance = 1;
+    double NormalizedError = Error / FMath::Max(MaxDistSq, 1e-12);
+    double tError = FMath::Clamp(NormalizedError * ErrorIntolerance, 0.0, 1.0);
+    tError = tError * tError * (3.0 - 2.0 * tError);
 
+    // Whichever reason is stronger drives the blend toward mass point
+    double t = FMath::Max(tDist, tError);
+
+    DualContourPosition = FMath::Lerp(CalculatedPos, MassPoint, t);
+
+    // Final clamp to node bounds
     DualContourPosition.X = FMath::Clamp(DualContourPosition.X, Center.X - Extent, Center.X + Extent);
     DualContourPosition.Y = FMath::Clamp(DualContourPosition.Y, Center.Y - Extent, Center.Y + Extent);
     DualContourPosition.Z = FMath::Clamp(DualContourPosition.Z, Center.Z - Extent, Center.Z + Extent);
-
-    // Cache ocean surface projection of the dual contour position.
-    // When ocean is disabled, OceanPosition == DualContourPosition
-    // so the min() in LOD distance is a no-op.
 
     DualContourNormal = FVector3f(Qef.GetAverageNormal());
 }
