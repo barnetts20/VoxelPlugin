@@ -1,12 +1,15 @@
-﻿// Fill out your copyright notice in the Description page of Project Settings.
+﻿// FNodeStructs.h — Core data types for octree node geometry: corners, edges, 
+// morton indices, and edge neighbor tracking.
 
 #pragma once
 
 #include "CoreMinimal.h"
+
 struct FAdaptiveOctreeNode;
-/**
- *
- */
+
+/** A single corner of an octree node, storing its world position,
+ *  SDF density value, and surface normal. Each node has 8 corners
+ *  indexed per OctreeConstants::Offsets (bit 0 = X, bit 1 = Y, bit 2 = Z). */
 struct VOXELPLUGIN_API FNodeCorner {
     FVector Position;
     float Density;
@@ -16,6 +19,11 @@ struct VOXELPLUGIN_API FNodeCorner {
     FNodeCorner(FVector InPos, float InDensity, FVector3f InNormal) : Position(InPos), Density(InDensity), Normal(InNormal) {}
 };
 
+/** Quantized, canonically-ordered key that uniquely identifies an edge in the octree.
+ *  Two endpoints are quantized to integer grid coordinates and stored in a consistent
+ *  order (lexicographic on (X,Y,Z)) so that the same edge discovered from different
+ *  neighboring nodes produces an identical key. The hash is computed once at construction
+ *  and cached for fast TMap lookups during edge deduplication. */
 struct VOXELPLUGIN_API FEdgeKey
 {
     int32 X0, Y0, Z0;
@@ -24,9 +32,10 @@ struct VOXELPLUGIN_API FEdgeKey
     uint32 CachedHash;
 
     // Set once by FAdaptiveOctree at construction.
-    // Value: 2^MaxDepth / RootExtent � maps the smallest possible edge to ~1 grid unit.
+    // Value: 2^MaxDepth / RootExtent - maps the smallest possible edge to ~1 grid unit.
     static inline double InvGridSize = 1.0;
 
+    /** Snaps a world-space coordinate to the integer grid defined by InvGridSize. */
     static int32 Quantize(double V)
     {
         return FMath::RoundToInt32(V * InvGridSize);
@@ -34,6 +43,8 @@ struct VOXELPLUGIN_API FEdgeKey
 
     FEdgeKey() : X0(0), Y0(0), Z0(0), X1(0), Y1(0), Z1(0), Axis(0), CachedHash(0) {}
 
+    /** Quantizes both endpoint positions, stores them in canonical (lexicographic) order,
+     *  and precomputes the hash. */
     void BuildFromCorners(const FVector& PosA, const FVector& PosB, uint8 InAxis)
     {
         int32 ax = Quantize(PosA.X);
@@ -74,17 +85,24 @@ struct VOXELPLUGIN_API FEdgeKey
     }
 };
 
+/** An axis-aligned edge between two node corners, carrying the data needed for
+ *  dual contouring: whether a sign change (surface crossing) exists, the interpolated
+ *  zero-crossing point along the edge, and a prebuilt FEdgeKey for deduplication.
+ *  Edges are always axis-aligned since they connect corners differing in exactly one bit. */
 struct VOXELPLUGIN_API FNodeEdge
 {
     FNodeCorner Corners[2];
-    double Size;
-    bool SignChange;
-    uint8 Axis;
-    FVector ZeroCrossingPoint;
+    double Size;            // Distance between the two corner positions.
+    bool SignChange;        // True if the density changes sign across this edge (surface crossing).
+    uint8 Axis;             // 0 = X, 1 = Y, 2 = Z.
+    FVector ZeroCrossingPoint;  // Linearly interpolated surface crossing position, or midpoint if no sign change.
     FEdgeKey CachedKey;
 
     FNodeEdge() : Size(0), SignChange(false), Axis(0) {}
 
+    /** Constructs the edge from two corners: detects sign change, determines axis,
+     *  computes the zero-crossing point via linear interpolation of densities,
+     *  and builds the cached edge key. */
     FNodeEdge(const FNodeCorner& InCorner1, const FNodeCorner& InCorner2)
     {
         Corners[0] = InCorner1;
@@ -96,6 +114,7 @@ struct VOXELPLUGIN_API FNodeEdge
         SignChange = (d1 < 0) != (d2 < 0);
         Size = FVector::Dist(InCorner1.Position, InCorner2.Position);
 
+        // Determine which axis this edge is aligned to from the dominant delta component.
         FVector Delta = (InCorner2.Position - InCorner1.Position).GetAbs();
         if (Delta.X > Delta.Y && Delta.X > Delta.Z)
             Axis = 0;
@@ -123,14 +142,18 @@ struct VOXELPLUGIN_API FNodeEdge
     }
 };
 
-// 128-bit morton index -- supports up to depth 42 (3 bits * 42 = 126 bits across two uint64s).
-// Lo holds depths 0-20, Hi holds depths 21-41. Both are always compared/hashed
-// so there is no branching in the hot path; Hi is simply 0 for shallow trees.
+/** 128-bit morton index encoding a path from root to a node in the octree.
+ *  Each level stores a 3-bit child index (0-7), supporting up to depth 42
+ *  (3 bits * 42 = 126 bits across two uint64s). Lo holds depths 0-20,
+ *  Hi holds depths 21-41. Both halves are always compared and hashed so
+ *  there is no branching in the hot path; Hi is simply 0 for shallow trees.
+ *  Used as the key for the FSparseEditStore path lookups. */
 struct VOXELPLUGIN_API FMortonIndex {
     uint64 Lo = 0;
     uint64 Hi = 0;
     uint8 Depth = 0;
 
+    /** Appends a child index (0-7) to the path, advancing depth by one level. */
     void PushChild(uint8 ChildIndex) {
         if (Depth < 21)
             Lo |= (uint64(ChildIndex & 0x7) << (Depth * 3));
@@ -139,6 +162,7 @@ struct VOXELPLUGIN_API FMortonIndex {
         Depth++;
     }
 
+    /** Returns the child index at the given level of the path. */
     uint8 GetChildAtLevel(uint8 Level) const {
         if (Level < 21)
             return (Lo >> (Level * 3)) & 0x7;
@@ -146,6 +170,7 @@ struct VOXELPLUGIN_API FMortonIndex {
             return (Hi >> ((Level - 21) * 3)) & 0x7;
     }
 
+    /** Returns the child index at the deepest level of this path. */
     uint8 LastChild() const {
         return GetChildAtLevel(Depth - 1);
     }
@@ -162,6 +187,10 @@ struct VOXELPLUGIN_API FMortonIndex {
     }
 };
 
+/** Fixed-capacity set of up to 4 leaf nodes sharing an edge.
+ *  In a regular octree, at most 4 leaf nodes can border a single edge.
+ *  Used during dual contouring to find the nodes whose QEF vertices
+ *  form a quad (or degenerate tri) across a sign-change edge. */
 struct FEdgeNeighbors {
     FAdaptiveOctreeNode* Nodes[4] = { nullptr, nullptr, nullptr, nullptr };
     int32 Count = 0;
