@@ -53,7 +53,7 @@ public:
         int32 Count = Input.Num();
         if (Count <= 0 || SampleLayers.Num() <= 0) return;
 
-        // Fast path: single layer � no temp allocation, no ParallelFor overhead
+        // Fast path: single layer - no temp allocation, no ParallelFor overhead
         if (SampleLayers.Num() == 1)
         {
             SampleLayers[0](Input, DensityOut);
@@ -75,7 +75,7 @@ public:
                     DensityOut[i] += LayerOutputs[LayerIdx][i];
         }
 
-        // Edit store � scalar loop for small batches, parallel only when worth it
+        // Edit store - scalar loop for small batches, parallel only when worth it
         if (EditStore.IsValid())
         {
             if (Count > 128)
