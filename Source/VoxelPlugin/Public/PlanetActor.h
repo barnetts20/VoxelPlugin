@@ -20,24 +20,18 @@ public:
     APlanetActor();
 
     // Root component � provides the transform gizmo in the editor.
-    // Scale.GetMax() = planet radius in cm.
     UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Planet")
     TObjectPtr<USceneComponent> PlanetRoot;
 
     // ------- Shape -------
-
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Planet|Shape",
-        meta = (ClampMin = "0.01", ClampMax = "1.0"))
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Planet|Shape", meta = (ClampMin = "0.01", ClampMax = "1.0"))
     double NoiseAmplitudeRatio = 0.15;
 
     // Sea level as a fraction of the noise distribution [0, 1].
-    // 0 = ocean at PlanetRadius (lowest terrain), 1 = ocean at PlanetRadius + NoiseAmplitude.
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Planet|Shape",
-        meta = (ClampMin = "0.0", ClampMax = "1.0"))
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Planet|Shape", meta = (ClampMin = "-1", ClampMax = "2.0"))
     double SeaLevel = 0.5;
 
     // ------- Ocean -------
-
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Planet|Ocean")
     bool bEnableOcean = true;
 
@@ -45,17 +39,14 @@ public:
     UMaterialInterface* OceanMaterial = nullptr;
 
     // ------- Terrain -------
-
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Planet|Terrain")
     UMaterialInterface* TerrainMaterial = nullptr;
 
     // ------- Atmosphere -------
-
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Planet|Atmosphere")
     bool bEnableAtmosphere = true;
 
     // ------- Accessors -------
-
     UFUNCTION(BlueprintCallable, Category = "Planet")
     AAdaptiveVoxelActor* GetTerrainActor() const { return TerrainActor; }
 
@@ -88,7 +79,6 @@ private:
     FastNoise::SmartNode<> Noise;
 
     // Shared compositor (noise + edit store) built during Initialize and reused
-    // for child actor re-initialization (e.g. material swaps, ocean radius updates).
     TSharedPtr<FDensitySampleCompositor> SharedCompositor;
 
     FVector LastInitScale = FVector::ZeroVector;
@@ -104,8 +94,7 @@ private:
     void SpawnChildActors();
     void DestroyChildActors();
 
-    TSharedPtr<FDensitySampleCompositor> BuildCompositor(double PlanetRadius,
-        double NoiseAmplitude, double RootExtent, int32 ChunkDepth, int32 MaxDepth);
+    TSharedPtr<FDensitySampleCompositor> BuildCompositor(double PlanetRadius, double NoiseAmplitude, double RootExtent, int32 ChunkDepth, int32 MaxDepth);
 
     double ComputeOceanRadius(double PlanetRadius, double NoiseAmplitude) const;
 };
