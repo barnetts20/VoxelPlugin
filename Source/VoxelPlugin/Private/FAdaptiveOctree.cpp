@@ -1,5 +1,5 @@
 ﻿#include "FAdaptiveOctree.h"
-#include <FOctreeConstants.h>
+#include "FOctreeConstants.h"
 
 FAdaptiveOctree::FAdaptiveOctree(const FOctreeParams& Params)
 {
@@ -576,7 +576,7 @@ FVector2f FAdaptiveOctree::ComputeTriplanarUV(FVector Position, FVector3f Normal
     }
 
     return UV;
-};
+}
 
 void FAdaptiveOctree::UpdateMeshChunkStreamData(TSharedPtr<FMeshChunk> InChunk)
 {
@@ -604,7 +604,6 @@ void FAdaptiveOctree::UpdateMeshChunkStreamData(TSharedPtr<FMeshChunk> InChunk)
         AllEdgeData[edgeIdx].Edge = currentEdge;
         AllEdgeData[edgeIdx].Vertices.SetNumZeroed(neighbors.Count);
 
-        FVector PlanetCenter = Root->Center;
         for (int i = 0; i < neighbors.Count; i++) {
             FAdaptiveOctreeNode* NodePtr = neighbors.Nodes[i];
             FVector LocalPos(NodePtr->DualContourPosition - InChunk->ChunkCenter);
@@ -703,7 +702,7 @@ void FAdaptiveOctree::UpdateMeshChunkStreamData(TSharedPtr<FMeshChunk> InChunk)
     InChunk->IsDirty = true;
 }
 
-void AppendUniqueEdges(const TArray<FNodeEdge>& InAppendEdges, TArray<FNodeEdge>& OutNodeEdges, TMap<FEdgeKey, int32>& EdgeMap)
+void FAdaptiveOctree::AppendUniqueEdges(const TArray<FNodeEdge>& InAppendEdges, TArray<FNodeEdge>& OutNodeEdges, TMap<FEdgeKey, int32>& EdgeMap)
 {
     for (const FNodeEdge& anEdge : InAppendEdges)
     {
@@ -800,7 +799,6 @@ void FAdaptiveOctree::UpdateLOD(FVector CameraPosition, double InScreenSpaceThre
     CachedFOVScale = FOVScale;
     CachedThresholdSq = ThresholdSq;
 
-    //double t0 = FPlatformTime::Seconds();
     ParallelFor(NumChunks, [&](int32 idx) {
         FAdaptiveOctreeNode* ChunkNode = Chunks[idx].Get();
         double DistSq = FMath::Max(FVector::DistSquared(ChunkNode->Center, CameraPosition), 1e-12);
@@ -820,20 +818,12 @@ void FAdaptiveOctree::UpdateLOD(FVector CameraPosition, double InScreenSpaceThre
         auto MeshChunk = ChunkMap[Chunks[idx]];
         MeshChunk->ChunkEdges = tChunkEdges;
         ModifiedChunks[idx] = MeshChunk;
-        });
+    });
 
-    ParallelFor(ModifiedChunks.Num(), [&](int32 idx)
-        {
-            if (ModifiedChunks[idx].IsValid())
-                UpdateMeshChunkStreamData(ModifiedChunks[idx]);
-        });
-
-    //double t1 = FPlatformTime::Seconds();
-    //if ((t1 - t0) * 1000.0 > 25.0)
-    //{
-    //    UE_LOG(LogTemp, Log, TEXT("[LOD] LODPass: %.2fms"),
-    //        (t1 - t0) * 1000.0);
-    //}
+    ParallelFor(ModifiedChunks.Num(), [&](int32 idx) {
+        if (ModifiedChunks[idx].IsValid())
+            UpdateMeshChunkStreamData(ModifiedChunks[idx]);
+    });
 }
 
 void FAdaptiveOctree::UpdateMesh()
