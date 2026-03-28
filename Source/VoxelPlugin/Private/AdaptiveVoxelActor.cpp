@@ -3,9 +3,7 @@
 #include "DrawDebugHelpers.h"
 #include "Kismet/GameplayStatics.h"
 #include "TimerManager.h"
-#include <FDensitySampleCompositor.h>
-
-using namespace RealtimeMesh;
+#include "FDensitySampleCompositor.h"
 
 //Pipeline log thresholds... log if the pipelines take longer than the set value in MS
 //0 will always log pipeline execution times.
