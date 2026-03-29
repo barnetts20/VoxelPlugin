@@ -9,7 +9,7 @@
 //0 will always log pipeline execution times.
 const float DATA_LOG_THRESHOLD = 100;
 const float MESH_LOG_THRESHOLD = 50;
-const float EDIT_LOG_THRESHOLD = 50; 
+const float EDIT_LOG_THRESHOLD = 50;
 
 // Sets default values
 AAdaptiveVoxelActor::AAdaptiveVoxelActor()
@@ -78,8 +78,6 @@ void AAdaptiveVoxelActor::PostEditChangeProperty(FPropertyChangedEvent& Property
         GET_MEMBER_NAME_CHECKED(AAdaptiveVoxelActor, MinDepth),
         GET_MEMBER_NAME_CHECKED(AAdaptiveVoxelActor, TargetPrecision),
         GET_MEMBER_NAME_CHECKED(AAdaptiveVoxelActor, PrecisionDepthFloor),
-        GET_MEMBER_NAME_CHECKED(AAdaptiveVoxelActor, ChunkCullingMode),
-        GET_MEMBER_NAME_CHECKED(AAdaptiveVoxelActor, VolumeSdfRadius),
         GET_MEMBER_NAME_CHECKED(AAdaptiveVoxelActor, SurfaceMaterial),
         GET_MEMBER_NAME_CHECKED(AAdaptiveVoxelActor, ScreenSpaceThreshold),
     };
@@ -320,9 +318,6 @@ void AAdaptiveVoxelActor::Initialize()
     PendingParams->MinDepth = MinDepth;
     PendingParams->MaxDepth = MaxDepth;
     PendingParams->PrecisionDepthFloor = PrecisionDepthFloor;
-    PendingParams->ChunkCullingMode = (ChunkCullingMode == EChunkCullingMode::Volume)
-        ? EOctreeChunkCulling::Volume : EOctreeChunkCulling::Surface;
-    PendingParams->VolumeSdfRadius = VolumeSdfRadius;
 
     LastInitScale = GetActorScale3D();
     Initialized = true;
@@ -419,9 +414,6 @@ void AAdaptiveVoxelActor::InitializeFromPlanet(TSharedPtr<FDensitySampleComposit
     PendingParams->MinDepth = MinDepth;
     PendingParams->MaxDepth = MaxDepth;
     PendingParams->PrecisionDepthFloor = PrecisionDepthFloor;
-    PendingParams->ChunkCullingMode = (ChunkCullingMode == EChunkCullingMode::Volume)
-        ? EOctreeChunkCulling::Volume : EOctreeChunkCulling::Surface;
-    PendingParams->VolumeSdfRadius = VolumeSdfRadius;
 
     LastInitScale = GetActorScale3D();
     Initialized = true;

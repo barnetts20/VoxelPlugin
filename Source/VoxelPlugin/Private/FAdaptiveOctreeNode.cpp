@@ -207,35 +207,6 @@ TArray<FNodeEdge>& FAdaptiveOctreeNode::GetSignChangeEdges()
     return SignChangeEdges;
 }
 
-TArray<TSharedPtr<FAdaptiveOctreeNode>> FAdaptiveOctreeNode::GetSurfaceChunks()
-{
-    TArray<TSharedPtr<FAdaptiveOctreeNode>> SurfaceNodes;
-    TArray<TSharedPtr<FAdaptiveOctreeNode>> Stack;
-    Stack.Reserve(128);
-    Stack.Add(AsShared());
-
-    while (Stack.Num() > 0)
-    {
-        TSharedPtr<FAdaptiveOctreeNode> CurrentNode = Stack.Pop(EAllowShrinking::No);
-
-        if (!CurrentNode || CurrentNode->Index.Depth > DepthBounds[EDepthBound::ChunkDepth]) continue;
-
-        if (CurrentNode->Index.Depth == DepthBounds[EDepthBound::ChunkDepth] && CurrentNode->IsSurfaceNode)
-        {
-            SurfaceNodes.Add(CurrentNode);
-        }
-        else
-        {
-            for (int i = 0; i < 8; i++)
-            {
-                if (CurrentNode->Children[i]) Stack.Add(CurrentNode->Children[i]);
-            }
-        }
-    }
-
-    return SurfaceNodes;
-}
-
 FVector FAdaptiveOctreeNode::ComputeNormalizedPosition(double InRadius) const
 {
     return DualContourPosition.GetSafeNormal() * InRadius;

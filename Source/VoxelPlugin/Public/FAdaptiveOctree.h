@@ -16,23 +16,8 @@
 #include "FAdaptiveOctreeNode.h"
 #include "FDensitySampleCompositor.h"
 
-/** Controls how SplitToDepth decides which nodes to recurse into during
- *  initial tree construction down to ChunkDepth. */
-enum class EOctreeChunkCulling : uint8
-{
-    /** Only split nodes with density sign changes at their corners.
-     *  Optimal for continuous surfaces (planets, terrain). */
-    Surface,
-
-    /** Split all nodes whose AABB overlaps a control volume (sphere SDF).
-     *  Required for discontinuous/scattered surfaces (debris fields, asteroid clusters)
-     *  where features may be smaller than the coarse node size. */
-    Volume
-};
-
 /** Construction parameters for FAdaptiveOctree. Aggregates rendering targets,
- *  density compositor, terrain geometry parameters, tree depth bounds, and
- *  chunk culling configuration. */
+ *  density compositor, terrain geometry parameters, and tree depth bounds. */
 struct VOXELPLUGIN_API FOctreeParams {
     // --- Rendering ---
     ARealtimeMeshActor* ParentActor = nullptr;
@@ -63,15 +48,6 @@ struct VOXELPLUGIN_API FOctreeParams {
      *  from parent corner densities. Noise loses float precision past this depth,
      *  but deeper splits still provide geometric detail for editing. */
     int PrecisionDepthFloor = 19;
-
-    // --- Chunk Culling ---
-    EOctreeChunkCulling ChunkCullingMode = EOctreeChunkCulling::Surface;
-
-    /** Center of the control volume for Volume culling mode. Defaults to origin. */
-    FVector VolumeSdfCenter = FVector::ZeroVector;
-
-    /** Radius of the control volume sphere SDF. 0 = use RootExtent. */
-    double VolumeSdfRadius = 0.0;
 };
 
 /** Adaptive octree for LOD-driven dual-contour voxel meshing.
@@ -110,11 +86,6 @@ private:
     int ChunkDepth;
     int PrecisionDepthFloor;
 
-    // --- Chunk Culling ---
-    EOctreeChunkCulling ChunkCullingMode;
-    FVector VolumeSdfCenter;
-    double VolumeSdfRadius;
-
     // --- Terrain Parameters (derived from FOctreeParams) ---
     double PlanetRadius;
     double NoiseAmplitude;
@@ -135,16 +106,18 @@ private:
     // =====================================================================
 
     /** Recursively splits the tree from root to InMinDepth (ChunkDepth), computing
-     *  density at each level. Respects ChunkCullingMode to skip empty subtrees. */
+     *  density at each level. Only recurses into children where CouldContainSurface
+     *  is true, skipping deep interior/exterior nodes. */
     void SplitToDepth(FAdaptiveOctreeNode* Node, int InMinDepth);
 
     /** After SplitToDepth, builds mesh chunks for all relevant chunk-depth nodes
      *  and populates the ChunkMap. Runs edge gathering and mesh stream building in parallel. */
     void PopulateChunks();
 
-    /** Volume culling mode helper: collects all chunk-depth nodes whose AABB overlaps
-     *  the control sphere, via recursive AABB-sphere overlap tests. */
-    void CollectVolumeChunks(FAdaptiveOctreeNode* Node, TArray<TSharedPtr<FAdaptiveOctreeNode>>& Out);
+    /** Recursively collects all chunk-depth nodes where CouldContainSurface is true.
+     *  This single walk replaces both the old Surface-mode GetSurfaceChunks + neighbor
+     *  buffer probing and the Volume-mode CollectVolumeChunks sphere-AABB test. */
+    void CollectNearSurfaceChunks(FAdaptiveOctreeNode* Node, TArray<TSharedPtr<FAdaptiveOctreeNode>>& Out);
 
     // =====================================================================
     // Edit Pipeline

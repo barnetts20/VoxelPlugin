@@ -142,9 +142,6 @@ public:
      *  re-split when the camera returns. */
     void Merge();
 
-    /** Collects all chunk-depth nodes with surface geometry in this subtree. */
-    TArray<TSharedPtr<FAdaptiveOctreeNode>> GetSurfaceChunks();
-
     /** Computes the normalized position on a sphere of given radius.
      *  Projects DualContourPosition onto the sphere surface. */
     FVector ComputeNormalizedPosition(double InRadius) const;

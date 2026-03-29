@@ -19,18 +19,6 @@
 #include "RealtimeMeshActor.h"
 #include "AdaptiveVoxelActor.generated.h"
 
-/** Editor-facing mirror of EOctreeChunkCulling. Exists as a separate UENUM so
- *  the octree's internal enum doesn't need UHT markup. Mapped to EOctreeChunkCulling
- *  when building FOctreeParams. */
-UENUM(BlueprintType)
-enum class EChunkCullingMode : uint8
-{
-    /** Only process nodes with density sign changes. Optimal for continuous surfaces (planets). */
-    Surface     UMETA(DisplayName = "Surface"),
-    /** Process all nodes within a control volume sphere. Required for scattered surfaces (debris fields). */
-    Volume      UMETA(DisplayName = "Volume")
-};
-
 /** Terrain actor that owns an adaptive octree and drives its async update pipeline.
  *
  *  Three async task chains run on background threads, gated by atomic flags:
@@ -155,20 +143,6 @@ public:
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrain|Octree",
         meta = (ClampMin = "1"))
     int32 PrecisionDepthFloor = 19;
-
-    // --- Chunk Culling ---
-
-    /** Controls how the octree decides which nodes to split during initial construction.
-     *  Surface: only split where the density crosses zero (planets).
-     *  Volume: split all nodes within a control sphere (debris fields, asteroids). */
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrain|Octree")
-    EChunkCullingMode ChunkCullingMode = EChunkCullingMode::Surface;
-
-    /** Radius of the control volume for Volume culling mode.
-     *  0 = use the full octree root extent. Only relevant when ChunkCullingMode = Volume. */
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrain|Octree",
-        meta = (EditCondition = "ChunkCullingMode == EChunkCullingMode::Volume", ClampMin = "0.0"))
-    double VolumeSdfRadius = 0.0;
 
     // --- LOD ---
 
