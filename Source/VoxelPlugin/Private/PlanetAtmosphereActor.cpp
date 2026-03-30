@@ -153,16 +153,24 @@ void APlanetAtmosphereActor::OnTransformUpdated(USceneComponent* Component, EUpd
     }
 }
 
-void APlanetAtmosphereActor::InitializeFromPlanet(USceneComponent* InAttachParent)
+void APlanetAtmosphereActor::InitializeFromPlanet(USceneComponent* InAttachParent,
+    FVector InScale)
 {
     bIsPlanetOwned = true;
+
+    // Apply scale BEFORE binding the transform guard — prevents the old guard
+    // from reverting a scale change that the planet actor intends.
+    if (USceneComponent* Root = GetRootComponent())
+        Root->TransformUpdated.RemoveAll(this);
+
+    if (!InScale.IsZero())
+        SetActorScale3D(InScale);
+
     PlanetDrivenScale = GetActorScale3D();
 
+    // Re-bind the guard now that PlanetDrivenScale reflects the new scale.
     if (USceneComponent* Root = GetRootComponent())
-    {
-        Root->TransformUpdated.RemoveAll(this);
         Root->TransformUpdated.AddUObject(this, &APlanetAtmosphereActor::OnTransformUpdated);
-    }
 
     // Planet actor handles spawn + attach. Just run our init.
     bPendingInitialize = false;

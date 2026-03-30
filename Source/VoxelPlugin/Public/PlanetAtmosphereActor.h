@@ -207,8 +207,10 @@ public:
 #endif
 
     /** Called by PlanetActor after spawn + attach. Sets bIsPlanetOwned, binds the
-     *  transform guard, and runs Initialize. Skips the deferred OnConstruction path. */
-    void InitializeFromPlanet(USceneComponent* InAttachParent);
+     *  transform guard, and runs Initialize. InScale sets the actor's scale before
+     *  initialization. Skips the deferred OnConstruction path. */
+    void InitializeFromPlanet(USceneComponent* InAttachParent,
+        FVector InScale = FVector::ZeroVector);
 
 private:
     /** Root component — child actors (PPV, light) attach here. */

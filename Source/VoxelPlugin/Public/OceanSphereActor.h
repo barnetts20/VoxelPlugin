@@ -160,9 +160,11 @@ public:
 #endif
 
     /** Called by APlanetActor -- uses the provided compositor (shared with terrain)
-     *  instead of creating one. Scale must already be set to OceanRadius. */
+     *  instead of creating one. InScale sets the actor's scale (= ocean radius) before
+     *  initialization reads it. */
     void InitializeFromPlanet(TSharedPtr<FDensitySampleCompositor> InCompositor,
-        USceneComponent* InAttachParent = nullptr);
+        USceneComponent* InAttachParent = nullptr,
+        FVector InScale = FVector::ZeroVector);
 
     /** Tears down the current quadtree and rebuilds from scratch. */
     void Initialize();

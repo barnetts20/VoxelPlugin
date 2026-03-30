@@ -345,19 +345,25 @@ void AAdaptiveVoxelActor::OnTransformUpdated(USceneComponent* Component, EUpdate
 }
 
 void AAdaptiveVoxelActor::InitializeFromPlanet(TSharedPtr<FDensitySampleCompositor> InCompositor,
-    USceneComponent* InAttachParent)
+    USceneComponent* InAttachParent, FVector InScale)
 {
     // Same teardown as Initialize
     Initialized = false;
     bIsPlanetOwned = true;
+
+    // Apply scale BEFORE binding the transform guard — prevents the old guard
+    // from reverting a scale change that the planet actor intends.
+    if (USceneComponent* Root = GetRootComponent())
+        Root->TransformUpdated.RemoveAll(this);
+
+    if (!InScale.IsZero())
+        SetActorScale3D(InScale);
+
     PlanetDrivenScale = GetActorScale3D();
 
-    // Guard transforms — bind once to snap back any editor-driven changes.
+    // Re-bind the guard now that PlanetDrivenScale reflects the new scale.
     if (USceneComponent* Root = GetRootComponent())
-    {
-        Root->TransformUpdated.RemoveAll(this);
         Root->TransformUpdated.AddUObject(this, &AAdaptiveVoxelActor::OnTransformUpdated);
-    }
     while (DataUpdateIsRunning || MeshUpdateIsRunning || EditUpdateIsRunning)
         FPlatformProcess::Sleep(0.001f);
 

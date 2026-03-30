@@ -185,10 +185,12 @@ public:
     USceneComponent* GetMeshAttachmentRoot() const { return MeshAttachmentRoot; }
 
     /** Called by APlanetActor — uses the provided compositor (shared noise + edit store)
-     *  instead of creating one. The actor's own scale must already be set to the desired
-     *  planet radius. If InAttachParent is provided, MeshAttachmentRoot is re-parented to it. */
+     *  instead of creating one. InScale sets the actor's scale (= planet radius) before
+     *  initialization reads it. If InAttachParent is provided, MeshAttachmentRoot is
+     *  re-parented to it. */
     void InitializeFromPlanet(TSharedPtr<FDensitySampleCompositor> InCompositor,
-        USceneComponent* InAttachParent = nullptr);
+        USceneComponent* InAttachParent = nullptr,
+        FVector InScale = FVector::ZeroVector);
 
     /** Tears down the current octree and rebuilds from scratch using current property values.
      *  Called by OnConstruction (scale change), PostEditChangeProperty (structural param change),

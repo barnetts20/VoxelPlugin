@@ -102,12 +102,9 @@ void APlanetActor::Tick(float DeltaTime)
         if (bEnableOcean && OceanActor)
         {
             double NewOceanRadius = ComputeOceanRadius(PlanetRadius, NoiseAmplitude);
-            // Set the ocean actor's own scale = its actual radius.
-            // Its Initialize reads scale to derive OceanRadius.
-            OceanActor->SetActorScale3D(FVector(NewOceanRadius));
             OceanActor->TerrainPlanetRadius = PlanetRadius;
             OceanActor->NoiseAmplitudeRatio = NoiseAmplitudeRatio;
-            OceanActor->InitializeFromPlanet(SharedCompositor, PlanetRoot);
+            OceanActor->InitializeFromPlanet(SharedCompositor, PlanetRoot, FVector(NewOceanRadius));
             OceanActor->SetActorHiddenInGame(false);
             OceanActor->SetActorTickEnabled(true);
         }
@@ -175,21 +172,19 @@ void APlanetActor::Initialize()
     SharedCompositor = NewCompositor;
 
     // --- Terrain actor ---
-    TerrainActor->SetActorScale3D(FVector(PlanetRadius));
     if (TerrainMaterial)
         TerrainActor->SurfaceMaterial = TerrainMaterial;
     TerrainActor->NoiseAmplitudeRatio = NoiseAmplitudeRatio;
-    TerrainActor->InitializeFromPlanet(SharedCompositor, PlanetRoot);
+    TerrainActor->InitializeFromPlanet(SharedCompositor, PlanetRoot, FVector(PlanetRadius));
 
     // --- Ocean actor ---
     if (bEnableOcean && OceanActor)
     {
-        OceanActor->SetActorScale3D(FVector(OceanRadiusValue));
         if (OceanMaterial)
             OceanActor->OceanMaterial = OceanMaterial;
         OceanActor->TerrainPlanetRadius = PlanetRadius;
         OceanActor->NoiseAmplitudeRatio = NoiseAmplitudeRatio;
-        OceanActor->InitializeFromPlanet(SharedCompositor, PlanetRoot);
+        OceanActor->InitializeFromPlanet(SharedCompositor, PlanetRoot, FVector(OceanRadiusValue));
         OceanActor->SetActorHiddenInGame(false);
         OceanActor->SetActorTickEnabled(true);
     }
@@ -204,8 +199,7 @@ void APlanetActor::Initialize()
     {
         // Scale = max(OceanRadius, PlanetRadius) — the visible surface floor
         double AtmosphereScale = FMath::Max(OceanRadiusValue, PlanetRadius);
-        AtmosphereActor->SetActorScale3D(FVector(AtmosphereScale));
-        AtmosphereActor->InitializeFromPlanet(PlanetRoot);
+        AtmosphereActor->InitializeFromPlanet(PlanetRoot, FVector(AtmosphereScale));
         AtmosphereActor->SetActorHiddenInGame(false);
         AtmosphereActor->SetActorTickEnabled(true);
     }
