@@ -62,10 +62,10 @@ public:
 
 private:
     TSharedPtr<FSparseEditNode> Root;
-    int MaxDepth;
     FVector Center;
     double Extent;
     int ChunkDepth;
+    int MaxDepth;
 
     /** Returns the child octant index (0-7) for a position relative to a node center.
      *  Bit 0 = X >= center, bit 1 = Y >= center, bit 2 = Z >= center. */
