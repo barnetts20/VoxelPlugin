@@ -68,34 +68,16 @@ void APlanetGravityZone::BeginPlay()
         Sphere->UpdateOverlaps();
     }
 
-    // Also check if there are already overlapping actors (from GravityManager::RegisterGravityZone pattern)
+    // Register any actors already inside the zone — overlap events don't
+    // fire for objects that were already overlapping when the component registered.
     TArray<AActor*> AlreadyOverlapping;
     GetOverlappingActors(AlreadyOverlapping);
-
-    double InnerRadius = GetActorScale3D().GetMax();
-    double OuterRadius = InnerRadius * InfluenceRatio;
-    UE_LOG(LogTemp, Warning, TEXT("PlanetGravityZone::BeginPlay - Location: %s, Scale: %s"),
-        *GetActorLocation().ToString(), *GetActorScale3D().ToString());
-    UE_LOG(LogTemp, Warning, TEXT("  InnerRadius(scale): %.0f, OuterRadius(world): %.0f"),
-        InnerRadius, OuterRadius);
-    if (Sphere)
-    {
-        UE_LOG(LogTemp, Warning, TEXT("  Sphere - UnscaledRadius: %.2f, ScaledRadius: %.2f"),
-            Sphere->GetUnscaledSphereRadius(), Sphere->GetScaledSphereRadius());
-        UE_LOG(LogTemp, Warning, TEXT("  Sphere - WorldLocation: %s, WorldScale: %s"),
-            *Sphere->GetComponentLocation().ToString(), *Sphere->GetComponentScale().ToString());
-        UE_LOG(LogTemp, Warning, TEXT("  Sphere - GenerateOverlap: %d, CollisionEnabled: %d, Profile: %s, IsRegistered: %d"),
-            (int32)Sphere->GetGenerateOverlapEvents(),
-            (int32)Sphere->GetCollisionEnabled(),
-            *Sphere->GetCollisionProfileName().ToString(),
-            (int32)Sphere->IsRegistered());
-    }
-    UE_LOG(LogTemp, Warning, TEXT("  Already overlapping actors: %d"), AlreadyOverlapping.Num());
     for (AActor* Actor : AlreadyOverlapping)
     {
-        UE_LOG(LogTemp, Warning, TEXT("    - %s"), *Actor->GetName());
-        // Manually notify for already-overlapping actors
-        OnZoneBeginOverlap(Actor);
+        if (Actor && Actor != this)
+        {
+            OnZoneBeginOverlap(Actor);
+        }
     }
 }
 
@@ -148,14 +130,6 @@ FVector APlanetGravityZone::GetGravityVector_Implementation(const FVector& InWor
         Result = Direction * Magnitude;
     }
 
-    // Throttled log — only print every ~60 frames
-    static int32 FrameCounter = 0;
-    if (++FrameCounter % 60 == 0)
-    {
-        UE_LOG(LogTemp, Warning, TEXT("PlanetGravityZone::GetGravityVector - Dist: %.0f, InnerR: %.0f, Mag: %.1f, Dir: %s, Result: %s"),
-            Distance, InnerRadius, Magnitude, *Direction.ToString(), *Result.ToString());
-    }
-
     return Result;
 }
 
@@ -189,7 +163,6 @@ void APlanetGravityZone::OnActorOverlapBegin(AActor* OverlappedActor, AActor* Ot
 {
     if (OtherActor && OtherActor != this)
     {
-        UE_LOG(LogTemp, Warning, TEXT("PlanetGravityZone::OnActorOverlapBegin - %s entered zone"), *OtherActor->GetName());
         OnZoneBeginOverlap(OtherActor);
     }
 }
@@ -198,7 +171,6 @@ void APlanetGravityZone::OnActorOverlapEnd(AActor* OverlappedActor, AActor* Othe
 {
     if (OtherActor && OtherActor != this)
     {
-        UE_LOG(LogTemp, Warning, TEXT("PlanetGravityZone::OnActorOverlapEnd - %s left zone"), *OtherActor->GetName());
         OnZoneEndOverlap(OtherActor);
     }
 }
