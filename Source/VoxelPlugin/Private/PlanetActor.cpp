@@ -1,5 +1,6 @@
 ﻿#include "PlanetActor.h"
 #include "PlanetAtmosphereActor.h"
+#include "PlanetGravityZone.h"
 #include "Kismet/GameplayStatics.h"
 
 APlanetActor::APlanetActor()
@@ -40,7 +41,8 @@ void APlanetActor::OnConstruction(const FTransform& Transform)
     }
     else if (SeaLevel != LastSeaLevel
         || bEnableOcean != bLastEnableOcean
-        || bEnableAtmosphere != bLastEnableAtmosphere)
+        || bEnableAtmosphere != bLastEnableAtmosphere
+        || bEnableGravity != bLastEnableGravity)
     {
         bPendingOceanUpdate = true;
     }
@@ -126,9 +128,24 @@ void APlanetActor::Tick(float DeltaTime)
             AtmosphereActor->SetActorTickEnabled(false);
         }
 
+        // Toggle gravity zone visibility
+        if (bEnableGravity && GravityZone)
+        {
+            GravityZone->SetActorHiddenInGame(false);
+            GravityZone->SetActorTickEnabled(true);
+            GravityZone->SetActorEnableCollision(true);
+        }
+        else if (GravityZone)
+        {
+            GravityZone->SetActorHiddenInGame(true);
+            GravityZone->SetActorTickEnabled(false);
+            GravityZone->SetActorEnableCollision(false);
+        }
+
         LastSeaLevel = SeaLevel;
         bLastEnableOcean = bEnableOcean;
         bLastEnableAtmosphere = bEnableAtmosphere;
+        bLastEnableGravity = bEnableGravity;
     }
 }
 
@@ -209,11 +226,31 @@ void APlanetActor::Initialize()
         AtmosphereActor->SetActorTickEnabled(false);
     }
 
+    // --- Gravity zone ---
+    if (bEnableGravity && GravityZone)
+    {
+        // Inner radius = atmosphere scale (max of ocean/planet), so full
+        // gravity is reached at the visible surface.
+        double GravityInnerRadius = FMath::Max(OceanRadiusValue, PlanetRadius);
+        GravityZone->SetActorScale3D(FVector(GravityInnerRadius));
+        GravityZone->InitializeFromPlanet();
+        GravityZone->SetActorHiddenInGame(false);
+        GravityZone->SetActorTickEnabled(true);
+        GravityZone->SetActorEnableCollision(true);
+    }
+    else if (GravityZone)
+    {
+        GravityZone->SetActorHiddenInGame(true);
+        GravityZone->SetActorTickEnabled(false);
+        GravityZone->SetActorEnableCollision(false);
+    }
+
     LastInitScale = GetActorScale3D();
     LastSeaLevel = SeaLevel;
     LastNoiseAmplitudeRatio = NoiseAmplitudeRatio;
     bLastEnableOcean = bEnableOcean;
     bLastEnableAtmosphere = bEnableAtmosphere;
+    bLastEnableGravity = bEnableGravity;
     bInitialized = true;
 }
 
@@ -336,6 +373,20 @@ void APlanetActor::SpawnChildActors()
         }
     }
 
+    if (!GravityZone)
+    {
+        GravityZone = World->SpawnActor<APlanetGravityZone>(
+            APlanetGravityZone::StaticClass(),
+            FTransform(GetActorRotation(), GetActorLocation()),
+            SpawnParams);
+        if (USceneComponent* ChildRoot = GravityZone->GetRootComponent())
+        {
+            ChildRoot->SetAbsolute(false, false, true);
+            ChildRoot->AttachToComponent(PlanetRoot,
+                FAttachmentTransformRules::KeepWorldTransform);
+        }
+    }
+
     // Load default materials if none set — paths reference plugin Content folder
     if (!TerrainMaterial)
     {
@@ -367,6 +418,11 @@ void APlanetActor::DestroyChildActors()
     {
         AtmosphereActor->Destroy();
         AtmosphereActor = nullptr;
+    }
+    if (GravityZone)
+    {
+        GravityZone->Destroy();
+        GravityZone = nullptr;
     }
 }
 

@@ -1,43 +1,121 @@
-// PlanetGravityZone.cpp — Implementation of spherical planet gravity zone.
+// PlanetGravityZone.cpp — C++ equivalent of BP_PlanetGravitySphere,
+// using actor scale for the inner radius (same pattern as atmosphere actor).
 
 #include "PlanetGravityZone.h"
 
 APlanetGravityZone::APlanetGravityZone()
 {
-    // --- Inner sphere: display only, shows full-gravity radius ---
-    InnerSphere = CreateDefaultSubobject<USphereComponent>(TEXT("InnerSphere"));
-    SetRootComponent(InnerSphere);
+    // --- Root scene component (matches BP DefaultSceneRoot) ---
+    DefaultSceneRoot = CreateDefaultSubobject<USceneComponent>(TEXT("DefaultSceneRoot"));
+    RootComponent = DefaultSceneRoot;
 
-    InnerSphere->SetSphereRadius(1.0f); // Scales with actor scale
-    InnerSphere->SetCollisionEnabled(ECollisionEnabled::NoCollision);
-    InnerSphere->SetGenerateOverlapEvents(false);
-    InnerSphere->SetHiddenInGame(true);
-    InnerSphere->bVisualizeComponent = true; // Visible in editor for tuning
+    // --- Inner sphere ("Planet"): display only ---
+    // Unit radius; actor scale determines effective world radius.
+    Planet = CreateDefaultSubobject<USphereComponent>(TEXT("Planet"));
+    Planet->SetupAttachment(DefaultSceneRoot);
+    Planet->SetSphereRadius(1.0f);
+    Planet->SetCollisionEnabled(ECollisionEnabled::NoCollision);
+    Planet->SetGenerateOverlapEvents(false);
+    Planet->SetHiddenInGame(true);
 
-    // --- Outer sphere: overlap detection for gravity influence zone ---
-    InfluenceSphere = CreateDefaultSubobject<USphereComponent>(TEXT("InfluenceSphere"));
-    InfluenceSphere->SetupAttachment(InnerSphere);
-
-    InfluenceSphere->SetSphereRadius(1.0f); // Will be sized to actor scale * InfluenceScale
-    InfluenceSphere->SetCollisionProfileName(TEXT("OverlapAllDynamic"));
-    InfluenceSphere->SetGenerateOverlapEvents(true);
-    InfluenceSphere->SetCollisionEnabled(ECollisionEnabled::QueryOnly);
-    InfluenceSphere->SetHiddenInGame(true);
-    InfluenceSphere->bVisualizeComponent = true;
-
-    // Influence sphere should not inherit actor scale — we size it manually.
-    InfluenceSphere->SetAbsolute(false, false, true);
-
-    // Bind overlap events to forward into the base class GravPlugin notifications.
-    InfluenceSphere->OnComponentBeginOverlap.AddDynamic(this, &APlanetGravityZone::OnInfluenceBeginOverlap);
-    InfluenceSphere->OnComponentEndOverlap.AddDynamic(this, &APlanetGravityZone::OnInfluenceEndOverlap);
+    // --- Outer sphere ("Sphere"): overlap detection ---
+    Sphere = CreateDefaultSubobject<USphereComponent>(TEXT("Sphere"));
+    Sphere->SetupAttachment(DefaultSceneRoot);
+    Sphere->SetSphereRadius(1.0f); // Sized properly in UpdateInfluenceSphereRadius
+    Sphere->SetCollisionProfileName(TEXT("OverlapAllDynamic"));
+    Sphere->SetGenerateOverlapEvents(true);
+    Sphere->SetCollisionEnabled(ECollisionEnabled::QueryOnly);
+    Sphere->SetHiddenInGame(true);
 
     // Default BaseVector: 980 cm/s² magnitude (direction unused for spherical gravity).
     BaseVector = FVector(0.0, 0.0, -980.0);
+
+    // Default inner radius: 1010 km = 101,000,000 cm (slightly above default
+    // planet surface of 1000 km so full gravity is reached above ground).
+    SetActorScale3D(FVector(101000000.0));
 }
 
 // ---------------------------------------------------------------------------
-// Gravity calculation
+// Lifecycle — mirrors Construction Script + BeginPlay from the blueprint
+// ---------------------------------------------------------------------------
+
+void APlanetGravityZone::OnConstruction(const FTransform& Transform)
+{
+    Super::OnConstruction(Transform);
+    UpdateInfluenceSphereRadius();
+}
+
+void APlanetGravityZone::BeginPlay()
+{
+    Super::BeginPlay();
+
+    // Bind actor overlap delegates — this is exactly what the BP
+    // "Event ActorBeginOverlap" / "Event ActorEndOverlap" nodes bind to.
+    OnActorBeginOverlap.AddDynamic(this, &APlanetGravityZone::OnActorOverlapBegin);
+    OnActorEndOverlap.AddDynamic(this, &APlanetGravityZone::OnActorOverlapEnd);
+
+    // Force overlap recalculation by resizing the sphere, matching what the
+    // BP does by calling SetSphereRadius in both Construction Script and BeginPlay.
+    if (Sphere)
+    {
+        Sphere->SetSphereRadius(0.0f, false);
+    }
+    UpdateInfluenceSphereRadius();
+
+    // Explicit overlap update in case SetSphereRadius didn't trigger it
+    if (Sphere)
+    {
+        Sphere->UpdateOverlaps();
+    }
+
+    // Also check if there are already overlapping actors (from GravityManager::RegisterGravityZone pattern)
+    TArray<AActor*> AlreadyOverlapping;
+    GetOverlappingActors(AlreadyOverlapping);
+
+    double InnerRadius = GetActorScale3D().GetMax();
+    double OuterRadius = InnerRadius * InfluenceRatio;
+    UE_LOG(LogTemp, Warning, TEXT("PlanetGravityZone::BeginPlay - Location: %s, Scale: %s"),
+        *GetActorLocation().ToString(), *GetActorScale3D().ToString());
+    UE_LOG(LogTemp, Warning, TEXT("  InnerRadius(scale): %.0f, OuterRadius(world): %.0f"),
+        InnerRadius, OuterRadius);
+    if (Sphere)
+    {
+        UE_LOG(LogTemp, Warning, TEXT("  Sphere - UnscaledRadius: %.2f, ScaledRadius: %.2f"),
+            Sphere->GetUnscaledSphereRadius(), Sphere->GetScaledSphereRadius());
+        UE_LOG(LogTemp, Warning, TEXT("  Sphere - WorldLocation: %s, WorldScale: %s"),
+            *Sphere->GetComponentLocation().ToString(), *Sphere->GetComponentScale().ToString());
+        UE_LOG(LogTemp, Warning, TEXT("  Sphere - GenerateOverlap: %d, CollisionEnabled: %d, Profile: %s, IsRegistered: %d"),
+            (int32)Sphere->GetGenerateOverlapEvents(),
+            (int32)Sphere->GetCollisionEnabled(),
+            *Sphere->GetCollisionProfileName().ToString(),
+            (int32)Sphere->IsRegistered());
+    }
+    UE_LOG(LogTemp, Warning, TEXT("  Already overlapping actors: %d"), AlreadyOverlapping.Num());
+    for (AActor* Actor : AlreadyOverlapping)
+    {
+        UE_LOG(LogTemp, Warning, TEXT("    - %s"), *Actor->GetName());
+        // Manually notify for already-overlapping actors
+        OnZoneBeginOverlap(Actor);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Sphere sizing
+// ---------------------------------------------------------------------------
+
+void APlanetGravityZone::UpdateInfluenceSphereRadius()
+{
+    if (Sphere)
+    {
+        // Sphere inherits actor scale. World radius = local radius * actor scale.
+        // We want world radius = actor scale * InfluenceRatio,
+        // so local radius = InfluenceRatio.
+        Sphere->SetSphereRadius(InfluenceRatio, true);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Gravity calculation — matches BP_PlanetGravitySphere::GetGravityVector
 // ---------------------------------------------------------------------------
 
 FVector APlanetGravityZone::GetGravityVector_Implementation(const FVector& InWorldPosition) const
@@ -51,47 +129,48 @@ FVector APlanetGravityZone::GetGravityVector_Implementation(const FVector& InWor
     }
 
     FVector Direction = ToCenter / Distance;
-    double MaxAcceleration = BaseVector.Size();
+    double Magnitude = BaseVector.Size();
 
-    // Inner radius = actor scale (the full-gravity boundary).
+    // Inner radius from actor scale.
     double InnerRadius = GetActorScale3D().GetMax();
-    // Outer radius = inner * InfluenceScale (the influence boundary).
-    double OuterRadius = InnerRadius * InfluenceScale;
 
-    if (Distance <= InnerRadius)
+    FVector Result;
+    if (Distance > InnerRadius)
     {
-        // Inside inner sphere: full gravity.
-        return Direction * MaxAcceleration;
+        // BP does: Power(PlanetRadius / Distance, Falloff)
+        // With positive Falloff (e.g. 2), this decays with distance since ratio < 1.
+        double Ratio = InnerRadius / Distance;
+        double FalloffMultiplier = FMath::Pow(Ratio, (double)Falloff);
+        Result = Direction * Magnitude * FalloffMultiplier;
+    }
+    else
+    {
+        Result = Direction * Magnitude;
     }
 
-    if (Distance >= OuterRadius)
+    // Throttled log — only print every ~60 frames
+    static int32 FrameCounter = 0;
+    if (++FrameCounter % 60 == 0)
     {
-        // Outside influence zone: no gravity.
-        return FVector::ZeroVector;
+        UE_LOG(LogTemp, Warning, TEXT("PlanetGravityZone::GetGravityVector - Dist: %.0f, InnerR: %.0f, Mag: %.1f, Dir: %s, Result: %s"),
+            Distance, InnerRadius, Magnitude, *Direction.ToString(), *Result.ToString());
     }
 
-    // Between inner and outer: ramp from 1.0 at inner edge to 0.0 at outer edge.
-    // t = 0 at inner radius, t = 1 at outer radius.
-    double t = (Distance - InnerRadius) / (OuterRadius - InnerRadius);
-    // Invert so strength is 1 at inner, 0 at outer, then apply falloff exponent.
-    double Strength = FMath::Pow(1.0 - t, Falloff);
-
-    return Direction * MaxAcceleration * Strength;
+    return Result;
 }
 
 // ---------------------------------------------------------------------------
 // Planet initialization
 // ---------------------------------------------------------------------------
 
-void APlanetGravityZone::InitializeFromPlanet(double InPlanetRadius, double InAtmosphereScale)
+void APlanetGravityZone::InitializeFromPlanet()
 {
     bIsPlanetOwned = true;
 
+    UpdateInfluenceSphereRadius();
+
     // Cache location for the transform guard.
     PlanetDrivenLocation = GetActorLocation();
-
-    // Update the influence sphere to match current scale * InfluenceScale.
-    UpdateInfluenceSphereRadius();
 
     // Bind the transform guard so editor drags snap back.
     if (USceneComponent* Root = GetRootComponent())
@@ -101,40 +180,25 @@ void APlanetGravityZone::InitializeFromPlanet(double InPlanetRadius, double InAt
     }
 }
 
-void APlanetGravityZone::UpdateInfluenceSphereRadius()
-{
-    if (InfluenceSphere)
-    {
-        double InnerRadius = GetActorScale3D().GetMax();
-        double OuterRadius = InnerRadius * InfluenceScale;
-
-        // InfluenceSphere uses absolute scale, so we set the radius directly
-        // in world units.
-        InfluenceSphere->SetSphereRadius(OuterRadius);
-    }
-}
-
 // ---------------------------------------------------------------------------
-// Overlap forwarding
+// Overlap forwarding — bound to OnActorBeginOverlap / OnActorEndOverlap
+// delegates, which is exactly what BP "Event ActorBeginOverlap" binds to.
 // ---------------------------------------------------------------------------
 
-void APlanetGravityZone::OnInfluenceBeginOverlap(
-    UPrimitiveComponent* OverlappedComponent, AActor* OtherActor,
-    UPrimitiveComponent* OtherComp, int32 OtherBodyIndex,
-    bool bFromSweep, const FHitResult& SweepResult)
+void APlanetGravityZone::OnActorOverlapBegin(AActor* OverlappedActor, AActor* OtherActor)
 {
     if (OtherActor && OtherActor != this)
     {
+        UE_LOG(LogTemp, Warning, TEXT("PlanetGravityZone::OnActorOverlapBegin - %s entered zone"), *OtherActor->GetName());
         OnZoneBeginOverlap(OtherActor);
     }
 }
 
-void APlanetGravityZone::OnInfluenceEndOverlap(
-    UPrimitiveComponent* OverlappedComponent, AActor* OtherActor,
-    UPrimitiveComponent* OtherComp, int32 OtherBodyIndex)
+void APlanetGravityZone::OnActorOverlapEnd(AActor* OverlappedActor, AActor* OtherActor)
 {
     if (OtherActor && OtherActor != this)
     {
+        UE_LOG(LogTemp, Warning, TEXT("PlanetGravityZone::OnActorOverlapEnd - %s left zone"), *OtherActor->GetName());
         OnZoneEndOverlap(OtherActor);
     }
 }
@@ -148,7 +212,6 @@ void APlanetGravityZone::OnTransformUpdated(
 {
     if (!bIsPlanetOwned) return;
 
-    // Snap location back — gravity zone must stay centered on the planet.
     if (!GetActorLocation().Equals(PlanetDrivenLocation, 0.01))
     {
         SetActorLocation(PlanetDrivenLocation);
@@ -167,8 +230,7 @@ void APlanetGravityZone::PostEditChangeProperty(FPropertyChangedEvent& PropertyC
 
     FName PropName = PropertyChangedEvent.GetPropertyName();
 
-    // If InfluenceScale changed, resize the outer sphere.
-    if (PropName == GET_MEMBER_NAME_CHECKED(APlanetGravityZone, InfluenceScale))
+    if (PropName == GET_MEMBER_NAME_CHECKED(APlanetGravityZone, InfluenceRatio))
     {
         UpdateInfluenceSphereRadius();
     }
@@ -181,7 +243,6 @@ bool APlanetGravityZone::CanEditChange(const FProperty* InProperty) const
     if (bIsPlanetOwned && InProperty)
     {
         FName PropName = InProperty->GetFName();
-        // Lock transform-related properties when planet-owned.
         if (PropName == TEXT("RelativeLocation") || PropName == TEXT("RelativeScale3D"))
         {
             return false;
@@ -200,7 +261,7 @@ void APlanetGravityZone::PostEditMove(bool bFinished)
         SetActorLocation(PlanetDrivenLocation);
     }
 
-    // Actor scale may have changed via gizmo — update influence sphere.
+    // Scale may have changed via gizmo — update influence sphere.
     UpdateInfluenceSphereRadius();
 }
 
@@ -218,7 +279,6 @@ void APlanetGravityZone::EditorApplyScale(
     if (bIsPlanetOwned) return;
     Super::EditorApplyScale(DeltaScale, PivotLocation, bAltDown, bShiftDown, bCtrlDown);
 
-    // Scale changed — update influence sphere.
     UpdateInfluenceSphereRadius();
 }
 

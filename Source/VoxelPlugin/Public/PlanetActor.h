@@ -20,6 +20,7 @@
 #include "PlanetActor.generated.h"
 
 class APlanetAtmosphereActor;
+class APlanetGravityZone;
 
 /** Top-level planet actor that spawns and coordinates terrain, ocean, and
  *  atmosphere child actors.
@@ -74,6 +75,11 @@ public:
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Planet|Atmosphere")
     bool bEnableAtmosphere = true;
 
+    // --- Gravity ---
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Planet|Gravity")
+    bool bEnableGravity = true;
+
     // --- Accessors ---
 
     UFUNCTION(BlueprintCallable, Category = "Planet")
@@ -84,6 +90,9 @@ public:
 
     UFUNCTION(BlueprintCallable, Category = "Planet")
     APlanetAtmosphereActor* GetAtmosphereActor() const { return AtmosphereActor; }
+
+    UFUNCTION(BlueprintCallable, Category = "Planet")
+    APlanetGravityZone* GetGravityZone() const { return GravityZone; }
 
     // --- Lifecycle ---
 
@@ -110,6 +119,10 @@ private:
     UPROPERTY()
     APlanetAtmosphereActor* AtmosphereActor = nullptr;
 
+    /** Gravity zone child actor (APlanetGravityZone). Centered on planet. */
+    UPROPERTY()
+    APlanetGravityZone* GravityZone = nullptr;
+
     /** FastNoise node tree for the shared heightmap. Configured once in Initialize,
      *  captured by value into the compositor's heightmap layer lambda. */
     FastNoise::SmartNode<> Noise;
@@ -126,6 +139,7 @@ private:
     double LastNoiseAmplitudeRatio = -1.0;
     bool bLastEnableOcean = true;
     bool bLastEnableAtmosphere = true;
+    bool bLastEnableGravity = true;
 
     bool bInitialized = false;
 
