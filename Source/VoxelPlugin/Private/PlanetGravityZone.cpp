@@ -143,10 +143,7 @@ void APlanetGravityZone::InitializeFromPlanet()
 
     UpdateInfluenceSphereRadius();
 
-    // Cache location for the transform guard.
-    PlanetDrivenLocation = GetActorLocation();
-
-    // Bind the transform guard so editor drags snap back.
+    // Bind the transform guard so editor drags snap back to parent.
     if (USceneComponent* Root = GetRootComponent())
     {
         Root->TransformUpdated.RemoveAll(this);
@@ -184,9 +181,16 @@ void APlanetGravityZone::OnTransformUpdated(
 {
     if (!bIsPlanetOwned) return;
 
-    if (!GetActorLocation().Equals(PlanetDrivenLocation, 0.01))
+    // Check relative location — if it's non-zero, someone dragged us away from
+    // the parent. Snap back. This doesn't fire when the parent (planet) moves
+    // because the relative offset stays at zero.
+    if (USceneComponent* Root = GetRootComponent())
     {
-        SetActorLocation(PlanetDrivenLocation);
+        if (!Root->GetRelativeLocation().IsNearlyZero(0.01))
+        {
+            Root->SetRelativeLocation_Direct(FVector::ZeroVector);
+            Root->UpdateComponentToWorld();
+        }
     }
 }
 
@@ -230,7 +234,10 @@ void APlanetGravityZone::PostEditMove(bool bFinished)
 
     if (bIsPlanetOwned)
     {
-        SetActorLocation(PlanetDrivenLocation);
+        if (USceneComponent* Root = GetRootComponent())
+        {
+            Root->SetRelativeLocation(FVector::ZeroVector);
+        }
     }
 
     // Scale may have changed via gizmo — update influence sphere.

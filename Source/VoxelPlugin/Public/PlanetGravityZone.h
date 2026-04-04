@@ -98,9 +98,6 @@ private:
     UPROPERTY(VisibleAnywhere, Category = "Gravity Zone")
     TObjectPtr<USphereComponent> Sphere;
 
-    /** Cached planet-driven location for the transform guard. */
-    FVector PlanetDrivenLocation = FVector::ZeroVector;
-
     /** Bound to OnActorBeginOverlap / OnActorEndOverlap delegates —
      *  exactly what BP "Event ActorBeginOverlap" nodes bind to. */
     UFUNCTION()
