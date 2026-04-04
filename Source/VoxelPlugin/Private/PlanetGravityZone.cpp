@@ -141,6 +141,13 @@ void APlanetGravityZone::InitializeFromPlanet()
 {
     bIsPlanetOwned = true;
     UpdateInfluenceSphereRadius();
+
+    // Bind the transform guard — uses _Direct setters to avoid lag.
+    if (USceneComponent* Root = GetRootComponent())
+    {
+        Root->TransformUpdated.RemoveAll(this);
+        Root->TransformUpdated.AddUObject(this, &APlanetGravityZone::OnTransformUpdated);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -161,6 +168,31 @@ void APlanetGravityZone::OnActorOverlapEnd(AActor* OverlappedActor, AActor* Othe
     if (OtherActor && OtherActor != this)
     {
         OnZoneEndOverlap(OtherActor);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Transform locking (planet-owned)
+// ---------------------------------------------------------------------------
+
+void APlanetGravityZone::OnTransformUpdated(
+    USceneComponent* Component, EUpdateTransformFlags Flags, ETeleportType Teleport)
+{
+    if (!bIsPlanetOwned) return;
+
+    if (USceneComponent* Root = GetRootComponent())
+    {
+        // Lock location and rotation. Using _Direct setters avoids recursive
+        // delegate firing and the frame-of-lag that SetActorLocation caused.
+        bool bLocationDirty = !Root->GetRelativeLocation().IsNearlyZero(0.01);
+        bool bRotationDirty = !Root->GetRelativeRotation().IsNearlyZero(0.01);
+
+        if (bLocationDirty || bRotationDirty)
+        {
+            Root->SetRelativeLocation_Direct(FVector::ZeroVector);
+            Root->SetRelativeRotation_Direct(FRotator::ZeroRotator);
+            Root->UpdateComponentToWorld();
+        }
     }
 }
 
@@ -189,7 +221,10 @@ bool APlanetGravityZone::CanEditChange(const FProperty* InProperty) const
     if (bIsPlanetOwned && InProperty)
     {
         FName PropName = InProperty->GetFName();
-        if (PropName == TEXT("RelativeLocation") || PropName == TEXT("RelativeScale3D"))
+        // Lock all transform properties when planet-owned.
+        if (PropName == TEXT("RelativeLocation")
+            || PropName == TEXT("RelativeRotation")
+            || PropName == TEXT("RelativeScale3D"))
         {
             return false;
         }

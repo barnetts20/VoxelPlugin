@@ -105,4 +105,8 @@ private:
 
     UFUNCTION()
     void OnActorOverlapEnd(AActor* OverlappedActor, AActor* OtherActor);
+
+    /** Bound to RootComponent->TransformUpdated when planet-owned.
+     *  Snaps location and rotation back — using _Direct setters to avoid lag. */
+    void OnTransformUpdated(USceneComponent* Component, EUpdateTransformFlags Flags, ETeleportType Teleport);
 };

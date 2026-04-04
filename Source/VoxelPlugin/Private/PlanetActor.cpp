@@ -21,8 +21,23 @@ void APlanetActor::BeginPlay()
     // bPendingInitialize defaults to true — first Tick calls Initialize.
 }
 
+void APlanetActor::Destroyed()
+{
+    // Destroyed() fires when the actor is explicitly deleted — both in-editor
+    // and at runtime. The world is still valid here, so Destroy() on children works.
+    DestroyChildActors();
+    Super::Destroyed();
+}
+
+void APlanetActor::EndPlay(const EEndPlayReason::Type EndPlayReason)
+{
+    DestroyChildActors();
+    Super::EndPlay(EndPlayReason);
+}
+
 void APlanetActor::BeginDestroy()
 {
+    // Fallback — catch anything EndPlay missed (shouldn't happen, but safe).
     DestroyChildActors();
     Super::BeginDestroy();
 }

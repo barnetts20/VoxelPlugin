@@ -31,8 +31,16 @@ APlanetAtmosphereActor::APlanetAtmosphereActor()
     SetActorScale3D(FVector(107500000.0));
 
     // Load default cloud volume texture so it displays in the editor details panel.
-    CloudVolumeTexture = Cast<UVolumeTexture>(
-        StaticLoadObject(UVolumeTexture::StaticClass(), nullptr, DefaultVolumeTexturePath));
+    static ConstructorHelpers::FObjectFinder<UVolumeTexture> DefaultCloudTexture(
+        TEXT("/VoxelPlugin/VolumeTextures/Textures/VT_PerlinWorley_Balanced"));
+    if (DefaultCloudTexture.Succeeded())
+    {
+        CloudVolumeTexture = DefaultCloudTexture.Object;
+    }
+    else
+    {
+        UE_LOG(LogTemp, Warning, TEXT("PlanetAtmosphereActor: Failed to load default cloud volume texture"));
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -42,6 +50,12 @@ APlanetAtmosphereActor::APlanetAtmosphereActor()
 void APlanetAtmosphereActor::BeginPlay()
 {
     Super::BeginPlay();
+}
+
+void APlanetAtmosphereActor::Destroyed()
+{
+    DestroyChildActors();
+    Super::Destroyed();
 }
 
 void APlanetAtmosphereActor::BeginDestroy()

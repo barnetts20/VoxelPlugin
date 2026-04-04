@@ -160,7 +160,7 @@ public:
 
     /** Atmosphere outer shell = PlanetRadius * (1 + AtmosphereHeightScale). */
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Atmosphere|Planet Geometry")
-    float AtmosphereHeightScale = 0.5f;
+    float AtmosphereHeightScale = 0.2f;
 
     /** Cloud layer outer shell = PlanetRadius * (1 + CloudOuterHeightScale). */
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Atmosphere|Planet Geometry")
@@ -192,6 +192,7 @@ public:
 
     virtual void OnConstruction(const FTransform& Transform) override;
     virtual void BeginPlay() override;
+    virtual void Destroyed() override;
     virtual void BeginDestroy() override;
     virtual bool ShouldTickIfViewportsOnly() const override { return true; }
     virtual void Tick(float DeltaTime) override;
