@@ -116,13 +116,13 @@ public:
 
     /** Minimum subdivision depth maintained regardless of camera distance. */
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrain|Octree")
-    int MinDepth = 8;
+    int MinDepth = 7;
 
     /** Target voxel spacing in world units (cm). MaxDepth is computed automatically
      *  so the finest LOD voxel cells are approximately this size. */
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrain|Octree",
         meta = (ClampMin = "1.0"))
-    double TargetPrecision = 100.0;
+    double TargetPrecision = 150.0;
 
     /** Computed from TargetPrecision and planet radius at init time.
      *  Clamped to [MinDepth, MaxKeyDepth].
@@ -142,7 +142,7 @@ public:
      *  but deeper splits still provide geometric detail for editing. */
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrain|Octree",
         meta = (ClampMin = "1"))
-    int32 PrecisionDepthFloor = 19;
+    int32 PrecisionDepthFloor = 20;
 
     // --- LOD ---
 

@@ -112,7 +112,7 @@ public:
 
     /** Multiplier on camera velocity for predictive LOD. */
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Ocean|LOD")
-    double VelocityLookAheadFactor = 8.0;
+    double VelocityLookAheadFactor = 2.0;
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Ocean|LOD")
     bool bTickInEditor = true;

@@ -140,15 +140,7 @@ FVector APlanetGravityZone::GetGravityVector_Implementation(const FVector& InWor
 void APlanetGravityZone::InitializeFromPlanet()
 {
     bIsPlanetOwned = true;
-
     UpdateInfluenceSphereRadius();
-
-    // Bind the transform guard so editor drags snap back to parent.
-    if (USceneComponent* Root = GetRootComponent())
-    {
-        Root->TransformUpdated.RemoveAll(this);
-        Root->TransformUpdated.AddUObject(this, &APlanetGravityZone::OnTransformUpdated);
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -169,28 +161,6 @@ void APlanetGravityZone::OnActorOverlapEnd(AActor* OverlappedActor, AActor* Othe
     if (OtherActor && OtherActor != this)
     {
         OnZoneEndOverlap(OtherActor);
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Transform locking (planet-owned)
-// ---------------------------------------------------------------------------
-
-void APlanetGravityZone::OnTransformUpdated(
-    USceneComponent* Component, EUpdateTransformFlags Flags, ETeleportType Teleport)
-{
-    if (!bIsPlanetOwned) return;
-
-    // Check relative location — if it's non-zero, someone dragged us away from
-    // the parent. Snap back. This doesn't fire when the parent (planet) moves
-    // because the relative offset stays at zero.
-    if (USceneComponent* Root = GetRootComponent())
-    {
-        if (!Root->GetRelativeLocation().IsNearlyZero(0.01))
-        {
-            Root->SetRelativeLocation_Direct(FVector::ZeroVector);
-            Root->UpdateComponentToWorld();
-        }
     }
 }
 

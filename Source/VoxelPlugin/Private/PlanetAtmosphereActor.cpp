@@ -29,6 +29,10 @@ APlanetAtmosphereActor::APlanetAtmosphereActor()
     // Default radius = max(OceanRadius, PlanetRadius) at planet defaults:
     // PlanetRadius(100M) + SeaLevel(0.5) * NoiseAmplitude(15M) = 107,500,000 cm
     SetActorScale3D(FVector(107500000.0));
+
+    // Load default cloud volume texture so it displays in the editor details panel.
+    CloudVolumeTexture = Cast<UVolumeTexture>(
+        StaticLoadObject(UVolumeTexture::StaticClass(), nullptr, DefaultVolumeTexturePath));
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -141,6 +145,7 @@ void APlanetAtmosphereActor::OnTransformUpdated(USceneComponent* Component, EUpd
     if (USceneComponent* Root = GetRootComponent())
     {
         // Lock location and scale. Rotation is intentionally left alone (light direction).
+        // Using _Direct setters avoids firing TransformUpdated recursively.
         bool bLocationDirty = !Root->GetRelativeLocation().IsNearlyZero(0.01);
         bool bScaleDirty = !Root->GetComponentScale().Equals(PlanetDrivenScale, 0.01);
 
@@ -289,13 +294,6 @@ void APlanetAtmosphereActor::CreateMaterialInstances()
     MID_Preprocess = UMaterialInstanceDynamic::Create(BasePre, this, TEXT("MID_Preprocess"));
     MID_Atmosphere = UMaterialInstanceDynamic::Create(BaseAtmo, this, TEXT("MID_Atmosphere"));
     MID_Postprocess = UMaterialInstanceDynamic::Create(BasePost, this, TEXT("MID_Postprocess"));
-
-    // Load default volume texture if none assigned
-    if (!CloudVolumeTexture)
-    {
-        CloudVolumeTexture = Cast<UVolumeTexture>(
-            StaticLoadObject(UVolumeTexture::StaticClass(), nullptr, DefaultVolumeTexturePath));
-    }
 
     // Assign to post-process volume blendables in exact order: preprocess, atmosphere, postprocess
     FPostProcessSettings& Settings = PostProcessVolume->Settings;
