@@ -195,7 +195,7 @@ void AAdaptiveVoxelActor::Initialize()
     {
         UMaterialInterface* PluginMaterial = Cast<UMaterialInterface>(
             StaticLoadObject(UMaterialInterface::StaticClass(), nullptr,
-                TEXT("/VoxelPlugin/MT_TriPlanar.MT_TriPlanar")));
+                TEXT("/VoxelPlugin/MT_TriPlanar.MT_Surface")));
         if (PluginMaterial)
             SurfaceMaterial = PluginMaterial;
     }
