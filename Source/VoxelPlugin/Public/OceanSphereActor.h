@@ -9,6 +9,7 @@
 #pragma once
 
 #include "CoreMinimal.h"
+#include "Misc/ScopeLock.h"
 #include "RealtimeMeshActor.h"
 #include "FOceanSharedStructs.h"
 #include "FOceanQuadTreeNode.h"
@@ -177,6 +178,12 @@ private:
     /** Maps chunk-depth quadtree nodes to their mesh chunks. */
     TMap<TSharedPtr<FOceanQuadTreeNode>, TSharedPtr<FOceanMeshChunk>> ChunkMap;
 
+    /** Serializes ChunkMap access between the async LOD task (snapshot read) and
+ *  GT teardown (InitializeInternal / BeginDestroy free it). Chunk values are
+ *  TWeakObjectPtr-only, so releasing the snapshot's shared refs on the worker
+ *  is safe; this lock only protects the map container itself. */
+    FCriticalSection ChunkMapCS;
+
     /** Mesh chunks attach to this component. Inherits actor position/rotation,
      *  uses absolute scale. */
     UPROPERTY()
@@ -244,9 +251,14 @@ private:
 
     /** Rebuilds vertex positions, normals, UVs, and triangles (inner + edge) for a
      *  single chunk. Handles edge stitching based on neighbor LOD differences and
-     *  per-triangle depth culling. Static so it can run in a ParallelFor. */
+     *  per-triangle depth culling. Static so it can run in a ParallelFor.
+     *
+     *  CompPin is the density compositor, pinned by the caller (snapshotted under
+     *  ChunkMapCS at task start). Passed in rather than fetched off the Actor so it
+     *  can't dangle if the GT swaps Compositor during a concurrent re-init. */
     static void RebuildChunkStreamData(TSharedPtr<FOceanMeshChunk> Chunk,
-        TSharedPtr<FOceanQuadTreeNode> ChunkNode);
+        TSharedPtr<FOceanQuadTreeNode> ChunkNode,
+        const TSharedPtr<FDensitySampleCompositor>& CompPin);
 
     /** Background LOD update task: evaluates split/merge for all leaves, checks
      *  neighbor LODs, rebuilds dirty chunks, and pushes mesh updates. Chains back

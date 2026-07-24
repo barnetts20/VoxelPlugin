@@ -38,8 +38,16 @@ void AOceanSphereActor::BeginPlay()
 void AOceanSphereActor::BeginDestroy()
 {
     bIsDestroyed = true;
+    ++InitGeneration;   // force any in-flight LOD task to bail at its next check
     if (UWorld* W = GetWorld())
         W->GetTimerManager().ClearAllTimersForObject(this);
+
+    // Drain any in-flight snapshot read, then empty the map under the lock so the
+    // TMap's own destruction (when the UObject is reclaimed) can't race a worker.
+    {
+        FScopeLock Lock(&ChunkMapCS);
+        ChunkMap.Empty();
+    }
     Super::BeginDestroy();
 }
 
@@ -212,10 +220,14 @@ void AOceanSphereActor::InitializeInternal(TSharedPtr<FDensitySampleCompositor> 
     bLodUpdateRunning = false;
     MeshGridCache.Empty();
 
-    CleanupComponents();
-    ChunkMap.Empty();
-    for (int32 i = 0; i < 6; ++i)
-        RootNodes[i].Reset();
+    {
+        // Serialize the free against the LOD task's snapshot read (Site 1).
+        FScopeLock Lock(&ChunkMapCS);
+        CleanupComponents();
+        ChunkMap.Empty();
+        for (int32 i = 0; i < 6; ++i)
+            RootNodes[i].Reset();
+    }
 
     // Load default plugin material if none assigned by the user.
     if (!OceanMaterial)
@@ -238,10 +250,18 @@ void AOceanSphereActor::InitializeInternal(TSharedPtr<FDensitySampleCompositor> 
         ActualPrecision = 2.0 * OceanRadius / (EffectiveRes * FMath::Pow(2.0, (double)MaxDepth));
     }
 
+    // Build the new compositor into a local first, then publish it to the member
+    // under ChunkMapCS (below). The LOD task snapshots Compositor under the same
+    // lock, so an in-flight task either sees the stale generation and bails, or
+    // pins the *old* compositor and keeps it alive for its run. Assigning the
+    // member directly here would let a worker mid-Sample() read a torn/freed
+    // TSharedPtr during a re-init (the parallax spawn-and-move crash).
+    TSharedPtr<FDensitySampleCompositor> NewCompositor;
+
     if (InCompositor.IsValid())
     {
         // Use planet-provided compositor
-        Compositor = InCompositor;
+        NewCompositor = InCompositor;
     }
     else
     {
@@ -296,8 +316,14 @@ void AOceanSphereActor::InitializeInternal(TSharedPtr<FDensitySampleCompositor> 
                 }
             };
 
-        Compositor = MakeShared<FDensitySampleCompositor>();
-        Compositor->AddSampleLayer(HeightmapLayer);
+        NewCompositor = MakeShared<FDensitySampleCompositor>();
+        NewCompositor->AddSampleLayer(HeightmapLayer);
+    }
+
+    // Publish the compositor under the same lock the LOD task reads it with.
+    {
+        FScopeLock Lock(&ChunkMapCS);
+        Compositor = NewCompositor;
     }
 
     // Unit cube: each face spans [-1, +1] in its two local axes. The absolute
@@ -364,12 +390,16 @@ void AOceanSphereActor::PopulateChunks()
     // Pre-build the grid cache before parallel work to avoid thread-unsafe lazy init.
     GetMeshGrid(FaceResolution);
 
+    // Runs on the GT during init, so Compositor is stable here; pin it once and
+    // pass it down so every chunk in this pass samples the same object.
+    TSharedPtr<FDensitySampleCompositor> CompPin = Compositor;
+
     ParallelFor(ChunkNodes.Num(), [&](int32 i)
         {
             NewChunks[i] = MakeShared<FOceanMeshChunk>();
             NewChunks[i]->CachedOwner = this;
             NewChunks[i]->InitializeData(ChunkNodes[i]->SphereCenter);
-            RebuildChunkStreamData(NewChunks[i], ChunkNodes[i]);
+            RebuildChunkStreamData(NewChunks[i], ChunkNodes[i], CompPin);
         });
 
     for (int32 i = 0; i < ChunkNodes.Num(); ++i)
@@ -393,13 +423,19 @@ void AOceanSphereActor::PopulateChunks()
 
 void AOceanSphereActor::RebuildChunkStreamData(
     TSharedPtr<FOceanMeshChunk>    Chunk,
-    TSharedPtr<FOceanQuadTreeNode> ChunkNode)
+    TSharedPtr<FOceanQuadTreeNode> ChunkNode,
+    const TSharedPtr<FDensitySampleCompositor>& CompPin)
 {
     if (!Chunk.IsValid() || !ChunkNode.IsValid()) return;
     if (!Chunk->InnerMeshData.IsValid() || !Chunk->EdgeMeshData.IsValid()) return;
 
     AOceanSphereActor* Actor = ChunkNode->Owner;
-    FDensitySampleCompositor* Comp = Actor ? Actor->GetCompositor().Get() : nullptr;
+
+    // Caller pins the compositor (snapshotted under ChunkMapCS at task start) so
+    // it stays alive for this whole call even if the GT swaps Compositor during a
+    // concurrent re-init. Do NOT fetch it raw off the Actor here — that raw ptr
+    // would dangle when the old compositor is freed mid-Sample().
+    FDensitySampleCompositor* Comp = CompPin.Get();
 
     const float TriCullThreshold = Actor ? Actor->TriangleCullDepthThreshold : -10000.f;
     const int32 Res = Actor ? Actor->FaceResolution : 3;
@@ -639,9 +675,28 @@ void AOceanSphereActor::RunLodUpdateTask()
 
             TArray<TSharedPtr<FOceanQuadTreeNode>> ChunkNodes;
             TArray<TSharedPtr<FOceanMeshChunk>>    MeshChunks;
-            Self->ChunkMap.GenerateKeyArray(ChunkNodes);
-            for (auto& CN : ChunkNodes)
-                MeshChunks.Add(Self->ChunkMap[CN]);
+            TSharedPtr<FDensitySampleCompositor>   CompPin;
+            {
+                // Serialize with InitializeInternal / BeginDestroy, which free
+                // ChunkMap on the GT. Re-check staleness under the lock: if a
+                // teardown bumped the generation between the outer guard and
+                // here, bail before snapshotting a map that's about to die.
+                FScopeLock Lock(&Self->ChunkMapCS);
+                if (Self->bIsDestroyed || Self->InitGeneration != CapturedGen)
+                {
+                    Self->bLodUpdateRunning = false;
+                    return;
+                }
+                Self->ChunkMap.GenerateKeyArray(ChunkNodes);
+                for (auto& CN : ChunkNodes)
+                    MeshChunks.Add(Self->ChunkMap[CN]);
+
+                // Pin the compositor for this task's entire lifetime. Reading it
+                // under the same lock InitializeInternal publishes it with avoids
+                // a torn read; holding the shared ref keeps the object alive even
+                // if the GT swaps Compositor mid-pass.
+                CompPin = Self->Compositor;
+            }
 
             int32 NumChunks = ChunkNodes.Num();
 
@@ -731,7 +786,7 @@ void AOceanSphereActor::RunLodUpdateTask()
                 {
                     if (Self->InitGeneration != CapturedGen) return;
                     if (ChunkTreeChanged[idx] || ChunkEdgeChanged[idx])
-                        RebuildChunkStreamData(MeshChunks[idx], ChunkNodes[idx]);
+                        RebuildChunkStreamData(MeshChunks[idx], ChunkNodes[idx], CompPin);
                 });
 
             Self->bLodUpdateRunning = false;
