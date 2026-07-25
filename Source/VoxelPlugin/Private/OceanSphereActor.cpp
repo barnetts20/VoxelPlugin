@@ -138,20 +138,6 @@ bool AOceanSphereActor::ShouldTickIfViewportsOnly() const
 }
 
 // ---------------------------------------------------------------------------
-// Mesh grid cache
-// ---------------------------------------------------------------------------
-
-const FOceanMeshGrid& AOceanSphereActor::GetMeshGrid(int32 Res)
-{
-    FOceanMeshGrid* Existing = MeshGridCache.Find(Res);
-    if (Existing) return *Existing;
-
-    FOceanMeshGrid& Grid = MeshGridCache.Add(Res);
-    Grid.Build(Res);
-    return Grid;
-}
-
-// ---------------------------------------------------------------------------
 // Initialize
 // ---------------------------------------------------------------------------
 
@@ -234,7 +220,6 @@ void AOceanSphereActor::InitializeInternal(TSharedPtr<FDensitySampleCompositor> 
         W->GetTimerManager().ClearTimer(LodTimerHandle);
 
     bLodUpdateRunning = false;
-    MeshGridCache.Empty();
 
     {
         // Serialize the free against the LOD task's snapshot read (Site 1).
@@ -403,8 +388,12 @@ void AOceanSphereActor::PopulateChunks()
     TArray<TSharedPtr<FOceanMeshChunk>> NewChunks;
     NewChunks.SetNum(ChunkNodes.Num());
 
-    // Pre-build the grid cache before parallel work to avoid thread-unsafe lazy init.
-    GetMeshGrid(FaceResolution);
+    // Build the triangle grid once on this thread (GT init, single-threaded), then
+    // pass it into each worker's rebuild. The grid is immutable and depends only on
+    // Res, so a task-local copy is race-free and needs no shared cache.
+    const int32 Res = FaceResolution;
+    FOceanMeshGrid Grid;
+    Grid.Build(Res);
 
     // Runs on the GT during init, so Compositor is stable here; pin it once and
     // pass it down so every chunk in this pass samples the same object.
@@ -415,7 +404,7 @@ void AOceanSphereActor::PopulateChunks()
             NewChunks[i] = MakeShared<FOceanMeshChunk>();
             NewChunks[i]->CachedOwner = this;
             NewChunks[i]->InitializeData(ChunkNodes[i]->SphereCenter);
-            RebuildChunkStreamData(NewChunks[i], ChunkNodes[i], CompPin);
+            RebuildChunkStreamData(NewChunks[i], ChunkNodes[i], CompPin, Grid, Res);
         });
 
     for (int32 i = 0; i < ChunkNodes.Num(); ++i)
@@ -429,8 +418,8 @@ void AOceanSphereActor::PopulateChunks()
 // RebuildChunkStreamData
 //
 // Generates vertex positions/normals/UVs/depths on the fly from node topology.
-// Triangle indices come from the static FOceanMeshGrid cache — no per-node
-// mesh arrays, no GenerateMeshData, no HasGenerated flag.
+// Triangle indices come from a caller-provided FOceanMeshGrid (built once per task
+// on a single thread and passed in) — no shared cache touched on workers.
 //
 // Per-leaf vertex layout: (Res+2) x (Res+2) extended grid, row-major ix*ExtRes+iy.
 // SpherePos  = (CubeCenter + CubeOffset).GetSafeNormal() * OceanRadius
@@ -440,7 +429,9 @@ void AOceanSphereActor::PopulateChunks()
 void AOceanSphereActor::RebuildChunkStreamData(
     TSharedPtr<FOceanMeshChunk>    Chunk,
     TSharedPtr<FOceanQuadTreeNode> ChunkNode,
-    const TSharedPtr<FDensitySampleCompositor>& CompPin)
+    const TSharedPtr<FDensitySampleCompositor>& CompPin,
+    const FOceanMeshGrid& Grid,
+    int32                          Res)
 {
     if (!Chunk.IsValid() || !ChunkNode.IsValid()) return;
     if (!Chunk->InnerMeshData.IsValid() || !Chunk->EdgeMeshData.IsValid()) return;
@@ -454,7 +445,9 @@ void AOceanSphereActor::RebuildChunkStreamData(
     FDensitySampleCompositor* Comp = CompPin.Get();
 
     const float TriCullThreshold = Actor ? Actor->TriangleCullDepthThreshold : -10000.f;
-    const int32 Res = Actor ? Actor->FaceResolution : 3;
+    // Res is passed in (matching the grid built by the caller) rather than re-read
+    // off the Actor, so vertex-array sizing and Grid triangle indices stay consistent
+    // even if FaceResolution changes on the GT mid-task.
     const int32 ExtRes = Res + 2;
     const int32 Total = ExtRes * ExtRes;
 
@@ -564,7 +557,6 @@ void AOceanSphereActor::RebuildChunkStreamData(
         }
 
         // Stage 3: emit inner triangles — cull if all 3 verts above water
-        const FOceanMeshGrid& Grid = Actor->GetMeshGrid(Res);
         const bool bFlip = Leaf->FaceTransform.bFlipWinding;
 
         for (FIndex3UI Tri : Grid.PatchTriangles)
@@ -729,6 +721,15 @@ void AOceanSphereActor::RunLodUpdateTask()
 
             int32 NumChunks = ChunkNodes.Num();
 
+            // Build the triangle grid once on this task thread (before any ParallelFor)
+            // and pass it into the Phase-3 rebuild. Immutable and Res-only, so the
+            // task-local copy is race-free -- workers never touch shared cache state,
+            // and a GT re-init clearing actor state can't pull the grid out from under
+            // an in-flight worker. Res is captured here so grid and vertex sizing match.
+            const int32 GridRes = Self->FaceResolution;
+            FOceanMeshGrid Grid;
+            Grid.Build(GridRes);
+
             TArray<TArray<TSharedPtr<FOceanQuadTreeNode>>> AllChunkLeaves;
             AllChunkLeaves.SetNum(NumChunks);
             TArray<bool> ChunkTreeChanged;
@@ -815,7 +816,7 @@ void AOceanSphereActor::RunLodUpdateTask()
                 {
                     if (Self->InitGeneration != CapturedGen) return;
                     if (ChunkTreeChanged[idx] || ChunkEdgeChanged[idx])
-                        RebuildChunkStreamData(MeshChunks[idx], ChunkNodes[idx], CompPin);
+                        RebuildChunkStreamData(MeshChunks[idx], ChunkNodes[idx], CompPin, Grid, GridRes);
                 });
 
             Self->bLodUpdateRunning = false;

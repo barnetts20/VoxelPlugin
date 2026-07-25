@@ -139,9 +139,6 @@ public:
     USceneComponent* GetMeshAttachmentRoot() const { return MeshAttachmentRoot; }
     TSharedPtr<FDensitySampleCompositor> GetCompositor() const { return Compositor; }
 
-    /** Returns the cached triangle grid for a given resolution, building it on first access. */
-    const FOceanMeshGrid& GetMeshGrid(int32 Res);
-
     /** Walks the quadtree to find the node matching a FQuadIndex. Returns nullptr if
      *  the path doesn't exist (node was merged). Used by CheckNeighbors for LOD queries. */
     TSharedPtr<FOceanQuadTreeNode> GetNodeByIndex(const FQuadIndex& Index) const;
@@ -250,10 +247,6 @@ private:
      *  Snaps transforms back to planet-driven values. */
     void OnTransformUpdated(USceneComponent* Component, EUpdateTransformFlags Flags, ETeleportType Teleport);
 
-    /** Static mesh grid cache -- keyed by FaceResolution. Built once per resolution,
-     *  reused across all nodes at that resolution. */
-    TMap<int32, FOceanMeshGrid> MeshGridCache;
-
     /** Internal init path shared by Initialize and InitializeFromPlanet.
      *  Builds the quadtree, populates chunks, and kicks off the first LOD pass. */
     void InitializeInternal(TSharedPtr<FDensitySampleCompositor> InCompositor);
@@ -270,11 +263,15 @@ private:
      *  per-triangle depth culling. Static so it can run in a ParallelFor.
      *
      *  CompPin is the density compositor, pinned by the caller (snapshotted under
-     *  ChunkMapCS at task start). Passed in rather than fetched off the Actor so it
-     *  can't dangle if the GT swaps Compositor during a concurrent re-init. */
+     *  ChunkMapCS at task start). Grid is a caller-owned triangle grid built once per
+     *  task on a single thread; Res is the resolution it was built with. Both are
+     *  passed in rather than fetched off the Actor so nothing shared is touched on
+     *  workers and a concurrent re-init can't invalidate them mid-rebuild. */
     static void RebuildChunkStreamData(TSharedPtr<FOceanMeshChunk> Chunk,
         TSharedPtr<FOceanQuadTreeNode> ChunkNode,
-        const TSharedPtr<FDensitySampleCompositor>& CompPin);
+        const TSharedPtr<FDensitySampleCompositor>& CompPin,
+        const FOceanMeshGrid& Grid,
+        int32 Res);
 
     /** Background LOD update task: evaluates split/merge for all leaves, checks
      *  neighbor LODs, rebuilds dirty chunks, and pushes mesh updates. Chains back
