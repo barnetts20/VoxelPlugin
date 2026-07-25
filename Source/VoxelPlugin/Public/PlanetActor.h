@@ -94,6 +94,17 @@ public:
     UFUNCTION(BlueprintCallable, Category = "Planet")
     APlanetGravityZone* GetGravityZone() const { return GravityZone; }
 
+    /** Cheap mode: forwarded to the terrain and ocean children so they settle their
+     *  LOD at MinDepth and stop doing split/merge/mesh work. Driven by the parallax
+     *  wrapper from the universe speed scale (cheap while SpeedScale != 1). Only acts
+     *  on transitions, so it's safe to call every frame.
+     *
+     *  Exposed as a UFUNCTION so the parallax wrapper (a different module) can invoke
+     *  it by name without a compile-time dependency on VoxelPlugin. This is the
+     *  temporary daisy-chain hop that the future speed-scale singleton will replace. */
+    UFUNCTION(BlueprintCallable, Category = "Planet")
+    void SetCheapMode(bool bInCheap);
+
     // --- Lifecycle ---
 
     virtual void OnConstruction(const FTransform& Transform) override;
@@ -144,6 +155,9 @@ private:
     bool bLastEnableGravity = true;
 
     bool bInitialized = false;
+
+    /** Current cheap-mode state, so SetCheapMode only forwards on transitions. */
+    bool bCheapMode = false;
 
     /** When true, Initialize runs on the next Tick. Set by OnConstruction for deferred
      *  child actor spawning (unsafe during construction). */

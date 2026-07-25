@@ -156,6 +156,11 @@ public:
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrain|LOD")
     double MinDataUpdateInterval = 0.05;
 
+    /** LOD heartbeat interval (seconds) while in cheap mode. Passes are near-no-op
+     *  once the octree has settled at MinDepth, so we run them less often. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrain|LOD")
+    double CheapDataUpdateInterval = 0.25;
+
     /** Multiplier on camera velocity for predictive LOD. Higher values split nodes
      *  earlier in the direction of camera movement. */
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrain|LOD")
@@ -197,6 +202,13 @@ public:
      *  InitializeFromPlanet (planet-driven init), and BeginPlay. */
     void Initialize();
 
+    /** Cheap mode: while active, the LOD pass suppresses screen-space splits and forces
+     *  merges, so the octree settles at MinDepth and holds there regardless of
+     *  camera/planet motion (used during parallax travel at SpeedScale != 1). Set by
+     *  APlanetActor. On the true->false transition the LOD pass is kicked immediately
+     *  so full detail resumes without waiting on the slow heartbeat. */
+    void SetCheapMode(bool bInCheap);
+
 protected:
     // --- Async Task Flags ---
     // Each flag gates its corresponding task so only one instance runs at a time.
@@ -204,6 +216,10 @@ protected:
     std::atomic<bool> DataUpdateIsRunning = false;
     std::atomic<bool> MeshUpdateIsRunning = false;
     std::atomic<bool> EditUpdateIsRunning = false;
+
+    /** When true, the LOD pass runs in cheap mode (settle at MinDepth, no further
+     *  split/merge work). Read at the start of each DataUpdate pass. */
+    std::atomic<bool> bCheapMode = false;
 
     /** Timer handle for the MinDataUpdateInterval delay between MeshUpdate completion
      *  and the next DataUpdate kickoff. */

@@ -270,6 +270,21 @@ void APlanetActor::Initialize()
 }
 
 // ---------------------------------------------------------------------------
+// Cheap mode
+// ---------------------------------------------------------------------------
+
+void APlanetActor::SetCheapMode(bool bInCheap)
+{
+    if (bInCheap == bCheapMode) return;   // transitions only
+    bCheapMode = bInCheap;
+
+    // Forward to the LOD-driven children. Atmosphere step-count scaling is handled
+    // separately (phase 2). GravityZone has no LOD work, so it's unaffected.
+    if (TerrainActor) TerrainActor->SetCheapMode(bInCheap);
+    if (OceanActor)   OceanActor->SetCheapMode(bInCheap);
+}
+
+// ---------------------------------------------------------------------------
 // Compositor
 // ---------------------------------------------------------------------------
 
