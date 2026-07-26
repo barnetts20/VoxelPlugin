@@ -46,6 +46,7 @@ void AAdaptiveVoxelActor::BeginDestroy()
     {
         FScopeLock Lock(&PendingApplyCS);
         PendingApply.Empty();
+        PendingDestroy.Empty();
     }
 
     FRWScopeLock WriteLock(OctreeLock, SLT_Write);
@@ -198,6 +199,7 @@ void AAdaptiveVoxelActor::Initialize()
     {
         FScopeLock Lock(&PendingApplyCS);
         PendingApply.Empty();
+        PendingDestroy.Empty();
     }
 
     // Now clean up any components that were already attached
@@ -232,27 +234,13 @@ void AAdaptiveVoxelActor::Initialize()
         ActualPrecision = 2.0 * ActorRootExtent / FMath::Pow(2.0, (double)MaxDepth);
     }
 
-    // Compute ChunkDepth from float precision requirements.
-    // Chunk-local vertex positions are FVector3f. The float precision at the
-    // chunk extent must be below a fixed threshold for artifact-free rendering.
-    // FloatPrecision = ChunkExtent * FLT_EPSILON ≈ (RootExtent / 2^D) * 1.19e-7
+    // Build the chunk cut at the shallow floor (MinChunkDepth). Float-precision jitter at
+    // this coarse depth is expected and is recovered near the camera by the chunk-cut pass
+    // (FAdaptiveOctree::PromoteChunksNearCamera), which promotes chunks toward MaxChunkDepth
+    // wherever the surface is close enough for the jitter to be visible.
     {
-        constexpr double FloatEps = 1.19e-7;
-        constexpr double MaxFloatError = 1.0; // cm — max acceptable vertex jitter
-        double Ratio = ActorRootExtent * FloatEps / MaxFloatError;
-        int32 IdealChunkDepth = (Ratio > 1.0) ? (int32)FMath::CeilToInt(FMath::Log2(Ratio)) : 2;
-        ChunkDepth = FMath::Clamp(IdealChunkDepth, 2, MaxChunkDepth);
+        ChunkDepth = FMath::Clamp(MinChunkDepth, 2, MaxChunkDepth);
         MinDepth = FMath::Max(MinDepth, ChunkDepth);
-
-        double ChunkExtent = ActorRootExtent / FMath::Pow(2.0, (double)ChunkDepth);
-        double FloatPrec = ChunkExtent * FloatEps;
-        if (FloatPrec > MaxFloatError)
-        {
-            UE_LOG(LogTemp, Warning,
-                TEXT("[Octree] Float precision (%.2fcm) exceeds %.0fcm at ChunkDepth %d. "
-                    "Reduce planet scale to avoid vertex jitter."),
-                FloatPrec, MaxFloatError, ChunkDepth);
-        }
     }
 
     //Composes a density sampling layer that treats the input noise node as if it was a heightmap
@@ -330,6 +318,7 @@ void AAdaptiveVoxelActor::Initialize()
     PendingParams->NoiseAmplitude = ActorNoiseAmplitude;
     PendingParams->ChunkDepth = ChunkDepth;
     PendingParams->MaxChunkDepth = MaxChunkDepth;
+    PendingParams->ChunkPrecisionThreshold = ChunkPrecisionThreshold;
     PendingParams->MinDepth = MinDepth;
     PendingParams->MaxDepth = MaxDepth;
     PendingParams->PrecisionDepthFloor = PrecisionDepthFloor;
@@ -395,6 +384,7 @@ void AAdaptiveVoxelActor::InitializeFromPlanet(TSharedPtr<FDensitySampleComposit
     {
         FScopeLock Lock(&PendingApplyCS);
         PendingApply.Empty();
+        PendingDestroy.Empty();
     }
 
     CleanSceneRoot();
@@ -420,13 +410,10 @@ void AAdaptiveVoxelActor::InitializeFromPlanet(TSharedPtr<FDensitySampleComposit
         ActualPrecision = 2.0 * ActorRootExtent / FMath::Pow(2.0, (double)MaxDepth);
     }
 
-    // Auto-derive ChunkDepth
+    // Build the chunk cut at the shallow floor (MinChunkDepth); precision is recovered
+    // near the camera by PromoteChunksNearCamera.
     {
-        constexpr double FloatEps = 1.19e-7;
-        constexpr double MaxFloatError = 1.0;
-        double Ratio = ActorRootExtent * FloatEps / MaxFloatError;
-        int32 IdealChunkDepth = (Ratio > 1.0) ? (int32)FMath::CeilToInt(FMath::Log2(Ratio)) : 2;
-        ChunkDepth = FMath::Clamp(IdealChunkDepth, 2, MaxChunkDepth);
+        ChunkDepth = FMath::Clamp(MinChunkDepth, 2, MaxChunkDepth);
         MinDepth = FMath::Max(MinDepth, ChunkDepth);
     }
 
@@ -440,6 +427,7 @@ void AAdaptiveVoxelActor::InitializeFromPlanet(TSharedPtr<FDensitySampleComposit
     PendingParams->NoiseAmplitude = ActorNoiseAmplitude;
     PendingParams->ChunkDepth = ChunkDepth;
     PendingParams->MaxChunkDepth = MaxChunkDepth;
+    PendingParams->ChunkPrecisionThreshold = ChunkPrecisionThreshold;
     PendingParams->MinDepth = MinDepth;
     PendingParams->MaxDepth = MaxDepth;
     PendingParams->PrecisionDepthFloor = PrecisionDepthFloor;
@@ -492,6 +480,7 @@ void AAdaptiveVoxelActor::RunDataUpdateTask()
             }
 
             double t0 = FPlatformTime::Seconds();
+            TArray<TSharedPtr<FMeshChunk>> RemovedChunks;
             {
                 FRWScopeLock WriteLock(Self->OctreeLock, SLT_Write);
                 FVector CurrentCamPos = Self->CameraPosition;
@@ -507,9 +496,21 @@ void AAdaptiveVoxelActor::RunDataUpdateTask()
                 // const double EffThreshold = Self->bCheapMode.load() ? 1e18 : Self->ScreenSpaceThreshold;
                 Self->AdaptiveOctree->UpdateLOD(PredictedPos, EffThreshold, Self->CameraFOV);
                 Self->LastLodUpdatePosition = Self->CameraPosition;
+
+                // Chunk-cut pass: promote chunks to finer origins where float jitter would
+                // show. Uses the ACTUAL camera position (precision is about where you are,
+                // not where you're heading). New chunks are dirty and flow through the mesh
+                // pass; retired coarse chunks come back in RemovedChunks for GT destruction.
+                Self->AdaptiveOctree->PromoteChunksNearCamera(CurrentCamPos, Self->CameraFOV, RemovedChunks);
             }
             double elapsed = (FPlatformTime::Seconds() - t0) * 1000.0;
             if (elapsed > DATA_LOG_THRESHOLD) UE_LOG(LogTemp, Log, TEXT("[Pipeline] DataUpdate: %.2fms"), elapsed);
+
+            if (RemovedChunks.Num() > 0)
+            {
+                FScopeLock Lock(&Self->PendingApplyCS);
+                Self->PendingDestroy.Append(MoveTemp(RemovedChunks));
+            }
 
             Self->DataUpdateIsRunning = false;
             Self->RunMeshUpdateTask();
@@ -621,6 +622,27 @@ void AAdaptiveVoxelActor::DrainPendingApply()
     }
 }
 
+void AAdaptiveVoxelActor::DrainPendingDestroy()
+{
+    if (IsDestroyed) return;
+
+    TArray<TSharedPtr<FMeshChunk>> ToDestroy;
+    {
+        FScopeLock Lock(&PendingApplyCS);
+        if (PendingDestroy.Num() == 0) return;
+        ToDestroy = MoveTemp(PendingDestroy);
+    }
+
+    // Promote-only produces few retirements per pass (one coarse parent each), so this is
+    // drained fully rather than time-sliced. Revisit if merge-back (which can retire eight
+    // children at once) lands.
+    for (const TSharedPtr<FMeshChunk>& Chunk : ToDestroy)
+    {
+        if (Chunk.IsValid())
+            Chunk->ReleaseComponent();
+    }
+}
+
 void AAdaptiveVoxelActor::RunEditUpdateTask(FVector InEditCenter, double InEditRadius, double InEditStrength, int InEditResolution)
 {
     if (EditUpdateIsRunning || IsDestroyed) return;
@@ -666,6 +688,10 @@ void AAdaptiveVoxelActor::Tick(float DeltaTime)
     // Drain a per-frame time slice of queued chunk applies (component creation + mesh
     // push). Decoupled from the data/mesh loop so it runs at frame rate.
     DrainPendingApply();
+
+    // Destroy components of chunks retired by the chunk-cut pass. After the applies above
+    // so the finer replacement chunks get a chance to appear first.
+    DrainPendingDestroy();
 
     // Cache cam data
     auto world = GetWorld();

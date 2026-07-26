@@ -108,20 +108,31 @@ public:
 
     // --- Octree Structure ---
 
-    /** Computed at init from float precision requirements. Determines the depth at
-     *  which the tree is spatially partitioned into mesh chunks.
-     *  At default scale (100M radius, 0.15 NAR): ChunkDepth=4. */
+    /** Computed at init: the depth the chunk cut is built at (= MinChunkDepth). Shown for
+     *  reference. Chunks promote deeper than this near the camera. */
     UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Terrain|Octree")
     int ChunkDepth = 4;
 
-    /** Ceiling on the chunk-cut depth. Caps the computed ChunkDepth clamp: lower it (e.g.
-     *  3) for a shallower, far cheaper cut that spawns/populates fast but loses surface
-     *  precision at large scale; raise it for finer origins. Once the variable-depth
-     *  chunk cut lands, this becomes the deepest chunks may go near the camera, while the
-     *  cut stays shallow far away. */
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrain|Octree",
-        meta = (ClampMin = "2"))
-    int MaxChunkDepth = 5;
+    /** Shallow floor the chunk cut is built at — the spawn / far-away chunk depth. Keep it
+     *  low (2-3) so spawn and distant terrain use few, large components. Precision is
+     *  recovered near the camera by promoting toward MaxChunkDepth. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrain|Octree", meta = (ClampMin = "2"))
+    int MinChunkDepth = 3;
+
+    /** Deepest a chunk root may sit — the near-camera precision ceiling. Chunks under the
+     *  camera promote toward this until their float jitter is sub-pixel. Raise it for very
+     *  large terrestrial planets that need walking-precision on the surface (a 10,000 km
+     *  planet wants ~12-14 for sub-mm); lower it to cap near-camera component count. Must
+     *  be <= MaxDepth. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrain|Octree", meta = (ClampMin = "2"))
+    int MaxChunkDepth = 10;
+
+    /** Screen-space tolerance for chunk float jitter (fraction of the view). A chunk
+     *  promotes when its worst-case FVector3f jitter would project larger than this at the
+     *  camera's near distance. Smaller = promote sooner / finer origins / more components.
+     *  ~5e-4 targets roughly half a pixel at 1080p. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrain|Octree", meta = (ClampMin = "0.00001"))
+    double ChunkPrecisionThreshold = 5e-4;
 
     /** Minimum subdivision depth maintained regardless of camera distance. */
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrain|Octree")
@@ -253,6 +264,12 @@ protected:
     TArray<TSharedPtr<FMeshChunk>> PendingApply;
     FCriticalSection PendingApplyCS;
 
+    /** Chunks retired by the chunk-cut pass (coarse parents replaced by finer children).
+     *  Their RealtimeMesh components must be destroyed on the game thread; Tick drains this
+     *  after DrainPendingApply so the finer children get a chance to appear first. Guarded
+     *  by PendingApplyCS (same low-contention queue family as PendingApply). */
+    TArray<TSharedPtr<FMeshChunk>> PendingDestroy;
+
     /** Destroys all RealtimeMesh components attached to MeshAttachmentRoot. */
     void CleanSceneRoot();
 
@@ -274,6 +291,11 @@ protected:
      *  Tick. Holds the octree read lock while applying so a concurrent data pass can't
      *  rewrite a chunk's stream mid-copy. */
     void DrainPendingApply();
+
+    /** Game-thread: destroys the RealtimeMesh components of chunks retired by the chunk-cut
+     *  pass. Called from Tick after DrainPendingApply. No octree lock needed (touches only
+     *  the retired chunks' own components). */
+    void DrainPendingDestroy();
 
     /** Background task: applies a spherical brush edit, reconstructs affected subtrees,
      *  and pushes updated meshes. Runs independently of the Data/Mesh chain. */

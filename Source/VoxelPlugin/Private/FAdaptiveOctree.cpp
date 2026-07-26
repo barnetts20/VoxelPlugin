@@ -9,6 +9,7 @@ FAdaptiveOctree::FAdaptiveOctree(const FOctreeParams& Params)
     Compositor = Params.Compositor;
     ChunkDepth = Params.ChunkDepth;
     MaxChunkDepth = Params.MaxChunkDepth;
+    ChunkPrecisionThreshold = Params.ChunkPrecisionThreshold;
     PrecisionDepthFloor = Params.PrecisionDepthFloor;
 
     // Core terrain parameters from params
@@ -759,6 +760,104 @@ void FAdaptiveOctree::CollectDirtyChunks(TArray<TSharedPtr<FMeshChunk>>& OutDirt
         const TSharedPtr<FMeshChunk>& Chunk = It.Value;
         if (Chunk.IsValid() && Chunk->IsDirty)
             OutDirtyChunks.Add(Chunk);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Chunk cut
+// ---------------------------------------------------------------------------
+
+bool FAdaptiveOctree::ChunkNeedsFinerPrecision(FAdaptiveOctreeNode* Node, FVector CameraPosition, double FOVScale) const
+{
+    // Near distance = distance from the camera to the closest point of the chunk's AABB,
+    // floored so that standing on the surface (near-dist -> 0) doesn't demand infinite
+    // depth. This is the key difference from the LOD test, which uses center distance:
+    // precision is about how close the *surface under your feet* is, not the chunk center
+    // (which can be half a planet away for a coarse chunk).
+    const FVector C = Node->Center;
+    const double  E = Node->Extent;
+    const FVector Closest(
+        FMath::Clamp(CameraPosition.X, C.X - E, C.X + E),
+        FMath::Clamp(CameraPosition.Y, C.Y - E, C.Y + E),
+        FMath::Clamp(CameraPosition.Z, C.Z - E, C.Z + E));
+
+    constexpr double MinNearDist = 100.0; // cm floor (~eye height)
+    const double NearDistSq = FMath::Max(FVector::DistSquared(Closest, CameraPosition), MinNearDist * MinNearDist);
+
+    // Worst-case FVector3f rounding error at this chunk's extent: vertices are stored
+    // chunk-local, so the largest coordinate magnitude is ~Extent and the absolute error
+    // there is Extent * FLT_EPSILON.
+    constexpr double FloatEps = 1.1920929e-7;
+    const double Jitter = E * FloatEps;
+
+    // Same screen-space form as EvaluateSplit (2 * size * FOVScale, compared against
+    // threshold * distance), but the "size" is the jitter magnitude: promote when the
+    // jitter would project larger than the tolerance at the near distance.
+    const double lhs = 2.0 * Jitter * FOVScale;
+    return (lhs * lhs) > (ChunkPrecisionThreshold * ChunkPrecisionThreshold) * NearDistSq;
+}
+
+void FAdaptiveOctree::PromoteChunk(TSharedPtr<FAdaptiveOctreeNode> ChunkNode, TArray<TSharedPtr<FMeshChunk>>& OutRemovedChunks)
+{
+    // Retire the coarse chunk: pull it from the map, clear its flag, and hand its
+    // FMeshChunk to the caller so the game thread destroys the component. bRetired stops
+    // the apply drain from (re)creating a component for it if it was still queued.
+    TSharedPtr<FMeshChunk> OldChunk;
+    ChunkMap.RemoveAndCopyValue(ChunkNode, OldChunk);
+    ChunkNode->bIsChunkRoot = false;
+    if (OldChunk.IsValid())
+    {
+        OldChunk->bRetired = true;
+        OutRemovedChunks.Add(OldChunk);
+    }
+
+    // Every child becomes a chunk root so chunk lookups/edits still resolve inside the
+    // promoted region, but only surface-bearing children get a meshed FMeshChunk.
+    for (int i = 0; i < 8; i++)
+    {
+        const TSharedPtr<FAdaptiveOctreeNode>& Child = ChunkNode->Children[i];
+        if (!Child.IsValid()) continue;
+
+        Child->bIsChunkRoot = true;
+        if (!Child->CouldContainSurface) continue;
+
+        TSharedPtr<FMeshChunk> NewChunk = MakeShared<FMeshChunk>();
+        NewChunk->CachedParentActor = CachedParentActor;
+        NewChunk->CachedMeshAttachRoot = CachedMeshAttachRoot;
+        NewChunk->CachedSurfaceMaterial = CachedSurfaceMaterial;
+        NewChunk->InitializeData(Child->Center, Child->Extent);
+
+        TArray<FNodeEdge> Edges;
+        TMap<FEdgeKey, int32> EdgeMap;
+        GatherLeafEdges(Child.Get(), Edges, EdgeMap);
+        NewChunk->ChunkEdges = Edges;
+        UpdateMeshChunkStreamData(NewChunk);
+        NewChunk->IsDirty = (NewChunk->SurfaceMeshData->GetPositionStream().Num() > 0);
+
+        ChunkMap.Add(Child, NewChunk);
+    }
+}
+
+void FAdaptiveOctree::PromoteChunksNearCamera(FVector InCameraPosition, double InCameraFOV, TArray<TSharedPtr<FMeshChunk>>& OutRemovedChunks)
+{
+    if (!MeshChunksInitialized) return;
+
+    const double FOVScale = 1.0 / FMath::Tan(FMath::DegreesToRadians(InCameraFOV * 0.5));
+
+    // Snapshot the current chunk roots so we don't iterate a map we're mutating. Only
+    // one level of promotion happens per pass (a promoted child is re-evaluated next
+    // pass), which spreads the near-camera refinement over frames and bounds the work.
+    TArray<TSharedPtr<FAdaptiveOctreeNode>> Chunks;
+    ChunkMap.GenerateKeyArray(Chunks);
+
+    for (const TSharedPtr<FAdaptiveOctreeNode>& C : Chunks)
+    {
+        if (!C.IsValid() || !C->bIsChunkRoot) continue;
+        if ((int)C->Index.Depth >= MaxChunkDepth) continue; // at the precision ceiling
+        if (C->IsLeaf()) continue;                          // no children to promote into yet
+        if (!ChunkNeedsFinerPrecision(C.Get(), InCameraPosition, FOVScale)) continue;
+
+        PromoteChunk(C, OutRemovedChunks);
     }
 }
 

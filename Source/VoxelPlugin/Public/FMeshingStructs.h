@@ -124,6 +124,11 @@ struct VOXELPLUGIN_API FMeshChunk {
      *  PendingApplyCS. */
     bool bApplyQueued = false;
 
+    /** Set when this chunk is retired by the chunk-cut pass (e.g. promoted into finer
+     *  children). A retired chunk must never (re)create its component: the apply drain
+     *  skips it and the destroy drain releases its component. */
+    bool bRetired = false;
+
     TWeakObjectPtr<URealtimeMeshSimple> ChunkRtMesh;
     TWeakObjectPtr<URealtimeMeshComponent> ChunkRtComponent;
     FRealtimeMeshLODKey LODKey = FRealtimeMeshLODKey(0);
@@ -201,6 +206,10 @@ struct VOXELPLUGIN_API FMeshChunk {
      *  the section group, and clears IsDirty. Clears the section group if there are no
      *  triangles to render. */
     void ApplyToComponent() {
+        // Retired by the chunk-cut pass -- never (re)create a component for it; the
+        // destroy drain will release any component it already had.
+        if (bRetired) return;
+
         // 1. Lazy Init
         if (!IsInitialized) {
             ARealtimeMeshActor* Parent = CachedParentActor.Get();
@@ -231,6 +240,17 @@ struct VOXELPLUGIN_API FMeshChunk {
         }
 
         IsDirty = false;
+    }
+
+    /** Destroys this chunk's RealtimeMesh component. MUST be called on the game thread
+     *  (the chunk-cut pass queues retired chunks; AAdaptiveVoxelActor::DrainPendingDestroy
+     *  calls this). Safe to call when no component was ever created. */
+    void ReleaseComponent() {
+        if (URealtimeMeshComponent* Comp = ChunkRtComponent.Get())
+            Comp->DestroyComponent();
+        ChunkRtComponent = nullptr;
+        ChunkRtMesh = nullptr;
+        IsInitialized = false;
     }
 };
 
