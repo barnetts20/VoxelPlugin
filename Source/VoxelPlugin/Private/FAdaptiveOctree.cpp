@@ -8,6 +8,7 @@ FAdaptiveOctree::FAdaptiveOctree(const FOctreeParams& Params)
     CachedSurfaceMaterial = Params.SurfaceMaterial;
     Compositor = Params.Compositor;
     ChunkDepth = Params.ChunkDepth;
+    MaxChunkDepth = Params.MaxChunkDepth;
     PrecisionDepthFloor = Params.PrecisionDepthFloor;
 
     // Core terrain parameters from params
@@ -49,7 +50,7 @@ void FAdaptiveOctree::CollectNearSurfaceChunks(FAdaptiveOctreeNode* Node, TArray
     if (!Node) return;
     if (!Node->CouldContainSurface) return;
 
-    if (Node->Index.Depth == ChunkDepth)
+    if (Node->bIsChunkRoot)
     {
         Out.Add(Node->AsShared());
         return;
@@ -718,7 +719,7 @@ void FAdaptiveOctree::UpdateLOD(FVector CameraPosition, double InScreenSpaceThre
         FAdaptiveOctreeNode* ChunkNode = Chunks[idx].Get();
         double DistSq = FMath::Max(FVector::DistSquared(ChunkNode->Center, CameraPosition), 1e-12);
         bool CouldSplit = FAdaptiveOctreeNode::EvaluateSplit(
-            ChunkNode->Extent, DistSq, FOVScale, ThresholdSq, 
+            ChunkNode->Extent, DistSq, FOVScale, ThresholdSq,
             ChunkNode->Index.Depth,
             ChunkNode->DepthBounds[EDepthBound::MaxDepth],    // MaxDepth param
             ChunkNode->DepthBounds[EDepthBound::MinDepth]);
@@ -749,21 +750,15 @@ void FAdaptiveOctree::UpdateLOD(FVector CameraPosition, double InScreenSpaceThre
         });
 }
 
-void FAdaptiveOctree::UpdateMesh()
+void FAdaptiveOctree::CollectDirtyChunks(TArray<TSharedPtr<FMeshChunk>>& OutDirtyChunks) const
 {
     if (!MeshChunksInitialized) return;
 
-    // Use a reference to avoid incrementing shared pointer ref counts unnecessarily during iteration
-    for (auto& It : ChunkMap)
+    for (const auto& It : ChunkMap)
     {
-        TSharedPtr<FMeshChunk> Chunk = It.Value;
-
-        if (!Chunk.IsValid()) continue;
-
-        if (Chunk->IsDirty)
-        {
-            Chunk->UpdateComponent(Chunk);
-        }
+        const TSharedPtr<FMeshChunk>& Chunk = It.Value;
+        if (Chunk.IsValid() && Chunk->IsDirty)
+            OutDirtyChunks.Add(Chunk);
     }
 }
 
@@ -1095,7 +1090,7 @@ FAdaptiveOctreeNode* FAdaptiveOctree::GetChunkNodeByPoint(FVector Position)
     FAdaptiveOctreeNode* CurrentNode = Root.Get();
     while (CurrentNode)
     {
-        if (CurrentNode->Index.Depth == ChunkDepth)
+        if (CurrentNode->bIsChunkRoot)
         {
             return CurrentNode;
         }

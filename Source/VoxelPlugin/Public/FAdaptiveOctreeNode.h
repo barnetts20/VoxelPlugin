@@ -88,6 +88,15 @@ public:
     /** When true, prevents the LOD system from merging this node regardless of distance. */
     bool LodOverride = false;
 
+    /** True when this node is the root of a mesh chunk (owns a RealtimeMesh component and
+     *  is the origin its descendant leaves mesh against). Chunk roots form an anti-chain:
+     *  exactly one lies on the path from the tree root to any leaf. Initialized at the
+     *  fixed chunk depth (DepthBounds[ChunkDepth]); the variable-depth chunk-cut pass may
+     *  later promote/demote it so chunks sit deeper near the camera (precision) and
+     *  shallower far away (spawn cost / draw calls). Chunk identity is read from this flag,
+     *  not from a fixed depth, so the chunk cut can be non-uniform. */
+    bool bIsChunkRoot = false;
+
     bool IsLeaf() const;
     bool IsRoot() const;
 

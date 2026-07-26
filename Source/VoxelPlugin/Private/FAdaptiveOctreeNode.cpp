@@ -25,6 +25,9 @@ FAdaptiveOctreeNode::FAdaptiveOctreeNode(double InExtent, int InChunkDepth, int 
     DepthBounds[EDepthBound::MinDepth] = (uint8)InMinDepth;
     DepthBounds[EDepthBound::MaxDepth] = (uint8)InMaxDepth;
 
+    // Chunk cut starts uniform at the chunk depth; the chunk-cut pass may move it later.
+    bIsChunkRoot = ((int)Index.Depth == InChunkDepth);
+
     for (int i = 0; i < 8; i++)
     {
         Corners[i].Position = Center + (OctreeConstants::Offsets[i] * Extent);
@@ -46,6 +49,9 @@ FAdaptiveOctreeNode::FAdaptiveOctreeNode(TSharedPtr<FAdaptiveOctreeNode> InParen
     DepthBounds[EDepthBound::ChunkDepth] = InParent->DepthBounds[EDepthBound::ChunkDepth];
     DepthBounds[EDepthBound::MinDepth] = InParent->DepthBounds[EDepthBound::MinDepth];
     DepthBounds[EDepthBound::MaxDepth] = InParent->DepthBounds[EDepthBound::MaxDepth];
+
+    // Chunk cut starts uniform at the chunk depth; the chunk-cut pass may move it later.
+    bIsChunkRoot = ((int)Index.Depth == (int)DepthBounds[EDepthBound::ChunkDepth]);
 
     for (int i = 0; i < 8; i++)
     {
@@ -145,9 +151,10 @@ void FAdaptiveOctreeNode::Split()
 {
     if (!bIsLeaf) return;
 
-    // At chunk depth, children start a new chunk — anchor to this node's center.
-    // Otherwise inherit the existing chunk center from the parent.
-    FVector NextAnchor = (Index.Depth == DepthBounds[EDepthBound::ChunkDepth]) ? Center : ChunkCenter;
+    // A chunk root's children start meshing against this node's center; below a chunk
+    // root they inherit the existing chunk center. (Reads the flag, not a fixed depth,
+    // so the chunk cut can be non-uniform.)
+    FVector NextAnchor = bIsChunkRoot ? Center : ChunkCenter;
 
     for (uint8 i = 0; i < 8; i++)
     {

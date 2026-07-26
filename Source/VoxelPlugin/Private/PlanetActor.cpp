@@ -206,7 +206,8 @@ void APlanetActor::Initialize()
         constexpr double FloatEps = 1.19e-7;
         double ChunkRatio = RootExtent * FloatEps / 1.0;
         TempChunkDepth = FMath::Clamp(
-            (ChunkRatio > 1.0) ? (int32)FMath::CeilToInt(FMath::Log2(ChunkRatio)) : 2, 2, 5);
+            (ChunkRatio > 1.0) ? (int32)FMath::CeilToInt(FMath::Log2(ChunkRatio)) : 2,
+            2, TerrainActor->MaxChunkDepth);
     }
 
     TSharedPtr<FDensitySampleCompositor> NewCompositor =

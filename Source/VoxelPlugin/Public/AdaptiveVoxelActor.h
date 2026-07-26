@@ -114,6 +114,15 @@ public:
     UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Terrain|Octree")
     int ChunkDepth = 4;
 
+    /** Ceiling on the chunk-cut depth. Caps the computed ChunkDepth clamp: lower it (e.g.
+     *  3) for a shallower, far cheaper cut that spawns/populates fast but loses surface
+     *  precision at large scale; raise it for finer origins. Once the variable-depth
+     *  chunk cut lands, this becomes the deepest chunks may go near the camera, while the
+     *  cut stays shallow far away. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrain|Octree",
+        meta = (ClampMin = "2"))
+    int MaxChunkDepth = 5;
+
     /** Minimum subdivision depth maintained regardless of camera distance. */
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrain|Octree")
     int MinDepth = 4;
@@ -165,6 +174,17 @@ public:
      *  earlier in the direction of camera movement. */
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrain|LOD")
     double VelocityLookAheadFactor = 2.0;
+
+    /** Per-frame game-thread time budget (milliseconds) for draining pending chunk
+     *  applies in Tick. First-touch component creation (RegisterComponent + section-group
+     *  setup) is the expensive game-thread cost; draining a fixed slice per frame spreads
+     *  the first-build population across frames without a hitch, while adapting to the
+     *  actual per-chunk cost (unlike a fixed count). The drain runs every frame (60/s),
+     *  not on the slower data/mesh loop cadence, so a modest budget still populates quickly.
+     *  Chunks not reached this frame stay queued for the next. Tune against the
+     *  particle-fade budget and your frame-time headroom. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrain|LOD", meta = (ClampMin = "0.1"))
+    double ChunkApplyBudgetMs = 2.0;
 
     // --- Lifecycle Overrides ---
 
@@ -225,6 +245,14 @@ protected:
      *  and the next DataUpdate kickoff. */
     FTimerHandle DataUpdateTimerHandle;
 
+    /** Game-thread apply queue. The mesh/edit tasks enqueue dirty chunks here (deduped
+     *  via FMeshChunk::bApplyQueued); Tick drains a per-frame time slice
+     *  (ChunkApplyBudgetMs) from it and applies each to its RealtimeMesh component. This
+     *  decouples the (expensive) component creation from the data/mesh loop cadence so it
+     *  runs at frame rate. Guarded by PendingApplyCS. */
+    TArray<TSharedPtr<FMeshChunk>> PendingApply;
+    FCriticalSection PendingApplyCS;
+
     /** Destroys all RealtimeMesh components attached to MeshAttachmentRoot. */
     void CleanSceneRoot();
 
@@ -232,9 +260,20 @@ protected:
      *  update pass. Chains to RunMeshUpdateTask on completion. */
     void RunDataUpdateTask();
 
-    /** Background task: pushes all dirty chunks to their RealtimeMesh components.
-     *  Chains back to RunDataUpdateTask after MinDataUpdateInterval. */
+    /** Background task: collects dirty chunks (under the read lock) and enqueues them for
+     *  the game-thread drain via EnqueueDirtyChunksForApply, then chains the next
+     *  RunDataUpdateTask on the normal interval. The apply itself is decoupled (Tick). */
     void RunMeshUpdateTask();
+
+    /** Adds dirty chunks to PendingApply, skipping any already queued. Callable from any
+     *  thread -- takes only PendingApplyCS. */
+    void EnqueueDirtyChunksForApply(const TArray<TSharedPtr<FMeshChunk>>& DirtyChunks);
+
+    /** Game-thread: applies queued chunks to their RealtimeMesh components until the
+     *  per-frame ChunkApplyBudgetMs is spent, leaving the rest for next frame. Called from
+     *  Tick. Holds the octree read lock while applying so a concurrent data pass can't
+     *  rewrite a chunk's stream mid-copy. */
+    void DrainPendingApply();
 
     /** Background task: applies a spherical brush edit, reconstructs affected subtrees,
      *  and pushes updated meshes. Runs independently of the Data/Mesh chain. */

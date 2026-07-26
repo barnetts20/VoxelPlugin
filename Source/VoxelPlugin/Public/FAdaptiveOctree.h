@@ -40,7 +40,17 @@ struct VOXELPLUGIN_API FOctreeParams {
     double RootExtentBuffer = 1.05;
 
     // --- Tree Structure ---
+
+    /** Depth of the (currently uniform) chunk cut: the tree is split to here at build and
+     *  every node at this depth becomes a chunk root. Also the floor for the future
+     *  variable-depth chunk cut. */
     int ChunkDepth = 4;
+
+    /** Deepest a chunk root may sit. Today it only caps the uniform ChunkDepth clamp
+     *  (lower it for a shallower, faster-to-populate cut). The variable-depth chunk-cut
+     *  pass will use it as the near-camera precision ceiling. */
+    int MaxChunkDepth = 5;
+
     int MinDepth = 8;
     int MaxDepth = 22;
 
@@ -84,6 +94,7 @@ private:
     double RootExtent;
     double ChunkExtent;
     int ChunkDepth;
+    int MaxChunkDepth;
     int PrecisionDepthFloor;
 
     // --- Terrain Parameters (derived from FOctreeParams) ---
@@ -222,8 +233,12 @@ public:
      *  camera distance and screen-space threshold, then rebuilds mesh streams for changed chunks. */
     void UpdateLOD(FVector InCameraPosition, double InScreenSpaceThreshold, double InCameraFOV);
 
-    /** Pushes all dirty mesh chunks to their RealtimeMesh components on the game thread. */
-    void UpdateMesh();
+    /** Collects all currently-dirty mesh chunks (holding a shared ref to each) into
+     *  OutDirtyChunks, for the caller to apply on the game thread under a per-frame
+     *  throttle. Replaces the old UpdateMesh, which pushed every dirty chunk to the game
+     *  thread at once via a per-chunk AsyncTask -- an unthrottled RegisterComponent burst
+     *  on first build. */
+    void CollectDirtyChunks(TArray<TSharedPtr<FMeshChunk>>& OutDirtyChunks) const;
 
     /** Destroys the entire tree and all mesh chunks. */
     void Clear();

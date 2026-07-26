@@ -41,6 +41,13 @@ void AAdaptiveVoxelActor::BeginDestroy()
         World->GetTimerManager().ClearAllTimersForObject(this);
     }
 
+    // Drop any queued applies so their chunk refs release and nothing is applied to a
+    // dying actor. IsDestroyed (set above) also gates DrainPendingApply.
+    {
+        FScopeLock Lock(&PendingApplyCS);
+        PendingApply.Empty();
+    }
+
     FRWScopeLock WriteLock(OctreeLock, SLT_Write);
     Super::BeginDestroy();
 }
@@ -185,6 +192,14 @@ void AAdaptiveVoxelActor::Initialize()
         AdaptiveOctree.Reset();
     }
 
+    // Drop queued applies referencing the old octree's chunks. The busy-wait above has
+    // already fenced any in-flight mesh task's enqueue (it enqueues before clearing
+    // MeshUpdateIsRunning), so nothing repopulates this after the clear.
+    {
+        FScopeLock Lock(&PendingApplyCS);
+        PendingApply.Empty();
+    }
+
     // Now clean up any components that were already attached
     CleanSceneRoot();
 
@@ -226,7 +241,7 @@ void AAdaptiveVoxelActor::Initialize()
         constexpr double MaxFloatError = 1.0; // cm — max acceptable vertex jitter
         double Ratio = ActorRootExtent * FloatEps / MaxFloatError;
         int32 IdealChunkDepth = (Ratio > 1.0) ? (int32)FMath::CeilToInt(FMath::Log2(Ratio)) : 2;
-        ChunkDepth = FMath::Clamp(IdealChunkDepth, 2, 5);
+        ChunkDepth = FMath::Clamp(IdealChunkDepth, 2, MaxChunkDepth);
         MinDepth = FMath::Max(MinDepth, ChunkDepth);
 
         double ChunkExtent = ActorRootExtent / FMath::Pow(2.0, (double)ChunkDepth);
@@ -314,6 +329,7 @@ void AAdaptiveVoxelActor::Initialize()
     PendingParams->PlanetRadius = ActorPlanetRadius;
     PendingParams->NoiseAmplitude = ActorNoiseAmplitude;
     PendingParams->ChunkDepth = ChunkDepth;
+    PendingParams->MaxChunkDepth = MaxChunkDepth;
     PendingParams->MinDepth = MinDepth;
     PendingParams->MaxDepth = MaxDepth;
     PendingParams->PrecisionDepthFloor = PrecisionDepthFloor;
@@ -374,6 +390,13 @@ void AAdaptiveVoxelActor::InitializeFromPlanet(TSharedPtr<FDensitySampleComposit
         AdaptiveOctree->Clear();
         AdaptiveOctree.Reset();
     }
+
+    // Drop queued applies referencing the old octree's chunks (see Initialize).
+    {
+        FScopeLock Lock(&PendingApplyCS);
+        PendingApply.Empty();
+    }
+
     CleanSceneRoot();
 
     // Re-parent MeshAttachmentRoot to the planet's component hierarchy.
@@ -403,7 +426,7 @@ void AAdaptiveVoxelActor::InitializeFromPlanet(TSharedPtr<FDensitySampleComposit
         constexpr double MaxFloatError = 1.0;
         double Ratio = ActorRootExtent * FloatEps / MaxFloatError;
         int32 IdealChunkDepth = (Ratio > 1.0) ? (int32)FMath::CeilToInt(FMath::Log2(Ratio)) : 2;
-        ChunkDepth = FMath::Clamp(IdealChunkDepth, 2, 5);
+        ChunkDepth = FMath::Clamp(IdealChunkDepth, 2, MaxChunkDepth);
         MinDepth = FMath::Max(MinDepth, ChunkDepth);
     }
 
@@ -416,6 +439,7 @@ void AAdaptiveVoxelActor::InitializeFromPlanet(TSharedPtr<FDensitySampleComposit
     PendingParams->PlanetRadius = ActorPlanetRadius;
     PendingParams->NoiseAmplitude = ActorNoiseAmplitude;
     PendingParams->ChunkDepth = ChunkDepth;
+    PendingParams->MaxChunkDepth = MaxChunkDepth;
     PendingParams->MinDepth = MinDepth;
     PendingParams->MaxDepth = MaxDepth;
     PendingParams->PrecisionDepthFloor = PrecisionDepthFloor;
@@ -505,18 +529,32 @@ void AAdaptiveVoxelActor::RunMeshUpdateTask()
             AAdaptiveVoxelActor* Self = WeakThis.Get();
             if (!Self || Self->IsDestroyed) return;
 
+            // Collect the dirty chunks under the read lock -- this is cheap (it just
+            // gathers shared refs). The actual RealtimeMesh apply is deferred to the game
+            // thread and throttled, so we neither hold the octree lock across component
+            // work nor fire one game-thread task per chunk (the old spawn-time burst).
             double t0 = FPlatformTime::Seconds();
+            TArray<TSharedPtr<FMeshChunk>> DirtyChunks;
             {
                 FRWScopeLock ReadLock(Self->OctreeLock, SLT_ReadOnly);
-                Self->AdaptiveOctree->UpdateMesh();
+                if (Self->AdaptiveOctree.IsValid())
+                    Self->AdaptiveOctree->CollectDirtyChunks(DirtyChunks);
             }
 
             double elapsed = (FPlatformTime::Seconds() - t0) * 1000.0;
             if (elapsed > MESH_LOG_THRESHOLD) UE_LOG(LogTemp, Log, TEXT("[Pipeline] MeshUpdate: %.2fms"), elapsed);
 
+            // Enqueue for the game-thread drain BEFORE clearing the running flag, so the
+            // teardown busy-wait in Initialize (which waits on MeshUpdateIsRunning) fences
+            // the enqueue -- a re-init can't clear PendingApply and then have this task add
+            // stale chunks after it.
+            Self->EnqueueDirtyChunksForApply(DirtyChunks);
+
             Self->MeshUpdateIsRunning = false;
 
-            // Chain back to data update after a minimum interval delay
+            // Chain the next data update on the normal interval. The apply is decoupled --
+            // Tick drains PendingApply at frame rate under a time budget -- so it's no
+            // longer gated to this loop's slower cadence (the old spawn-population bottleneck).
             AsyncTask(ENamedThreads::GameThread, [WeakThis]()
                 {
                     AAdaptiveVoxelActor* Self = WeakThis.Get();
@@ -528,13 +566,59 @@ void AAdaptiveVoxelActor::RunMeshUpdateTask()
                             Self,
                             &AAdaptiveVoxelActor::RunDataUpdateTask,
                             Self->MinDataUpdateInterval,
-                            //Self->bCheapMode.load() ? Self->CheapDataUpdateInterval : Self->MinDataUpdateInterval,
-                            false
-                        );
+                            false);
                     }
                 });
 
         }, TStatId(), nullptr, ENamedThreads::AnyNormalThreadHiPriTask);
+}
+
+void AAdaptiveVoxelActor::EnqueueDirtyChunksForApply(const TArray<TSharedPtr<FMeshChunk>>& DirtyChunks)
+{
+    FScopeLock Lock(&PendingApplyCS);
+    for (const TSharedPtr<FMeshChunk>& Chunk : DirtyChunks)
+    {
+        if (Chunk.IsValid() && !Chunk->bApplyQueued)
+        {
+            Chunk->bApplyQueued = true;
+            PendingApply.Add(Chunk);
+        }
+    }
+}
+
+void AAdaptiveVoxelActor::DrainPendingApply()
+{
+    if (!Initialized || IsDestroyed) return;
+
+    const double BudgetSeconds = FMath::Max(0.1, ChunkApplyBudgetMs) / 1000.0;
+    const double StartTime = FPlatformTime::Seconds();
+
+    for (;;)
+    {
+        TSharedPtr<FMeshChunk> Chunk;
+        {
+            FScopeLock Lock(&PendingApplyCS);
+            if (PendingApply.Num() == 0) break;
+            Chunk = PendingApply.Pop(EAllowShrinking::No);
+            if (Chunk.IsValid()) Chunk->bApplyQueued = false;
+        }
+
+        // Apply WITHOUT the octree lock -- matching the original per-chunk apply.
+        // RegisterComponent / UpdateSectionGroup must run on the game thread but don't
+        // touch the octree; taking the octree read lock here would block the whole drain on
+        // the data pass's write lock (a multi-ms UpdateLOD, and the full initial build),
+        // reintroducing the game-thread stall we're removing. ApplyToComponent reads the
+        // chunk's stream, which a concurrent data pass could be rewriting -- a narrow,
+        // pre-existing race (a chunk's stream is only rewritten when its LOD changes, and
+        // RealtimeMesh copies the stream on update). If it ever bites, the fix is to hand
+        // the drain an immutable stream snapshot at mesh time rather than to lock here.
+        if (Chunk.IsValid() && Chunk->IsDirty)
+            Chunk->ApplyToComponent();
+
+        // Budget checked after applying at least one chunk, so the drain always makes
+        // progress even with a tiny budget.
+        if (FPlatformTime::Seconds() - StartTime > BudgetSeconds) break;
+    }
 }
 
 void AAdaptiveVoxelActor::RunEditUpdateTask(FVector InEditCenter, double InEditRadius, double InEditStrength, int InEditResolution)
@@ -548,16 +632,23 @@ void AAdaptiveVoxelActor::RunEditUpdateTask(FVector InEditCenter, double InEditR
             double t0 = FPlatformTime::Seconds();
             AAdaptiveVoxelActor* Self = WeakThis.Get();
             if (!Self || Self->IsDestroyed) return;
+
+            TArray<TSharedPtr<FMeshChunk>> DirtyChunks;
             {
                 FRWScopeLock WriteLock(Self->OctreeLock, SLT_Write);
                 Self->AdaptiveOctree->ApplyEdit(InEditCenter, InEditRadius, InEditStrength, InEditResolution);
-                Self->AdaptiveOctree->UpdateMesh();
+                Self->AdaptiveOctree->CollectDirtyChunks(DirtyChunks);
             }
 
             double elapsed = (FPlatformTime::Seconds() - t0) * 1000.0;
             if (elapsed > EDIT_LOG_THRESHOLD) UE_LOG(LogTemp, Log, TEXT("[Pipeline] EditUpdate: %.2fms"), elapsed);
 
             Self->EditUpdateIsRunning = false;
+
+            // Enqueue for the same game-thread drain as the mesh loop; Tick applies within
+            // the per-frame budget. Edits touch few chunks, so they typically drain in the
+            // next frame or two.
+            Self->EnqueueDirtyChunksForApply(DirtyChunks);
 
         }, TStatId(), nullptr, ENamedThreads::AnyNormalThreadHiPriTask);
 }
@@ -571,6 +662,10 @@ void AAdaptiveVoxelActor::Tick(float DeltaTime)
 {
     Super::Tick(DeltaTime);
     if (!Initialized) return;
+
+    // Drain a per-frame time slice of queued chunk applies (component creation + mesh
+    // push). Decoupled from the data/mesh loop so it runs at frame rate.
+    DrainPendingApply();
 
     // Cache cam data
     auto world = GetWorld();
