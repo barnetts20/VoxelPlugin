@@ -32,6 +32,7 @@ void FOceanMeshChunk::InitializeComponent(AOceanSphereActor* InOwner)
     ChunkRtComponent = NewObject<URealtimeMeshComponent>(InOwner, URealtimeMeshComponent::StaticClass());
     ChunkRtComponent->RegisterComponent();
     ChunkRtComponent->SetMaterial(0, InOwner->OceanMaterial);
+    ChunkRtComponent->SetMobility(EComponentMobility::Movable);
     ChunkRtComponent->SetCollisionEnabled(ECollisionEnabled::NoCollision);
 
     // Attach to MeshAttachmentRoot (absolute scale, inherits position + rotation).
