@@ -226,7 +226,7 @@ void AAdaptiveVoxelActor::Initialize()
         constexpr double MaxFloatError = 1.0; // cm — max acceptable vertex jitter
         double Ratio = ActorRootExtent * FloatEps / MaxFloatError;
         int32 IdealChunkDepth = (Ratio > 1.0) ? (int32)FMath::CeilToInt(FMath::Log2(Ratio)) : 2;
-        ChunkDepth = FMath::Clamp(IdealChunkDepth, 2, 5);
+        ChunkDepth = FMath::Clamp(IdealChunkDepth, 2, MaxChunkDepth);
         MinDepth = FMath::Max(MinDepth, ChunkDepth);
 
         double ChunkExtent = ActorRootExtent / FMath::Pow(2.0, (double)ChunkDepth);
@@ -403,7 +403,7 @@ void AAdaptiveVoxelActor::InitializeFromPlanet(TSharedPtr<FDensitySampleComposit
         constexpr double MaxFloatError = 1.0;
         double Ratio = ActorRootExtent * FloatEps / MaxFloatError;
         int32 IdealChunkDepth = (Ratio > 1.0) ? (int32)FMath::CeilToInt(FMath::Log2(Ratio)) : 2;
-        ChunkDepth = FMath::Clamp(IdealChunkDepth, 2, 5);
+        ChunkDepth = FMath::Clamp(IdealChunkDepth, 2, MaxChunkDepth);
         MinDepth = FMath::Max(MinDepth, ChunkDepth);
     }
 
@@ -505,10 +505,16 @@ void AAdaptiveVoxelActor::RunMeshUpdateTask()
             AAdaptiveVoxelActor* Self = WeakThis.Get();
             if (!Self || Self->IsDestroyed) return;
 
+            // Collect the dirty chunks under the read lock -- this is cheap (it just
+            // gathers shared refs). The actual RealtimeMesh apply is deferred to the game
+            // thread and throttled, so we neither hold the octree lock across component
+            // work nor fire one game-thread task per chunk (the old spawn-time burst).
             double t0 = FPlatformTime::Seconds();
+            TArray<TSharedPtr<FMeshChunk>> DirtyChunks;
             {
                 FRWScopeLock ReadLock(Self->OctreeLock, SLT_ReadOnly);
-                Self->AdaptiveOctree->UpdateMesh();
+                if (Self->AdaptiveOctree.IsValid())
+                    Self->AdaptiveOctree->CollectDirtyChunks(DirtyChunks);
             }
 
             double elapsed = (FPlatformTime::Seconds() - t0) * 1000.0;
@@ -516,25 +522,61 @@ void AAdaptiveVoxelActor::RunMeshUpdateTask()
 
             Self->MeshUpdateIsRunning = false;
 
-            // Chain back to data update after a minimum interval delay
-            AsyncTask(ENamedThreads::GameThread, [WeakThis]()
-                {
-                    AAdaptiveVoxelActor* Self = WeakThis.Get();
-                    if (!Self || Self->IsDestroyed) return;
-                    if (UWorld* World = Self->GetWorld())
-                    {
-                        World->GetTimerManager().SetTimer(
-                            Self->DataUpdateTimerHandle,
-                            Self,
-                            &AAdaptiveVoxelActor::RunDataUpdateTask,
-                            Self->MinDataUpdateInterval,
-                            //Self->bCheapMode.load() ? Self->CheapDataUpdateInterval : Self->MinDataUpdateInterval,
-                            false
-                        );
-                    }
-                });
+            // Hand off to the throttled game-thread apply. Because it also reschedules the
+            // next data update once it finishes, the data->mesh->apply loop serializes
+            // through the apply: the per-frame init cap holds, and chunks left over from a
+            // throttled pass are re-collected (still dirty) and applied on the next pass.
+            Self->ApplyDirtyChunksThrottled(MoveTemp(DirtyChunks), /*bRescheduleData=*/true);
 
         }, TStatId(), nullptr, ENamedThreads::AnyNormalThreadHiPriTask);
+}
+
+void AAdaptiveVoxelActor::ApplyDirtyChunksThrottled(TArray<TSharedPtr<FMeshChunk>> DirtyChunks, bool bRescheduleData)
+{
+    TWeakObjectPtr<AAdaptiveVoxelActor> WeakThis(this);
+
+    AsyncTask(ENamedThreads::GameThread,
+        [WeakThis, DirtyChunks = MoveTemp(DirtyChunks), bRescheduleData]()
+        {
+            AAdaptiveVoxelActor* Self = WeakThis.Get();
+            if (!Self || Self->IsDestroyed) return;
+
+            int32 NumInitThisPass = 0;
+            const int32 MaxInit = FMath::Max(1, Self->MaxChunkInitsPerApply);
+
+            for (const TSharedPtr<FMeshChunk>& Chunk : DirtyChunks)
+            {
+                if (!Chunk.IsValid() || !Chunk->IsDirty) continue;
+
+                // Only first-touch component creation (RegisterComponent + section group)
+                // is capped -- that's the expensive game-thread cost. A chunk that would
+                // exceed the cap is left dirty for the next pass. Already-created chunks
+                // re-apply freely (cheap stream update, no proxy churn).
+                if (Chunk->NeedsComponentInit())
+                {
+                    if (NumInitThisPass >= MaxInit) continue;
+                    ++NumInitThisPass;
+                }
+
+                Chunk->ApplyToComponent();
+            }
+
+            // Reschedule the data/mesh loop from here (not from RunMeshUpdateTask) so the
+            // next pass can't start until this apply completes -- that's what keeps the
+            // per-pass init cap from being exceeded by overlapping apply tasks.
+            if (bRescheduleData && !Self->IsDestroyed)
+            {
+                if (UWorld* World = Self->GetWorld())
+                {
+                    World->GetTimerManager().SetTimer(
+                        Self->DataUpdateTimerHandle,
+                        Self,
+                        &AAdaptiveVoxelActor::RunDataUpdateTask,
+                        Self->MinDataUpdateInterval,
+                        false);
+                }
+            }
+        });
 }
 
 void AAdaptiveVoxelActor::RunEditUpdateTask(FVector InEditCenter, double InEditRadius, double InEditStrength, int InEditResolution)
@@ -548,16 +590,24 @@ void AAdaptiveVoxelActor::RunEditUpdateTask(FVector InEditCenter, double InEditR
             double t0 = FPlatformTime::Seconds();
             AAdaptiveVoxelActor* Self = WeakThis.Get();
             if (!Self || Self->IsDestroyed) return;
+
+            TArray<TSharedPtr<FMeshChunk>> DirtyChunks;
             {
                 FRWScopeLock WriteLock(Self->OctreeLock, SLT_Write);
                 Self->AdaptiveOctree->ApplyEdit(InEditCenter, InEditRadius, InEditStrength, InEditResolution);
-                Self->AdaptiveOctree->UpdateMesh();
+                Self->AdaptiveOctree->CollectDirtyChunks(DirtyChunks);
             }
 
             double elapsed = (FPlatformTime::Seconds() - t0) * 1000.0;
             if (elapsed > EDIT_LOG_THRESHOLD) UE_LOG(LogTemp, Log, TEXT("[Pipeline] EditUpdate: %.2fms"), elapsed);
 
             Self->EditUpdateIsRunning = false;
+
+            // Same throttled game-thread apply as the mesh loop. Edits touch few chunks,
+            // but routing them through the same path keeps the per-frame init cap global.
+            // No reschedule -- the continuous data/mesh loop owns that and will re-collect
+            // any chunks this pass leaves over the cap.
+            Self->ApplyDirtyChunksThrottled(MoveTemp(DirtyChunks), /*bRescheduleData=*/false);
 
         }, TStatId(), nullptr, ENamedThreads::AnyNormalThreadHiPriTask);
 }

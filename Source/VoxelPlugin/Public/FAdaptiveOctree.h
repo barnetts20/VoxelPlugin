@@ -222,8 +222,12 @@ public:
      *  camera distance and screen-space threshold, then rebuilds mesh streams for changed chunks. */
     void UpdateLOD(FVector InCameraPosition, double InScreenSpaceThreshold, double InCameraFOV);
 
-    /** Pushes all dirty mesh chunks to their RealtimeMesh components on the game thread. */
-    void UpdateMesh();
+    /** Collects all currently-dirty mesh chunks (holding a shared ref to each) into
+     *  OutDirtyChunks, for the caller to apply on the game thread under a per-frame
+     *  throttle. Replaces the old UpdateMesh, which pushed every dirty chunk to the game
+     *  thread at once via a per-chunk AsyncTask -- an unthrottled RegisterComponent burst
+     *  on first build. */
+    void CollectDirtyChunks(TArray<TSharedPtr<FMeshChunk>>& OutDirtyChunks) const;
 
     /** Destroys the entire tree and all mesh chunks. */
     void Clear();

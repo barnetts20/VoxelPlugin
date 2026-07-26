@@ -101,7 +101,7 @@ struct VOXELPLUGIN_API FMeshStreamData {
  *  surface within its bounds.
  *
  *  Lifecycle: InitializeData sets the spatial bounds and stream keys. The RealtimeMesh
- *  component is lazily created on the game thread during the first UpdateComponent call
+ *  component is lazily created on the game thread during the first ApplyToComponent call
  *  (via InitializeComponent). Subsequent updates push new stream data when IsDirty is set. */
 struct VOXELPLUGIN_API FMeshChunk {
     TWeakObjectPtr<ARealtimeMeshActor> CachedParentActor;
@@ -135,7 +135,7 @@ struct VOXELPLUGIN_API FMeshChunk {
     };
 
     /** Creates the RealtimeMesh UObject and component, attaches to the parent actor,
-     *  and configures collision. Called lazily from UpdateComponent on the game thread. */
+     *  and configures collision. Called lazily from ApplyToComponent on the game thread. */
     void InitializeComponent(ARealtimeMeshActor* InParentActor, USceneComponent* InAttachRoot, UMaterialInterface* InSurfaceMaterial) {
         FRealtimeMeshCollisionConfiguration cConfig;
         cConfig.bShouldFastCookMeshes = false;
@@ -184,43 +184,48 @@ struct VOXELPLUGIN_API FMeshChunk {
         return true;
     }
 
-    /** Pushes current stream data to the RealtimeMesh component on the game thread.
-     *  Takes a TSharedPtr to Self to prevent destruction while the async task is in flight.
-     *  Lazily initializes the component on first call. Clears the section group if there
-     *  are no triangles to render. */
-    void UpdateComponent(TSharedPtr<FMeshChunk> Self) {
-        AsyncTask(ENamedThreads::GameThread, [Self]() {
-            // 1. Lazy Init
-            if (!Self->IsInitialized) {
-                ARealtimeMeshActor* Parent = Self->CachedParentActor.Get();
-                USceneComponent* AttachRoot = Self->CachedMeshAttachRoot.Get();
-                UMaterialInterface* SurfaceMaterial = Self->CachedSurfaceMaterial.Get();
-                if (!Parent || !AttachRoot || !SurfaceMaterial) return;
-                Self->InitializeComponent(Parent, AttachRoot, SurfaceMaterial);
-            }
+    /** True until the RealtimeMesh component has been created. The throttled game-thread
+     *  apply checks this to decide whether this chunk counts against the per-frame
+     *  component-init budget (the RegisterComponent + section-group cost). */
+    bool NeedsComponentInit() const { return !IsInitialized; }
 
-            // 2. Ensure valid component pointers
-            URealtimeMeshSimple* MeshPtr = Self->ChunkRtMesh.Get();
-            URealtimeMeshComponent* CompPtr = Self->ChunkRtComponent.Get();
-            if (!MeshPtr || !CompPtr) return;
-            if (!Self->IsDirty) return;
+    /** Pushes current stream data to the RealtimeMesh component. MUST be called on the
+     *  game thread -- the caller batches and throttles these (see
+     *  AAdaptiveVoxelActor::ApplyDirtyChunksThrottled), so unlike the old UpdateComponent
+     *  this does NOT dispatch its own AsyncTask. Lazily creates the component on first
+     *  call, updates the section group, and clears IsDirty. Clears the section group if
+     *  there are no triangles to render. */
+    void ApplyToComponent() {
+        // 1. Lazy Init
+        if (!IsInitialized) {
+            ARealtimeMeshActor* Parent = CachedParentActor.Get();
+            USceneComponent* AttachRoot = CachedMeshAttachRoot.Get();
+            UMaterialInterface* SurfaceMaterial = CachedSurfaceMaterial.Get();
+            if (!Parent || !AttachRoot || !SurfaceMaterial) return;
+            InitializeComponent(Parent, AttachRoot, SurfaceMaterial);
+        }
 
-            // 3. Surface update
-            auto* SrfTriStream = Self->SurfaceMeshData->MeshStream.Find(FRealtimeMeshStreams::Triangles);
-            int32 SrfNumTris = SrfTriStream ? SrfTriStream->Num() : 0;
-            if (SrfNumTris <= 0)
-            {
-                MeshPtr->UpdateSectionGroup(Self->SurfaceMeshData->MeshGroupKey, FRealtimeMeshStreamSet());
-            }
-            else
-            {
-                MeshPtr->UpdateSectionGroup(Self->SurfaceMeshData->MeshGroupKey, Self->SurfaceMeshData->MeshStream);
-                FRealtimeMeshSectionConfig SrfConfig(0); // material slot 0
-                MeshPtr->UpdateSectionConfig(Self->SurfaceMeshData->MeshSectionKey, SrfConfig, true);
-            }
+        // 2. Ensure valid component pointers
+        URealtimeMeshSimple* MeshPtr = ChunkRtMesh.Get();
+        URealtimeMeshComponent* CompPtr = ChunkRtComponent.Get();
+        if (!MeshPtr || !CompPtr) return;
+        if (!IsDirty) return;
 
-            Self->IsDirty = false;
-            });
+        // 3. Surface update
+        auto* SrfTriStream = SurfaceMeshData->MeshStream.Find(FRealtimeMeshStreams::Triangles);
+        int32 SrfNumTris = SrfTriStream ? SrfTriStream->Num() : 0;
+        if (SrfNumTris <= 0)
+        {
+            MeshPtr->UpdateSectionGroup(SurfaceMeshData->MeshGroupKey, FRealtimeMeshStreamSet());
+        }
+        else
+        {
+            MeshPtr->UpdateSectionGroup(SurfaceMeshData->MeshGroupKey, SurfaceMeshData->MeshStream);
+            FRealtimeMeshSectionConfig SrfConfig(0); // material slot 0
+            MeshPtr->UpdateSectionConfig(SurfaceMeshData->MeshSectionKey, SrfConfig, true);
+        }
+
+        IsDirty = false;
     }
 };
 

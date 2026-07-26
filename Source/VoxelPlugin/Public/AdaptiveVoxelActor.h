@@ -56,6 +56,7 @@ private:
 
     double CameraFOV = 90;
 
+    int MaxChunkDepth = 4;
     /** Read-write lock protecting AdaptiveOctree. DataUpdate and EditUpdate acquire
      *  write; MeshUpdate acquires read-only. */
     FRWLock OctreeLock;
@@ -166,6 +167,16 @@ public:
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrain|LOD")
     double VelocityLookAheadFactor = 2.0;
 
+    /** Maximum number of chunk RealtimeMesh components to create per game-thread apply
+     *  pass. First-touch component creation (RegisterComponent + section-group setup) is
+     *  the expensive game-thread cost at spawn; capping it spreads the first-build burst
+     *  across several passes instead of one hitch. Chunks over the cap stay dirty and are
+     *  picked up by the next pass. Already-created chunks re-apply without counting against
+     *  this cap. Tune against the particle-fade budget: raise until the spawn hitch
+     *  reappears, then back off. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrain|LOD", meta = (ClampMin = "1"))
+    int32 MaxChunkInitsPerApply = 8;
+
     // --- Lifecycle Overrides ---
 
     virtual void OnConstruction(const FTransform& Transform) override;
@@ -232,9 +243,17 @@ protected:
      *  update pass. Chains to RunMeshUpdateTask on completion. */
     void RunDataUpdateTask();
 
-    /** Background task: pushes all dirty chunks to their RealtimeMesh components.
-     *  Chains back to RunDataUpdateTask after MinDataUpdateInterval. */
+    /** Background task: collects dirty chunks (under the read lock) and hands them to
+     *  ApplyDirtyChunksThrottled for a throttled game-thread apply, which reschedules the
+     *  next RunDataUpdateTask on completion. */
     void RunMeshUpdateTask();
+
+    /** Game-thread apply for a batch of dirty chunks, throttled to MaxChunkInitsPerApply
+     *  component inits per pass. When bRescheduleData is true (the data/mesh loop) it
+     *  schedules the next RunDataUpdateTask on completion, so the loop serializes through
+     *  the apply and the per-frame cap holds; the edit path passes false. Safe to call
+     *  from any thread -- it dispatches the work to the game thread itself. */
+    void ApplyDirtyChunksThrottled(TArray<TSharedPtr<FMeshChunk>> DirtyChunks, bool bRescheduleData);
 
     /** Background task: applies a spherical brush edit, reconstructs affected subtrees,
      *  and pushes updated meshes. Runs independently of the Data/Mesh chain. */

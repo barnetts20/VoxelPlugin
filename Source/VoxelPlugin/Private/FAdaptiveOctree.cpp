@@ -718,7 +718,7 @@ void FAdaptiveOctree::UpdateLOD(FVector CameraPosition, double InScreenSpaceThre
         FAdaptiveOctreeNode* ChunkNode = Chunks[idx].Get();
         double DistSq = FMath::Max(FVector::DistSquared(ChunkNode->Center, CameraPosition), 1e-12);
         bool CouldSplit = FAdaptiveOctreeNode::EvaluateSplit(
-            ChunkNode->Extent, DistSq, FOVScale, ThresholdSq, 
+            ChunkNode->Extent, DistSq, FOVScale, ThresholdSq,
             ChunkNode->Index.Depth,
             ChunkNode->DepthBounds[EDepthBound::MaxDepth],    // MaxDepth param
             ChunkNode->DepthBounds[EDepthBound::MinDepth]);
@@ -749,21 +749,15 @@ void FAdaptiveOctree::UpdateLOD(FVector CameraPosition, double InScreenSpaceThre
         });
 }
 
-void FAdaptiveOctree::UpdateMesh()
+void FAdaptiveOctree::CollectDirtyChunks(TArray<TSharedPtr<FMeshChunk>>& OutDirtyChunks) const
 {
     if (!MeshChunksInitialized) return;
 
-    // Use a reference to avoid incrementing shared pointer ref counts unnecessarily during iteration
-    for (auto& It : ChunkMap)
+    for (const auto& It : ChunkMap)
     {
-        TSharedPtr<FMeshChunk> Chunk = It.Value;
-
-        if (!Chunk.IsValid()) continue;
-
-        if (Chunk->IsDirty)
-        {
-            Chunk->UpdateComponent(Chunk);
-        }
+        const TSharedPtr<FMeshChunk>& Chunk = It.Value;
+        if (Chunk.IsValid() && Chunk->IsDirty)
+            OutDirtyChunks.Add(Chunk);
     }
 }
 
