@@ -230,8 +230,11 @@ private:
      *  split/merge work). Read at the start of each LOD pass. */
     std::atomic<bool>   bCheapMode = false;
 
-    /** True during Initialize to prevent re-entrant init from OnConstruction/Tick. */
-    bool                bIsInitializing = false;
+    /** True from the start of InitializeInternal until the async initial build task
+     *  publishes the tree. Read on the game thread (OnConstruction) to prevent
+     *  re-entrant init; cleared on the worker once the build completes, so it must
+     *  be atomic. */
+    std::atomic<bool>   bIsInitializing = false;
 
     // --- Change Detection ---
     FVector LastInitScale = FVector::ZeroVector;
@@ -254,9 +257,16 @@ private:
     /** Destroys all RealtimeMesh components and clears the chunk map. */
     void CleanupComponents();
 
-    /** Creates mesh chunks for all chunk-depth leaf nodes and adds them to ChunkMap.
-     *  Runs initial mesh stream builds in parallel. */
-    void PopulateChunks();
+    /** Worker task that performs the initial tree build off the game thread: builds
+     *  the 6 face roots, splits each to ChunkDepth, and generates the initial mesh
+     *  chunks (all into locals), then publishes RootNodes/ChunkMap under ChunkMapCS
+     *  with a generation re-check and chains to RunLodUpdateTask. Kicked from
+     *  InitializeInternal after the game-thread teardown + compositor publish.
+     *
+     *  This replaces the old synchronous game-thread PopulateChunks build, which was
+     *  the dominant spawn-time GT hitch (the split/sample and the blocking mesh-gen
+     *  ParallelFor both ran on the game thread before this). */
+    void RunInitialBuildTask();
 
     /** Rebuilds vertex positions, normals, UVs, and triangles (inner + edge) for a
      *  single chunk. Handles edge stitching based on neighbor LOD differences and

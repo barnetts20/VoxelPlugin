@@ -327,91 +327,151 @@ void AOceanSphereActor::InitializeInternal(TSharedPtr<FDensitySampleCompositor> 
         Compositor = NewCompositor;
     }
 
-    // Unit cube: each face spans [-1, +1] in its two local axes. The absolute
-    // magnitude doesn't matter -- positions are normalized before sphere projection.
-    // HalfSize=1.0 at root means WorldExtent = HalfSize * OceanRadius = OceanRadius.
-    const double Size = 2.0;
-    const double HalfSize = 1.0;
-
-    const FVector FaceCenters[6] = {
-        FVector(HalfSize,        0,        0),
-        FVector(-HalfSize,        0,        0),
-        FVector(0,  HalfSize,        0),
-        FVector(0, -HalfSize,        0),
-        FVector(0,        0,  HalfSize),
-        FVector(0,        0, -HalfSize),
-    };
-
-    for (int32 i = 0; i < 6; ++i)
-    {
-        RootNodes[i] = MakeShared<FOceanQuadTreeNode>(
-            this, FCubeTransform::FaceTransforms[i], FQuadIndex((uint8)i),
-            FaceCenters[i], Size, OceanRadius, MinDepth, MaxDepth, ChunkDepth);
-        RootNodes[i]->ChunkAnchorCenter = RootNodes[i]->SphereCenter;
-    }
-
-    for (int32 i = 0; i < 6; ++i)
-        RootNodes[i]->SplitToDepth(ChunkDepth);
-
-    PopulateChunks();
-
+    // The quadtree build (6 face roots -> split-to-ChunkDepth -> initial mesh gen)
+    // used to run here, synchronously on the game thread, and only then kicked the
+    // async LOD pass. On a planet spawn that inline build was the dominant GT hitch:
+    // both the split/sample walk and the "parallel" mesh-gen ParallelFor block the
+    // calling (game) thread. It now runs on a worker via RunInitialBuildTask, which
+    // builds into locals, publishes RootNodes/ChunkMap under ChunkMapCS with a
+    // generation re-check, then chains to RunLodUpdateTask.
+    //
+    // bInitialized / bIsInitializing are flipped inside that task once the tree is
+    // published, so nothing here marks the actor ready -- InitializeInternal now
+    // returns almost immediately, mirroring the terrain actor's deferred build.
     LastInitScale = GetActorScale3D();
     LastTerrainPlanetRadius = TerrainPlanetRadius;
-    bInitialized = true;
-    bIsInitializing = false;
-    RunLodUpdateTask();
+    RunInitialBuildTask();
 }
 
 // ---------------------------------------------------------------------------
-// PopulateChunks
+// RunInitialBuildTask
+//
+// Worker-thread initial tree build. Mirrors AAdaptiveVoxelActor's deferred octree
+// construction: the game thread does only the (cheap) teardown + compositor publish
+// in InitializeInternal, then kicks this task. Everything here -- the 6 face roots,
+// the split-to-ChunkDepth walk, and the mesh-gen ParallelFor -- runs off the game
+// thread, so the spawn frame no longer stalls on the ocean build.
+//
+// Concurrency contract (same tokens the LOD task uses):
+//   - Build into locals only. RootNodes/ChunkMap are published under ChunkMapCS with
+//     a final InitGeneration re-check, so a re-init (which bumps the generation and
+//     tears down under the same lock) can never observe a half-built tree, and a
+//     superseded build drops its locals instead of clobbering the new one.
+//   - Geometry params are snapshotted by value on the GT before dispatch; the
+//     compositor is pinned under ChunkMapCS so the whole build samples one object.
+//   - bInitialized / bIsInitializing flip only after a successful publish.
 // ---------------------------------------------------------------------------
 
-void AOceanSphereActor::PopulateChunks()
+void AOceanSphereActor::RunInitialBuildTask()
 {
-    TArray<TSharedPtr<FOceanQuadTreeNode>> ChunkNodes;
-    for (int32 i = 0; i < 6; ++i)
+    TWeakObjectPtr<AOceanSphereActor> WeakThis(this);
+    const uint32 CapturedGen = InitGeneration;
+
+    // Snapshot the (build-immutable) geometry params on the game thread so the worker
+    // never reads live actor members that a concurrent re-init could mutate.
+    const double CapOceanRadius = OceanRadius;
+    const int32  CapMinDepth = MinDepth;
+    const int32  CapMaxDepth = MaxDepth;
+    const int32  CapChunkDepth = ChunkDepth;
+    const int32  CapFaceRes = FaceResolution;
+
+    // Pin the compositor under the lock InitializeInternal published it with, so this
+    // build can't tear-read a TSharedPtr the GT is swapping during a re-init.
+    TSharedPtr<FDensitySampleCompositor> CompPin;
     {
-        TArray<TSharedPtr<FOceanQuadTreeNode>> Stack;
-        Stack.Push(RootNodes[i]);
-        while (Stack.Num() > 0)
-        {
-            TSharedPtr<FOceanQuadTreeNode> Node = Stack.Pop(EAllowShrinking::No);
-            if (!Node.IsValid()) continue;
-            if (Node->GetDepth() == ChunkDepth)
-                ChunkNodes.Add(Node);
-            else
-                for (auto& Child : Node->Children)
-                    if (Child.IsValid()) Stack.Add(Child);
-        }
+        FScopeLock Lock(&ChunkMapCS);
+        CompPin = Compositor;
     }
 
-    TArray<TSharedPtr<FOceanMeshChunk>> NewChunks;
-    NewChunks.SetNum(ChunkNodes.Num());
-
-    // Build the triangle grid once on this thread (GT init, single-threaded), then
-    // pass it into each worker's rebuild. The grid is immutable and depends only on
-    // Res, so a task-local copy is race-free and needs no shared cache.
-    const int32 Res = FaceResolution;
-    FOceanMeshGrid Grid;
-    Grid.Build(Res);
-
-    // Runs on the GT during init, so Compositor is stable here; pin it once and
-    // pass it down so every chunk in this pass samples the same object.
-    TSharedPtr<FDensitySampleCompositor> CompPin = Compositor;
-
-    ParallelFor(ChunkNodes.Num(), [&](int32 i)
+    FFunctionGraphTask::CreateAndDispatchWhenReady(
+        [WeakThis, CapturedGen, CompPin, CapOceanRadius, CapMinDepth, CapMaxDepth, CapChunkDepth, CapFaceRes]()
         {
-            NewChunks[i] = MakeShared<FOceanMeshChunk>();
-            NewChunks[i]->CachedOwner = this;
-            NewChunks[i]->InitializeData(ChunkNodes[i]->SphereCenter);
-            RebuildChunkStreamData(NewChunks[i], ChunkNodes[i], CompPin, Grid, Res);
-        });
+            AOceanSphereActor* Self = WeakThis.Get();
+            if (!Self || Self->bIsDestroyed || Self->InitGeneration != CapturedGen)
+                return;
 
-    for (int32 i = 0; i < ChunkNodes.Num(); ++i)
-    {
-        NewChunks[i]->IsDirty = true;
-        ChunkMap.Add(ChunkNodes[i], NewChunks[i]);
-    }
+            // --- Build 6 face roots + split to ChunkDepth (pure geometry, no actor state) ---
+            const double Size = 2.0;
+            const double HalfSize = 1.0;
+            const FVector FaceCenters[6] = {
+                FVector(HalfSize,        0,        0),
+                FVector(-HalfSize,        0,        0),
+                FVector(0,  HalfSize,        0),
+                FVector(0, -HalfSize,        0),
+                FVector(0,        0,  HalfSize),
+                FVector(0,        0, -HalfSize),
+            };
+
+            TSharedPtr<FOceanQuadTreeNode> LocalRoots[6];
+            for (int32 i = 0; i < 6; ++i)
+            {
+                LocalRoots[i] = MakeShared<FOceanQuadTreeNode>(
+                    Self, FCubeTransform::FaceTransforms[i], FQuadIndex((uint8)i),
+                    FaceCenters[i], Size, CapOceanRadius, CapMinDepth, CapMaxDepth, CapChunkDepth);
+                LocalRoots[i]->ChunkAnchorCenter = LocalRoots[i]->SphereCenter;
+            }
+            for (int32 i = 0; i < 6; ++i)
+                LocalRoots[i]->SplitToDepth(CapChunkDepth);
+
+            if (Self->bIsDestroyed || Self->InitGeneration != CapturedGen) return;
+
+            // --- Collect chunk-depth nodes from the locals ---
+            TArray<TSharedPtr<FOceanQuadTreeNode>> ChunkNodes;
+            for (int32 i = 0; i < 6; ++i)
+            {
+                TArray<TSharedPtr<FOceanQuadTreeNode>> Stack;
+                Stack.Push(LocalRoots[i]);
+                while (Stack.Num() > 0)
+                {
+                    TSharedPtr<FOceanQuadTreeNode> Node = Stack.Pop(EAllowShrinking::No);
+                    if (!Node.IsValid()) continue;
+                    if (Node->GetDepth() == CapChunkDepth)
+                        ChunkNodes.Add(Node);
+                    else
+                        for (auto& Child : Node->Children)
+                            if (Child.IsValid()) Stack.Add(Child);
+                }
+            }
+
+            // --- Initial mesh generation (parallel; task-local grid + pinned compositor) ---
+            TArray<TSharedPtr<FOceanMeshChunk>> NewChunks;
+            NewChunks.SetNum(ChunkNodes.Num());
+
+            FOceanMeshGrid Grid;
+            Grid.Build(CapFaceRes);
+
+            ParallelFor(ChunkNodes.Num(), [&](int32 i)
+                {
+                    if (Self->InitGeneration != CapturedGen) return;
+                    NewChunks[i] = MakeShared<FOceanMeshChunk>();
+                    NewChunks[i]->CachedOwner = Self;
+                    NewChunks[i]->InitializeData(ChunkNodes[i]->SphereCenter);
+                    RebuildChunkStreamData(NewChunks[i], ChunkNodes[i], CompPin, Grid, CapFaceRes);
+                    NewChunks[i]->IsDirty = true;
+                });
+
+            // --- Publish under the lock, with a final staleness re-check ---
+            {
+                FScopeLock Lock(&Self->ChunkMapCS);
+                if (Self->bIsDestroyed || Self->InitGeneration != CapturedGen)
+                    return;  // superseded or destroyed: drop locals; GT teardown owns cleanup
+
+                for (int32 i = 0; i < 6; ++i)
+                    Self->RootNodes[i] = LocalRoots[i];
+
+                Self->ChunkMap.Empty(ChunkNodes.Num());
+                for (int32 i = 0; i < ChunkNodes.Num(); ++i)
+                    Self->ChunkMap.Add(ChunkNodes[i], NewChunks[i]);
+            }
+
+            // Publish complete -- mark ready and hand off to the LOD/apply pass. The
+            // atomic store on bInitialized releases the map writes above to any reader
+            // that acquires it (the LOD task re-reads ChunkMap under ChunkMapCS anyway).
+            Self->bIsInitializing = false;
+            Self->bInitialized = true;
+            Self->RunLodUpdateTask();
+
+        }, TStatId(), nullptr, ENamedThreads::AnyNormalThreadHiPriTask);
 }
 
 // ---------------------------------------------------------------------------
@@ -880,7 +940,7 @@ void AOceanSphereActor::RunLodUpdateTask()
                             Self->LodTimerHandle, Self,
                             &AOceanSphereActor::RunLodUpdateTask,
                             (float)Self->MinLodInterval, false);
-                            // (float)(Self->bCheapMode.load() ? Self->CheapLodInterval : Self->MinLodInterval), false);
+                    // (float)(Self->bCheapMode.load() ? Self->CheapLodInterval : Self->MinLodInterval), false);
                 });
 
         }, TStatId(), nullptr, ENamedThreads::AnyNormalThreadHiPriTask);
