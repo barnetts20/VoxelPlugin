@@ -182,7 +182,7 @@ bool FAdaptiveOctreeNode::ShouldSplit(FVector InCameraPosition, double Threshold
     // The dot product is negative when the node is behind the planet center
     // relative to the camera. The threshold (0.04) allows a ~11 degree margin.
     double Dot = FVector::DotProduct(InCameraPosition, Center);
-    if (Dot < 0.0)
+    if (Dot < 0.0 && Index.Depth >= DepthBounds[EDepthBound::MinDepth])
     {
         double CamDistSq = InCameraPosition.SizeSquared();
         double NodeDistSq = Center.SizeSquared();

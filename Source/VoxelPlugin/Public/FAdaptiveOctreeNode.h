@@ -121,7 +121,6 @@ public:
      *  the merge threshold. Never merges at or below ChunkDepth or below MinDepth. */
     static bool EvaluateMerge(double Extent, double DistSq, double FOVScale, double MergeThresholdSq, int Depth, int ChunkDepth, int MinDepth)
     {
-        if (Depth <= ChunkDepth) return false;
         if (Depth < MinDepth) return false;
         double lhs = 2.0 * Extent * FOVScale;
         return (lhs * lhs) < (MergeThresholdSq * DistSq);

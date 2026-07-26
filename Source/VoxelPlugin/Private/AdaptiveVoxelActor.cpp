@@ -227,7 +227,6 @@ void AAdaptiveVoxelActor::Initialize()
         double Ratio = ActorRootExtent * FloatEps / MaxFloatError;
         int32 IdealChunkDepth = (Ratio > 1.0) ? (int32)FMath::CeilToInt(FMath::Log2(Ratio)) : 2;
         ChunkDepth = FMath::Clamp(IdealChunkDepth, 2, 5);
-
         MinDepth = FMath::Max(MinDepth, ChunkDepth);
 
         double ChunkExtent = ActorRootExtent / FMath::Pow(2.0, (double)ChunkDepth);
@@ -480,7 +479,8 @@ void AAdaptiveVoxelActor::RunDataUpdateTask()
                 // The forced "Depth < MinDepth" split and the MinDepth/ChunkDepth floor
                 // guards stay intact, so the octree settles at MinDepth and holds. 1e18
                 // squares to 1e36 internally, clearing the largest lhs^2 by many orders.
-                const double EffThreshold = Self->bCheapMode.load() ? 1e18 : Self->ScreenSpaceThreshold;
+                const double EffThreshold = Self->ScreenSpaceThreshold;
+                // const double EffThreshold = Self->bCheapMode.load() ? 1e18 : Self->ScreenSpaceThreshold;
                 Self->AdaptiveOctree->UpdateLOD(PredictedPos, EffThreshold, Self->CameraFOV);
                 Self->LastLodUpdatePosition = Self->CameraPosition;
             }
@@ -527,7 +527,8 @@ void AAdaptiveVoxelActor::RunMeshUpdateTask()
                             Self->DataUpdateTimerHandle,
                             Self,
                             &AAdaptiveVoxelActor::RunDataUpdateTask,
-                            Self->bCheapMode.load() ? Self->CheapDataUpdateInterval : Self->MinDataUpdateInterval,
+                            Self->MinDataUpdateInterval,
+                            //Self->bCheapMode.load() ? Self->CheapDataUpdateInterval : Self->MinDataUpdateInterval,
                             false
                         );
                     }

@@ -80,7 +80,7 @@ public:
 
     /** Minimum subdivision depth maintained regardless of camera distance. */
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Ocean|LOD")
-    int32 MinDepth = 4;
+    int32 MinDepth = 3;
 
     /** Target vertex spacing in world units (cm). MaxDepth is computed automatically
      *  so the finest LOD achieves roughly this spacing between adjacent vertices. */

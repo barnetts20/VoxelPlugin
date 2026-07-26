@@ -717,9 +717,17 @@ void FAdaptiveOctree::UpdateLOD(FVector CameraPosition, double InScreenSpaceThre
     ParallelFor(NumChunks, [&](int32 idx) {
         FAdaptiveOctreeNode* ChunkNode = Chunks[idx].Get();
         double DistSq = FMath::Max(FVector::DistSquared(ChunkNode->Center, CameraPosition), 1e-12);
-        bool CouldSplit = FAdaptiveOctreeNode::EvaluateSplit(ChunkNode->Extent, DistSq, FOVScale, ThresholdSq, ChunkNode->Index.Depth, ChunkNode->DepthBounds[EDepthBound::MinDepth], ChunkNode->DepthBounds[EDepthBound::MaxDepth]);
-        double SmallestExtent = ChunkNode->Extent / (double)(1 << (ChunkNode->DepthBounds[EDepthBound::MinDepth] - ChunkNode->Index.Depth));
-        bool CouldMerge = FAdaptiveOctreeNode::EvaluateMerge(SmallestExtent, DistSq, FOVScale, MergeThresholdSq, ChunkNode->DepthBounds[EDepthBound::MinDepth], ChunkNode->DepthBounds[EDepthBound::ChunkDepth], ChunkNode->DepthBounds[EDepthBound::MaxDepth]);
+        bool CouldSplit = FAdaptiveOctreeNode::EvaluateSplit(
+            ChunkNode->Extent, DistSq, FOVScale, ThresholdSq, 
+            ChunkNode->Index.Depth,
+            ChunkNode->DepthBounds[EDepthBound::MaxDepth],    // MaxDepth param
+            ChunkNode->DepthBounds[EDepthBound::MinDepth]);
+        double SmallestExtent = ChunkNode->Extent / (double)(1 << (ChunkNode->DepthBounds[EDepthBound::MaxDepth] - ChunkNode->Index.Depth));
+        bool CouldMerge = FAdaptiveOctreeNode::EvaluateMerge(
+            SmallestExtent, DistSq, FOVScale, MergeThresholdSq,
+            ChunkNode->DepthBounds[EDepthBound::MaxDepth],    // Depth = deepest possible node
+            ChunkNode->DepthBounds[EDepthBound::ChunkDepth],  // ChunkDepth
+            ChunkNode->DepthBounds[EDepthBound::MinDepth]);   // MinDepth
 
         if (!CouldSplit && !CouldMerge) return; //Early out
 

@@ -116,7 +116,7 @@ public:
 
     /** Minimum subdivision depth maintained regardless of camera distance. */
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrain|Octree")
-    int MinDepth = 7;
+    int MinDepth = 4;
 
     /** Target voxel spacing in world units (cm). MaxDepth is computed automatically
      *  so the finest LOD voxel cells are approximately this size. */

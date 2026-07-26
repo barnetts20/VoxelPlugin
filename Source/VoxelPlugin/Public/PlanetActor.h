@@ -73,7 +73,7 @@ public:
     // --- Atmosphere ---
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Planet|Atmosphere")
-    bool bEnableAtmosphere = true;
+    bool bEnableAtmosphere = false;
 
     // --- Gravity ---
 

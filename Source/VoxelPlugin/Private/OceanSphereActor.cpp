@@ -143,6 +143,7 @@ bool AOceanSphereActor::ShouldTickIfViewportsOnly() const
 
 void AOceanSphereActor::Initialize()
 {
+    MinDepth = FMath::Max(MinDepth, ChunkDepth);
     InitializeInternal(nullptr);
 }
 
@@ -167,8 +168,8 @@ void AOceanSphereActor::OnTransformUpdated(USceneComponent* Component, EUpdateTr
 void AOceanSphereActor::InitializeFromPlanet(TSharedPtr<FDensitySampleCompositor> InCompositor,
     USceneComponent* InAttachParent, FVector InScale)
 {
+    MinDepth = FMath::Max(MinDepth, ChunkDepth);
     bIsPlanetOwned = true;
-
     // Apply scale BEFORE binding the transform guard — prevents the old guard
     // from reverting a scale change that the planet actor intends.
     if (USceneComponent* Root = GetRootComponent())
@@ -190,7 +191,6 @@ void AOceanSphereActor::InitializeFromPlanet(TSharedPtr<FDensitySampleCompositor
         MeshAttachmentRoot->AttachToComponent(InAttachParent,
             FAttachmentTransformRules::KeepWorldTransform);
     }
-
     InitializeInternal(InCompositor);
 }
 
@@ -687,12 +687,12 @@ void AOceanSphereActor::RunLodUpdateTask()
             // intact, so the tree converges to exactly MinDepth and holds there --
             // no deep subdivision, no re-meshing on motion. 1e36 clears the largest
             // possible lhs^2 by many orders while staying far below double overflow.
-            const bool bCheap = Self->bCheapMode.load();
-            if (bCheap)
-            {
-                ThresholdSq = 1e36;        // lhs^2 > (1e36 * DistSq) never true  -> no screen-space split
-                MergeThresholdSq = 1e36;   // lhs^2 < (1e36 * DistSq) always true -> merge above MinDepth
-            }
+            //const bool bCheap = Self->bCheapMode.load();
+            //if (bCheap)
+            //{
+            //    ThresholdSq = 1e36;        // lhs^2 > (1e36 * DistSq) never true  -> no screen-space split
+            //    MergeThresholdSq = 1e36;   // lhs^2 < (1e36 * DistSq) always true -> merge above MinDepth
+            //}
 
             TArray<TSharedPtr<FOceanQuadTreeNode>> ChunkNodes;
             TArray<TSharedPtr<FOceanMeshChunk>>    MeshChunks;
@@ -879,7 +879,8 @@ void AOceanSphereActor::RunLodUpdateTask()
                         W->GetTimerManager().SetTimer(
                             Self->LodTimerHandle, Self,
                             &AOceanSphereActor::RunLodUpdateTask,
-                            (float)(Self->bCheapMode.load() ? Self->CheapLodInterval : Self->MinLodInterval), false);
+                            (float)Self->MinLodInterval, false);
+                            // (float)(Self->bCheapMode.load() ? Self->CheapLodInterval : Self->MinLodInterval), false);
                 });
 
         }, TStatId(), nullptr, ENamedThreads::AnyNormalThreadHiPriTask);

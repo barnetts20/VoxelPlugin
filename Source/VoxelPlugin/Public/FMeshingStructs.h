@@ -154,7 +154,7 @@ struct VOXELPLUGIN_API FMeshChunk {
 
         ChunkRtComponent->AttachToComponent(InAttachRoot, FAttachmentTransformRules::KeepRelativeTransform);
         ChunkRtComponent->SetRelativeLocation(ChunkCenter);
-        ChunkRtComponent->SetCollisionEnabled(ECollisionEnabled::QueryAndPhysics);
+        ChunkRtComponent->SetCollisionEnabled(ECollisionEnabled::NoCollision);// ::QueryAndPhysics);
         ChunkRtComponent->SetCollisionResponseToAllChannels(ECollisionResponse::ECR_Block);
         ChunkRtComponent->SetRealtimeMesh(ChunkRtMesh.Get());
         ChunkRtComponent->SetRenderCustomDepth(true);
