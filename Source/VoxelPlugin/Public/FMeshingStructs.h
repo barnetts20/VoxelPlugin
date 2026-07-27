@@ -129,6 +129,13 @@ struct VOXELPLUGIN_API FMeshChunk {
      *  skips it and the destroy drain releases its component. */
     bool bRetired = false;
 
+    /** When retired, the chunk(s) that now cover this chunk's space (finer children on
+     *  promote, the coarser parent on demote). The destroy drain keeps this chunk's
+     *  component alive -- still rendering its last mesh -- until every entry here has
+     *  applied (or is itself retired with its own replacements settled), so a swap never
+     *  opens a hole. Cleared when the chunk is finally released. */
+    TArray<TSharedPtr<FMeshChunk>> ReplacedBy;
+
     TWeakObjectPtr<URealtimeMeshSimple> ChunkRtMesh;
     TWeakObjectPtr<URealtimeMeshComponent> ChunkRtComponent;
     FRealtimeMeshLODKey LODKey = FRealtimeMeshLODKey(0);

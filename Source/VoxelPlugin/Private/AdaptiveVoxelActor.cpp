@@ -626,24 +626,63 @@ void AAdaptiveVoxelActor::DrainPendingApply()
     }
 }
 
+// A chunk is "settled" once whatever it will show is showing: it has applied (IsDirty
+// cleared) or is empty. A chunk retired before it ever applied is settled once its OWN
+// replacements are settled -- this follows a fast promote/demote cascade to the bottom so
+// we never release a coarse chunk while a hole would remain.
+static bool IsChunkSettled(const FMeshChunk* Chunk)
+{
+    if (!Chunk) return true;
+    if (!Chunk->IsDirty) return true;            // applied at least once, or empty
+    if (Chunk->bRetired)                         // superseded before applying -- follow the chain
+    {
+        for (const TSharedPtr<FMeshChunk>& Rep : Chunk->ReplacedBy)
+            if (!IsChunkSettled(Rep.Get())) return false;
+        return true;
+    }
+    return false;                                // still waiting on its first apply
+}
+
 void AAdaptiveVoxelActor::DrainPendingDestroy()
 {
     if (IsDestroyed) return;
 
-    TArray<TSharedPtr<FMeshChunk>> ToDestroy;
+    TArray<TSharedPtr<FMeshChunk>> ToProcess;
     {
         FScopeLock Lock(&PendingApplyCS);
         if (PendingDestroy.Num() == 0) return;
-        ToDestroy = MoveTemp(PendingDestroy);
+        ToProcess = MoveTemp(PendingDestroy);
     }
 
-    // Promote-only produces few retirements per pass (one coarse parent each), so this is
-    // drained fully rather than time-sliced. Revisit if merge-back (which can retire eight
-    // children at once) lands.
-    for (const TSharedPtr<FMeshChunk>& Chunk : ToDestroy)
+    // Release a retired chunk only once every chunk that replaces it is live. Until then it
+    // keeps rendering its last mesh, so the promote/demote swap never opens a hole. Chunks
+    // that aren't ready yet are re-queued for a later frame.
+    TArray<TSharedPtr<FMeshChunk>> Deferred;
+    for (const TSharedPtr<FMeshChunk>& Chunk : ToProcess)
     {
-        if (Chunk.IsValid())
+        if (!Chunk.IsValid()) continue;
+
+        bool bReplacementsLive = true;
+        for (const TSharedPtr<FMeshChunk>& Rep : Chunk->ReplacedBy)
+        {
+            if (!IsChunkSettled(Rep.Get())) { bReplacementsLive = false; break; }
+        }
+
+        if (bReplacementsLive)
+        {
+            Chunk->ReplacedBy.Reset();
             Chunk->ReleaseComponent();
+        }
+        else
+        {
+            Deferred.Add(Chunk);
+        }
+    }
+
+    if (Deferred.Num() > 0)
+    {
+        FScopeLock Lock(&PendingApplyCS);
+        PendingDestroy.Append(MoveTemp(Deferred));
     }
 }
 

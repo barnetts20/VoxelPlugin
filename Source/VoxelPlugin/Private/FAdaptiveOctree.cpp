@@ -827,20 +827,15 @@ TSharedPtr<FMeshChunk> FAdaptiveOctree::BuildMeshChunkFor(FAdaptiveOctreeNode* N
 
 void FAdaptiveOctree::PromoteChunk(TSharedPtr<FAdaptiveOctreeNode> ChunkNode, TArray<TSharedPtr<FMeshChunk>>& OutRemovedChunks)
 {
-    // Retire the coarse chunk: pull it from the map, clear its flag, and hand its
-    // FMeshChunk to the caller so the game thread destroys the component. bRetired stops
-    // the apply drain from (re)creating a component for it if it was still queued.
+    // Pull the coarse chunk out of the map and clear its flag. It stays alive (still
+    // rendering) in OutRemovedChunks until its finer children have applied.
     TSharedPtr<FMeshChunk> OldChunk;
     ChunkMap.RemoveAndCopyValue(ChunkNode, OldChunk);
     ChunkNode->bIsChunkRoot = false;
-    if (OldChunk.IsValid())
-    {
-        OldChunk->bRetired = true;
-        OutRemovedChunks.Add(OldChunk);
-    }
 
     // Every child becomes a chunk root so chunk lookups/edits still resolve inside the
     // promoted region, but only surface-bearing children get a meshed FMeshChunk.
+    TArray<TSharedPtr<FMeshChunk>> Created;
     for (int i = 0; i < 8; i++)
     {
         const TSharedPtr<FAdaptiveOctreeNode>& Child = ChunkNode->Children[i];
@@ -849,13 +844,38 @@ void FAdaptiveOctree::PromoteChunk(TSharedPtr<FAdaptiveOctreeNode> ChunkNode, TA
         Child->bIsChunkRoot = true;
         if (!Child->CouldContainSurface) continue;
 
-        ChunkMap.Add(Child, BuildMeshChunkFor(Child.Get()));
+        TSharedPtr<FMeshChunk> NewChunk = BuildMeshChunkFor(Child.Get());
+        ChunkMap.Add(Child, NewChunk);
+        Created.Add(NewChunk);
+    }
+
+    // Retire the coarse chunk, remembering the children that now cover it so the destroy
+    // drain won't release it until they're live. bRetired also stops the apply drain from
+    // (re)creating a component for it if it was still queued.
+    if (OldChunk.IsValid())
+    {
+        OldChunk->bRetired = true;
+        OldChunk->ReplacedBy = MoveTemp(Created);
+        OutRemovedChunks.Add(OldChunk);
     }
 }
 
 void FAdaptiveOctree::DemoteChunk(TSharedPtr<FAdaptiveOctreeNode> ParentNode, TArray<TSharedPtr<FMeshChunk>>& OutRemovedChunks)
 {
-    // Retire the 8 child chunk roots (only surface-bearing ones actually held a chunk).
+    // Build the parent chunk first (re-meshing its whole subtree against its own coarser
+    // origin, which also re-covers any non-surface sub-regions the children skipped) so we
+    // can point the retired children at it. GatherLeafEdges walks the subtree directly and
+    // doesn't care that the children are still in the map at this instant.
+    ParentNode->bIsChunkRoot = true;
+    TSharedPtr<FMeshChunk> ParentChunk;
+    if (ParentNode->CouldContainSurface)
+    {
+        ParentChunk = BuildMeshChunkFor(ParentNode.Get());
+        ChunkMap.Add(ParentNode, ParentChunk);
+    }
+
+    // Retire the 8 child chunk roots. They stay alive (still rendering their finer meshes)
+    // until the parent chunk has applied, so the collapse never opens a hole.
     for (int i = 0; i < 8; i++)
     {
         const TSharedPtr<FAdaptiveOctreeNode>& Child = ParentNode->Children[i];
@@ -866,16 +886,11 @@ void FAdaptiveOctree::DemoteChunk(TSharedPtr<FAdaptiveOctreeNode> ParentNode, TA
         if (ChunkMap.RemoveAndCopyValue(Child, OldChunk) && OldChunk.IsValid())
         {
             OldChunk->bRetired = true;
+            if (ParentChunk.IsValid())
+                OldChunk->ReplacedBy = { ParentChunk };
             OutRemovedChunks.Add(OldChunk);
         }
     }
-
-    // The parent becomes the chunk root and re-meshes its whole subtree against its own
-    // (coarser) origin. This also re-covers any non-surface sub-regions the promoted
-    // children didn't mesh.
-    ParentNode->bIsChunkRoot = true;
-    if (ParentNode->CouldContainSurface)
-        ChunkMap.Add(ParentNode, BuildMeshChunkFor(ParentNode.Get()));
 }
 
 void FAdaptiveOctree::UpdateChunkCut(FVector InCameraPosition, double InCameraFOV, TArray<TSharedPtr<FMeshChunk>>& OutRemovedChunks)
