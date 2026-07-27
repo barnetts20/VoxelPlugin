@@ -10,6 +10,7 @@ FAdaptiveOctree::FAdaptiveOctree(const FOctreeParams& Params)
     ChunkDepth = Params.ChunkDepth;
     MaxChunkDepth = Params.MaxChunkDepth;
     ChunkPrecisionThreshold = Params.ChunkPrecisionThreshold;
+    ChunkDemoteHysteresis = Params.ChunkDemoteHysteresis;
     PrecisionDepthFloor = Params.PrecisionDepthFloor;
 
     // Core terrain parameters from params
@@ -767,9 +768,9 @@ void FAdaptiveOctree::CollectDirtyChunks(TArray<TSharedPtr<FMeshChunk>>& OutDirt
 // Chunk cut
 // ---------------------------------------------------------------------------
 
-bool FAdaptiveOctree::ChunkNeedsFinerPrecision(FAdaptiveOctreeNode* Node, FVector CameraPosition, double FOVScale) const
+bool FAdaptiveOctree::ChunkJitterExceeds(FAdaptiveOctreeNode* Node, FVector CameraPosition, double FOVScale, double ThresholdSq) const
 {
-    // Near distance = distance from the camera to the closest point of the chunk's AABB,
+    // Near distance = distance from the camera to the closest point of the node's AABB,
     // floored so that standing on the surface (near-dist -> 0) doesn't demand infinite
     // depth. This is the key difference from the LOD test, which uses center distance:
     // precision is about how close the *surface under your feet* is, not the chunk center
@@ -784,17 +785,44 @@ bool FAdaptiveOctree::ChunkNeedsFinerPrecision(FAdaptiveOctreeNode* Node, FVecto
     constexpr double MinNearDist = 100.0; // cm floor (~eye height)
     const double NearDistSq = FMath::Max(FVector::DistSquared(Closest, CameraPosition), MinNearDist * MinNearDist);
 
-    // Worst-case FVector3f rounding error at this chunk's extent: vertices are stored
+    // Worst-case FVector3f rounding error at this node's extent: vertices are stored
     // chunk-local, so the largest coordinate magnitude is ~Extent and the absolute error
     // there is Extent * FLT_EPSILON.
     constexpr double FloatEps = 1.1920929e-7;
     const double Jitter = E * FloatEps;
 
     // Same screen-space form as EvaluateSplit (2 * size * FOVScale, compared against
-    // threshold * distance), but the "size" is the jitter magnitude: promote when the
-    // jitter would project larger than the tolerance at the near distance.
+    // threshold * distance), but the "size" is the jitter magnitude.
     const double lhs = 2.0 * Jitter * FOVScale;
-    return (lhs * lhs) > (ChunkPrecisionThreshold * ChunkPrecisionThreshold) * NearDistSq;
+    return (lhs * lhs) > ThresholdSq * NearDistSq;
+}
+
+bool FAdaptiveOctree::AllChildrenAreChunkRoots(FAdaptiveOctreeNode* Node) const
+{
+    if (!Node || Node->IsLeaf()) return false;
+    for (int i = 0; i < 8; i++)
+    {
+        const FAdaptiveOctreeNode* Child = Node->Children[i].Get();
+        if (!Child || !Child->bIsChunkRoot) return false;
+    }
+    return true;
+}
+
+TSharedPtr<FMeshChunk> FAdaptiveOctree::BuildMeshChunkFor(FAdaptiveOctreeNode* Node)
+{
+    TSharedPtr<FMeshChunk> NewChunk = MakeShared<FMeshChunk>();
+    NewChunk->CachedParentActor = CachedParentActor;
+    NewChunk->CachedMeshAttachRoot = CachedMeshAttachRoot;
+    NewChunk->CachedSurfaceMaterial = CachedSurfaceMaterial;
+    NewChunk->InitializeData(Node->Center, Node->Extent);
+
+    TArray<FNodeEdge> Edges;
+    TMap<FEdgeKey, int32> EdgeMap;
+    GatherLeafEdges(Node, Edges, EdgeMap);
+    NewChunk->ChunkEdges = Edges;
+    UpdateMeshChunkStreamData(NewChunk);
+    NewChunk->IsDirty = (NewChunk->SurfaceMeshData->GetPositionStream().Num() > 0);
+    return NewChunk;
 }
 
 void FAdaptiveOctree::PromoteChunk(TSharedPtr<FAdaptiveOctreeNode> ChunkNode, TArray<TSharedPtr<FMeshChunk>>& OutRemovedChunks)
@@ -821,43 +849,78 @@ void FAdaptiveOctree::PromoteChunk(TSharedPtr<FAdaptiveOctreeNode> ChunkNode, TA
         Child->bIsChunkRoot = true;
         if (!Child->CouldContainSurface) continue;
 
-        TSharedPtr<FMeshChunk> NewChunk = MakeShared<FMeshChunk>();
-        NewChunk->CachedParentActor = CachedParentActor;
-        NewChunk->CachedMeshAttachRoot = CachedMeshAttachRoot;
-        NewChunk->CachedSurfaceMaterial = CachedSurfaceMaterial;
-        NewChunk->InitializeData(Child->Center, Child->Extent);
-
-        TArray<FNodeEdge> Edges;
-        TMap<FEdgeKey, int32> EdgeMap;
-        GatherLeafEdges(Child.Get(), Edges, EdgeMap);
-        NewChunk->ChunkEdges = Edges;
-        UpdateMeshChunkStreamData(NewChunk);
-        NewChunk->IsDirty = (NewChunk->SurfaceMeshData->GetPositionStream().Num() > 0);
-
-        ChunkMap.Add(Child, NewChunk);
+        ChunkMap.Add(Child, BuildMeshChunkFor(Child.Get()));
     }
 }
 
-void FAdaptiveOctree::PromoteChunksNearCamera(FVector InCameraPosition, double InCameraFOV, TArray<TSharedPtr<FMeshChunk>>& OutRemovedChunks)
+void FAdaptiveOctree::DemoteChunk(TSharedPtr<FAdaptiveOctreeNode> ParentNode, TArray<TSharedPtr<FMeshChunk>>& OutRemovedChunks)
+{
+    // Retire the 8 child chunk roots (only surface-bearing ones actually held a chunk).
+    for (int i = 0; i < 8; i++)
+    {
+        const TSharedPtr<FAdaptiveOctreeNode>& Child = ParentNode->Children[i];
+        if (!Child.IsValid()) continue;
+
+        Child->bIsChunkRoot = false;
+        TSharedPtr<FMeshChunk> OldChunk;
+        if (ChunkMap.RemoveAndCopyValue(Child, OldChunk) && OldChunk.IsValid())
+        {
+            OldChunk->bRetired = true;
+            OutRemovedChunks.Add(OldChunk);
+        }
+    }
+
+    // The parent becomes the chunk root and re-meshes its whole subtree against its own
+    // (coarser) origin. This also re-covers any non-surface sub-regions the promoted
+    // children didn't mesh.
+    ParentNode->bIsChunkRoot = true;
+    if (ParentNode->CouldContainSurface)
+        ChunkMap.Add(ParentNode, BuildMeshChunkFor(ParentNode.Get()));
+}
+
+void FAdaptiveOctree::UpdateChunkCut(FVector InCameraPosition, double InCameraFOV, TArray<TSharedPtr<FMeshChunk>>& OutRemovedChunks)
 {
     if (!MeshChunksInitialized) return;
 
     const double FOVScale = 1.0 / FMath::Tan(FMath::DegreesToRadians(InCameraFOV * 0.5));
+    const double PromoteThresholdSq = ChunkPrecisionThreshold * ChunkPrecisionThreshold;
+    const double DemoteThresholdSq = FMath::Square(ChunkPrecisionThreshold * ChunkDemoteHysteresis);
 
-    // Snapshot the current chunk roots so we don't iterate a map we're mutating. Only
-    // one level of promotion happens per pass (a promoted child is re-evaluated next
-    // pass), which spreads the near-camera refinement over frames and bounds the work.
+    // Snapshot the current chunk roots so we don't iterate a map we're mutating. Each chunk
+    // changes at most one level per pass (a promoted child / demoted parent is re-evaluated
+    // next pass), which spreads refinement + collapse over frames and bounds the work.
     TArray<TSharedPtr<FAdaptiveOctreeNode>> Chunks;
     ChunkMap.GenerateKeyArray(Chunks);
 
+    // Parents already collapsed this pass, so their (snapshotted) siblings skip the retry.
+    TSet<FAdaptiveOctreeNode*> DemotedParents;
+
     for (const TSharedPtr<FAdaptiveOctreeNode>& C : Chunks)
     {
+        // May have been retired by a sibling's demote earlier in this loop.
         if (!C.IsValid() || !C->bIsChunkRoot) continue;
-        if ((int)C->Index.Depth >= MaxChunkDepth) continue; // at the precision ceiling
-        if (C->IsLeaf()) continue;                          // no children to promote into yet
-        if (!ChunkNeedsFinerPrecision(C.Get(), InCameraPosition, FOVScale)) continue;
 
-        PromoteChunk(C, OutRemovedChunks);
+        const int Depth = (int)C->Index.Depth;
+
+        // --- Promote: too coarse for its near distance, with room to go deeper. ---
+        if (Depth < MaxChunkDepth && !C->IsLeaf() &&
+            ChunkJitterExceeds(C.Get(), InCameraPosition, FOVScale, PromoteThresholdSq))
+        {
+            PromoteChunk(C, OutRemovedChunks);
+            continue;
+        }
+
+        // --- Demote: collapse C and its 7 siblings back into the parent once the parent
+        //     (one step coarser) is comfortably precise by the tighter demote threshold. ---
+        TSharedPtr<FAdaptiveOctreeNode> Parent = C->Parent.Pin();
+        if (!Parent.IsValid()) continue;
+        if ((int)Parent->Index.Depth < ChunkDepth) continue;         // never collapse below the build floor
+        if (DemotedParents.Contains(Parent.Get())) continue;
+        if (!AllChildrenAreChunkRoots(Parent.Get())) continue;       // must be the frontier
+        if (ChunkJitterExceeds(Parent.Get(), InCameraPosition, FOVScale, DemoteThresholdSq)) continue; // parent still needs the detail
+
+        DemoteChunk(Parent, OutRemovedChunks);
+        DemotedParents.Add(Parent.Get());
     }
 }
 

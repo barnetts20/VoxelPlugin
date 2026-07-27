@@ -134,6 +134,13 @@ public:
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrain|Octree", meta = (ClampMin = "0.00001"))
     double ChunkPrecisionThreshold = 5e-4;
 
+    /** Demote hysteresis (0-1]. A promoted chunk only collapses back once its parent is
+     *  precise to ChunkPrecisionThreshold * this. Lower = wider dead zone / less
+     *  create-destroy churn near the promote/demote boundary, at the cost of holding finer
+     *  chunks slightly longer as you leave. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrain|Octree", meta = (ClampMin = "0.05", ClampMax = "1.0"))
+    double ChunkDemoteHysteresis = 0.5;
+
     /** Minimum subdivision depth maintained regardless of camera distance. */
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrain|Octree")
     int MinDepth = 4;

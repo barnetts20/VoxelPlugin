@@ -236,7 +236,7 @@ void AAdaptiveVoxelActor::Initialize()
 
     // Build the chunk cut at the shallow floor (MinChunkDepth). Float-precision jitter at
     // this coarse depth is expected and is recovered near the camera by the chunk-cut pass
-    // (FAdaptiveOctree::PromoteChunksNearCamera), which promotes chunks toward MaxChunkDepth
+    // (FAdaptiveOctree::UpdateChunkCut), which promotes chunks toward MaxChunkDepth
     // wherever the surface is close enough for the jitter to be visible.
     {
         ChunkDepth = FMath::Clamp(MinChunkDepth, 2, MaxChunkDepth);
@@ -319,6 +319,7 @@ void AAdaptiveVoxelActor::Initialize()
     PendingParams->ChunkDepth = ChunkDepth;
     PendingParams->MaxChunkDepth = MaxChunkDepth;
     PendingParams->ChunkPrecisionThreshold = ChunkPrecisionThreshold;
+    PendingParams->ChunkDemoteHysteresis = ChunkDemoteHysteresis;
     PendingParams->MinDepth = MinDepth;
     PendingParams->MaxDepth = MaxDepth;
     PendingParams->PrecisionDepthFloor = PrecisionDepthFloor;
@@ -411,7 +412,7 @@ void AAdaptiveVoxelActor::InitializeFromPlanet(TSharedPtr<FDensitySampleComposit
     }
 
     // Build the chunk cut at the shallow floor (MinChunkDepth); precision is recovered
-    // near the camera by PromoteChunksNearCamera.
+    // near the camera by UpdateChunkCut.
     {
         ChunkDepth = FMath::Clamp(MinChunkDepth, 2, MaxChunkDepth);
         MinDepth = FMath::Max(MinDepth, ChunkDepth);
@@ -428,6 +429,7 @@ void AAdaptiveVoxelActor::InitializeFromPlanet(TSharedPtr<FDensitySampleComposit
     PendingParams->ChunkDepth = ChunkDepth;
     PendingParams->MaxChunkDepth = MaxChunkDepth;
     PendingParams->ChunkPrecisionThreshold = ChunkPrecisionThreshold;
+    PendingParams->ChunkDemoteHysteresis = ChunkDemoteHysteresis;
     PendingParams->MinDepth = MinDepth;
     PendingParams->MaxDepth = MaxDepth;
     PendingParams->PrecisionDepthFloor = PrecisionDepthFloor;
@@ -498,10 +500,12 @@ void AAdaptiveVoxelActor::RunDataUpdateTask()
                 Self->LastLodUpdatePosition = Self->CameraPosition;
 
                 // Chunk-cut pass: promote chunks to finer origins where float jitter would
-                // show. Uses the ACTUAL camera position (precision is about where you are,
-                // not where you're heading). New chunks are dirty and flow through the mesh
-                // pass; retired coarse chunks come back in RemovedChunks for GT destruction.
-                Self->AdaptiveOctree->PromoteChunksNearCamera(CurrentCamPos, Self->CameraFOV, RemovedChunks);
+                // show, and demote them back as the camera leaves. Uses the ACTUAL camera
+                // position (precision is about where you are, not where you're heading). New
+                // chunks are dirty and flow through the mesh pass; retired chunks (coarse
+                // parents on promote, fine children on demote) come back in RemovedChunks for
+                // GT destruction.
+                Self->AdaptiveOctree->UpdateChunkCut(CurrentCamPos, Self->CameraFOV, RemovedChunks);
             }
             double elapsed = (FPlatformTime::Seconds() - t0) * 1000.0;
             if (elapsed > DATA_LOG_THRESHOLD) UE_LOG(LogTemp, Log, TEXT("[Pipeline] DataUpdate: %.2fms"), elapsed);

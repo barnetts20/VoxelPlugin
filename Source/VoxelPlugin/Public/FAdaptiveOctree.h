@@ -57,6 +57,13 @@ struct VOXELPLUGIN_API FOctreeParams {
      *  distance. Smaller = promote sooner (finer origins, more components). */
     double ChunkPrecisionThreshold = 5e-4;
 
+    /** Demote hysteresis: a promoted chunk only collapses back once its parent would be
+     *  precise to ChunkPrecisionThreshold * this (< 1 => parent must be comfortably below
+     *  the promote trigger). Combined with the 2x parent/child extent ratio this gives a
+     *  stable dead zone so a chunk on a distance boundary doesn't create/destroy every
+     *  frame. */
+    double ChunkDemoteHysteresis = 0.5;
+
     int MinDepth = 8;
     int MaxDepth = 22;
 
@@ -102,6 +109,7 @@ private:
     int ChunkDepth;
     int MaxChunkDepth;
     double ChunkPrecisionThreshold;
+    double ChunkDemoteHysteresis;
     int PrecisionDepthFloor;
 
     // --- Terrain Parameters (derived from FOctreeParams) ---
@@ -173,17 +181,32 @@ private:
     // Chunk cut (variable-depth chunk roots)
     // =====================================================================
 
-    /** True if this chunk root is too coarse for its viewing distance: its worst-case
-     *  FVector3f jitter (Extent * FLT_EPSILON) would project larger than
-     *  ChunkPrecisionThreshold at the camera's near distance (closest point of the chunk
-     *  AABB, floored). Mirrors the screen-space form of EvaluateSplit. */
-    bool ChunkNeedsFinerPrecision(FAdaptiveOctreeNode* Node, FVector CameraPosition, double FOVScale) const;
+    /** True if the node's worst-case FVector3f jitter (Extent * FLT_EPSILON) would project
+     *  larger than sqrt(ThresholdSq) at the camera's near distance (closest point of the
+     *  node's AABB, floored). Mirrors the screen-space form of EvaluateSplit. Promote uses
+     *  the precision threshold; demote uses a tighter (hysteresis-scaled) threshold on the
+     *  parent so a chunk parked on a distance boundary doesn't thrash. */
+    bool ChunkJitterExceeds(FAdaptiveOctreeNode* Node, FVector CameraPosition, double FOVScale, double ThresholdSq) const;
+
+    /** True if all 8 children of Node exist and are chunk roots -- i.e. Node sits exactly
+     *  one level above the chunk-cut frontier and is a candidate to collapse into. */
+    bool AllChildrenAreChunkRoots(FAdaptiveOctreeNode* Node) const;
+
+    /** Builds and meshes a fresh FMeshChunk whose origin is Node->Center, gathering Node's
+     *  subtree leaves. Shared by promote (per surface child) and demote (the parent). */
+    TSharedPtr<FMeshChunk> BuildMeshChunkFor(FAdaptiveOctreeNode* Node);
 
     /** Promotes one chunk root into its children: retires the coarse chunk (handed to
      *  OutRemovedChunks for game-thread component destruction), marks all 8 children as
      *  chunk roots, and builds + meshes a new FMeshChunk for each surface-bearing child.
      *  Caller must hold the write lock and the node must be a non-leaf chunk root. */
     void PromoteChunk(TSharedPtr<FAdaptiveOctreeNode> ChunkNode, TArray<TSharedPtr<FMeshChunk>>& OutRemovedChunks);
+
+    /** Collapses a parent's 8 chunk-root children back into the parent: retires the child
+     *  chunks (handed to OutRemovedChunks), clears their flags, marks the parent a chunk
+     *  root, and builds + meshes a single FMeshChunk for it (if it bears surface). Caller
+     *  must hold the write lock; the parent must satisfy AllChildrenAreChunkRoots. */
+    void DemoteChunk(TSharedPtr<FAdaptiveOctreeNode> ParentNode, TArray<TSharedPtr<FMeshChunk>>& OutRemovedChunks);
 
     // =====================================================================
     // LOD
@@ -256,13 +279,17 @@ public:
      *  camera distance and screen-space threshold, then rebuilds mesh streams for changed chunks. */
     void UpdateLOD(FVector InCameraPosition, double InScreenSpaceThreshold, double InCameraFOV);
 
-    /** Chunk-cut pass: promotes chunk roots to finer children where float-precision jitter
-     *  would be visible at the camera's near distance, so near-camera chunks get smaller
-     *  origins while far chunks stay coarse. Retired coarse chunks are appended to
-     *  OutRemovedChunks for the caller to destroy on the game thread. New child chunks are
-     *  marked dirty and flow through the normal CollectDirtyChunks/apply path. Caller holds
-     *  the write lock. (Promote-only for now; merge-back is a later pass.) */
-    void PromoteChunksNearCamera(FVector InCameraPosition, double InCameraFOV, TArray<TSharedPtr<FMeshChunk>>& OutRemovedChunks);
+    /** Chunk-cut pass: keeps each chunk root at the depth where its float-precision jitter
+     *  is just sub-pixel at the camera's near distance. Promotes chunks to finer children
+     *  where jitter would show (near the camera) and demotes finer children back into their
+     *  parent once the region is comfortably far (a tighter, hysteresis-scaled threshold on
+     *  the parent prevents thrashing at the boundary). One level of change per chunk per
+     *  pass, so the near-camera funnel refines and the wake collapses gradually. Retired
+     *  chunks (coarse parents on promote, fine children on demote) are appended to
+     *  OutRemovedChunks for the caller to destroy on the game thread; new chunks are marked
+     *  dirty and flow through the normal CollectDirtyChunks/apply path. Caller holds the
+     *  write lock. */
+    void UpdateChunkCut(FVector InCameraPosition, double InCameraFOV, TArray<TSharedPtr<FMeshChunk>>& OutRemovedChunks);
 
     /** Collects all currently-dirty mesh chunks (holding a shared ref to each) into
      *  OutDirtyChunks, for the caller to apply on the game thread under a per-frame
