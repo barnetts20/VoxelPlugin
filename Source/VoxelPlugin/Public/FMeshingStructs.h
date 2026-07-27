@@ -5,6 +5,7 @@
 #pragma once
 
 #include "FAdaptiveOctreeNode.h"
+#include "Misc/ScopeLock.h"
 #include "RealtimeMeshActor.h"
 #include <RealtimeMeshCore.h>
 #include <RealtimeMeshSimple.h>
@@ -116,6 +117,14 @@ struct VOXELPLUGIN_API FMeshChunk {
 
     TSharedPtr<FMeshStreamData> SurfaceMeshData;
 
+    /** Guards ONLY the SurfaceMeshData pointer (the swap in UpdateMeshChunkStreamData vs the
+     *  capture at the top of ApplyToComponent). The stream itself is immutable once
+     *  published -- each re-mesh builds a fresh FMeshStreamData and swaps the pointer -- so
+     *  holding this only around the pointer op (a shared-ptr copy) is enough to stop the game
+     *  thread from tearing the read while a worker re-meshes. Fine-grained: never held across
+     *  meshing or the UpdateSectionGroup push, so it can't stall the game thread. */
+    FCriticalSection MeshDataCS;
+
     bool IsDirty = false;
     bool IsInitialized = false;
 
@@ -153,7 +162,7 @@ struct VOXELPLUGIN_API FMeshChunk {
 
     /** Creates the RealtimeMesh UObject and component, attaches to the parent actor,
      *  and configures collision. Called lazily from ApplyToComponent on the game thread. */
-    void InitializeComponent(ARealtimeMeshActor* InParentActor, USceneComponent* InAttachRoot, UMaterialInterface* InSurfaceMaterial) {
+    void InitializeComponent(ARealtimeMeshActor* InParentActor, USceneComponent* InAttachRoot, UMaterialInterface* InSurfaceMaterial, const FRealtimeMeshSectionGroupKey& InGroupKey) {
         FRealtimeMeshCollisionConfiguration cConfig;
         cConfig.bShouldFastCookMeshes = false;
         cConfig.bUseComplexAsSimpleCollision = true;
@@ -178,7 +187,7 @@ struct VOXELPLUGIN_API FMeshChunk {
         ChunkRtComponent->SetRenderCustomDepth(true);
         ChunkRtComponent->SetVisibleInRayTracing(false);
 
-        ChunkRtMesh->CreateSectionGroup(SurfaceMeshData->MeshGroupKey, FRealtimeMeshStreamSet());
+        ChunkRtMesh->CreateSectionGroup(InGroupKey, FRealtimeMeshStreamSet());
 
         IsInitialized = true;
     }
@@ -217,13 +226,24 @@ struct VOXELPLUGIN_API FMeshChunk {
         // destroy drain will release any component it already had.
         if (bRetired) return;
 
+        // Capture the published stream once under the lock, up front, so nothing below --
+        // including lazy init's section-group create -- can tear the pointer against a
+        // concurrent worker re-mesh. The captured shared ptr keeps that FMeshStreamData
+        // alive and immutable for the whole call.
+        TSharedPtr<FMeshStreamData> SrfData;
+        {
+            FScopeLock Lock(&MeshDataCS);
+            SrfData = SurfaceMeshData;
+        }
+        if (!SrfData) return;
+
         // 1. Lazy Init
         if (!IsInitialized) {
             ARealtimeMeshActor* Parent = CachedParentActor.Get();
             USceneComponent* AttachRoot = CachedMeshAttachRoot.Get();
             UMaterialInterface* SurfaceMaterial = CachedSurfaceMaterial.Get();
             if (!Parent || !AttachRoot || !SurfaceMaterial) return;
-            InitializeComponent(Parent, AttachRoot, SurfaceMaterial);
+            InitializeComponent(Parent, AttachRoot, SurfaceMaterial, SrfData->MeshGroupKey);
         }
 
         // 2. Ensure valid component pointers
@@ -233,17 +253,17 @@ struct VOXELPLUGIN_API FMeshChunk {
         if (!IsDirty) return;
 
         // 3. Surface update
-        auto* SrfTriStream = SurfaceMeshData->MeshStream.Find(FRealtimeMeshStreams::Triangles);
+        auto* SrfTriStream = SrfData->MeshStream.Find(FRealtimeMeshStreams::Triangles);
         int32 SrfNumTris = SrfTriStream ? SrfTriStream->Num() : 0;
         if (SrfNumTris <= 0)
         {
-            MeshPtr->UpdateSectionGroup(SurfaceMeshData->MeshGroupKey, FRealtimeMeshStreamSet());
+            MeshPtr->UpdateSectionGroup(SrfData->MeshGroupKey, FRealtimeMeshStreamSet());
         }
         else
         {
-            MeshPtr->UpdateSectionGroup(SurfaceMeshData->MeshGroupKey, SurfaceMeshData->MeshStream);
+            MeshPtr->UpdateSectionGroup(SrfData->MeshGroupKey, SrfData->MeshStream);
             FRealtimeMeshSectionConfig SrfConfig(0); // material slot 0
-            MeshPtr->UpdateSectionConfig(SurfaceMeshData->MeshSectionKey, SrfConfig, true);
+            MeshPtr->UpdateSectionConfig(SrfData->MeshSectionKey, SrfConfig, true);
         }
 
         IsDirty = false;

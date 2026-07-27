@@ -64,6 +64,15 @@ struct VOXELPLUGIN_API FOctreeParams {
      *  frame. */
     double ChunkDemoteHysteresis = 0.5;
 
+    /** Restricted-octree balance: the largest depth difference allowed between face-adjacent
+     *  chunk roots. The mesher can only stitch a boundary whose leaf sizes differ by <= ~2
+     *  levels, and a chunk floors its leaves at its own depth, so an unbounded chunk-depth
+     *  gap opens cracks. The chunk-cut pass force-promotes a chunk that is more than this
+     *  many levels coarser than a neighbor and refuses a demote that would exceed it. 1 is
+     *  the safe 2:1 balance; 2 allows a steeper (cheaper) funnel and is usually still
+     *  crack-free. */
+    int MaxChunkDepthDelta = 1;
+
     int MinDepth = 8;
     int MaxDepth = 22;
 
@@ -110,6 +119,7 @@ private:
     int MaxChunkDepth;
     double ChunkPrecisionThreshold;
     double ChunkDemoteHysteresis;
+    int MaxChunkDepthDelta;
     int PrecisionDepthFloor;
 
     // --- Terrain Parameters (derived from FOctreeParams) ---
@@ -191,6 +201,21 @@ private:
     /** True if all 8 children of Node exist and are chunk roots -- i.e. Node sits exactly
      *  one level above the chunk-cut frontier and is a candidate to collapse into. */
     bool AllChildrenAreChunkRoots(FAdaptiveOctreeNode* Node) const;
+
+    /** Collects every chunk root in the subtree (surface AND non-surface), stopping at each
+     *  since chunk roots form an anti-chain. The chunk-cut pass iterates this rather than
+     *  ChunkMap: non-surface chunk roots have no FMeshChunk (aren't in ChunkMap) but must
+     *  still be demotable, or a promoted parent with all-non-surface children can never
+     *  collapse and deadlocks the cut. */
+    void CollectAllChunkRoots(FAdaptiveOctreeNode* Node, TArray<TSharedPtr<FAdaptiveOctreeNode>>& Out) const;
+
+    /** True if any chunk root just outside Node's six faces is deeper than DepthThreshold.
+     *  Samples each face at 2^(MaxChunkDepthDelta+1) per axis -- fine enough that a
+     *  delta-violating (>= threshold+1) neighbour can't hide between samples -- and
+     *  short-circuits on the first hit. Used to keep the chunk cut restricted: a chunk more
+     *  than MaxChunkDepthDelta shallower than a neighbour must refine, and a demote that
+     *  would breach the delta is refused. */
+    bool AnyFaceNeighborChunkDeeperThan(FAdaptiveOctreeNode* Node, int DepthThreshold);
 
     /** Builds and meshes a fresh FMeshChunk whose origin is Node->Center, gathering Node's
      *  subtree leaves. Shared by promote (per surface child) and demote (the parent). */

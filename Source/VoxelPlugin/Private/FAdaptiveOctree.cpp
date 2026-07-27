@@ -11,6 +11,7 @@ FAdaptiveOctree::FAdaptiveOctree(const FOctreeParams& Params)
     MaxChunkDepth = Params.MaxChunkDepth;
     ChunkPrecisionThreshold = Params.ChunkPrecisionThreshold;
     ChunkDemoteHysteresis = Params.ChunkDemoteHysteresis;
+    MaxChunkDepthDelta = FMath::Max(1, Params.MaxChunkDepthDelta);
     PrecisionDepthFloor = Params.PrecisionDepthFloor;
 
     // Core terrain parameters from params
@@ -615,7 +616,12 @@ void FAdaptiveOctree::UpdateMeshChunkStreamData(TSharedPtr<FMeshChunk> InChunk)
         SrfPolygroupStream.Set(TriIdx, 0);
         });
 
-    InChunk->SurfaceMeshData = UpdatedSurfaceData;
+    // Publish the freshly-built stream. Under the per-chunk lock so a concurrent game-thread
+    // ApplyToComponent captures either the old or new stream whole, never a torn pointer.
+    {
+        FScopeLock Lock(&InChunk->MeshDataCS);
+        InChunk->SurfaceMeshData = UpdatedSurfaceData;
+    }
 
     InChunk->IsDirty = true;
 }
@@ -660,8 +666,14 @@ void FAdaptiveOctree::UpdateLodRecursive(FAdaptiveOctreeNode* Node, FVector Came
                 GatherLeafEdges(Node->Children[i].Get(), OutNodeEdges, EdgeMap);
             return;
         }
-        else if (Node->Index.LastChild() == 7 && Node->Parent.IsValid())
+        else if (Node->Index.LastChild() == 7 && Node->Parent.IsValid() && !Node->bIsChunkRoot)
         {
+            // NOTE: !Node->bIsChunkRoot is load-bearing. This branch merges Node's PARENT,
+            // destroying all 8 of the parent's children. If Node is a chunk root, its parent
+            // is above the chunk cut and its siblings are the other chunk roots -- merging it
+            // would free live ChunkMap nodes (and, since chunk siblings are LOD'd in parallel,
+            // free nodes other threads are still walking). Coarsening the chunk cut is the
+            // demote pass's job alone; LOD stops at the chunk root, which is the merge floor.
             FAdaptiveOctreeNode* ParentPtr = Node->Parent.Pin().Get();
             if (ParentPtr && ParentPtr->ShouldMerge(CameraPosition, MergeThresholdSq, InFOVScale))
             {
@@ -808,6 +820,55 @@ bool FAdaptiveOctree::AllChildrenAreChunkRoots(FAdaptiveOctreeNode* Node) const
     return true;
 }
 
+void FAdaptiveOctree::CollectAllChunkRoots(FAdaptiveOctreeNode* Node, TArray<TSharedPtr<FAdaptiveOctreeNode>>& Out) const
+{
+    if (!Node) return;
+    if (Node->bIsChunkRoot) { Out.Add(Node->AsShared()); return; }  // anti-chain: nothing deeper is a root
+    if (Node->IsLeaf()) return;
+    for (int i = 0; i < 8; i++)
+        CollectAllChunkRoots(Node->Children[i].Get(), Out);
+}
+
+bool FAdaptiveOctree::AnyFaceNeighborChunkDeeperThan(FAdaptiveOctreeNode* Node, int DepthThreshold)
+{
+    const FVector Ctr = Node->Center;
+    const double  E = Node->Extent;
+    const double  Out = E * 1.01;   // just past the face plane
+
+    // Resolve neighbours finely enough to catch one that VIOLATES the balance delta. A
+    // neighbour up to (delta+1) levels finer than Node has 2^(delta+1) cells across the
+    // face, so sample that many per axis. The old 2x2 (one-level-finer) grid let a small
+    // deep patch hide between samples -> missed skirt / missed demote-refusal -> unstitched
+    // >delta boundary -> cracks.
+    const int    N = 1 << (MaxChunkDepthDelta + 1);
+    const double Cell = (2.0 * E) / (double)N;
+    const double Start = -E + 0.5 * Cell;
+
+    static const FVector FaceNormals[6] = {
+        FVector(1, 0, 0), FVector(-1, 0, 0),
+        FVector(0, 1, 0), FVector(0, -1, 0),
+        FVector(0, 0, 1), FVector(0, 0, -1) };
+
+    for (int f = 0; f < 6; f++)
+    {
+        const FVector Nrm = FaceNormals[f];
+        FVector T1, T2;
+        if (FMath::Abs(Nrm.X) > 0.5) { T1 = FVector(0, 1, 0); T2 = FVector(0, 0, 1); }
+        else if (FMath::Abs(Nrm.Y) > 0.5) { T1 = FVector(1, 0, 0); T2 = FVector(0, 0, 1); }
+        else { T1 = FVector(1, 0, 0); T2 = FVector(0, 1, 0); }
+
+        for (int a = 0; a < N; a++)
+            for (int b = 0; b < N; b++)
+            {
+                const FVector P = Ctr + Nrm * Out + T1 * (Start + a * Cell) + T2 * (Start + b * Cell);
+                if (const FAdaptiveOctreeNode* Nb = GetChunkNodeByPoint(P))
+                    if ((int)Nb->Index.Depth > DepthThreshold)
+                        return true;   // found a delta-violating neighbour; that's all we need
+            }
+    }
+    return false;
+}
+
 TSharedPtr<FMeshChunk> FAdaptiveOctree::BuildMeshChunkFor(FAdaptiveOctreeNode* Node)
 {
     TSharedPtr<FMeshChunk> NewChunk = MakeShared<FMeshChunk>();
@@ -901,11 +962,12 @@ void FAdaptiveOctree::UpdateChunkCut(FVector InCameraPosition, double InCameraFO
     const double PromoteThresholdSq = ChunkPrecisionThreshold * ChunkPrecisionThreshold;
     const double DemoteThresholdSq = FMath::Square(ChunkPrecisionThreshold * ChunkDemoteHysteresis);
 
-    // Snapshot the current chunk roots so we don't iterate a map we're mutating. Each chunk
-    // changes at most one level per pass (a promoted child / demoted parent is re-evaluated
-    // next pass), which spreads refinement + collapse over frames and bounds the work.
+    // Snapshot ALL chunk roots (not just ChunkMap's surface ones) so non-surface chunk
+    // roots can trigger their parent's demote -- otherwise a promoted parent whose children
+    // all came out non-surface never collapses and deadlocks the cut. Each chunk changes at
+    // most one level per pass, spreading the work over frames.
     TArray<TSharedPtr<FAdaptiveOctreeNode>> Chunks;
-    ChunkMap.GenerateKeyArray(Chunks);
+    CollectAllChunkRoots(Root.Get(), Chunks);
 
     // Parents already collapsed this pass, so their (snapshotted) siblings skip the retry.
     TSet<FAdaptiveOctreeNode*> DemotedParents;
@@ -917,9 +979,32 @@ void FAdaptiveOctree::UpdateChunkCut(FVector InCameraPosition, double InCameraFO
 
         const int Depth = (int)C->Index.Depth;
 
-        // --- Promote: too coarse for its near distance, with room to go deeper. ---
-        if (Depth < MaxChunkDepth && !C->IsLeaf() &&
+        // Promotion is only worthwhile if it actually produces a surface (meshable) child;
+        // otherwise it just mints non-surface roots (and, since those demote right back,
+        // oscillates). A chunk with no surface-bearing child has nothing to refine -- it
+        // only participates in demote.
+        bool bHasSurfaceChild = false;
+        if (!C->IsLeaf())
+            for (int i = 0; i < 8; i++)
+            {
+                const FAdaptiveOctreeNode* Ch = C->Children[i].Get();
+                if (Ch && Ch->CouldContainSurface) { bHasSurfaceChild = true; break; }
+            }
+        const bool bCanGoDeeper = bHasSurfaceChild && (Depth < MaxChunkDepth);
+
+        // --- Promote (precision): too coarse for its near distance. ---
+        if (bCanGoDeeper &&
             ChunkJitterExceeds(C.Get(), InCameraPosition, FOVScale, PromoteThresholdSq))
+        {
+            PromoteChunk(C, OutRemovedChunks);
+            continue;
+        }
+
+        // --- Promote (balance): never sit more than MaxChunkDepthDelta levels coarser than
+        //     a face neighbour, or the leaf floors differ too much for the mesher to stitch
+        //     and the boundary cracks. Force-refine toward the finer neighbour. ---
+        if (bCanGoDeeper &&
+            AnyFaceNeighborChunkDeeperThan(C.Get(), Depth + MaxChunkDepthDelta))
         {
             PromoteChunk(C, OutRemovedChunks);
             continue;
@@ -929,10 +1014,16 @@ void FAdaptiveOctree::UpdateChunkCut(FVector InCameraPosition, double InCameraFO
         //     (one step coarser) is comfortably precise by the tighter demote threshold. ---
         TSharedPtr<FAdaptiveOctreeNode> Parent = C->Parent.Pin();
         if (!Parent.IsValid()) continue;
-        if ((int)Parent->Index.Depth < ChunkDepth) continue;         // never collapse below the build floor
+        const int ParentDepth = (int)Parent->Index.Depth;
+        if (ParentDepth < ChunkDepth) continue;                      // never collapse below the build floor
         if (DemotedParents.Contains(Parent.Get())) continue;
         if (!AllChildrenAreChunkRoots(Parent.Get())) continue;       // must be the frontier
         if (ChunkJitterExceeds(Parent.Get(), InCameraPosition, FOVScale, DemoteThresholdSq)) continue; // parent still needs the detail
+
+        // Balance: don't coarsen if it would leave the parent more than MaxChunkDepthDelta
+        // levels shallower than a still-fine neighbour (that's the crack we're avoiding).
+        // The finer neighbour collapses first; this parent follows on a later pass.
+        if (AnyFaceNeighborChunkDeeperThan(Parent.Get(), ParentDepth + MaxChunkDepthDelta)) continue;
 
         DemoteChunk(Parent, OutRemovedChunks);
         DemotedParents.Add(Parent.Get());

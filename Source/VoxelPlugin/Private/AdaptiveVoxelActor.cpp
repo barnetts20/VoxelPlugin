@@ -320,6 +320,7 @@ void AAdaptiveVoxelActor::Initialize()
     PendingParams->MaxChunkDepth = MaxChunkDepth;
     PendingParams->ChunkPrecisionThreshold = ChunkPrecisionThreshold;
     PendingParams->ChunkDemoteHysteresis = ChunkDemoteHysteresis;
+    PendingParams->MaxChunkDepthDelta = MaxChunkDepthDelta;
     PendingParams->MinDepth = MinDepth;
     PendingParams->MaxDepth = MaxDepth;
     PendingParams->PrecisionDepthFloor = PrecisionDepthFloor;
@@ -430,6 +431,7 @@ void AAdaptiveVoxelActor::InitializeFromPlanet(TSharedPtr<FDensitySampleComposit
     PendingParams->MaxChunkDepth = MaxChunkDepth;
     PendingParams->ChunkPrecisionThreshold = ChunkPrecisionThreshold;
     PendingParams->ChunkDemoteHysteresis = ChunkDemoteHysteresis;
+    PendingParams->MaxChunkDepthDelta = MaxChunkDepthDelta;
     PendingParams->MinDepth = MinDepth;
     PendingParams->MaxDepth = MaxDepth;
     PendingParams->PrecisionDepthFloor = PrecisionDepthFloor;

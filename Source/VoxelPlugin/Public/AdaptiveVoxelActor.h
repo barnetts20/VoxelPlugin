@@ -141,6 +141,13 @@ public:
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrain|Octree", meta = (ClampMin = "0.05", ClampMax = "1.0"))
     double ChunkDemoteHysteresis = 0.5;
 
+    /** Restricted-octree balance: largest depth gap allowed between face-adjacent chunks.
+     *  Chunks force-refine (and demotes are refused) to hold this, preventing the >2-level
+     *  boundaries the mesher can't stitch. 1 = strict 2:1 balance (most components, safest);
+     *  2 = steeper funnel / fewer components, usually still crack-free. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrain|Octree", meta = (ClampMin = "1", ClampMax = "2"))
+    int MaxChunkDepthDelta = 1;
+
     /** Minimum subdivision depth maintained regardless of camera distance. */
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrain|Octree")
     int MinDepth = 4;
