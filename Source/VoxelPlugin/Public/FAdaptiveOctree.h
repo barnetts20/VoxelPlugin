@@ -316,6 +316,13 @@ public:
      *  write lock. */
     void UpdateChunkCut(FVector InCameraPosition, double InCameraFOV, TArray<TSharedPtr<FMeshChunk>>& OutRemovedChunks);
 
+    /** Distance-gated collision pass: sets each surface chunk's desired collision from its
+     *  near distance to the camera, with hysteresis (on below CollisionOnDist, off above
+     *  CollisionOffDist). Chunks whose desired state changed from what's applied are appended
+     *  to OutChanged for the game thread to flip. Only near chunks end up cooking a body, so
+     *  the cooked set follows the player and stays bounded. Caller holds the read/write lock. */
+    void UpdateChunkCollision(FVector InCameraPosition, double CollisionOnDist, double CollisionOffDist, TArray<TSharedPtr<FMeshChunk>>& OutChanged);
+
     /** Collects all currently-dirty mesh chunks (holding a shared ref to each) into
      *  OutDirtyChunks, for the caller to apply on the game thread under a per-frame
      *  throttle. Replaces the old UpdateMesh, which pushed every dirty chunk to the game

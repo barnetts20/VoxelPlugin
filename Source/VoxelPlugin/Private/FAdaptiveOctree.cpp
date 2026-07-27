@@ -1030,6 +1030,40 @@ void FAdaptiveOctree::UpdateChunkCut(FVector InCameraPosition, double InCameraFO
     }
 }
 
+void FAdaptiveOctree::UpdateChunkCollision(FVector InCameraPosition, double CollisionOnDist, double CollisionOffDist, TArray<TSharedPtr<FMeshChunk>>& OutChanged)
+{
+    if (!MeshChunksInitialized) return;
+
+    const double OnSq = CollisionOnDist * CollisionOnDist;
+    const double OffSq = CollisionOffDist * CollisionOffDist;
+
+    for (const auto& It : ChunkMap)
+    {
+        const TSharedPtr<FAdaptiveOctreeNode>& Node = It.Key;
+        const TSharedPtr<FMeshChunk>& Chunk = It.Value;
+        if (!Node.IsValid() || !Chunk.IsValid()) continue;
+
+        // Near distance to the chunk's AABB (same quantity the jitter test uses).
+        const FVector C = Node->Center;
+        const double  E = Node->Extent;
+        const FVector Closest(
+            FMath::Clamp(InCameraPosition.X, C.X - E, C.X + E),
+            FMath::Clamp(InCameraPosition.Y, C.Y - E, C.Y + E),
+            FMath::Clamp(InCameraPosition.Z, C.Z - E, C.Z + E));
+        const double NearSq = FVector::DistSquared(Closest, InCameraPosition);
+
+        // Hysteresis: on below OnDist, off above OffDist, hold in between so a chunk pacing
+        // along the threshold (e.g. a ship at constant altitude) doesn't cook/uncook.
+        bool Want = Chunk->bWantsCollision;
+        if (NearSq < OnSq)       Want = true;
+        else if (NearSq > OffSq) Want = false;
+
+        Chunk->bWantsCollision = Want;
+        if (Chunk->bWantsCollision != Chunk->bCollisionActive)
+            OutChanged.Add(Chunk);
+    }
+}
+
 void FAdaptiveOctree::GatherLeafEdges(FAdaptiveOctreeNode* Node, TArray<FNodeEdge>& OutEdges, TMap<FEdgeKey, int32>& EdgeMap)
 {
     if (!Node) return;

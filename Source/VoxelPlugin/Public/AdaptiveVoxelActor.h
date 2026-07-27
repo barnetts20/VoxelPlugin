@@ -148,6 +148,29 @@ public:
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrain|Octree", meta = (ClampMin = "1", ClampMax = "2"))
     int MaxChunkDepthDelta = 1;
 
+    /** Master switch for distance-gated surface collision. When off, no chunk cooks a
+     *  collision body (pure render performance). When on, only chunks within the
+     *  speed-scaled lead distance cook + enable query collision. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrain|Collision")
+    bool bEnableSurfaceCollision = true;
+
+    /** Collision shell kept underfoot regardless of speed (cm). Sized for walking/hovering.
+     *  ~75 m by default. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrain|Collision", meta = (ClampMin = "0"))
+    double WalkBaseCollisionDistance = 7500.0;
+
+    /** Seconds of lead the collision shell extends ahead per unit speed: CollisionDistance =
+     *  WalkBase + Speed * this. Covers the worst-case cook latency (data-pass interval +
+     *  async cook + a frame or two) so a chunk is queryable before you reach it at speed.
+     *  At 5 km/s this adds ~1.5 km of lead. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrain|Collision", meta = (ClampMin = "0"))
+    double CollisionCookLeadTime = 0.3;
+
+    /** Hysteresis on the collision distance: collision turns on at CollisionDistance, off at
+     *  this multiple of it, so a chunk sitting on the boundary doesn't cook/uncook. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrain|Collision", meta = (ClampMin = "1.0", ClampMax = "3.0"))
+    double CollisionHysteresis = 1.3;
+
     /** Minimum subdivision depth maintained regardless of camera distance. */
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrain|Octree")
     int MinDepth = 4;
@@ -284,6 +307,17 @@ protected:
      *  by PendingApplyCS (same low-contention queue family as PendingApply). */
     TArray<TSharedPtr<FMeshChunk>> PendingDestroy;
 
+    /** Chunks whose desired collision state changed (set by the collision pass on a worker).
+     *  Drained on the game thread to flip SetCollisionEnabled / re-cook. Guarded by
+     *  PendingApplyCS. */
+    TArray<TSharedPtr<FMeshChunk>> PendingCollision;
+
+    /** Smoothed player speed (cm/s) from camera-position deltas, updated in Tick. Drives the
+     *  speed-scaled collision lead distance. */
+    double PlayerSpeed = 0.0;
+    FVector PrevSpeedSamplePos = FVector::ZeroVector;
+    bool bHasSpeedSample = false;
+
     /** Destroys all RealtimeMesh components attached to MeshAttachmentRoot. */
     void CleanSceneRoot();
 
@@ -310,6 +344,10 @@ protected:
      *  pass. Called from Tick after DrainPendingApply. No octree lock needed (touches only
      *  the retired chunks' own components). */
     void DrainPendingDestroy();
+
+    /** Game-thread: flips SetCollisionEnabled / re-cooks for chunks whose desired collision
+     *  changed. Called from Tick. No octree lock needed. */
+    void DrainPendingCollision();
 
     /** Background task: applies a spherical brush edit, reconstructs affected subtrees,
      *  and pushes updated meshes. Runs independently of the Data/Mesh chain. */

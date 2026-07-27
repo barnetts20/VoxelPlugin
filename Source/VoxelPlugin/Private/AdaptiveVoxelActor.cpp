@@ -47,6 +47,7 @@ void AAdaptiveVoxelActor::BeginDestroy()
         FScopeLock Lock(&PendingApplyCS);
         PendingApply.Empty();
         PendingDestroy.Empty();
+        PendingCollision.Empty();
     }
 
     FRWScopeLock WriteLock(OctreeLock, SLT_Write);
@@ -200,6 +201,7 @@ void AAdaptiveVoxelActor::Initialize()
         FScopeLock Lock(&PendingApplyCS);
         PendingApply.Empty();
         PendingDestroy.Empty();
+        PendingCollision.Empty();
     }
 
     // Now clean up any components that were already attached
@@ -387,6 +389,7 @@ void AAdaptiveVoxelActor::InitializeFromPlanet(TSharedPtr<FDensitySampleComposit
         FScopeLock Lock(&PendingApplyCS);
         PendingApply.Empty();
         PendingDestroy.Empty();
+        PendingCollision.Empty();
     }
 
     CleanSceneRoot();
@@ -485,6 +488,7 @@ void AAdaptiveVoxelActor::RunDataUpdateTask()
 
             double t0 = FPlatformTime::Seconds();
             TArray<TSharedPtr<FMeshChunk>> RemovedChunks;
+            TArray<TSharedPtr<FMeshChunk>> CollisionChanges;
             {
                 FRWScopeLock WriteLock(Self->OctreeLock, SLT_Write);
                 FVector CurrentCamPos = Self->CameraPosition;
@@ -508,14 +512,23 @@ void AAdaptiveVoxelActor::RunDataUpdateTask()
                 // parents on promote, fine children on demote) come back in RemovedChunks for
                 // GT destruction.
                 Self->AdaptiveOctree->UpdateChunkCut(CurrentCamPos, Self->CameraFOV, RemovedChunks);
+
+                // Collision pass: decide which chunks should carry a collision body based on
+                // near distance + the speed-scaled lead, so the cooked set follows the player.
+                const double OnDist = Self->bEnableSurfaceCollision
+                    ? (Self->WalkBaseCollisionDistance + Self->PlayerSpeed * Self->CollisionCookLeadTime)
+                    : 0.0;
+                const double OffDist = OnDist * Self->CollisionHysteresis;
+                Self->AdaptiveOctree->UpdateChunkCollision(CurrentCamPos, OnDist, OffDist, CollisionChanges);
             }
             double elapsed = (FPlatformTime::Seconds() - t0) * 1000.0;
             if (elapsed > DATA_LOG_THRESHOLD) UE_LOG(LogTemp, Log, TEXT("[Pipeline] DataUpdate: %.2fms"), elapsed);
 
-            if (RemovedChunks.Num() > 0)
+            if (RemovedChunks.Num() > 0 || CollisionChanges.Num() > 0)
             {
                 FScopeLock Lock(&Self->PendingApplyCS);
-                Self->PendingDestroy.Append(MoveTemp(RemovedChunks));
+                if (RemovedChunks.Num() > 0)     Self->PendingDestroy.Append(MoveTemp(RemovedChunks));
+                if (CollisionChanges.Num() > 0)  Self->PendingCollision.Append(MoveTemp(CollisionChanges));
             }
 
             Self->DataUpdateIsRunning = false;
@@ -688,6 +701,27 @@ void AAdaptiveVoxelActor::DrainPendingDestroy()
     }
 }
 
+void AAdaptiveVoxelActor::DrainPendingCollision()
+{
+    if (IsDestroyed) return;
+
+    TArray<TSharedPtr<FMeshChunk>> ToProcess;
+    {
+        FScopeLock Lock(&PendingApplyCS);
+        if (PendingCollision.Num() == 0) return;
+        ToProcess = MoveTemp(PendingCollision);
+    }
+
+    // Few chunks cross the collision threshold per pass, so this is drained fully rather
+    // than time-sliced. RealtimeMesh async-cooks, so the flip itself is cheap; the cook cost
+    // is amortized by the async worker and covered by the lead distance.
+    for (const TSharedPtr<FMeshChunk>& Chunk : ToProcess)
+    {
+        if (Chunk.IsValid() && !Chunk->bRetired && Chunk->bWantsCollision != Chunk->bCollisionActive)
+            Chunk->SetCollisionActive(Chunk->bWantsCollision);
+    }
+}
+
 void AAdaptiveVoxelActor::RunEditUpdateTask(FVector InEditCenter, double InEditRadius, double InEditStrength, int InEditResolution)
 {
     if (EditUpdateIsRunning || IsDestroyed) return;
@@ -738,6 +772,9 @@ void AAdaptiveVoxelActor::Tick(float DeltaTime)
     // so the finer replacement chunks get a chance to appear first.
     DrainPendingDestroy();
 
+    // Flip collision on/off for chunks the collision pass re-gated (cook + query).
+    DrainPendingCollision();
+
     // Cache cam data
     auto world = GetWorld();
     if (world != nullptr)
@@ -750,6 +787,16 @@ void AAdaptiveVoxelActor::Tick(float DeltaTime)
             FVector WorldCamPos = viewLocations[0];
             FTransform NoScaleTransform(GetActorRotation(), GetActorLocation());
             this->CameraPosition = NoScaleTransform.InverseTransformPosition(WorldCamPos);
+
+            // Smoothed player speed (cm/s) for the collision lead distance. Smoothing avoids
+            // a single stutter frame briefly inflating the collision shell.
+            if (bHasSpeedSample && DeltaTime > KINDA_SMALL_NUMBER)
+            {
+                const double Inst = (CameraPosition - PrevSpeedSamplePos).Size() / DeltaTime;
+                PlayerSpeed = FMath::FInterpTo(PlayerSpeed, Inst, DeltaTime, 4.0);
+            }
+            PrevSpeedSamplePos = CameraPosition;
+            bHasSpeedSample = true;
 
             APlayerCameraManager* CamManager = UGameplayStatics::GetPlayerCameraManager(world, 0);
             if (CamManager)

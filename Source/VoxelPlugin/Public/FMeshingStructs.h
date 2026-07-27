@@ -145,6 +145,46 @@ struct VOXELPLUGIN_API FMeshChunk {
      *  opens a hole. Cleared when the chunk is finally released. */
     TArray<TSharedPtr<FMeshChunk>> ReplacedBy;
 
+    /** Distance-gated collision. bWantsCollision is the desired state, set on a worker by
+     *  the collision pass from the player's distance to this chunk; bCollisionActive is what
+     *  the game thread last applied. Only near chunks cook a collision body -- that's the
+     *  perf win, since cooking (complex-as-simple) was the cost, not the query. Far / flight
+     *  chunks carry no body at all. */
+    bool bWantsCollision = false;
+    bool bCollisionActive = false;
+
+    /** True once a non-empty UpdateSectionGroup has actually created the poly-group section.
+     *  Empty chunks (no triangles) never create one, so touching its config would throw
+     *  "Failed to find Section". Guards the collision config call. */
+    bool bHasSection = false;
+
+    /** Game thread: bring the component's collision in line with bEnable. Re-marks the
+     *  render section for complex-collision cooking (or drops it) and toggles query
+     *  collision. RealtimeMesh async-cooks, so enabling isn't instant -- the speed-scaled
+     *  lead distance is what covers that latency. No-op until the component exists. */
+    void SetCollisionActive(bool bEnable) {
+        URealtimeMeshSimple* Mesh = ChunkRtMesh.Get();
+        URealtimeMeshComponent* Comp = ChunkRtComponent.Get();
+        if (!Mesh || !Comp) { bWantsCollision = bEnable; return; }
+
+        // Only re-mark the section for cooking if it actually exists. Empty chunks have no
+        // section; their collision is moot and configuring it would throw. When such a chunk
+        // later gains geometry, ApplyToComponent's non-empty branch sets the cook flag then.
+        if (bHasSection)
+        {
+            FRealtimeMeshSectionKey SectionKey;
+            {
+                FScopeLock Lock(&MeshDataCS);
+                if (!SurfaceMeshData) return;
+                SectionKey = SurfaceMeshData->MeshSectionKey;
+            }
+            FRealtimeMeshSectionConfig Config(0);
+            Mesh->UpdateSectionConfig(SectionKey, Config, bEnable); // 3rd arg = bShouldCreateCollision
+        }
+        Comp->SetCollisionEnabled(bEnable ? ECollisionEnabled::QueryAndPhysics : ECollisionEnabled::NoCollision);
+        bCollisionActive = bEnable;
+    }
+
     TWeakObjectPtr<URealtimeMeshSimple> ChunkRtMesh;
     TWeakObjectPtr<URealtimeMeshComponent> ChunkRtComponent;
     FRealtimeMeshLODKey LODKey = FRealtimeMeshLODKey(0);
@@ -258,12 +298,21 @@ struct VOXELPLUGIN_API FMeshChunk {
         if (SrfNumTris <= 0)
         {
             MeshPtr->UpdateSectionGroup(SrfData->MeshGroupKey, FRealtimeMeshStreamSet());
+            bHasSection = false; // empty stream clears the poly-group section
         }
         else
         {
             MeshPtr->UpdateSectionGroup(SrfData->MeshGroupKey, SrfData->MeshStream);
+            bHasSection = true; // the poly-group section now exists
             FRealtimeMeshSectionConfig SrfConfig(0); // material slot 0
-            MeshPtr->UpdateSectionConfig(SrfData->MeshSectionKey, SrfConfig, true);
+            // 3rd arg is bShouldCreateCollision -- gated on distance so only near chunks
+            // cook. Keeps collision correct across a re-mesh without a separate pass.
+            MeshPtr->UpdateSectionConfig(SrfData->MeshSectionKey, SrfConfig, bWantsCollision);
+            if (bCollisionActive != bWantsCollision)
+            {
+                CompPtr->SetCollisionEnabled(bWantsCollision ? ECollisionEnabled::QueryAndPhysics : ECollisionEnabled::NoCollision);
+                bCollisionActive = bWantsCollision;
+            }
         }
 
         IsDirty = false;
