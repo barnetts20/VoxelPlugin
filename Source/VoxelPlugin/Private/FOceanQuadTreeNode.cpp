@@ -30,6 +30,10 @@ void FOceanMeshChunk::InitializeComponent(AOceanSphereActor* InOwner)
     ChunkRtMesh->SetupMaterialSlot(0, "OceanMaterial");
 
     ChunkRtComponent = NewObject<URealtimeMeshComponent>(InOwner, URealtimeMeshComponent::StaticClass());
+    // Real geometry: rendered by the main camera only, excluded from the virtual
+    // backdrop SceneCapture. Set before RegisterComponent so it's baked into the
+    // scene proxy at creation.
+    ChunkRtComponent->bHiddenInSceneCapture = true;
     ChunkRtComponent->RegisterComponent();
     ChunkRtComponent->SetMaterial(0, InOwner->OceanMaterial);
     ChunkRtComponent->SetMobility(EComponentMobility::Movable);

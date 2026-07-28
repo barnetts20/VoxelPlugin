@@ -214,6 +214,10 @@ struct VOXELPLUGIN_API FMeshChunk {
         ChunkRtMesh->SetupMaterialSlot(0, "Surface Material");
 
         ChunkRtComponent = NewObject<URealtimeMeshComponent>(InParentActor, URealtimeMeshComponent::StaticClass());
+        // Real geometry: rendered by the main camera only, excluded from the virtual
+        // backdrop SceneCapture. Set before RegisterComponent so it's baked into the
+        // scene proxy at creation.
+        ChunkRtComponent->bHiddenInSceneCapture = true;
         ChunkRtComponent->RegisterComponent();
 
         ChunkRtComponent->SetMaterial(0, InSurfaceMaterial);
