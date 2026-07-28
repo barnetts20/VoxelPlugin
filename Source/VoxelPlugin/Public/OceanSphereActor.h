@@ -80,7 +80,7 @@ public:
 
     /** Minimum subdivision depth maintained regardless of camera distance. */
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Ocean|LOD")
-    int32 MinDepth = 3;
+    int32 MinDepth = 4;
 
     /** Target vertex spacing in world units (cm). MaxDepth is computed automatically
      *  so the finest LOD achieves roughly this spacing between adjacent vertices. */
@@ -125,7 +125,7 @@ public:
      *  values extend the mesh skirt above the waterline to prevent WPO waves from
      *  exposing gaps. e.g. -50000 = keep triangles up to 500m above the ocean surface. */
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Ocean|Culling")
-    float TriangleCullDepthThreshold = -10000.f;
+    float TriangleCullDepthThreshold = -50000.f;
 
     // --- Public Accessors ---
 

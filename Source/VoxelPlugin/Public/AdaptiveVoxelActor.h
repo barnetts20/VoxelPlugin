@@ -125,7 +125,7 @@ public:
      *  planet wants ~12-14 for sub-mm); lower it to cap near-camera component count. Must
      *  be <= MaxDepth. */
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrain|Octree", meta = (ClampMin = "2"))
-    int MaxChunkDepth = 10;
+    int MaxChunkDepth = 14;
 
     /** Screen-space tolerance for chunk float jitter (fraction of the view). A chunk
      *  promotes when its worst-case FVector3f jitter would project larger than this at the
@@ -173,7 +173,7 @@ public:
 
     /** Minimum subdivision depth maintained regardless of camera distance. */
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrain|Octree")
-    int MinDepth = 4;
+    int MinDepth = 5;
 
     /** Target voxel spacing in world units (cm). MaxDepth is computed automatically
      *  so the finest LOD voxel cells are approximately this size. */
