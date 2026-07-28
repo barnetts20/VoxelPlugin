@@ -444,22 +444,6 @@ void AAdaptiveVoxelActor::InitializeFromPlanet(TSharedPtr<FDensitySampleComposit
     RunDataUpdateTask();
 }
 
-void AAdaptiveVoxelActor::SetCheapMode(bool bInCheap)
-{
-    const bool bWas = bCheapMode.exchange(bInCheap);
-    if (bWas == bInCheap) return;   // only act on transitions
-
-    // Leaving cheap mode: kick a full-detail pass now rather than waiting out the
-    // slow cheap heartbeat. Entering needs no kick -- the next scheduled pass reads
-    // the flag and settles the octree to MinDepth.
-    if (bWas && !bInCheap && Initialized && !IsDestroyed)
-    {
-        if (UWorld* W = GetWorld())
-            W->GetTimerManager().ClearTimer(DataUpdateTimerHandle);
-        RunDataUpdateTask();
-    }
-}
-
 void AAdaptiveVoxelActor::RunDataUpdateTask()
 {
     if (DataUpdateIsRunning || IsDestroyed) return;
@@ -495,14 +479,7 @@ void AAdaptiveVoxelActor::RunDataUpdateTask()
                 FVector Velocity = (CurrentCamPos - Self->LastLodUpdatePosition);
                 FVector PredictedPos = CurrentCamPos + (Velocity * Self->VelocityLookAheadFactor);
 
-                // Cheap mode: pass a huge screen-space threshold so EvaluateSplit's
-                // screen-space test can never fire and EvaluateMerge's always does.
-                // The forced "Depth < MinDepth" split and the MinDepth/ChunkDepth floor
-                // guards stay intact, so the octree settles at MinDepth and holds. 1e18
-                // squares to 1e36 internally, clearing the largest lhs^2 by many orders.
-                const double EffThreshold = Self->ScreenSpaceThreshold;
-                // const double EffThreshold = Self->bCheapMode.load() ? 1e18 : Self->ScreenSpaceThreshold;
-                Self->AdaptiveOctree->UpdateLOD(PredictedPos, EffThreshold, Self->CameraFOV);
+                Self->AdaptiveOctree->UpdateLOD(PredictedPos, Self->ScreenSpaceThreshold, Self->CameraFOV);
                 Self->LastLodUpdatePosition = Self->CameraPosition;
 
                 // Chunk-cut pass: promote chunks to finer origins where float jitter would

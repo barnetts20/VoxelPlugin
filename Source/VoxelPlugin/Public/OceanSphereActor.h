@@ -111,11 +111,6 @@ public:
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Ocean|LOD")
     double MinLodInterval = 0.05;
 
-    /** LOD heartbeat interval (seconds) while in cheap mode. Passes are near-no-op
-     *  once the tree has settled at MinDepth, so we run them less often. */
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Ocean|LOD")
-    double CheapLodInterval = 0.25;
-
     /** Multiplier on camera velocity for predictive LOD. */
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Ocean|LOD")
     double VelocityLookAheadFactor = 2.0;
@@ -169,13 +164,6 @@ public:
         USceneComponent* InAttachParent = nullptr,
         FVector InScale = FVector::ZeroVector);
 
-    /** Cheap mode: while active, the LOD pass suppresses screen-space splits and
-     *  forces merges, so the quadtree settles at MinDepth and holds there regardless
-     *  of camera/planet motion (used during parallax travel at SpeedScale != 1).
-     *  Set by APlanetActor. On the true->false transition the LOD pass is kicked
-     *  immediately so full detail resumes without waiting on the slow heartbeat. */
-    void SetCheapMode(bool bInCheap);
-
     /** Tears down the current quadtree and rebuilds from scratch. */
     void Initialize();
 
@@ -225,10 +213,6 @@ private:
      *  so in-flight async tasks from a previous generation can detect they're stale
      *  and exit without touching the new tree state. */
     std::atomic<uint32> InitGeneration = 0;
-
-    /** When true, the LOD pass runs in cheap mode (settle at MinDepth, no further
-     *  split/merge work). Read at the start of each LOD pass. */
-    std::atomic<bool>   bCheapMode = false;
 
     /** True from the start of InitializeInternal until the async initial build task
      *  publishes the tree. Read on the game thread (OnConstruction) to prevent

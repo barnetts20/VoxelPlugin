@@ -177,16 +177,6 @@ void APlanetActor::Initialize()
 
     SpawnChildActors();
 
-    // Sync the just-created children to the planet's current cheap-mode state BEFORE
-    // their InitializeFromPlanet below kicks the first LOD pass. Without this, a planet
-    // spawned while already moving (SpeedScale != 1) latches bCheapMode=true on the
-    // planet before the children existed, and the transition guard in SetCheapMode then
-    // never re-forwards it -- so the children would run full LOD during parallax travel.
-    // Children persist their own cheap flag across later re-inits, so this first sync is
-    // the one that matters; repeating it on every Initialize() is harmless.
-    if (TerrainActor) TerrainActor->SetCheapMode(bCheapMode);
-    if (OceanActor)   OceanActor->SetCheapMode(bCheapMode);
-
     // Build the shared noise + compositor
     Noise = FastNoise::NewFromEncodedNodeTree(
         "GQAgAB8AEwCamRk+DQAMAAAAAAAAQAcAAAAAAD8AAAAAAAAAAAA/AAAAAD8AAAAAvwAAAAA/"
@@ -278,26 +268,6 @@ void APlanetActor::Initialize()
     bLastEnableAtmosphere = bEnableAtmosphere;
     bLastEnableGravity = bEnableGravity;
     bInitialized = true;
-}
-
-// ---------------------------------------------------------------------------
-// Cheap mode
-// ---------------------------------------------------------------------------
-
-void APlanetActor::SetCheapMode(bool bInCheap)
-{
-    if (bInCheap == bCheapMode) return;   // transitions only
-    bCheapMode = bInCheap;
-
-    UE_LOG(LogTemp, Log, TEXT("[Planet] %s cheap mode %s (terrain=%s ocean=%s)"),
-        *GetName(), bInCheap ? TEXT("ON") : TEXT("OFF"),
-        TerrainActor ? TEXT("y") : TEXT("null"),
-        OceanActor ? TEXT("y") : TEXT("null"));
-
-    // Forward to the LOD-driven children. Atmosphere step-count scaling is handled
-    // separately (phase 2). GravityZone has no LOD work, so it's unaffected.
-    if (TerrainActor) TerrainActor->SetCheapMode(bInCheap);
-    if (OceanActor)   OceanActor->SetCheapMode(bInCheap);
 }
 
 // ---------------------------------------------------------------------------

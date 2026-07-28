@@ -194,22 +194,6 @@ void AOceanSphereActor::InitializeFromPlanet(TSharedPtr<FDensitySampleCompositor
     InitializeInternal(InCompositor);
 }
 
-void AOceanSphereActor::SetCheapMode(bool bInCheap)
-{
-    const bool bWas = bCheapMode.exchange(bInCheap);
-    if (bWas == bInCheap) return;   // only act on transitions
-
-    // Leaving cheap mode: kick a full-detail LOD pass right away instead of
-    // waiting out the slow cheap heartbeat. Entering cheap mode needs no kick --
-    // the next scheduled pass reads the flag and settles the tree to MinDepth.
-    if (bWas && !bInCheap && bInitialized && !bIsDestroyed)
-    {
-        if (UWorld* W = GetWorld())
-            W->GetTimerManager().ClearTimer(LodTimerHandle);
-        RunLodUpdateTask();
-    }
-}
-
 void AOceanSphereActor::InitializeInternal(TSharedPtr<FDensitySampleCompositor> InCompositor)
 {
     bIsInitializing = true;
@@ -741,19 +725,6 @@ void AOceanSphereActor::RunLodUpdateTask()
             double ThresholdSq = Self->ScreenSpaceThreshold * Self->ScreenSpaceThreshold;
             double MergeThresholdSq = (Self->ScreenSpaceThreshold * 0.5) * (Self->ScreenSpaceThreshold * 0.5);
 
-            // Cheap mode: make the screen-space split test impossible to satisfy and
-            // the merge test always satisfied. The forced "Depth < MinDepth" split and
-            // the MinDepth/ChunkDepth floor guards in ShouldSplit/ShouldMerge are left
-            // intact, so the tree converges to exactly MinDepth and holds there --
-            // no deep subdivision, no re-meshing on motion. 1e36 clears the largest
-            // possible lhs^2 by many orders while staying far below double overflow.
-            //const bool bCheap = Self->bCheapMode.load();
-            //if (bCheap)
-            //{
-            //    ThresholdSq = 1e36;        // lhs^2 > (1e36 * DistSq) never true  -> no screen-space split
-            //    MergeThresholdSq = 1e36;   // lhs^2 < (1e36 * DistSq) always true -> merge above MinDepth
-            //}
-
             TArray<TSharedPtr<FOceanQuadTreeNode>> ChunkNodes;
             TArray<TSharedPtr<FOceanMeshChunk>>    MeshChunks;
             TSharedPtr<FDensitySampleCompositor>   CompPin;
@@ -940,7 +911,6 @@ void AOceanSphereActor::RunLodUpdateTask()
                             Self->LodTimerHandle, Self,
                             &AOceanSphereActor::RunLodUpdateTask,
                             (float)Self->MinLodInterval, false);
-                    // (float)(Self->bCheapMode.load() ? Self->CheapLodInterval : Self->MinLodInterval), false);
                 });
 
         }, TStatId(), nullptr, ENamedThreads::AnyNormalThreadHiPriTask);
