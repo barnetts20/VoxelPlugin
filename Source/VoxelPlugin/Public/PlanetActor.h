@@ -17,6 +17,7 @@
 #include "OceanSphereActor.h"
 #include "FDensitySampleCompositor.h"
 #include "FastNoise/FastNoise.h"
+#include "PooledActor.h"
 #include "PlanetActor.generated.h"
 
 class APlanetAtmosphereActor;
@@ -35,7 +36,7 @@ class APlanetGravityZone;
  *    - bPendingInitialize: full rebuild (scale, NAR changes)
  *    - bPendingOceanUpdate: ocean/atmosphere toggle or sea level change only */
 UCLASS()
-class VOXELPLUGIN_API APlanetActor : public AActor
+class VOXELPLUGIN_API APlanetActor : public AActor, public IPooledActor, public IStarLit
 {
     GENERATED_BODY()
 
@@ -103,6 +104,22 @@ public:
     virtual void BeginDestroy() override;
     virtual bool ShouldTickIfViewportsOnly() const override { return true; }
     virtual void Tick(float DeltaTime) override;
+
+    // IPooledActor as a proxy-CARRIED body -- driven only by the wrapping proxy,
+    // never registered with the pool manager (so the arg-less OnAcquired() is unused).
+    using IPooledActor::OnAcquired;   // un-hide the arg-less overload we don't implement
+    virtual void OnAcquired(double WorldRadius) override;
+    virtual void OnReturnToPool() override;
+
+    // IStarLit -- the star system pushes its star's world position each frame so the
+    // atmosphere can aim its directional light + raymarch at the star.
+    virtual void SetStarWorldPosition(const FVector& StarWorldPos) override;
+
+    /** Master dormancy toggle: hides + tick-disables this actor and all four child
+     *  actors (terrain/ocean/atmosphere/gravity), disables the atmosphere post-process
+     *  volume, and drops collision. A dormant planet does NO per-frame CPU or GPU work.
+     *  Waking respects the bEnableOcean/Atmosphere/Gravity feature flags. */
+    void SetDormant(bool bDormant);
 
 #if WITH_EDITOR
     virtual void PostEditChangeProperty(FPropertyChangedEvent& PropertyChangedEvent) override;

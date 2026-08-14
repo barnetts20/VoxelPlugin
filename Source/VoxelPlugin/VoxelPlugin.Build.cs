@@ -49,6 +49,7 @@ public class VoxelPlugin : ModuleRules
 				"Projects",
 				"RealtimeMeshComponent",
 				"GravPlugin",
+				"ULTRALARGESCALE"
 				//"RealtimeMeshExt",
 				//"RealtimeMeshSpatial"
 			}

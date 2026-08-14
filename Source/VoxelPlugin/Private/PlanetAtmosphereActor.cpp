@@ -408,6 +408,18 @@ void APlanetAtmosphereActor::UpdateMaterialParameters()
 // Light update
 // ─────────────────────────────────────────────────────────────────────────────
 
+void APlanetAtmosphereActor::OrientToStar(const FVector& StarWorldPos)
+{
+    // Point the atmosphere's forward at the star, then let the existing rotation->light
+    // sync propagate it to the directional light + raymarch MIDs. If illumination ends
+    // up inverted, negate ToStar: a directional light's forward is the *travel*
+    // direction (away from the star), not the direction toward it.
+    const FVector ToStar = StarWorldPos - GetActorLocation();
+    if (ToStar.IsNearlyZero()) return;
+    SetActorRotation(ToStar.Rotation());
+    UpdateLightFromRotation();
+}
+
 void APlanetAtmosphereActor::UpdateLightFromRotation()
 {
     if (!SunLight) return;
@@ -439,4 +451,12 @@ void APlanetAtmosphereActor::UpdateLightFromRotation()
         LightComp->SetLightColor(FLinearColor::White);
         LightComp->SetIntensity(0.0f);
     }
+}
+
+void APlanetAtmosphereActor::SetAtmosphereActive(bool bActive)
+{
+    // bEnabled drops the volume out of the post-process chain entirely -- the ray march
+    // stops. Unbound volumes affect the whole camera regardless of actor visibility, so
+    // this is what makes a pooled/dormant planet cost zero atmosphere GPU.
+    if (PostProcessVolume) PostProcessVolume->bEnabled = bActive;
 }

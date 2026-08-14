@@ -24,5 +24,11 @@
 				"RealtimeMeshComponent"
 			]
 		}
+	],
+	"Plugins": [
+		{
+			"Name": "UltraLargeScale",
+			"Enabled": true
+		}
 	]
 }

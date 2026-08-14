@@ -209,6 +209,8 @@ void APlanetActor::Initialize()
         TerrainActor->SurfaceMaterial = TerrainMaterial;
     TerrainActor->NoiseAmplitudeRatio = NoiseAmplitudeRatio;
     TerrainActor->InitializeFromPlanet(SharedCompositor, PlanetRoot, FVector(PlanetRadius));
+    TerrainActor->SetActorHiddenInGame(false);
+    TerrainActor->SetActorTickEnabled(true);   // re-activate after a pool park
 
     // --- Ocean actor ---
     if (bEnableOcean && OceanActor)
@@ -235,6 +237,7 @@ void APlanetActor::Initialize()
         AtmosphereActor->InitializeFromPlanet(PlanetRoot, FVector(AtmosphereScale));
         AtmosphereActor->SetActorHiddenInGame(false);
         AtmosphereActor->SetActorTickEnabled(true);
+        AtmosphereActor->SetAtmosphereActive(true);   // re-enable PP volume after a park
     }
     else if (AtmosphereActor)
     {
@@ -445,4 +448,78 @@ void APlanetActor::DestroyChildActors()
 double APlanetActor::ComputeOceanRadius(double PlanetRadius, double NoiseAmplitude) const
 {
     return PlanetRadius + SeaLevel * NoiseAmplitude;
+}
+
+// ---------------------------------------------------------------------------
+// Pooling: dormancy + reconfigure (IPooledActor, proxy-carried)
+// ---------------------------------------------------------------------------
+
+void APlanetActor::SetDormant(bool bDormant)
+{
+    const bool bActive = !bDormant;
+
+    SetActorHiddenInGame(bDormant);
+    SetActorTickEnabled(bActive);
+
+    if (TerrainActor)
+    {
+        TerrainActor->SetActorHiddenInGame(bDormant);
+        TerrainActor->SetActorTickEnabled(bActive);   // gate the adaptive LOD meshing pump
+    }
+    if (OceanActor)
+    {
+        const bool bOn = bActive && bEnableOcean;
+        OceanActor->SetActorHiddenInGame(!bOn);
+        OceanActor->SetActorTickEnabled(bOn);
+    }
+    if (AtmosphereActor)
+    {
+        const bool bOn = bActive && bEnableAtmosphere;
+        AtmosphereActor->SetActorHiddenInGame(!bOn);
+        AtmosphereActor->SetActorTickEnabled(bOn);
+        AtmosphereActor->SetAtmosphereActive(bOn);   // unbound PP volume: NOT covered by hide/tick
+    }
+    if (GravityZone)
+    {
+        const bool bOn = bActive && bEnableGravity;
+        GravityZone->SetActorHiddenInGame(!bOn);
+        GravityZone->SetActorTickEnabled(bOn);
+        GravityZone->SetActorEnableCollision(bOn);
+    }
+}
+
+void APlanetActor::SetStarWorldPosition(const FVector& StarWorldPos)
+{
+    if (AtmosphereActor)
+        AtmosphereActor->OrientToStar(StarWorldPos);
+}
+
+void APlanetActor::OnReturnToPool()
+{
+    SetDormant(true);
+}
+
+void APlanetActor::OnAcquired(double WorldRadius)
+{
+    SetActorScale3D(FVector(WorldRadius));
+
+    // Terrain geometry is a function of radius, so only rebuild when it actually
+    // changed; a re-acquired planet at the same radius (warm revisit) skips the
+    // rebuild entirely and just un-parks.
+    const double BuiltRadius = LastInitScale.GetMax();
+    const bool bNeedsRebuild = !bInitialized ||
+        !FMath::IsNearlyEqual(BuiltRadius, WorldRadius, FMath::Max(1.0, BuiltRadius * 1e-4));
+
+    if (bNeedsRebuild)
+    {
+        // Wake this actor's tick so its next Tick runs Initialize(), which reconfigures
+        // and re-activates every child at the new scale (children stay parked until then).
+        SetActorHiddenInGame(false);
+        SetActorTickEnabled(true);
+        bPendingInitialize = true;
+    }
+    else
+    {
+        SetDormant(false);   // warm revisit: geometry matches, just un-park
+    }
 }

@@ -47,6 +47,17 @@ public:
     UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Atmosphere")
     bool bIsPlanetOwned = false;
 
+    /** Enable/disable the atmosphere's unbound post-process volume. This is the ONLY
+     *  reliable off-switch for the ray march: the volume is not a primitive component,
+     *  so hiding the actor or disabling its tick does not stop it. Parked planets MUST
+     *  call this with false, or every pooled atmosphere keeps tinting the whole screen. */
+    void SetAtmosphereActive(bool bActive);
+
+    /** Aim the atmosphere's light/raymarch at the star. Points the actor's forward at
+     *  StarWorldPos and runs the existing rotation->light sync. Called each frame by
+     *  the owning planet from IStarLit::SetStarWorldPosition. */
+    void OrientToStar(const FVector& StarWorldPos);
+
     // --- Atmosphere Scattering ---
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Atmosphere|Scattering")
