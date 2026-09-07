@@ -12,8 +12,11 @@
 //
 // TWO CLOUD MODELS SHARE ONE MARCH. PlanetType selects which material fills
 // slot 1: a terrestrial cloud band, or a gas giant deck driven by the flow
-// simulation. Slots 0 and 2 are shared. See AtmosphereParams.h for how the
-// parameters divide.
+// simulation. Slots 0 and 2 are shared.
+//
+// The parameters are one Environment set plus one Common set and one model set
+// PER TYPE. PlanetType picks which pair goes to the material. See
+// AtmosphereParams.h for what lives where.
 
 #pragma once
 
@@ -82,14 +85,24 @@ public:
 
     // --- Parameters ---
     //
-    // Split by who reads them. Shared is what both march materials declare and
-    // tune identically; the two cloud structs carry their own copies of
-    // anything that would want substantially different values.
+    // Environment is one instance for both models. Common is one definition
+    // with an instance per model, so the shell, the air and the march budget
+    // can differ without two definitions of what they mean. The model structs
+    // are what only one march material declares.
+    //
+    // Every per-type property is EditConditionHides, so the details panel shows
+    // exactly one Common set and one model set at a time.
 
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Atmosphere|Shared", meta = (ShowOnlyInnerProperties))
-    FAtmosphereSharedParams Shared;
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Atmosphere|Environment", meta = (ShowOnlyInnerProperties))
+    FAtmosphereEnvironmentParams Environment;
 
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Atmosphere|Terrestrial", meta = (EditCondition = "PlanetType == EPlanetAtmosphereType::Terrestrial", EditConditionHides, ShowOnlyInnerProperties))
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Atmosphere|Terrestrial Common", meta = (EditCondition = "PlanetType == EPlanetAtmosphereType::Terrestrial", EditConditionHides, ShowOnlyInnerProperties))
+    FAtmosphereCommonParams TerrestrialCommon;
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Atmosphere|Gas Giant Common", meta = (EditCondition = "PlanetType == EPlanetAtmosphereType::GasGiant", EditConditionHides, ShowOnlyInnerProperties))
+    FAtmosphereCommonParams GasGiantCommon;
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Atmosphere|Terrestrial Cloud", meta = (EditCondition = "PlanetType == EPlanetAtmosphereType::Terrestrial", EditConditionHides, ShowOnlyInnerProperties))
     FTerrestrialCloudParams Terrestrial;
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Atmosphere|Gas Giant Deck", meta = (EditCondition = "PlanetType == EPlanetAtmosphereType::GasGiant", EditConditionHides, ShowOnlyInnerProperties))
@@ -215,18 +228,31 @@ private:
      *  BuiltType, not PlanetType. */
     void UpdateMaterialParameters();
 
-    /** Geometry, light, air scattering, raymarching. Both march materials. */
-    void ApplySharedParams(float PlanetRadius, const FVector& PlanetCenter, const FVector& LightDir);
+    /** The Common instance the live march material was built for.
+     *
+     *  KEYED ON BuiltType, not PlanetType, for the same reason the parameter
+     *  sweep is: a type change that has not been rebuilt yet would otherwise
+     *  push the wrong shell and march budget at the material on screen. */
+    const FAtmosphereCommonParams& GetCommonParams() const
+    {
+        return BuiltType == EPlanetAtmosphereType::GasGiant ? GasGiantCommon : TerrestrialCommon;
+    }
 
-    /** Cloud shell, noise and lighting. Terrestrial material only. */
-    void ApplyTerrestrialParams();
+    /** Geometry, light, air scattering, cloud lighting, raymarching. Both march
+     *  materials, and no branching inside — the caller passes whichever Common
+     *  instance is live. */
+    void ApplyCommonParams(const FAtmosphereCommonParams& Common, float PlanetRadius,
+        const FVector& PlanetCenter, const FVector& LightDir);
+
+    /** Cloud shell, noise and extinction. Terrestrial material only. */
+    void ApplyTerrestrialParams(const FAtmosphereCommonParams& Common);
 
     /** Field, volumes, per-band scattering and the planet's local frame.
      *
      *  The cloud radii are absent on purpose: the gas giant shader derives them
      *  from GG_TopBounds, and pushing them here would create a second source
      *  that can disagree with the bound the march is culling against. */
-    void ApplyGasGiantParams(float PlanetRadius);
+    void ApplyGasGiantParams(const FAtmosphereCommonParams& Common, float PlanetRadius);
 
     /** Starts the sim subsystem against the deck's config. */
     void StartGasGiantSimulation();
