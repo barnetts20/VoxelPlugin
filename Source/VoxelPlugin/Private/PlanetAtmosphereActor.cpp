@@ -531,15 +531,15 @@ void APlanetAtmosphereActor::ApplyGasGiantParams(const FAtmosphereCommonParams& 
 
     // -- Profile ------------------------------------------------------------
     //
-    // ShellThickness is the deck's depth in world units, solved so the highest
-    // the deck can reach lands at DeckTopFraction of the atmosphere height. The
-    // only absolute length in the field, and the one that silently turns the
-    // deck into a film when authored against a scale-derived planet radius.
+    // AtmosphereThickness is the only absolute length the field reads, and the
+    // unit every height in the deck is a fraction of. The deck has no shell of
+    // its own: DeckTop and DeckBottom place it inside the air, so sizing the
+    // air does not resize the deck.
 
     const FLinearColor Profile = GasGiantDeck.GetProfile(PlanetRadius, Common.AtmosphereHeightScale);
 
-    MID_Atmosphere->SetScalarParameterValue(TEXT("ShellThickness"), Profile.R);
-    MID_Atmosphere->SetScalarParameterValue(TEXT("DensityRamp"), Profile.G);
+    MID_Atmosphere->SetScalarParameterValue(TEXT("AtmosphereThickness"), Profile.R);
+    MID_Atmosphere->SetScalarParameterValue(TEXT("DeckBottom"), Profile.G);
     MID_Atmosphere->SetScalarParameterValue(TEXT("VortexThreshold"), Profile.B);
     MID_Atmosphere->SetScalarParameterValue(TEXT("CoreDensity"), Profile.A);
 
@@ -573,14 +573,17 @@ void APlanetAtmosphereActor::ApplyGasGiantParams(const FAtmosphereCommonParams& 
 
     // -- Relief -------------------------------------------------------------
     //
-    // Shell fractions. GetTopMax() sums these the same way GG_TopBounds does,
-    // and the thickness above was solved against that sum -- so retuning any of
-    // them keeps the cull radius where DeckTopFraction says it should be.
+    // Fractions of the gradient depth, so relief rides on the room the deck
+    // has rather than on the whole shell. GetTopMax() sums them the same way
+    // GG_TopBounds does and the cull radius follows it; GetReliefBudget() is
+    // the matching floor check.
 
-    MID_Atmosphere->SetScalarParameterValue(TEXT("DeckBaseHeight"), GasGiantDeck.Relief.R);
-    MID_Atmosphere->SetScalarParameterValue(TEXT("BandRelief"), GasGiantDeck.Relief.G);
-    MID_Atmosphere->SetScalarParameterValue(TEXT("PressureLift"), GasGiantDeck.Relief.B);
-    MID_Atmosphere->SetScalarParameterValue(TEXT("StormTowerHeight"), GasGiantDeck.Relief.A);
+    const FLinearColor Relief = GasGiantDeck.GetRelief();
+
+    MID_Atmosphere->SetScalarParameterValue(TEXT("DeckTop"), Relief.R);
+    MID_Atmosphere->SetScalarParameterValue(TEXT("BandRelief"), Relief.G);
+    MID_Atmosphere->SetScalarParameterValue(TEXT("PressureLift"), Relief.B);
+    MID_Atmosphere->SetScalarParameterValue(TEXT("StormTowerHeight"), Relief.A);
 
     // -- Layers -------------------------------------------------------------
 
@@ -605,11 +608,12 @@ void APlanetAtmosphereActor::ApplyGasGiantParams(const FAtmosphereCommonParams& 
     MID_Atmosphere->SetScalarParameterValue(TEXT("BandSharpness"), GasGiantDeck.BandSharpness);
     MID_Atmosphere->SetScalarParameterValue(TEXT("ReliefThinning"), GasGiantDeck.ReliefThinning);
     MID_Atmosphere->SetScalarParameterValue(TEXT("DetailVertical"), GasGiantDeck.GetDetailVertical());
+    MID_Atmosphere->SetScalarParameterValue(TEXT("StructureVertical"), GasGiantDeck.GetStructureVertical());
     MID_Atmosphere->SetScalarParameterValue(TEXT("DetailErosion"), GasGiantDeck.DetailErosion);
     MID_Atmosphere->SetScalarParameterValue(TEXT("DetailRelief"), GasGiantDeck.DetailRelief);
     MID_Atmosphere->SetScalarParameterValue(TEXT("StructureRelief"), GasGiantDeck.StructureRelief);
     MID_Atmosphere->SetScalarParameterValue(TEXT("StructureErosion"), GasGiantDeck.StructureErosion);
-    MID_Atmosphere->SetScalarParameterValue(TEXT("DetailDepth"), GasGiantDeck.GetDetailDepth());
+    MID_Atmosphere->SetScalarParameterValue(TEXT("ErosionDepth"), GasGiantDeck.ErosionDepth);
     MID_Atmosphere->SetScalarParameterValue(TEXT("DensityCurve"), GasGiantDeck.DensityCurve);
     MID_Atmosphere->SetScalarParameterValue(TEXT("RigidRate"), GasGiantDeck.RigidRate);
 
@@ -639,15 +643,13 @@ void APlanetAtmosphereActor::ApplyGasGiantParams(const FAtmosphereCommonParams& 
     MID_Atmosphere->SetVectorParameterValue(TEXT("ScatterBase"), GasGiantScatter.ScatterBase);
     MID_Atmosphere->SetScalarParameterValue(TEXT("BandScale"), GasGiantScatter.BandScale);
 
-    // Solved from DeckOpticalDepth against the same TopMax the shell thickness
-    // was solved against, so retuning Relief or CoreDensity leaves the deck's
-    // opacity where it was authored.
-    const float TopMax = GasGiantDeck.GetTopMax();
-
+    // Solved from DeckOpticalDepth against the path a vertical ray takes
+    // through the deck, so moving either anchor or retuning CoreDensity leaves
+    // the deck's opacity where it was authored.
     MID_Atmosphere->SetVectorParameterValue(TEXT("Cloud Beta"),
-        GasGiantScatter.GetCloudBeta(GasGiantDeck.DeckTopFraction, TopMax, GasGiantDeck.CoreDensity));
+        GasGiantScatter.GetCloudBeta(GasGiantDeck.DeckTop, GasGiantDeck.DeckBottom, GasGiantDeck.CoreDensity));
     MID_Atmosphere->SetVectorParameterValue(TEXT("Cloud Absorption Beta"),
-        GasGiantScatter.GetCloudAbsorptionBeta(GasGiantDeck.DeckTopFraction, TopMax, GasGiantDeck.CoreDensity));
+        GasGiantScatter.GetCloudAbsorptionBeta(GasGiantDeck.DeckTop, GasGiantDeck.DeckBottom, GasGiantDeck.CoreDensity));
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
