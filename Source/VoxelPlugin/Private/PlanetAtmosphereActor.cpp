@@ -568,6 +568,18 @@ void APlanetAtmosphereActor::ApplyGasGiantParams(float PlanetRadius)
     MID_Atmosphere->SetScalarParameterValue(TEXT("DeepFlowLayer"), static_cast<float>(GasGiantDeck.DeepFlowLayer));
     MID_Atmosphere->SetScalarParameterValue(TEXT("DeckSlope"), GasGiantDeck.DeckSlope);
 
+    // -- Fade ranges --------------------------------------------------------
+    //
+    // Atmosphere thicknesses from the camera. Composed into FadeRanges by the
+    // material, like the other float4s.
+
+    const FLinearColor FadeRanges = GasGiantDeck.GetFadeRanges();
+
+    MID_Atmosphere->SetScalarParameterValue(TEXT("DetailFadeNear"), FadeRanges.R);
+    MID_Atmosphere->SetScalarParameterValue(TEXT("DetailFadeFar"), FadeRanges.G);
+    MID_Atmosphere->SetScalarParameterValue(TEXT("PackedFadeNear"), FadeRanges.B);
+    MID_Atmosphere->SetScalarParameterValue(TEXT("PackedFadeFar"), FadeRanges.A);
+
     // -- Loose field scalars ------------------------------------------------
 
     MID_Atmosphere->SetScalarParameterValue(TEXT("BandSharpness"), GasGiantDeck.BandSharpness);
@@ -575,6 +587,8 @@ void APlanetAtmosphereActor::ApplyGasGiantParams(float PlanetRadius)
     MID_Atmosphere->SetScalarParameterValue(TEXT("DetailVertical"), GasGiantDeck.GetDetailVertical());
     MID_Atmosphere->SetScalarParameterValue(TEXT("DetailErosion"), GasGiantDeck.DetailErosion);
     MID_Atmosphere->SetScalarParameterValue(TEXT("DetailRelief"), GasGiantDeck.DetailRelief);
+    MID_Atmosphere->SetScalarParameterValue(TEXT("PackedRelief"), GasGiantDeck.PackedRelief);
+    MID_Atmosphere->SetScalarParameterValue(TEXT("PackedErosion"), GasGiantDeck.PackedErosion);
     MID_Atmosphere->SetScalarParameterValue(TEXT("DetailDepth"), GasGiantDeck.GetDetailDepth());
     MID_Atmosphere->SetScalarParameterValue(TEXT("DensityCurve"), GasGiantDeck.DensityCurve);
     MID_Atmosphere->SetScalarParameterValue(TEXT("RigidRate"), GasGiantDeck.RigidRate);
@@ -605,8 +619,15 @@ void APlanetAtmosphereActor::ApplyGasGiantParams(float PlanetRadius)
     MID_Atmosphere->SetVectorParameterValue(TEXT("ScatterBase"), GasGiantScatter.ScatterBase);
     MID_Atmosphere->SetScalarParameterValue(TEXT("BandScale"), GasGiantScatter.BandScale);
 
-    MID_Atmosphere->SetVectorParameterValue(TEXT("Cloud Beta"), GasGiantScatter.CloudBeta);
-    MID_Atmosphere->SetVectorParameterValue(TEXT("Cloud Absorption Beta"), GasGiantScatter.CloudAbsorptionBeta);
+    // Solved from DeckOpticalDepth against the same TopMax the shell thickness
+    // was solved against, so retuning Relief or CoreDensity leaves the deck's
+    // opacity where it was authored.
+    const float TopMax = GasGiantDeck.GetTopMax();
+
+    MID_Atmosphere->SetVectorParameterValue(TEXT("Cloud Beta"),
+        GasGiantScatter.GetCloudBeta(GasGiantDeck.DeckTopFraction, TopMax, GasGiantDeck.CoreDensity));
+    MID_Atmosphere->SetVectorParameterValue(TEXT("Cloud Absorption Beta"),
+        GasGiantScatter.GetCloudAbsorptionBeta(GasGiantDeck.DeckTopFraction, TopMax, GasGiantDeck.CoreDensity));
     MID_Atmosphere->SetVectorParameterValue(TEXT("Cloud Ambient"), GasGiantScatter.CloudAmbient);
     MID_Atmosphere->SetVectorParameterValue(TEXT("Cloud Phase Params"), GasGiantScatter.CloudPhaseParams);
 
