@@ -29,6 +29,22 @@
 		{
 			"Name": "UltraLargeScale",
 			"Enabled": true
+		},
+		{
+			"Name": "RealtimeMeshComponent",
+			"Enabled": true
+		},
+		{
+			"Name": "GravPlugin",
+			"Enabled": true
+		},
+		{
+			"Name": "CloudAtmosphere",
+			"Enabled": true
 		}
+	],
+	"AdditionalDependencies": [
+		"RealtimeMeshComponent",
+		"CloudAtmosphere"
 	]
 }

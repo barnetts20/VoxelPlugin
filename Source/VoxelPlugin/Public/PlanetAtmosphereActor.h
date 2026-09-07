@@ -9,6 +9,11 @@
 // Actor Location  → Planet Center / Atmosphere Center
 // Actor Scale max → Planet Radius
 // Actor Rotation  → Light Direction + directional light rotation
+//
+// TWO CLOUD MODELS SHARE ONE MARCH. PlanetType selects which material fills
+// slot 1: a terrestrial cloud band, or a gas giant deck driven by the flow
+// simulation. Slots 0 and 2 are shared. See AtmosphereParams.h for how the
+// parameters divide.
 
 #pragma once
 
@@ -19,6 +24,7 @@
 #include "Components/DirectionalLightComponent.h"
 #include "Engine/VolumeTexture.h"
 #include "Materials/MaterialInstanceDynamic.h"
+#include "AtmosphereParams.h"
 #include "PlanetAtmosphereActor.generated.h"
 
 /** Renders a volumetric atmosphere and cloud layer via post-process materials.
@@ -33,7 +39,13 @@
  *  rotation and LightColor property via UpdateLightFromRotation.
  *
  *  When planet-owned: location and scale are locked (driven by the planet),
- *  rotation remains editable (controls light direction). */
+ *  rotation remains editable (controls light direction).
+ *
+ *  ONE FUNCTION PICKS THE MATERIAL AND ONE PICKS THE PARAMETERS, BOTH FROM
+ *  PlanetType. Setting a parameter a material does not declare does nothing and
+ *  logs nothing, so a march material and a parameter sweep that disagree render
+ *  something plausible with none of the model-specific inputs bound — which
+ *  reads as a simulation or texture bug rather than a wiring one. */
 UCLASS()
 class VOXELPLUGIN_API APlanetAtmosphereActor : public AActor
 {
@@ -47,6 +59,11 @@ public:
     UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Atmosphere")
     bool bIsPlanetOwned = false;
 
+    /** Which cloud model slot 1 renders. Changing this at runtime requires
+     *  RebuildMaterialInstances — the material is chosen once, at creation. */
+    UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Atmosphere")
+    EPlanetAtmosphereType PlanetType = EPlanetAtmosphereType::Terrestrial;
+
     /** Enable/disable the atmosphere's unbound post-process volume. This is the ONLY
      *  reliable off-switch for the ray march: the volume is not a primitive component,
      *  so hiding the actor or disabling its tick does not stop it. Parked planets MUST
@@ -58,146 +75,48 @@ public:
      *  the owning planet from IStarLit::SetStarWorldPosition. */
     void OrientToStar(const FVector& StarWorldPos);
 
-    // --- Atmosphere Scattering ---
+    /** Recreates slot 1 against the current PlanetType and repopulates every
+     *  slot. Call after changing PlanetType or either march material. */
+    UFUNCTION(BlueprintCallable, Category = "Atmosphere")
+    void RebuildMaterialInstances();
 
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Atmosphere|Scattering")
-    FLinearColor RayleighBeta = FLinearColor(0.896360f, 2.913294f, 4.0f, 1.0f);
+    // --- Parameters ---
+    //
+    // Split by who reads them. Shared is what both march materials declare and
+    // tune identically; the two cloud structs carry their own copies of
+    // anything that would want substantially different values.
 
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Atmosphere|Scattering")
-    float RayleighHeight = 0.1f;
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Atmosphere|Shared", meta = (ShowOnlyInnerProperties))
+    FAtmosphereSharedParams Shared;
 
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Atmosphere|Scattering")
-    FLinearColor MieBeta = FLinearColor(1.0f, 0.83163f, 0.71612f, 1.0f);
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Atmosphere|Terrestrial", meta = (EditCondition = "PlanetType == EPlanetAtmosphereType::Terrestrial", EditConditionHides, ShowOnlyInnerProperties))
+    FTerrestrialCloudParams Terrestrial;
 
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Atmosphere|Scattering")
-    float MieHeight = 0.05f;
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Atmosphere|Gas Giant Deck", meta = (EditCondition = "PlanetType == EPlanetAtmosphereType::GasGiant", EditConditionHides, ShowOnlyInnerProperties))
+    FGasGiantDeckParams GasGiantDeck;
 
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Atmosphere|Scattering")
-    float MieG = 0.9f;
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Atmosphere|Gas Giant Scattering", meta = (EditCondition = "PlanetType == EPlanetAtmosphereType::GasGiant", EditConditionHides, ShowOnlyInnerProperties))
+    FGasGiantScatterParams GasGiantScatter;
 
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Atmosphere|Scattering")
-    FLinearColor AtmosphereAbsorptionBeta = FLinearColor(0.05f, 0.05f, 0.05f, 0.0f);
+    // --- Material assets ---
+    //
+    // Soft references rather than hardcoded paths: a stale path logs a warning
+    // and otherwise looks like a broken material, and these assets are expected
+    // to move out of VoxelPlugin.
 
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Atmosphere|Scattering")
-    float AtmosphereAbsorptionHeight = 0.15f;
+    UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Atmosphere|Materials")
+    TSoftObjectPtr<UMaterialInterface> PreprocessMaterial;
 
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Atmosphere|Scattering")
-    float AtmosphereAbsorptionFalloff = 0.1f;
+    /** Slot 1 for PlanetType::Terrestrial. */
+    UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Atmosphere|Materials")
+    TSoftObjectPtr<UMaterialInterface> TerrestrialMarchMaterial;
 
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Atmosphere|Scattering")
-    FLinearColor AtmosphereAmbient = FLinearColor(0.080328f, 0.080328f, 0.1f, 0.0f);
+    /** Slot 1 for PlanetType::GasGiant. */
+    UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Atmosphere|Materials")
+    TSoftObjectPtr<UMaterialInterface> GasGiantMarchMaterial;
 
-    // --- Cloud Shape ---
-
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Atmosphere|Cloud Shape")
-    TObjectPtr<UVolumeTexture> CloudVolumeTexture = nullptr;
-
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Atmosphere|Cloud Shape")
-    FLinearColor AnimationWeights = FLinearColor(0.0f, 0.0f, 0.0f, 990.0f);
-
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Atmosphere|Cloud Shape")
-    float CloudCoverage = 0.6f;
-
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Atmosphere|Cloud Shape")
-    float CloudDensityMultiplier = 2.0f;
-
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Atmosphere|Cloud Shape")
-    float CloudHeightCurveMax = 0.7f;
-
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Atmosphere|Cloud Shape")
-    float CloudHeightCurveMin = 0.3f;
-
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Atmosphere|Cloud Shape")
-    float CloudNoiseFrequency = 1.0f;
-
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Atmosphere|Cloud Shape")
-    FLinearColor CloudNoiseInvert = FLinearColor(0.0f, 0.0f, 0.0f, 0.0f);
-
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Atmosphere|Cloud Shape")
-    FLinearColor CloudNoiseWeights = FLinearColor(0.55f, 0.3f, 0.15f, 0.3f);
-
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Atmosphere|Cloud Shape")
-    float DetailErodeStrength = 0.3f;
-
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Atmosphere|Cloud Shape")
-    float DetailNoiseFrequency = 6.0f;
-
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Atmosphere|Cloud Shape")
-    FLinearColor DetailNoiseInvert = FLinearColor(1.0f, 1.0f, 1.0f, 1.0f);
-
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Atmosphere|Cloud Shape")
-    FLinearColor DetailNoiseWeights = FLinearColor(0.2f, 0.3f, 0.3f, 0.2f);
-
-    // --- Cloud Lighting ---
-
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Atmosphere|Cloud Lighting")
-    FLinearColor CloudBeta = FLinearColor(150.0f, 145.3125f, 140.625f, 0.5f);
-
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Atmosphere|Cloud Lighting")
-    FLinearColor CloudAbsorptionBeta = FLinearColor(25.0f, 25.0f, 25.0f, 0.0f);
-
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Atmosphere|Cloud Lighting")
-    FLinearColor CloudAmbient = FLinearColor(0.04f, 0.04f, 0.05f, 0.0f);
-
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Atmosphere|Cloud Lighting")
-    FLinearColor CloudPhaseParams = FLinearColor(0.9f, 0.1f, 0.5f, 0.5f);
-
-    // --- Light ---
-
-    /** RGB = light color direction, magnitude of RGB = intensity. Alpha = LightColor.A
-     *  is passed through to the material but not used by the directional light. */
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Atmosphere|Light")
-    FLinearColor LightColor = FLinearColor(1.0f, 0.95f, 0.9f, 10.0f);
-
-    // --- Ray Marching ---
-
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Atmosphere|Ray Marching")
-    float AtmosphereSteps = 32.0f;
-
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Atmosphere|Ray Marching")
-    float CloudSteps = 32.0f;
-
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Atmosphere|Ray Marching")
-    float AtmosphereLightSteps = 16.0f;
-
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Atmosphere|Ray Marching")
-    float CloudLightSteps = 32.0f;
-
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Atmosphere|Ray Marching")
-    float StepScaleFactor = 2.0f;
-
-    // --- Planet Geometry ---
-    // These are ratios of PlanetRadius (actor scale), not absolute distances.
-
-    /** Atmosphere outer shell = PlanetRadius * (1 + AtmosphereHeightScale). */
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Atmosphere|Planet Geometry")
-    float AtmosphereHeightScale = 0.2f;
-
-    /** Cloud layer outer shell = PlanetRadius * (1 + CloudOuterHeightScale). */
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Atmosphere|Planet Geometry")
-    float CloudOuterHeightScale = 0.4f;
-
-    /** Cloud layer inner shell = PlanetRadius * (1 + CloudInnerHeightScale). */
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Atmosphere|Planet Geometry")
-    float CloudInnerHeightScale = 0.05f;
-
-    /** Vertical offset applied to the atmosphere floor (planet surface). */
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Atmosphere|Planet Geometry")
-    float AtmosphereFloorOffset = 0.0f;
-
-    // --- Postprocess ---
-
-    /** Controls how quickly the atmosphere blur falls off with distance from the planet edge. */
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Atmosphere|Postprocess")
-    float BlurFalloffFactor = 2.0f;
-
-    /** Maximum blur weight at the planet edge. */
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Atmosphere|Postprocess")
-    float MaxW = 0.5f;
-
-    /** Minimum blur weight (applied everywhere within the atmosphere). */
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Atmosphere|Postprocess")
-    float MinW = 0.05f;
+    UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Atmosphere|Materials")
+    TSoftObjectPtr<UMaterialInterface> PostprocessMaterial;
 
     // --- Lifecycle ---
 
@@ -244,7 +163,7 @@ private:
     UPROPERTY()
     TObjectPtr<UMaterialInstanceDynamic> MID_Preprocess = nullptr;
 
-    /** Pass 1: atmosphere + cloud ray marching. */
+    /** Pass 1: atmosphere + cloud ray marching. Parent depends on PlanetType. */
     UPROPERTY()
     TObjectPtr<UMaterialInstanceDynamic> MID_Atmosphere = nullptr;
 
@@ -252,11 +171,21 @@ private:
     UPROPERTY()
     TObjectPtr<UMaterialInstanceDynamic> MID_Postprocess = nullptr;
 
+    /** Which model MID_Atmosphere was created for. Guards against a PlanetType
+     *  change reaching the parameter sweep before the material is rebuilt,
+     *  which would push a whole model's parameters at a material that declares
+     *  none of them and silently render the other model. */
+    EPlanetAtmosphereType BuiltType = EPlanetAtmosphereType::Terrestrial;
+
     bool bInitialized = false;
 
     /** When true, Initialize runs on the next Tick. Set by OnConstruction to defer
      *  initialization until the world is fully ready. */
     bool bPendingInitialize = true;
+
+    /** True once this actor has asked the subsystem to start. Cleared on
+     *  teardown so a pooled planet does not leave the sim running. */
+    bool bStartedSimulation = false;
 
     /** Cached scale set by the planet actor, used by the transform guard. */
     FVector PlanetDrivenScale = FVector::OneVector;
@@ -276,19 +205,44 @@ private:
     /** Destroys the post-process volume and directional light, nulls the MID pointers. */
     void DestroyChildActors();
 
-    /** Creates the 3 dynamic material instances from the plugin's base materials
-     *  and assigns them as blendables on the post-process volume. Loads the default
-     *  cloud volume texture if none is assigned. */
+    /** Creates the 3 dynamic material instances and assigns them as blendables.
+     *  Slot 1's parent is chosen from PlanetType here and recorded in
+     *  BuiltType. */
     void CreateMaterialInstances();
 
-    /** Pushes all UPROPERTY values to the atmosphere and postprocess material instances.
-     *  Called every tick and on property changes. */
+    /** Pushes every parameter to the atmosphere and postprocess instances.
+     *  Called every tick and on property changes. Dispatches the cloud half on
+     *  BuiltType, not PlanetType. */
     void UpdateMaterialParameters();
+
+    /** Geometry, light, air scattering, raymarching. Both march materials. */
+    void ApplySharedParams(float PlanetRadius, const FVector& PlanetCenter, const FVector& LightDir);
+
+    /** Cloud shell, noise and lighting. Terrestrial material only. */
+    void ApplyTerrestrialParams();
+
+    /** Field, volumes, per-band scattering and the planet's local frame.
+     *
+     *  The cloud radii are absent on purpose: the gas giant shader derives them
+     *  from GG_TopBounds, and pushing them here would create a second source
+     *  that can disagree with the bound the march is culling against. */
+    void ApplyGasGiantParams(float PlanetRadius);
+
+    /** Starts the sim subsystem against the deck's config. */
+    void StartGasGiantSimulation();
+
+    /** Simulated time from the sim subsystem, or 0 when it is not running.
+     *
+     *  NOT WORLD TIME. The field is coherent against the sim's own clock, and
+     *  the two diverge the moment the sim pauses, is stepped by hand, or is
+     *  restored from a snapshot — after which the warp advects a field that has
+     *  not moved. */
+    float GetGasGiantTime() const;
 
     /** Syncs the directional light's rotation and color/intensity from the actor's
      *  rotation and LightColor property. */
     void UpdateLightFromRotation();
 
-    /** Loads a material by content path, returning nullptr on failure. */
-    static UMaterialInterface* LoadMaterialAsset(const TCHAR* Path);
+    /** Resolves a soft material reference, logging which one failed. */
+    static UMaterialInterface* LoadMaterialAsset(const TSoftObjectPtr<UMaterialInterface>& Ref, const TCHAR* Label);
 };
