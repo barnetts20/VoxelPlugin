@@ -535,13 +535,15 @@ void APlanetAtmosphereActor::ApplyGasGiantParams(const FAtmosphereCommonParams& 
     // unit every height in the deck is a fraction of. The deck has no shell of
     // its own: DeckTop and DeckBottom place it inside the air, so sizing the
     // air does not resize the deck.
+    //
+    // DeckBottom is also the fine band's lower edge, so the march's step sizing
+    // follows the anchors rather than the extinction.
 
     const FLinearColor Profile = GasGiantDeck.GetProfile(PlanetRadius, Common.AtmosphereHeightScale);
 
     MID_Atmosphere->SetScalarParameterValue(TEXT("AtmosphereThickness"), Profile.R);
     MID_Atmosphere->SetScalarParameterValue(TEXT("DeckBottom"), Profile.G);
     MID_Atmosphere->SetScalarParameterValue(TEXT("VortexThreshold"), Profile.B);
-    MID_Atmosphere->SetScalarParameterValue(TEXT("CoreDensity"), Profile.A);
 
     // -- Scales -------------------------------------------------------------
 
@@ -566,10 +568,23 @@ void APlanetAtmosphereActor::ApplyGasGiantParams(const FAtmosphereCommonParams& 
     // xyz are renormalized by their sum in the shader, so changing the balance
     // between them does not change how much cloud there is.
 
-    MID_Atmosphere->SetScalarParameterValue(TEXT("RidgeWeight"), GasGiantDeck.DetailWeights.R);
-    MID_Atmosphere->SetScalarParameterValue(TEXT("FluffWeight"), GasGiantDeck.DetailWeights.G);
-    MID_Atmosphere->SetScalarParameterValue(TEXT("WispWeight"), GasGiantDeck.DetailWeights.B);
-    MID_Atmosphere->SetScalarParameterValue(TEXT("EdgeBias"), GasGiantDeck.DetailWeights.A);
+    // Each layer's Worley ladder, coarse to fine, plus its own amount. The
+    // ladder is renormalized shader-side, so these set the spectrum and the w
+    // sets the strength.
+    const FLinearColor DetailNoise = GasGiantDeck.GetDetailNoise();
+    const FLinearColor StructureNoise = GasGiantDeck.GetStructureNoise();
+
+    MID_Atmosphere->SetScalarParameterValue(TEXT("DetailWorleyCoarse"), DetailNoise.R);
+    MID_Atmosphere->SetScalarParameterValue(TEXT("DetailWorleyMid"), DetailNoise.G);
+    MID_Atmosphere->SetScalarParameterValue(TEXT("DetailWorleyFine"), DetailNoise.B);
+    MID_Atmosphere->SetScalarParameterValue(TEXT("DetailAmount"), DetailNoise.A);
+
+    MID_Atmosphere->SetScalarParameterValue(TEXT("StructureWorleyCoarse"), StructureNoise.R);
+    MID_Atmosphere->SetScalarParameterValue(TEXT("StructureWorleyMid"), StructureNoise.G);
+    MID_Atmosphere->SetScalarParameterValue(TEXT("StructureWorleyFine"), StructureNoise.B);
+    MID_Atmosphere->SetScalarParameterValue(TEXT("StructureAmount"), StructureNoise.A);
+
+    MID_Atmosphere->SetScalarParameterValue(TEXT("EdgeBias"), GasGiantDeck.EdgeBias);
 
     // -- Relief -------------------------------------------------------------
     //
@@ -644,12 +659,12 @@ void APlanetAtmosphereActor::ApplyGasGiantParams(const FAtmosphereCommonParams& 
     MID_Atmosphere->SetScalarParameterValue(TEXT("BandScale"), GasGiantScatter.BandScale);
 
     // Solved from DeckOpticalDepth against the path a vertical ray takes
-    // through the deck, so moving either anchor or retuning CoreDensity leaves
-    // the deck's opacity where it was authored.
+    // through the deck, so moving either anchor leaves the deck's opacity where
+    // it was authored.
     MID_Atmosphere->SetVectorParameterValue(TEXT("Cloud Beta"),
-        GasGiantScatter.GetCloudBeta(GasGiantDeck.DeckTop, GasGiantDeck.DeckBottom, GasGiantDeck.CoreDensity));
+        GasGiantScatter.GetCloudBeta(GasGiantDeck.DeckTop, GasGiantDeck.DeckBottom));
     MID_Atmosphere->SetVectorParameterValue(TEXT("Cloud Absorption Beta"),
-        GasGiantScatter.GetCloudAbsorptionBeta(GasGiantDeck.DeckTop, GasGiantDeck.DeckBottom, GasGiantDeck.CoreDensity));
+        GasGiantScatter.GetCloudAbsorptionBeta(GasGiantDeck.DeckTop, GasGiantDeck.DeckBottom));
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
