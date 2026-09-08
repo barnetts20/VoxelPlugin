@@ -622,8 +622,8 @@ void APlanetAtmosphereActor::ApplyGasGiantParams(const FAtmosphereCommonParams& 
 
     MID_Atmosphere->SetScalarParameterValue(TEXT("BandSharpness"), GasGiantDeck.BandSharpness);
     MID_Atmosphere->SetScalarParameterValue(TEXT("ReliefThinning"), GasGiantDeck.ReliefThinning);
-    MID_Atmosphere->SetScalarParameterValue(TEXT("DetailVertical"), GasGiantDeck.GetDetailVertical());
-    MID_Atmosphere->SetScalarParameterValue(TEXT("StructureVertical"), GasGiantDeck.GetStructureVertical());
+    MID_Atmosphere->SetScalarParameterValue(TEXT("DetailVertical"), GasGiantDeck.GetDetailVertical(Common.AtmosphereHeightScale));
+    MID_Atmosphere->SetScalarParameterValue(TEXT("StructureVertical"), GasGiantDeck.GetStructureVertical(Common.AtmosphereHeightScale));
     MID_Atmosphere->SetScalarParameterValue(TEXT("DetailErosion"), GasGiantDeck.DetailErosion);
     MID_Atmosphere->SetScalarParameterValue(TEXT("DetailRelief"), GasGiantDeck.DetailRelief);
     MID_Atmosphere->SetScalarParameterValue(TEXT("StructureRelief"), GasGiantDeck.StructureRelief);
