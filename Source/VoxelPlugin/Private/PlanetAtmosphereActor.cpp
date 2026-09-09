@@ -17,7 +17,7 @@
 
 static const TCHAR* MatPath_Preprocess = TEXT("/VoxelPlugin/Material/MT_UCA_Preprocess_Inst.MT_UCA_Preprocess_Inst");
 static const TCHAR* MatPath_Terrestrial = TEXT("/VoxelPlugin/Material/MT_UCA_Default_Inst.MT_UCA_Default_Inst");
-static const TCHAR* MatPath_GasGiant = TEXT("/VoxelPlugin/Material/MT_UGA_Default_Inst.MT_UGA_Default_Inst");
+static const TCHAR* MatPath_GasGiant = TEXT("/CloudAtmosphere/Material/MT_UGA_Default_Inst.MT_UGA_Default_Inst");
 static const TCHAR* MatPath_Postprocess = TEXT("/VoxelPlugin/Material/MT_UCA_Postprocess_Inst.MT_UCA_Postprocess_Inst");
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -47,7 +47,10 @@ APlanetAtmosphereActor::APlanetAtmosphereActor()
     GasGiantMarchMaterial = TSoftObjectPtr<UMaterialInterface>(FSoftObjectPath(MatPath_GasGiant));
     PostprocessMaterial = TSoftObjectPtr<UMaterialInterface>(FSoftObjectPath(MatPath_Postprocess));
 
-    // Load default cloud volume texture so it displays in the editor details panel.
+    // Default source assets, so both models display something in the details
+    // panel and a fresh actor renders. A deck with no volumes is not a subtle
+    // failure -- the carves and the erosion both go to their neutral values and
+    // the deck comes out as a smooth shell.
     static ConstructorHelpers::FObjectFinder<UVolumeTexture> DefaultCloudTexture(
         TEXT("/VoxelPlugin/VolumeTextures/Textures/VT_PerlinWorley_Balanced"));
     if (DefaultCloudTexture.Succeeded())
@@ -57,6 +60,39 @@ APlanetAtmosphereActor::APlanetAtmosphereActor()
     else
     {
         UE_LOG(LogTemp, Warning, TEXT("PlanetAtmosphereActor: Failed to load default cloud volume texture"));
+    }
+
+    static ConstructorHelpers::FObjectFinder<UVolumeTexture> DefaultDetailVolume(
+        TEXT("/CloudAtmosphere/Noise/VT_PerlinWorley_S8_128"));
+    if (DefaultDetailVolume.Succeeded())
+    {
+        GasGiantDeck.DetailVolume = DefaultDetailVolume.Object;
+    }
+    else
+    {
+        UE_LOG(LogTemp, Warning, TEXT("PlanetAtmosphereActor: Failed to load default deck detail volume"));
+    }
+
+    static ConstructorHelpers::FObjectFinder<UVolumeTexture> DefaultStructureVolume(
+        TEXT("/UniverseNoisePack/128/VT_Worley_F1_S8"));
+    if (DefaultStructureVolume.Succeeded())
+    {
+        GasGiantDeck.StructureVolume = DefaultStructureVolume.Object;
+    }
+    else
+    {
+        UE_LOG(LogTemp, Warning, TEXT("PlanetAtmosphereActor: Failed to load default deck structure volume"));
+    }
+
+    static ConstructorHelpers::FObjectFinder<UGasGiantSimConfig> DefaultSimConfig(
+        TEXT("/CloudAtmosphere/NoiseRecipes/GasGiantSimScratch"));
+    if (DefaultSimConfig.Succeeded())
+    {
+        GasGiantDeck.SimConfig = DefaultSimConfig.Object;
+    }
+    else
+    {
+        UE_LOG(LogTemp, Warning, TEXT("PlanetAtmosphereActor: Failed to load default sim config"));
     }
 }
 
@@ -533,17 +569,20 @@ void APlanetAtmosphereActor::ApplyGasGiantParams(const FAtmosphereCommonParams& 
     //
     // AtmosphereThickness is the only absolute length the field reads, and the
     // unit every height in the deck is a fraction of. The deck has no shell of
-    // its own: DeckTop and DeckBottom place it inside the air, so sizing the
-    // air does not resize the deck.
+    // its own: the anchors place it inside the air, so sizing the air does not
+    // resize the deck.
     //
-    // DeckBottom is also the fine band's lower edge, so the march's step sizing
-    // follows the anchors rather than the extinction.
+    // GradientThickness is the span the density profile occupies below each
+    // column's own top; DeckBottom is the backstop under it, and also the fine
+    // band's lower edge, so the march's step sizing follows the anchors rather
+    // than the extinction.
 
     const FLinearColor Profile = GasGiantDeck.GetProfile(PlanetRadius, Common.AtmosphereHeightScale);
 
     MID_Atmosphere->SetScalarParameterValue(TEXT("AtmosphereThickness"), Profile.R);
     MID_Atmosphere->SetScalarParameterValue(TEXT("DeckBottom"), Profile.G);
     MID_Atmosphere->SetScalarParameterValue(TEXT("VortexThreshold"), Profile.B);
+    MID_Atmosphere->SetScalarParameterValue(TEXT("GradientThickness"), Profile.A);
 
     // -- Scales -------------------------------------------------------------
 
@@ -588,10 +627,10 @@ void APlanetAtmosphereActor::ApplyGasGiantParams(const FAtmosphereCommonParams& 
 
     // -- Relief -------------------------------------------------------------
     //
-    // Fractions of the gradient depth, so relief rides on the room the deck
-    // has rather than on the whole shell. GetTopMax() sums them the same way
-    // GG_TopBounds does and the cull radius follows it; GetReliefBudget() is
-    // the matching floor check.
+    // Fractions of GradientThickness, so relief moves the profile rather than
+    // stretching it. GetTopMax() sums them the same way GG_TopBounds does and
+    // the cull radius follows it; nothing bounds them below, since the backstop
+    // catches whatever they cut.
 
     const FLinearColor Relief = GasGiantDeck.GetRelief();
 
@@ -658,13 +697,23 @@ void APlanetAtmosphereActor::ApplyGasGiantParams(const FAtmosphereCommonParams& 
     MID_Atmosphere->SetVectorParameterValue(TEXT("ScatterBase"), GasGiantScatter.ScatterBase);
     MID_Atmosphere->SetScalarParameterValue(TEXT("BandScale"), GasGiantScatter.BandScale);
 
-    // Solved from DeckOpticalDepth against the path a vertical ray takes
-    // through the deck, so moving either anchor leaves the deck's opacity where
-    // it was authored.
+    // Terminator shaping. One float4 in the shader, four scalars here, because
+    // they are tuned against each other: the softness sets the terminator's
+    // width and the power crushes the tail the forward lobe leaks through it.
+    const FLinearColor LobeParams = GasGiantScatter.GetLobeParams();
+
+    MID_Atmosphere->SetScalarParameterValue(TEXT("TerminatorSoftness"), LobeParams.R);
+    MID_Atmosphere->SetScalarParameterValue(TEXT("AmbientTerminator"), LobeParams.G);
+    MID_Atmosphere->SetScalarParameterValue(TEXT("MieLobeDecay"), LobeParams.B);
+    MID_Atmosphere->SetScalarParameterValue(TEXT("LobeShadowPower"), LobeParams.A);
+
+    // Solved from DeckOpticalDepth against the path a vertical ray takes down a
+    // column with no relief, so retuning the shell leaves the deck's opacity
+    // where it was authored.
     MID_Atmosphere->SetVectorParameterValue(TEXT("Cloud Beta"),
-        GasGiantScatter.GetCloudBeta(GasGiantDeck.DeckTop, GasGiantDeck.DeckBottom));
+        GasGiantScatter.GetCloudBeta(GasGiantDeck.DeckTop, GasGiantDeck.GetNominalFloor()));
     MID_Atmosphere->SetVectorParameterValue(TEXT("Cloud Absorption Beta"),
-        GasGiantScatter.GetCloudAbsorptionBeta(GasGiantDeck.DeckTop, GasGiantDeck.DeckBottom));
+        GasGiantScatter.GetCloudAbsorptionBeta(GasGiantDeck.DeckTop, GasGiantDeck.GetNominalFloor()));
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
