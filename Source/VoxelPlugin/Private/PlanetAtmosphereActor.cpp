@@ -44,7 +44,8 @@ APlanetAtmosphereActor::APlanetAtmosphereActor()
     // today and free to diverge -- carrying two instances is what makes that a
     // value edit rather than a code change.
     GasGiantGeometry = FAtmosphereGeometryParams::MakeGasGiantDefaults();
-    GasGiantAir = FAtmosphereAirParams::MakeGasGiantDefaults();
+    GasGiantAtmosphereScattering = FAtmosphereAirScatteringParams::MakeGasGiantDefaults();
+    GasGiantCloudScattering = FAtmosphereCloudScatteringParams::MakeGasGiantDefaults();
     GasGiantRaymarch = FAtmosphereRaymarchParams::MakeGasGiantDefaults();
 
     PreprocessMaterial = TSoftObjectPtr<UMaterialInterface>(FSoftObjectPath(MatPath_Preprocess));
@@ -495,18 +496,18 @@ void APlanetAtmosphereActor::ApplyCommonParams(const FAtmosphereCommonView& Comm
         FLinearColor(LightDir.X, LightDir.Y, LightDir.Z, 0.0f));
     MID_Atmosphere->SetVectorParameterValue(TEXT("Light Color"), LightColor);
 
-    MID_Atmosphere->SetVectorParameterValue(TEXT("Rayleigh Beta"), Common.Air.RayleighBeta);
+    MID_Atmosphere->SetVectorParameterValue(TEXT("Rayleigh Beta"), Common.AirScattering.RayleighBeta);
 
-    MID_Atmosphere->SetVectorParameterValue(TEXT("Mie Beta"), Common.Air.MieBeta);
+    MID_Atmosphere->SetVectorParameterValue(TEXT("Mie Beta"), Common.AirScattering.MieBeta);
 
-    MID_Atmosphere->SetScalarParameterValue(TEXT("Mie G"), Common.Air.MieG);
-    MID_Atmosphere->SetVectorParameterValue(TEXT("Atmosphere Absorption Beta"), Common.Air.AbsorptionBeta);
+    MID_Atmosphere->SetScalarParameterValue(TEXT("Mie G"), Common.AirScattering.MieG);
+    MID_Atmosphere->SetVectorParameterValue(TEXT("Atmosphere Absorption Beta"), Common.AirScattering.AbsorptionBeta);
 
-    MID_Atmosphere->SetScalarParameterValue(TEXT("Atmosphere Absorption Falloff"), Common.Air.AbsorptionFalloff);
-    MID_Atmosphere->SetVectorParameterValue(TEXT("Atmosphere Ambient"), Common.Air.Ambient);
+    MID_Atmosphere->SetScalarParameterValue(TEXT("Atmosphere Absorption Falloff"), Common.AirScattering.AbsorptionFalloff);
+    MID_Atmosphere->SetVectorParameterValue(TEXT("Atmosphere Ambient"), Common.AirScattering.Ambient);
 
-    MID_Atmosphere->SetVectorParameterValue(TEXT("Cloud Ambient"), Common.CloudLight.Ambient);
-    MID_Atmosphere->SetVectorParameterValue(TEXT("Cloud Phase Params"), Common.CloudLight.PhaseParams);
+    MID_Atmosphere->SetVectorParameterValue(TEXT("Cloud Ambient"), Common.CloudScattering.Ambient);
+    MID_Atmosphere->SetVectorParameterValue(TEXT("Cloud Phase Params"), Common.CloudScattering.PhaseParams);
 
     MID_Atmosphere->SetScalarParameterValue(TEXT("Atmosphere Steps"), Common.Raymarch.AtmosphereSteps);
     MID_Atmosphere->SetScalarParameterValue(TEXT("Atmosphere Light Steps"), Common.Raymarch.AtmosphereLightSteps);

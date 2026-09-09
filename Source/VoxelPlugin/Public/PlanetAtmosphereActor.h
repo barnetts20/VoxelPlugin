@@ -57,15 +57,62 @@ class VOXELPLUGIN_API APlanetAtmosphereActor : public AActor
 public:
     APlanetAtmosphereActor();
 
+    // --- Pipeline ---
+    //
+    // The assets and passes the actor drives, rather than anything the march
+    // reads. First in the panel because none of the parameters below mean
+    // anything until these are right.
+    //
+    // Soft material references rather than hardcoded paths: a stale path logs a
+    // warning and otherwise just looks like a broken material.
+
+    UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "CloudAtmosphere|Pipeline|Materials")
+    TSoftObjectPtr<UMaterialInterface> PreprocessMaterial;
+
+    /** Slot 1 for PlanetType::Terrestrial. */
+    UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "CloudAtmosphere|Pipeline|Materials")
+    TSoftObjectPtr<UMaterialInterface> TerrestrialMarchMaterial;
+
+    /** Slot 1 for PlanetType::GasGiant. */
+    UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "CloudAtmosphere|Pipeline|Materials")
+    TSoftObjectPtr<UMaterialInterface> GasGiantMarchMaterial;
+
+    UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "CloudAtmosphere|Pipeline|Materials")
+    TSoftObjectPtr<UMaterialInterface> PostprocessMaterial;
+
+    /** Recreates slot 1 against the current PlanetType and repopulates every
+     *  slot. Call after changing PlanetType or either march material. */
+    UFUNCTION(BlueprintCallable, Category = "CloudAtmosphere|Pipeline|Materials")
+    void RebuildMaterialInstances();
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CloudAtmosphere|Pipeline")
+    FAtmosphereCompositeParams Composite;
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CloudAtmosphere|Pipeline")
+    FAtmosphereSimulationParams Simulation;
+
+    // --- Atmosphere ---
+    //
+    // What the actor IS, before anything about how it looks.
+
     /** True when spawned and driven by APlanetActor. Location and scale become
      *  read-only; rotation remains editable (controls light direction). */
-    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Atmosphere")
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "CloudAtmosphere|Atmosphere")
     bool bIsPlanetOwned = false;
 
     /** Which cloud model slot 1 renders. Changing this at runtime requires
      *  RebuildMaterialInstances — the material is chosen once, at creation. */
-    UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Atmosphere")
+    UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "CloudAtmosphere|Atmosphere")
     EPlanetAtmosphereType PlanetType = EPlanetAtmosphereType::Terrestrial;
+
+    // A GROUP OF ONE GETS NO WRAPPER. The substruct buys a fold-out, which is
+    // only worth a click when there is more than one thing behind it.
+
+    /** RGB direction is the hue, RGB magnitude is the intensity. The march and
+     *  the directional light both derive from this, so they cannot disagree
+     *  about the star. Light DIRECTION comes from the actor's rotation. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CloudAtmosphere|Atmosphere")
+    FLinearColor LightColor = FLinearColor(30.0f, 28.5f, 27.0f, 10.0f);
 
     /** Enable/disable the atmosphere's unbound post-process volume. This is the ONLY
      *  reliable off-switch for the ray march: the volume is not a primitive component,
@@ -78,17 +125,11 @@ public:
      *  the owning planet from IStarLit::SetStarWorldPosition. */
     void OrientToStar(const FVector& StarWorldPos);
 
-    /** Recreates slot 1 against the current PlanetType and repopulates every
-     *  slot. Call after changing PlanetType or either march material. */
-    UFUNCTION(BlueprintCallable, Category = "Atmosphere")
-    void RebuildMaterialInstances();
-
     // --- Parameters ---
     //
-    // Environment is one instance for both models. Common is one definition
-    // with an instance per model, so the shell, the air and the march budget
-    // can differ without two definitions of what they mean. The model structs
-    // are what only one march material declares.
+    // Common is one definition with an instance per model, so the shell, the
+    // air and the march budget can differ without two definitions of what they
+    // mean. The model structs are what only one march material declares.
     //
     // Every per-type property is EditConditionHides, so the details panel shows
     // exactly one Common set and one model set at a time.
@@ -99,77 +140,58 @@ public:
     // Declaring one property per group instead puts the group name one level
     // under the category and its members under that.
 
-    // A GROUP OF ONE GETS NO WRAPPER. The substruct buys a fold-out, which is
-    // only worth a click when there is more than one thing behind it.
+    // The Common groups, once per model, each its own panel category.
+    //
+    // INLINED, so the group name comes from the category rather than from a
+    // struct row underneath it. Their members carry no category of their own,
+    // which is what lets one shared definition land in a different group per
+    // model -- an absolute path on the members could only name one.
+    //
+    // EditConditionHides does not survive the inlining: the condition lives on
+    // the property row, and there is no row left. Both models' groups are
+    // visible at once, which the naming is what distinguishes.
 
-    /** RGB direction is the hue, RGB magnitude is the intensity. The march and
-     *  the directional light both derive from this, so they cannot disagree
-     *  about the star. Light DIRECTION comes from the actor's rotation. */
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Environment")
-    FLinearColor LightColor = FLinearColor(30.0f, 28.5f, 27.0f, 10.0f);
-
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Environment")
-    FAtmosphereCompositeParams Composite;
-
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Environment")
-    FAtmosphereSimulationParams Simulation;
-
-    // The Common groups, once per model. One definition of what each group
-    // means, two sets of values, so the shell, the air and the march budget can
-    // differ without two definitions.
-
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrestrial Common", meta = (EditCondition = "PlanetType == EPlanetAtmosphereType::Terrestrial", EditConditionHides))
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CloudAtmosphere|Terrestrial|Terrestrial Geometry", meta = (EditCondition = "PlanetType == EPlanetAtmosphereType::Terrestrial", EditConditionHides, ShowOnlyInnerProperties))
     FAtmosphereGeometryParams TerrestrialGeometry;
 
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrestrial Common", meta = (EditCondition = "PlanetType == EPlanetAtmosphereType::Terrestrial", EditConditionHides))
-    FAtmosphereAirParams TerrestrialAir;
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CloudAtmosphere|Terrestrial|Terrestrial Atmosphere Scattering", meta = (EditCondition = "PlanetType == EPlanetAtmosphereType::Terrestrial", EditConditionHides, ShowOnlyInnerProperties))
+    FAtmosphereAirScatteringParams TerrestrialAtmosphereScattering;
 
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrestrial Common", meta = (EditCondition = "PlanetType == EPlanetAtmosphereType::Terrestrial", EditConditionHides))
-    FAtmosphereCloudLightParams TerrestrialCloudLight;
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CloudAtmosphere|Terrestrial|Terrestrial Cloud Scattering", meta = (EditCondition = "PlanetType == EPlanetAtmosphereType::Terrestrial", EditConditionHides, ShowOnlyInnerProperties))
+    FAtmosphereCloudScatteringParams TerrestrialCloudScattering;
 
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrestrial Common", meta = (EditCondition = "PlanetType == EPlanetAtmosphereType::Terrestrial", EditConditionHides))
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CloudAtmosphere|Terrestrial|Terrestrial Raymarch", meta = (EditCondition = "PlanetType == EPlanetAtmosphereType::Terrestrial", EditConditionHides, ShowOnlyInnerProperties))
     FAtmosphereRaymarchParams TerrestrialRaymarch;
 
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Gas Giant Common", meta = (EditCondition = "PlanetType == EPlanetAtmosphereType::GasGiant", EditConditionHides))
-    FAtmosphereGeometryParams GasGiantGeometry;
-
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Gas Giant Common", meta = (EditCondition = "PlanetType == EPlanetAtmosphereType::GasGiant", EditConditionHides))
-    FAtmosphereAirParams GasGiantAir;
-
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Gas Giant Common", meta = (EditCondition = "PlanetType == EPlanetAtmosphereType::GasGiant", EditConditionHides))
-    FAtmosphereCloudLightParams GasGiantCloudLight;
-
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Gas Giant Common", meta = (EditCondition = "PlanetType == EPlanetAtmosphereType::GasGiant", EditConditionHides))
-    FAtmosphereRaymarchParams GasGiantRaymarch;
-
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Atmosphere|Terrestrial Cloud", meta = (EditCondition = "PlanetType == EPlanetAtmosphereType::Terrestrial", EditConditionHides, ShowOnlyInnerProperties))
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CloudAtmosphere|Terrestrial|Terrestrial Cloud", meta = (EditCondition = "PlanetType == EPlanetAtmosphereType::Terrestrial", EditConditionHides, ShowOnlyInnerProperties))
     FTerrestrialCloudParams Terrestrial;
 
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Atmosphere|Gas Giant Deck", meta = (EditCondition = "PlanetType == EPlanetAtmosphereType::GasGiant", EditConditionHides, ShowOnlyInnerProperties))
+    // THE SHELL IS THE DECK'S FIRST SHAPE TERM. Every other value under Shape
+    // is a fraction of this one, so an absolute at the top of the group is what
+    // the rest are read against. It sizes the air as well, which is why the
+    // terrestrial copy keeps a group of its own.
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CloudAtmosphere|Gas Giant|Gas Giant Deck|Shape", meta = (EditCondition = "PlanetType == EPlanetAtmosphereType::GasGiant", EditConditionHides, ShowOnlyInnerProperties))
+    FAtmosphereGeometryParams GasGiantGeometry;
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CloudAtmosphere|Gas Giant|Gas Giant Deck", meta = (EditCondition = "PlanetType == EPlanetAtmosphereType::GasGiant", EditConditionHides, ShowOnlyInnerProperties))
     FGasGiantDeckParams GasGiantDeck;
 
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Atmosphere|Gas Giant Scattering", meta = (EditCondition = "PlanetType == EPlanetAtmosphereType::GasGiant", EditConditionHides, ShowOnlyInnerProperties))
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CloudAtmosphere|Gas Giant|Gas Giant Atmosphere Scattering", meta = (EditCondition = "PlanetType == EPlanetAtmosphereType::GasGiant", EditConditionHides, ShowOnlyInnerProperties))
+    FAtmosphereAirScatteringParams GasGiantAtmosphereScattering;
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CloudAtmosphere|Gas Giant|Gas Giant Cloud Scattering", meta = (EditCondition = "PlanetType == EPlanetAtmosphereType::GasGiant", EditConditionHides, ShowOnlyInnerProperties))
+    FAtmosphereCloudScatteringParams GasGiantCloudScattering;
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CloudAtmosphere|Gas Giant|Gas Giant Raymarch", meta = (EditCondition = "PlanetType == EPlanetAtmosphereType::GasGiant", EditConditionHides, ShowOnlyInnerProperties))
+    FAtmosphereRaymarchParams GasGiantRaymarch;
+
+    // NO GROUP OF ITS OWN. Every member carries an absolute path -- the bands
+    // and the extinction to Cloud Scattering, the four lighting scalars to
+    // Terminator, the optical depth and band scale to the Deck -- so a category
+    // here would only add an empty node beside the groups they went to. Named
+    // for one of those groups so the fallback merges instead of stranding.
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CloudAtmosphere|Gas Giant|Gas Giant Cloud Scattering", meta = (EditCondition = "PlanetType == EPlanetAtmosphereType::GasGiant", EditConditionHides, ShowOnlyInnerProperties))
     FGasGiantScatterParams GasGiantScatter;
-
-    // --- Material assets ---
-    //
-    // Soft references rather than hardcoded paths: a stale path logs a warning
-    // and otherwise looks like a broken material, and these assets are expected
-    // to move out of VoxelPlugin.
-
-    UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Atmosphere|Materials")
-    TSoftObjectPtr<UMaterialInterface> PreprocessMaterial;
-
-    /** Slot 1 for PlanetType::Terrestrial. */
-    UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Atmosphere|Materials")
-    TSoftObjectPtr<UMaterialInterface> TerrestrialMarchMaterial;
-
-    /** Slot 1 for PlanetType::GasGiant. */
-    UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Atmosphere|Materials")
-    TSoftObjectPtr<UMaterialInterface> GasGiantMarchMaterial;
-
-    UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Atmosphere|Materials")
-    TSoftObjectPtr<UMaterialInterface> PostprocessMaterial;
 
     // --- Lifecycle ---
 
@@ -279,8 +301,8 @@ private:
 
         return FAtmosphereCommonView{
             bGasGiant ? GasGiantGeometry : TerrestrialGeometry,
-            bGasGiant ? GasGiantAir : TerrestrialAir,
-            bGasGiant ? GasGiantCloudLight : TerrestrialCloudLight,
+            bGasGiant ? GasGiantAtmosphereScattering : TerrestrialAtmosphereScattering,
+            bGasGiant ? GasGiantCloudScattering : TerrestrialCloudScattering,
             bGasGiant ? GasGiantRaymarch : TerrestrialRaymarch };
     }
 
