@@ -521,7 +521,7 @@ void APlanetAtmosphereActor::ApplyCommonParams(const FAtmosphereCommonView& Comm
     MID_Atmosphere->SetScalarParameterValue(TEXT("Step Scale Factor"), Common.Raymarch.StepScaleFactor);
     MID_Atmosphere->SetScalarParameterValue(TEXT("Cloud Steps"), Common.Raymarch.CloudSteps);
     MID_Atmosphere->SetScalarParameterValue(TEXT("Cloud Light Steps"), Common.Raymarch.CloudLightSteps);
-    MID_Atmosphere->SetScalarParameterValue(TEXT("Light Budget Floor"), Common.Raymarch.LightBudgetFloor);
+    MID_Atmosphere->SetScalarParameterValue(TEXT("Light Step Texels"), Common.Raymarch.LightStepTexels);
 }
 
 void APlanetAtmosphereActor::ApplyTerrestrialParams(const FAtmosphereCommonView& Common)
@@ -649,6 +649,22 @@ void APlanetAtmosphereActor::ApplyGasGiantParams(const FAtmosphereCommonView& Co
     // -- Layers -------------------------------------------------------------
 
     MID_Atmosphere->SetScalarParameterValue(TEXT("DeckSlope"), GasGiantDeck.DeckSlope);
+
+    const FLinearColor Crossfade = GasGiantDeck.GetCrossfade();
+
+    // AUTHORED IN SIMULATED SECONDS, PUSHED IN REAL ONES. TimeScale is simulated
+    // time per real second, so the flow's own motion speeds up with it -- and
+    // noise the flow is supposed to be carrying has to speed up by the same
+    // factor or the two visibly come apart the moment the sim speed is touched.
+    //
+    // A frozen sim freezes the crossfade with it, which is the right answer
+    // rather than an edge case: nothing is advecting, so nothing should travel.
+    const float SimTimeScale = Simulation.Config ? Simulation.Config->TimeScale : 1.0f;
+
+    MID_Atmosphere->SetScalarParameterValue(TEXT("Crossfade Period"),
+        Crossfade.R / FMath::Max(SimTimeScale, KINDA_SMALL_NUMBER));
+    MID_Atmosphere->SetScalarParameterValue(TEXT("Crossfade Detail"), Crossfade.G);
+    MID_Atmosphere->SetScalarParameterValue(TEXT("Crossfade Structure"), Crossfade.B);
 
     // -- Fade ranges --------------------------------------------------------
     //
