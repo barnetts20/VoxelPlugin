@@ -522,6 +522,7 @@ void APlanetAtmosphereActor::ApplyCommonParams(const FAtmosphereCommonView& Comm
     MID_Atmosphere->SetScalarParameterValue(TEXT("Cloud Steps"), Common.Raymarch.CloudSteps);
     MID_Atmosphere->SetScalarParameterValue(TEXT("Cloud Light Steps"), Common.Raymarch.CloudLightSteps);
     MID_Atmosphere->SetScalarParameterValue(TEXT("Light Step Texels"), Common.Raymarch.LightStepTexels);
+    MID_Atmosphere->SetScalarParameterValue(TEXT("View Step Pixels"), Common.Raymarch.ViewStepPixels);
 }
 
 void APlanetAtmosphereActor::ApplyTerrestrialParams(const FAtmosphereCommonView& Common)
