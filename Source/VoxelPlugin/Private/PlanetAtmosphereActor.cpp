@@ -39,8 +39,13 @@ APlanetAtmosphereActor::APlanetAtmosphereActor()
     // Set on the CDO rather than left to member initialisers, so the details
     // panel's reset-to-default gives each type ITS defaults. Member
     // initialisers can only serve one of the two.
-    TerrestrialCommon = FAtmosphereCommonParams::MakeTerrestrialDefaults();
-    GasGiantCommon = FAtmosphereCommonParams::MakeGasGiantDefaults();
+    // The terrestrial sets are the member initialisers; the gas giant sets are
+    // deltas against them, per group. Everything not overridden is identical
+    // today and free to diverge -- carrying two instances is what makes that a
+    // value edit rather than a code change.
+    GasGiantGeometry = FAtmosphereGeometryParams::MakeGasGiantDefaults();
+    GasGiantAir = FAtmosphereAirParams::MakeGasGiantDefaults();
+    GasGiantRaymarch = FAtmosphereRaymarchParams::MakeGasGiantDefaults();
 
     PreprocessMaterial = TSoftObjectPtr<UMaterialInterface>(FSoftObjectPath(MatPath_Preprocess));
     TerrestrialMarchMaterial = TSoftObjectPtr<UMaterialInterface>(FSoftObjectPath(MatPath_Terrestrial));
@@ -88,7 +93,7 @@ APlanetAtmosphereActor::APlanetAtmosphereActor()
         TEXT("/CloudAtmosphere/NoiseRecipes/GasGiantSimScratch"));
     if (DefaultSimConfig.Succeeded())
     {
-        GasGiantDeck.SimConfig = DefaultSimConfig.Object;
+        Simulation.Config = DefaultSimConfig.Object;
     }
     else
     {
@@ -105,7 +110,7 @@ void APlanetAtmosphereActor::BeginPlay()
     Super::BeginPlay();
 
     if (PlanetType == EPlanetAtmosphereType::GasGiant &&
-        GasGiantDeck.bStartSimulationOnBeginPlay)
+        Simulation.bStartOnBeginPlay)
     {
         StartGasGiantSimulation();
     }
@@ -451,7 +456,7 @@ void APlanetAtmosphereActor::UpdateMaterialParameters()
     // Selected once and threaded through, so the shell radius the composite
     // blurs against cannot come from a different instance than the one the
     // march planned with.
-    const FAtmosphereCommonParams& Common = GetCommonParams();
+    const FAtmosphereCommonView Common = GetCommonParams();
 
     ApplyCommonParams(Common, PlanetRadius, PlanetCenter, LightDir);
 
@@ -471,51 +476,51 @@ void APlanetAtmosphereActor::UpdateMaterialParameters()
 
     MID_Postprocess->SetVectorParameterValue(TEXT("Atmosphere Center"),
         FLinearColor(PlanetCenter.X, PlanetCenter.Y, PlanetCenter.Z, 0.0f));
-    MID_Postprocess->SetScalarParameterValue(TEXT("Atmosphere Radius"), Common.GetAtmosphereRadius(PlanetRadius));
-    MID_Postprocess->SetScalarParameterValue(TEXT("Blur Falloff Factor"), Environment.BlurFalloffFactor);
-    MID_Postprocess->SetScalarParameterValue(TEXT("MaxW"), Environment.MaxBlurWeight);
-    MID_Postprocess->SetScalarParameterValue(TEXT("MinW"), Environment.GetMinBlurWeight());
+    MID_Postprocess->SetScalarParameterValue(TEXT("Atmosphere Radius"), Common.Geometry.GetAtmosphereRadius(PlanetRadius));
+    MID_Postprocess->SetScalarParameterValue(TEXT("Blur Falloff Factor"), Composite.BlurFalloffFactor);
+    MID_Postprocess->SetScalarParameterValue(TEXT("MaxW"), Composite.MaxBlurWeight);
+    MID_Postprocess->SetScalarParameterValue(TEXT("MinW"), Composite.GetMinBlurWeight());
 }
 
-void APlanetAtmosphereActor::ApplyCommonParams(const FAtmosphereCommonParams& Common, float PlanetRadius,
+void APlanetAtmosphereActor::ApplyCommonParams(const FAtmosphereCommonView& Common, float PlanetRadius,
     const FVector& PlanetCenter, const FVector& LightDir)
 {
     MID_Atmosphere->SetVectorParameterValue(TEXT("Planet Center"),
         FLinearColor(PlanetCenter.X, PlanetCenter.Y, PlanetCenter.Z, 0.0f));
     MID_Atmosphere->SetScalarParameterValue(TEXT("Planet Radius"), PlanetRadius);
-    MID_Atmosphere->SetScalarParameterValue(TEXT("Atmosphere Height Scale"), Common.AtmosphereHeightScale);
-    MID_Atmosphere->SetScalarParameterValue(TEXT("Atmosphere Floor Offset"), Common.AtmosphereFloorOffset);
+    MID_Atmosphere->SetScalarParameterValue(TEXT("Atmosphere Height Scale"), Common.Geometry.HeightScale);
+    MID_Atmosphere->SetScalarParameterValue(TEXT("Atmosphere Floor Offset"), Common.Geometry.FloorOffset);
 
     MID_Atmosphere->SetVectorParameterValue(TEXT("Light Direction"),
         FLinearColor(LightDir.X, LightDir.Y, LightDir.Z, 0.0f));
-    MID_Atmosphere->SetVectorParameterValue(TEXT("Light Color"), Environment.LightColor);
+    MID_Atmosphere->SetVectorParameterValue(TEXT("Light Color"), LightColor);
 
-    MID_Atmosphere->SetVectorParameterValue(TEXT("Rayleigh Beta"), Common.RayleighBeta);
-    MID_Atmosphere->SetScalarParameterValue(TEXT("Rayleigh Height"), Common.RayleighHeight);
-    MID_Atmosphere->SetVectorParameterValue(TEXT("Mie Beta"), Common.MieBeta);
-    MID_Atmosphere->SetScalarParameterValue(TEXT("Mie Height"), Common.MieHeight);
-    MID_Atmosphere->SetScalarParameterValue(TEXT("Mie G"), Common.MieG);
-    MID_Atmosphere->SetVectorParameterValue(TEXT("Atmosphere Absorption Beta"), Common.AtmosphereAbsorptionBeta);
-    MID_Atmosphere->SetScalarParameterValue(TEXT("Atmosphere Absorption Height"), Common.AtmosphereAbsorptionHeight);
-    MID_Atmosphere->SetScalarParameterValue(TEXT("Atmosphere Absorption Falloff"), Common.AtmosphereAbsorptionFalloff);
-    MID_Atmosphere->SetVectorParameterValue(TEXT("Atmosphere Ambient"), Common.AtmosphereAmbient);
+    MID_Atmosphere->SetVectorParameterValue(TEXT("Rayleigh Beta"), Common.Air.RayleighBeta);
 
-    MID_Atmosphere->SetVectorParameterValue(TEXT("Cloud Ambient"), Common.CloudAmbient);
-    MID_Atmosphere->SetVectorParameterValue(TEXT("Cloud Phase Params"), Common.CloudPhaseParams);
+    MID_Atmosphere->SetVectorParameterValue(TEXT("Mie Beta"), Common.Air.MieBeta);
 
-    MID_Atmosphere->SetScalarParameterValue(TEXT("Atmosphere Steps"), Common.AtmosphereSteps);
-    MID_Atmosphere->SetScalarParameterValue(TEXT("Atmosphere Light Steps"), Common.AtmosphereLightSteps);
-    MID_Atmosphere->SetScalarParameterValue(TEXT("Step Scale Factor"), Common.StepScaleFactor);
-    MID_Atmosphere->SetScalarParameterValue(TEXT("Cloud Steps"), Common.CloudSteps);
-    MID_Atmosphere->SetScalarParameterValue(TEXT("Cloud Light Steps"), Common.CloudLightSteps);
+    MID_Atmosphere->SetScalarParameterValue(TEXT("Mie G"), Common.Air.MieG);
+    MID_Atmosphere->SetVectorParameterValue(TEXT("Atmosphere Absorption Beta"), Common.Air.AbsorptionBeta);
+
+    MID_Atmosphere->SetScalarParameterValue(TEXT("Atmosphere Absorption Falloff"), Common.Air.AbsorptionFalloff);
+    MID_Atmosphere->SetVectorParameterValue(TEXT("Atmosphere Ambient"), Common.Air.Ambient);
+
+    MID_Atmosphere->SetVectorParameterValue(TEXT("Cloud Ambient"), Common.CloudLight.Ambient);
+    MID_Atmosphere->SetVectorParameterValue(TEXT("Cloud Phase Params"), Common.CloudLight.PhaseParams);
+
+    MID_Atmosphere->SetScalarParameterValue(TEXT("Atmosphere Steps"), Common.Raymarch.AtmosphereSteps);
+    MID_Atmosphere->SetScalarParameterValue(TEXT("Atmosphere Light Steps"), Common.Raymarch.AtmosphereLightSteps);
+    MID_Atmosphere->SetScalarParameterValue(TEXT("Step Scale Factor"), Common.Raymarch.StepScaleFactor);
+    MID_Atmosphere->SetScalarParameterValue(TEXT("Cloud Steps"), Common.Raymarch.CloudSteps);
+    MID_Atmosphere->SetScalarParameterValue(TEXT("Cloud Light Steps"), Common.Raymarch.CloudLightSteps);
 }
 
-void APlanetAtmosphereActor::ApplyTerrestrialParams(const FAtmosphereCommonParams& Common)
+void APlanetAtmosphereActor::ApplyTerrestrialParams(const FAtmosphereCommonView& Common)
 {
     MID_Atmosphere->SetScalarParameterValue(TEXT("Cloud Outer Height Scale"),
-        Terrestrial.GetOuterHeightScale(Common.AtmosphereHeightScale));
+        Terrestrial.GetOuterHeightScale(Common.Geometry.HeightScale));
     MID_Atmosphere->SetScalarParameterValue(TEXT("Cloud Inner Height Scale"),
-        Terrestrial.GetInnerHeightScale(Common.AtmosphereHeightScale));
+        Terrestrial.GetInnerHeightScale(Common.Geometry.HeightScale));
 
     if (Terrestrial.CloudVolumeTexture)
     {
@@ -539,7 +544,7 @@ void APlanetAtmosphereActor::ApplyTerrestrialParams(const FAtmosphereCommonParam
     MID_Atmosphere->SetVectorParameterValue(TEXT("Cloud Absorption Beta"), Terrestrial.CloudAbsorptionBeta);
 }
 
-void APlanetAtmosphereActor::ApplyGasGiantParams(const FAtmosphereCommonParams& Common, float PlanetRadius)
+void APlanetAtmosphereActor::ApplyGasGiantParams(const FAtmosphereCommonView& Common, float PlanetRadius)
 {
     // THE MATERIAL COMPOSES THE SHADER'S FLOAT4s FROM INDIVIDUAL SCALARS via
     // Convert nodes, for instance-editor clarity. So there is no "Profile" or
@@ -550,9 +555,9 @@ void APlanetAtmosphereActor::ApplyGasGiantParams(const FAtmosphereCommonParams& 
     // rather than as a migrated asset. Its sampler must be WRAP U, CLAMP V:
     // the sim grid is a cylinder, and wrapping V joins the north pole to the
     // south, which reads as a simulation bug rather than a sampler one.
-    if (GasGiantDeck.SimConfig && GasGiantDeck.SimConfig->FlowTarget)
+    if (Simulation.Config && Simulation.Config->FlowTarget)
     {
-        MID_Atmosphere->SetTextureParameterValue(TEXT("flowField"), GasGiantDeck.SimConfig->FlowTarget);
+        MID_Atmosphere->SetTextureParameterValue(TEXT("flowField"), Simulation.Config->FlowTarget);
     }
 
     if (GasGiantDeck.DetailVolume)
@@ -573,14 +578,14 @@ void APlanetAtmosphereActor::ApplyGasGiantParams(const FAtmosphereCommonParams& 
     // resize the deck.
     //
     // GradientThickness is the span the density profile occupies below each
-    // column's own top; DeckBottom is the backstop under it, and also the fine
+    // column's own top; DeckBackstop is the backstop under it, and also the fine
     // band's lower edge, so the march's step sizing follows the anchors rather
     // than the extinction.
 
-    const FLinearColor Profile = GasGiantDeck.GetProfile(PlanetRadius, Common.AtmosphereHeightScale);
+    const FLinearColor Profile = GasGiantDeck.GetProfile(PlanetRadius, Common.Geometry.HeightScale);
 
     MID_Atmosphere->SetScalarParameterValue(TEXT("AtmosphereThickness"), Profile.R);
-    MID_Atmosphere->SetScalarParameterValue(TEXT("DeckBottom"), Profile.G);
+    MID_Atmosphere->SetScalarParameterValue(TEXT("DeckBackstop"), Profile.G);
     MID_Atmosphere->SetScalarParameterValue(TEXT("VortexThreshold"), Profile.B);
     MID_Atmosphere->SetScalarParameterValue(TEXT("GradientThickness"), Profile.A);
 
@@ -613,15 +618,8 @@ void APlanetAtmosphereActor::ApplyGasGiantParams(const FAtmosphereCommonParams& 
     const FLinearColor DetailNoise = GasGiantDeck.GetDetailNoise();
     const FLinearColor StructureNoise = GasGiantDeck.GetStructureNoise();
 
-    MID_Atmosphere->SetScalarParameterValue(TEXT("DetailWorleyCoarse"), DetailNoise.R);
-    MID_Atmosphere->SetScalarParameterValue(TEXT("DetailWorleyMid"), DetailNoise.G);
-    MID_Atmosphere->SetScalarParameterValue(TEXT("DetailWorleyFine"), DetailNoise.B);
-    MID_Atmosphere->SetScalarParameterValue(TEXT("DetailAmount"), DetailNoise.A);
-
-    MID_Atmosphere->SetScalarParameterValue(TEXT("StructureWorleyCoarse"), StructureNoise.R);
-    MID_Atmosphere->SetScalarParameterValue(TEXT("StructureWorleyMid"), StructureNoise.G);
-    MID_Atmosphere->SetScalarParameterValue(TEXT("StructureWorleyFine"), StructureNoise.B);
-    MID_Atmosphere->SetScalarParameterValue(TEXT("StructureAmount"), StructureNoise.A);
+    MID_Atmosphere->SetVectorParameterValue(TEXT("DetailNoise"), DetailNoise);
+    MID_Atmosphere->SetVectorParameterValue(TEXT("StructureNoise"), StructureNoise);
 
     MID_Atmosphere->SetScalarParameterValue(TEXT("EdgeBias"), GasGiantDeck.EdgeBias);
 
@@ -636,13 +634,11 @@ void APlanetAtmosphereActor::ApplyGasGiantParams(const FAtmosphereCommonParams& 
 
     MID_Atmosphere->SetScalarParameterValue(TEXT("DeckTop"), Relief.R);
     MID_Atmosphere->SetScalarParameterValue(TEXT("BandRelief"), Relief.G);
-    MID_Atmosphere->SetScalarParameterValue(TEXT("PressureLift"), Relief.B);
-    MID_Atmosphere->SetScalarParameterValue(TEXT("StormTowerHeight"), Relief.A);
+    MID_Atmosphere->SetScalarParameterValue(TEXT("PressureRelief"), Relief.B);
+    MID_Atmosphere->SetScalarParameterValue(TEXT("StormTowerRelief"), Relief.A);
 
     // -- Layers -------------------------------------------------------------
 
-    MID_Atmosphere->SetScalarParameterValue(TEXT("FlowLayer"), static_cast<float>(GasGiantDeck.FlowLayer));
-    MID_Atmosphere->SetScalarParameterValue(TEXT("DeepFlowLayer"), static_cast<float>(GasGiantDeck.DeepFlowLayer));
     MID_Atmosphere->SetScalarParameterValue(TEXT("DeckSlope"), GasGiantDeck.DeckSlope);
 
     // -- Fade ranges --------------------------------------------------------
@@ -661,15 +657,15 @@ void APlanetAtmosphereActor::ApplyGasGiantParams(const FAtmosphereCommonParams& 
 
     MID_Atmosphere->SetScalarParameterValue(TEXT("BandSharpness"), GasGiantDeck.BandSharpness);
     MID_Atmosphere->SetScalarParameterValue(TEXT("ReliefThinning"), GasGiantDeck.ReliefThinning);
-    MID_Atmosphere->SetScalarParameterValue(TEXT("DetailVertical"), GasGiantDeck.GetDetailVertical(Common.AtmosphereHeightScale));
-    MID_Atmosphere->SetScalarParameterValue(TEXT("StructureVertical"), GasGiantDeck.GetStructureVertical(Common.AtmosphereHeightScale));
+    MID_Atmosphere->SetScalarParameterValue(TEXT("DetailVertical"), GasGiantDeck.GetDetailVertical(Common.Geometry.HeightScale));
+    MID_Atmosphere->SetScalarParameterValue(TEXT("StructureVertical"), GasGiantDeck.GetStructureVertical(Common.Geometry.HeightScale));
     MID_Atmosphere->SetScalarParameterValue(TEXT("DetailErosion"), GasGiantDeck.DetailErosion);
     MID_Atmosphere->SetScalarParameterValue(TEXT("DetailRelief"), GasGiantDeck.DetailRelief);
     MID_Atmosphere->SetScalarParameterValue(TEXT("StructureRelief"), GasGiantDeck.StructureRelief);
     MID_Atmosphere->SetScalarParameterValue(TEXT("StructureErosion"), GasGiantDeck.StructureErosion);
     MID_Atmosphere->SetScalarParameterValue(TEXT("ErosionDepth"), GasGiantDeck.ErosionDepth);
     MID_Atmosphere->SetScalarParameterValue(TEXT("DensityCurve"), GasGiantDeck.DensityCurve);
-    MID_Atmosphere->SetScalarParameterValue(TEXT("RigidRate"), GasGiantDeck.RigidRate);
+    MID_Atmosphere->SetScalarParameterValue(TEXT("RotationWeight"), GasGiantDeck.RotationWeight);
 
     // The sim's clock, not the world's. Requires the material's Time parameter
     // to feed the Custom node directly -- wired through a multiply against an
@@ -711,9 +707,9 @@ void APlanetAtmosphereActor::ApplyGasGiantParams(const FAtmosphereCommonParams& 
     // column with no relief, so retuning the shell leaves the deck's opacity
     // where it was authored.
     MID_Atmosphere->SetVectorParameterValue(TEXT("Cloud Beta"),
-        GasGiantScatter.GetCloudBeta(GasGiantDeck.DeckTop, GasGiantDeck.GetNominalFloor()));
+        GasGiantScatter.GetCloudBeta(GasGiantDeck.GetDeckBase(), GasGiantDeck.GetNominalFloor()));
     MID_Atmosphere->SetVectorParameterValue(TEXT("Cloud Absorption Beta"),
-        GasGiantScatter.GetCloudAbsorptionBeta(GasGiantDeck.DeckTop, GasGiantDeck.GetNominalFloor()));
+        GasGiantScatter.GetCloudAbsorptionBeta(GasGiantDeck.GetDeckBase(), GasGiantDeck.GetNominalFloor()));
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -722,7 +718,7 @@ void APlanetAtmosphereActor::ApplyGasGiantParams(const FAtmosphereCommonParams& 
 
 void APlanetAtmosphereActor::StartGasGiantSimulation()
 {
-    if (!GasGiantDeck.SimConfig)
+    if (!Simulation.Config)
     {
         UE_LOG(LogTemp, Warning,
             TEXT("PlanetAtmosphereActor: gas giant with no SimConfig. The deck will render against "
@@ -736,7 +732,7 @@ void APlanetAtmosphereActor::StartGasGiantSimulation()
     UGasGiantSimSubsystem* Sim = World->GetSubsystem<UGasGiantSimSubsystem>();
     if (!Sim) return;
 
-    Sim->StartSimulation(GasGiantDeck.SimConfig);
+    Sim->StartSimulation(Simulation.Config);
     bStartedSimulation = true;
 }
 
@@ -787,15 +783,15 @@ void APlanetAtmosphereActor::UpdateLightFromRotation()
 
     // Extract color and intensity from LightColor.
     // RGB = normalized color, magnitude of RGB = intensity multiplier.
-    const FVector ColorVec(Environment.LightColor.R, Environment.LightColor.G, Environment.LightColor.B);
+    const FVector ColorVec(LightColor.R, LightColor.G, LightColor.B);
     const float Magnitude = ColorVec.Size();
 
     if (Magnitude > KINDA_SMALL_NUMBER)
     {
         const FLinearColor NormalizedColor(
-            Environment.LightColor.R / Magnitude,
-            Environment.LightColor.G / Magnitude,
-            Environment.LightColor.B / Magnitude, 1.0f);
+            LightColor.R / Magnitude,
+            LightColor.G / Magnitude,
+            LightColor.B / Magnitude, 1.0f);
         LightComp->SetLightColor(NormalizedColor);
         LightComp->SetIntensity(Magnitude);
     }

@@ -93,14 +93,54 @@ public:
     // Every per-type property is EditConditionHides, so the details panel shows
     // exactly one Common set and one model set at a time.
 
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Atmosphere|Environment", meta = (ShowOnlyInnerProperties))
-    FAtmosphereEnvironmentParams Environment;
+    // GROUPS COME FROM SUBSTRUCTS, NOT FROM CATEGORY STRINGS. Category metadata
+    // on a USTRUCT's members is inert while that struct renders as a row, so a
+    // struct declared here shows as Category > struct row > every member flat.
+    // Declaring one property per group instead puts the group name one level
+    // under the category and its members under that.
 
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Atmosphere|Terrestrial Common", meta = (EditCondition = "PlanetType == EPlanetAtmosphereType::Terrestrial", EditConditionHides, ShowOnlyInnerProperties))
-    FAtmosphereCommonParams TerrestrialCommon;
+    // A GROUP OF ONE GETS NO WRAPPER. The substruct buys a fold-out, which is
+    // only worth a click when there is more than one thing behind it.
 
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Atmosphere|Gas Giant Common", meta = (EditCondition = "PlanetType == EPlanetAtmosphereType::GasGiant", EditConditionHides, ShowOnlyInnerProperties))
-    FAtmosphereCommonParams GasGiantCommon;
+    /** RGB direction is the hue, RGB magnitude is the intensity. The march and
+     *  the directional light both derive from this, so they cannot disagree
+     *  about the star. Light DIRECTION comes from the actor's rotation. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Environment")
+    FLinearColor LightColor = FLinearColor(30.0f, 28.5f, 27.0f, 10.0f);
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Environment")
+    FAtmosphereCompositeParams Composite;
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Environment")
+    FAtmosphereSimulationParams Simulation;
+
+    // The Common groups, once per model. One definition of what each group
+    // means, two sets of values, so the shell, the air and the march budget can
+    // differ without two definitions.
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrestrial Common", meta = (EditCondition = "PlanetType == EPlanetAtmosphereType::Terrestrial", EditConditionHides))
+    FAtmosphereGeometryParams TerrestrialGeometry;
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrestrial Common", meta = (EditCondition = "PlanetType == EPlanetAtmosphereType::Terrestrial", EditConditionHides))
+    FAtmosphereAirParams TerrestrialAir;
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrestrial Common", meta = (EditCondition = "PlanetType == EPlanetAtmosphereType::Terrestrial", EditConditionHides))
+    FAtmosphereCloudLightParams TerrestrialCloudLight;
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrestrial Common", meta = (EditCondition = "PlanetType == EPlanetAtmosphereType::Terrestrial", EditConditionHides))
+    FAtmosphereRaymarchParams TerrestrialRaymarch;
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Gas Giant Common", meta = (EditCondition = "PlanetType == EPlanetAtmosphereType::GasGiant", EditConditionHides))
+    FAtmosphereGeometryParams GasGiantGeometry;
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Gas Giant Common", meta = (EditCondition = "PlanetType == EPlanetAtmosphereType::GasGiant", EditConditionHides))
+    FAtmosphereAirParams GasGiantAir;
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Gas Giant Common", meta = (EditCondition = "PlanetType == EPlanetAtmosphereType::GasGiant", EditConditionHides))
+    FAtmosphereCloudLightParams GasGiantCloudLight;
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Gas Giant Common", meta = (EditCondition = "PlanetType == EPlanetAtmosphereType::GasGiant", EditConditionHides))
+    FAtmosphereRaymarchParams GasGiantRaymarch;
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Atmosphere|Terrestrial Cloud", meta = (EditCondition = "PlanetType == EPlanetAtmosphereType::Terrestrial", EditConditionHides, ShowOnlyInnerProperties))
     FTerrestrialCloudParams Terrestrial;
@@ -233,26 +273,32 @@ private:
      *  KEYED ON BuiltType, not PlanetType, for the same reason the parameter
      *  sweep is: a type change that has not been rebuilt yet would otherwise
      *  push the wrong shell and march budget at the material on screen. */
-    const FAtmosphereCommonParams& GetCommonParams() const
+    FAtmosphereCommonView GetCommonParams() const
     {
-        return BuiltType == EPlanetAtmosphereType::GasGiant ? GasGiantCommon : TerrestrialCommon;
+        const bool bGasGiant = BuiltType == EPlanetAtmosphereType::GasGiant;
+
+        return FAtmosphereCommonView{
+            bGasGiant ? GasGiantGeometry : TerrestrialGeometry,
+            bGasGiant ? GasGiantAir : TerrestrialAir,
+            bGasGiant ? GasGiantCloudLight : TerrestrialCloudLight,
+            bGasGiant ? GasGiantRaymarch : TerrestrialRaymarch };
     }
 
     /** Geometry, light, air scattering, cloud lighting, raymarching. Both march
      *  materials, and no branching inside — the caller passes whichever Common
      *  instance is live. */
-    void ApplyCommonParams(const FAtmosphereCommonParams& Common, float PlanetRadius,
+    void ApplyCommonParams(const FAtmosphereCommonView& Common, float PlanetRadius,
         const FVector& PlanetCenter, const FVector& LightDir);
 
     /** Cloud shell, noise and extinction. Terrestrial material only. */
-    void ApplyTerrestrialParams(const FAtmosphereCommonParams& Common);
+    void ApplyTerrestrialParams(const FAtmosphereCommonView& Common);
 
     /** Field, volumes, per-band scattering and the planet's local frame.
      *
      *  The cloud radii are absent on purpose: the gas giant shader derives them
      *  from GG_TopBounds, and pushing them here would create a second source
      *  that can disagree with the bound the march is culling against. */
-    void ApplyGasGiantParams(const FAtmosphereCommonParams& Common, float PlanetRadius);
+    void ApplyGasGiantParams(const FAtmosphereCommonView& Common, float PlanetRadius);
 
     /** Starts the sim subsystem against the deck's config. */
     void StartGasGiantSimulation();
