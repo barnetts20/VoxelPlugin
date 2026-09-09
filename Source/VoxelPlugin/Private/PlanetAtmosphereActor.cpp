@@ -478,7 +478,14 @@ void APlanetAtmosphereActor::UpdateMaterialParameters()
     MID_Postprocess->SetVectorParameterValue(TEXT("Atmosphere Center"),
         FLinearColor(PlanetCenter.X, PlanetCenter.Y, PlanetCenter.Z, 0.0f));
     MID_Postprocess->SetScalarParameterValue(TEXT("Atmosphere Radius"), Common.Geometry.GetAtmosphereRadius(PlanetRadius));
+    // EVERY ARGUMENT Atmo_Composite TAKES IS PUSHED FROM HERE. The radius and the
+    // depth cutoff were material constants, which made two of the three handles
+    // on this struct look inert -- they were reaching a graph that had nothing
+    // to spend them on.
+    MID_Postprocess->SetScalarParameterValue(TEXT("Blur Radius"), static_cast<float>(Composite.BlurRadius));
     MID_Postprocess->SetScalarParameterValue(TEXT("Blur Falloff Factor"), Composite.BlurFalloffFactor);
+    MID_Postprocess->SetScalarParameterValue(TEXT("Depth Sharpness"), Composite.DepthSharpness);
+    MID_Postprocess->SetScalarParameterValue(TEXT("Depth Tap Scale"), Composite.DepthTapScale);
     MID_Postprocess->SetScalarParameterValue(TEXT("MaxW"), Composite.MaxBlurWeight);
     MID_Postprocess->SetScalarParameterValue(TEXT("MinW"), Composite.GetMinBlurWeight());
 }
