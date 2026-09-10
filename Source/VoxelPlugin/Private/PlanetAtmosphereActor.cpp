@@ -6,6 +6,7 @@
 #include "Engine/VolumeTexture.h"
 #include "Engine/TextureRenderTarget2D.h"
 #include "Engine/TextureRenderTarget2DArray.h"
+#include "Engine/TextureRenderTarget2DArray.h"
 #include "GasGiantShadowMap.h"
 #include "GasGiantSimSubsystem.h"
 #include "GasGiantSimTypes.h"
@@ -729,6 +730,9 @@ void APlanetAtmosphereActor::ApplyGasGiantParams(const FAtmosphereCommonView& Co
         SetTextureChecked(MID_Atmosphere, TEXT("shadowMap"), GasGiantShadowTarget);
     }
 
+    // The camera position the bake centred its cascades on is pushed separately,
+    // in RequestGasGiantShadowBake.
+
     // -- Profile ------------------------------------------------------------
     //
     // AtmosphereThickness is the only absolute length the field reads, and the
@@ -890,7 +894,7 @@ void APlanetAtmosphereActor::ApplyGasGiantParams(const FAtmosphereCommonView& Co
 
 bool APlanetAtmosphereActor::PrepareGasGiantShadowTarget()
 {
-    UTextureRenderTarget2D* Target = GasGiantShadowTarget;
+    UTextureRenderTarget2DArray* Target = GasGiantShadowTarget;
 
     if (!Target)
     {
@@ -900,14 +904,14 @@ bool APlanetAtmosphereActor::PrepareGasGiantShadowTarget()
 
             UE_LOG(LogTemp, Warning,
                 TEXT("%s: no Gas Giant Shadow Target set. Create a Texture Render Target 2D ")
-                TEXT("asset and assign it; the deck shadow bake has nowhere to write until then."),
+                TEXT("Array asset and assign it; the deck shadow bake has nowhere to write."),
                 *GetName());
         }
 
         return false;
     }
 
-    const int32 Edge = FMath::Clamp(GasGiantShadowResolution, 128, 4096);
+    const int32 Edge = FMath::Clamp(GasGiantShadowResolution, 64, 4096);
 
     // bCanCreateUAV must be set BEFORE the resource is created, or the texture
     // comes back without UAV support and every dispatch that writes it silently
@@ -915,25 +919,25 @@ bool APlanetAtmosphereActor::PrepareGasGiantShadowTarget()
     const bool bMismatch =
         Target->SizeX != Edge ||
         Target->SizeY != Edge ||
+        Target->Slices != GasGiantShadow::CascadeCount ||
         Target->OverrideFormat != PF_FloatRGBA ||
-        !Target->bCanCreateUAV ||
-        !Target->bForceLinearGamma;
+        !Target->bCanCreateUAV;
 
     if (bMismatch)
     {
         Target->bCanCreateUAV = true;
-        Target->bForceLinearGamma = true;
         Target->OverrideFormat = PF_FloatRGBA;
         Target->ClearColor = FLinearColor::Black;
 
-        // LINEAR GAMMA IS NOT COSMETIC HERE. The map stores depths in
-        // atmosphere thicknesses, which run well past 1 and reach the
-        // no-deck sentinel at 1000. An sRGB path would clamp them to 1.
-        Target->InitCustomFormat(Edge, Edge, PF_FloatRGBA, true);
+        // The map stores depths in atmosphere thicknesses, which run well past 1
+        // and reach the no-deck sentinel at 1000. A float format has no sRGB
+        // variant so nothing clamps them here -- but the material's Texture
+        // Object must still be set to Linear Color, which no flag can enforce.
+        Target->Init(Edge, Edge, GasGiantShadow::CascadeCount, PF_FloatRGBA);
         Target->UpdateResourceImmediate(true);
 
-        UE_LOG(LogTemp, Log, TEXT("%s: Gas Giant Shadow Target set to %dx%d RGBA16F linear."),
-            *GetName(), Edge, Edge);
+        UE_LOG(LogTemp, Log, TEXT("%s: Gas Giant Shadow Target set to %dx%d x %d RGBA16F."),
+            *GetName(), Edge, Edge, GasGiantShadow::CascadeCount);
     }
 
     bWarnedShadowTarget = false;
@@ -1006,8 +1010,18 @@ void APlanetAtmosphereActor::RequestGasGiantShadowBake(const FAtmosphereCommonVi
 
     Params.CameraLocal = ToLocal(CameraWorld - PlanetCenter);
 
-    // NO EXTENT PUSHED. The map's half-width follows the unfaded cull radius,
-    // which GasGiantShadow.ush derives from the field on both sides.
+    // PUSHED, NOT RE-DERIVED. The near map's centre is snapped to its own texel
+    // grid, so the reconstruction has to snap from the same camera the bake did.
+    // Deriving it from the material's own camera instead would differ by a frame,
+    // and a frame is enough to land a whole texel out -- which is a jump in where
+    // the map sits, not a smooth disagreement.
+    SetVectorChecked(MID_Atmosphere, TEXT("shadowCameraLocal"),
+        FLinearColor(Params.CameraLocal.X, Params.CameraLocal.Y, Params.CameraLocal.Z, 0.0f));
+
+    // NO EXTENT AND NO CENTRE PUSHED. Every cascade derives its half-width from
+    // the fade radii and its centre from the camera, on both sides, so the level
+    // index is the only thing that distinguishes them -- and that comes from the
+    // dispatch rather than from here.
     Params.MapSize = FIntPoint(GasGiantShadowTarget->SizeX, GasGiantShadowTarget->SizeY);
 
     // -- Deck ---------------------------------------------------------------
@@ -1099,6 +1113,7 @@ void APlanetAtmosphereActor::RequestGasGiantShadowBake(const FAtmosphereCommonVi
     }
 
     Params.FlowTexture = FlowRes->GetRenderTargetTexture();
+
     Params.MapTexture = MapRes->GetRenderTargetTexture();
 
     Sim->RequestShadowBake(Params);

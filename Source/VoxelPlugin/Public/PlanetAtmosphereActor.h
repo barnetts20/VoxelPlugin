@@ -30,6 +30,8 @@
 #include "AtmosphereParams.h"
 #include "PlanetAtmosphereActor.generated.h"
 
+class UTextureRenderTarget2DArray;
+
 /** Renders a volumetric atmosphere and cloud layer via post-process materials.
  *
  *  Spawns two child actors (APostProcessVolume + ADirectionalLight) and creates
@@ -182,7 +184,8 @@ public:
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CloudAtmosphere|Gas Giant|Gas Giant Deck", meta = (EditCondition = "PlanetType == EPlanetAtmosphereType::GasGiant", EditConditionHides, ShowOnlyInnerProperties))
     FGasGiantDeckParams GasGiantDeck;
 
-    /** Destination for the deck shadow bake, in the light's frame.
+    /** Destination for the deck shadow bake, in the light's frame: a cascade of
+     *  slices, all the same resolution, each covering a smaller radius.
      *
      *  ASSIGNED, NOT CREATED, matching FlowTarget: an asset can be opened beside
      *  the planet and watched while the light moves, which is the whole
@@ -193,10 +196,14 @@ public:
      *  disc. Format and UAV support are forced to RGBA16F on assignment, since
      *  a target without bCanCreateUAV accepts every dispatch and stays black. */
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CloudAtmosphere|Gas Giant|Gas Giant Deck", meta = (EditCondition = "PlanetType == EPlanetAtmosphereType::GasGiant", EditConditionHides))
-    TObjectPtr<UTextureRenderTarget2D> GasGiantShadowTarget;
+    TObjectPtr<UTextureRenderTarget2DArray> GasGiantShadowTarget;
 
-    /** Edge of the shadow map, in texels. The target is resized to match, so
+    /** Edge of each cascade slice, in texels. The target is resized to match, so
      *  this rather than the asset's own size is the handle.
+     *
+     *  EVERY LEVEL SHARES IT, and the world scale falls out of the extents: the
+     *  disc slice is coarse, the detail slice is fine, and one number moves all
+     *  of them together.
      *
      *  SQUARE BECAUSE THE MAP HAS ONE EXTENT. Both axes cover the same world
      *  distance, so unequal sizes stretch the planet disc.
@@ -207,6 +214,7 @@ public:
      *  not respond to this, which makes it a useful thing to rule out. */
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CloudAtmosphere|Gas Giant|Gas Giant Deck", meta = (EditCondition = "PlanetType == EPlanetAtmosphereType::GasGiant", EditConditionHides, ClampMin = "128", ClampMax = "4096"))
     int32 GasGiantShadowResolution = 1024;
+
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CloudAtmosphere|Gas Giant|Gas Giant Atmosphere Scattering", meta = (EditCondition = "PlanetType == EPlanetAtmosphereType::GasGiant", EditConditionHides, ShowOnlyInnerProperties))
     FAtmosphereAirScatteringParams GasGiantAtmosphereScattering;
