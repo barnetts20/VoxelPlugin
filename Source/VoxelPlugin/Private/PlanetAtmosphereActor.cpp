@@ -883,6 +883,13 @@ void APlanetAtmosphereActor::ApplyGasGiantParams(const FAtmosphereCommonView& Co
     SetScalarChecked(MID_Atmosphere, TEXT("MieLobeDecay"), LobeParams.B);
     SetScalarChecked(MID_Atmosphere, TEXT("LobeShadowPower"), LobeParams.A);
 
+    const FLinearColor OctaveParams = GasGiantScatter.GetOctaveParams();
+
+    SetScalarChecked(MID_Atmosphere, TEXT("OctaveCount"), OctaveParams.R);
+    SetScalarChecked(MID_Atmosphere, TEXT("OctaveAttenuation"), OctaveParams.G);
+    SetScalarChecked(MID_Atmosphere, TEXT("OctaveContribution"), OctaveParams.B);
+    SetScalarChecked(MID_Atmosphere, TEXT("OctaveEccentricity"), OctaveParams.A);
+
     // Solved from DeckOpticalDepth against the path a vertical ray takes down a
     // column with no relief, so retuning the shell leaves the deck's opacity
     // where it was authored.
