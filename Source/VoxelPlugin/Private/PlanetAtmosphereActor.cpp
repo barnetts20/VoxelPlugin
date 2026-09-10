@@ -7,6 +7,8 @@
 #include "Engine/TextureRenderTarget2DArray.h"
 #include "GasGiantSimSubsystem.h"
 #include "GasGiantSimTypes.h"
+#include "Materials/MaterialInstanceDynamic.h"
+#include "MaterialTypes.h"
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Default material and texture assets
@@ -19,6 +21,136 @@ static const TCHAR* MatPath_Preprocess = TEXT("/VoxelPlugin/Material/MT_UCA_Prep
 static const TCHAR* MatPath_Terrestrial = TEXT("/VoxelPlugin/Material/MT_UCA_Default_Inst.MT_UCA_Default_Inst");
 static const TCHAR* MatPath_GasGiant = TEXT("/CloudAtmosphere/Material/MT_UGA_Default_Inst.MT_UGA_Default_Inst");
 static const TCHAR* MatPath_Postprocess = TEXT("/VoxelPlugin/Material/MT_UCA_Postprocess_Inst.MT_UCA_Postprocess_Inst");
+
+// ---------------------------------------------------------------------------
+// Checked parameter pushes
+//
+// SetXParameterValue ON A NAME THE MATERIAL DOES NOT HAVE IS A SILENT NO-OP.
+// No warning, no log, no return value -- the handle simply stops working, which
+// reads as a shader bug and costs an afternoon. Every silent failure in this
+// system so far has been a misspelled or renamed parameter.
+//
+// These wrappers check every push, editor-only, and are otherwise the same
+// call. The point is that a rename is caught on the next rebuild rather than on
+// the next screenshot.
+//
+// WARNED ONCE PER NAME, BECAUSE THE PUSH RUNS EVERY TICK. Unfiltered this would
+// be a line per missing parameter per frame, which is not a diagnostic but a
+// flood that buries the next one.
+//
+// RebuildMaterialInstances CLEARS THE FILTER, so the button in the details panel
+// is the retrigger. Only the ACTIVE model's parameters are pushed, so covering
+// both means pressing it, flipping PlanetType, and pressing it again.
+// ---------------------------------------------------------------------------
+
+#if WITH_EDITOR
+static TSet<FString> GWarnedMaterialParameters;
+
+// THE PARAMETER SET, NOT A PARAMETER VALUE. GetXParameterValue answers "is this
+// overridden anywhere in the chain", which is false for a parameter that exists
+// in the base material and has never been touched in the instance -- a true
+// answer to a question nobody asked, and a false alarm for the one that matters.
+// GetAllXParameterInfo enumerates what the material HAS.
+//
+// Cached per MID because the enumeration allocates, and cleared alongside the
+// warning filter so a rebuilt material is re-read rather than remembered.
+static TMap<const UMaterialInstanceDynamic*, TSet<FName>> GKnownScalarNames;
+static TMap<const UMaterialInstanceDynamic*, TSet<FName>> GKnownVectorNames;
+static TMap<const UMaterialInstanceDynamic*, TSet<FName>> GKnownTextureNames;
+
+enum class EAtmoParamKind : uint8 { Scalar, Vector, Texture };
+
+static bool MaterialHasParameter(UMaterialInstanceDynamic* MID, EAtmoParamKind Kind, FName Name)
+{
+    TMap<const UMaterialInstanceDynamic*, TSet<FName>>& Cache =
+        Kind == EAtmoParamKind::Scalar ? GKnownScalarNames
+        : Kind == EAtmoParamKind::Vector ? GKnownVectorNames
+        : GKnownTextureNames;
+
+    TSet<FName>* Known = Cache.Find(MID);
+
+    if (!Known)
+    {
+        TArray<FMaterialParameterInfo> Infos;
+        TArray<FGuid> Guids;
+
+        switch (Kind)
+        {
+        case EAtmoParamKind::Scalar:  MID->GetAllScalarParameterInfo(Infos, Guids); break;
+        case EAtmoParamKind::Vector:  MID->GetAllVectorParameterInfo(Infos, Guids); break;
+        default:                      MID->GetAllTextureParameterInfo(Infos, Guids); break;
+        }
+
+        Known = &Cache.Add(MID);
+
+        for (const FMaterialParameterInfo& Info : Infos)
+        {
+            Known->Add(Info.Name);
+        }
+    }
+
+    return Known->Contains(Name);
+}
+
+static void WarnMissingParameter(const UMaterialInstanceDynamic* MID, const TCHAR* Kind, FName Name)
+{
+    const FString Key = FString::Printf(TEXT("%s.%s"),
+        MID ? *MID->GetName() : TEXT("null"), *Name.ToString());
+
+    if (GWarnedMaterialParameters.Contains(Key))
+    {
+        return;
+    }
+
+    GWarnedMaterialParameters.Add(Key);
+
+    UE_LOG(LogTemp, Warning,
+        TEXT("PlanetAtmosphereActor: material '%s' has no %s parameter '%s' -- push ignored"),
+        MID ? *MID->GetName() : TEXT("null"), Kind, *Name.ToString());
+}
+#endif
+
+static void SetScalarChecked(UMaterialInstanceDynamic* MID, FName Name, float Value)
+{
+    if (!MID) return;
+
+#if WITH_EDITOR
+    if (!MaterialHasParameter(MID, EAtmoParamKind::Scalar, Name))
+    {
+        WarnMissingParameter(MID, TEXT("scalar"), Name);
+    }
+#endif
+
+    MID->SetScalarParameterValue(Name, Value);
+}
+
+static void SetVectorChecked(UMaterialInstanceDynamic* MID, FName Name, const FLinearColor& Value)
+{
+    if (!MID) return;
+
+#if WITH_EDITOR
+    if (!MaterialHasParameter(MID, EAtmoParamKind::Vector, Name))
+    {
+        WarnMissingParameter(MID, TEXT("vector"), Name);
+    }
+#endif
+
+    MID->SetVectorParameterValue(Name, Value);
+}
+
+static void SetTextureChecked(UMaterialInstanceDynamic* MID, FName Name, UTexture* Value)
+{
+    if (!MID) return;
+
+#if WITH_EDITOR
+    if (!MaterialHasParameter(MID, EAtmoParamKind::Texture, Name))
+    {
+        WarnMissingParameter(MID, TEXT("texture"), Name);
+    }
+#endif
+
+    MID->SetTextureParameterValue(Name, Value);
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Constructor
@@ -291,6 +423,15 @@ void APlanetAtmosphereActor::Initialize()
 
 void APlanetAtmosphereActor::RebuildMaterialInstances()
 {
+#if WITH_EDITOR
+    // The parameter-check retrigger. Cleared before the push, so every missing
+    // name reports again rather than staying silent from the first run.
+    GWarnedMaterialParameters.Reset();
+    GKnownScalarNames.Reset();
+    GKnownVectorNames.Reset();
+    GKnownTextureNames.Reset();
+#endif
+
     CreateMaterialInstances();
     UpdateMaterialParameters();
 }
@@ -472,86 +613,83 @@ void APlanetAtmosphereActor::UpdateMaterialParameters()
 
     // --- Postprocess (slot 2) ---
     //
-    // One material for both models, so the blur parameters come from
-    // Environment. Only the radius is per-model.
+    // One material for both models, so every blur parameter comes from
+    // Environment and none of it is per-model.
+    //
+    // EVERY ARGUMENT Atmo_Composite TAKES IS PUSHED FROM HERE, and nothing else
+    // is. The pass reads the atmosphere buffer and the depth buffer; it does not
+    // need to know where the planet is, which is why the centre and radius that
+    // used to go with these are gone.
 
-    MID_Postprocess->SetVectorParameterValue(TEXT("Atmosphere Center"),
-        FLinearColor(PlanetCenter.X, PlanetCenter.Y, PlanetCenter.Z, 0.0f));
-    MID_Postprocess->SetScalarParameterValue(TEXT("Atmosphere Radius"), Common.Geometry.GetAtmosphereRadius(PlanetRadius));
-    // EVERY ARGUMENT Atmo_Composite TAKES IS PUSHED FROM HERE. The radius and the
-    // depth cutoff were material constants, which made two of the three handles
-    // on this struct look inert -- they were reaching a graph that had nothing
-    // to spend them on.
-    MID_Postprocess->SetScalarParameterValue(TEXT("Blur Radius"), static_cast<float>(Composite.BlurRadius));
-    MID_Postprocess->SetScalarParameterValue(TEXT("Blur Falloff Factor"), Composite.BlurFalloffFactor);
-    MID_Postprocess->SetScalarParameterValue(TEXT("Depth Sharpness"), Composite.DepthSharpness);
-    MID_Postprocess->SetScalarParameterValue(TEXT("Depth Tap Scale"), Composite.DepthTapScale);
-    MID_Postprocess->SetScalarParameterValue(TEXT("MaxW"), Composite.MaxBlurWeight);
-    MID_Postprocess->SetScalarParameterValue(TEXT("MinW"), Composite.GetMinBlurWeight());
+    SetScalarChecked(MID_Postprocess, TEXT("Blur Radius"), static_cast<float>(Composite.BlurRadius));
+    SetScalarChecked(MID_Postprocess, TEXT("Blur Falloff Factor"), Composite.BlurFalloffFactor);
+    SetScalarChecked(MID_Postprocess, TEXT("Depth Sharpness"), Composite.DepthSharpness);
+    SetScalarChecked(MID_Postprocess, TEXT("Depth Tap Scale"), Composite.DepthTapScale);
+    SetScalarChecked(MID_Postprocess, TEXT("Blur Weight"), Composite.BlurWeight);
 }
 
 void APlanetAtmosphereActor::ApplyCommonParams(const FAtmosphereCommonView& Common, float PlanetRadius,
     const FVector& PlanetCenter, const FVector& LightDir)
 {
-    MID_Atmosphere->SetVectorParameterValue(TEXT("Planet Center"),
+    SetVectorChecked(MID_Atmosphere, TEXT("Planet Center"),
         FLinearColor(PlanetCenter.X, PlanetCenter.Y, PlanetCenter.Z, 0.0f));
-    MID_Atmosphere->SetScalarParameterValue(TEXT("Planet Radius"), PlanetRadius);
-    MID_Atmosphere->SetScalarParameterValue(TEXT("Atmosphere Height Scale"), Common.Geometry.HeightScale);
-    MID_Atmosphere->SetScalarParameterValue(TEXT("Atmosphere Floor Offset"), Common.Geometry.FloorOffset);
+    SetScalarChecked(MID_Atmosphere, TEXT("Planet Radius"), PlanetRadius);
+    SetScalarChecked(MID_Atmosphere, TEXT("Atmosphere Height Scale"), Common.Geometry.HeightScale);
+    SetScalarChecked(MID_Atmosphere, TEXT("Atmosphere Floor Offset"), Common.Geometry.FloorOffset);
 
-    MID_Atmosphere->SetVectorParameterValue(TEXT("Light Direction"),
+    SetVectorChecked(MID_Atmosphere, TEXT("Light Direction"),
         FLinearColor(LightDir.X, LightDir.Y, LightDir.Z, 0.0f));
-    MID_Atmosphere->SetVectorParameterValue(TEXT("Light Color"), LightColor);
+    SetVectorChecked(MID_Atmosphere, TEXT("Light Color"), LightColor);
 
-    MID_Atmosphere->SetVectorParameterValue(TEXT("Rayleigh Beta"), Common.AirScattering.RayleighBeta);
+    SetVectorChecked(MID_Atmosphere, TEXT("Rayleigh Beta"), Common.AirScattering.RayleighBeta);
 
-    MID_Atmosphere->SetVectorParameterValue(TEXT("Mie Beta"), Common.AirScattering.MieBeta);
+    SetVectorChecked(MID_Atmosphere, TEXT("Mie Beta"), Common.AirScattering.MieBeta);
 
-    MID_Atmosphere->SetScalarParameterValue(TEXT("Mie G"), Common.AirScattering.MieG);
-    MID_Atmosphere->SetVectorParameterValue(TEXT("Atmosphere Absorption Beta"), Common.AirScattering.AbsorptionBeta);
+    SetScalarChecked(MID_Atmosphere, TEXT("Mie G"), Common.AirScattering.MieG);
+    SetVectorChecked(MID_Atmosphere, TEXT("Atmosphere Absorption Beta"), Common.AirScattering.AbsorptionBeta);
 
-    MID_Atmosphere->SetScalarParameterValue(TEXT("Atmosphere Absorption Falloff"), Common.AirScattering.AbsorptionFalloff);
-    MID_Atmosphere->SetVectorParameterValue(TEXT("Atmosphere Ambient"), Common.AirScattering.Ambient);
+    SetScalarChecked(MID_Atmosphere, TEXT("Atmosphere Absorption Falloff"), Common.AirScattering.AbsorptionFalloff);
+    SetVectorChecked(MID_Atmosphere, TEXT("Atmosphere Ambient"), Common.AirScattering.Ambient);
 
-    MID_Atmosphere->SetVectorParameterValue(TEXT("Cloud Ambient"), Common.CloudScattering.Ambient);
-    MID_Atmosphere->SetVectorParameterValue(TEXT("Cloud Phase Params"), Common.CloudScattering.PhaseParams);
+    SetVectorChecked(MID_Atmosphere, TEXT("Cloud Ambient"), Common.CloudScattering.Ambient);
+    SetVectorChecked(MID_Atmosphere, TEXT("Cloud Phase Params"), Common.CloudScattering.PhaseParams);
 
-    MID_Atmosphere->SetScalarParameterValue(TEXT("Atmosphere Steps"), Common.Raymarch.AtmosphereSteps);
-    MID_Atmosphere->SetScalarParameterValue(TEXT("Atmosphere Light Steps"), Common.Raymarch.AtmosphereLightSteps);
-    MID_Atmosphere->SetScalarParameterValue(TEXT("Step Scale Factor"), Common.Raymarch.StepScaleFactor);
-    MID_Atmosphere->SetScalarParameterValue(TEXT("Cloud Steps"), Common.Raymarch.CloudSteps);
-    MID_Atmosphere->SetScalarParameterValue(TEXT("Cloud Light Steps"), Common.Raymarch.CloudLightSteps);
-    MID_Atmosphere->SetScalarParameterValue(TEXT("Light Step Texels"), Common.Raymarch.LightStepTexels);
-    MID_Atmosphere->SetScalarParameterValue(TEXT("View Step Pixels"), Common.Raymarch.ViewStepPixels);
+    SetScalarChecked(MID_Atmosphere, TEXT("Atmosphere Steps"), Common.Raymarch.AtmosphereSteps);
+    SetScalarChecked(MID_Atmosphere, TEXT("Atmosphere Light Steps"), Common.Raymarch.AtmosphereLightSteps);
+    SetScalarChecked(MID_Atmosphere, TEXT("Step Scale Factor"), Common.Raymarch.StepScaleFactor);
+    SetScalarChecked(MID_Atmosphere, TEXT("Cloud Steps"), Common.Raymarch.CloudSteps);
+    SetScalarChecked(MID_Atmosphere, TEXT("Cloud Light Steps"), Common.Raymarch.CloudLightSteps);
+    SetScalarChecked(MID_Atmosphere, TEXT("Light Step Texels"), Common.Raymarch.LightStepTexels);
+    SetScalarChecked(MID_Atmosphere, TEXT("View Step Pixels"), Common.Raymarch.ViewStepPixels);
 }
 
 void APlanetAtmosphereActor::ApplyTerrestrialParams(const FAtmosphereCommonView& Common)
 {
-    MID_Atmosphere->SetScalarParameterValue(TEXT("Cloud Outer Height Scale"),
+    SetScalarChecked(MID_Atmosphere, TEXT("Cloud Outer Height Scale"),
         Terrestrial.GetOuterHeightScale(Common.Geometry.HeightScale));
-    MID_Atmosphere->SetScalarParameterValue(TEXT("Cloud Inner Height Scale"),
+    SetScalarChecked(MID_Atmosphere, TEXT("Cloud Inner Height Scale"),
         Terrestrial.GetInnerHeightScale(Common.Geometry.HeightScale));
 
     if (Terrestrial.CloudVolumeTexture)
     {
-        MID_Atmosphere->SetTextureParameterValue(TEXT("Cloud Volume Texture"), Terrestrial.CloudVolumeTexture);
+        SetTextureChecked(MID_Atmosphere, TEXT("Cloud Volume Texture"), Terrestrial.CloudVolumeTexture);
     }
 
-    MID_Atmosphere->SetVectorParameterValue(TEXT("Animation Weights"), Terrestrial.AnimationWeights);
-    MID_Atmosphere->SetScalarParameterValue(TEXT("Cloud Coverage"), Terrestrial.CloudCoverage);
-    MID_Atmosphere->SetScalarParameterValue(TEXT("Cloud Density Multiplier"), Terrestrial.CloudDensityMultiplier);
-    MID_Atmosphere->SetScalarParameterValue(TEXT("Cloud Height Curve Min"), Terrestrial.CloudHeightCurveMin);
-    MID_Atmosphere->SetScalarParameterValue(TEXT("Cloud Height Curve Max"), Terrestrial.CloudHeightCurveMax);
-    MID_Atmosphere->SetScalarParameterValue(TEXT("Cloud Noise Frequency"), Terrestrial.CloudNoiseFrequency);
-    MID_Atmosphere->SetVectorParameterValue(TEXT("Cloud Noise Weights"), Terrestrial.CloudNoiseWeights);
-    MID_Atmosphere->SetVectorParameterValue(TEXT("Cloud Noise Invert"), Terrestrial.CloudNoiseInvert);
-    MID_Atmosphere->SetScalarParameterValue(TEXT("Detail Noise Frequency"), Terrestrial.GetDetailNoiseFrequency());
-    MID_Atmosphere->SetVectorParameterValue(TEXT("Detail Noise Weights"), Terrestrial.DetailNoiseWeights);
-    MID_Atmosphere->SetVectorParameterValue(TEXT("Detail Noise Invert"), Terrestrial.DetailNoiseInvert);
-    MID_Atmosphere->SetScalarParameterValue(TEXT("Detail Erode Strength"), Terrestrial.DetailErodeStrength);
+    SetVectorChecked(MID_Atmosphere, TEXT("Animation Weights"), Terrestrial.AnimationWeights);
+    SetScalarChecked(MID_Atmosphere, TEXT("Cloud Coverage"), Terrestrial.CloudCoverage);
+    SetScalarChecked(MID_Atmosphere, TEXT("Cloud Density Multiplier"), Terrestrial.CloudDensityMultiplier);
+    SetScalarChecked(MID_Atmosphere, TEXT("Cloud Height Curve Min"), Terrestrial.CloudHeightCurveMin);
+    SetScalarChecked(MID_Atmosphere, TEXT("Cloud Height Curve Max"), Terrestrial.CloudHeightCurveMax);
+    SetScalarChecked(MID_Atmosphere, TEXT("Cloud Noise Frequency"), Terrestrial.CloudNoiseFrequency);
+    SetVectorChecked(MID_Atmosphere, TEXT("Cloud Noise Weights"), Terrestrial.CloudNoiseWeights);
+    SetVectorChecked(MID_Atmosphere, TEXT("Cloud Noise Invert"), Terrestrial.CloudNoiseInvert);
+    SetScalarChecked(MID_Atmosphere, TEXT("Detail Noise Frequency"), Terrestrial.GetDetailNoiseFrequency());
+    SetVectorChecked(MID_Atmosphere, TEXT("Detail Noise Weights"), Terrestrial.DetailNoiseWeights);
+    SetVectorChecked(MID_Atmosphere, TEXT("Detail Noise Invert"), Terrestrial.DetailNoiseInvert);
+    SetScalarChecked(MID_Atmosphere, TEXT("Detail Erode Strength"), Terrestrial.DetailErodeStrength);
 
-    MID_Atmosphere->SetVectorParameterValue(TEXT("Cloud Beta"), Terrestrial.CloudBeta);
-    MID_Atmosphere->SetVectorParameterValue(TEXT("Cloud Absorption Beta"), Terrestrial.CloudAbsorptionBeta);
+    SetVectorChecked(MID_Atmosphere, TEXT("Cloud Beta"), Terrestrial.CloudBeta);
+    SetVectorChecked(MID_Atmosphere, TEXT("Cloud Absorption Beta"), Terrestrial.CloudAbsorptionBeta);
 }
 
 void APlanetAtmosphereActor::ApplyGasGiantParams(const FAtmosphereCommonView& Common, float PlanetRadius)
@@ -567,17 +705,17 @@ void APlanetAtmosphereActor::ApplyGasGiantParams(const FAtmosphereCommonView& Co
     // south, which reads as a simulation bug rather than a sampler one.
     if (Simulation.Config && Simulation.Config->FlowTarget)
     {
-        MID_Atmosphere->SetTextureParameterValue(TEXT("flowField"), Simulation.Config->FlowTarget);
+        SetTextureChecked(MID_Atmosphere, TEXT("flowField"), Simulation.Config->FlowTarget);
     }
 
     if (GasGiantDeck.DetailVolume)
     {
-        MID_Atmosphere->SetTextureParameterValue(TEXT("detailVolume"), GasGiantDeck.DetailVolume);
+        SetTextureChecked(MID_Atmosphere, TEXT("detailVolume"), GasGiantDeck.DetailVolume);
     }
 
     if (GasGiantDeck.StructureVolume)
     {
-        MID_Atmosphere->SetTextureParameterValue(TEXT("structureVolume"), GasGiantDeck.StructureVolume);
+        SetTextureChecked(MID_Atmosphere, TEXT("structureVolume"), GasGiantDeck.StructureVolume);
     }
 
     // -- Profile ------------------------------------------------------------
@@ -594,28 +732,28 @@ void APlanetAtmosphereActor::ApplyGasGiantParams(const FAtmosphereCommonView& Co
 
     const FLinearColor Profile = GasGiantDeck.GetProfile(PlanetRadius, Common.Geometry.HeightScale);
 
-    MID_Atmosphere->SetScalarParameterValue(TEXT("AtmosphereThickness"), Profile.R);
-    MID_Atmosphere->SetScalarParameterValue(TEXT("DeckBackstop"), Profile.G);
-    MID_Atmosphere->SetScalarParameterValue(TEXT("VortexThreshold"), Profile.B);
-    MID_Atmosphere->SetScalarParameterValue(TEXT("GradientThickness"), Profile.A);
+    SetScalarChecked(MID_Atmosphere, TEXT("AtmosphereThickness"), Profile.R);
+    SetScalarChecked(MID_Atmosphere, TEXT("DeckBackstop"), Profile.G);
+    SetScalarChecked(MID_Atmosphere, TEXT("VortexThreshold"), Profile.B);
+    SetScalarChecked(MID_Atmosphere, TEXT("GradientThickness"), Profile.A);
 
     // -- Scales -------------------------------------------------------------
 
     const FLinearColor Scales = GasGiantDeck.GetScales();
 
-    MID_Atmosphere->SetScalarParameterValue(TEXT("DetailScale"), Scales.R);
-    MID_Atmosphere->SetScalarParameterValue(TEXT("StructureScale"), Scales.G);
-    MID_Atmosphere->SetScalarParameterValue(TEXT("DetailWarpInherit"), Scales.B);
-    MID_Atmosphere->SetScalarParameterValue(TEXT("StructureWarpInherit"), Scales.A);
+    SetScalarChecked(MID_Atmosphere, TEXT("DetailScale"), Scales.R);
+    SetScalarChecked(MID_Atmosphere, TEXT("StructureScale"), Scales.G);
+    SetScalarChecked(MID_Atmosphere, TEXT("DetailWarpInherit"), Scales.B);
+    SetScalarChecked(MID_Atmosphere, TEXT("StructureWarpInherit"), Scales.A);
 
     // -- Warps --------------------------------------------------------------
 
     const FLinearColor Warps = GasGiantDeck.GetWarps();
 
-    MID_Atmosphere->SetScalarParameterValue(TEXT("WarpTime"), Warps.R);
-    MID_Atmosphere->SetScalarParameterValue(TEXT("DetailWarp"), Warps.G);
-    MID_Atmosphere->SetScalarParameterValue(TEXT("BandBias"), Warps.B);
-    MID_Atmosphere->SetScalarParameterValue(TEXT("TurbulenceFloor"), Warps.A);
+    SetScalarChecked(MID_Atmosphere, TEXT("WarpTime"), Warps.R);
+    SetScalarChecked(MID_Atmosphere, TEXT("DetailWarp"), Warps.G);
+    SetScalarChecked(MID_Atmosphere, TEXT("BandBias"), Warps.B);
+    SetScalarChecked(MID_Atmosphere, TEXT("TurbulenceFloor"), Warps.A);
 
     // -- Detail weights -----------------------------------------------------
     //
@@ -628,10 +766,10 @@ void APlanetAtmosphereActor::ApplyGasGiantParams(const FAtmosphereCommonView& Co
     const FLinearColor DetailNoise = GasGiantDeck.GetDetailNoise();
     const FLinearColor StructureNoise = GasGiantDeck.GetStructureNoise();
 
-    MID_Atmosphere->SetVectorParameterValue(TEXT("DetailNoise"), DetailNoise);
-    MID_Atmosphere->SetVectorParameterValue(TEXT("StructureNoise"), StructureNoise);
+    SetVectorChecked(MID_Atmosphere, TEXT("DetailNoise"), DetailNoise);
+    SetVectorChecked(MID_Atmosphere, TEXT("StructureNoise"), StructureNoise);
 
-    MID_Atmosphere->SetScalarParameterValue(TEXT("EdgeBias"), GasGiantDeck.EdgeBias);
+    SetScalarChecked(MID_Atmosphere, TEXT("EdgeBias"), GasGiantDeck.EdgeBias);
 
     // -- Relief -------------------------------------------------------------
     //
@@ -642,14 +780,14 @@ void APlanetAtmosphereActor::ApplyGasGiantParams(const FAtmosphereCommonView& Co
 
     const FLinearColor Relief = GasGiantDeck.GetRelief();
 
-    MID_Atmosphere->SetScalarParameterValue(TEXT("DeckTop"), Relief.R);
-    MID_Atmosphere->SetScalarParameterValue(TEXT("BandRelief"), Relief.G);
-    MID_Atmosphere->SetScalarParameterValue(TEXT("PressureRelief"), Relief.B);
-    MID_Atmosphere->SetScalarParameterValue(TEXT("StormTowerRelief"), Relief.A);
+    SetScalarChecked(MID_Atmosphere, TEXT("DeckTop"), Relief.R);
+    SetScalarChecked(MID_Atmosphere, TEXT("BandRelief"), Relief.G);
+    SetScalarChecked(MID_Atmosphere, TEXT("PressureRelief"), Relief.B);
+    SetScalarChecked(MID_Atmosphere, TEXT("StormTowerRelief"), Relief.A);
 
     // -- Layers -------------------------------------------------------------
 
-    MID_Atmosphere->SetScalarParameterValue(TEXT("DeckSlope"), GasGiantDeck.DeckSlope);
+    SetScalarChecked(MID_Atmosphere, TEXT("DeckSlope"), GasGiantDeck.DeckSlope);
 
     const FLinearColor Crossfade = GasGiantDeck.GetCrossfade();
 
@@ -662,10 +800,10 @@ void APlanetAtmosphereActor::ApplyGasGiantParams(const FAtmosphereCommonView& Co
     // rather than an edge case: nothing is advecting, so nothing should travel.
     const float SimTimeScale = Simulation.Config ? Simulation.Config->TimeScale : 1.0f;
 
-    MID_Atmosphere->SetScalarParameterValue(TEXT("Crossfade Period"),
+    SetScalarChecked(MID_Atmosphere, TEXT("Crossfade Period"),
         Crossfade.R / FMath::Max(SimTimeScale, KINDA_SMALL_NUMBER));
-    MID_Atmosphere->SetScalarParameterValue(TEXT("Crossfade Detail"), Crossfade.G);
-    MID_Atmosphere->SetScalarParameterValue(TEXT("Crossfade Structure"), Crossfade.B);
+    SetScalarChecked(MID_Atmosphere, TEXT("Crossfade Detail"), Crossfade.G);
+    SetScalarChecked(MID_Atmosphere, TEXT("Crossfade Structure"), Crossfade.B);
 
     // -- Fade ranges --------------------------------------------------------
     //
@@ -674,30 +812,30 @@ void APlanetAtmosphereActor::ApplyGasGiantParams(const FAtmosphereCommonView& Co
 
     const FLinearColor FadeRanges = GasGiantDeck.GetFadeRanges();
 
-    MID_Atmosphere->SetScalarParameterValue(TEXT("DetailFadeNear"), FadeRanges.R);
-    MID_Atmosphere->SetScalarParameterValue(TEXT("DetailFadeFar"), FadeRanges.G);
-    MID_Atmosphere->SetScalarParameterValue(TEXT("StructureFadeNear"), FadeRanges.B);
-    MID_Atmosphere->SetScalarParameterValue(TEXT("StructureFadeFar"), FadeRanges.A);
+    SetScalarChecked(MID_Atmosphere, TEXT("DetailFadeNear"), FadeRanges.R);
+    SetScalarChecked(MID_Atmosphere, TEXT("DetailFadeFar"), FadeRanges.G);
+    SetScalarChecked(MID_Atmosphere, TEXT("StructureFadeNear"), FadeRanges.B);
+    SetScalarChecked(MID_Atmosphere, TEXT("StructureFadeFar"), FadeRanges.A);
 
     // -- Loose field scalars ------------------------------------------------
 
-    MID_Atmosphere->SetScalarParameterValue(TEXT("BandSharpness"), GasGiantDeck.BandSharpness);
-    MID_Atmosphere->SetScalarParameterValue(TEXT("ReliefThinning"), GasGiantDeck.ReliefThinning);
-    MID_Atmosphere->SetScalarParameterValue(TEXT("DetailVertical"), GasGiantDeck.GetDetailVertical(Common.Geometry.HeightScale));
-    MID_Atmosphere->SetScalarParameterValue(TEXT("StructureVertical"), GasGiantDeck.GetStructureVertical(Common.Geometry.HeightScale));
-    MID_Atmosphere->SetScalarParameterValue(TEXT("DetailErosion"), GasGiantDeck.DetailErosion);
-    MID_Atmosphere->SetScalarParameterValue(TEXT("DetailRelief"), GasGiantDeck.DetailRelief);
-    MID_Atmosphere->SetScalarParameterValue(TEXT("StructureRelief"), GasGiantDeck.StructureRelief);
-    MID_Atmosphere->SetScalarParameterValue(TEXT("StructureErosion"), GasGiantDeck.StructureErosion);
-    MID_Atmosphere->SetScalarParameterValue(TEXT("ErosionDepth"), GasGiantDeck.ErosionDepth);
-    MID_Atmosphere->SetScalarParameterValue(TEXT("DensityCurve"), GasGiantDeck.DensityCurve);
-    MID_Atmosphere->SetScalarParameterValue(TEXT("RotationWeight"), GasGiantDeck.RotationWeight);
+    SetScalarChecked(MID_Atmosphere, TEXT("BandSharpness"), GasGiantDeck.BandSharpness);
+    SetScalarChecked(MID_Atmosphere, TEXT("ReliefThinning"), GasGiantDeck.ReliefThinning);
+    SetScalarChecked(MID_Atmosphere, TEXT("DetailVertical"), GasGiantDeck.GetDetailVertical(Common.Geometry.HeightScale));
+    SetScalarChecked(MID_Atmosphere, TEXT("StructureVertical"), GasGiantDeck.GetStructureVertical(Common.Geometry.HeightScale));
+    SetScalarChecked(MID_Atmosphere, TEXT("DetailErosion"), GasGiantDeck.DetailErosion);
+    SetScalarChecked(MID_Atmosphere, TEXT("DetailRelief"), GasGiantDeck.DetailRelief);
+    SetScalarChecked(MID_Atmosphere, TEXT("StructureRelief"), GasGiantDeck.StructureRelief);
+    SetScalarChecked(MID_Atmosphere, TEXT("StructureErosion"), GasGiantDeck.StructureErosion);
+    SetScalarChecked(MID_Atmosphere, TEXT("ErosionDepth"), GasGiantDeck.ErosionDepth);
+    SetScalarChecked(MID_Atmosphere, TEXT("DensityCurve"), GasGiantDeck.DensityCurve);
+    SetScalarChecked(MID_Atmosphere, TEXT("RotationWeight"), GasGiantDeck.RotationWeight);
 
     // The sim's clock, not the world's. Requires the material's Time parameter
     // to feed the Custom node directly -- wired through a multiply against an
     // engine Time node, this value is ignored and the field advects against
     // world time, which diverges the moment the sim pauses or restores.
-    MID_Atmosphere->SetScalarParameterValue(TEXT("Time"), GetGasGiantTime());
+    SetScalarChecked(MID_Atmosphere, TEXT("Time"), GetGasGiantTime());
 
     // -- Local frame --------------------------------------------------------
     //
@@ -708,33 +846,33 @@ void APlanetAtmosphereActor::ApplyGasGiantParams(const FAtmosphereCommonView& Co
     const FVector AxisY = GetActorRightVector();
     const FVector AxisZ = GetActorUpVector();
 
-    MID_Atmosphere->SetVectorParameterValue(TEXT("localAxisX"), FLinearColor(AxisX.X, AxisX.Y, AxisX.Z, 0.0f));
-    MID_Atmosphere->SetVectorParameterValue(TEXT("localAxisY"), FLinearColor(AxisY.X, AxisY.Y, AxisY.Z, 0.0f));
-    MID_Atmosphere->SetVectorParameterValue(TEXT("localAxisZ"), FLinearColor(AxisZ.X, AxisZ.Y, AxisZ.Z, 0.0f));
+    SetVectorChecked(MID_Atmosphere, TEXT("localAxisX"), FLinearColor(AxisX.X, AxisX.Y, AxisX.Z, 0.0f));
+    SetVectorChecked(MID_Atmosphere, TEXT("localAxisY"), FLinearColor(AxisY.X, AxisY.Y, AxisY.Z, 0.0f));
+    SetVectorChecked(MID_Atmosphere, TEXT("localAxisZ"), FLinearColor(AxisZ.X, AxisZ.Y, AxisZ.Z, 0.0f));
 
     // -- Scattering ---------------------------------------------------------
 
-    MID_Atmosphere->SetVectorParameterValue(TEXT("ScatterNeg"), GasGiantScatter.ScatterNegative);
-    MID_Atmosphere->SetVectorParameterValue(TEXT("ScatterPos"), GasGiantScatter.ScatterPositive);
-    MID_Atmosphere->SetVectorParameterValue(TEXT("ScatterBase"), GasGiantScatter.ScatterBase);
-    MID_Atmosphere->SetScalarParameterValue(TEXT("BandScale"), GasGiantScatter.BandScale);
+    SetVectorChecked(MID_Atmosphere, TEXT("ScatterNeg"), GasGiantScatter.ScatterNegative);
+    SetVectorChecked(MID_Atmosphere, TEXT("ScatterPos"), GasGiantScatter.ScatterPositive);
+    SetVectorChecked(MID_Atmosphere, TEXT("ScatterBase"), GasGiantScatter.ScatterBase);
+    SetScalarChecked(MID_Atmosphere, TEXT("BandScale"), GasGiantScatter.BandScale);
 
     // Terminator shaping. One float4 in the shader, four scalars here, because
     // they are tuned against each other: the softness sets the terminator's
     // width and the power crushes the tail the forward lobe leaks through it.
     const FLinearColor LobeParams = GasGiantScatter.GetLobeParams();
 
-    MID_Atmosphere->SetScalarParameterValue(TEXT("TerminatorSoftness"), LobeParams.R);
-    MID_Atmosphere->SetScalarParameterValue(TEXT("AmbientTerminator"), LobeParams.G);
-    MID_Atmosphere->SetScalarParameterValue(TEXT("MieLobeDecay"), LobeParams.B);
-    MID_Atmosphere->SetScalarParameterValue(TEXT("LobeShadowPower"), LobeParams.A);
+    SetScalarChecked(MID_Atmosphere, TEXT("TerminatorSoftness"), LobeParams.R);
+    SetScalarChecked(MID_Atmosphere, TEXT("AmbientTerminator"), LobeParams.G);
+    SetScalarChecked(MID_Atmosphere, TEXT("MieLobeDecay"), LobeParams.B);
+    SetScalarChecked(MID_Atmosphere, TEXT("LobeShadowPower"), LobeParams.A);
 
     // Solved from DeckOpticalDepth against the path a vertical ray takes down a
     // column with no relief, so retuning the shell leaves the deck's opacity
     // where it was authored.
-    MID_Atmosphere->SetVectorParameterValue(TEXT("Cloud Beta"),
+    SetVectorChecked(MID_Atmosphere, TEXT("Cloud Beta"),
         GasGiantScatter.GetCloudBeta(GasGiantDeck.GetDeckBase(), GasGiantDeck.GetNominalFloor()));
-    MID_Atmosphere->SetVectorParameterValue(TEXT("Cloud Absorption Beta"),
+    SetVectorChecked(MID_Atmosphere, TEXT("Cloud Absorption Beta"),
         GasGiantScatter.GetCloudAbsorptionBeta(GasGiantDeck.GetDeckBase(), GasGiantDeck.GetNominalFloor()));
 }
 

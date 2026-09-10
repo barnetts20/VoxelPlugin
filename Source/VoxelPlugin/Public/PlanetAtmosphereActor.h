@@ -81,8 +81,14 @@ public:
     TSoftObjectPtr<UMaterialInterface> PostprocessMaterial;
 
     /** Recreates slot 1 against the current PlanetType and repopulates every
-     *  slot. Call after changing PlanetType or either march material. */
-    UFUNCTION(BlueprintCallable, Category = "CloudAtmosphere|Pipeline|Materials")
+     *  slot. Call after changing PlanetType or either march material.
+     *
+     *  ALSO THE PARAMETER-CHECK RETRIGGER. Every push is verified against the
+     *  material and warns once per name; this clears that filter, so pressing it
+     *  re-reports anything the material no longer has. Only the ACTIVE model is
+     *  pushed, so covering both means pressing it, flipping PlanetType, and
+     *  pressing it again. */
+    UFUNCTION(BlueprintCallable, CallInEditor, Category = "CloudAtmosphere|Pipeline|Materials")
     void RebuildMaterialInstances();
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CloudAtmosphere|Pipeline")
