@@ -661,7 +661,6 @@ void APlanetAtmosphereActor::ApplyCommonParams(const FAtmosphereCommonView& Comm
     SetVectorChecked(MID_Atmosphere, TEXT("Cloud Phase Params"), Common.CloudScattering.PhaseParams);
 
     SetScalarChecked(MID_Atmosphere, TEXT("Atmosphere Steps"), Common.Raymarch.AtmosphereSteps);
-    SetScalarChecked(MID_Atmosphere, TEXT("Atmosphere Light Steps"), Common.Raymarch.AtmosphereLightSteps);
     SetScalarChecked(MID_Atmosphere, TEXT("Step Scale Factor"), Common.Raymarch.StepScaleFactor);
     SetScalarChecked(MID_Atmosphere, TEXT("Cloud Steps"), Common.Raymarch.CloudSteps);
     SetScalarChecked(MID_Atmosphere, TEXT("View Step Pixels"), Common.Raymarch.ViewStepPixels);
