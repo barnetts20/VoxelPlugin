@@ -195,6 +195,19 @@ public:
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CloudAtmosphere|Gas Giant|Gas Giant Deck", meta = (EditCondition = "PlanetType == EPlanetAtmosphereType::GasGiant", EditConditionHides))
     TObjectPtr<UTextureRenderTarget2D> GasGiantShadowTarget;
 
+    /** Edge of the shadow map, in texels. The target is resized to match, so
+     *  this rather than the asset's own size is the handle.
+     *
+     *  SQUARE BECAUSE THE MAP HAS ONE EXTENT. Both axes cover the same world
+     *  distance, so unequal sizes stretch the planet disc.
+     *
+     *  Costs the square: 512 is 2 MB at RGBA16F, 1024 is 8, 2048 is 32. Spatial
+     *  resolution is rarely the limit -- 1024 across a disc already resolves the
+     *  flow grid several times over -- so a step or reconstruction artifact will
+     *  not respond to this, which makes it a useful thing to rule out. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CloudAtmosphere|Gas Giant|Gas Giant Deck", meta = (EditCondition = "PlanetType == EPlanetAtmosphereType::GasGiant", EditConditionHides, ClampMin = "128", ClampMax = "4096"))
+    int32 GasGiantShadowResolution = 1024;
+
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CloudAtmosphere|Gas Giant|Gas Giant Atmosphere Scattering", meta = (EditCondition = "PlanetType == EPlanetAtmosphereType::GasGiant", EditConditionHides, ShowOnlyInnerProperties))
     FAtmosphereAirScatteringParams GasGiantAtmosphereScattering;
 

@@ -19,10 +19,10 @@
 // relocated asset is a data edit rather than a code one.
 // ─────────────────────────────────────────────────────────────────────────────
 
-static const TCHAR* MatPath_Preprocess = TEXT("/VoxelPlugin/Material/MT_UCA_Preprocess_Inst.MT_UCA_Preprocess_Inst");
-static const TCHAR* MatPath_Terrestrial = TEXT("/VoxelPlugin/Material/MT_UCA_Default_Inst.MT_UCA_Default_Inst");
+static const TCHAR* MatPath_Preprocess = TEXT("/CloudAtmosphere/Material/MT_UCA_Preprocess_Inst.MT_UCA_Preprocess_Inst");
+static const TCHAR* MatPath_Terrestrial = TEXT("/CloudAtmosphere/Material/MT_UCA_Default_Inst.MT_UCA_Default_Inst");
 static const TCHAR* MatPath_GasGiant = TEXT("/CloudAtmosphere/Material/MT_UGA_Default_Inst.MT_UGA_Default_Inst");
-static const TCHAR* MatPath_Postprocess = TEXT("/VoxelPlugin/Material/MT_UCA_Postprocess_Inst.MT_UCA_Postprocess_Inst");
+static const TCHAR* MatPath_Postprocess = TEXT("/CloudAtmosphere/Material/MT_UCA_Postprocess_Inst.MT_UCA_Postprocess_Inst");
 
 // ---------------------------------------------------------------------------
 // Checked parameter pushes
@@ -721,6 +721,14 @@ void APlanetAtmosphereActor::ApplyGasGiantParams(const FAtmosphereCommonView& Co
         SetTextureChecked(MID_Atmosphere, TEXT("structureVolume"), GasGiantDeck.StructureVolume);
     }
 
+    // The deck shadow map, baked this frame by the sim subsystem. Its sampler
+    // must be CLAMP on both axes: the map is a disc inside a square, and
+    // wrapping puts the far limb against the near one.
+    if (GasGiantShadowTarget)
+    {
+        SetTextureChecked(MID_Atmosphere, TEXT("shadowMap"), GasGiantShadowTarget);
+    }
+
     // -- Profile ------------------------------------------------------------
     //
     // AtmosphereThickness is the only absolute length the field reads, and the
@@ -884,14 +892,14 @@ bool APlanetAtmosphereActor::PrepareGasGiantShadowTarget()
 {
     UTextureRenderTarget2D* Target = GasGiantShadowTarget;
 
-    if (!Target || Target->SizeX <= 0 || Target->SizeY <= 0)
+    if (!Target)
     {
         if (!bWarnedShadowTarget)
         {
             bWarnedShadowTarget = true;
 
             UE_LOG(LogTemp, Warning,
-                TEXT("%s: no Gas Giant Shadow Target set. Create a square Texture Render Target 2D ")
+                TEXT("%s: no Gas Giant Shadow Target set. Create a Texture Render Target 2D ")
                 TEXT("asset and assign it; the deck shadow bake has nowhere to write until then."),
                 *GetName());
         }
@@ -899,37 +907,33 @@ bool APlanetAtmosphereActor::PrepareGasGiantShadowTarget()
         return false;
     }
 
+    const int32 Edge = FMath::Clamp(GasGiantShadowResolution, 128, 4096);
+
     // bCanCreateUAV must be set BEFORE the resource is created, or the texture
     // comes back without UAV support and every dispatch that writes it silently
     // does nothing -- a black target with no warning anywhere.
     const bool bMismatch =
+        Target->SizeX != Edge ||
+        Target->SizeY != Edge ||
         Target->OverrideFormat != PF_FloatRGBA ||
-        !Target->bCanCreateUAV;
+        !Target->bCanCreateUAV ||
+        !Target->bForceLinearGamma;
 
     if (bMismatch)
     {
         Target->bCanCreateUAV = true;
+        Target->bForceLinearGamma = true;
         Target->OverrideFormat = PF_FloatRGBA;
         Target->ClearColor = FLinearColor::Black;
-        Target->InitCustomFormat(Target->SizeX, Target->SizeY, PF_FloatRGBA, false);
+
+        // LINEAR GAMMA IS NOT COSMETIC HERE. The map stores depths in
+        // atmosphere thicknesses, which run well past 1 and reach the
+        // no-deck sentinel at 1000. An sRGB path would clamp them to 1.
+        Target->InitCustomFormat(Edge, Edge, PF_FloatRGBA, true);
         Target->UpdateResourceImmediate(true);
 
-        UE_LOG(LogTemp, Log, TEXT("%s: reformatted Gas Giant Shadow Target to %dx%d RGBA16F."),
-            *GetName(), Target->SizeX, Target->SizeY);
-    }
-
-    // Square is not enforced, only reported. One extent covers both axes, so an
-    // unequal target stretches the disc rather than failing.
-    if (Target->SizeX != Target->SizeY && !bWarnedShadowTarget)
-    {
-        bWarnedShadowTarget = true;
-
-        UE_LOG(LogTemp, Warning,
-            TEXT("%s: Gas Giant Shadow Target is %dx%d. The map has one extent for both axes, ")
-            TEXT("so a non-square target stretches the planet disc."),
-            *GetName(), Target->SizeX, Target->SizeY);
-
-        return true;
+        UE_LOG(LogTemp, Log, TEXT("%s: Gas Giant Shadow Target set to %dx%d RGBA16F linear."),
+            *GetName(), Edge, Edge);
     }
 
     bWarnedShadowTarget = false;
@@ -990,8 +994,6 @@ void APlanetAtmosphereActor::RequestGasGiantShadowBake(const FAtmosphereCommonVi
     // because they are handed the same value.
     Params.LightDir = ToLocal(LightDir).GetSafeNormal();
 
-    GasGiantShadow::BuildBasis(Params.LightDir, Params.BasisU, Params.BasisV);
-
     // THE VIEW RENDERED LAST FRAME, which is what makes this work in an editor
     // viewport with no player controller. One frame stale, and a frame of camera
     // motion moves a fade distance by nothing visible.
@@ -1004,18 +1006,8 @@ void APlanetAtmosphereActor::RequestGasGiantShadowBake(const FAtmosphereCommonVi
 
     Params.CameraLocal = ToLocal(CameraWorld - PlanetCenter);
 
-    // -- Extent -------------------------------------------------------------
-    //
-    // The cull radius, not the planet radius: the map has to cover the deck at
-    // its highest, and the margin gives the limb texels outside the shell to
-    // interpolate toward instead of clamping against the map edge.
-
-    const float Thickness =
-        GasGiantDeck.GetAtmosphereThickness(PlanetRadius, Common.Geometry.HeightScale);
-
-    const float CloudOuter = PlanetRadius + Thickness * GasGiantDeck.GetTopMax();
-
-    Params.Extent = CloudOuter * GasGiantShadow::ExtentMargin;
+    // NO EXTENT PUSHED. The map's half-width follows the unfaded cull radius,
+    // which GasGiantShadow.ush derives from the field on both sides.
     Params.MapSize = FIntPoint(GasGiantShadowTarget->SizeX, GasGiantShadowTarget->SizeY);
 
     // -- Deck ---------------------------------------------------------------
