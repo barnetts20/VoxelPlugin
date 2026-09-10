@@ -804,6 +804,7 @@ void APlanetAtmosphereActor::ApplyGasGiantParams(const FAtmosphereCommonView& Co
         Crossfade.R / FMath::Max(SimTimeScale, KINDA_SMALL_NUMBER));
     SetScalarChecked(MID_Atmosphere, TEXT("Crossfade Detail"), Crossfade.G);
     SetScalarChecked(MID_Atmosphere, TEXT("Crossfade Structure"), Crossfade.B);
+    SetScalarChecked(MID_Atmosphere, TEXT("Structure Shadows"), Crossfade.A);
 
     // -- Fade ranges --------------------------------------------------------
     //
