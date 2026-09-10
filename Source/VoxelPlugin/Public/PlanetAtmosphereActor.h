@@ -28,8 +28,10 @@
 #include "Engine/VolumeTexture.h"
 #include "Materials/MaterialInstanceDynamic.h"
 #include "AtmosphereParams.h"
+#include "AtmosphereTransmittance.h"
 #include "PlanetAtmosphereActor.generated.h"
 
+class UTextureRenderTarget2D;
 class UTextureRenderTarget2DArray;
 
 /** Renders a volumetric atmosphere and cloud layer via post-process materials.
@@ -286,6 +288,15 @@ private:
     UPROPERTY()
     TObjectPtr<UMaterialInstanceDynamic> MID_Postprocess = nullptr;
 
+    /** Air transmittance table, created on first use. Visible for inspection;
+     *  it depends only on the radii and the air profile, so there is nothing
+     *  to watch it do. */
+    UPROPERTY(Transient, VisibleInstanceOnly, Category = "CloudAtmosphere")
+    TObjectPtr<UTextureRenderTarget2D> TransmittanceTable = nullptr;
+
+    /** Inputs and destination of the last enqueued bake. */
+    FAtmosphereTransmittanceParams TransmittanceBaked;
+
     /** Which model MID_Atmosphere was created for. Guards against a PlanetType
      *  change reaching the parameter sweep before the material is rebuilt,
      *  which would push a whole model's parameters at a material that declares
@@ -379,6 +390,14 @@ private:
     /** Suppresses the per-tick repeat of the shadow target complaint. Cleared
      *  when a usable target appears, so a fixed asset logs its recovery. */
     bool bWarnedShadowTarget = false;
+
+    /** Creates the transmittance table if needed, rebakes it when its inputs or
+     *  its resource change, and pushes it to the march material. */
+    void UpdateTransmittanceTable(const FAtmosphereCommonView& Common, float PlanetRadius);
+
+    /** Creates the table if absent and forces its fixed size, float format,
+     *  clamp addressing and UAV support. */
+    void PrepareTransmittanceTable();
 
     /** Starts the sim subsystem against the deck's config. */
     void StartGasGiantSimulation();

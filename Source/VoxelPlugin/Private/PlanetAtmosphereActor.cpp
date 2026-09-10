@@ -7,6 +7,7 @@
 #include "Engine/TextureRenderTarget2D.h"
 #include "Engine/TextureRenderTarget2DArray.h"
 #include "Engine/TextureRenderTarget2DArray.h"
+#include "AtmosphereTransmittance.h"
 #include "GasGiantShadowMap.h"
 #include "GasGiantSimSubsystem.h"
 #include "GasGiantSimTypes.h"
@@ -609,6 +610,7 @@ void APlanetAtmosphereActor::UpdateMaterialParameters()
     {
         ApplyGasGiantParams(Common, PlanetRadius);
         RequestGasGiantShadowBake(Common, PlanetRadius, PlanetCenter, LightDir);
+        UpdateTransmittanceTable(Common, PlanetRadius);
     }
     else
     {
@@ -942,6 +944,79 @@ bool APlanetAtmosphereActor::PrepareGasGiantShadowTarget()
     bWarnedShadowTarget = false;
 
     return true;
+}
+
+void APlanetAtmosphereActor::PrepareTransmittanceTable()
+{
+    if (!TransmittanceTable)
+    {
+        TransmittanceTable = NewObject<UTextureRenderTarget2D>(
+            this, TEXT("TransmittanceTable"), RF_Transient);
+    }
+
+    UTextureRenderTarget2D* Table = TransmittanceTable;
+
+    // CLAMP ON BOTH AXES. Wrapping the cosine axis blends the straight-up
+    // column into the horizon one; wrapping altitude blends the ground row into
+    // the top. The material samples with the texture's own address modes.
+    const bool bMismatch =
+        Table->SizeX != AtmosphereTransmittance::Width ||
+        Table->SizeY != AtmosphereTransmittance::Height ||
+        Table->OverrideFormat != AtmosphereTransmittance::Format ||
+        Table->AddressX != TA_Clamp ||
+        Table->AddressY != TA_Clamp ||
+        !Table->bCanCreateUAV;
+
+    if (bMismatch)
+    {
+        // bCanCreateUAV before the resource exists, or every dispatch into it
+        // silently does nothing.
+        Table->bCanCreateUAV = true;
+        Table->AddressX = TA_Clamp;
+        Table->AddressY = TA_Clamp;
+        Table->ClearColor = FLinearColor::Black;
+
+        // Linear gamma: the table holds integrals well past 1. The material's
+        // Texture Object must still be Linear Color, which no flag enforces.
+        Table->InitCustomFormat(AtmosphereTransmittance::Width, AtmosphereTransmittance::Height,
+            AtmosphereTransmittance::Format, true);
+        Table->UpdateResourceImmediate(true);
+    }
+}
+
+void APlanetAtmosphereActor::UpdateTransmittanceTable(const FAtmosphereCommonView& Common, float PlanetRadius)
+{
+    PrepareTransmittanceTable();
+
+    FTextureRenderTargetResource* TableRes = TransmittanceTable->GameThread_GetRenderTargetResource();
+
+    if (!TableRes)
+    {
+        return;
+    }
+
+    // The values ApplyCommonParams pushes, in the form the material receives
+    // them: the table is keyed to the pins, and AtmoT_Profile converts them on
+    // both sides.
+    FAtmosphereTransmittanceParams Params;
+    Params.PlanetRadius = PlanetRadius;
+    Params.AtmosphereRadius = Common.Geometry.GetAtmosphereRadius(PlanetRadius);
+    Params.ProfilePins = FVector4f(
+        Common.AirScattering.RayleighBeta.A,
+        Common.AirScattering.MieBeta.A,
+        Common.AirScattering.AbsorptionBeta.A,
+        Common.AirScattering.AbsorptionFalloff);
+    Params.Table = TableRes->GetRenderTargetTexture();
+
+    // A null texture means the resource is still initialising. Not recorded as
+    // baked, so the next tick tries again.
+    if (Params.IsUsable() && !Params.Matches(TransmittanceBaked))
+    {
+        AtmosphereTransmittance::RequestBake(Params);
+        TransmittanceBaked = Params;
+    }
+
+    SetTextureChecked(MID_Atmosphere, TEXT("transmittanceTable"), TransmittanceTable);
 }
 
 void APlanetAtmosphereActor::RequestGasGiantShadowBake(const FAtmosphereCommonView& Common,
