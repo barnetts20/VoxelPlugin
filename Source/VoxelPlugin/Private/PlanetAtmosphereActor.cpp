@@ -4,7 +4,9 @@
 #include "Components/DirectionalLightComponent.h"
 #include "Components/PostProcessComponent.h"
 #include "Engine/VolumeTexture.h"
+#include "Engine/TextureRenderTarget2D.h"
 #include "Engine/TextureRenderTarget2DArray.h"
+#include "GasGiantShadowMap.h"
 #include "GasGiantSimSubsystem.h"
 #include "GasGiantSimTypes.h"
 #include "Materials/MaterialInstanceDynamic.h"
@@ -605,6 +607,7 @@ void APlanetAtmosphereActor::UpdateMaterialParameters()
     if (BuiltType == EPlanetAtmosphereType::GasGiant)
     {
         ApplyGasGiantParams(Common, PlanetRadius);
+        RequestGasGiantShadowBake(Common, PlanetRadius, PlanetCenter, LightDir);
     }
     else
     {
@@ -875,6 +878,238 @@ void APlanetAtmosphereActor::ApplyGasGiantParams(const FAtmosphereCommonView& Co
         GasGiantScatter.GetCloudBeta(GasGiantDeck.GetDeckBase(), GasGiantDeck.GetNominalFloor()));
     SetVectorChecked(MID_Atmosphere, TEXT("Cloud Absorption Beta"),
         GasGiantScatter.GetCloudAbsorptionBeta(GasGiantDeck.GetDeckBase(), GasGiantDeck.GetNominalFloor()));
+}
+
+bool APlanetAtmosphereActor::PrepareGasGiantShadowTarget()
+{
+    UTextureRenderTarget2D* Target = GasGiantShadowTarget;
+
+    if (!Target || Target->SizeX <= 0 || Target->SizeY <= 0)
+    {
+        if (!bWarnedShadowTarget)
+        {
+            bWarnedShadowTarget = true;
+
+            UE_LOG(LogTemp, Warning,
+                TEXT("%s: no Gas Giant Shadow Target set. Create a square Texture Render Target 2D ")
+                TEXT("asset and assign it; the deck shadow bake has nowhere to write until then."),
+                *GetName());
+        }
+
+        return false;
+    }
+
+    // bCanCreateUAV must be set BEFORE the resource is created, or the texture
+    // comes back without UAV support and every dispatch that writes it silently
+    // does nothing -- a black target with no warning anywhere.
+    const bool bMismatch =
+        Target->OverrideFormat != PF_FloatRGBA ||
+        !Target->bCanCreateUAV;
+
+    if (bMismatch)
+    {
+        Target->bCanCreateUAV = true;
+        Target->OverrideFormat = PF_FloatRGBA;
+        Target->ClearColor = FLinearColor::Black;
+        Target->InitCustomFormat(Target->SizeX, Target->SizeY, PF_FloatRGBA, false);
+        Target->UpdateResourceImmediate(true);
+
+        UE_LOG(LogTemp, Log, TEXT("%s: reformatted Gas Giant Shadow Target to %dx%d RGBA16F."),
+            *GetName(), Target->SizeX, Target->SizeY);
+    }
+
+    // Square is not enforced, only reported. One extent covers both axes, so an
+    // unequal target stretches the disc rather than failing.
+    if (Target->SizeX != Target->SizeY && !bWarnedShadowTarget)
+    {
+        bWarnedShadowTarget = true;
+
+        UE_LOG(LogTemp, Warning,
+            TEXT("%s: Gas Giant Shadow Target is %dx%d. The map has one extent for both axes, ")
+            TEXT("so a non-square target stretches the planet disc."),
+            *GetName(), Target->SizeX, Target->SizeY);
+
+        return true;
+    }
+
+    bWarnedShadowTarget = false;
+
+    return true;
+}
+
+void APlanetAtmosphereActor::RequestGasGiantShadowBake(const FAtmosphereCommonView& Common,
+    float PlanetRadius, const FVector& PlanetCenter, const FVector& LightDir)
+{
+    UWorld* World = GetWorld();
+
+    if (!World || !PrepareGasGiantShadowTarget())
+    {
+        return;
+    }
+
+    UGasGiantSimSubsystem* Sim = World->GetSubsystem<UGasGiantSimSubsystem>();
+
+    if (!Sim || !Simulation.Config || !Simulation.Config->FlowTarget)
+    {
+        return;
+    }
+
+    FTextureRenderTargetResource* FlowRes =
+        Simulation.Config->FlowTarget->GameThread_GetRenderTargetResource();
+
+    FTextureRenderTargetResource* MapRes =
+        GasGiantShadowTarget->GameThread_GetRenderTargetResource();
+
+    if (!FlowRes || !MapRes)
+    {
+        return;
+    }
+
+    FGasGiantShadowParams Params;
+
+    // -- Frame --------------------------------------------------------------
+    //
+    // The planet's axes are the rows of WorldToLocal, exactly as the material
+    // receives them, so the light and the camera arrive in the frame the field
+    // is defined in. Spin is not applied here: GG_FlowProbe applies it.
+
+    const FVector AxisX = GetActorForwardVector();
+    const FVector AxisY = GetActorRightVector();
+    const FVector AxisZ = GetActorUpVector();
+
+    auto ToLocal = [&AxisX, &AxisY, &AxisZ](const FVector& V)
+        {
+            return FVector3f(
+                static_cast<float>(FVector::DotProduct(AxisX, V)),
+                static_cast<float>(FVector::DotProduct(AxisY, V)),
+                static_cast<float>(FVector::DotProduct(AxisZ, V)));
+        };
+
+    // THE SAME VECTOR THE MATERIAL GETS, not a re-derivation of it. Whichever
+    // convention Light Direction carries, the map and the march agree about it
+    // because they are handed the same value.
+    Params.LightDir = ToLocal(LightDir).GetSafeNormal();
+
+    GasGiantShadow::BuildBasis(Params.LightDir, Params.BasisU, Params.BasisV);
+
+    // THE VIEW RENDERED LAST FRAME, which is what makes this work in an editor
+    // viewport with no player controller. One frame stale, and a frame of camera
+    // motion moves a fade distance by nothing visible.
+    FVector CameraWorld = PlanetCenter;
+
+    if (World->ViewLocationsRenderedLastFrame.Num() > 0)
+    {
+        CameraWorld = World->ViewLocationsRenderedLastFrame[0];
+    }
+
+    Params.CameraLocal = ToLocal(CameraWorld - PlanetCenter);
+
+    // -- Extent -------------------------------------------------------------
+    //
+    // The cull radius, not the planet radius: the map has to cover the deck at
+    // its highest, and the margin gives the limb texels outside the shell to
+    // interpolate toward instead of clamping against the map edge.
+
+    const float Thickness =
+        GasGiantDeck.GetAtmosphereThickness(PlanetRadius, Common.Geometry.HeightScale);
+
+    const float CloudOuter = PlanetRadius + Thickness * GasGiantDeck.GetTopMax();
+
+    Params.Extent = CloudOuter * GasGiantShadow::ExtentMargin;
+    Params.MapSize = FIntPoint(GasGiantShadowTarget->SizeX, GasGiantShadowTarget->SizeY);
+
+    // -- Deck ---------------------------------------------------------------
+    //
+    // GG_BuildField's arguments, from the same getters ApplyGasGiantParams
+    // pushes to the material. Any divergence here is a deck the light sees and
+    // the eye does not.
+
+    const FLinearColor Scales = GasGiantDeck.GetScales();
+    const FLinearColor Warps = GasGiantDeck.GetWarps();
+    const FLinearColor DetailNoise = GasGiantDeck.GetDetailNoise();
+    const FLinearColor StructureNoise = GasGiantDeck.GetStructureNoise();
+    const FLinearColor Crossfade = GasGiantDeck.GetCrossfade();
+    const FLinearColor Relief = GasGiantDeck.GetRelief();
+    const FLinearColor Profile = GasGiantDeck.GetProfile(PlanetRadius, Common.Geometry.HeightScale);
+    const FLinearColor FadeRanges = GasGiantDeck.GetFadeRanges();
+
+    // Authored in simulated seconds, consumed in real ones, like the material's
+    // copy. A crossfade that does not scale with TimeScale comes apart from the
+    // flow it is supposed to be riding the moment sim speed is touched.
+    const float SimTimeScale = Simulation.Config->TimeScale;
+
+    Params.PlanetRadius = PlanetRadius;
+    Params.Time = GetGasGiantTime();
+    Params.RotationWeight = GasGiantDeck.RotationWeight;
+
+    Params.Scales = FVector4f(Scales.R, Scales.G, Scales.B, Scales.A);
+    Params.Warps = FVector4f(Warps.R, Warps.G, Warps.B, Warps.A);
+    Params.DetailNoise = FVector4f(DetailNoise.R, DetailNoise.G, DetailNoise.B, DetailNoise.A);
+    Params.StructureNoise = FVector4f(StructureNoise.R, StructureNoise.G, StructureNoise.B, StructureNoise.A);
+
+    Params.EdgeBias = GasGiantDeck.EdgeBias;
+    Params.DeckSlope = GasGiantDeck.DeckSlope;
+
+    Params.Crossfade = FVector4f(
+        Crossfade.R / FMath::Max(SimTimeScale, KINDA_SMALL_NUMBER),
+        Crossfade.G, Crossfade.B, Crossfade.A);
+
+    Params.Relief = FVector4f(Relief.R, Relief.G, Relief.B, Relief.A);
+    Params.Profile = FVector4f(Profile.R, Profile.G, Profile.B, Profile.A);
+
+    Params.BandSharpness = GasGiantDeck.BandSharpness;
+    Params.ReliefThinning = GasGiantDeck.ReliefThinning;
+    Params.DetailVertical = GasGiantDeck.GetDetailVertical(Common.Geometry.HeightScale);
+    Params.StructureVertical = GasGiantDeck.GetStructureVertical(Common.Geometry.HeightScale);
+    Params.DetailErosion = GasGiantDeck.DetailErosion;
+    Params.DetailRelief = GasGiantDeck.DetailRelief;
+    Params.ErosionDepth = GasGiantDeck.ErosionDepth;
+    Params.DensityCurve = GasGiantDeck.DensityCurve;
+    Params.StructureRelief = GasGiantDeck.StructureRelief;
+    Params.StructureErosion = GasGiantDeck.StructureErosion;
+
+    Params.FadeRanges = FVector4f(FadeRanges.R, FadeRanges.G, FadeRanges.B, FadeRanges.A);
+
+    // -- Extinction ---------------------------------------------------------
+    //
+    // The band ALPHAS only. Their rgb is albedo, which belongs to the scattering
+    // site rather than to the medium the light crossed, and multiplying by it
+    // here would tint the shadow by the band it passed through.
+
+    Params.ScatterAlphas = FVector4f(
+        GasGiantScatter.ScatterNegative.A,
+        GasGiantScatter.ScatterPositive.A,
+        GasGiantScatter.ScatterBase.A,
+        GasGiantScatter.BandScale);
+
+    // Solved the same way the material's copy is, from the same anchors, so the
+    // depth at which the map says the deck goes opaque is the depth at which the
+    // march says it does.
+    const FLinearColor AbsBeta = GasGiantScatter.GetCloudAbsorptionBeta(
+        GasGiantDeck.GetDeckBase(), GasGiantDeck.GetNominalFloor());
+
+    Params.AbsBeta = FVector3f(AbsBeta.R, AbsBeta.G, AbsBeta.B);
+
+    // -- Volumes ------------------------------------------------------------
+    //
+    // RHI handles taken from the properties ApplyGasGiantParams already pushes,
+    // not a second reference to the assets. A compute pass runs on the render
+    // thread and cannot reach a UObject, so this is the only crossing available.
+
+    if (GasGiantDeck.DetailVolume && GasGiantDeck.DetailVolume->GetResource())
+    {
+        Params.DetailTexture = GasGiantDeck.DetailVolume->GetResource()->TextureRHI;
+    }
+
+    if (GasGiantDeck.StructureVolume && GasGiantDeck.StructureVolume->GetResource())
+    {
+        Params.StructureTexture = GasGiantDeck.StructureVolume->GetResource()->TextureRHI;
+    }
+
+    Params.FlowTexture = FlowRes->GetRenderTargetTexture();
+    Params.MapTexture = MapRes->GetRenderTargetTexture();
+
+    Sim->RequestShadowBake(Params);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

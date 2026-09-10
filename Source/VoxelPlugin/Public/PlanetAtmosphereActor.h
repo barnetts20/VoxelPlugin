@@ -182,6 +182,19 @@ public:
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CloudAtmosphere|Gas Giant|Gas Giant Deck", meta = (EditCondition = "PlanetType == EPlanetAtmosphereType::GasGiant", EditConditionHides, ShowOnlyInnerProperties))
     FGasGiantDeckParams GasGiantDeck;
 
+    /** Destination for the deck shadow bake, in the light's frame.
+     *
+     *  ASSIGNED, NOT CREATED, matching FlowTarget: an asset can be opened beside
+     *  the planet and watched while the light moves, which is the whole
+     *  debugging loop for a map nothing samples yet.
+     *
+     *  The asset's own SizeX and SizeY set the resolution and should be square
+     *  -- the map has one extent for both axes, so an unequal one stretches the
+     *  disc. Format and UAV support are forced to RGBA16F on assignment, since
+     *  a target without bCanCreateUAV accepts every dispatch and stays black. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CloudAtmosphere|Gas Giant|Gas Giant Deck", meta = (EditCondition = "PlanetType == EPlanetAtmosphereType::GasGiant", EditConditionHides))
+    TObjectPtr<UTextureRenderTarget2D> GasGiantShadowTarget;
+
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CloudAtmosphere|Gas Giant|Gas Giant Atmosphere Scattering", meta = (EditCondition = "PlanetType == EPlanetAtmosphereType::GasGiant", EditConditionHides, ShowOnlyInnerProperties))
     FAtmosphereAirScatteringParams GasGiantAtmosphereScattering;
 
@@ -327,6 +340,24 @@ private:
      *  from GG_TopBounds, and pushing them here would create a second source
      *  that can disagree with the bound the march is culling against. */
     void ApplyGasGiantParams(const FAtmosphereCommonView& Common, float PlanetRadius);
+
+    /** Queues this frame's deck shadow bake with the sim subsystem.
+     *
+     *  SEPARATE FROM ApplyGasGiantParams because it pushes nothing to the
+     *  material. The deck values it sends come from the same FGasGiantDeckParams
+     *  getters, which is what keeps the deck the light sees identical to the
+     *  deck the eye sees -- but its destination is a compute pass, not a MID. */
+    void RequestGasGiantShadowBake(const FAtmosphereCommonView& Common, float PlanetRadius,
+        const FVector& PlanetCenter, const FVector& LightDir);
+
+    /** Forces the assigned shadow target to RGBA16F with UAV support, resizing
+     *  only if the format is wrong. Returns false when there is nothing usable,
+     *  having logged the reason at most once per state. */
+    bool PrepareGasGiantShadowTarget();
+
+    /** Suppresses the per-tick repeat of the shadow target complaint. Cleared
+     *  when a usable target appears, so a fixed asset logs its recovery. */
+    bool bWarnedShadowTarget = false;
 
     /** Starts the sim subsystem against the deck's config. */
     void StartGasGiantSimulation();
