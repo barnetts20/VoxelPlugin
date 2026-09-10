@@ -662,8 +662,6 @@ void APlanetAtmosphereActor::ApplyCommonParams(const FAtmosphereCommonView& Comm
     SetScalarChecked(MID_Atmosphere, TEXT("Atmosphere Light Steps"), Common.Raymarch.AtmosphereLightSteps);
     SetScalarChecked(MID_Atmosphere, TEXT("Step Scale Factor"), Common.Raymarch.StepScaleFactor);
     SetScalarChecked(MID_Atmosphere, TEXT("Cloud Steps"), Common.Raymarch.CloudSteps);
-    SetScalarChecked(MID_Atmosphere, TEXT("Cloud Light Steps"), Common.Raymarch.CloudLightSteps);
-    SetScalarChecked(MID_Atmosphere, TEXT("Light Step Texels"), Common.Raymarch.LightStepTexels);
     SetScalarChecked(MID_Atmosphere, TEXT("View Step Pixels"), Common.Raymarch.ViewStepPixels);
 }
 
@@ -819,7 +817,6 @@ void APlanetAtmosphereActor::ApplyGasGiantParams(const FAtmosphereCommonView& Co
         Crossfade.R / FMath::Max(SimTimeScale, KINDA_SMALL_NUMBER));
     SetScalarChecked(MID_Atmosphere, TEXT("Crossfade Detail"), Crossfade.G);
     SetScalarChecked(MID_Atmosphere, TEXT("Crossfade Structure"), Crossfade.B);
-    SetScalarChecked(MID_Atmosphere, TEXT("Structure Shadows"), Crossfade.A);
 
     // -- Fade ranges --------------------------------------------------------
     //
@@ -844,6 +841,8 @@ void APlanetAtmosphereActor::ApplyGasGiantParams(const FAtmosphereCommonView& Co
     SetScalarChecked(MID_Atmosphere, TEXT("StructureRelief"), GasGiantDeck.StructureRelief);
     SetScalarChecked(MID_Atmosphere, TEXT("StructureErosion"), GasGiantDeck.StructureErosion);
     SetScalarChecked(MID_Atmosphere, TEXT("ErosionDepth"), GasGiantDeck.ErosionDepth);
+    SetScalarChecked(MID_Atmosphere, TEXT("StructureBandMix"), GasGiantDeck.StructureBandMix);
+    SetScalarChecked(MID_Atmosphere, TEXT("DetailBandMix"), GasGiantDeck.DetailBandMix);
     SetScalarChecked(MID_Atmosphere, TEXT("DensityCurve"), GasGiantDeck.DensityCurve);
     SetScalarChecked(MID_Atmosphere, TEXT("RotationWeight"), GasGiantDeck.RotationWeight);
 
@@ -1075,6 +1074,7 @@ void APlanetAtmosphereActor::RequestGasGiantShadowBake(const FAtmosphereCommonVi
     Params.StructureErosion = GasGiantDeck.StructureErosion;
 
     Params.FadeRanges = FVector4f(FadeRanges.R, FadeRanges.G, FadeRanges.B, FadeRanges.A);
+    Params.BandMix = FVector2f(GasGiantDeck.StructureBandMix, GasGiantDeck.DetailBandMix);
 
     // -- Extinction ---------------------------------------------------------
     //
