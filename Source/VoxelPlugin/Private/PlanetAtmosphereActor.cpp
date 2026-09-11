@@ -172,17 +172,14 @@ APlanetAtmosphereActor::APlanetAtmosphereActor()
     // PlanetRadius(100M) + SeaLevel(0.5) * NoiseAmplitude(15M) = 107,500,000 cm
     SetActorScale3D(FVector(107500000.0));
 
-    // Set on the CDO rather than left to member initialisers, so the details
-    // panel's reset-to-default gives each type ITS defaults. Member
-    // initialisers can only serve one of the two.
-    // The terrestrial sets are the member initialisers; the gas giant sets are
-    // deltas against them, per group. Everything not overridden is identical
-    // today and free to diverge -- carrying two instances is what makes that a
-    // value edit rather than a code change.
-    GasGiantGeometry = FAtmosphereGeometryParams::MakeGasGiantDefaults();
-    GasGiantAtmosphereScattering = FAtmosphereAirScatteringParams::MakeGasGiantDefaults();
-    GasGiantCloudScattering = FAtmosphereCloudScatteringParams::MakeGasGiantDefaults();
-    GasGiantRaymarch = FAtmosphereRaymarchParams::MakeGasGiantDefaults();
+    // Structs shared between instances take their gas giant defaults here on
+    // the CDO rather than as member initialisers, so reset-to-default in the
+    // details panel gives each instance its own.
+    GasGiantStructureLayer = FGasGiantNoiseLayerParams::MakeStructureDefaults();
+    GasGiantDetailLayer = FGasGiantNoiseLayerParams::MakeDetailDefaults();
+
+    // The geometry struct's own default is the terrestrial shell.
+    GasGiantGeometry.HeightScale = 1.0f;
 
     PreprocessMaterial = TSoftObjectPtr<UMaterialInterface>(FSoftObjectPath(MatPath_Preprocess));
     TerrestrialMarchMaterial = TSoftObjectPtr<UMaterialInterface>(FSoftObjectPath(MatPath_Terrestrial));
@@ -208,7 +205,7 @@ APlanetAtmosphereActor::APlanetAtmosphereActor()
         TEXT("/CloudAtmosphere/Noise/VT_PerlinWorley_S8_128"));
     if (DefaultDetailVolume.Succeeded())
     {
-        GasGiantDeck.DetailVolume = DefaultDetailVolume.Object;
+        GasGiantDetailLayer.Volume = DefaultDetailVolume.Object;
     }
     else
     {
@@ -216,10 +213,10 @@ APlanetAtmosphereActor::APlanetAtmosphereActor()
     }
 
     static ConstructorHelpers::FObjectFinder<UVolumeTexture> DefaultStructureVolume(
-        TEXT("/UniverseNoisePack/128/VT_Worley_F1_S8"));
+        TEXT("/CloudAtmosphere/Noise/VT_PerlinWorley_S4_128"));
     if (DefaultStructureVolume.Succeeded())
     {
-        GasGiantDeck.StructureVolume = DefaultStructureVolume.Object;
+        GasGiantStructureLayer.Volume = DefaultStructureVolume.Object;
     }
     else
     {
@@ -710,14 +707,14 @@ void APlanetAtmosphereActor::ApplyGasGiantParams(const FAtmosphereCommonView& Co
         SetTextureChecked(MID_Atmosphere, TEXT("flowField"), Simulation.Config->FlowTarget);
     }
 
-    if (GasGiantDeck.DetailVolume)
+    if (GasGiantDetailLayer.Volume)
     {
-        SetTextureChecked(MID_Atmosphere, TEXT("detailVolume"), GasGiantDeck.DetailVolume);
+        SetTextureChecked(MID_Atmosphere, TEXT("detailVolume"), GasGiantDetailLayer.Volume);
     }
 
-    if (GasGiantDeck.StructureVolume)
+    if (GasGiantStructureLayer.Volume)
     {
-        SetTextureChecked(MID_Atmosphere, TEXT("structureVolume"), GasGiantDeck.StructureVolume);
+        SetTextureChecked(MID_Atmosphere, TEXT("structureVolume"), GasGiantStructureLayer.Volume);
     }
 
     // The deck shadow map, baked this frame by the sim subsystem. Its sampler
@@ -731,120 +728,80 @@ void APlanetAtmosphereActor::ApplyGasGiantParams(const FAtmosphereCommonView& Co
     // The camera position the bake centred its cascades on is pushed separately,
     // in RequestGasGiantShadowBake.
 
+    const FGasGiantDeckShape Shape = GetGasGiantDeckShape();
+    const float HeightScale = Common.Geometry.HeightScale;
+
     // -- Profile ------------------------------------------------------------
     //
     // AtmosphereThickness is the only absolute length the field reads, and the
-    // unit every height in the deck is a fraction of. The deck has no shell of
-    // its own: the anchors place it inside the air, so sizing the air does not
-    // resize the deck.
+    // unit every deck height is a fraction of. DeckTop receives the solved base,
+    // never the authored ceiling: the shader hangs every column from the base.
+
+    SetScalarChecked(MID_Atmosphere, TEXT("AtmosphereThickness"), PlanetRadius * HeightScale);
+    SetScalarChecked(MID_Atmosphere, TEXT("DeckTop"), Shape.Base);
+    SetScalarChecked(MID_Atmosphere, TEXT("GradientThickness"), GasGiantProfile.GradientThickness);
+    SetScalarChecked(MID_Atmosphere, TEXT("DeckBackstop"), GasGiantProfile.DeckBackstop);
+    SetScalarChecked(MID_Atmosphere, TEXT("DensityCurve"), GasGiantProfile.DensityCurve);
+
+    // -- Flow ---------------------------------------------------------------
+
+    SetScalarChecked(MID_Atmosphere, TEXT("BandSharpness"), GasGiantFlow.BandSharpness);
+    SetScalarChecked(MID_Atmosphere, TEXT("BandBias"), GasGiantFlow.BandBias);
+    SetScalarChecked(MID_Atmosphere, TEXT("BandRelief"), GasGiantFlow.BandRelief);
+    SetScalarChecked(MID_Atmosphere, TEXT("PressureRelief"), GasGiantFlow.PressureRelief);
+    SetScalarChecked(MID_Atmosphere, TEXT("VortexThreshold"), GasGiantFlow.VortexThreshold);
+    SetScalarChecked(MID_Atmosphere, TEXT("StormTowerRelief"), GasGiantFlow.StormTowerRelief);
+    SetScalarChecked(MID_Atmosphere, TEXT("ReliefThinning"), GasGiantFlow.ReliefThinning);
+    SetScalarChecked(MID_Atmosphere, TEXT("RotationWeight"), GasGiantFlow.RotationWeight);
+
+    // -- Motion -------------------------------------------------------------
     //
-    // GradientThickness is the span the density profile occupies below each
-    // column's own top; DeckBackstop is the backstop under it, and also the fine
-    // band's lower edge, so the march's step sizing follows the anchors rather
-    // than the extinction.
+    // CROSSFADE AUTHORED IN SIMULATED SECONDS, PUSHED IN REAL ONES. TimeScale
+    // is simulated time per real second, so noise the flow is carrying has to
+    // speed up with it or the two come apart the moment the sim speed changes.
+    // A frozen sim freezes the crossfade, which is right: nothing is advecting.
 
-    const FLinearColor Profile = GasGiantDeck.GetProfile(PlanetRadius, Common.Geometry.HeightScale);
+    const float SimTimeScale = Simulation.Config ? Simulation.Config->TimeScale : 1.0f;
 
-    SetScalarChecked(MID_Atmosphere, TEXT("AtmosphereThickness"), Profile.R);
-    SetScalarChecked(MID_Atmosphere, TEXT("DeckBackstop"), Profile.G);
-    SetScalarChecked(MID_Atmosphere, TEXT("VortexThreshold"), Profile.B);
-    SetScalarChecked(MID_Atmosphere, TEXT("GradientThickness"), Profile.A);
+    SetScalarChecked(MID_Atmosphere, TEXT("WarpTime"), GasGiantMotion.WarpTime);
+    SetScalarChecked(MID_Atmosphere, TEXT("DetailWarp"), GasGiantMotion.WarpTime * GasGiantMotion.DeepShearRatio);
+    SetScalarChecked(MID_Atmosphere, TEXT("TurbulenceFloor"), GasGiantMotion.TurbulenceFloor);
+    SetScalarChecked(MID_Atmosphere, TEXT("Crossfade Period"),
+        GasGiantMotion.CrossfadePeriod / FMath::Max(SimTimeScale, KINDA_SMALL_NUMBER));
 
-    // -- Scales -------------------------------------------------------------
+    // -- Surface ------------------------------------------------------------
 
-    const FLinearColor Scales = GasGiantDeck.GetScales();
-
-    SetScalarChecked(MID_Atmosphere, TEXT("DetailScale"), Scales.R);
-    SetScalarChecked(MID_Atmosphere, TEXT("StructureScale"), Scales.G);
-    SetScalarChecked(MID_Atmosphere, TEXT("DetailWarpInherit"), Scales.B);
-    SetScalarChecked(MID_Atmosphere, TEXT("StructureWarpInherit"), Scales.A);
-
-    // -- Warps --------------------------------------------------------------
-
-    const FLinearColor Warps = GasGiantDeck.GetWarps();
-
-    SetScalarChecked(MID_Atmosphere, TEXT("WarpTime"), Warps.R);
-    SetScalarChecked(MID_Atmosphere, TEXT("DetailWarp"), Warps.G);
-    SetScalarChecked(MID_Atmosphere, TEXT("BandBias"), Warps.B);
-    SetScalarChecked(MID_Atmosphere, TEXT("TurbulenceFloor"), Warps.A);
-
-    // -- Detail weights -----------------------------------------------------
-    //
-    // xyz are renormalized by their sum in the shader, so changing the balance
-    // between them does not change how much cloud there is.
-
-    // Each layer's Worley ladder, coarse to fine, plus its own amount. The
-    // ladder is renormalized shader-side, so these set the spectrum and the w
-    // sets the strength.
-    const FLinearColor DetailNoise = GasGiantDeck.GetDetailNoise();
-    const FLinearColor StructureNoise = GasGiantDeck.GetStructureNoise();
-
-    SetVectorChecked(MID_Atmosphere, TEXT("DetailNoise"), DetailNoise);
-    SetVectorChecked(MID_Atmosphere, TEXT("StructureNoise"), StructureNoise);
-
-    SetScalarChecked(MID_Atmosphere, TEXT("EdgeBias"), GasGiantDeck.EdgeBias);
-
-    // -- Relief -------------------------------------------------------------
-    //
-    // Fractions of GradientThickness, so relief moves the profile rather than
-    // stretching it. GetTopMax() sums them the same way GG_TopBounds does and
-    // the cull radius follows it; nothing bounds them below, since the backstop
-    // catches whatever they cut.
-
-    const FLinearColor Relief = GasGiantDeck.GetRelief();
-
-    SetScalarChecked(MID_Atmosphere, TEXT("DeckTop"), Relief.R);
-    SetScalarChecked(MID_Atmosphere, TEXT("BandRelief"), Relief.G);
-    SetScalarChecked(MID_Atmosphere, TEXT("PressureRelief"), Relief.B);
-    SetScalarChecked(MID_Atmosphere, TEXT("StormTowerRelief"), Relief.A);
+    SetScalarChecked(MID_Atmosphere, TEXT("EdgeBias"), GasGiantSurface.EdgeBias);
+    SetScalarChecked(MID_Atmosphere, TEXT("ErosionDepth"), GasGiantSurface.ErosionDepth);
 
     // -- Layers -------------------------------------------------------------
 
-    SetScalarChecked(MID_Atmosphere, TEXT("DeckSlope"), GasGiantDeck.DeckSlope);
+    const FGasGiantNoiseLayerParams& Structure = GasGiantStructureLayer;
+    const FGasGiantNoiseLayerParams& Detail = GasGiantDetailLayer;
 
-    const FLinearColor Crossfade = GasGiantDeck.GetCrossfade();
+    SetVectorChecked(MID_Atmosphere, TEXT("StructureNoise"), Structure.NoiseWeights);
+    SetScalarChecked(MID_Atmosphere, TEXT("StructureScale"), Structure.Scale);
+    SetScalarChecked(MID_Atmosphere, TEXT("StructureVertical"), Structure.GetVertical(HeightScale));
+    SetScalarChecked(MID_Atmosphere, TEXT("StructureRelief"), Structure.Relief);
+    SetScalarChecked(MID_Atmosphere, TEXT("StructureErosion"), Structure.Erosion);
+    SetScalarChecked(MID_Atmosphere, TEXT("StructureWarpInherit"), Structure.FlowInherit);
+    SetScalarChecked(MID_Atmosphere, TEXT("StructureFadeNear"), Structure.FadeNear);
+    SetScalarChecked(MID_Atmosphere, TEXT("StructureFadeFar"), Structure.GetFadeFar());
+    SetScalarChecked(MID_Atmosphere, TEXT("StructureBandMix"), Structure.BandMix);
+    SetScalarChecked(MID_Atmosphere, TEXT("Crossfade Structure"), Structure.bCrossfade ? 1.0f : 0.0f);
 
-    // AUTHORED IN SIMULATED SECONDS, PUSHED IN REAL ONES. TimeScale is simulated
-    // time per real second, so the flow's own motion speeds up with it -- and
-    // noise the flow is supposed to be carrying has to speed up by the same
-    // factor or the two visibly come apart the moment the sim speed is touched.
-    //
-    // A frozen sim freezes the crossfade with it, which is the right answer
-    // rather than an edge case: nothing is advecting, so nothing should travel.
-    const float SimTimeScale = Simulation.Config ? Simulation.Config->TimeScale : 1.0f;
+    SetVectorChecked(MID_Atmosphere, TEXT("DetailNoise"), Detail.NoiseWeights);
+    SetScalarChecked(MID_Atmosphere, TEXT("DetailScale"), Detail.Scale);
+    SetScalarChecked(MID_Atmosphere, TEXT("DetailVertical"), Detail.GetVertical(HeightScale));
+    SetScalarChecked(MID_Atmosphere, TEXT("DetailRelief"), Detail.Relief);
+    SetScalarChecked(MID_Atmosphere, TEXT("DetailErosion"), Detail.Erosion);
+    SetScalarChecked(MID_Atmosphere, TEXT("DetailWarpInherit"), Detail.FlowInherit);
+    SetScalarChecked(MID_Atmosphere, TEXT("DetailFadeNear"), Detail.FadeNear);
+    SetScalarChecked(MID_Atmosphere, TEXT("DetailFadeFar"), Detail.GetFadeFar());
+    SetScalarChecked(MID_Atmosphere, TEXT("DetailBandMix"), Detail.BandMix);
+    SetScalarChecked(MID_Atmosphere, TEXT("Crossfade Detail"), Detail.bCrossfade ? 1.0f : 0.0f);
 
-    SetScalarChecked(MID_Atmosphere, TEXT("Crossfade Period"),
-        Crossfade.R / FMath::Max(SimTimeScale, KINDA_SMALL_NUMBER));
-    SetScalarChecked(MID_Atmosphere, TEXT("Crossfade Detail"), Crossfade.G);
-    SetScalarChecked(MID_Atmosphere, TEXT("Crossfade Structure"), Crossfade.B);
-
-    // -- Fade ranges --------------------------------------------------------
-    //
-    // Atmosphere thicknesses from the camera. Composed into FadeRanges by the
-    // material, like the other float4s.
-
-    const FLinearColor FadeRanges = GasGiantDeck.GetFadeRanges();
-
-    SetScalarChecked(MID_Atmosphere, TEXT("DetailFadeNear"), FadeRanges.R);
-    SetScalarChecked(MID_Atmosphere, TEXT("DetailFadeFar"), FadeRanges.G);
-    SetScalarChecked(MID_Atmosphere, TEXT("StructureFadeNear"), FadeRanges.B);
-    SetScalarChecked(MID_Atmosphere, TEXT("StructureFadeFar"), FadeRanges.A);
-
-    // -- Loose field scalars ------------------------------------------------
-
-    SetScalarChecked(MID_Atmosphere, TEXT("BandSharpness"), GasGiantDeck.BandSharpness);
-    SetScalarChecked(MID_Atmosphere, TEXT("ReliefThinning"), GasGiantDeck.ReliefThinning);
-    SetScalarChecked(MID_Atmosphere, TEXT("DetailVertical"), GasGiantDeck.GetDetailVertical(Common.Geometry.HeightScale));
-    SetScalarChecked(MID_Atmosphere, TEXT("StructureVertical"), GasGiantDeck.GetStructureVertical(Common.Geometry.HeightScale));
-    SetScalarChecked(MID_Atmosphere, TEXT("DetailErosion"), GasGiantDeck.DetailErosion);
-    SetScalarChecked(MID_Atmosphere, TEXT("DetailRelief"), GasGiantDeck.DetailRelief);
-    SetScalarChecked(MID_Atmosphere, TEXT("StructureRelief"), GasGiantDeck.StructureRelief);
-    SetScalarChecked(MID_Atmosphere, TEXT("StructureErosion"), GasGiantDeck.StructureErosion);
-    SetScalarChecked(MID_Atmosphere, TEXT("ErosionDepth"), GasGiantDeck.ErosionDepth);
-    SetScalarChecked(MID_Atmosphere, TEXT("StructureBandMix"), GasGiantDeck.StructureBandMix);
-    SetScalarChecked(MID_Atmosphere, TEXT("DetailBandMix"), GasGiantDeck.DetailBandMix);
-    SetScalarChecked(MID_Atmosphere, TEXT("DensityCurve"), GasGiantDeck.DensityCurve);
-    SetScalarChecked(MID_Atmosphere, TEXT("RotationWeight"), GasGiantDeck.RotationWeight);
+    SetScalarChecked(MID_Atmosphere, TEXT("DeckSlope"), GasGiantRaymarch.DeckSlope);
 
     // The sim's clock, not the world's. Requires the material's Time parameter
     // to feed the Custom node directly -- wired through a multiply against an
@@ -865,37 +822,35 @@ void APlanetAtmosphereActor::ApplyGasGiantParams(const FAtmosphereCommonView& Co
     SetVectorChecked(MID_Atmosphere, TEXT("localAxisY"), FLinearColor(AxisY.X, AxisY.Y, AxisY.Z, 0.0f));
     SetVectorChecked(MID_Atmosphere, TEXT("localAxisZ"), FLinearColor(AxisZ.X, AxisZ.Y, AxisZ.Z, 0.0f));
 
-    // -- Scattering ---------------------------------------------------------
+    // -- Cloud lighting -----------------------------------------------------
 
-    SetVectorChecked(MID_Atmosphere, TEXT("ScatterNeg"), GasGiantScatter.ScatterNegative);
-    SetVectorChecked(MID_Atmosphere, TEXT("ScatterPos"), GasGiantScatter.ScatterPositive);
-    SetVectorChecked(MID_Atmosphere, TEXT("ScatterBase"), GasGiantScatter.ScatterBase);
-    SetScalarChecked(MID_Atmosphere, TEXT("BandScale"), GasGiantScatter.BandScale);
+    // Each band's albedo with its extinction amount in A, which is how the
+    // march reads a band's share of the extinction.
+    SetVectorChecked(MID_Atmosphere, TEXT("ScatterNeg"), GasGiantBands.GetScatterNegative());
+    SetVectorChecked(MID_Atmosphere, TEXT("ScatterPos"), GasGiantBands.GetScatterPositive());
+    SetVectorChecked(MID_Atmosphere, TEXT("ScatterBase"), GasGiantBands.GetScatterBase());
+    SetScalarChecked(MID_Atmosphere, TEXT("BandScale"), GasGiantBands.BandScale);
 
-    // Terminator shaping. One float4 in the shader, four scalars here, because
-    // they are tuned against each other: the softness sets the terminator's
-    // width and the power crushes the tail the forward lobe leaks through it.
-    const FLinearColor LobeParams = GasGiantScatter.GetLobeParams();
+    SetScalarChecked(MID_Atmosphere, TEXT("TerminatorSoftness"), GasGiantTerminator.TerminatorSoftness);
+    SetScalarChecked(MID_Atmosphere, TEXT("AmbientTerminator"), GasGiantTerminator.AmbientTerminator);
+    SetScalarChecked(MID_Atmosphere, TEXT("MieLobeDecay"), GasGiantTerminator.MieLobeDecay);
+    SetScalarChecked(MID_Atmosphere, TEXT("LobeShadowPower"), GasGiantTerminator.LobeShadowPower);
 
-    SetScalarChecked(MID_Atmosphere, TEXT("TerminatorSoftness"), LobeParams.R);
-    SetScalarChecked(MID_Atmosphere, TEXT("AmbientTerminator"), LobeParams.G);
-    SetScalarChecked(MID_Atmosphere, TEXT("MieLobeDecay"), LobeParams.B);
-    SetScalarChecked(MID_Atmosphere, TEXT("LobeShadowPower"), LobeParams.A);
+    SetScalarChecked(MID_Atmosphere, TEXT("OctaveCount"), static_cast<float>(GasGiantMultipleScattering.OctaveCount));
+    SetScalarChecked(MID_Atmosphere, TEXT("OctaveAttenuation"), GasGiantMultipleScattering.OctaveAttenuation);
+    SetScalarChecked(MID_Atmosphere, TEXT("OctaveContribution"), GasGiantMultipleScattering.OctaveContribution);
+    SetScalarChecked(MID_Atmosphere, TEXT("OctaveEccentricity"), GasGiantMultipleScattering.OctaveEccentricity);
 
-    const FLinearColor OctaveParams = GasGiantScatter.GetOctaveParams();
+    // Solved from DeckOpticalDepth against the path a vertical ray takes down an
+    // unrelieved column, so retuning the shell leaves the deck's opacity where
+    // it was authored. The march reads one extinction tint for every band; the
+    // base band's supplies it.
+    const FLinearColor Tint = GasGiantBands.GetExtinctionTint();
 
-    SetScalarChecked(MID_Atmosphere, TEXT("OctaveCount"), OctaveParams.R);
-    SetScalarChecked(MID_Atmosphere, TEXT("OctaveAttenuation"), OctaveParams.G);
-    SetScalarChecked(MID_Atmosphere, TEXT("OctaveContribution"), OctaveParams.B);
-    SetScalarChecked(MID_Atmosphere, TEXT("OctaveEccentricity"), OctaveParams.A);
-
-    // Solved from DeckOpticalDepth against the path a vertical ray takes down a
-    // column with no relief, so retuning the shell leaves the deck's opacity
-    // where it was authored.
     SetVectorChecked(MID_Atmosphere, TEXT("Cloud Beta"),
-        GasGiantScatter.GetCloudBeta(GasGiantDeck.GetDeckBase(), GasGiantDeck.GetNominalFloor()));
+        Tint * GasGiantExtinction.GetDeckBeta(Shape.Base, Shape.NominalFloor));
     SetVectorChecked(MID_Atmosphere, TEXT("Cloud Absorption Beta"),
-        GasGiantScatter.GetCloudAbsorptionBeta(GasGiantDeck.GetDeckBase(), GasGiantDeck.GetNominalFloor()));
+        Tint * GasGiantExtinction.GetDeckLightBeta(Shape.Base, Shape.NominalFloor));
 }
 
 bool APlanetAtmosphereActor::PrepareGasGiantShadowTarget()
@@ -1109,14 +1064,11 @@ void APlanetAtmosphereActor::RequestGasGiantShadowBake(const FAtmosphereCommonVi
     // pushes to the material. Any divergence here is a deck the light sees and
     // the eye does not.
 
-    const FLinearColor Scales = GasGiantDeck.GetScales();
-    const FLinearColor Warps = GasGiantDeck.GetWarps();
-    const FLinearColor DetailNoise = GasGiantDeck.GetDetailNoise();
-    const FLinearColor StructureNoise = GasGiantDeck.GetStructureNoise();
-    const FLinearColor Crossfade = GasGiantDeck.GetCrossfade();
-    const FLinearColor Relief = GasGiantDeck.GetRelief();
-    const FLinearColor Profile = GasGiantDeck.GetProfile(PlanetRadius, Common.Geometry.HeightScale);
-    const FLinearColor FadeRanges = GasGiantDeck.GetFadeRanges();
+    const FGasGiantDeckShape Shape = GetGasGiantDeckShape();
+    const float HeightScale = Common.Geometry.HeightScale;
+
+    const FGasGiantNoiseLayerParams& Structure = GasGiantStructureLayer;
+    const FGasGiantNoiseLayerParams& Detail = GasGiantDetailLayer;
 
     // Authored in simulated seconds, consumed in real ones, like the material's
     // copy. A crossfade that does not scale with TimeScale comes apart from the
@@ -1125,54 +1077,65 @@ void APlanetAtmosphereActor::RequestGasGiantShadowBake(const FAtmosphereCommonVi
 
     Params.PlanetRadius = PlanetRadius;
     Params.Time = GetGasGiantTime();
-    Params.RotationWeight = GasGiantDeck.RotationWeight;
+    Params.RotationWeight = GasGiantFlow.RotationWeight;
 
-    Params.Scales = FVector4f(Scales.R, Scales.G, Scales.B, Scales.A);
-    Params.Warps = FVector4f(Warps.R, Warps.G, Warps.B, Warps.A);
+    Params.Scales = FVector4f(Detail.Scale, Structure.Scale, Detail.FlowInherit, Structure.FlowInherit);
+    Params.Warps = FVector4f(
+        GasGiantMotion.WarpTime,
+        GasGiantMotion.WarpTime * GasGiantMotion.DeepShearRatio,
+        GasGiantFlow.BandBias,
+        GasGiantMotion.TurbulenceFloor);
+
+    const FLinearColor& DetailNoise = Detail.NoiseWeights;
+    const FLinearColor& StructureNoise = Structure.NoiseWeights;
+
     Params.DetailNoise = FVector4f(DetailNoise.R, DetailNoise.G, DetailNoise.B, DetailNoise.A);
     Params.StructureNoise = FVector4f(StructureNoise.R, StructureNoise.G, StructureNoise.B, StructureNoise.A);
 
-    Params.EdgeBias = GasGiantDeck.EdgeBias;
-    Params.DeckSlope = GasGiantDeck.DeckSlope;
+    Params.EdgeBias = GasGiantSurface.EdgeBias;
+    Params.DeckSlope = GasGiantRaymarch.DeckSlope;
 
     Params.Crossfade = FVector4f(
-        Crossfade.R / FMath::Max(SimTimeScale, KINDA_SMALL_NUMBER),
-        Crossfade.G, Crossfade.B, Crossfade.A);
+        GasGiantMotion.CrossfadePeriod / FMath::Max(SimTimeScale, KINDA_SMALL_NUMBER),
+        Detail.bCrossfade ? 1.0f : 0.0f,
+        Structure.bCrossfade ? 1.0f : 0.0f,
+        0.0f);
 
-    Params.Relief = FVector4f(Relief.R, Relief.G, Relief.B, Relief.A);
-    Params.Profile = FVector4f(Profile.R, Profile.G, Profile.B, Profile.A);
+    Params.Relief = FVector4f(Shape.Base,
+        GasGiantFlow.BandRelief, GasGiantFlow.PressureRelief, GasGiantFlow.StormTowerRelief);
+    Params.Profile = FVector4f(PlanetRadius * HeightScale,
+        GasGiantProfile.DeckBackstop, GasGiantFlow.VortexThreshold, GasGiantProfile.GradientThickness);
 
-    Params.BandSharpness = GasGiantDeck.BandSharpness;
-    Params.ReliefThinning = GasGiantDeck.ReliefThinning;
-    Params.DetailVertical = GasGiantDeck.GetDetailVertical(Common.Geometry.HeightScale);
-    Params.StructureVertical = GasGiantDeck.GetStructureVertical(Common.Geometry.HeightScale);
-    Params.DetailErosion = GasGiantDeck.DetailErosion;
-    Params.DetailRelief = GasGiantDeck.DetailRelief;
-    Params.ErosionDepth = GasGiantDeck.ErosionDepth;
-    Params.DensityCurve = GasGiantDeck.DensityCurve;
-    Params.StructureRelief = GasGiantDeck.StructureRelief;
-    Params.StructureErosion = GasGiantDeck.StructureErosion;
+    Params.BandSharpness = GasGiantFlow.BandSharpness;
+    Params.ReliefThinning = GasGiantFlow.ReliefThinning;
+    Params.DetailVertical = Detail.GetVertical(HeightScale);
+    Params.StructureVertical = Structure.GetVertical(HeightScale);
+    Params.DetailErosion = Detail.Erosion;
+    Params.DetailRelief = Detail.Relief;
+    Params.ErosionDepth = GasGiantSurface.ErosionDepth;
+    Params.DensityCurve = GasGiantProfile.DensityCurve;
+    Params.StructureRelief = Structure.Relief;
+    Params.StructureErosion = Structure.Erosion;
 
-    Params.FadeRanges = FVector4f(FadeRanges.R, FadeRanges.G, FadeRanges.B, FadeRanges.A);
-    Params.BandMix = FVector2f(GasGiantDeck.StructureBandMix, GasGiantDeck.DetailBandMix);
+    Params.FadeRanges = FVector4f(Detail.FadeNear, Detail.GetFadeFar(), Structure.FadeNear, Structure.GetFadeFar());
+    Params.BandMix = FVector2f(Structure.BandMix, Detail.BandMix);
 
     // -- Extinction ---------------------------------------------------------
     //
-    // The band ALPHAS only. Their rgb is albedo, which belongs to the scattering
-    // site rather than to the medium the light crossed, and multiplying by it
-    // here would tint the shadow by the band it passed through.
+    // The band extinction AMOUNTS only. The map stores one scalar depth, and the
+    // colour is applied where it is exponentiated.
 
     Params.ScatterAlphas = FVector4f(
-        GasGiantScatter.ScatterNegative.A,
-        GasGiantScatter.ScatterPositive.A,
-        GasGiantScatter.ScatterBase.A,
-        GasGiantScatter.BandScale);
+        GasGiantBands.ExtinctionNegative.A,
+        GasGiantBands.ExtinctionPositive.A,
+        GasGiantBands.ExtinctionBase.A,
+        GasGiantBands.BandScale);
 
     // Solved the same way the material's copy is, from the same anchors, so the
     // depth at which the map says the deck goes opaque is the depth at which the
     // march says it does.
-    const FLinearColor AbsBeta = GasGiantScatter.GetCloudAbsorptionBeta(
-        GasGiantDeck.GetDeckBase(), GasGiantDeck.GetNominalFloor());
+    const FLinearColor AbsBeta = GasGiantBands.GetExtinctionTint()
+        * GasGiantExtinction.GetDeckLightBeta(Shape.Base, Shape.NominalFloor);
 
     Params.AbsBeta = FVector3f(AbsBeta.R, AbsBeta.G, AbsBeta.B);
 
@@ -1182,14 +1145,14 @@ void APlanetAtmosphereActor::RequestGasGiantShadowBake(const FAtmosphereCommonVi
     // not a second reference to the assets. A compute pass runs on the render
     // thread and cannot reach a UObject, so this is the only crossing available.
 
-    if (GasGiantDeck.DetailVolume && GasGiantDeck.DetailVolume->GetResource())
+    if (Detail.Volume && Detail.Volume->GetResource())
     {
-        Params.DetailTexture = GasGiantDeck.DetailVolume->GetResource()->TextureRHI;
+        Params.DetailTexture = Detail.Volume->GetResource()->TextureRHI;
     }
 
-    if (GasGiantDeck.StructureVolume && GasGiantDeck.StructureVolume->GetResource())
+    if (Structure.Volume && Structure.Volume->GetResource())
     {
-        Params.StructureTexture = GasGiantDeck.StructureVolume->GetResource()->TextureRHI;
+        Params.StructureTexture = Structure.Volume->GetResource()->TextureRHI;
     }
 
     Params.FlowTexture = FlowRes->GetRenderTargetTexture();

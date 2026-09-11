@@ -106,6 +106,9 @@ public:
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CloudAtmosphere|Pipeline")
     FAtmosphereSimulationParams Simulation;
 
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CloudAtmosphere|Pipeline|Raymarch", meta = (EditCondition = "PlanetType == EPlanetAtmosphereType::GasGiant", EditConditionHides, ShowOnlyInnerProperties))
+    FGasGiantRaymarchParams GasGiantRaymarch;
+
     // Baked Lighting: targets the per-frame and on-change bakes write and the
     // march reads. Set once for a performance tier, not tuned for looks.
 
@@ -168,29 +171,16 @@ public:
 
     // --- Parameters ---
     //
-    // Common is one definition with an instance per model, so the shell, the
-    // air and the march budget can differ without two definitions of what they
-    // mean. The model structs are what only one march material declares.
-    //
-    // Every per-type property is EditConditionHides, so the details panel shows
-    // exactly one Common set and one model set at a time.
-
-    // GROUPS COME FROM SUBSTRUCTS, NOT FROM CATEGORY STRINGS. Category metadata
-    // on a USTRUCT's members is inert while that struct renders as a row, so a
-    // struct declared here shows as Category > struct row > every member flat.
-    // Declaring one property per group instead puts the group name one level
-    // under the category and its members under that.
-
-    // The Common groups, once per model, each its own panel category.
-    //
-    // INLINED, so the group name comes from the category rather than from a
-    // struct row underneath it. Their members carry no category of their own,
-    // which is what lets one shared definition land in a different group per
-    // model -- an absolute path on the members could only name one.
+    // ONE PROPERTY PER PANEL GROUP, INLINED. ShowOnlyInnerProperties puts the
+    // members directly under the property's category, so the group name comes
+    // from the category rather than from a struct row. Members carry no
+    // category of their own and so display in declaration order.
     //
     // EditConditionHides does not survive the inlining: the condition lives on
     // the property row, and there is no row left. Both models' groups are
-    // visible at once, which the naming is what distinguishes.
+    // visible at once, distinguished by their Terrestrial or Gas Giant parent.
+
+    // Terrestrial: the shared Common structs plus the cloud band.
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CloudAtmosphere|Terrestrial|Terrestrial Geometry", meta = (EditCondition = "PlanetType == EPlanetAtmosphereType::Terrestrial", EditConditionHides, ShowOnlyInnerProperties))
     FAtmosphereGeometryParams TerrestrialGeometry;
@@ -207,32 +197,50 @@ public:
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CloudAtmosphere|Terrestrial|Terrestrial Cloud", meta = (EditCondition = "PlanetType == EPlanetAtmosphereType::Terrestrial", EditConditionHides, ShowOnlyInnerProperties))
     FTerrestrialCloudParams Terrestrial;
 
-    // THE SHELL IS THE DECK'S FIRST SHAPE TERM. Every other value under Shape
-    // is a fraction of this one, so an absolute at the top of the group is what
-    // the rest are read against. It sizes the air as well, which is why the
-    // terrestrial copy keeps a group of its own.
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CloudAtmosphere|Gas Giant|Gas Giant Deck|Shape", meta = (EditCondition = "PlanetType == EPlanetAtmosphereType::GasGiant", EditConditionHides, ShowOnlyInnerProperties))
+    // Gas giant: the authoritative layout. ApplyCommonParams reads it through
+    // GetCommonParams, which packs it into the shared view.
+
+    // THE MASTER SCALE, first under Gas Giant: every deck height is a fraction
+    // of the shell it sets. The shared geometry struct, whose one member is the
+    // height scale, inlined so the member sits directly under the category.
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CloudAtmosphere|Gas Giant", meta = (EditCondition = "PlanetType == EPlanetAtmosphereType::GasGiant", EditConditionHides, ShowOnlyInnerProperties))
     FAtmosphereGeometryParams GasGiantGeometry;
 
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CloudAtmosphere|Gas Giant|Gas Giant Deck", meta = (EditCondition = "PlanetType == EPlanetAtmosphereType::GasGiant", EditConditionHides, ShowOnlyInnerProperties))
-    FGasGiantDeckParams GasGiantDeck;
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CloudAtmosphere|Gas Giant|Deck|Profile", meta = (EditCondition = "PlanetType == EPlanetAtmosphereType::GasGiant", EditConditionHides, ShowOnlyInnerProperties))
+    FGasGiantProfileParams GasGiantProfile;
 
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CloudAtmosphere|Gas Giant|Gas Giant Atmosphere Scattering", meta = (EditCondition = "PlanetType == EPlanetAtmosphereType::GasGiant", EditConditionHides, ShowOnlyInnerProperties))
-    FAtmosphereAirScatteringParams GasGiantAtmosphereScattering;
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CloudAtmosphere|Gas Giant|Deck|Flow", meta = (EditCondition = "PlanetType == EPlanetAtmosphereType::GasGiant", EditConditionHides, ShowOnlyInnerProperties))
+    FGasGiantFlowParams GasGiantFlow;
 
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CloudAtmosphere|Gas Giant|Gas Giant Cloud Scattering", meta = (EditCondition = "PlanetType == EPlanetAtmosphereType::GasGiant", EditConditionHides, ShowOnlyInnerProperties))
-    FAtmosphereCloudScatteringParams GasGiantCloudScattering;
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CloudAtmosphere|Gas Giant|Deck|Motion", meta = (EditCondition = "PlanetType == EPlanetAtmosphereType::GasGiant", EditConditionHides, ShowOnlyInnerProperties))
+    FGasGiantMotionParams GasGiantMotion;
 
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CloudAtmosphere|Gas Giant|Gas Giant Raymarch", meta = (EditCondition = "PlanetType == EPlanetAtmosphereType::GasGiant", EditConditionHides, ShowOnlyInnerProperties))
-    FAtmosphereRaymarchParams GasGiantRaymarch;
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CloudAtmosphere|Gas Giant|Deck|Surface", meta = (EditCondition = "PlanetType == EPlanetAtmosphereType::GasGiant", EditConditionHides, ShowOnlyInnerProperties))
+    FGasGiantSurfaceParams GasGiantSurface;
 
-    // NO GROUP OF ITS OWN. Every member carries an absolute path -- the bands
-    // and the extinction to Cloud Scattering, the four lighting scalars to
-    // Terminator, the optical depth and band scale to the Deck -- so a category
-    // here would only add an empty node beside the groups they went to. Named
-    // for one of those groups so the fallback merges instead of stranding.
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CloudAtmosphere|Gas Giant|Gas Giant Cloud Scattering", meta = (EditCondition = "PlanetType == EPlanetAtmosphereType::GasGiant", EditConditionHides, ShowOnlyInnerProperties))
-    FGasGiantScatterParams GasGiantScatter;
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CloudAtmosphere|Gas Giant|Deck|Structure Layer", meta = (EditCondition = "PlanetType == EPlanetAtmosphereType::GasGiant", EditConditionHides, ShowOnlyInnerProperties))
+    FGasGiantNoiseLayerParams GasGiantStructureLayer;
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CloudAtmosphere|Gas Giant|Deck|Detail Layer", meta = (EditCondition = "PlanetType == EPlanetAtmosphereType::GasGiant", EditConditionHides, ShowOnlyInnerProperties))
+    FGasGiantNoiseLayerParams GasGiantDetailLayer;
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CloudAtmosphere|Gas Giant|Atmosphere Lighting", meta = (EditCondition = "PlanetType == EPlanetAtmosphereType::GasGiant", EditConditionHides, ShowOnlyInnerProperties))
+    FGasGiantAtmosphereLightingParams GasGiantAtmosphereLighting;
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CloudAtmosphere|Gas Giant|Cloud Lighting|Bands", meta = (EditCondition = "PlanetType == EPlanetAtmosphereType::GasGiant", EditConditionHides, ShowOnlyInnerProperties))
+    FGasGiantBandParams GasGiantBands;
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CloudAtmosphere|Gas Giant|Cloud Lighting|Extinction", meta = (EditCondition = "PlanetType == EPlanetAtmosphereType::GasGiant", EditConditionHides, ShowOnlyInnerProperties))
+    FGasGiantExtinctionParams GasGiantExtinction;
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CloudAtmosphere|Gas Giant|Cloud Lighting|Phase", meta = (EditCondition = "PlanetType == EPlanetAtmosphereType::GasGiant", EditConditionHides, ShowOnlyInnerProperties))
+    FGasGiantPhaseParams GasGiantPhase;
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CloudAtmosphere|Gas Giant|Cloud Lighting|Multiple Scattering", meta = (EditCondition = "PlanetType == EPlanetAtmosphereType::GasGiant", EditConditionHides, ShowOnlyInnerProperties))
+    FGasGiantMultipleScatteringParams GasGiantMultipleScattering;
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CloudAtmosphere|Gas Giant|Cloud Lighting|Terminator", meta = (EditCondition = "PlanetType == EPlanetAtmosphereType::GasGiant", EditConditionHides, ShowOnlyInnerProperties))
+    FGasGiantTerminatorParams GasGiantTerminator;
 
     // --- Lifecycle ---
 
@@ -347,13 +355,27 @@ private:
      *  push the wrong shell and march budget at the material on screen. */
     FAtmosphereCommonView GetCommonParams() const
     {
-        const bool bGasGiant = BuiltType == EPlanetAtmosphereType::GasGiant;
+        if (BuiltType == EPlanetAtmosphereType::GasGiant)
+        {
+            return FAtmosphereCommonView{
+                GasGiantGeometry,
+                GasGiantAtmosphereLighting.GetAirScattering(),
+                GasGiantPhase.GetCloudScattering(),
+                GasGiantRaymarch.GetRaymarch() };
+        }
 
         return FAtmosphereCommonView{
-            bGasGiant ? GasGiantGeometry : TerrestrialGeometry,
-            bGasGiant ? GasGiantAtmosphereScattering : TerrestrialAtmosphereScattering,
-            bGasGiant ? GasGiantCloudScattering : TerrestrialCloudScattering,
-            bGasGiant ? GasGiantRaymarch : TerrestrialRaymarch };
+            TerrestrialGeometry,
+            TerrestrialAtmosphereScattering,
+            TerrestrialCloudScattering,
+            TerrestrialRaymarch };
+    }
+
+    /** The deck's derived heights, from the groups that set them. */
+    FGasGiantDeckShape GetGasGiantDeckShape() const
+    {
+        return FGasGiantDeckShape::Solve(
+            GasGiantProfile, GasGiantFlow, GasGiantStructureLayer, GasGiantDetailLayer);
     }
 
     /** Geometry, light, air scattering, cloud lighting, raymarching. Both march
