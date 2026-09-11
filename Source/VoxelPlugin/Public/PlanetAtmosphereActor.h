@@ -91,8 +91,13 @@ public:
      *  material and warns once per name; this clears that filter, so pressing it
      *  re-reports anything the material no longer has. Only the ACTIVE model is
      *  pushed, so covering both means pressing it, flipping PlanetType, and
-     *  pressing it again. */
-    UFUNCTION(BlueprintCallable, CallInEditor, Category = "CloudAtmosphere|Pipeline|Materials")
+     *  pressing it again.
+     *
+     *  PITFALL: a CallInEditor function's category must be top-level. The
+     *  details panel does not nest it: a path with '|' becomes one flat
+     *  category of that literal name, and every property sharing the exact
+     *  path is pulled out of its nested group into it. */
+    UFUNCTION(BlueprintCallable, CallInEditor, Category = "CloudAtmosphere")
     void RebuildMaterialInstances();
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CloudAtmosphere|Pipeline")
@@ -100,6 +105,32 @@ public:
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CloudAtmosphere|Pipeline")
     FAtmosphereSimulationParams Simulation;
+
+    // Baked Lighting: targets the per-frame and on-change bakes write and the
+    // march reads. Set once for a performance tier, not tuned for looks.
+
+    /** Destination for the deck shadow bake, in the light's frame: a cascade of
+     *  slices, all the same resolution, each covering a smaller radius.
+     *
+     *  ASSIGNED, NOT CREATED, matching FlowTarget: an asset can be opened beside
+     *  the planet and watched while the light moves. Size, format and UAV
+     *  support are forced on assignment; a target without bCanCreateUAV
+     *  accepts every dispatch and stays black. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CloudAtmosphere|Pipeline|Baked Lighting", meta = (EditCondition = "PlanetType == EPlanetAtmosphereType::GasGiant", EditConditionHides))
+    TObjectPtr<UTextureRenderTarget2DArray> GasGiantShadowTarget;
+
+    /** Edge of each cascade slice, in texels. The target is resized to match, so
+     *  this rather than the asset's own size is the handle.
+     *
+     *  EVERY LEVEL SHARES IT, and the world scale falls out of the extents: the
+     *  disc slice is coarse, the detail slice is fine, and one number moves all
+     *  of them together. Square because the map has one extent for both axes.
+     *
+     *  Bake time and memory scale with the square; memory is 2 MB per slice at
+     *  512 in RGBA16F. The bake band-limits at its source, so a lower value
+     *  softens shadows rather than aliasing them. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CloudAtmosphere|Pipeline|Baked Lighting", meta = (EditCondition = "PlanetType == EPlanetAtmosphereType::GasGiant", EditConditionHides, ClampMin = "128", ClampMax = "4096"))
+    int32 GasGiantShadowResolution = 1024;
 
     // --- Atmosphere ---
     //
@@ -186,38 +217,6 @@ public:
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CloudAtmosphere|Gas Giant|Gas Giant Deck", meta = (EditCondition = "PlanetType == EPlanetAtmosphereType::GasGiant", EditConditionHides, ShowOnlyInnerProperties))
     FGasGiantDeckParams GasGiantDeck;
 
-    /** Destination for the deck shadow bake, in the light's frame: a cascade of
-     *  slices, all the same resolution, each covering a smaller radius.
-     *
-     *  ASSIGNED, NOT CREATED, matching FlowTarget: an asset can be opened beside
-     *  the planet and watched while the light moves, which is the whole
-     *  debugging loop for a map nothing samples yet.
-     *
-     *  The asset's own SizeX and SizeY set the resolution and should be square
-     *  -- the map has one extent for both axes, so an unequal one stretches the
-     *  disc. Format and UAV support are forced to RGBA16F on assignment, since
-     *  a target without bCanCreateUAV accepts every dispatch and stays black. */
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CloudAtmosphere|Gas Giant|Gas Giant Deck", meta = (EditCondition = "PlanetType == EPlanetAtmosphereType::GasGiant", EditConditionHides))
-    TObjectPtr<UTextureRenderTarget2DArray> GasGiantShadowTarget;
-
-    /** Edge of each cascade slice, in texels. The target is resized to match, so
-     *  this rather than the asset's own size is the handle.
-     *
-     *  EVERY LEVEL SHARES IT, and the world scale falls out of the extents: the
-     *  disc slice is coarse, the detail slice is fine, and one number moves all
-     *  of them together.
-     *
-     *  SQUARE BECAUSE THE MAP HAS ONE EXTENT. Both axes cover the same world
-     *  distance, so unequal sizes stretch the planet disc.
-     *
-     *  Costs the square: 512 is 2 MB at RGBA16F, 1024 is 8, 2048 is 32. Spatial
-     *  resolution is rarely the limit -- 1024 across a disc already resolves the
-     *  flow grid several times over -- so a step or reconstruction artifact will
-     *  not respond to this, which makes it a useful thing to rule out. */
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CloudAtmosphere|Gas Giant|Gas Giant Deck", meta = (EditCondition = "PlanetType == EPlanetAtmosphereType::GasGiant", EditConditionHides, ClampMin = "128", ClampMax = "4096"))
-    int32 GasGiantShadowResolution = 1024;
-
-
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CloudAtmosphere|Gas Giant|Gas Giant Atmosphere Scattering", meta = (EditCondition = "PlanetType == EPlanetAtmosphereType::GasGiant", EditConditionHides, ShowOnlyInnerProperties))
     FAtmosphereAirScatteringParams GasGiantAtmosphereScattering;
 
@@ -291,7 +290,7 @@ private:
     /** Air transmittance table, created on first use. Visible for inspection;
      *  it depends only on the radii and the air profile, so there is nothing
      *  to watch it do. */
-    UPROPERTY(Transient, VisibleInstanceOnly, Category = "CloudAtmosphere")
+    UPROPERTY(Transient, VisibleInstanceOnly, Category = "CloudAtmosphere|Pipeline|Baked Lighting")
     TObjectPtr<UTextureRenderTarget2D> TransmittanceTable = nullptr;
 
     /** Inputs and destination of the last enqueued bake. */

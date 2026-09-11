@@ -641,7 +641,6 @@ void APlanetAtmosphereActor::ApplyCommonParams(const FAtmosphereCommonView& Comm
         FLinearColor(PlanetCenter.X, PlanetCenter.Y, PlanetCenter.Z, 0.0f));
     SetScalarChecked(MID_Atmosphere, TEXT("Planet Radius"), PlanetRadius);
     SetScalarChecked(MID_Atmosphere, TEXT("Atmosphere Height Scale"), Common.Geometry.HeightScale);
-    SetScalarChecked(MID_Atmosphere, TEXT("Atmosphere Floor Offset"), Common.Geometry.FloorOffset);
 
     SetVectorChecked(MID_Atmosphere, TEXT("Light Direction"),
         FLinearColor(LightDir.X, LightDir.Y, LightDir.Z, 0.0f));
