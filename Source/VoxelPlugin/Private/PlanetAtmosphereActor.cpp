@@ -687,6 +687,19 @@ void APlanetAtmosphereActor::ApplyTerrestrialParams(const FAtmosphereCommonView&
     SetVectorChecked(MID_Atmosphere, TEXT("Cloud Absorption Beta"), Terrestrial.CloudAbsorptionBeta);
 }
 
+// READOUT ONLY, NEVER PUSHED. Mirrors GG_TopBounds' upper bound before its
+// clamp at the shell, with the detail carve centred as GG_DETAIL_RELIEF_CENTRED's
+// default has it. A mismatch misreports the readout and changes nothing drawn.
+static float SolveTopMaxReadout(const FGasGiantProfileParams& Profile, const FGasGiantFlowParams& Flow,
+    const FGasGiantNoiseLayerParams& Structure, const FGasGiantNoiseLayerParams& Detail)
+{
+    const float UpReach = 0.5f * FMath::Abs(Flow.BandRelief) + FMath::Abs(Flow.PressureRelief)
+        + 0.5f * FMath::Abs(Structure.Relief) + 0.5f * FMath::Abs(Detail.Relief)
+        + FMath::Abs(Flow.StormTowerRelief);
+
+    return Profile.DeckTop + FMath::Max(Profile.GradientThickness, 1e-4f) * UpReach;
+}
+
 void APlanetAtmosphereActor::ApplyGasGiantParams(float PlanetRadius, const FVector& PlanetCenter, const FVector& LightDir)
 {
     // EVERY NAME HERE IS THE MEMBER'S OWN, so the parameter, the Custom node pin
@@ -711,8 +724,6 @@ void APlanetAtmosphereActor::ApplyGasGiantParams(float PlanetRadius, const FVect
     // engine Time node, this value is ignored and the field advects against
     // world time, which diverges the moment the sim pauses or restores.
     SetScalarChecked(MID_Atmosphere, TEXT("Time"), GetGasGiantTime());
-    SetScalarChecked(MID_Atmosphere, TEXT("SimTimeScale"),
-        Simulation.Config ? Simulation.Config->TimeScale : 1.0f);
 
     // The planet's orientation as a quaternion; GGAtmo_WorldToLocal rebuilds
     // the rotation from it. The field is defined with the spin axis on Z; the
@@ -748,8 +759,11 @@ void APlanetAtmosphereActor::ApplyGasGiantParams(float PlanetRadius, const FVect
 
     // -- Deck ---------------------------------------------------------------------
 
+    GasGiantProfile.SolvedTopMax = SolveTopMaxReadout(
+        GasGiantProfile, GasGiantFlow, GasGiantStructureLayer, GasGiantDetailLayer);
+
     SetScalarChecked(MID_Atmosphere, TEXT("DeckTop"), GasGiantProfile.DeckTop);
-    SetScalarChecked(MID_Atmosphere, TEXT("CeilingReserve"), GasGiantProfile.CeilingReserve);
+    SetScalarChecked(MID_Atmosphere, TEXT("CeilingFalloff"), GasGiantProfile.CeilingFalloff);
     SetScalarChecked(MID_Atmosphere, TEXT("GradientThickness"), GasGiantProfile.GradientThickness);
     SetScalarChecked(MID_Atmosphere, TEXT("DeckBackstop"), GasGiantProfile.DeckBackstop);
 
@@ -1065,10 +1079,9 @@ void APlanetAtmosphereActor::RequestGasGiantShadowBake(
     Params.PlanetRadius = PlanetRadius;
     Params.HeightScale = GasGiantGeometry.HeightScale;
     Params.Time = GetGasGiantTime();
-    Params.SimTimeScale = Simulation.Config->TimeScale;
 
     Params.DeckTop = GasGiantProfile.DeckTop;
-    Params.CeilingReserve = GasGiantProfile.CeilingReserve;
+    Params.CeilingFalloff = GasGiantProfile.CeilingFalloff;
     Params.GradientThickness = GasGiantProfile.GradientThickness;
     Params.DeckBackstop = GasGiantProfile.DeckBackstop;
     Params.DensityCurve = GasGiantExtinction.DensityCurve;
