@@ -752,7 +752,6 @@ void APlanetAtmosphereActor::ApplyGasGiantParams(float PlanetRadius, const FVect
     SetScalarChecked(MID_Atmosphere, TEXT("CeilingReserve"), GasGiantProfile.CeilingReserve);
     SetScalarChecked(MID_Atmosphere, TEXT("GradientThickness"), GasGiantProfile.GradientThickness);
     SetScalarChecked(MID_Atmosphere, TEXT("DeckBackstop"), GasGiantProfile.DeckBackstop);
-    SetScalarChecked(MID_Atmosphere, TEXT("DensityCurve"), GasGiantProfile.DensityCurve);
 
     SetScalarChecked(MID_Atmosphere, TEXT("BandSharpness"), GasGiantFlow.BandSharpness);
     SetScalarChecked(MID_Atmosphere, TEXT("BandBias"), GasGiantFlow.BandBias);
@@ -799,6 +798,7 @@ void APlanetAtmosphereActor::ApplyGasGiantParams(float PlanetRadius, const FVect
     SetVectorChecked(MID_Atmosphere, TEXT("ExtinctionBase"), GasGiantBands.ExtinctionBase);
     SetScalarChecked(MID_Atmosphere, TEXT("BandScale"), GasGiantBands.BandScale);
 
+    SetScalarChecked(MID_Atmosphere, TEXT("DensityCurve"), GasGiantExtinction.DensityCurve);
     SetScalarChecked(MID_Atmosphere, TEXT("DeckOpticalDepth"), GasGiantExtinction.DeckOpticalDepth);
     SetScalarChecked(MID_Atmosphere, TEXT("LightExtinctionFraction"), GasGiantExtinction.LightExtinctionFraction);
 
@@ -1071,7 +1071,7 @@ void APlanetAtmosphereActor::RequestGasGiantShadowBake(
     Params.CeilingReserve = GasGiantProfile.CeilingReserve;
     Params.GradientThickness = GasGiantProfile.GradientThickness;
     Params.DeckBackstop = GasGiantProfile.DeckBackstop;
-    Params.DensityCurve = GasGiantProfile.DensityCurve;
+    Params.DensityCurve = GasGiantExtinction.DensityCurve;
 
     Params.BandSharpness = GasGiantFlow.BandSharpness;
     Params.BandBias = GasGiantFlow.BandBias;
