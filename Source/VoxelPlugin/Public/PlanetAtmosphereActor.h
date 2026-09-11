@@ -348,22 +348,10 @@ private:
      *  BuiltType, not PlanetType. */
     void UpdateMaterialParameters();
 
-    /** The Common instance the live march material was built for.
-     *
-     *  KEYED ON BuiltType, not PlanetType, for the same reason the parameter
-     *  sweep is: a type change that has not been rebuilt yet would otherwise
-     *  push the wrong shell and march budget at the material on screen. */
+    /** The terrestrial model's Common groups, as ApplyCommonParams takes them.
+     *  The gas giant pushes its own groups directly. */
     FAtmosphereCommonView GetCommonParams() const
     {
-        if (BuiltType == EPlanetAtmosphereType::GasGiant)
-        {
-            return FAtmosphereCommonView{
-                GasGiantGeometry,
-                GasGiantAtmosphereLighting.GetAirScattering(),
-                GasGiantPhase.GetCloudScattering(),
-                GasGiantRaymarch.GetRaymarch() };
-        }
-
         return FAtmosphereCommonView{
             TerrestrialGeometry,
             TerrestrialAtmosphereScattering,
@@ -371,37 +359,33 @@ private:
             TerrestrialRaymarch };
     }
 
-    /** The deck's derived heights, from the groups that set them. */
-    FGasGiantDeckShape GetGasGiantDeckShape() const
-    {
-        return FGasGiantDeckShape::Solve(
-            GasGiantProfile, GasGiantFlow, GasGiantStructureLayer, GasGiantDetailLayer);
-    }
-
-    /** Geometry, light, air scattering, cloud lighting, raymarching. Both march
-     *  materials, and no branching inside — the caller passes whichever Common
-     *  instance is live. */
+    /** Geometry, light, air scattering, cloud lighting, raymarching, under the
+     *  terrestrial material's parameter names. */
     void ApplyCommonParams(const FAtmosphereCommonView& Common, float PlanetRadius,
         const FVector& PlanetCenter, const FVector& LightDir);
 
     /** Cloud shell, noise and extinction. Terrestrial material only. */
     void ApplyTerrestrialParams(const FAtmosphereCommonView& Common);
 
-    /** Field, volumes, per-band scattering and the planet's local frame.
+    /** Every gas giant group, under its members' own names, plus the planet,
+     *  the light, the clock and the local frame.
      *
-     *  The cloud radii are absent on purpose: the gas giant shader derives them
-     *  from GG_TopBounds, and pushing them here would create a second source
-     *  that can disagree with the bound the march is culling against. */
-    void ApplyGasGiantParams(const FAtmosphereCommonView& Common, float PlanetRadius);
+     *  AUTHORED VALUES ONLY. Everything derived -- the deck base, the cloud
+     *  radii, the extinction coefficients -- is computed in the shader, once,
+     *  from these; a value derived here would be a second source that can
+     *  disagree with the one the bake uses. */
+    void ApplyGasGiantParams(float PlanetRadius, const FVector& PlanetCenter, const FVector& LightDir);
+
+    /** One noise layer's members, each under Prefix + member name. */
+    void ApplyGasGiantLayer(const TCHAR* Prefix, const FGasGiantNoiseLayerParams& Layer);
 
     /** Queues this frame's deck shadow bake with the sim subsystem.
      *
-     *  SEPARATE FROM ApplyGasGiantParams because it pushes nothing to the
-     *  material. The deck values it sends come from the same FGasGiantDeckParams
-     *  getters, which is what keeps the deck the light sees identical to the
-     *  deck the eye sees -- but its destination is a compute pass, not a MID. */
-    void RequestGasGiantShadowBake(const FAtmosphereCommonView& Common, float PlanetRadius,
-        const FVector& PlanetCenter, const FVector& LightDir);
+     *  SEPARATE FROM ApplyGasGiantParams because its destination is a compute
+     *  pass, not a MID. It sends the same authored values under the same names,
+     *  and the bake derives from them with the same shader functions, which is
+     *  what keeps the deck the light sees identical to the deck the eye sees. */
+    void RequestGasGiantShadowBake(float PlanetRadius, const FVector& PlanetCenter, const FVector& LightDir);
 
     /** Forces the assigned shadow target to RGBA16F with UAV support, resizing
      *  only if the format is wrong. Returns false when there is nothing usable,
@@ -414,7 +398,7 @@ private:
 
     /** Creates the transmittance table if needed, rebakes it when its inputs or
      *  its resource change, and pushes it to the march material. */
-    void UpdateTransmittanceTable(const FAtmosphereCommonView& Common, float PlanetRadius);
+    void UpdateTransmittanceTable(float PlanetRadius);
 
     /** Creates the table if absent and forces its fixed size, float format,
      *  clamp addressing and UAV support. */
