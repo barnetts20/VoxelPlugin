@@ -769,6 +769,7 @@ void APlanetAtmosphereActor::ApplyGasGiantParams(float PlanetRadius, const FVect
 
     SetScalarChecked(MID_Atmosphere, TEXT("BandSharpness"), GasGiantFlow.BandSharpness);
     SetScalarChecked(MID_Atmosphere, TEXT("BandBias"), GasGiantFlow.BandBias);
+    SetScalarChecked(MID_Atmosphere, TEXT("HemisphereBlend"), GasGiantFlow.HemisphereBlend);
     SetScalarChecked(MID_Atmosphere, TEXT("BandRelief"), GasGiantFlow.BandRelief);
     SetScalarChecked(MID_Atmosphere, TEXT("PressureRelief"), GasGiantFlow.PressureRelief);
     SetScalarChecked(MID_Atmosphere, TEXT("VortexThreshold"), GasGiantFlow.VortexThreshold);
@@ -1088,6 +1089,7 @@ void APlanetAtmosphereActor::RequestGasGiantShadowBake(
 
     Params.BandSharpness = GasGiantFlow.BandSharpness;
     Params.BandBias = GasGiantFlow.BandBias;
+    Params.HemisphereBlend = GasGiantFlow.HemisphereBlend;
     Params.BandRelief = GasGiantFlow.BandRelief;
     Params.PressureRelief = GasGiantFlow.PressureRelief;
     Params.VortexThreshold = GasGiantFlow.VortexThreshold;
