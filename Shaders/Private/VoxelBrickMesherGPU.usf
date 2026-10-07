@@ -1,0 +1,96 @@
+// VoxelBrickMesherGPU.usf - The stitched brick mesher on the GPU (VoxelBrickMesherGPU.cpp).
+// The passes are VoxelBrickMesherPasses.ush; this file declares their inputs and entry points.
+
+#include "/Engine/Public/Platform.ush"
+#include "/Plugin/VoxelPlugin/Private/VoxelDensityCore.ush"
+#include "/Plugin/VoxelPlugin/Private/VoxelDF64.ush"
+#include "/Plugin/VoxelPlugin/Private/VoxelBrickStitch.ush"
+
+// Density (VoxelDensitySample.ush).
+StructuredBuffer<FVoxelOctave> Octaves;
+float2 HalfFinest;
+uint ContinentOctaves;
+uint MountainOctaves;
+uint DetailOctaves;
+float2 InvNormContinent;
+float2 InvNormMountain;
+float2 InvNormDetail;
+float2 PlanetRadius;
+float2 NoiseAmplitude;
+float2 ContinentWeight;
+float2 MountainWeight;
+float2 MountainStart;
+float2 MountainBlend;
+float2 DetailWeight;
+float RidgeGain;
+float SlopeDamping;
+
+// Edits (VoxelEditSample.ush).
+StructuredBuffer<float> EditCorners;
+StructuredBuffer<int> EditChildren;
+StructuredBuffer<uint> EditFlags;
+uint EditNodeCount;
+int EditRootExtent;
+
+// Mesher (VoxelBrickMesherPasses.ush).
+StructuredBuffer<FVoxelMesherBrick> Bricks;
+int CellsPerBrick;
+uint NumBricks;
+uint HashSize;
+uint FaceCap;
+uint VertexCap;
+uint TriangleCap;
+float FinestCell;
+float MinFootprint;
+uint PassMode;
+uint GroupsX;
+RWStructuredBuffer<float> Dense;
+RWStructuredBuffer<uint> HashKeys;
+RWStructuredBuffer<uint> HashValues;
+RWStructuredBuffer<uint> SlotState;
+RWStructuredBuffer<uint> SlotVertex;
+RWStructuredBuffer<uint> Faces;
+RWStructuredBuffer<uint> Counters;
+RWStructuredBuffer<float> Vertices;
+RWStructuredBuffer<uint> Indices;
+
+#include "/Plugin/VoxelPlugin/Private/VoxelDensitySample.ush"
+#include "/Plugin/VoxelPlugin/Private/VoxelEditSample.ush"
+#include "/Plugin/VoxelPlugin/Private/VoxelBrickMesherPasses.ush"
+
+// Thread index over a 2D grid of 64-thread groups (GroupsX wide), so a pass can exceed 65535
+// groups.
+uint ThreadIndex(uint3 GroupId, uint GroupThread)
+{
+    return (GroupId.y * GroupsX + GroupId.x) * 64u + GroupThread;
+}
+
+[numthreads(64, 1, 1)]
+void SampleCS(uint3 GroupId : SV_GroupID, uint GroupThread : SV_GroupIndex)
+{
+    VoxelMesherSamplePass(ThreadIndex(GroupId, GroupThread), PassMode);
+}
+
+[numthreads(64, 1, 1)]
+void EdgesCS(uint3 GroupId : SV_GroupID, uint GroupThread : SV_GroupIndex)
+{
+    VoxelMesherEdgesPass(ThreadIndex(GroupId, GroupThread));
+}
+
+[numthreads(64, 1, 1)]
+void RequestCS(uint3 GroupId : SV_GroupID, uint GroupThread : SV_GroupIndex)
+{
+    VoxelMesherRequestPass(ThreadIndex(GroupId, GroupThread), PassMode);
+}
+
+[numthreads(64, 1, 1)]
+void SolveCS(uint3 GroupId : SV_GroupID, uint GroupThread : SV_GroupIndex)
+{
+    VoxelMesherSolvePass(ThreadIndex(GroupId, GroupThread));
+}
+
+[numthreads(64, 1, 1)]
+void TrianglesCS(uint3 GroupId : SV_GroupID, uint GroupThread : SV_GroupIndex)
+{
+    VoxelMesherTrianglesPass(ThreadIndex(GroupId, GroupThread));
+}

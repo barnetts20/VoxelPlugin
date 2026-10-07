@@ -1,0 +1,140 @@
+// VoxelDF64.ush - Double-float arithmetic for the GPU density: a value is the unevaluated sum
+// Hi + Lo of two floats (float2, x = Hi), about 44 significant bits. Shared subset (see
+// VoxelShaderCompat.h), so the C++ tests run the same code the GPU does.
+//
+// Dekker/Knuth error-free transformations without fused multiply-add: every operation
+// marked VOXEL_PRECISE must round exactly as written. Division and square root start from
+// the hardware result and correct it, so approximate GPU division and sqrt are fine.
+
+#ifndef VOXEL_DF64_USH
+#define VOXEL_DF64_USH
+
+#ifndef VOXEL_FUNC
+#define VOXEL_FUNC
+#endif
+#ifndef VOXEL_PRECISE
+#define VOXEL_PRECISE precise
+#endif
+
+// A + B exactly, as (rounded sum, error).
+VOXEL_FUNC float2 VoxelDFTwoSum(float A, float B)
+{
+    VOXEL_PRECISE float S = A + B;
+    VOXEL_PRECISE float V = S - A;
+    VOXEL_PRECISE float E = (A - (S - V)) + (B - V);
+    return float2(S, E);
+}
+
+// Same, for |A| >= |B|.
+VOXEL_FUNC float2 VoxelDFQuickTwoSum(float A, float B)
+{
+    VOXEL_PRECISE float S = A + B;
+    VOXEL_PRECISE float E = B - (S - A);
+    return float2(S, E);
+}
+
+// A as two floats of 12 significant bits each, whose products are exact.
+VOXEL_FUNC float2 VoxelDFSplit(float A)
+{
+    VOXEL_PRECISE float T = 4097.0f * A;
+    VOXEL_PRECISE float Hi = T - (T - A);
+    VOXEL_PRECISE float Lo = A - Hi;
+    return float2(Hi, Lo);
+}
+
+// A * B exactly, as (rounded product, error).
+VOXEL_FUNC float2 VoxelDFTwoProd(float A, float B)
+{
+    VOXEL_PRECISE float P = A * B;
+    const float2 SA = VoxelDFSplit(A);
+    const float2 SB = VoxelDFSplit(B);
+    VOXEL_PRECISE float E = ((SA.x * SB.x - P) + SA.x * SB.y + SA.y * SB.x) + SA.y * SB.y;
+    return float2(P, E);
+}
+
+VOXEL_FUNC float2 VoxelDFAdd(float2 A, float2 B)
+{
+    const float2 S = VoxelDFTwoSum(A.x, B.x);
+    const float2 T = VoxelDFTwoSum(A.y, B.y);
+    VOXEL_PRECISE float Lo = S.y + T.x;
+    const float2 U = VoxelDFQuickTwoSum(S.x, Lo);
+    VOXEL_PRECISE float Lo2 = U.y + T.y;
+    return VoxelDFQuickTwoSum(U.x, Lo2);
+}
+
+VOXEL_FUNC float2 VoxelDFSub(float2 A, float2 B)
+{
+    return VoxelDFAdd(A, float2(-B.x, -B.y));
+}
+
+VOXEL_FUNC float2 VoxelDFMul(float2 A, float2 B)
+{
+    const float2 P = VoxelDFTwoProd(A.x, B.x);
+    VOXEL_PRECISE float Lo = P.y + (A.x * B.y + A.y * B.x);
+    return VoxelDFQuickTwoSum(P.x, Lo);
+}
+
+VOXEL_FUNC float2 VoxelDFMulFloat(float2 A, float B)
+{
+    const float2 P = VoxelDFTwoProd(A.x, B);
+    VOXEL_PRECISE float Lo = P.y + A.y * B;
+    return VoxelDFQuickTwoSum(P.x, Lo);
+}
+
+// Long division with two correction steps.
+VOXEL_FUNC float2 VoxelDFDiv(float2 A, float2 B)
+{
+    VOXEL_PRECISE float Q1 = A.x / B.x;
+    const float2 R1 = VoxelDFSub(A, VoxelDFMulFloat(B, Q1));
+    VOXEL_PRECISE float Q2 = R1.x / B.x;
+    const float2 R2 = VoxelDFSub(R1, VoxelDFMulFloat(B, Q2));
+    VOXEL_PRECISE float Q3 = R2.x / B.x;
+    return VoxelDFAdd(VoxelDFQuickTwoSum(Q1, Q2), float2(Q3, 0.0f));
+}
+
+// One Newton step from the float square root.
+VOXEL_FUNC float2 VoxelDFSqrt(float2 A)
+{
+    if (A.x <= 0.0f) return float2(0.0f, 0.0f);
+    VOXEL_PRECISE float X = sqrt(A.x);
+    const float2 R = VoxelDFSub(A, VoxelDFTwoProd(X, X));
+    VOXEL_PRECISE float C = R.x / (2.0f * X);
+    return VoxelDFQuickTwoSum(X, C);
+}
+
+// An int exactly (two floats of at most 19 and 12 significant bits).
+VOXEL_FUNC float2 VoxelDFFromInt(int I)
+{
+    const int HiPart = (I >> 12) * 4096;
+    return VoxelDFTwoSum(float(HiPart), float(I - HiPart));
+}
+
+VOXEL_FUNC float2 VoxelDFClamp01(float2 A)
+{
+    if (A.x < 0.0f || (A.x == 0.0f && A.y < 0.0f)) return float2(0.0f, 0.0f);
+    if (A.x > 1.0f || (A.x == 1.0f && A.y > 0.0f)) return float2(1.0f, 0.0f);
+    return A;
+}
+
+// A lattice coordinate split into its cell (floor) and the fraction inside it.
+struct FVoxelLatticeSplit
+{
+    int Cell;
+    float Frac;
+};
+
+VOXEL_FUNC FVoxelLatticeSplit VoxelDFLatticeSplit(float2 A)
+{
+    const float F = floor(A.x);
+    const float2 R = VoxelDFSub(A, float2(F, 0.0f));
+    float G = floor(R.x);
+    if (R.x == G && R.y < 0.0f) G -= 1.0f;
+    const float2 Frac = VoxelDFSub(R, float2(G, 0.0f));
+
+    FVoxelLatticeSplit Split;
+    Split.Cell = int(F) + int(G);
+    Split.Frac = Frac.x + Frac.y;
+    return Split;
+}
+
+#endif // VOXEL_DF64_USH

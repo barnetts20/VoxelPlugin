@@ -8,6 +8,8 @@
 #include "FDensitySampleCompositor.h"
 #include "VoxelDensity.generated.h"
 
+struct FVoxelDensityGPUData;
+
 /** Shape of the planet's surface heightfield. Wavelengths are fractions of the planet radius,
  *  so a setting keeps its look at any planet size; weights are fractions of the noise
  *  amplitude (the height range above the planet radius). */
@@ -103,25 +105,33 @@ public:
     /** Terrain density (negative = solid) at each input position, without edits. */
     void Sample(const FSampleInput& Input, float* DensityOut) const;
 
+    /** The octave tables and constants the GPU evaluation (VoxelDensitySample.ush) needs to
+     *  compute this density. */
+    void BuildGPUData(FVoxelDensityGPUData& Out) const;
+
     double GetPlanetRadius() const { return PlanetRadius; }
     double GetNoiseAmplitude() const { return NoiseAmplitude; }
 
 private:
-    struct FLayer
+    /** One octave, fixed at construction; both backends read these. */
+    struct FOctave
     {
-        double BaseFrequency = 0.0;   // cycles per cm at octave 0
-        double Lacunarity = 2.0;
-        double Gain = 0.5;
-        int32 Octaves = 0;
+        double Frequency = 0.0;       // cycles per cm
+        FVector Offset;               // lattice offset (decorrelates octaves)
+        float Wavelength = 0.0f;      // cm, for the band weight
+        float Amplitude = 1.0f;       // gain^octave, accumulated in float
         uint32 Seed = 0;
-        double InvNorm = 0.0;         // output scale (see MakeLayer)
-        TArray<FVector> Offsets;      // per-octave lattice offset (decorrelates octaves)
     };
 
-    enum class ELayerKind : uint8 { Plain, Ridged, Damped };
+    struct FLayer
+    {
+        uint32 Kind = 0;              // VoxelLayerPlain / Ridged / Damped
+        double InvNorm = 0.0;         // output scale (see MakeLayer)
+        TArray<FOctave> Octaves;
+    };
 
-    static FLayer MakeLayer(ELayerKind Kind, double WavelengthFraction, double InPlanetRadius, double InLacunarity, double InGain, int32 InOctaves, uint32 InSeed);
-    double EvaluateLayer(const FLayer& Layer, ELayerKind Kind, const FVector& SurfacePoint, double Footprint) const;
+    static FLayer MakeLayer(uint32 Kind, double WavelengthFraction, double InPlanetRadius, double InLacunarity, double InGain, int32 InOctaves, uint32 InSeed);
+    double EvaluateLayer(const FLayer& Layer, const FVector& SurfacePoint, double Footprint) const;
     float SampleOne(const FVector& Position, double Footprint) const;
 
     FVoxelSurfaceSettings Settings;

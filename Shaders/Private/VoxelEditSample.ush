@@ -1,0 +1,55 @@
+// VoxelEditSample.ush - The edit delta at a lattice point, from the sparse edit tree
+// (FSparseEditStore::SampleTree) flattened for the GPU. Shared subset (VoxelShaderCompat.h).
+//
+// Inputs, declared by the includer:
+//   StructuredBuffer<float> EditCorners;    8 corner deltas per node
+//   StructuredBuffer<int> EditChildren;     8 child node indices per node, -1 for none
+//   StructuredBuffer<uint> EditFlags;       1 when the node holds edits
+//   uint EditNodeCount;                     0: no edits
+//   int EditRootExtent;                     root half-extent in half finest cells (2^MaxDepth)
+//
+// The tree is centred on the actor and its nodes are dyadic, so the walk runs in integer
+// lattice coordinates (half finest cells from the root centre).
+
+#ifndef VOXEL_EDIT_SAMPLE_USH
+#define VOXEL_EDIT_SAMPLE_USH
+
+VOXEL_FUNC float VoxelEditDelta(int X, int Y, int Z)
+{
+    if (EditNodeCount == 0u) return 0.0f;
+
+    int Node = 0;
+    int CX = 0;
+    int CY = 0;
+    int CZ = 0;
+    int E = EditRootExtent;
+    float Sum = 0.0f;
+    for (int Depth = 0; Depth < 40; Depth++)
+    {
+        if (EditFlags[uint(Node)] != 0u)
+        {
+            const float Size = float(2 * E);
+            const float TX = saturate(float(X - (CX - E)) / Size);
+            const float TY = saturate(float(Y - (CY - E)) / Size);
+            const float TZ = saturate(float(Z - (CZ - E)) / Size);
+            const uint Base = uint(Node) * 8u;
+            const float C00 = lerp(EditCorners[Base + 0u], EditCorners[Base + 1u], TX);
+            const float C01 = lerp(EditCorners[Base + 2u], EditCorners[Base + 3u], TX);
+            const float C10 = lerp(EditCorners[Base + 4u], EditCorners[Base + 5u], TX);
+            const float C11 = lerp(EditCorners[Base + 6u], EditCorners[Base + 7u], TX);
+            Sum += lerp(lerp(C00, C01, TY), lerp(C10, C11, TY), TZ);
+        }
+
+        const int Child = (X >= CX ? 1 : 0) | (Y >= CY ? 2 : 0) | (Z >= CZ ? 4 : 0);
+        const int Next = EditChildren[uint(Node) * 8u + uint(Child)];
+        if (Next < 0 || E < 2) break;
+        E = E / 2;
+        CX += (Child & 1) != 0 ? E : -E;
+        CY += (Child & 2) != 0 ? E : -E;
+        CZ += (Child & 4) != 0 ? E : -E;
+        Node = Next;
+    }
+    return Sum;
+}
+
+#endif // VOXEL_EDIT_SAMPLE_USH

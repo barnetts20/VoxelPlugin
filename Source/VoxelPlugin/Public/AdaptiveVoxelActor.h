@@ -270,6 +270,15 @@ public:
 
     USceneComponent* GetMeshAttachmentRoot() const { return MeshAttachmentRoot; }
 
+    /** The density this terrain samples (null before initialization). */
+    TSharedPtr<FDensitySampleCompositor> GetDensityCompositor() const { return DensityCompositor; }
+
+    /** The camera position last seen by Tick, in actor space without scale. */
+    FVector GetCameraPositionLocal() const { return CameraPosition; }
+
+    /** The brick terrain (exists once initialized; holds bricks while voxel.Render.Bricks is on). */
+    TSharedPtr<FVoxelBrickTerrain> GetBrickTerrain() const { return BrickTerrain; }
+
     /** Called by APlanetActor — uses the provided compositor (shared noise + edit store)
      *  instead of creating one. InScale sets the actor's scale (= planet radius) before
      *  initialization reads it. If InAttachParent is provided, MeshAttachmentRoot is

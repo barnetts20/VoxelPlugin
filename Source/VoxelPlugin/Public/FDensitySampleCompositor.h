@@ -9,6 +9,8 @@
 #include "Async/ParallelFor.h"
 #include "FSparseEditStore.h"
 
+class FVoxelDensityCPU;
+
 /** Non-owning view of a batch of world-space sample positions (double SoA, actor-local) and
  *  the footprint they will be meshed at. Callers own the backing storage. The footprint (cm,
  *  the cell size of the samples) lets the density leave out noise octaves too fine to show;
@@ -49,6 +51,11 @@ public:
     FDensitySampleCompositor(TSharedPtr<FSparseEditStore> InEditStore) : EditStore(InEditStore) {}
 
     TSharedPtr<FSparseEditStore> GetEditStore() { return EditStore; }
+
+    /** The CPU density this compositor was built on (VoxelDensity::MakeCompositor), for
+     *  consumers that evaluate the same field elsewhere (the GPU path); null otherwise. */
+    TSharedPtr<const FVoxelDensityCPU> GetBaseDensity() const { return BaseDensity; }
+    void SetBaseDensity(TSharedPtr<const FVoxelDensityCPU> InDensity) { BaseDensity = MoveTemp(InDensity); }
 
     /** Registers a density sample layer. Layers are evaluated in registration order
      *  and their outputs are summed. */
@@ -101,6 +108,7 @@ public:
 private:
     TArray<TFunction<void(const FSampleInput&, float*)>> SampleLayers;
     TSharedPtr<FSparseEditStore> EditStore;
+    TSharedPtr<const FVoxelDensityCPU> BaseDensity;
 
     /** Shared helper: additively applies edit-store deltas to an existing density buffer
      *  (one tree snapshot per batch; the store parallelizes large batches). */

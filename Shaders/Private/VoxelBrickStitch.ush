@@ -1,0 +1,303 @@
+// VoxelBrickStitch.ush - The stitched brick mesher's geometry rules (VoxelBrickMesher.cpp,
+// MeshBrickStitched) for the GPU: neighbour levels, the cell containing a probe, the minimal
+// edges on a cell's boundary, and the cell's QEF vertex. Shared subset (VoxelShaderCompat.h).
+//
+// Coordinates are integers in half-cells of the brick's level ("units") from its min corner:
+// the brick spans [0, 2N], its cells are 2 units, a finer neighbour's 1, a coarser one's 4.
+
+#ifndef VOXEL_BRICK_STITCH_USH
+#define VOXEL_BRICK_STITCH_USH
+
+#ifndef VOXEL_FUNC
+#define VOXEL_FUNC
+#endif
+
+#ifndef VOXEL_LOOP
+#define VOXEL_LOOP [loop]
+#endif
+
+static const float VoxelProbeOffset = 0.25f;   // units off an edge or face; stays in one leaf
+
+// Components by a runtime axis, without dynamic vector indexing (FXC can't write that).
+VOXEL_FUNC int VoxelAxis(int3 V, int Axis) { return Axis == 0 ? V.x : (Axis == 1 ? V.y : V.z); }
+VOXEL_FUNC int3 VoxelAddAxis(int3 V, int Axis, int X) { return int3(V.x + (Axis == 0 ? X : 0), V.y + (Axis == 1 ? X : 0), V.z + (Axis == 2 ? X : 0)); }
+VOXEL_FUNC int3 VoxelSetAxis(int3 V, int Axis, int X) { return int3(Axis == 0 ? X : V.x, Axis == 1 ? X : V.y, Axis == 2 ? X : V.z); }
+VOXEL_FUNC float3 VoxelAddAxisF(float3 V, int Axis, float X) { return float3(V.x + (Axis == 0 ? X : 0.0f), V.y + (Axis == 1 ? X : 0.0f), V.z + (Axis == 2 ? X : 0.0f)); }
+VOXEL_FUNC float3 VoxelSetAxisF(float3 V, int Axis, float X) { return float3(Axis == 0 ? X : V.x, Axis == 1 ? X : V.y, Axis == 2 ? X : V.z); }
+
+// The brick: N cells per axis; neighbour levels relative to it, (delta + 1) in 2 bits per
+// direction d = (dz+1)*9 + (dy+1)*3 + (dx+1), d < 16 in LevelsLo and the rest in LevelsHi;
+// bit d of Meshed set when the same-level brick in direction d is meshed.
+struct FVoxelStitchBrick
+{
+    int N;
+    uint LevelsLo;
+    uint LevelsHi;
+    uint Meshed;
+};
+
+struct FVoxelStitchCell
+{
+    int Level;   // relative: -1, 0 or +1
+    int3 Min;    // units
+    int Size;    // units
+};
+
+struct FVoxelStitchEdge
+{
+    bool Valid;
+    int3 Lo;
+    int Axis;
+    int Length;  // units
+};
+
+VOXEL_FUNC int VoxelStitchBlockOf(int X, int N)
+{
+    return X < 0 ? -1 : (X >= 2 * N ? 1 : 0);
+}
+
+VOXEL_FUNC int VoxelStitchDirection(int BX, int BY, int BZ)
+{
+    return (BZ + 1) * 9 + (BY + 1) * 3 + (BX + 1);
+}
+
+VOXEL_FUNC int VoxelStitchNeighbourLevel(FVoxelStitchBrick B, int D)
+{
+    if (D == 13) return 0;
+    const uint Bits = D < 16 ? (B.LevelsLo >> uint(2 * D)) : (B.LevelsHi >> uint(2 * (D - 16)));
+    return int(Bits & 3u) - 1;
+}
+
+// Level of the leaf owning lattice point (X,Y,Z); leaves are half-open boxes.
+VOXEL_FUNC int VoxelStitchOwnerLevel(FVoxelStitchBrick B, int X, int Y, int Z)
+{
+    return VoxelStitchNeighbourLevel(B, VoxelStitchDirection(VoxelStitchBlockOf(X, B.N), VoxelStitchBlockOf(Y, B.N), VoxelStitchBlockOf(Z, B.N)));
+}
+
+VOXEL_FUNC bool VoxelStitchIsMeshed(FVoxelStitchBrick B, int D)
+{
+    return D == 13 || ((B.Meshed >> uint(D)) & 1u) != 0u;
+}
+
+VOXEL_FUNC int VoxelFloorTo(int X, int Step)
+{
+    return (X >= 0 ? X / Step : -((-X + Step - 1) / Step)) * Step;
+}
+
+// Cell containing a point off the lattice (a probe).
+VOXEL_FUNC FVoxelStitchCell VoxelStitchCellAt(FVoxelStitchBrick B, float3 Probe)
+{
+    const int FX = int(floor(Probe.x));
+    const int FY = int(floor(Probe.y));
+    const int FZ = int(floor(Probe.z));
+    FVoxelStitchCell C;
+    C.Level = VoxelStitchOwnerLevel(B, FX, FY, FZ);
+    C.Size = int(1u << uint(C.Level + 1));
+    C.Min = int3(VoxelFloorTo(FX, C.Size), VoxelFloorTo(FY, C.Size), VoxelFloorTo(FZ, C.Size));
+    return C;
+}
+
+VOXEL_FUNC float3 VoxelToFloat3(int3 P)
+{
+    return float3(float(P.x), float(P.y), float(P.z));
+}
+
+// Edge Slot (0..47) of a cell, in the order MeshBrickStitched accumulates them:
+//   0..23: cell edge e = Slot / 2 (axis e / 4, in the octree mesher's corner order). Half 0 is
+//          the whole edge unless a finer cell touches it; then halves 0 and 1 are its halves.
+//   24..47: four half-edges across face (Slot - 24) / 4 (its two midlines), only when the cell
+//          across that face is finer.
+VOXEL_FUNC FVoxelStitchEdge VoxelStitchCellEdge(FVoxelStitchBrick B, FVoxelStitchCell C, int Slot)
+{
+    FVoxelStitchEdge E;
+    E.Valid = false;
+    E.Lo = C.Min;
+    E.Axis = 0;
+    E.Length = 0;
+    const int S = C.Size;
+    const int H = S / 2;
+
+    if (Slot < 24)
+    {
+        const int Axis = Slot / 8;
+        const int Corner = (Slot / 2) % 4;
+        const int Half = Slot % 2;
+        const int A = (Axis + 1) % 3;
+        const int AB = (Axis + 2) % 3;
+        const int3 Lo = VoxelAddAxis(VoxelAddAxis(C.Min, A, (Corner & 1) * S), AB, (Corner >> 1) * S);
+
+        bool bSplit = false;
+        VOXEL_LOOP
+        for (int q = 0; q < 4 && H >= 1; q++)
+        {
+            float3 Probe = VoxelAddAxisF(VoxelToFloat3(Lo), Axis, 0.5f * float(S));
+            Probe = VoxelAddAxisF(Probe, A, (q & 1) != 0 ? VoxelProbeOffset : -VoxelProbeOffset);
+            Probe = VoxelAddAxisF(Probe, AB, (q & 2) != 0 ? VoxelProbeOffset : -VoxelProbeOffset);
+            if (VoxelStitchCellAt(B, Probe).Level < C.Level) bSplit = true;
+        }
+        if (!bSplit && Half == 1) return E;
+
+        E.Valid = true;
+        E.Lo = Lo;
+        E.Axis = Axis;
+        E.Length = bSplit ? H : S;
+        if (bSplit) E.Lo = VoxelAddAxis(Lo, Axis, Half * H);
+        return E;
+    }
+
+    if (H < 1) return E;
+    const int Face = (Slot - 24) / 4;
+    const int K = (Slot - 24) % 4;
+    const int Normal = Face / 2;
+    const int Side = Face % 2;
+    float3 Probe = VoxelToFloat3(C.Min) + float3(0.5f * float(S), 0.5f * float(S), 0.5f * float(S));
+    Probe = VoxelSetAxisF(Probe, Normal, float(VoxelAxis(C.Min, Normal) + Side * S) + (Side != 0 ? VoxelProbeOffset : -VoxelProbeOffset));
+    if (VoxelStitchCellAt(B, Probe).Level >= C.Level) return E;
+
+    // The face's midlines along its two in-plane axes (lower axis first), each in two halves.
+    const int Along = K < 2 ? (Normal == 0 ? 1 : 0) : (Normal == 2 ? 1 : 2);
+    const int Across = 3 - Normal - Along;
+    const int3 Lo = VoxelAddAxis(VoxelAddAxis(VoxelAddAxis(C.Min, Normal, Side * S), Across, H), Along, (K % 2) * H);
+    E.Valid = true;
+    E.Lo = Lo;
+    E.Axis = Along;
+    E.Length = H;
+    return E;
+}
+
+// Quadratic error function in cell units, as FQEF.
+struct FVoxelQef
+{
+    float A00; float A01; float A02; float A11; float A12; float A22;
+    float BX; float BY; float BZ;
+    float BB;
+    int Count;
+    float3 Mass;
+    float3 NormalSum;
+};
+
+VOXEL_FUNC FVoxelQef VoxelQefBegin()
+{
+    FVoxelQef Q;
+    Q.A00 = 0.0f; Q.A01 = 0.0f; Q.A02 = 0.0f; Q.A11 = 0.0f; Q.A12 = 0.0f; Q.A22 = 0.0f;
+    Q.BX = 0.0f; Q.BY = 0.0f; Q.BZ = 0.0f;
+    Q.BB = 0.0f;
+    Q.Count = 0;
+    Q.Mass = float3(0.0f, 0.0f, 0.0f);
+    Q.NormalSum = float3(0.0f, 0.0f, 0.0f);
+    return Q;
+}
+
+VOXEL_FUNC FVoxelQef VoxelQefAdd(FVoxelQef Q, float3 P, float3 N)
+{
+    const float D = dot(N, P);
+    Q.A00 += N.x * N.x; Q.A01 += N.x * N.y; Q.A02 += N.x * N.z;
+    Q.A11 += N.y * N.y; Q.A12 += N.y * N.z; Q.A22 += N.z * N.z;
+    Q.BX += N.x * D; Q.BY += N.y * D; Q.BZ += N.z * D;
+    Q.BB += D * D;
+    Q.Mass = Q.Mass + P;
+    Q.NormalSum = Q.NormalSum + N;
+    Q.Count += 1;
+    return Q;
+}
+
+// FQEF::Solve(centre 0.5, extent 0.5) blended toward the mass point as BlendedVertex in
+// VoxelBrickMesher.cpp: the vertex in cell units, [0,1] per axis.
+VOXEL_FUNC float3 VoxelQefVertex(FVoxelQef Q)
+{
+    const float3 Avg = Q.Mass / float(Q.Count);
+    const float RX = Q.BX - (Q.A00 * Avg.x + Q.A01 * Avg.y + Q.A02 * Avg.z);
+    const float RY = Q.BY - (Q.A01 * Avg.x + Q.A11 * Avg.y + Q.A12 * Avg.z);
+    const float RZ = Q.BZ - (Q.A02 * Avg.x + Q.A12 * Avg.y + Q.A22 * Avg.z);
+
+    // Jacobi eigen-decomposition of ATA, as FQEF::SolveSVD.
+    float M[3][3];
+    M[0][0] = Q.A00; M[0][1] = Q.A01; M[0][2] = Q.A02;
+    M[1][0] = Q.A01; M[1][1] = Q.A11; M[1][2] = Q.A12;
+    M[2][0] = Q.A02; M[2][1] = Q.A12; M[2][2] = Q.A22;
+    float V[3][3];
+    V[0][0] = 1.0f; V[0][1] = 0.0f; V[0][2] = 0.0f;
+    V[1][0] = 0.0f; V[1][1] = 1.0f; V[1][2] = 0.0f;
+    V[2][0] = 0.0f; V[2][1] = 0.0f; V[2][2] = 1.0f;
+    VOXEL_LOOP
+    for (int Iter = 0; Iter < 20; Iter++)
+    {
+        int P = 0;
+        int R = 1;
+        float MaxValue = abs(M[0][1]);
+        if (abs(M[0][2]) > MaxValue) { P = 0; R = 2; MaxValue = abs(M[0][2]); }
+        if (abs(M[1][2]) > MaxValue) { P = 1; R = 2; MaxValue = abs(M[1][2]); }
+        if (MaxValue < 1.0e-12f) break;
+
+        const float Theta = 0.5f * atan2(2.0f * M[P][R], M[P][P] - M[R][R]);
+        const float Cs = cos(Theta);
+        const float Sn = sin(Theta);
+        const int T = 3 - P - R;
+        const float MPP = Cs * Cs * M[P][P] + 2.0f * Sn * Cs * M[P][R] + Sn * Sn * M[R][R];
+        const float MRR = Sn * Sn * M[P][P] - 2.0f * Sn * Cs * M[P][R] + Cs * Cs * M[R][R];
+        const float MPT = Cs * M[P][T] + Sn * M[R][T];
+        const float MRT = -Sn * M[P][T] + Cs * M[R][T];
+        M[P][P] = MPP;
+        M[R][R] = MRR;
+        M[P][R] = 0.0f; M[R][P] = 0.0f;
+        M[P][T] = MPT; M[T][P] = MPT;
+        M[R][T] = MRT; M[T][R] = MRT;
+        for (int i = 0; i < 3; i++)
+        {
+            const float VP = V[i][P];
+            const float VR = V[i][R];
+            V[i][P] = Cs * VP + Sn * VR;
+            V[i][R] = -Sn * VP + Cs * VR;
+        }
+    }
+    const float MaxEigen = max(max(abs(M[0][0]), abs(M[1][1])), abs(M[2][2]));
+    const float Threshold = MaxEigen * 0.1f;
+    float Scaled[3];
+    for (int k = 0; k < 3; k++)
+    {
+        const float Projected = V[0][k] * RX + V[1][k] * RY + V[2][k] * RZ;
+        Scaled[k] = abs(M[k][k]) > Threshold ? Projected / M[k][k] : 0.0f;
+    }
+    float3 Solved = Avg + float3(
+        V[0][0] * Scaled[0] + V[0][1] * Scaled[1] + V[0][2] * Scaled[2],
+        V[1][0] * Scaled[0] + V[1][1] * Scaled[1] + V[1][2] * Scaled[2],
+        V[2][0] * Scaled[0] + V[2][1] * Scaled[1] + V[2][2] * Scaled[2]);
+    Solved = float3(saturate(Solved.x), saturate(Solved.y), saturate(Solved.z));
+
+    // Residual, then the blend toward the mass point when the solution drifts or the planes
+    // disagree.
+    const float XAX = Solved.x * (Q.A00 * Solved.x + Q.A01 * Solved.y + Q.A02 * Solved.z)
+        + Solved.y * (Q.A01 * Solved.x + Q.A11 * Solved.y + Q.A12 * Solved.z)
+        + Solved.z * (Q.A02 * Solved.x + Q.A12 * Solved.y + Q.A22 * Solved.z);
+    const float Error = XAX - 2.0f * (Solved.x * Q.BX + Solved.y * Q.BY + Solved.z * Q.BZ) + Q.BB;
+
+    const float MaxDistSq = 0.25f;
+    const float3 ToMass = Solved - Avg;
+    const float DistSq = dot(ToMass, ToMass);
+    float TDist = 0.0f;
+    if (DistSq > MaxDistSq)
+        TDist = 1.0f;
+    else if (DistSq > MaxDistSq * 0.25f)
+    {
+        TDist = (DistSq - MaxDistSq * 0.25f) / (MaxDistSq * 0.75f);
+        TDist = TDist * TDist * (3.0f - 2.0f * TDist);
+    }
+    float TError = saturate(Error / MaxDistSq);
+    TError = TError * TError * (3.0f - 2.0f * TError);
+    const float Blend = max(TDist, TError);
+    const float3 Local = Solved + (Avg - Solved) * Blend;
+    return float3(saturate(Local.x), saturate(Local.y), saturate(Local.z));
+}
+
+// One brick of the batch (32 bytes; matches FVoxelMesherBrickGPU).
+struct FVoxelMesherBrick
+{
+    int3 MinIndex;   // lattice index of the min corner, half finest cells from the root centre
+    int Level;
+    uint LevelsLo;
+    uint LevelsHi;
+    uint Meshed;
+    uint Pad;
+};
+
+#endif // VOXEL_BRICK_STITCH_USH

@@ -95,6 +95,12 @@ public:
     /** Publishes an empty tree and clears the log. */
     void Clear();
 
+    /** The current published tree (immutable; null when empty), for copies elsewhere such
+     *  as the GPU's flattened tree. */
+    TSharedPtr<const FSparseEditNode> GetRootSnapshot() const { return PinRoot(); }
+    FVector GetCenter() const { return Center; }
+    double GetExtent() const { return Extent; }
+
 private:
     /** Root of the published tree. Read and replaced under RootCS; the tree behind it is
      *  immutable. */

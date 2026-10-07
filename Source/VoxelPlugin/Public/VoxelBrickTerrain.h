@@ -79,6 +79,14 @@ public:
 
     int32 NumBricks() const { return Bricks.Num(); }
 
+    /** Game thread. Bricks of the latest tree and their signatures (neighbour levels, see
+     *  RunTask), and the settings they were built with. */
+    const TMap<FVoxelBrickKey, uint64>& GetWantedSignatures() const { return Wanted; }
+    const FVoxelBrickTerrainSettings& GetSettings() const { return Settings; }
+
+    /** Game thread. True if the brick holds a mesh with surface (a component). */
+    bool HoldsSurface(const FVoxelBrickKey& Key) const;
+
 private:
     struct FBrick
     {
@@ -98,6 +106,7 @@ private:
         bool bApplied = false;        // a mesh (or, empty, nothing) has been applied
         bool bHasSection = false;
         bool bDirty = false;
+        bool bProvenEmpty = false;    // the newest mesh is empty by the empty test
     };
 
     struct FBuilt
@@ -106,6 +115,7 @@ private:
         TSharedPtr<FMeshStreamData> Stream;   // null when the brick holds no surface
         uint64 Signature = 0;
         TArray<FVoxelBrickKey> Neighbours;    // wanted bricks touching it
+        bool bProvenEmpty = false;            // the empty test skipped it
     };
 
     struct FTaskInput
@@ -114,6 +124,7 @@ private:
         FVector Camera = FVector::ZeroVector;
         TMap<FVoxelBrickKey, uint64> Known;   // held bricks and the signature of their newest mesh
         TArray<FVoxelBrickKey> Rebuild;
+        TSet<FVoxelBrickKey> ProvenEmpty;     // held bricks whose newest mesh the empty test skipped
         int32 SeamMode = 0;
         TSharedPtr<FDensitySampleCompositor> Density;
         FVoxelBrickTerrainSettings Settings;
@@ -125,8 +136,12 @@ private:
         uint32 StartSequence = 0;
         TMap<FVoxelBrickKey, uint64> Wanted;   // and their signatures
         TArray<FBuilt> Built;
+        FVector Camera = FVector::ZeroVector;
+        int32 SeamMode = 0;
+        bool bComplete = false;               // every wanted brick has a mesh for its signature
         int32 BalanceSplits = 0;
         int32 NumRestitched = 0;
+        int32 NumRestitchedEmpty = 0;
         int64 Samples = 0;
         double Milliseconds = 0.0;
     };
@@ -166,6 +181,11 @@ private:
     uint32 Generation = 0;
     bool bHasWanted = false;      // a task result has set Wanted since the last Reset
     double LastLaunchTime = 0.0;
+    /** The latest result left nothing to do for its camera; no new task runs until the
+     *  camera moves, an edit arrives or the seam mode changes. */
+    bool bLastComplete = false;
+    FVector LastTaskCamera = FVector::ZeroVector;
+    int32 LastSeamMode = -1;
 
     std::atomic<bool> bTaskRunning{ false };
     FCriticalSection ResultCS;

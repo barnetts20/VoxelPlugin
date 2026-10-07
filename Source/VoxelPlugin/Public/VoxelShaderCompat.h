@@ -4,21 +4,37 @@
 // Include this, then the .ush, inside namespace VoxelShader (see VoxelDensity.cpp): the
 // names below (float3, dot, lerp, ...) stay out of the global namespace.
 //
-// Subset rules for shared code: scalar/float3/uint3 only; members .x/.y/.z (no swizzles);
-// no out/inout parameters (return structs); 32-bit uint arithmetic (wraps on both sides);
-// float literals with the f suffix.
+// Subset rules for shared code: scalar/float2/float3/int3/uint3 only; members .x/.y/.z or
+// [axis] (no swizzles); no out/inout parameters in shared functions (return structs; the
+// Interlocked* intrinsics are the exception); 32-bit int/uint arithmetic (wraps on both
+// sides); float literals with the f suffix; VOXEL_PRECISE on every float operation whose exact
+// rounding matters (double-float arithmetic). Compile the C++ side without fused
+// multiply-add contraction (MSVC /fp:precise, the UE default).
 
 #pragma once
 
+#include <atomic>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 
 // Shared functions are plain inline functions in C++ (HLSL inlines everything anyway).
 #define VOXEL_FUNC inline
+// HLSL's precise (no reassociation, no fusing); plain float operations in C++.
+#define VOXEL_PRECISE
+// HLSL's [loop] (don't unroll); nothing in C++.
+#define VOXEL_LOOP
 
 namespace VoxelShader
 {
     typedef uint32_t uint;
+
+    struct float2
+    {
+        float x, y;
+        float2() : x(0.f), y(0.f) {}
+        float2(float InX, float InY) : x(InX), y(InY) {}
+    };
 
     struct float3
     {
@@ -26,6 +42,8 @@ namespace VoxelShader
         float3() : x(0.f), y(0.f), z(0.f) {}
         explicit float3(float s) : x(s), y(s), z(s) {}
         float3(float InX, float InY, float InZ) : x(InX), y(InY), z(InZ) {}
+        float& operator[](int i) { return i == 0 ? x : (i == 1 ? y : z); }
+        float operator[](int i) const { return i == 0 ? x : (i == 1 ? y : z); }
     };
 
     inline float3 operator+(float3 a, float3 b) { return float3(a.x + b.x, a.y + b.y, a.z + b.z); }
@@ -50,7 +68,52 @@ namespace VoxelShader
 
     inline uint3 operator+(uint3 a, uint3 b) { return uint3(a.x + b.x, a.y + b.y, a.z + b.z); }
 
+    struct int3
+    {
+        int x, y, z;
+        int3() : x(0), y(0), z(0) {}
+        int3(int InX, int InY, int InZ) : x(InX), y(InY), z(InZ) {}
+        int& operator[](int i) { return i == 0 ? x : (i == 1 ? y : z); }
+        int operator[](int i) const { return i == 0 ? x : (i == 1 ? y : z); }
+    };
+
+    inline int3 operator+(int3 a, int3 b) { return int3(a.x + b.x, a.y + b.y, a.z + b.z); }
+    inline int3 operator-(int3 a, int3 b) { return int3(a.x - b.x, a.y - b.y, a.z - b.z); }
+
+    inline float floor(float a) { return std::floor(a); }
+    inline uint asuint(int a) { return (uint)a; }
+    inline uint asuint(float a) { uint u; std::memcpy(&u, &a, 4); return u; }
+    inline float asfloat(uint a) { float f; std::memcpy(&f, &a, 4); return f; }
+    inline float ldexp(float a, int e) { return std::ldexp(a, e); }
+    inline float atan2(float y, float x) { return std::atan2(y, x); }
+    inline float cos(float a) { return std::cos(a); }
+    inline float sin(float a) { return std::sin(a); }
+    inline int min(int a, int b) { return a < b ? a : b; }
+    inline int max(int a, int b) { return a > b ? a : b; }
+    inline uint min(uint a, uint b) { return a < b ? a : b; }
+
+#if defined(__cpp_lib_atomic_ref)
+    // Atomics on buffer elements (uint lvalues), with HLSL's signatures (C++ tests of the
+    // GPU passes).
+    inline void InterlockedAdd(uint& Dest, uint Value, uint& Original)
+    {
+        Original = std::atomic_ref<uint>(Dest).fetch_add(Value);
+    }
+    inline void InterlockedCompareExchange(uint& Dest, uint Compare, uint Value, uint& Original)
+    {
+        uint Expected = Compare;
+        std::atomic_ref<uint>(Dest).compare_exchange_strong(Expected, Value);
+        Original = Expected;
+    }
+    inline void InterlockedOr(uint& Dest, uint Value)
+    {
+        std::atomic_ref<uint>(Dest).fetch_or(Value);
+    }
+#endif
+
     inline float dot(float3 a, float3 b) { return a.x * b.x + a.y * b.y + a.z * b.z; }
+    inline float length(float3 a) { return std::sqrt(dot(a, a)); }
+    inline float3 cross(float3 a, float3 b) { return float3(a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x); }
     inline float abs(float a) { return std::fabs(a); }
     inline float sqrt(float a) { return std::sqrt(a); }
     inline float min(float a, float b) { return a < b ? a : b; }

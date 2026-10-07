@@ -369,6 +369,7 @@ void FVoxelBrickTerrain::Reset()
     RecentEdits.Reset();
     Generation++;
     LastLaunchTime = 0.0;
+    bLastComplete = false;
     FScopeLock Lock(&ResultCS);
     Results.Reset();
 }
@@ -412,12 +413,23 @@ void FVoxelBrickTerrain::Tick(const FVector& Camera)
     // A task that finished since the drain above must be in Known before the next starts.
     DrainResults();
 
+    // Nothing to do: the latest result is complete for (about) this camera and nothing changed.
+    const int32 SeamMode = FMath::Clamp(CVarVoxelBrickSeams.GetValueOnGameThread(), 0, 2);
+    if (bLastComplete && SeamMode == LastSeamMode && RecentEdits.Num() == 0
+        && FVector::Dist(Camera, LastTaskCamera) < Settings.FinestCell * Settings.CellsPerBrick / 16.0)
+    {
+        bool bAnyDirty = false;
+        for (const TPair<FVoxelBrickKey, FBrick>& Pair : Bricks)
+            bAnyDirty |= Pair.Value.bDirty;
+        if (!bAnyDirty) return;
+    }
+
     FTaskInput Input;
     Input.Generation = Generation;
     Input.Camera = Camera;
     Input.Density = Density;
     Input.Settings = Settings;
-    Input.SeamMode = FMath::Clamp(CVarVoxelBrickSeams.GetValueOnGameThread(), 0, 2);
+    Input.SeamMode = SeamMode;
     Input.Known.Reserve(Bricks.Num());
     for (TPair<FVoxelBrickKey, FBrick>& Pair : Bricks)
     {
@@ -426,6 +438,8 @@ void FVoxelBrickTerrain::Tick(const FVector& Camera)
         Input.Known.Add(Pair.Key, Pair.Value.bHasPending ? Pair.Value.PendingSignature : Pair.Value.Signature);
         if (Pair.Value.bDirty && Wanted.Contains(Pair.Key))
             Input.Rebuild.Add(Pair.Key);
+        if (Pair.Value.bProvenEmpty)
+            Input.ProvenEmpty.Add(Pair.Key);
     }
 
     bTaskRunning.store(true, std::memory_order_release);
@@ -522,6 +536,7 @@ void FVoxelBrickTerrain::RunTask(const TSharedRef<FVoxelBrickTerrain>& Self, FTa
                     Built.Key = Entry.Key;
                     Built.Signature = Entry.Signature;
                     Built.Stream = VBT::BuildRenderStream(Mesh, Grid.BrickMin(Entry.Key.Coord), Entry.Key.Level, (float)Input.Settings.TriplanarUVScale);
+                    Built.bProvenEmpty = Stats.bSkipped;
                     Tree.TouchingWanted(Entry.Key, Built.Neighbours);
                     Samples.fetch_add(Stats.Samples, std::memory_order_relaxed);
                 });
@@ -531,8 +546,33 @@ void FVoxelBrickTerrain::RunTask(const TSharedRef<FVoxelBrickTerrain>& Self, FTa
     // Edit rebuilds always finish. New bricks are meshed nearest first while the budget lasts;
     // those left over are found again next task.
     MeshAll(Rebuilds, 0, Rebuilds.Num());
+    int32 NewMeshed = 0;
     for (int32 Start = 0; Start < NewBricks.Num() && Samples.load() < VBT::MaxSamplesPerTask; Start += VBT::MeshBatch)
-        MeshAll(NewBricks, Start, FMath::Min(VBT::MeshBatch, NewBricks.Num() - Start));
+    {
+        const int32 Count = FMath::Min(VBT::MeshBatch, NewBricks.Num() - Start);
+        MeshAll(NewBricks, Start, Count);
+        NewMeshed += Count;
+    }
+
+    // The empty test reads neither the neighbour levels nor the meshed mask, so a brick it
+    // skipped would be skipped again: it takes the new signature without meshing. A seam
+    // mode change switches mesher, so those bricks are meshed again.
+    TArray<FToMesh> Remesh;
+    for (const FToMesh& Entry : Restitches)
+    {
+        const uint64 SeamBits = 3ULL << 56;
+        if (!Input.ProvenEmpty.Contains(Entry.Key) || ((Input.Known[Entry.Key] ^ Entry.Signature) & SeamBits) != 0)
+        {
+            Remesh.Add(Entry);
+            continue;
+        }
+        FBuilt& Built = Result.Built.AddDefaulted_GetRef();
+        Built.Key = Entry.Key;
+        Built.Signature = Entry.Signature;
+        Built.bProvenEmpty = true;
+        Tree.TouchingWanted(Entry.Key, Built.Neighbours);
+        Result.NumRestitchedEmpty++;
+    }
 
     // Held bricks whose neighbours changed are restitched once every brick touching them is
     // held or built, so the restitched mesh never waits long on screen for its neighbours.
@@ -541,7 +581,7 @@ void FVoxelBrickTerrain::RunTask(const TSharedRef<FVoxelBrickTerrain>& Self, FTa
         Available.Add(Built.Key);
     TArray<FToMesh> Ready;
     TArray<FVoxelBrickKey> Touching;
-    for (const FToMesh& Entry : Restitches)
+    for (const FToMesh& Entry : Remesh)
     {
         Touching.Reset();
         Tree.TouchingWanted(Entry.Key, Touching);
@@ -554,6 +594,9 @@ void FVoxelBrickTerrain::RunTask(const TSharedRef<FVoxelBrickTerrain>& Self, FTa
     Result.NumRestitched = Ready.Num();
     for (int32 Start = 0; Start < Ready.Num(); Start += VBT::MeshBatch)
         MeshAll(Ready, Start, FMath::Min(VBT::MeshBatch, Ready.Num() - Start));
+    Result.Camera = Input.Camera;
+    Result.SeamMode = Input.SeamMode;
+    Result.bComplete = NewMeshed == NewBricks.Num() && Ready.Num() == Remesh.Num();
 
     Result.Samples = Tree.Samples + Samples.load();
     Result.Milliseconds = (FPlatformTime::Seconds() - T0) * 1000.0;
@@ -580,6 +623,9 @@ void FVoxelBrickTerrain::DrainResults()
 
         Wanted = MoveTemp(Result.Wanted);
         bHasWanted = true;
+        bLastComplete = Result.bComplete;
+        LastTaskCamera = Result.Camera;
+        LastSeamMode = Result.SeamMode;
 
         int32 NumWithSurface = 0;
         for (FBuilt& Built : Result.Built)
@@ -587,6 +633,7 @@ void FVoxelBrickTerrain::DrainResults()
             FBrick& Brick = Bricks.FindOrAdd(Built.Key);
             Brick.Pending = MoveTemp(Built.Stream);
             Brick.PendingSignature = Built.Signature;
+            Brick.bProvenEmpty = Built.bProvenEmpty;
             NumWithSurface += Brick.Pending.IsValid() ? 1 : 0;
 
             // A mesh stitched to other neighbours than the one on screen waits until its new
@@ -614,8 +661,9 @@ void FVoxelBrickTerrain::DrainResults()
 
         if (CVarVoxelDebugBricks.GetValueOnGameThread() > 0)
         {
-            UE_LOG(LogTemp, Log, TEXT("[VoxelBricks] %d wanted (%d balance splits), %d meshed (%d with surface, %d restitched), %lld samples, %.1f ms, %d bricks held"),
-                Result.Wanted.Num(), Result.BalanceSplits, Result.Built.Num(), NumWithSurface, Result.NumRestitched, Result.Samples, Result.Milliseconds, Bricks.Num());
+            UE_LOG(LogTemp, Log, TEXT("[VoxelBricks] %d wanted (%d balance splits), %d meshed (%d with surface, %d restitched, %d empty bricks restitched without meshing), %lld samples, %.1f ms, %d bricks held%s"),
+                Wanted.Num(), Result.BalanceSplits, Result.Built.Num() - Result.NumRestitchedEmpty, NumWithSurface, Result.NumRestitched, Result.NumRestitchedEmpty,
+                Result.Samples, Result.Milliseconds, Bricks.Num(), Result.bComplete ? TEXT(", complete") : TEXT(""));
         }
     }
 }
@@ -708,6 +756,12 @@ bool FVoxelBrickTerrain::IsOnScreen(const FVoxelBrickKey& Key) const
     if (!Brick->Component.IsValid()) return true;   // applied empty: nothing to show
     const uint64 Frame = Brick->ShownFrame.IsValid() ? Brick->ShownFrame->load(std::memory_order_acquire) : 0;
     return Frame != 0 && GFrameCounter >= Frame;
+}
+
+bool FVoxelBrickTerrain::HoldsSurface(const FVoxelBrickKey& Key) const
+{
+    const FBrick* Brick = Bricks.Find(Key);
+    return Brick && Brick->Component.IsValid();
 }
 
 bool FVoxelBrickTerrain::IsSettled(const FVoxelBrickKey& Key) const

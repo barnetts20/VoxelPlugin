@@ -1,0 +1,91 @@
+// VoxelDensitySample.ush - The planet density at a lattice point, in double-float precision:
+// what FVoxelDensityCPU::Sample computes in double, for the GPU. Shared subset (see
+// VoxelShaderCompat.h), so the C++ tests run it against the CPU backend.
+//
+// Include after VoxelDensityCore.ush and VoxelDF64.ush, and after declaring the inputs
+// below (shader parameters on the GPU, globals in the C++ tests). Octave tables and every
+// constant come from FVoxelDensityCPU::BuildGPUData, so both backends evaluate the same
+// octaves with the same seeds, offsets, amplitudes and band limits.
+//
+//   StructuredBuffer<FVoxelOctave> Octaves;      continent, mountain, then detail octaves
+//   uint ContinentOctaves, MountainOctaves, DetailOctaves;
+//   float2 InvNormContinent, InvNormMountain, InvNormDetail;   (double-float)
+//   float2 PlanetRadius, NoiseAmplitude, HalfFinest;
+//   float2 ContinentWeight, MountainWeight, MountainStart, MountainBlend, DetailWeight;
+//   float RidgeGain, SlopeDamping;
+
+#ifndef VOXEL_DENSITY_SAMPLE_USH
+#define VOXEL_DENSITY_SAMPLE_USH
+
+// Sum of one layer's octaves, before normalisation. SP is the point on the planet sphere.
+VOXEL_FUNC float2 VoxelLayerSumDF(uint First, uint Count, uint Kind, float2 SPX, float2 SPY, float2 SPZ, float Footprint)
+{
+    FVoxelFbmState State = VoxelFbmBegin();
+    float2 Sum = float2(0.0f, 0.0f);
+    for (uint o = 0u; o < Count; o++)
+    {
+        const FVoxelOctave Oct = Octaves[First + o];
+        const float Band = VoxelOctaveBandWeight(Oct.Wavelength, Footprint);
+        if (Band <= 0.0f) break;
+
+        const FVoxelLatticeSplit LX = VoxelDFLatticeSplit(VoxelDFAdd(VoxelDFMul(SPX, Oct.Frequency), Oct.OffsetX));
+        const FVoxelLatticeSplit LY = VoxelDFLatticeSplit(VoxelDFAdd(VoxelDFMul(SPY, Oct.Frequency), Oct.OffsetY));
+        const FVoxelLatticeSplit LZ = VoxelDFLatticeSplit(VoxelDFAdd(VoxelDFMul(SPZ, Oct.Frequency), Oct.OffsetZ));
+        const FVoxelNoiseSample N = VoxelGradientNoise(uint3(asuint(LX.Cell), asuint(LY.Cell), asuint(LZ.Cell)),
+            float3(LX.Frac, LY.Frac, LZ.Frac), Oct.Seed);
+
+        // Each octave's contribution is taken from a zeroed float sum and added in
+        // double-float, as the CPU adds them in double.
+        State.Sum = 0.0f;
+        State = VoxelLayerOctave(State, Kind, N, Oct.Amplitude * Band, RidgeGain, SlopeDamping);
+        Sum = VoxelDFAdd(Sum, float2(State.Sum, 0.0f));
+    }
+    return Sum;
+}
+
+// Density (negative = solid, cm) at lattice point Index (half finest cells from the root
+// centre), with octaves finer than Footprint (cm) left out. Edits are not included.
+VOXEL_FUNC float VoxelSampleDensityDF(int IndexX, int IndexY, int IndexZ, float Footprint)
+{
+    const float2 PX = VoxelDFMul(VoxelDFFromInt(IndexX), HalfFinest);
+    const float2 PY = VoxelDFMul(VoxelDFFromInt(IndexY), HalfFinest);
+    const float2 PZ = VoxelDFMul(VoxelDFFromInt(IndexZ), HalfFinest);
+    const float2 Radius = VoxelDFSqrt(VoxelDFAdd(VoxelDFAdd(VoxelDFMul(PX, PX), VoxelDFMul(PY, PY)), VoxelDFMul(PZ, PZ)));
+
+    float2 Height = float2(0.0f, 0.0f);
+    if (Radius.x > 1.0e-6f && NoiseAmplitude.x > 0.0f)
+    {
+        const float2 Scale = VoxelDFDiv(PlanetRadius, Radius);
+        const float2 SPX = VoxelDFMul(PX, Scale);
+        const float2 SPY = VoxelDFMul(PY, Scale);
+        const float2 SPZ = VoxelDFMul(PZ, Scale);
+
+        const float2 C = VoxelDFMul(VoxelLayerSumDF(0u, ContinentOctaves, VoxelLayerPlain, SPX, SPY, SPZ, Footprint), InvNormContinent);
+        const float2 R = VoxelDFMul(VoxelLayerSumDF(ContinentOctaves, MountainOctaves, VoxelLayerRidged, SPX, SPY, SPZ, Footprint), InvNormMountain);
+        const float2 D = VoxelDFMul(VoxelLayerSumDF(ContinentOctaves + MountainOctaves, DetailOctaves, VoxelLayerDamped, SPX, SPY, SPZ, Footprint), InvNormDetail);
+
+        // FVoxelDensityCPU::HeightAt.
+        const float2 Base = VoxelDFAdd(float2(0.5f, 0.0f), VoxelDFMulFloat(VoxelDFMul(ContinentWeight, C), 0.5f));
+        const float2 T = VoxelDFClamp01(VoxelDFDiv(VoxelDFSub(C, MountainStart), MountainBlend));
+        const float2 Mask = VoxelDFMul(VoxelDFMul(T, T), VoxelDFSub(float2(3.0f, 0.0f), VoxelDFMulFloat(T, 2.0f)));
+        const float2 Mountains = VoxelDFMul(VoxelDFMul(MountainWeight, Mask), R);
+        const float2 Details = VoxelDFMul(DetailWeight, D);
+        Height = VoxelDFMul(NoiseAmplitude, VoxelDFClamp01(VoxelDFAdd(VoxelDFAdd(Base, Mountains), Details)));
+    }
+
+    const float2 Surface = VoxelDFSub(Radius, VoxelDFAdd(PlanetRadius, Height));
+    return VoxelComposeTerrain(Surface.x + Surface.y, VoxelCaveDensity());
+}
+
+// |p| - R at lattice point Index, no noise: checks the double-float position path alone.
+VOXEL_FUNC float VoxelRadialDF(int IndexX, int IndexY, int IndexZ)
+{
+    const float2 PX = VoxelDFMul(VoxelDFFromInt(IndexX), HalfFinest);
+    const float2 PY = VoxelDFMul(VoxelDFFromInt(IndexY), HalfFinest);
+    const float2 PZ = VoxelDFMul(VoxelDFFromInt(IndexZ), HalfFinest);
+    const float2 Radius = VoxelDFSqrt(VoxelDFAdd(VoxelDFAdd(VoxelDFMul(PX, PX), VoxelDFMul(PY, PY)), VoxelDFMul(PZ, PZ)));
+    const float2 Height = VoxelDFSub(Radius, PlanetRadius);
+    return Height.x + Height.y;
+}
+
+#endif // VOXEL_DENSITY_SAMPLE_USH

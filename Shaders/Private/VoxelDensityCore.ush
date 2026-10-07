@@ -26,17 +26,18 @@ struct FVoxelFbmState
     float RidgeWeight;   // ridged multifractal feedback
 };
 
-// Surface-shape constants (filled from FVoxelSurfaceSettings).
-struct FVoxelSurfaceParams
+// One octave of a layer, as FVoxelDensityCPU::BuildGPUData uploads it (48 bytes; matches
+// FVoxelDensityGPUOctave). Double values are double-float pairs (see VoxelDF64.ush).
+struct FVoxelOctave
 {
-    float ContinentWeight;
-    float MountainWeight;
-    float MountainStart;
-    float MountainBlend;
-    float RidgeOffset;
-    float RidgeGain;
-    float DetailWeight;
-    float DetailSlopeDamping;
+    float2 Frequency;    // cycles per cm
+    float2 OffsetX;      // lattice offset (decorrelates octaves)
+    float2 OffsetY;
+    float2 OffsetZ;
+    float Wavelength;    // cm, for the band weight
+    float Amplitude;     // gain^octave
+    uint Seed;
+    uint Pad;
 };
 
 // 32-bit hash of a lattice cell (lowbias32 finalizer).
@@ -162,16 +163,17 @@ VOXEL_FUNC FVoxelFbmState VoxelFbmAddRidged(FVoxelFbmState S, FVoxelNoiseSample 
     return S;
 }
 
-// Surface height as a fraction [0, 1] of the noise amplitude, from the normalised layer sums:
-// Continent and Detail in about [-1, 1], Ridge in about [0, 1]. Continent 0 sits at half the
-// amplitude. (The CPU backend composes the same formula in double: FVoxelDensityCPU::HeightAt.)
-VOXEL_FUNC float VoxelSurfaceHeight01(float Continent, float Ridge, float Detail, FVoxelSurfaceParams P)
+// Layer kinds (the fBm step each octave of a layer takes).
+static const uint VoxelLayerPlain = 0u;
+static const uint VoxelLayerRidged = 1u;
+static const uint VoxelLayerDamped = 2u;
+
+// One octave of a layer of the given kind. Ridged layers use a ridge offset of 1.
+VOXEL_FUNC FVoxelFbmState VoxelLayerOctave(FVoxelFbmState S, uint Kind, FVoxelNoiseSample N, float Amplitude, float RidgeGain, float SlopeDamping)
 {
-    const float Base = 0.5f + 0.5f * P.ContinentWeight * Continent;
-    const float MountainMask = smoothstep(P.MountainStart, P.MountainStart + P.MountainBlend, Continent);
-    const float Mountains = P.MountainWeight * MountainMask * Ridge;
-    const float Details = P.DetailWeight * Detail;
-    return saturate(Base + Mountains + Details);
+    if (Kind == VoxelLayerRidged) return VoxelFbmAddRidged(S, N, Amplitude, 1.0f, RidgeGain);
+    if (Kind == VoxelLayerDamped) return VoxelFbmAddDamped(S, N, Amplitude, SlopeDamping);
+    return VoxelFbmAdd(S, N, Amplitude);
 }
 
 // Signed distance-like value of the cave layer: negative inside a cave. Placeholder until the
