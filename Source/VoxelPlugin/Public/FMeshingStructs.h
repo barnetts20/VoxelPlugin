@@ -290,10 +290,11 @@ struct VOXELPLUGIN_API FMeshChunk : public TSharedFromThis<FMeshChunk> {
      *  starts empty, so the new component draws nothing until ApplyStream swaps a stream
      *  in. Game thread. */
     void InitializeComponent(ARealtimeMeshActor* InParentActor, USceneComponent* InAttachRoot, UMaterialInterface* InSurfaceMaterial, const FRealtimeMeshBufferSetKey& InGroupKey) {
-        ChunkRtMesh = NewObject<URealtimeMeshSimple>(InParentActor);
+        // Transient: built at run time, never saved with the level or copied into PIE.
+        ChunkRtMesh = NewObject<URealtimeMeshSimple>(InParentActor, NAME_None, RF_Transient);
         ChunkRtMesh->SetupMaterialSlot(0, "Surface Material");
 
-        ChunkRtComponent = NewObject<URealtimeMeshComponent>(InParentActor, URealtimeMeshComponent::StaticClass());
+        ChunkRtComponent = NewObject<URealtimeMeshComponent>(InParentActor, URealtimeMeshComponent::StaticClass(), NAME_None, RF_Transient);
         // Real geometry: rendered by the main camera only, excluded from the virtual
         // backdrop SceneCapture. Set before RegisterComponent so it's baked into the
         // scene proxy at creation.

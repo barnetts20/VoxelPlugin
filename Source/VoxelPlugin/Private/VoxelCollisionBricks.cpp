@@ -8,6 +8,7 @@
 #include "Engine/World.h"
 #include "GameFramework/Actor.h"
 #include "HAL/IConsoleManager.h"
+#include "Components/PrimitiveComponent.h"
 
 static TAutoConsoleVariable<int32> CVarVoxelDebugCollision(
     TEXT("voxel.Debug.Collision"), 0,
@@ -23,6 +24,16 @@ namespace
     constexpr int32 MeshBatch = 32;                 // bricks meshed per parallel batch
 
     const FName CollisionGroupName(TEXT("COLLISION"));
+
+    FRealtimeMeshCollisionConfiguration MakeCollisionConfig()
+    {
+        FRealtimeMeshCollisionConfiguration Config;
+        Config.bUseComplexAsSimpleCollision = true;
+        Config.bUseAsyncCook = true;
+        Config.bShouldFastCookMeshes = false;
+        Config.bDeformableMesh = false;
+        return Config;
+    }
 
     double BoxDistanceSquared(const FBox& Box, const FVector& P)
     {
@@ -439,6 +450,27 @@ void FVoxelCollisionBricks::ApplyQueued()
             Mesh->UpdateSectionConfig(Data->MeshSectionKey, FRealtimeMeshSectionConfig(0), true);
             Brick->bHasSection = true;
         }
+
+        // The stream update re-cooks the section's collision; SetCollisionConfig joins that
+        // cook and returns its future, so the brick shows as waiting until the new body is in.
+        if (!Brick->CooksInFlight.IsValid())
+            Brick->CooksInFlight = MakeShared<std::atomic<int32>>(0);
+        if (!Brick->LastCookResult.IsValid())
+            Brick->LastCookResult = MakeShared<std::atomic<int32>>(-1);
+        Brick->CooksInFlight->fetch_add(1);
+        Brick->NumApplies++;
+        const TSharedPtr<std::atomic<int32>> InFlight = Brick->CooksInFlight;
+        const TSharedPtr<std::atomic<int32>> LastResult = Brick->LastCookResult;
+        const bool bDebug = CVarVoxelDebugCollision.GetValueOnGameThread() > 0;
+        const FInt64Vector BrickCoord = Coord;
+        Mesh->SetCollisionConfig(MakeCollisionConfig()).Next([InFlight, LastResult, bDebug, BrickCoord](ERealtimeMeshCollisionUpdateResult Result)
+            {
+                InFlight->fetch_sub(1);
+                LastResult->store((int32)Result);
+                if (bDebug && Result != ERealtimeMeshCollisionUpdateResult::Updated && Result != ERealtimeMeshCollisionUpdateResult::Ignored)
+                    UE_LOG(LogTemp, Warning, TEXT("[VoxelCollision] Cook of brick (%lld, %lld, %lld) failed (result %d)"),
+                        BrickCoord.X, BrickCoord.Y, BrickCoord.Z, (int32)Result);
+            });
     }
     ApplyQueue.SetNum(Kept);
 }
@@ -449,16 +481,12 @@ bool FVoxelCollisionBricks::EnsureComponent(const FInt64Vector& Coord, FBrick& B
     USceneComponent* Root = AttachRoot.Get();
     if (!OwnerActor || !Root) return false;
 
-    URealtimeMeshSimple* Mesh = NewObject<URealtimeMeshSimple>(OwnerActor);
-    FRealtimeMeshCollisionConfiguration Config;
-    Config.bUseComplexAsSimpleCollision = true;
-    Config.bUseAsyncCook = true;
-    Config.bShouldFastCookMeshes = false;
-    Config.bDeformableMesh = false;
-    Mesh->SetCollisionConfig(Config);
+    // Transient: built at run time, never saved with the level or copied into PIE.
+    URealtimeMeshSimple* Mesh = NewObject<URealtimeMeshSimple>(OwnerActor, NAME_None, RF_Transient);
+    Mesh->SetCollisionConfig(MakeCollisionConfig());
     Mesh->SetupMaterialSlot(0, "Collision");
 
-    URealtimeMeshComponent* Component = NewObject<URealtimeMeshComponent>(OwnerActor, URealtimeMeshComponent::StaticClass());
+    URealtimeMeshComponent* Component = NewObject<URealtimeMeshComponent>(OwnerActor, URealtimeMeshComponent::StaticClass(), NAME_None, RF_Transient);
     Component->SetVisibility(false);
     Component->SetCanEverAffectNavigation(false);
     Component->SetGenerateOverlapEvents(false);
@@ -488,15 +516,47 @@ void FVoxelCollisionBricks::DestroyComponent(FBrick& Brick)
     Brick.NumTriangles = 0;
 }
 
+FString FVoxelCollisionBricks::DescribeHit(const UPrimitiveComponent* HitComponent, const FVector& LocalPoint) const
+{
+    auto Describe = [](const FInt64Vector& Coord, const FBrick& Brick)
+        {
+            return FString::Printf(TEXT("brick (%lld, %lld, %lld): %d tris, %d applies, %d cooks in flight, last cook result %d, dirty %d, pending %d"),
+                Coord.X, Coord.Y, Coord.Z, Brick.NumTriangles, Brick.NumApplies,
+                Brick.CooksInFlight.IsValid() ? Brick.CooksInFlight->load() : 0,
+                Brick.LastCookResult.IsValid() ? Brick.LastCookResult->load() : -1,
+                Brick.bDirty ? 1 : 0, Brick.bHasPending ? 1 : 0);
+        };
+
+    FString HitText = FString::Printf(TEXT("hit %s (owner %s) is not a collision brick"),
+        HitComponent ? *HitComponent->GetName() : TEXT("nothing"),
+        HitComponent && HitComponent->GetOwner() ? *HitComponent->GetOwner()->GetName() : TEXT("none"));
+    for (const TPair<FInt64Vector, FBrick>& Pair : Bricks)
+    {
+        if (HitComponent && Pair.Value.Component.Get() == HitComponent)
+        {
+            HitText = TEXT("hit collision ") + Describe(Pair.Key, Pair.Value);
+            break;
+        }
+    }
+
+    const FInt64Vector Here = Grid.BrickAt(LocalPoint);
+    const FBrick* Brick = Bricks.Find(Here);
+    const FString HereText = Brick ? TEXT("point is in ") + Describe(Here, *Brick)
+        : FString::Printf(TEXT("point is in brick (%lld, %lld, %lld), not held"), Here.X, Here.Y, Here.Z);
+    return HitText + TEXT("; ") + HereText;
+}
+
 void FVoxelCollisionBricks::DrawDebug(UWorld* World, const FTransform& ToWorld) const
 {
     if (!World || CVarVoxelDebugCollision.GetValueOnGameThread() <= 0) return;
     for (const TPair<FInt64Vector, FBrick>& Pair : Bricks)
     {
         const bool bHasCollision = Pair.Value.Component.IsValid() && Pair.Value.NumTriangles > 0;
-        if (!bHasCollision && !Pair.Value.bDirty) continue;
+        const bool bCooking = Pair.Value.CooksInFlight.IsValid() && Pair.Value.CooksInFlight->load() > 0;
+        const bool bWaiting = Pair.Value.bDirty || Pair.Value.bHasPending || bCooking;
+        if (!bHasCollision && !bWaiting) continue;
         const FBox Box = CellBounds(Grid, Pair.Key, 1);
         DrawDebugBox(World, ToWorld.TransformPosition(Box.GetCenter()), Box.GetExtent(), ToWorld.GetRotation(),
-            Pair.Value.bDirty ? FColor::Orange : FColor::Green, false, -1.f, 0, 5.f);
+            bWaiting ? FColor::Orange : FColor::Green, false, -1.f, 0, 5.f);
     }
 }

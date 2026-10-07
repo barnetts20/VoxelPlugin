@@ -6,6 +6,12 @@
 #include "FDensitySampleCompositor.h"
 #include "GameFramework/Pawn.h"
 #include "GameFramework/PlayerController.h"
+#include "HAL/IConsoleManager.h"
+
+static TAutoConsoleVariable<int32> CVarVoxelRenderBricks(
+    TEXT("voxel.Render.Bricks"), 0,
+    TEXT("1: render terrain from LOD bricks (VoxelBrickTerrain) instead of the octree; the octree's chunks are hidden and its LOD passes paused."),
+    ECVF_Default);
 
 //Pipeline log thresholds... log if the pipelines take longer than the set value in MS
 //0 will always log pipeline execution times.
@@ -31,6 +37,10 @@ AAdaptiveVoxelActor::AAdaptiveVoxelActor()
     MeshAttachmentRoot = CreateDefaultSubobject<USceneComponent>(TEXT("MeshAttachmentRoot"));
     MeshAttachmentRoot->SetupAttachment(GetRootComponent());
     MeshAttachmentRoot->SetAbsolute(false, false, true);
+
+    BrickAttachmentRoot = CreateDefaultSubobject<USceneComponent>(TEXT("BrickAttachmentRoot"));
+    BrickAttachmentRoot->SetupAttachment(GetRootComponent());
+    BrickAttachmentRoot->SetAbsolute(false, false, true);
 }
 
 void AAdaptiveVoxelActor::BeginDestroy()
@@ -107,6 +117,13 @@ void AAdaptiveVoxelActor::PostEditChangeProperty(FPropertyChangedEvent& Property
         return;
     }
 
+    if (PropName == GET_MEMBER_NAME_CHECKED(AAdaptiveVoxelActor, BrickLodDistanceFactor))
+    {
+        const double ActorPlanetRadius = GetActorScale3D().GetMax();
+        InitializeBrickTerrain(VoxelDensity::RootExtentFor(ActorPlanetRadius, ActorPlanetRadius * NoiseAmplitudeRatio));
+        return;
+    }
+
     // Collision lattice changes rebuild only the collision bricks.
     if (PropName == GET_MEMBER_NAME_CHECKED(AAdaptiveVoxelActor, CollisionCellScale)
         || PropName == GET_MEMBER_NAME_CHECKED(AAdaptiveVoxelActor, CollisionSlopeBound))
@@ -179,13 +196,17 @@ void AAdaptiveVoxelActor::BeginPlay()
 
 void AAdaptiveVoxelActor::CleanSceneRoot()
 {
-    auto destroyComponentArray = MeshAttachmentRoot->GetAttachChildren();
-    for (TObjectPtr<USceneComponent> child : destroyComponentArray)
+    // Both roots: components left from an earlier run (saved with the level, or copied from the
+    // editor world into PIE before they were transient) would otherwise keep rendering or
+    // colliding without anything tracking them.
+    for (USceneComponent* AttachRoot : { MeshAttachmentRoot.Get(), BrickAttachmentRoot.Get() })
     {
-        URealtimeMeshComponent* meshComponent = Cast<URealtimeMeshComponent>(child);
-        if (meshComponent)
+        if (!AttachRoot) continue;
+        const TArray<TObjectPtr<USceneComponent>> Attached = AttachRoot->GetAttachChildren();
+        for (const TObjectPtr<USceneComponent>& Child : Attached)
         {
-            meshComponent->DestroyComponent();
+            if (URealtimeMeshComponent* MeshComponent = Cast<URealtimeMeshComponent>(Child))
+                MeshComponent->DestroyComponent();
         }
     }
 }
@@ -272,6 +293,10 @@ void AAdaptiveVoxelActor::Initialize()
         VoxelDensity::TerrainFinestCell(ActorPlanetRadius, ActorNoiseAmplitude, MaxDepth));
     DensityCompositor = Compositor;
     InitializeCollision(ActorRootExtent);
+    InitializeBrickTerrain(ActorRootExtent);
+    // The root's visibility is saved with the level; match it to the current render mode.
+    if (MeshAttachmentRoot)
+        MeshAttachmentRoot->SetVisibility(!bBrickRenderActive, true);
 
     // Store params for deferred construction on the background thread.
     PendingParams = MakeShared<FOctreeParams>();
@@ -366,6 +391,11 @@ void AAdaptiveVoxelActor::InitializeFromPlanet(TSharedPtr<FDensitySampleComposit
         MeshAttachmentRoot->AttachToComponent(InAttachParent,
             FAttachmentTransformRules::KeepWorldTransform);
     }
+    if (InAttachParent && BrickAttachmentRoot)
+    {
+        BrickAttachmentRoot->AttachToComponent(InAttachParent,
+            FAttachmentTransformRules::KeepWorldTransform);
+    }
 
     // Scale = planet radius, same as standalone Initialize
     double ActorPlanetRadius = GetActorScale3D().GetMax();
@@ -395,6 +425,10 @@ void AAdaptiveVoxelActor::InitializeFromPlanet(TSharedPtr<FDensitySampleComposit
     PendingParams->Compositor = InCompositor;
     DensityCompositor = InCompositor;
     InitializeCollision(ActorRootExtent);
+    InitializeBrickTerrain(ActorRootExtent);
+    // The root's visibility is saved with the level; match it to the current render mode.
+    if (MeshAttachmentRoot)
+        MeshAttachmentRoot->SetVisibility(!bBrickRenderActive, true);
     PendingParams->PlanetRadius = ActorPlanetRadius;
     PendingParams->NoiseAmplitude = ActorNoiseAmplitude;
     PendingParams->ChunkDepth = ChunkDepth;
@@ -413,6 +447,9 @@ void AAdaptiveVoxelActor::InitializeFromPlanet(TSharedPtr<FDensitySampleComposit
 void AAdaptiveVoxelActor::RunDataUpdateTask()
 {
     if (DataUpdateIsRunning || IsDestroyed) return;
+    // Paused while the brick terrain renders; the first pass still builds the octree, which
+    // edits need.
+    if (bBrickRenderActive && AdaptiveOctree.IsValid() && !PendingParams.IsValid()) return;
 
     DataUpdateIsRunning = true;
     TWeakObjectPtr<AAdaptiveVoxelActor> WeakThis(this);
@@ -832,7 +869,50 @@ void AAdaptiveVoxelActor::InitializeCollision(double RootExtent)
     Grid.Origin = FVector(-RootExtent);
     Grid.CellSize = ActualPrecision * FMath::Max(1, CollisionCellScale);
     Grid.CellsPerBrick = 16;
-    CollisionBricks->Initialize(this, MeshAttachmentRoot, DensityCompositor, Grid, CollisionSlopeBound);
+    CollisionBricks->Initialize(this, BrickAttachmentRoot, DensityCompositor, Grid, CollisionSlopeBound);
+}
+
+void AAdaptiveVoxelActor::InitializeBrickTerrain(double RootExtent)
+{
+    if (!BrickTerrain.IsValid())
+        BrickTerrain = MakeShared<FVoxelBrickTerrain>();
+
+    // 32-cell bricks: level MaxDepth - 5 is a single brick covering the whole root.
+    FVoxelBrickTerrainSettings Settings;
+    Settings.Origin = FVector(-RootExtent);
+    Settings.FinestCell = ActualPrecision;
+    Settings.CellsPerBrick = 32;
+    Settings.MaxLevel = FMath::Max(0, MaxDepth - 5);
+    Settings.LodDistanceFactor = BrickLodDistanceFactor;
+    Settings.SlopeBound = CollisionSlopeBound;
+    Settings.TriplanarUVScale = 0.0001 * (80000000.0 / FMath::Max(GetActorScale3D().GetMax(), 1.0));
+    Settings.Material = SurfaceMaterial;
+    BrickTerrain->Initialize(this, BrickAttachmentRoot, DensityCompositor, Settings);
+}
+
+void AAdaptiveVoxelActor::SetBrickRender(bool bOn)
+{
+    bBrickRenderActive = bOn;
+    if (MeshAttachmentRoot)
+        MeshAttachmentRoot->SetVisibility(!bOn, true);
+
+    if (!bOn)
+    {
+        if (BrickTerrain.IsValid())
+            BrickTerrain->Reset();
+        // Resume the octree's LOD passes (a pass still in flight continues the chain itself).
+        // The camera moved while paused; don't predict the first pass from that jump.
+        LastLodUpdatePosition = CameraPosition;
+        if (!DataUpdateIsRunning && !MeshUpdateIsRunning)
+            RunDataUpdateTask();
+    }
+}
+
+void AAdaptiveVoxelActor::LogEditHit(const FHitResult& Hit, const FVector& LocalHit) const
+{
+    static IConsoleVariable* DebugCollision = IConsoleManager::Get().FindConsoleVariable(TEXT("voxel.Debug.Collision"));
+    if (!DebugCollision || DebugCollision->GetInt() <= 0 || !CollisionBricks.IsValid()) return;
+    UE_LOG(LogTemp, Log, TEXT("[VoxelCollision] Edit trace: %s"), *CollisionBricks->DescribeHit(Hit.GetComponent(), LocalHit));
 }
 
 void AAdaptiveVoxelActor::TickCollision(UWorld* World)
@@ -846,7 +926,11 @@ void AAdaptiveVoxelActor::TickCollision(UWorld* World)
         PendingEditNotices.Reset();
     }
     for (const FEditNotice& Notice : Notices)
+    {
         CollisionBricks->NotifyEdit(Notice.Sequence, Notice.Center, Notice.Radius);
+        if (bBrickRenderActive && BrickTerrain.IsValid())
+            BrickTerrain->NotifyEdit(Notice.Sequence, Notice.Center, Notice.Radius);
+    }
 
     TArray<FVoxelCollisionSource> Sources;
     if (bEnableSurfaceCollision)
@@ -873,8 +957,8 @@ void AAdaptiveVoxelActor::TickCollision(UWorld* World)
     }
 
     CollisionBricks->Tick(Sources, CollisionHysteresis);
-    if (MeshAttachmentRoot)
-        CollisionBricks->DrawDebug(World, MeshAttachmentRoot->GetComponentTransform());
+    if (BrickAttachmentRoot)
+        CollisionBricks->DrawDebug(World, BrickAttachmentRoot->GetComponentTransform());
 }
 
 void AAdaptiveVoxelActor::RunEditUpdateTask(FVector InEditCenter, double InEditRadius, double InEditStrength, int InEditResolution)
@@ -934,12 +1018,21 @@ void AAdaptiveVoxelActor::Tick(float DeltaTime)
     Super::Tick(DeltaTime);
     if (!Initialized) return;
 
-    // Create components and swap in finished passes (component creation is time-sliced).
-    DrainPendingApply();
+    const bool bWantBricks = CVarVoxelRenderBricks.GetValueOnGameThread() > 0;
+    if (bWantBricks != bBrickRenderActive)
+        SetBrickRender(bWantBricks);
 
-    // Destroy components of chunks retired by the chunk-cut pass. After the applies above
-    // so the finer replacement chunks get a chance to appear first.
-    DrainPendingDestroy();
+    // The octree's chunks wait in their queues while the brick terrain renders, so none
+    // appears under the hidden root.
+    if (!bBrickRenderActive)
+    {
+        // Create components and swap in finished passes (component creation is time-sliced).
+        DrainPendingApply();
+
+        // Destroy components of chunks retired by the chunk-cut pass. After the applies
+        // above so the finer replacement chunks get a chance to appear first.
+        DrainPendingDestroy();
+    }
 
     // Cache cam data
     auto world = GetWorld();
@@ -997,6 +1090,8 @@ void AAdaptiveVoxelActor::Tick(float DeltaTime)
         }
 
         TickCollision(world);
+        if (bBrickRenderActive && BrickTerrain.IsValid())
+            BrickTerrain->Tick(CameraPosition);
 
         //Example of edit flow, would want to move off tick for actual implementation
         if (world->IsGameWorld())
@@ -1019,6 +1114,7 @@ void AAdaptiveVoxelActor::Tick(float DeltaTime)
                 if (world->LineTraceSingleByChannel(Hit, Start, End, ECC_Visibility))
                 {
                     FVector LocalHit = NoScaleTransform.InverseTransformPosition(Hit.ImpactPoint);
+                    LogEditHit(Hit, LocalHit);
                     RunEditUpdateTask(LocalHit, InEditRadius, InEditStrength, InEditResolution);
                     DrawDebugSphere(world, Hit.ImpactPoint, InEditRadius, 32, FColor::Red, false, DebugDrawTime);
                 }
@@ -1033,6 +1129,7 @@ void AAdaptiveVoxelActor::Tick(float DeltaTime)
                 if (world->LineTraceSingleByChannel(Hit, Start, End, ECC_Visibility))
                 {
                     FVector LocalHit = NoScaleTransform.InverseTransformPosition(Hit.ImpactPoint);
+                    LogEditHit(Hit, LocalHit);
                     RunEditUpdateTask(LocalHit, InEditRadius, -InEditStrength, 3);
                     DrawDebugSphere(world, Hit.ImpactPoint, InEditRadius, 32, FColor::Green, false, DebugDrawTime);
                 }

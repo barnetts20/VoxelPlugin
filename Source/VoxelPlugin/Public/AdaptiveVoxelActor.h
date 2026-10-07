@@ -17,6 +17,7 @@
 #include "FAdaptiveOctree.h"
 #include "VoxelDensity.h"
 #include "VoxelCollisionBricks.h"
+#include "VoxelBrickTerrain.h"
 #include "RealtimeMeshActor.h"
 #include "AdaptiveVoxelActor.generated.h"
 
@@ -51,6 +52,11 @@ private:
      *  trigger full reconstruction via OnConstruction. */
     UPROPERTY()
     TObjectPtr<USceneComponent> MeshAttachmentRoot;
+
+    /** Collision bricks and brick-terrain components attach to this one, placed like
+     *  MeshAttachmentRoot. Kept apart so hiding the octree's chunks leaves them alone. */
+    UPROPERTY()
+    TObjectPtr<USceneComponent> BrickAttachmentRoot;
 
     /** Camera position in actor-local space, updated each tick from the viewport. */
     FVector CameraPosition = FVector::ZeroVector;
@@ -188,6 +194,11 @@ public:
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrain|Collision", meta = (ClampMin = "1.0", UIMax = "8.0"))
     double CollisionSlopeBound = 3.5;
 
+    /** Brick terrain (voxel.Render.Bricks 1): a brick splits while the camera is closer than
+     *  this many brick sizes. Higher is finer and costs more bricks. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrain|Bricks", meta = (ClampMin = "0.5", UIMin = "1.0", UIMax = "6.0"))
+    double BrickLodDistanceFactor = 2.5;
+
     /** Minimum subdivision depth maintained regardless of camera distance. */
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrain|Octree")
     int MinDepth = 5;
@@ -302,6 +313,11 @@ protected:
     /** Collision around the pawns, built from DensityCompositor. */
     TSharedPtr<FVoxelCollisionBricks> CollisionBricks;
 
+    /** Terrain rendered from bricks while voxel.Render.Bricks is 1 (the octree's chunks are
+     *  hidden and its LOD passes paused meanwhile). */
+    TSharedPtr<FVoxelBrickTerrain> BrickTerrain;
+    bool bBrickRenderActive = false;
+
     /** Edits applied by the edit task, for the collision bricks (drained in Tick). Guarded by
      *  PendingApplyCS. */
     struct FEditNotice
@@ -339,7 +355,7 @@ protected:
      *  (game thread only). Caps how long it holds newer groups back. */
     int32 ApplyHeldFrames = 0;
 
-    /** Destroys all RealtimeMesh components attached to MeshAttachmentRoot. */
+    /** Destroys all RealtimeMesh components attached to MeshAttachmentRoot and BrickAttachmentRoot. */
     void CleanSceneRoot();
 
     /** Background task: builds the octree (if PendingParams set), then runs one LOD
@@ -372,9 +388,18 @@ protected:
     /** Game thread: (re)starts the collision bricks for the current density and precision. */
     void InitializeCollision(double RootExtent);
 
+    /** Game thread: (re)starts the brick terrain for the current density and precision. */
+    void InitializeBrickTerrain(double RootExtent);
+
+    /** Game thread: switches rendering between the octree and the brick terrain. */
+    void SetBrickRender(bool bOn);
+
     /** Game thread: forwards finished edits, gathers the collision sources (player pawns, or
      *  the camera) and ticks the collision bricks. */
     void TickCollision(UWorld* World);
+
+    /** Diagnostics (voxel.Debug.Collision): logs what the edit trace hit. */
+    void LogEditHit(const FHitResult& Hit, const FVector& LocalHit) const;
 
     /** Background task: applies a spherical brush edit, reconstructs affected subtrees,
      *  and pushes updated meshes. Runs independently of the Data/Mesh chain. */

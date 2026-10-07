@@ -68,4 +68,9 @@ namespace VoxelBrickMesher
      *  point it covers. Pass bNoSkip where the bound may not hold (edited regions). */
     VOXELPLUGIN_API void MeshBrick(const FDensitySampleCompositor& Density, const FVoxelBrickGrid& Grid,
         const FInt64Vector& Brick, double SlopeBound, bool bNoSkip, FVoxelBrickMesh& Out, FVoxelBrickStats& OutStats);
+
+    /** Hangs a skirt from every open edge of Mesh: a strip pushed Depth into the solid along
+     *  the vertex normals, wound to continue the surface. Hides the cracks between bricks of
+     *  different LOD; between same-LOD bricks it stays under the neighbour's surface. */
+    VOXELPLUGIN_API void AddSkirts(FVoxelBrickMesh& Mesh, float Depth);
 }

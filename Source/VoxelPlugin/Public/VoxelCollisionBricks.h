@@ -14,6 +14,7 @@ class USceneComponent;
 class UWorld;
 class URealtimeMeshSimple;
 class URealtimeMeshComponent;
+class UPrimitiveComponent;
 class FDensitySampleCompositor;
 struct FMeshStreamData;
 
@@ -35,7 +36,8 @@ struct FVoxelCollisionSource
  *
  *  Collision geometry goes through a hidden component's section with collision enabled: in
  *  the RealtimeMesh source read on 2026-10-07, custom complex geometry is only cooked when
- *  some section also has collision. */
+ *  some section also has collision. Components and meshes are transient, so none is saved
+ *  with the level or copied from the editor world into PIE. */
 class VOXELPLUGIN_API FVoxelCollisionBricks : public TSharedFromThis<FVoxelCollisionBricks>
 {
 public:
@@ -58,12 +60,21 @@ public:
 
     const FVoxelBrickGrid& GetGrid() const { return Grid; }
 
+    /** Game thread, diagnostics: what a trace hit at LocalPoint (actor-local) – whether
+     *  HitComponent is one of these bricks, and the state of the brick holding the point. */
+    FString DescribeHit(const UPrimitiveComponent* HitComponent, const FVector& LocalPoint) const;
+
 private:
     struct FBrick
     {
         TWeakObjectPtr<URealtimeMeshSimple> Mesh;
         TWeakObjectPtr<URealtimeMeshComponent> Component;
         TSharedPtr<FMeshStreamData> Pending;   // built, not yet applied (null: empty)
+        /** Cooks requested and not yet finished; decremented by the cook futures. */
+        TSharedPtr<std::atomic<int32>> CooksInFlight;
+        /** Result of the latest finished cook (ERealtimeMeshCollisionUpdateResult), -1 before any. */
+        TSharedPtr<std::atomic<int32>> LastCookResult;
+        int32 NumApplies = 0;
         int32 NumTriangles = 0;
         bool bSkipped = false;                 // proven empty by the slope-bound test
         bool bHasPending = false;
