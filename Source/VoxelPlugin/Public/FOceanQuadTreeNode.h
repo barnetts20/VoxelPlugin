@@ -1,4 +1,4 @@
-﻿// FOceanQuadTreeNode.h — Ocean quadtree node, mesh chunk, stream data, and
+// FOceanQuadTreeNode.h — Ocean quadtree node, mesh chunk, stream data, and
 // static triangle grid cache. The quadtree tiles a cube-sphere with 6 face
 // roots, each subdivided into a quadtree that drives LOD and mesh generation.
 //
@@ -26,7 +26,7 @@ class AOceanSphereActor;
  *  surface, interpolated on the GPU for depth-based shading). */
 struct VOXELPLUGIN_API FOceanStreamData
 {
-    FRealtimeMeshSectionGroupKey MeshGroupKey;
+    FRealtimeMeshBufferSetKey MeshGroupKey;
     FRealtimeMeshSectionKey      MeshSectionKey;
     FRealtimeMeshStreamSet       MeshStream;
 
@@ -203,8 +203,14 @@ public:
     /** Checks the 2 outer-facing neighbor edges for this node's quadrant position.
      *  Only outer edges can have LOD mismatches -- inner edges share a sibling at
      *  the same depth. Updates NeighborLods and returns true if any changed
-     *  (triggering edge stitch rebuild). */
-    bool CheckNeighbors();
+     *  (triggering edge stitch rebuild). Neighbours are looked up in Roots, a snapshot
+     *  of the 6 face roots taken by the caller, so a concurrent re-init can't change
+     *  them underneath the lookup. */
+    bool CheckNeighbors(const TSharedPtr<FOceanQuadTreeNode> (&Roots)[6]);
+
+    /** Walks Roots to the node matching Index: the deepest existing node on its path (a
+     *  leaf above the requested depth if the path was merged), or nullptr. */
+    static TSharedPtr<FOceanQuadTreeNode> FindNodeByIndex(const TSharedPtr<FOceanQuadTreeNode> (&Roots)[6], const FQuadIndex& Index);
 
     static void Split(TSharedPtr<FOceanQuadTreeNode> Node);
     static void Merge(TSharedPtr<FOceanQuadTreeNode> Node);
@@ -221,4 +227,4 @@ public:
 
     bool  IsLeaf()   const { return Children.Num() == 0; }
     int32 GetDepth() const { return Index.GetDepth(); }
-};
+};

@@ -10,13 +10,13 @@ public class VoxelPlugin : ModuleRules
 		PCHUsage = ModuleRules.PCHUsageMode.UseExplicitOrSharedPCHs;
         CMakeTarget.add(Target, this, "FastNoise", Path.Combine(this.ModuleDirectory, "../FastNoise2"), "-DFASTNOISE2_NOISETOOL=OFF", true);
         PublicDefinitions.Add("FASTNOISE_STATIC_LIB");
-        CppStandard = CppStandardVersion.Cpp20; //Clean up mutated cpp state
+		CppStandard = CppStandardVersion.Cpp20; //Clean up mutated cpp state
 
         PublicIncludePaths.AddRange(
 			new string[] {
                 //Path.Combine(ModuleDirectory, "Shaders/Public")
             }
-			);
+		);
 				
 		//string RealTimeMeshLibPath = Path.Combine(ModuleDirectory, "../RealTimeMesh/RealtimeMeshComponent/Binaries/Win64");//D:\Projects\vxl\Plugins\VoxelPlugin\Source\RealTimeMesh\RealtimeMeshComponent\Binaries\Win64
         PrivateIncludePaths.AddRange(
@@ -33,8 +33,9 @@ public class VoxelPlugin : ModuleRules
 				// Include RealtimeMeshSpatial
 				//Path.Combine(ModuleDirectory, "../RealTimeMesh/RealtimeMeshComponent/Source/RealtimeMeshSpatial/Public"),
 				//Path.Combine(ModuleDirectory, "../RealTimeMesh/RealtimeMeshComponent/Source/RealtimeMeshSpatial/Private")
-    }
-            );
+				Path.Combine(PluginDirectory, "Shaders", "Private")
+            }
+        );
 
 		PublicDependencyModuleNames.AddRange(
 			new string[]

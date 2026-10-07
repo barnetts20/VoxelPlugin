@@ -1,4 +1,4 @@
-﻿// OceanSphereActor.h — Ocean surface actor using a cube-sphere quadtree.
+// OceanSphereActor.h — Ocean surface actor using a cube-sphere quadtree.
 // Renders the ocean as 6 quadtree faces projected onto a sphere at OceanRadius,
 // with LOD-driven subdivision and depth-based triangle culling where terrain
 // pokes above the waterline.
@@ -14,7 +14,7 @@
 #include "FOceanSharedStructs.h"
 #include "FOceanQuadTreeNode.h"
 #include "FDensitySampleCompositor.h"
-#include "FastNoise/FastNoise.h"
+#include "VoxelDensity.h"
 #include "OceanSphereActor.generated.h"
 
 /** Ocean surface actor. Manages a cube-sphere quadtree (6 face roots) that
@@ -61,6 +61,12 @@ public:
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Ocean|Shape",
         meta = (ClampMin = "0.01", ClampMax = "1.0", EditCondition = "!bIsPlanetOwned"))
     double NoiseAmplitudeRatio = 0.15;
+
+    /** Must match the terrain actor's SurfaceSettings. Used by the standalone compositor;
+     *  when planet-owned, the planet's settings are used. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Ocean|Shape",
+        meta = (EditCondition = "!bIsPlanetOwned"))
+    FVoxelSurfaceSettings SurfaceSettings;
 
     // --- Mesh ---
 
@@ -134,10 +140,6 @@ public:
     USceneComponent* GetMeshAttachmentRoot() const { return MeshAttachmentRoot; }
     TSharedPtr<FDensitySampleCompositor> GetCompositor() const { return Compositor; }
 
-    /** Walks the quadtree to find the node matching a FQuadIndex. Returns nullptr if
-     *  the path doesn't exist (node was merged). Used by CheckNeighbors for LOD queries. */
-    TSharedPtr<FOceanQuadTreeNode> GetNodeByIndex(const FQuadIndex& Index) const;
-
     // --- Lifecycle ---
 
     virtual void OnConstruction(const FTransform& Transform) override;
@@ -189,9 +191,6 @@ private:
     /** Density compositor -- either shared from PlanetActor or built standalone.
      *  Provides terrain SDF density at ocean vertex positions for depth calculation. */
     TSharedPtr<FDensitySampleCompositor> Compositor;
-
-    /** FastNoise node for standalone mode's terrain heightmap. Unused when planet-owned. */
-    FastNoise::SmartNode<> Noise;
 
     // --- Camera State ---
     FVector CameraPosition = FVector::ZeroVector;
@@ -271,4 +270,4 @@ private:
      *  neighbor LODs, rebuilds dirty chunks, and pushes mesh updates. Chains back
      *  to itself after MinLodInterval. */
     void RunLodUpdateTask();
-};
+};

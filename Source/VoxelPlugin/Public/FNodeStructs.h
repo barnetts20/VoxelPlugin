@@ -1,4 +1,4 @@
-﻿// FNodeStructs.h — Core data types for octree node geometry: corners, edges, 
+// FNodeStructs.h — Core data types for octree node geometry: corners, edges,
 // morton indices, and edge neighbor tracking.
 
 #pragma once
@@ -173,6 +173,34 @@ struct VOXELPLUGIN_API FMortonIndex {
     /** Returns the child index at the deepest level of this path. */
     uint8 LastChild() const {
         return GetChildAtLevel(Depth - 1);
+    }
+
+    /** True if this path starts with Ancestor's path, i.e. this node is Ancestor or lies
+     *  in its subtree. */
+    bool IsWithin(const FMortonIndex& Ancestor) const {
+        if (Depth < Ancestor.Depth) return false;
+        const uint32 LoLevels = FMath::Min<uint32>(Ancestor.Depth, 21);
+        const uint64 LoMask = (LoLevels * 3 >= 64) ? ~0ull : ((1ull << (LoLevels * 3)) - 1);
+        if ((Lo & LoMask) != (Ancestor.Lo & LoMask)) return false;
+        if (Ancestor.Depth <= 21) return true;
+        const uint32 HiLevels = Ancestor.Depth - 21;
+        const uint64 HiMask = (HiLevels * 3 >= 64) ? ~0ull : ((1ull << (HiLevels * 3)) - 1);
+        return (Hi & HiMask) == (Ancestor.Hi & HiMask);
+    }
+
+    /** Root-first lexicographic order on paths: the first level where they differ decides;
+     *  a prefix sorts before its extensions. For two nodes that are not ancestor and
+     *  descendant, the result is the same for any of their descendants, so it stays stable
+     *  when a chunk root is promoted to its children or demoted to its parent. */
+    static bool PathLess(const FMortonIndex& A, const FMortonIndex& B) {
+        const uint8 Shared = FMath::Min(A.Depth, B.Depth);
+        for (uint8 Level = 0; Level < Shared; Level++)
+        {
+            const uint8 ChildA = A.GetChildAtLevel(Level);
+            const uint8 ChildB = B.GetChildAtLevel(Level);
+            if (ChildA != ChildB) return ChildA < ChildB;
+        }
+        return A.Depth < B.Depth;
     }
 
     bool operator==(const FMortonIndex& Other) const {

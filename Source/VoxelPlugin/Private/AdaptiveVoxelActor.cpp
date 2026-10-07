@@ -1,9 +1,11 @@
-﻿#include "AdaptiveVoxelActor.h"
+#include "AdaptiveVoxelActor.h"
 #include "PlanetActor.h"
 #include "DrawDebugHelpers.h"
 #include "Kismet/GameplayStatics.h"
 #include "TimerManager.h"
 #include "FDensitySampleCompositor.h"
+#include "GameFramework/Pawn.h"
+#include "GameFramework/PlayerController.h"
 
 //Pipeline log thresholds... log if the pipelines take longer than the set value in MS
 //0 will always log pipeline execution times.
@@ -47,7 +49,9 @@ void AAdaptiveVoxelActor::BeginDestroy()
         FScopeLock Lock(&PendingApplyCS);
         PendingApply.Empty();
         PendingDestroy.Empty();
-        PendingCollision.Empty();
+        PendingEditNotices.Empty();
+        DebugStaleBounds.Empty();
+        DebugFoldedBounds.Empty();
     }
 
     FRWScopeLock WriteLock(OctreeLock, SLT_Write);
@@ -86,14 +90,29 @@ void AAdaptiveVoxelActor::PostEditChangeProperty(FPropertyChangedEvent& Property
         GET_MEMBER_NAME_CHECKED(AAdaptiveVoxelActor, NoiseAmplitudeRatio),
         GET_MEMBER_NAME_CHECKED(AAdaptiveVoxelActor, MinDepth),
         GET_MEMBER_NAME_CHECKED(AAdaptiveVoxelActor, TargetPrecision),
-        GET_MEMBER_NAME_CHECKED(AAdaptiveVoxelActor, PrecisionDepthFloor),
         GET_MEMBER_NAME_CHECKED(AAdaptiveVoxelActor, SurfaceMaterial),
         GET_MEMBER_NAME_CHECKED(AAdaptiveVoxelActor, ScreenSpaceThreshold),
     };
 
-    if (RebuildProps.Contains(PropName))
+    // A change inside SurfaceSettings reports the inner field as the property; the member
+    // property is the struct.
+    // Slider drags rebuild once, on release.
+    const bool bSurfaceChanged = !bIsPlanetOwned && PropertyChangedEvent.ChangeType != EPropertyChangeType::Interactive
+        && PropertyChangedEvent.MemberProperty
+        && PropertyChangedEvent.MemberProperty->GetFName() == GET_MEMBER_NAME_CHECKED(AAdaptiveVoxelActor, SurfaceSettings);
+
+    if (RebuildProps.Contains(PropName) || bSurfaceChanged)
     {
         Initialize();
+        return;
+    }
+
+    // Collision lattice changes rebuild only the collision bricks.
+    if (PropName == GET_MEMBER_NAME_CHECKED(AAdaptiveVoxelActor, CollisionCellScale)
+        || PropName == GET_MEMBER_NAME_CHECKED(AAdaptiveVoxelActor, CollisionSlopeBound))
+    {
+        const double ActorPlanetRadius = GetActorScale3D().GetMax();
+        InitializeCollision(VoxelDensity::RootExtentFor(ActorPlanetRadius, ActorPlanetRadius * NoiseAmplitudeRatio));
     }
 }
 
@@ -187,7 +206,7 @@ void AAdaptiveVoxelActor::Initialize()
         World->GetTimerManager().ClearTimer(DataUpdateTimerHandle);
     }
 
-    // Destroy old octree first � this releases all chunk shared pointers
+    // Destroy old octree first - this releases all chunk shared pointers
     if (AdaptiveOctree.IsValid())
     {
         AdaptiveOctree->Clear();
@@ -195,14 +214,17 @@ void AAdaptiveVoxelActor::Initialize()
     }
 
     // Drop queued applies referencing the old octree's chunks. The busy-wait above has
-    // already fenced any in-flight mesh task's enqueue (it enqueues before clearing
-    // MeshUpdateIsRunning), so nothing repopulates this after the clear.
+    // already fenced every task's enqueue (each enqueues before clearing its running
+    // flag), so nothing repopulates this after the clear.
     {
         FScopeLock Lock(&PendingApplyCS);
         PendingApply.Empty();
         PendingDestroy.Empty();
-        PendingCollision.Empty();
+        PendingEditNotices.Empty();
+        DebugStaleBounds.Empty();
+        DebugFoldedBounds.Empty();
     }
+    ApplyHeldFrames = 0;
 
     // Now clean up any components that were already attached
     CleanSceneRoot();
@@ -224,7 +246,7 @@ void AAdaptiveVoxelActor::Initialize()
     // MeshAttachmentRoot handles world placement via position/rotation only (absolute scale).
     double ActorPlanetRadius = GetActorScale3D().GetMax();
     double ActorNoiseAmplitude = ActorPlanetRadius * NoiseAmplitudeRatio;
-    double ActorRootExtent = (ActorPlanetRadius + ActorNoiseAmplitude) * 1.05;
+    double ActorRootExtent = VoxelDensity::RootExtentFor(ActorPlanetRadius, ActorNoiseAmplitude);
 
     // Compute MaxDepth from TargetPrecision.
     // At depth D, voxel extent = RootExtent / 2^D, vertex spacing ≈ 2 * extent.
@@ -245,70 +267,11 @@ void AAdaptiveVoxelActor::Initialize()
         MinDepth = FMath::Max(MinDepth, ChunkDepth);
     }
 
-    //Composes a density sampling layer that treats the input noise node as if it was a heightmap
-    Noise = FastNoise::NewFromEncodedNodeTree("GQAgAB8AEwCamRk+DQAMAAAAAAAAQAcAAAAAAD8AAAAAAAAAAAA/AAAAAD8AAAAAvwAAAAA/ARsAFwCamRk+AAAAPwAAAAAAAAA/IAAgABMAAABAQBsAJAACAAAADQAIAAAAAAAAQAsAAQAAAAAAAAABAAAAAAAAAAAAAIA/AAAAAD8AAAAAAAAAAIA/AAAAAAAAmpmZPgCamRk+AM3MTD4BEwDNzEw+IAAfABcAAACAvwAAgD8AAIDAAAAAPw8AAQAAAAAAAED//wEAAAAAAD8AAAAAAAAAAIA/AAAAAD8AAACAvwAAAAA/");
-    auto HeightmapLayer = [NoiseNode = Noise, PlanetRadius = ActorPlanetRadius, NoiseAmplitude = ActorNoiseAmplitude](const FSampleInput& Input, float* DensityOut) {
-        int32 Count = Input.Num();
-
-        double InvNoiseAmplitude = 1.0 / NoiseAmplitude;
-        double RootExtent = (PlanetRadius + NoiseAmplitude) * 1.05;
-
-        // Stack buffers for the common small-count paths (8, 19 samples).
-        // Only heap-allocate for large bulk calls (ReconstructSubtree).
-        constexpr int32 StackLimit = 64;
-
-        float  StackPX[StackLimit], StackPY[StackLimit], StackPZ[StackLimit], StackNoise[StackLimit];
-        double StackDist[StackLimit];
-
-        TArray<float>  HeapPX, HeapPY, HeapPZ, HeapNoise;
-        TArray<double> HeapDist;
-
-        float* PX; float* PY; float* PZ; float* NoiseOut;
-        double* Distances;
-
-        if (Count <= StackLimit)
-        {
-            PX = StackPX; PY = StackPY; PZ = StackPZ; NoiseOut = StackNoise;
-            Distances = StackDist;
-        }
-        else
-        {
-            HeapPX.SetNumUninitialized(Count);
-            HeapPY.SetNumUninitialized(Count);
-            HeapPZ.SetNumUninitialized(Count);
-            HeapNoise.SetNumUninitialized(Count);
-            HeapDist.SetNumUninitialized(Count);
-            PX = HeapPX.GetData(); PY = HeapPY.GetData(); PZ = HeapPZ.GetData();
-            NoiseOut = HeapNoise.GetData(); Distances = HeapDist.GetData();
-        }
-
-        // Project positions onto sphere surface for noise sampling.
-        // Cache Dist to avoid recomputing sqrt in the density loop.
-        for (int32 i = 0; i < Count; i++)
-        {
-            double px = Input.X[i], py = Input.Y[i], pz = Input.Z[i];
-            double Dist = FMath::Sqrt(px * px + py * py + pz * pz);
-            Distances[i] = Dist;
-            double InvDist = (Dist > 1e-10) ? (RootExtent / Dist) : 0.0;
-            PX[i] = (float)(px * InvDist * InvNoiseAmplitude);
-            PY[i] = (float)(py * InvDist * InvNoiseAmplitude);
-            PZ[i] = (float)(pz * InvDist * InvNoiseAmplitude);
-        }
-
-        NoiseNode->GenPositionArray3D(NoiseOut, Count, PX, PY, PZ, 0, 0, 0, 0);
-
-        for (int32 i = 0; i < Count; i++)
-        {
-            double Clamped = FMath::Clamp((double)NoiseOut[i], -1.0, 1.0);
-            double Height = (Clamped + 1.0) * 0.5 * NoiseAmplitude;
-            DensityOut[i] = (float)(Distances[i] - (PlanetRadius + Height));
-        }
-        };
-
-    TSharedPtr<FSparseEditStore> EditStore = MakeShared<FSparseEditStore>(FVector::ZeroVector, ActorRootExtent, ChunkDepth, MaxDepth);
-
-    TSharedPtr<FDensitySampleCompositor> Compositor = MakeShared<FDensitySampleCompositor>(EditStore);
-    Compositor->AddSampleLayer(HeightmapLayer);
+    TSharedPtr<FSparseEditStore> EditStore = MakeShared<FSparseEditStore>(FVector::ZeroVector, ActorRootExtent, MaxDepth);
+    TSharedPtr<FDensitySampleCompositor> Compositor = VoxelDensity::MakeCompositor(SurfaceSettings, ActorPlanetRadius, ActorNoiseAmplitude, EditStore,
+        VoxelDensity::TerrainFinestCell(ActorPlanetRadius, ActorNoiseAmplitude, MaxDepth));
+    DensityCompositor = Compositor;
+    InitializeCollision(ActorRootExtent);
 
     // Store params for deferred construction on the background thread.
     PendingParams = MakeShared<FOctreeParams>();
@@ -325,7 +288,6 @@ void AAdaptiveVoxelActor::Initialize()
     PendingParams->MaxChunkDepthDelta = MaxChunkDepthDelta;
     PendingParams->MinDepth = MinDepth;
     PendingParams->MaxDepth = MaxDepth;
-    PendingParams->PrecisionDepthFloor = PrecisionDepthFloor;
 
     LastInitScale = GetActorScale3D();
     Initialized = true;
@@ -389,8 +351,11 @@ void AAdaptiveVoxelActor::InitializeFromPlanet(TSharedPtr<FDensitySampleComposit
         FScopeLock Lock(&PendingApplyCS);
         PendingApply.Empty();
         PendingDestroy.Empty();
-        PendingCollision.Empty();
+        PendingEditNotices.Empty();
+        DebugStaleBounds.Empty();
+        DebugFoldedBounds.Empty();
     }
+    ApplyHeldFrames = 0;
 
     CleanSceneRoot();
 
@@ -405,7 +370,7 @@ void AAdaptiveVoxelActor::InitializeFromPlanet(TSharedPtr<FDensitySampleComposit
     // Scale = planet radius, same as standalone Initialize
     double ActorPlanetRadius = GetActorScale3D().GetMax();
     double ActorNoiseAmplitude = ActorPlanetRadius * NoiseAmplitudeRatio;
-    double ActorRootExtent = (ActorPlanetRadius + ActorNoiseAmplitude) * 1.05;
+    double ActorRootExtent = VoxelDensity::RootExtentFor(ActorPlanetRadius, ActorNoiseAmplitude);
 
     // Auto-derive MaxDepth
     {
@@ -428,6 +393,8 @@ void AAdaptiveVoxelActor::InitializeFromPlanet(TSharedPtr<FDensitySampleComposit
     PendingParams->MeshAttachmentRoot = MeshAttachmentRoot;
     PendingParams->SurfaceMaterial = SurfaceMaterial;
     PendingParams->Compositor = InCompositor;
+    DensityCompositor = InCompositor;
+    InitializeCollision(ActorRootExtent);
     PendingParams->PlanetRadius = ActorPlanetRadius;
     PendingParams->NoiseAmplitude = ActorNoiseAmplitude;
     PendingParams->ChunkDepth = ChunkDepth;
@@ -437,7 +404,6 @@ void AAdaptiveVoxelActor::InitializeFromPlanet(TSharedPtr<FDensitySampleComposit
     PendingParams->MaxChunkDepthDelta = MaxChunkDepthDelta;
     PendingParams->MinDepth = MinDepth;
     PendingParams->MaxDepth = MaxDepth;
-    PendingParams->PrecisionDepthFloor = PrecisionDepthFloor;
 
     LastInitScale = GetActorScale3D();
     Initialized = true;
@@ -470,11 +436,21 @@ void AAdaptiveVoxelActor::RunDataUpdateTask()
                 return;
             }
 
+            const bool bDebug = CVarVoxelDebugFlicker.GetValueOnAnyThread() > 0;
+            bool bSeamChecked = false;
+            TArray<FBox> StaleBounds;
+            int32 DroppedInterior = 0;
+            int32 DroppedFace = 0;
+            int32 VertexlessQuads = 0;
+            int32 FoldedTris = 0;
+            TArray<FBox> FoldedBounds;
+
             double t0 = FPlatformTime::Seconds();
             TArray<TSharedPtr<FMeshChunk>> RemovedChunks;
-            TArray<TSharedPtr<FMeshChunk>> CollisionChanges;
             {
                 FRWScopeLock WriteLock(Self->OctreeLock, SLT_Write);
+                Self->AdaptiveOctree->BeginPass();
+
                 FVector CurrentCamPos = Self->CameraPosition;
                 FVector Velocity = (CurrentCamPos - Self->LastLodUpdatePosition);
                 FVector PredictedPos = CurrentCamPos + (Velocity * Self->VelocityLookAheadFactor);
@@ -490,22 +466,44 @@ void AAdaptiveVoxelActor::RunDataUpdateTask()
                 // GT destruction.
                 Self->AdaptiveOctree->UpdateChunkCut(CurrentCamPos, Self->CameraFOV, RemovedChunks);
 
-                // Collision pass: decide which chunks should carry a collision body based on
-                // near distance + the speed-scaled lead, so the cooked set follows the player.
-                const double OnDist = Self->bEnableSurfaceCollision
-                    ? (Self->WalkBaseCollisionDistance + Self->PlayerSpeed * Self->CollisionCookLeadTime)
-                    : 0.0;
-                const double OffDist = OnDist * Self->CollisionHysteresis;
-                Self->AdaptiveOctree->UpdateChunkCollision(CurrentCamPos, OnDist, OffDist, CollisionChanges);
+                if (bDebug)
+                {
+                    Self->AdaptiveOctree->ConsumeDebugCounters(DroppedInterior, DroppedFace, VertexlessQuads, FoldedTris);
+                    Self->AdaptiveOctree->FindFoldedChunks(FoldedBounds);
+                    const uint32 Interval = (uint32)FMath::Max(1, CVarVoxelDebugSeamCheckInterval.GetValueOnAnyThread());
+                    if (++Self->DebugDataPassCount % Interval == 0)
+                    {
+                        Self->AdaptiveOctree->FindStaleSeams(StaleBounds);
+                        bSeamChecked = true;
+                    }
+                }
             }
             double elapsed = (FPlatformTime::Seconds() - t0) * 1000.0;
             if (elapsed > DATA_LOG_THRESHOLD) UE_LOG(LogTemp, Log, TEXT("[Pipeline] DataUpdate: %.2fms"), elapsed);
 
-            if (RemovedChunks.Num() > 0 || CollisionChanges.Num() > 0)
+            if (bDebug)
+            {
+                if (DroppedInterior > 0 || DroppedFace > 0)
+                    UE_LOG(LogTemp, Warning, TEXT("[VoxelFlicker] Dropped edges (a neighbour >2 levels coarser): %d interior, %d on chunk faces"), DroppedInterior, DroppedFace);
+                if (bSeamChecked && StaleBounds.Num() > 0)
+                    UE_LOG(LogTemp, Warning, TEXT("[VoxelFlicker] Stale seams: %d chunks meshed against outdated neighbours"), StaleBounds.Num());
+                if (VertexlessQuads > 0)
+                    UE_LOG(LogTemp, Warning, TEXT("[VoxelFlicker] Quads skipped for a leaf without vertex data: %d"), VertexlessQuads);
+                if (FoldedTris > 0)
+                    UE_LOG(LogTemp, Warning, TEXT("[VoxelFlicker] Folded triangles meshed this pass: %d (%d chunks now hold folds)"), FoldedTris, FoldedBounds.Num());
+            }
+
+            if (RemovedChunks.Num() > 0 || bSeamChecked || bDebug)
             {
                 FScopeLock Lock(&Self->PendingApplyCS);
                 if (RemovedChunks.Num() > 0)     Self->PendingDestroy.Append(MoveTemp(RemovedChunks));
-                if (CollisionChanges.Num() > 0)  Self->PendingCollision.Append(MoveTemp(CollisionChanges));
+                if (bSeamChecked)
+                {
+                    Self->DebugStaleBounds = MoveTemp(StaleBounds);
+                    Self->DebugStaleBoundsTime = FPlatformTime::Seconds();
+                }
+                if (bDebug)
+                    Self->DebugFoldedBounds = MoveTemp(FoldedBounds);
             }
 
             Self->DataUpdateIsRunning = false;
@@ -527,15 +525,21 @@ void AAdaptiveVoxelActor::RunMeshUpdateTask()
             if (!Self || Self->IsDestroyed) return;
 
             // Collect the dirty chunks under the read lock -- this is cheap (it just
-            // gathers shared refs). The actual RealtimeMesh apply is deferred to the game
-            // thread and throttled, so we neither hold the octree lock across component
-            // work nor fire one game-thread task per chunk (the old spawn-time burst).
+            // gathers shared refs). The RealtimeMesh apply happens on the game thread in
+            // Tick, so the octree lock is never held across component work.
             double t0 = FPlatformTime::Seconds();
+            const bool bDebug = CVarVoxelDebugFlicker.GetValueOnAnyThread() > 0;
+            const bool bLogStats = bDebug && (t0 - Self->DebugLastStatsTime) > 1.0;
+            FOctreeDebugStats Stats;
             TArray<TSharedPtr<FMeshChunk>> DirtyChunks;
             {
                 FRWScopeLock ReadLock(Self->OctreeLock, SLT_ReadOnly);
                 if (Self->AdaptiveOctree.IsValid())
+                {
                     Self->AdaptiveOctree->CollectDirtyChunks(DirtyChunks);
+                    if (bLogStats)
+                        Self->AdaptiveOctree->GetDebugStats(Stats);
+                }
             }
 
             double elapsed = (FPlatformTime::Seconds() - t0) * 1000.0;
@@ -547,11 +551,24 @@ void AAdaptiveVoxelActor::RunMeshUpdateTask()
             // stale chunks after it.
             Self->EnqueueDirtyChunksForApply(DirtyChunks);
 
+            if (bLogStats)
+            {
+                Self->DebugLastStatsTime = t0;
+                int32 NumQueued = 0;
+                {
+                    FScopeLock Lock(&Self->PendingApplyCS);
+                    NumQueued = Self->PendingApply.Num();
+                }
+                const uint64 OldestAge = Stats.OldestDirtyPublishFrame > 0 ? (GFrameCounter - Stats.OldestDirtyPublishFrame) : 0;
+                UE_LOG(LogTemp, Log, TEXT("[VoxelFlicker] Chunks %d, dirty %d (oldest unapplied: %llu frames), queued %d"),
+                    Stats.NumChunks, Stats.NumDirty, OldestAge, NumQueued);
+            }
+
             Self->MeshUpdateIsRunning = false;
 
             // Chain the next data update on the normal interval. The apply is decoupled --
-            // Tick drains PendingApply at frame rate under a time budget -- so it's no
-            // longer gated to this loop's slower cadence (the old spawn-population bottleneck).
+            // Tick drains PendingApply at frame rate -- so it isn't gated to this loop's
+            // slower cadence.
             AsyncTask(ENamedThreads::GameThread, [WeakThis]()
                 {
                     AAdaptiveVoxelActor* Self = WeakThis.Get();
@@ -587,45 +604,163 @@ void AAdaptiveVoxelActor::DrainPendingApply()
 {
     if (!Initialized || IsDestroyed) return;
 
+    TArray<TSharedPtr<FMeshChunk>> Queue;
+    {
+        FScopeLock Lock(&PendingApplyCS);
+        if (PendingApply.Num() == 0) return;
+        Queue = MoveTemp(PendingApply);
+        PendingApply.Reset();
+    }
+
+    // Capture each chunk's latest stream once; that exact stream is what gets applied, so
+    // a stream published meanwhile can't slip into the wrong group. FirstPass..LastPass
+    // spans the passes the chunk has unapplied work from.
+    struct FQueued
+    {
+        TSharedPtr<FMeshChunk> Chunk;
+        TSharedPtr<FMeshStreamData> Stream;
+        uint32 FirstPass;
+        uint32 LastPass;
+    };
+    TArray<FQueued> Entries;
+    Entries.Reserve(Queue.Num());
+    for (TSharedPtr<FMeshChunk>& Chunk : Queue)
+    {
+        if (!Chunk.IsValid()) continue;
+        if (Chunk->bRetired || !Chunk->IsDirty())
+        {
+            // Leave the queue, then re-check: a publish landing in between either sees the
+            // cleared flag and re-enqueues, or is caught here and kept.
+            {
+                FScopeLock Lock(&PendingApplyCS);
+                Chunk->bApplyQueued = false;
+            }
+            if (Chunk->bRetired || !Chunk->IsDirty()) continue;
+            FScopeLock Lock(&PendingApplyCS);
+            if (Chunk->bApplyQueued) continue;
+            Chunk->bApplyQueued = true;
+        }
+        TSharedPtr<FMeshStreamData> Stream = Chunk->GetPublished();
+        if (!Stream.IsValid()) continue;
+        const uint32 LastPass = Stream->PassId;
+        const uint32 First = Chunk->FirstUnappliedPass.load(std::memory_order_relaxed);
+        Entries.Add({ Chunk, Stream, (First != 0 && First < LastPass) ? First : LastPass, LastPass });
+    }
+    Entries.StableSort([](const FQueued& A, const FQueued& B)
+        {
+            return A.FirstPass != B.FirstPass ? A.FirstPass < B.FirstPass : A.LastPass < B.LastPass;
+        });
+
     const double BudgetSeconds = FMath::Max(0.1, ChunkApplyBudgetMs) / 1000.0;
     const double StartTime = FPlatformTime::Seconds();
 
-    for (;;)
+    // 1. Create missing components within the budget: grouped work first, oldest first,
+    //    since a group waits for all of its components; then the initial build, which
+    //    blocks nothing. A new component's section group is empty, so creating it early
+    //    shows nothing.
+    for (int32 Round = 0; Round < 2; Round++)
     {
-        TSharedPtr<FMeshChunk> Chunk;
+        const bool bBuildRound = Round == 1;
+        for (FQueued& Entry : Entries)
         {
-            FScopeLock Lock(&PendingApplyCS);
-            if (PendingApply.Num() == 0) break;
-            Chunk = PendingApply.Pop(EAllowShrinking::No);
-            if (Chunk.IsValid()) Chunk->bApplyQueued = false;
+            if (FPlatformTime::Seconds() - StartTime > BudgetSeconds) break;
+            if ((Entry.FirstPass == FAdaptiveOctree::BuildPassId) != bBuildRound) continue;
+            if (Entry.Chunk->NeedsComponentFor(Entry.Stream))
+                Entry.Chunk->EnsureComponent();
+        }
+    }
+
+    auto ApplyEntry = [this](FQueued& Entry)
+        {
+            {
+                // Cleared before the apply: a stream published during it re-enqueues.
+                FScopeLock Lock(&PendingApplyCS);
+                Entry.Chunk->bApplyQueued = false;
+            }
+            Entry.Chunk->ApplyStream(Entry.Stream);
+            Entry.Chunk.Reset();
+        };
+
+    // 2. The initial build has no seams on screen to keep consistent yet: its chunks fill
+    //    in as their components appear. (They sort first.)
+    int32 First = 0;
+    while (First < Entries.Num() && Entries[First].FirstPass == FAdaptiveOctree::BuildPassId)
+    {
+        if (!Entries[First].Chunk->NeedsComponentFor(Entries[First].Stream))
+            ApplyEntry(Entries[First]);
+        First++;
+    }
+
+    // 3. Everything later applies in groups: entries whose pass ranges overlap belong
+    //    together (a chunk with work from passes 10..12 ties those passes), and a group
+    //    applies in one frame once all its components exist. A waiting group holds back
+    //    newer ones, whose seams may depend on it. After MaxApplyHoldFrames consecutive
+    //    frames of waiting, every group's ready chunks go up anyway.
+    constexpr int32 MaxApplyHoldFrames = 30;
+    const bool bDebug = CVarVoxelDebugFlicker.GetValueOnGameThread() > 0;
+    const bool bReleaseHeld = ApplyHeldFrames >= MaxApplyHoldFrames;
+    bool bHeadWaiting = false;
+    int32 GroupStart = First;
+    while (GroupStart < Entries.Num())
+    {
+        const uint32 GroupPass = Entries[GroupStart].FirstPass;
+        uint32 GroupLastPass = Entries[GroupStart].LastPass;
+        int32 GroupEnd = GroupStart;
+        bool bReady = true;
+        while (GroupEnd < Entries.Num() && Entries[GroupEnd].FirstPass <= GroupLastPass)
+        {
+            GroupLastPass = FMath::Max(GroupLastPass, Entries[GroupEnd].LastPass);
+            if (Entries[GroupEnd].Chunk->NeedsComponentFor(Entries[GroupEnd].Stream)) bReady = false;
+            GroupEnd++;
         }
 
-        // Apply WITHOUT the octree lock -- matching the original per-chunk apply.
-        // RegisterComponent / UpdateSectionGroup must run on the game thread but don't
-        // touch the octree; taking the octree read lock here would block the whole drain on
-        // the data pass's write lock (a multi-ms UpdateLOD, and the full initial build),
-        // reintroducing the game-thread stall we're removing. ApplyToComponent reads the
-        // chunk's stream, which a concurrent data pass could be rewriting -- a narrow,
-        // pre-existing race (a chunk's stream is only rewritten when its LOD changes, and
-        // RealtimeMesh copies the stream on update). If it ever bites, the fix is to hand
-        // the drain an immutable stream snapshot at mesh time rather than to lock here.
-        if (Chunk.IsValid() && Chunk->IsDirty)
-            Chunk->ApplyToComponent();
+        if (!bReady)
+        {
+            if (GroupStart == First) bHeadWaiting = true;
+            if (!bReleaseHeld) break;
+            if (bDebug)
+                UE_LOG(LogTemp, Warning, TEXT("[VoxelFlicker] Passes %u-%u waited %d frames for components; applying the ready part"),
+                    GroupPass, GroupLastPass, ApplyHeldFrames);
+            for (int32 i = GroupStart; i < GroupEnd; i++)
+                if (!Entries[i].Chunk->NeedsComponentFor(Entries[i].Stream))
+                    ApplyEntry(Entries[i]);
+            GroupStart = GroupEnd;
+            continue;
+        }
 
-        // Budget checked after applying at least one chunk, so the drain always makes
-        // progress even with a tiny budget.
-        if (FPlatformTime::Seconds() - StartTime > BudgetSeconds) break;
+        if (bDebug && GroupStart == First && ApplyHeldFrames > 0)
+        {
+            UE_LOG(LogTemp, Log, TEXT("[VoxelFlicker] Passes %u-%u applied (%d chunks) after waiting %d frames for components"),
+                GroupPass, GroupLastPass, GroupEnd - GroupStart, ApplyHeldFrames);
+        }
+
+        for (int32 i = GroupStart; i < GroupEnd; i++)
+            ApplyEntry(Entries[i]);
+        GroupStart = GroupEnd;
+    }
+
+    // Consecutive frames the oldest group has been waiting for components.
+    ApplyHeldFrames = bHeadWaiting ? ApplyHeldFrames + 1 : 0;
+
+    // Return the rest to the queue (still marked queued).
+    FScopeLock Lock(&PendingApplyCS);
+    for (FQueued& Entry : Entries)
+    {
+        if (Entry.Chunk.IsValid())
+            PendingApply.Add(MoveTemp(Entry.Chunk));
     }
 }
 
-// A chunk is "settled" once whatever it will show is showing: it has applied (IsDirty
-// cleared) or is empty. A chunk retired before it ever applied is settled once its OWN
-// replacements are settled -- this follows a fast promote/demote cascade to the bottom so
-// we never release a coarse chunk while a hole would remain.
+// A replacement chunk covers its space once its render proxy has a mesh (IsDisplayed), or
+// immediately when it was applied with nothing to show. A chunk retired before it ever
+// applied is settled once its OWN replacements are settled -- this follows a fast
+// promote/demote cascade to the bottom so we never release a coarse chunk while a hole
+// would remain.
 static bool IsChunkSettled(const FMeshChunk* Chunk)
 {
     if (!Chunk) return true;
-    if (!Chunk->IsDirty) return true;            // applied at least once, or empty
+    if (Chunk->IsDisplayed()) return true;
+    if (!Chunk->IsDirty() && !Chunk->IsInitialized) return true;   // applied, nothing to show
     if (Chunk->bRetired)                         // superseded before applying -- follow the chain
     {
         for (const TSharedPtr<FMeshChunk>& Rep : Chunk->ReplacedBy)
@@ -646,19 +781,28 @@ void AAdaptiveVoxelActor::DrainPendingDestroy()
         ToProcess = MoveTemp(PendingDestroy);
     }
 
-    // Release a retired chunk only once every chunk that replaces it is live. Until then it
-    // keeps rendering its last mesh, so the promote/demote swap never opens a hole. Chunks
-    // that aren't ready yet are re-queued for a later frame.
+    // Release a retired chunk only once every chunk that replaces it is on screen. Until
+    // then it keeps rendering its last mesh, so the promote/demote swap never opens a hole.
+    // Chunks that aren't ready yet are re-queued for a later frame; MaxRetireWaitFrames after
+    // all replacements have applied, one is released anyway, so a display report that never
+    // arrives can't pin old geometry.
+    constexpr int32 MaxRetireWaitFrames = 120;
     TArray<TSharedPtr<FMeshChunk>> Deferred;
     for (const TSharedPtr<FMeshChunk>& Chunk : ToProcess)
     {
         if (!Chunk.IsValid()) continue;
 
         bool bReplacementsLive = true;
+        bool bReplacementsApplied = true;
         for (const TSharedPtr<FMeshChunk>& Rep : Chunk->ReplacedBy)
         {
-            if (!IsChunkSettled(Rep.Get())) { bReplacementsLive = false; break; }
+            if (!IsChunkSettled(Rep.Get())) bReplacementsLive = false;
+            if (Rep.IsValid() && !Rep->bRetired && Rep->AppliedGen.load(std::memory_order_acquire) == 0) bReplacementsApplied = false;
         }
+        // The timeout only runs once every replacement has been applied: it guards against
+        // a display report that never arrives, not against applies still queued.
+        if (!bReplacementsLive && bReplacementsApplied && ++Chunk->RetireWaitFrames > MaxRetireWaitFrames)
+            bReplacementsLive = true;
 
         if (bReplacementsLive)
         {
@@ -678,25 +822,59 @@ void AAdaptiveVoxelActor::DrainPendingDestroy()
     }
 }
 
-void AAdaptiveVoxelActor::DrainPendingCollision()
+void AAdaptiveVoxelActor::InitializeCollision(double RootExtent)
 {
-    if (IsDestroyed) return;
+    if (!CollisionBricks.IsValid())
+        CollisionBricks = MakeShared<FVoxelCollisionBricks>();
 
-    TArray<TSharedPtr<FMeshChunk>> ToProcess;
+    // The finest octree lattice: corners at -RootExtent + k * ActualPrecision on each axis.
+    FVoxelBrickGrid Grid;
+    Grid.Origin = FVector(-RootExtent);
+    Grid.CellSize = ActualPrecision * FMath::Max(1, CollisionCellScale);
+    Grid.CellsPerBrick = 16;
+    CollisionBricks->Initialize(this, MeshAttachmentRoot, DensityCompositor, Grid, CollisionSlopeBound);
+}
+
+void AAdaptiveVoxelActor::TickCollision(UWorld* World)
+{
+    if (!CollisionBricks.IsValid() || !World) return;
+
+    TArray<FEditNotice> Notices;
     {
         FScopeLock Lock(&PendingApplyCS);
-        if (PendingCollision.Num() == 0) return;
-        ToProcess = MoveTemp(PendingCollision);
+        Notices = MoveTemp(PendingEditNotices);
+        PendingEditNotices.Reset();
+    }
+    for (const FEditNotice& Notice : Notices)
+        CollisionBricks->NotifyEdit(Notice.Sequence, Notice.Center, Notice.Radius);
+
+    TArray<FVoxelCollisionSource> Sources;
+    if (bEnableSurfaceCollision)
+    {
+        const double MaxRadius = FMath::Max(MaxCollisionDistance, WalkBaseCollisionDistance);
+        auto RadiusFor = [this, MaxRadius](double Speed)
+            {
+                return FMath::Min(WalkBaseCollisionDistance + Speed * CollisionCookLeadTime, MaxRadius);
+            };
+
+        const FTransform NoScaleTransform(GetActorRotation(), GetActorLocation());
+        for (FConstPlayerControllerIterator It = World->GetPlayerControllerIterator(); It; ++It)
+        {
+            const APlayerController* PC = It->Get();
+            const APawn* Pawn = PC ? PC->GetPawn() : nullptr;
+            if (!Pawn) continue;
+            // A pawn moved by setting its location reports no velocity; the local camera's
+            // smoothed speed covers that case.
+            const double Speed = FMath::Max((double)Pawn->GetVelocity().Size(), PC->IsLocalController() ? PlayerSpeed : 0.0);
+            Sources.Add({ NoScaleTransform.InverseTransformPosition(Pawn->GetActorLocation()), RadiusFor(Speed) });
+        }
+        if (Sources.Num() == 0 && bHasSpeedSample)
+            Sources.Add({ CameraPosition, RadiusFor(PlayerSpeed) });
     }
 
-    // Few chunks cross the collision threshold per pass, so this is drained fully rather
-    // than time-sliced. RealtimeMesh async-cooks, so the flip itself is cheap; the cook cost
-    // is amortized by the async worker and covered by the lead distance.
-    for (const TSharedPtr<FMeshChunk>& Chunk : ToProcess)
-    {
-        if (Chunk.IsValid() && !Chunk->bRetired && Chunk->bWantsCollision != Chunk->bCollisionActive)
-            Chunk->SetCollisionActive(Chunk->bWantsCollision);
-    }
+    CollisionBricks->Tick(Sources, CollisionHysteresis);
+    if (MeshAttachmentRoot)
+        CollisionBricks->DrawDebug(World, MeshAttachmentRoot->GetComponentTransform());
 }
 
 void AAdaptiveVoxelActor::RunEditUpdateTask(FVector InEditCenter, double InEditRadius, double InEditStrength, int InEditResolution)
@@ -712,21 +890,36 @@ void AAdaptiveVoxelActor::RunEditUpdateTask(FVector InEditCenter, double InEditR
             if (!Self || Self->IsDestroyed) return;
 
             TArray<TSharedPtr<FMeshChunk>> DirtyChunks;
+            bool bApplied = false;
             {
                 FRWScopeLock WriteLock(Self->OctreeLock, SLT_Write);
-                Self->AdaptiveOctree->ApplyEdit(InEditCenter, InEditRadius, InEditStrength, InEditResolution);
-                Self->AdaptiveOctree->CollectDirtyChunks(DirtyChunks);
+                // The octree is built by the first data pass; an edit before that is dropped.
+                if (Self->AdaptiveOctree.IsValid())
+                {
+                    Self->AdaptiveOctree->BeginPass();
+                    Self->AdaptiveOctree->ApplyEdit(InEditCenter, InEditRadius, InEditStrength, InEditResolution);
+                    Self->AdaptiveOctree->CollectDirtyChunks(DirtyChunks);
+                    bApplied = true;
+                }
+            }
+
+            // The collision bricks rebuild what this edit reaches.
+            TSharedPtr<FSparseEditStore> EditStore;
+            if (Self->DensityCompositor.IsValid())
+                EditStore = Self->DensityCompositor->GetEditStore();
+            if (bApplied && EditStore.IsValid())
+            {
+                FScopeLock Lock(&Self->PendingApplyCS);
+                Self->PendingEditNotices.Add({ EditStore->GetLastSequence(), InEditCenter, InEditRadius });
             }
 
             double elapsed = (FPlatformTime::Seconds() - t0) * 1000.0;
             if (elapsed > EDIT_LOG_THRESHOLD) UE_LOG(LogTemp, Log, TEXT("[Pipeline] EditUpdate: %.2fms"), elapsed);
 
-            Self->EditUpdateIsRunning = false;
-
-            // Enqueue for the same game-thread drain as the mesh loop; Tick applies within
-            // the per-frame budget. Edits touch few chunks, so they typically drain in the
-            // next frame or two.
+            // Enqueue before clearing the running flag: Initialize waits on the flag and then
+            // clears the queue, so chunks of a replaced octree never land after that clear.
             Self->EnqueueDirtyChunksForApply(DirtyChunks);
+            Self->EditUpdateIsRunning = false;
 
         }, TStatId(), nullptr, ENamedThreads::AnyNormalThreadHiPriTask);
 }
@@ -741,26 +934,47 @@ void AAdaptiveVoxelActor::Tick(float DeltaTime)
     Super::Tick(DeltaTime);
     if (!Initialized) return;
 
-    // Drain a per-frame time slice of queued chunk applies (component creation + mesh
-    // push). Decoupled from the data/mesh loop so it runs at frame rate.
+    // Create components and swap in finished passes (component creation is time-sliced).
     DrainPendingApply();
 
     // Destroy components of chunks retired by the chunk-cut pass. After the applies above
     // so the finer replacement chunks get a chance to appear first.
     DrainPendingDestroy();
 
-    // Flip collision on/off for chunks the collision pass re-gated (cook + query).
-    DrainPendingCollision();
-
     // Cache cam data
     auto world = GetWorld();
     if (world != nullptr)
     {
+        // Flicker diagnostics: outline chunks the last stale-seam check flagged (red) and
+        // chunks whose current mesh holds folded triangles (yellow).
+        if (CVarVoxelDebugFlicker.GetValueOnGameThread() > 0 && MeshAttachmentRoot)
+        {
+            TArray<FBox> StaleBounds;
+            TArray<FBox> FoldedBounds;
+            {
+                FScopeLock Lock(&PendingApplyCS);
+                if (FPlatformTime::Seconds() - DebugStaleBoundsTime < 2.0)
+                    StaleBounds = DebugStaleBounds;
+                FoldedBounds = DebugFoldedBounds;
+            }
+            const FTransform& ToWorld = MeshAttachmentRoot->GetComponentTransform();
+            for (const FBox& Bounds : StaleBounds)
+            {
+                DrawDebugBox(world, ToWorld.TransformPosition(Bounds.GetCenter()), Bounds.GetExtent(),
+                    ToWorld.GetRotation(), FColor::Red, false, -1.f, 0, 50.f);
+            }
+            for (const FBox& Bounds : FoldedBounds)
+            {
+                DrawDebugBox(world, ToWorld.TransformPosition(Bounds.GetCenter()), Bounds.GetExtent(),
+                    ToWorld.GetRotation(), FColor::Yellow, false, -1.f, 0, 30.f);
+            }
+        }
+
         auto viewLocations = world->ViewLocationsRenderedLastFrame;
         if (viewLocations.Num() > 0)
         {
             // Convert world-space camera to actor-local space.
-            // Position and rotation only � octree is built at world scale, not normalized.
+            // Position and rotation only - octree is built at world scale, not normalized.
             FVector WorldCamPos = viewLocations[0];
             FTransform NoScaleTransform(GetActorRotation(), GetActorLocation());
             this->CameraPosition = NoScaleTransform.InverseTransformPosition(WorldCamPos);
@@ -781,6 +995,8 @@ void AAdaptiveVoxelActor::Tick(float DeltaTime)
                 CameraFOV = CamManager->GetFOVAngle();
             }
         }
+
+        TickCollision(world);
 
         //Example of edit flow, would want to move off tick for actual implementation
         if (world->IsGameWorld())

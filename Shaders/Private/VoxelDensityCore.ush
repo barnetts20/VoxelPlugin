@@ -1,0 +1,190 @@
+// VoxelDensityCore.ush - Density math shared by the CPU backend (compiled as C++ through
+// VoxelShaderCompat.h) and the GPU mesher (HLSL). Keep to the subset described in
+// VoxelShaderCompat.h. Positions never reach this file: callers pass, per noise octave, an
+// integer lattice cell (uint3, wrapping at 2^32) and a fraction in [0,1), so the math is
+// precise at any planet radius.
+
+#ifndef VOXEL_DENSITY_CORE_USH
+#define VOXEL_DENSITY_CORE_USH
+
+#ifndef VOXEL_FUNC
+#define VOXEL_FUNC
+#endif
+
+// Value and gradient (in lattice units) of one noise evaluation.
+struct FVoxelNoiseSample
+{
+    float Value;
+    float3 Gradient;
+};
+
+// Running state of a fractal sum.
+struct FVoxelFbmState
+{
+    float Sum;
+    float3 DerivSum;     // accumulated lattice-unit gradients (slope damping)
+    float RidgeWeight;   // ridged multifractal feedback
+};
+
+// Surface-shape constants (filled from FVoxelSurfaceSettings).
+struct FVoxelSurfaceParams
+{
+    float ContinentWeight;
+    float MountainWeight;
+    float MountainStart;
+    float MountainBlend;
+    float RidgeOffset;
+    float RidgeGain;
+    float DetailWeight;
+    float DetailSlopeDamping;
+};
+
+// 32-bit hash of a lattice cell (lowbias32 finalizer).
+VOXEL_FUNC uint VoxelHash(uint3 Cell, uint Seed)
+{
+    uint H = Seed ^ (Cell.x * 0x8da6b343u) ^ (Cell.y * 0xd8163841u) ^ (Cell.z * 0xcb1ab31fu);
+    H ^= H >> 16;
+    H *= 0x7feb352du;
+    H ^= H >> 15;
+    H *= 0x846ca68bu;
+    H ^= H >> 16;
+    return H;
+}
+
+VOXEL_FUNC uint VoxelHashSeed(uint Seed, uint Salt)
+{
+    return VoxelHash(uint3(Salt, Salt * 0x9e3779b9u, 0x632be5abu), Seed);
+}
+
+// Pseudo-random gradient with components in [-1, 1].
+VOXEL_FUNC float3 VoxelGradient(uint H)
+{
+    const float3 G = float3(float(H & 0x3ffu), float((H >> 10) & 0x3ffu), float((H >> 20) & 0x3ffu));
+    return G * (2.0f / 1023.0f) - 1.0f;
+}
+
+// Gradient noise with quintic interpolation and its analytic gradient. Cell is the lattice
+// cell containing the point, F the point's position inside it.
+VOXEL_FUNC FVoxelNoiseSample VoxelGradientNoise(uint3 Cell, float3 F, uint Seed)
+{
+    const float3 U = F * F * F * (F * (F * 6.0f - 15.0f) + 10.0f);
+    const float3 DU = 30.0f * F * F * (F * (F - 2.0f) + 1.0f);
+
+    const float3 GA = VoxelGradient(VoxelHash(Cell + uint3(0u, 0u, 0u), Seed));
+    const float3 GB = VoxelGradient(VoxelHash(Cell + uint3(1u, 0u, 0u), Seed));
+    const float3 GC = VoxelGradient(VoxelHash(Cell + uint3(0u, 1u, 0u), Seed));
+    const float3 GD = VoxelGradient(VoxelHash(Cell + uint3(1u, 1u, 0u), Seed));
+    const float3 GE = VoxelGradient(VoxelHash(Cell + uint3(0u, 0u, 1u), Seed));
+    const float3 GF = VoxelGradient(VoxelHash(Cell + uint3(1u, 0u, 1u), Seed));
+    const float3 GG = VoxelGradient(VoxelHash(Cell + uint3(0u, 1u, 1u), Seed));
+    const float3 GH = VoxelGradient(VoxelHash(Cell + uint3(1u, 1u, 1u), Seed));
+
+    const float VA = dot(GA, F);
+    const float VB = dot(GB, F - float3(1.0f, 0.0f, 0.0f));
+    const float VC = dot(GC, F - float3(0.0f, 1.0f, 0.0f));
+    const float VD = dot(GD, F - float3(1.0f, 1.0f, 0.0f));
+    const float VE = dot(GE, F - float3(0.0f, 0.0f, 1.0f));
+    const float VF = dot(GF, F - float3(1.0f, 0.0f, 1.0f));
+    const float VG = dot(GG, F - float3(0.0f, 1.0f, 1.0f));
+    const float VH = dot(GH, F - float3(1.0f, 1.0f, 1.0f));
+
+    const float K1 = VB - VA;
+    const float K2 = VC - VA;
+    const float K3 = VE - VA;
+    const float K4 = VA - VB - VC + VD;
+    const float K5 = VA - VC - VE + VG;
+    const float K6 = VA - VB - VE + VF;
+    const float K7 = -VA + VB + VC - VD + VE - VF - VG + VH;
+
+    FVoxelNoiseSample Result;
+    Result.Value = VA + K1 * U.x + K2 * U.y + K3 * U.z
+        + K4 * U.x * U.y + K5 * U.y * U.z + K6 * U.z * U.x + K7 * U.x * U.y * U.z;
+
+    const float3 G1 = GB - GA;
+    const float3 G2 = GC - GA;
+    const float3 G3 = GE - GA;
+    const float3 G4 = GA - GB - GC + GD;
+    const float3 G5 = GA - GC - GE + GG;
+    const float3 G6 = GA - GB - GE + GF;
+    const float3 G7 = GH - GA + GB + GC - GD + GE - GF - GG;
+    const float3 Interp = GA + G1 * U.x + G2 * U.y + G3 * U.z
+        + G4 * (U.x * U.y) + G5 * (U.y * U.z) + G6 * (U.z * U.x) + G7 * (U.x * U.y * U.z);
+    const float3 Slope = float3(
+        K1 + K4 * U.y + K6 * U.z + K7 * U.y * U.z,
+        K2 + K5 * U.z + K4 * U.x + K7 * U.z * U.x,
+        K3 + K6 * U.x + K5 * U.y + K7 * U.x * U.y);
+    Result.Gradient = Interp + DU * Slope;
+    return Result;
+}
+
+// Weight of an octave of the given wavelength for samples meshed at Footprint (both in the
+// same units): 1 when the wavelength spans at least four footprints, fading to 0 at two.
+// Footprint <= 0 keeps every octave.
+VOXEL_FUNC float VoxelOctaveBandWeight(float Wavelength, float Footprint)
+{
+    if (Footprint <= 0.0f) return 1.0f;
+    return saturate(Wavelength / (2.0f * Footprint) - 1.0f);
+}
+
+VOXEL_FUNC FVoxelFbmState VoxelFbmBegin()
+{
+    FVoxelFbmState S;
+    S.Sum = 0.0f;
+    S.DerivSum = float3(0.0f, 0.0f, 0.0f);
+    S.RidgeWeight = 1.0f;
+    return S;
+}
+
+// Plain fBm octave.
+VOXEL_FUNC FVoxelFbmState VoxelFbmAdd(FVoxelFbmState S, FVoxelNoiseSample N, float Amplitude)
+{
+    S.Sum += Amplitude * N.Value;
+    return S;
+}
+
+// fBm octave damped by the slope accumulated so far: steep areas get less fine detail,
+// which reads as erosion without simulating it.
+VOXEL_FUNC FVoxelFbmState VoxelFbmAddDamped(FVoxelFbmState S, FVoxelNoiseSample N, float Amplitude, float Damping)
+{
+    S.DerivSum = S.DerivSum + N.Gradient;
+    S.Sum += Amplitude * N.Value / (1.0f + Damping * dot(S.DerivSum, S.DerivSum));
+    return S;
+}
+
+// Ridged multifractal octave: sharp crests where the noise crosses zero, each octave
+// weighted by the previous one so detail concentrates on the ridges.
+VOXEL_FUNC FVoxelFbmState VoxelFbmAddRidged(FVoxelFbmState S, FVoxelNoiseSample N, float Amplitude, float Offset, float Gain)
+{
+    float Signal = Offset - abs(N.Value);
+    Signal = Signal * Signal * S.RidgeWeight;
+    S.RidgeWeight = saturate(Signal * Gain);
+    S.Sum += Amplitude * Signal;
+    return S;
+}
+
+// Surface height as a fraction [0, 1] of the noise amplitude, from the normalised layer sums:
+// Continent and Detail in about [-1, 1], Ridge in about [0, 1]. Continent 0 sits at half the
+// amplitude. (The CPU backend composes the same formula in double: FVoxelDensityCPU::HeightAt.)
+VOXEL_FUNC float VoxelSurfaceHeight01(float Continent, float Ridge, float Detail, FVoxelSurfaceParams P)
+{
+    const float Base = 0.5f + 0.5f * P.ContinentWeight * Continent;
+    const float MountainMask = smoothstep(P.MountainStart, P.MountainStart + P.MountainBlend, Continent);
+    const float Mountains = P.MountainWeight * MountainMask * Ridge;
+    const float Details = P.DetailWeight * Detail;
+    return saturate(Base + Mountains + Details);
+}
+
+// Signed distance-like value of the cave layer: negative inside a cave. Placeholder until the
+// cave layer exists: no caves anywhere.
+VOXEL_FUNC float VoxelCaveDensity()
+{
+    return 1.0e30f;
+}
+
+// Terrain density from the surface and cave terms (negative = solid). Caves subtract.
+VOXEL_FUNC float VoxelComposeTerrain(float Surface, float Cave)
+{
+    return max(Surface, -Cave);
+}
+
+#endif // VOXEL_DENSITY_CORE_USH

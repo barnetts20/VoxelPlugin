@@ -1,0 +1,153 @@
+// VoxelDensity.h - The planet's density function: surface settings, the CPU evaluation of the
+// shared density core (VoxelDensityCore.ush), and the one factory every consumer (terrain,
+// ocean, planet) builds its compositor from.
+
+#pragma once
+
+#include "CoreMinimal.h"
+#include "FDensitySampleCompositor.h"
+#include "VoxelDensity.generated.h"
+
+/** Shape of the planet's surface heightfield. Wavelengths are fractions of the planet radius,
+ *  so a setting keeps its look at any planet size; weights are fractions of the noise
+ *  amplitude (the height range above the planet radius). */
+USTRUCT(BlueprintType)
+struct VOXELPLUGIN_API FVoxelSurfaceSettings
+{
+    GENERATED_BODY()
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Surface")
+    int32 Seed = 1337;
+
+    /** Frequency ratio between successive octaves in every layer. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Surface", meta = (ClampMin = "1.01", UIMin = "1.5", UIMax = "3.0"))
+    double Lacunarity = 2.0;
+
+    // --- Continents: large, smooth landmasses and basins ---
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Surface|Continents", meta = (ClampMin = "0.000001", UIMin = "0.05", UIMax = "2.0"))
+    double ContinentWavelength = 0.6;
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Surface|Continents", meta = (ClampMin = "0", UIMin = "1", UIMax = "10"))
+    int32 ContinentOctaves = 5;
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Surface|Continents", meta = (UIMin = "0.2", UIMax = "0.8"))
+    double ContinentGain = 0.5;
+
+    /** Height swing of the continents around half the amplitude (1 = the full range). */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Surface|Continents", meta = (UIMin = "0.0", UIMax = "1.0"))
+    double ContinentWeight = 0.6;
+
+    // --- Mountains: ridged ranges on the higher continental ground ---
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Surface|Mountains", meta = (ClampMin = "0.000001", UIMin = "0.005", UIMax = "0.5"))
+    double MountainWavelength = 0.08;
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Surface|Mountains", meta = (ClampMin = "0", UIMin = "1", UIMax = "12"))
+    int32 MountainOctaves = 8;
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Surface|Mountains", meta = (UIMin = "0.2", UIMax = "0.8"))
+    double MountainGain = 0.45;
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Surface|Mountains", meta = (UIMin = "0.0", UIMax = "1.0"))
+    double MountainWeight = 0.25;
+
+    /** Continent value (about -1..1) where mountains begin, and the range they fade in over. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Surface|Mountains", meta = (UIMin = "-1.0", UIMax = "1.0"))
+    double MountainStart = 0.1;
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Surface|Mountains", meta = (ClampMin = "0.0001", UIMin = "0.05", UIMax = "1.0"))
+    double MountainBlend = 0.4;
+
+    /** Ridge sharpness feedback: higher concentrates detail on the crests. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Surface|Mountains", meta = (UIMin = "0.5", UIMax = "4.0"))
+    double RidgeGain = 2.0;
+
+    // --- Detail: fine relief, damped on steep slopes ---
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Surface|Detail", meta = (ClampMin = "0.0000001", UIMin = "0.0005", UIMax = "0.05"))
+    double DetailWavelength = 0.01;
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Surface|Detail", meta = (ClampMin = "0", UIMin = "1", UIMax = "20"))
+    int32 DetailOctaves = 14;
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Surface|Detail", meta = (UIMin = "0.2", UIMax = "0.8"))
+    double DetailGain = 0.45;
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Surface|Detail", meta = (UIMin = "0.0", UIMax = "0.5"))
+    double DetailWeight = 0.02;
+
+    /** How strongly accumulated slope suppresses finer octaves (0 = plain fBm). */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Surface|Detail", meta = (ClampMin = "0.0", UIMin = "0.0", UIMax = "4.0"))
+    double DetailSlopeDamping = 3.0;
+
+    /** Hash of every field, for change detection. */
+    uint32 GetSettingsHash() const;
+};
+
+/** CPU evaluation of the planet's density: surface heightfield, cave slot and their
+ *  composition, from VoxelDensityCore.ush. Positions are double and each noise octave is
+ *  evaluated on an integer lattice split in double, so results are precise at any radius.
+ *  Immutable after construction; safe to call from any thread. */
+class VOXELPLUGIN_API FVoxelDensityCPU
+{
+public:
+    /** InMinFootprint (cm) is the smallest footprint any sample is evaluated at: octaves finer
+     *  than it are always left out, whatever footprint a caller passes (0 keeps all). */
+    FVoxelDensityCPU(const FVoxelSurfaceSettings& InSettings, double InPlanetRadius, double InNoiseAmplitude, double InMinFootprint = 0.0);
+
+    /** Height above the planet radius (cm, 0..NoiseAmplitude) in direction Dir (any length),
+     *  with octaves finer than Footprint (cm) left out. */
+    double HeightAt(const FVector& Dir, double Footprint) const;
+
+    /** Terrain density (negative = solid) at each input position, without edits. */
+    void Sample(const FSampleInput& Input, float* DensityOut) const;
+
+    double GetPlanetRadius() const { return PlanetRadius; }
+    double GetNoiseAmplitude() const { return NoiseAmplitude; }
+
+private:
+    struct FLayer
+    {
+        double BaseFrequency = 0.0;   // cycles per cm at octave 0
+        double Lacunarity = 2.0;
+        double Gain = 0.5;
+        int32 Octaves = 0;
+        uint32 Seed = 0;
+        double InvNorm = 0.0;         // output scale (see MakeLayer)
+        TArray<FVector> Offsets;      // per-octave lattice offset (decorrelates octaves)
+    };
+
+    enum class ELayerKind : uint8 { Plain, Ridged, Damped };
+
+    static FLayer MakeLayer(ELayerKind Kind, double WavelengthFraction, double InPlanetRadius, double InLacunarity, double InGain, int32 InOctaves, uint32 InSeed);
+    double EvaluateLayer(const FLayer& Layer, ELayerKind Kind, const FVector& SurfacePoint, double Footprint) const;
+    float SampleOne(const FVector& Position, double Footprint) const;
+
+    FVoxelSurfaceSettings Settings;
+    double PlanetRadius = 1.0;
+    double NoiseAmplitude = 0.0;
+    double MinFootprint = 0.0;
+    FLayer Continent;
+    FLayer Mountain;
+    FLayer Detail;
+};
+
+namespace VoxelDensity
+{
+    /** The compositor every terrain, ocean and planet consumer samples: the CPU density as its
+     *  only layer, plus EditStore (may be null) applied on top. MinFootprint is the terrain's
+     *  finest cell size (TerrainFinestCell), so every consumer of one compositor sees the same
+     *  field; 0 keeps every octave. */
+    VOXELPLUGIN_API TSharedPtr<FDensitySampleCompositor> MakeCompositor(const FVoxelSurfaceSettings& Settings,
+        double PlanetRadius, double NoiseAmplitude, TSharedPtr<FSparseEditStore> EditStore, double MinFootprint = 0.0);
+
+    /** Root half-extent of a terrain octree for a planet: holds every possible surface point. */
+    inline double RootExtentFor(double PlanetRadius, double NoiseAmplitude) { return (PlanetRadius + NoiseAmplitude) * 1.05; }
+
+    /** Cell size (cm) of the finest terrain octree level. */
+    inline double TerrainFinestCell(double PlanetRadius, double NoiseAmplitude, int32 MaxDepth)
+    {
+        return 2.0 * RootExtentFor(PlanetRadius, NoiseAmplitude) / FMath::Pow(2.0, (double)MaxDepth);
+    }
+}

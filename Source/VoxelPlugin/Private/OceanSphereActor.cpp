@@ -1,4 +1,4 @@
-﻿#include "OceanSphereActor.h"
+#include "OceanSphereActor.h"
 #include "FOceanQuadTreeNode.h"
 #include "FDensitySampleCompositor.h"
 #include "Kismet/GameplayStatics.h"
@@ -74,7 +74,13 @@ void AOceanSphereActor::PostEditChangeProperty(FPropertyChangedEvent& PropertyCh
         GET_MEMBER_NAME_CHECKED(AOceanSphereActor, ScreenSpaceThreshold),
     };
 
-    if (RebuildProps.Contains(PropName))
+    // A change inside SurfaceSettings reports the inner field; the member property is the
+    // struct. Slider drags rebuild once, on release.
+    const bool bSurfaceChanged = !bIsPlanetOwned && PropertyChangedEvent.ChangeType != EPropertyChangeType::Interactive
+        && PropertyChangedEvent.MemberProperty
+        && PropertyChangedEvent.MemberProperty->GetFName() == GET_MEMBER_NAME_CHECKED(AOceanSphereActor, SurfaceSettings);
+
+    if (RebuildProps.Contains(PropName) || bSurfaceChanged)
     {
         Initialize();
     }
@@ -250,59 +256,9 @@ void AOceanSphereActor::InitializeInternal(TSharedPtr<FDensitySampleCompositor> 
     }
     else
     {
-        // Standalone — build our own noise + compositor
-        Noise = FastNoise::NewFromEncodedNodeTree("GQAgAB8AEwCamRk+DQAMAAAAAAAAQAcAAAAAAD8AAAAAAAAAAAA/AAAAAD8AAAAAvwAAAAA/ARsAFwCamRk+AAAAPwAAAAAAAAA/IAAgABMAAABAQBsAJAACAAAADQAIAAAAAAAAQAsAAQAAAAAAAAABAAAAAAAAAAAAAIA/AAAAAD8AAAAAAAAAAIA/AAAAAAAAmpmZPgCamRk+AM3MTD4BEwDNzEw+IAAfABcAAACAvwAAgD8AAIDAAAAAPw8AAQAAAAAAAED//wEAAAAAAD8AAAAAAAAAAIA/AAAAAD8AAACAvwAAAAA/");
-
-        auto HeightmapLayer = [NoiseNode = Noise, PlanetRadius = TerrainPlanetRadius, NoiseAmplitude = TerrainNoiseAmplitude]
-        (const FSampleInput& Input, float* DensityOut)
-            {
-                int32 Count = Input.Num();
-                double InvNoiseAmplitude = 1.0 / NoiseAmplitude;
-                double RootExtent = (PlanetRadius + NoiseAmplitude) * 1.05;
-
-                constexpr int32 StackLimit = 64;
-                float  StackPX[StackLimit], StackPY[StackLimit], StackPZ[StackLimit], StackNoise[StackLimit];
-                double StackDist[StackLimit];
-                TArray<float>  HeapPX, HeapPY, HeapPZ, HeapNoise;
-                TArray<double> HeapDist;
-
-                float* PX; float* PY; float* PZ; float* NoiseOut; double* Distances;
-                if (Count <= StackLimit)
-                {
-                    PX = StackPX; PY = StackPY; PZ = StackPZ; NoiseOut = StackNoise; Distances = StackDist;
-                }
-                else
-                {
-                    HeapPX.SetNumUninitialized(Count); HeapPY.SetNumUninitialized(Count);
-                    HeapPZ.SetNumUninitialized(Count); HeapNoise.SetNumUninitialized(Count);
-                    HeapDist.SetNumUninitialized(Count);
-                    PX = HeapPX.GetData(); PY = HeapPY.GetData(); PZ = HeapPZ.GetData();
-                    NoiseOut = HeapNoise.GetData(); Distances = HeapDist.GetData();
-                }
-
-                for (int32 i = 0; i < Count; i++)
-                {
-                    double px = Input.X[i], py = Input.Y[i], pz = Input.Z[i];
-                    double Dist = FMath::Sqrt(px * px + py * py + pz * pz);
-                    Distances[i] = Dist;
-                    double InvDist = (Dist > 1e-10) ? (RootExtent / Dist) : 0.0;
-                    PX[i] = (float)(px * InvDist * InvNoiseAmplitude);
-                    PY[i] = (float)(py * InvDist * InvNoiseAmplitude);
-                    PZ[i] = (float)(pz * InvDist * InvNoiseAmplitude);
-                }
-
-                NoiseNode->GenPositionArray3D(NoiseOut, Count, PX, PY, PZ, 0, 0, 0, 0);
-
-                for (int32 i = 0; i < Count; i++)
-                {
-                    double Clamped = FMath::Clamp((double)NoiseOut[i], -1.0, 1.0);
-                    double Height = (Clamped + 1.0) * 0.5 * NoiseAmplitude;
-                    DensityOut[i] = (float)(Distances[i] - (PlanetRadius + Height));
-                }
-            };
-
-        NewCompositor = MakeShared<FDensitySampleCompositor>();
-        NewCompositor->AddSampleLayer(HeightmapLayer);
+        // Standalone: build our own compositor (no edit store; the terrain's depth is not
+        // known here, so every octave is kept).
+        NewCompositor = VoxelDensity::MakeCompositor(SurfaceSettings, TerrainPlanetRadius, TerrainNoiseAmplitude, nullptr);
     }
 
     // Publish the compositor under the same lock the LOD task reads it with.
@@ -541,7 +497,7 @@ void AOceanSphereActor::RebuildChunkStreamData(
         TArray<FColor>    LeafColor; LeafColor.SetNumUninitialized(Total);
 
         // Stage 1: positions, normals, sphere positions for sampling
-        TArray<float> SX, SY, SZ;
+        TArray<double> SX, SY, SZ;
         SX.SetNumUninitialized(Total);
         SY.SetNumUninitialized(Total);
         SZ.SetNumUninitialized(Total);
@@ -564,9 +520,9 @@ void AOceanSphereActor::RebuildChunkStreamData(
                 FVector Normal = SpherePos.GetSafeNormal();
                 LeafNorm[vi] = FVector3f(Normal);
 
-                SX[vi] = (float)SpherePos.X;
-                SY[vi] = (float)SpherePos.Y;
-                SZ[vi] = (float)SpherePos.Z;
+                SX[vi] = SpherePos.X;
+                SY[vi] = SpherePos.Y;
+                SZ[vi] = SpherePos.Z;
             }
         }
 
@@ -728,6 +684,7 @@ void AOceanSphereActor::RunLodUpdateTask()
             TArray<TSharedPtr<FOceanQuadTreeNode>> ChunkNodes;
             TArray<TSharedPtr<FOceanMeshChunk>>    MeshChunks;
             TSharedPtr<FDensitySampleCompositor>   CompPin;
+            TSharedPtr<FOceanQuadTreeNode>         RootsPin[6];
             {
                 // Serialize with InitializeInternal / BeginDestroy, which free
                 // ChunkMap on the GT. Re-check staleness under the lock: if a
@@ -748,6 +705,11 @@ void AOceanSphereActor::RunLodUpdateTask()
                 // a torn read; holding the shared ref keeps the object alive even
                 // if the GT swaps Compositor mid-pass.
                 CompPin = Self->Compositor;
+
+                // Same for the face roots: neighbour lookups walk this snapshot, never the
+                // live RootNodes a re-init resets on the game thread.
+                for (int32 i = 0; i < 6; ++i)
+                    RootsPin[i] = Self->RootNodes[i];
             }
 
             int32 NumChunks = ChunkNodes.Num();
@@ -835,7 +797,7 @@ void AOceanSphereActor::RunLodUpdateTask()
                     if (Self->InitGeneration != CapturedGen) return;
                     bool bAnyEdgeChanged = false;
                     for (auto& Leaf : AllChunkLeaves[idx])
-                        if (Leaf->CheckNeighbors())
+                        if (Leaf->CheckNeighbors(RootsPin))
                             bAnyEdgeChanged = true;
                     ChunkEdgeChanged[idx] = bAnyEdgeChanged;
                 });
@@ -885,23 +847,23 @@ void AOceanSphereActor::RunLodUpdateTask()
                         auto* InnerTriStream = Chunk->InnerMeshData->MeshStream.Find(FRealtimeMeshStreams::Triangles);
                         if (InnerTriStream && InnerTriStream->Num() > 0)
                         {
-                            MeshPtr->UpdateSectionGroup(Chunk->InnerMeshData->MeshGroupKey, Chunk->InnerMeshData->MeshStream);
+                            MeshPtr->UpdateBufferSet(Chunk->InnerMeshData->MeshGroupKey, Chunk->InnerMeshData->MeshStream);
                             FRealtimeMeshSectionConfig Config(0);
-                            MeshPtr->UpdateSectionConfig(Chunk->InnerMeshData->MeshSectionKey, Config, true);
+                            MeshPtr->UpdateSectionConfig(Chunk->InnerMeshData->MeshSectionKey, Config, false); // no collision: the ocean has none
                         }
                         else
-                            MeshPtr->UpdateSectionGroup(Chunk->InnerMeshData->MeshGroupKey, FRealtimeMeshStreamSet());
+                            MeshPtr->UpdateBufferSet(Chunk->InnerMeshData->MeshGroupKey, FRealtimeMeshStreamSet());
 
                         auto* EdgeTriStream = Chunk->EdgeMeshData->MeshStream.Find(FRealtimeMeshStreams::Triangles);
                         if (EdgeTriStream && EdgeTriStream->Num() > 0)
                         {
-                            MeshPtr->UpdateSectionGroup(Chunk->EdgeMeshData->MeshGroupKey, Chunk->EdgeMeshData->MeshStream);
+                            MeshPtr->UpdateBufferSet(Chunk->EdgeMeshData->MeshGroupKey, Chunk->EdgeMeshData->MeshStream);
                             FRealtimeMeshSectionConfig Config(0);
                             Config.bCastsShadow = false;
-                            MeshPtr->UpdateSectionConfig(Chunk->EdgeMeshData->MeshSectionKey, Config, true);
+                            MeshPtr->UpdateSectionConfig(Chunk->EdgeMeshData->MeshSectionKey, Config, false); // no collision: the ocean has none
                         }
                         else
-                            MeshPtr->UpdateSectionGroup(Chunk->EdgeMeshData->MeshGroupKey, FRealtimeMeshStreamSet());
+                            MeshPtr->UpdateBufferSet(Chunk->EdgeMeshData->MeshGroupKey, FRealtimeMeshStreamSet());
 
                         Chunk->IsDirty = false;
                     }
@@ -914,26 +876,4 @@ void AOceanSphereActor::RunLodUpdateTask()
                 });
 
         }, TStatId(), nullptr, ENamedThreads::AnyNormalThreadHiPriTask);
-}
-
-// ---------------------------------------------------------------------------
-// GetNodeByIndex
-// ---------------------------------------------------------------------------
-
-TSharedPtr<FOceanQuadTreeNode> AOceanSphereActor::GetNodeByIndex(const FQuadIndex& Index) const
-{
-    if (Index.FaceId >= 6) return nullptr;
-    TSharedPtr<FOceanQuadTreeNode> Cur = RootNodes[Index.FaceId];
-    if (!Cur.IsValid() || Index.IsRoot()) return Cur;
-
-    uint8 Depth = Index.GetDepth();
-    for (uint8 Level = 0; Level < Depth; ++Level)
-    {
-        uint8 Quad = Index.GetQuadrantAtDepth(Level);
-        if (Cur->IsLeaf()) return Cur;
-        if (Quad >= (uint8)Cur->Children.Num()) return Cur;
-        Cur = Cur->Children[Quad];
-        if (!Cur.IsValid()) return nullptr;
-    }
-    return Cur;
 }

@@ -1,4 +1,4 @@
-﻿#include "FAdaptiveOctreeNode.h"
+#include "FAdaptiveOctreeNode.h"
 #include "FAdaptiveOctree.h"
 #include "FQEF.h"
 #include "FOctreeConstants.h"
@@ -124,6 +124,17 @@ void FAdaptiveOctreeNode::FinalizeFromExistingCorners(bool bSkipNormals)
     // Edit persistence is handled separately by bHasEditedDescendants.
     CouldContainSurface = IsNearSurface();
 
+    // An interior node's own corners can miss surface its children hold.
+    if (!bIsLeaf)
+    {
+        for (int i = 0; i < 8; i++)
+        {
+            if (!Children[i].IsValid()) continue;
+            IsSurfaceNode |= Children[i]->IsSurfaceNode;
+            CouldContainSurface |= Children[i]->CouldContainSurface;
+        }
+    }
+
     // Propagate surface flags up to ancestors so the LOD system knows
     // which subtrees contain geometry without traversing them.
     if (IsSurfaceNode)
@@ -167,16 +178,16 @@ void FAdaptiveOctreeNode::Merge()
 {
     if (bIsLeaf) return;
 
-    // Before destroying children, check if any had edit-created surface
-    // that this node's corners can't resolve. Preserve that knowledge
-    // so the LOD system re-splits when the camera returns.
+    // Children merge first, so their flags already summarize their whole subtree.
     for (int i = 0; i < 8; i++)
     {
         if (Children[i].IsValid())
         {
-            if (Children[i]->bHasEditedDescendants || Children[i]->CouldContainSurface)
-                bHasEditedDescendants = true;
             Children[i]->Merge();
+            if (Children[i]->bHasEditedDescendants)
+                bHasEditedDescendants = true;
+            if (Children[i]->CouldContainSurface || Children[i]->bHadSurfaceDescendants)
+                bHadSurfaceDescendants = true;
             Children[i].Reset();
         }
     }
@@ -214,6 +225,11 @@ TArray<FNodeEdge>& FAdaptiveOctreeNode::GetSignChangeEdges()
     return SignChangeEdges;
 }
 
+const TArray<FNodeEdge>& FAdaptiveOctreeNode::GetSignChangeEdges() const
+{
+    return SignChangeEdges;
+}
+
 FVector FAdaptiveOctreeNode::ComputeNormalizedPosition(double InRadius) const
 {
     return DualContourPosition.GetSafeNormal() * InRadius;
@@ -221,15 +237,21 @@ FVector FAdaptiveOctreeNode::ComputeNormalizedPosition(double InRadius) const
 
 void FAdaptiveOctreeNode::ComputeDualContourPosition()
 {
-    if (SignChangeEdges.Num() == 0)
+    IsSurfaceNode = SignChangeEdges.Num() > 0;
+    SolveVertex(nullptr);
+}
+
+void FAdaptiveOctreeNode::SolveVertex(const TArray<FNodeEdge>* ExtraEdges)
+{
+    const int32 NumExtra = ExtraEdges ? ExtraEdges->Num() : 0;
+    bHasVertexData = SignChangeEdges.Num() + NumExtra > 0;
+    if (!bHasVertexData)
     {
         DualContourNormal = FVector3f::ZeroVector;
         DualContourPosition = Center;
-        IsSurfaceNode = false;
         return;
     }
 
-    IsSurfaceNode = true;
     FQEF Qef;
     FVector MassPoint = FVector::ZeroVector;
     int32 ValidEdges = 0;
@@ -240,6 +262,20 @@ void FAdaptiveOctreeNode::ComputeDualContourPosition()
         MassPoint += P;
 
         FVector Normal = GetInterpolatedNormal(P);
+        Qef.AddPlane(P, Normal);
+        ValidEdges++;
+    }
+
+    // Neighbour edges carry their own corner normals; interpolate along the edge.
+    for (int32 i = 0; i < NumExtra; i++)
+    {
+        const FNodeEdge& Edge = (*ExtraEdges)[i];
+        const FVector P = Edge.ZeroCrossingPoint;
+        const double t = (Edge.Size > 0.0) ? FMath::Clamp(FVector::Dist(P, Edge.Corners[0].Position) / Edge.Size, 0.0, 1.0) : 0.5;
+        FVector Normal = FVector(FMath::Lerp(Edge.Corners[0].Normal, Edge.Corners[1].Normal, (float)t));
+        if (!Normal.Normalize())
+            Normal = GetInterpolatedNormal(P);
+        MassPoint += P;
         Qef.AddPlane(P, Normal);
         ValidEdges++;
     }
@@ -282,5 +318,12 @@ void FAdaptiveOctreeNode::ComputeDualContourPosition()
     DualContourPosition.Y = FMath::Clamp(DualContourPosition.Y, Center.Y - Extent, Center.Y + Extent);
     DualContourPosition.Z = FMath::Clamp(DualContourPosition.Z, Center.Z - Extent, Center.Z + Extent);
 
-    DualContourNormal = FVector3f(Qef.GetAverageNormal());
+    // Plane normals can cancel on thin sheets and creases; fall back to the corner field,
+    // then to the outward direction from the planet center.
+    FVector VertexNormal = Qef.AccumulatedNormal;
+    if (VertexNormal.SizeSquared() < 1e-6 * (double)ValidEdges * (double)ValidEdges)
+        VertexNormal = GetInterpolatedNormal(DualContourPosition);
+    if (!VertexNormal.Normalize())
+        VertexNormal = DualContourPosition.GetSafeNormal();
+    DualContourNormal = FVector3f(VertexNormal);
 }

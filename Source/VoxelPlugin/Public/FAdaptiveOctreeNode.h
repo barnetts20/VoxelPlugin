@@ -27,10 +27,15 @@ namespace EDepthBound
 struct VOXELPLUGIN_API FAdaptiveOctreeNode : public TSharedFromThis<FAdaptiveOctreeNode>
 {
 private:
-    /** Solves the QEF (Quadric Error Function) from sign-change edges to place
-     *  the dual contour vertex. Falls back to mass point when the QEF drifts
-     *  too far, with a smoothstep blend in between. */
+    /** Sets IsSurfaceNode from the node's own sign-change edges and places the dual
+     *  contour vertex from them (SolveVertex). */
     void ComputeDualContourPosition();
+
+    /** Solves the QEF (Quadric Error Function) from the node's own sign-change edges plus
+     *  ExtraEdges to place the dual contour vertex and its normal. Falls back to mass point
+     *  when the QEF drifts too far, with a smoothstep blend in between. With no edges at
+     *  all the vertex is the node center and the normal zero. */
+    void SolveVertex(const TArray<FNodeEdge>* ExtraEdges);
 
     /** Trilinearly interpolates corner normals at an arbitrary point within the node.
      *  Used to evaluate surface normals at sign-change edge crossing points for QEF input. */
@@ -72,6 +77,10 @@ public:
     FVector DualContourPosition;
     FVector3f DualContourNormal = FVector3f(0, 0, 1);
 
+    /** True if the vertex was solved from at least one crossing (own or boundary edge);
+     *  false means it is just the node center. */
+    bool bHasVertexData = false;
+
     /** True if this node has at least one sign-change edge (density crosses zero). */
     bool IsSurfaceNode = false;
 
@@ -80,10 +89,16 @@ public:
      *  finer resolution. Used by the LOD system to avoid skipping near-surface nodes. */
     bool CouldContainSurface = false;
 
-    /** True if this node once had descendants with edit-created surface that
-     *  its own corners can't resolve. Set during merge, inherited during split,
-     *  so the LOD system re-splits to the correct depth when the camera returns. */
+    /** True if user edits overlap this node's region: set by ApplyEdit for nodes the brush
+     *  touches, kept through merges, and re-derived from the edit store when a flagged
+     *  node splits. The edit pipeline (gather, propagate, finalize, enforce splits) only
+     *  walks nodes carrying it. */
     bool bHasEditedDescendants = false;
+
+    /** True if this node was merged while a descendant could contain surface. Its own
+     *  corners may miss a feature smaller than the node, so the LOD still lets it split
+     *  when the camera returns. */
+    bool bHadSurfaceDescendants = false;
 
     /** When true, prevents the LOD system from merging this node regardless of distance. */
     bool LodOverride = false;
@@ -145,9 +160,9 @@ public:
      *  center if this node is at ChunkDepth (starting a new chunk). */
     void Split();
 
-    /** Destroys all descendants, transitioning this node back to a leaf.
-     *  Preserves bHasEditedDescendants from children so edit regions are
-     *  re-split when the camera returns. */
+    /** Destroys all descendants, transitioning this node back to a leaf. Keeps
+     *  bHasEditedDescendants and bHadSurfaceDescendants from the merged subtree so the
+     *  region re-splits when the camera returns. */
     void Merge();
 
     /** Computes the normalized position on a sphere of given radius.
@@ -156,12 +171,25 @@ public:
 
     /** Returns this node's sign-change edges (surface crossings). */
     TArray<FNodeEdge>& GetSignChangeEdges();
+    const TArray<FNodeEdge>& GetSignChangeEdges() const;
 
     /** Recomputes normals (unless skipped), sign-change edges, dual contour position,
-     *  and surface flags from the current corner densities. Propagates IsSurfaceNode
-     *  and CouldContainSurface up to ancestors. Called after corner data is populated
-     *  (initial construction, LOD split, or edit reconstruction). */
+     *  and surface flags from the current corner densities. An interior node also keeps
+     *  its children's surface flags. Propagates IsSurfaceNode and CouldContainSurface up
+     *  to ancestors. Called after corner data is populated (initial construction, LOD
+     *  split, or edit reconstruction). */
     void FinalizeFromExistingCorners(bool bSkipNormals = false);
+
+    /** Re-places this leaf's vertex from its own sign-change edges plus BoundaryEdges:
+     *  sign-change edges of same-size or finer neighbours that lie on this leaf's faces.
+     *  A leaf coarser than its neighbour may not see a crossing its neighbour resolves on
+     *  their shared face, yet the quad around that edge uses this leaf's vertex, so the
+     *  vertex has to come from those edges (Ju et al., minimal edges). Flags unchanged. */
+    void SolveVertexWithBoundaryEdges(const TArray<FNodeEdge>& BoundaryEdges) { SolveVertex(&BoundaryEdges); }
+
+    /** True if this node has sign-change edges of its own (IsSurfaceNode may also be set
+     *  by propagation from descendants, and stays set on a merged leaf). */
+    bool HasOwnSurface() const { return SignChangeEdges.Num() > 0; }
 
     /** Root constructor. Creates the top-level node centered at origin with the
      *  given extent and depth bounds. */

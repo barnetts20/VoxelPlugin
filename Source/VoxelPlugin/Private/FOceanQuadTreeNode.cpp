@@ -1,4 +1,4 @@
-﻿#include "FOceanQuadTreeNode.h"
+#include "FOceanQuadTreeNode.h"
 #include "OceanSphereActor.h"
 #include "Async/Async.h"
 
@@ -10,10 +10,10 @@ void FOceanMeshChunk::InitializeData(FVector InCenter)
 {
     ChunkCenter = InCenter;
     InnerMeshData = MakeShared<FOceanStreamData>();
-    InnerMeshData->MeshGroupKey = FRealtimeMeshSectionGroupKey::Create(LODKey, FName("INNER"));
+    InnerMeshData->MeshGroupKey = FRealtimeMeshBufferSetKey::Create(LODKey, FName("INNER"));
     InnerMeshData->MeshSectionKey = FRealtimeMeshSectionKey::CreateForPolyGroup(InnerMeshData->MeshGroupKey, 0);
     EdgeMeshData = MakeShared<FOceanStreamData>();
-    EdgeMeshData->MeshGroupKey = FRealtimeMeshSectionGroupKey::Create(LODKey, FName("EDGE"));
+    EdgeMeshData->MeshGroupKey = FRealtimeMeshBufferSetKey::Create(LODKey, FName("EDGE"));
     EdgeMeshData->MeshSectionKey = FRealtimeMeshSectionKey::CreateForPolyGroup(EdgeMeshData->MeshGroupKey, 0);
 }
 
@@ -49,8 +49,8 @@ void FOceanMeshChunk::InitializeComponent(AOceanSphereActor* InOwner)
     ChunkRtComponent->SetRenderCustomDepth(true);
     ChunkRtComponent->SetVisibleInRayTracing(false);
 
-    ChunkRtMesh->CreateSectionGroup(InnerMeshData->MeshGroupKey, FRealtimeMeshStreamSet());
-    ChunkRtMesh->CreateSectionGroup(EdgeMeshData->MeshGroupKey, FRealtimeMeshStreamSet());
+    ChunkRtMesh->CreateBufferSet(InnerMeshData->MeshGroupKey, FRealtimeMeshStreamSet());
+    ChunkRtMesh->CreateBufferSet(EdgeMeshData->MeshGroupKey, FRealtimeMeshStreamSet());
 
     IsInitialized = true;
 }
@@ -386,14 +386,32 @@ void FOceanQuadTreeNode::SplitToDepth(int32 TargetDepth)
 // Neighbors
 // ---------------------------------------------------------------------------
 
-bool FOceanQuadTreeNode::CheckNeighbors()
+TSharedPtr<FOceanQuadTreeNode> FOceanQuadTreeNode::FindNodeByIndex(const TSharedPtr<FOceanQuadTreeNode> (&Roots)[6], const FQuadIndex& InIndex)
+{
+    if (InIndex.FaceId >= 6) return nullptr;
+    TSharedPtr<FOceanQuadTreeNode> Cur = Roots[InIndex.FaceId];
+    if (!Cur.IsValid() || InIndex.IsRoot()) return Cur;
+
+    const uint8 Depth = InIndex.GetDepth();
+    for (uint8 Level = 0; Level < Depth; ++Level)
+    {
+        const uint8 Quad = InIndex.GetQuadrantAtDepth(Level);
+        if (Cur->IsLeaf()) return Cur;
+        if (Quad >= (uint8)Cur->Children.Num()) return Cur;
+        Cur = Cur->Children[Quad];
+        if (!Cur.IsValid()) return nullptr;
+    }
+    return Cur;
+}
+
+bool FOceanQuadTreeNode::CheckNeighbors(const TSharedPtr<FOceanQuadTreeNode> (&Roots)[6])
 {
     uint8 myQuadrant = (uint8)Index.GetQuadrant();
     bool  bChanged = false;
 
     auto Check = [&](EdgeOrientation Edge)
         {
-            TSharedPtr<FOceanQuadTreeNode> Neighbor = Owner->GetNodeByIndex(Index.GetNeighborIndex(Edge));
+            TSharedPtr<FOceanQuadTreeNode> Neighbor = FindNodeByIndex(Roots, Index.GetNeighborIndex(Edge));
             if (!Neighbor.IsValid()) return;
             int32 d = Neighbor->GetDepth();
             if (NeighborLods[(uint8)Edge] != d) { NeighborLods[(uint8)Edge] = d; bChanged = true; }
@@ -417,8 +435,9 @@ bool FOceanQuadTreeNode::CheckNeighbors()
 void FOceanQuadTreeNode::SampleMaxDepth()
 {
     if (!Owner) return;
-    FDensitySampleCompositor* Comp = Owner->GetCompositor().Get();
-    if (!Comp) return;
+    // Hold the compositor for the call: the actor may publish a new one meanwhile.
+    const TSharedPtr<FDensitySampleCompositor> Comp = Owner->GetCompositor();
+    if (!Comp.IsValid()) return;
 
     // Sample the 4 face corners — cheap proxy for MaxVertexDepth.
     const int32  U = FaceTransform.AxisMap[0];
@@ -426,18 +445,19 @@ void FOceanQuadTreeNode::SampleMaxDepth()
     const int32  DU = FaceTransform.AxisDir[0];
     const int32  DV = FaceTransform.AxisDir[1];
 
-    float SX[4], SY[4], SZ[4], Out[4];
+    double SX[4], SY[4], SZ[4];
+    float Out[4];
     for (int32 c = 0; c < 4; ++c)
     {
         FVector Corner = CubeCenter;
         Corner[U] += DU * HalfSize * ((c & 1) ? 1.0 : -1.0);
         Corner[V] += DV * HalfSize * ((c & 2) ? 1.0 : -1.0);
         FVector S = Corner.GetSafeNormal() * OceanRadius;
-        SX[c] = (float)S.X;
-        SY[c] = (float)S.Y;
-        SZ[c] = (float)S.Z;
+        SX[c] = S.X;
+        SY[c] = S.Y;
+        SZ[c] = S.Z;
     }
     FSampleInput Input(SX, SY, SZ, 4);
     Comp->Sample(Input, Out);
     MaxVertexDepth = FMath::Max(FMath::Max(Out[0], Out[1]), FMath::Max(Out[2], Out[3]));
-}
+}

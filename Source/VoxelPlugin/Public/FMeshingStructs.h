@@ -5,10 +5,12 @@
 #pragma once
 
 #include "FAdaptiveOctreeNode.h"
+#include "CoreGlobals.h"
 #include "Misc/ScopeLock.h"
 #include "RealtimeMeshActor.h"
 #include <RealtimeMeshCore.h>
 #include <RealtimeMeshSimple.h>
+#include <atomic>
 
 // Required by RealtimeMesh stream builder types. Narrower scoping is not feasible
 // due to the template-heavy API surface used throughout this file.
@@ -42,22 +44,30 @@ struct VOXELPLUGIN_API FMeshVertex
 
 /** Per-edge output from the parallel meshing pass. Stores the vertices (one per
  *  neighboring leaf node) that will form a quad or tri across a sign-change edge,
- *  along with the edge itself. IsValid is false if the edge was filtered out by
- *  ShouldProcessEdge. */
+ *  along with the edge itself. IsValid is false if the edge produces no faces in this
+ *  chunk. BoundaryHash summarizes the leaves outside the chunk that the edge's
+ *  faces depend on (0 if none); it feeds FMeshChunk::SeamHash. */
 struct VOXELPLUGIN_API FEdgeVertexData {
     TArray<FMeshVertex> Vertices;
     TOptional<FNodeEdge> Edge;
+    uint32 BoundaryHash = 0;
     bool IsValid = false;
 };
 
 /** Wrapper around a RealtimeMesh FRealtimeMeshStreamSet, pre-configured with
  *  the six vertex streams needed for rendering: position, tangents, triangles,
  *  polygroups, texcoords, and vertex color. Provides typed stream builder
- *  accessors for each. */
+ *  accessors for each.
+ *
+ *  Generation and PassId identify the publish that produced this stream: Generation
+ *  counts publishes on its chunk, PassId is the octree pass (FAdaptiveOctree::BeginPass)
+ *  that built it. Both are set when the stream is published and never change after. */
 struct VOXELPLUGIN_API FMeshStreamData {
-    FRealtimeMeshSectionGroupKey MeshGroupKey;
+    FRealtimeMeshBufferSetKey MeshGroupKey;
     FRealtimeMeshSectionKey MeshSectionKey;
     FRealtimeMeshStreamSet MeshStream;
+    uint32 Generation = 0;
+    uint32 PassId = 0;
 
     FMeshStreamData() {
         MeshStream.AddStream(FRealtimeMeshStreams::Position, GetRealtimeMeshBufferLayout<FVector3f>());
@@ -87,24 +97,25 @@ struct VOXELPLUGIN_API FMeshStreamData {
         return TRealtimeMeshStreamBuilder<FColor>(*MeshStream.Find(FRealtimeMeshStreams::Color));
     }
 
-    void ResetStreams() {
-        if (auto* Position = MeshStream.Find(FRealtimeMeshStreams::Position)) Position->Empty();
-        if (auto* Tangent = MeshStream.Find(FRealtimeMeshStreams::Tangents)) Tangent->Empty();
-        if (auto* Triangle = MeshStream.Find(FRealtimeMeshStreams::Triangles)) Triangle->Empty();
-        if (auto* Polygroup = MeshStream.Find(FRealtimeMeshStreams::PolyGroups)) Polygroup->Empty();
-        if (auto* TexCoord = MeshStream.Find(FRealtimeMeshStreams::TexCoords)) TexCoord->Empty();
-        if (auto* Color = MeshStream.Find(FRealtimeMeshStreams::Color)) Color->Empty();
+    int32 NumTriangles() {
+        auto* Triangles = MeshStream.Find(FRealtimeMeshStreams::Triangles);
+        return Triangles ? Triangles->Num() : 0;
     }
 };
 
 /** A spatial subdivision of the octree used for mesh generation. Each chunk corresponds
- *  to a node at ChunkDepth and owns a RealtimeMesh component that renders the dual-contour
+ *  to a chunk-root node and owns a RealtimeMesh component that renders the dual-contour
  *  surface within its bounds.
  *
- *  Lifecycle: InitializeData sets the spatial bounds and stream keys. The RealtimeMesh
- *  component is lazily created on the game thread during the first ApplyToComponent call
- *  (via InitializeComponent). Subsequent updates push new stream data when IsDirty is set. */
-struct VOXELPLUGIN_API FMeshChunk {
+ *  Lifecycle: InitializeData sets the spatial bounds and stream keys. A worker builds a
+ *  stream and calls Publish. The game thread creates the component (EnsureComponent,
+ *  budgeted) and later swaps the stream in (ApplyStream).
+ *
+ *  Dirty state is two counters: PublishedGen (bumped by Publish) and AppliedGen (the
+ *  generation the game thread last applied or settled). The chunk is dirty while they
+ *  differ, so a stream published while an older one is being applied stays dirty and is
+ *  applied on a later frame. */
+struct VOXELPLUGIN_API FMeshChunk : public TSharedFromThis<FMeshChunk> {
     TWeakObjectPtr<ARealtimeMeshActor> CachedParentActor;
     TWeakObjectPtr<USceneComponent> CachedMeshAttachRoot;
     TWeakObjectPtr<UMaterialInterface> CachedSurfaceMaterial;
@@ -115,17 +126,50 @@ struct VOXELPLUGIN_API FMeshChunk {
     /** All sign-change edges within this chunk's leaf nodes, collected during LOD updates. */
     TArray<FNodeEdge> ChunkEdges;
 
-    TSharedPtr<FMeshStreamData> SurfaceMeshData;
+    /** Sum of the BoundaryHash of every edge in ChunkEdges at the last mesh: a summary of
+     *  the leaves outside this chunk that its faces were built against. Written by the
+     *  mesher and read by the seam check, both under the octree write lock. */
+    uint32 SeamHash = 0;
 
-    /** Guards ONLY the SurfaceMeshData pointer (the swap in UpdateMeshChunkStreamData vs the
-     *  capture at the top of ApplyToComponent). The stream itself is immutable once
-     *  published -- each re-mesh builds a fresh FMeshStreamData and swaps the pointer -- so
-     *  holding this only around the pointer op (a shared-ptr copy) is enough to stop the game
-     *  thread from tearing the read while a worker re-meshes. Fine-grained: never held across
-     *  meshing or the UpdateSectionGroup push, so it can't stall the game thread. */
+    /** Triangles of the last mesh that face against their vertex normals (folds), counted
+     *  only with flicker diagnostics on. Same lock rules as SeamHash. */
+    int32 DebugFoldedTriangles = 0;
+
+    /** Latest published stream. Guarded by MeshDataCS for the pointer swap and copy only;
+     *  a published stream is never modified (each re-mesh publishes a fresh one). */
+    TSharedPtr<FMeshStreamData> SurfaceMeshData;
     FCriticalSection MeshDataCS;
 
-    bool IsDirty = false;
+    std::atomic<uint32> PublishedGen{ 0 };
+    std::atomic<uint32> AppliedGen{ 0 };
+
+    /** Pass of the oldest publish not yet applied: set by a publish that finds the chunk
+     *  clean, left alone by later ones. The drain groups chunks by the passes between this
+     *  and their latest stream's pass. */
+    std::atomic<uint32> FirstUnappliedPass{ 0 };
+
+    /** GFrameCounter at the latest publish and at the latest apply (debug statistics). */
+    std::atomic<uint64> PublishFrame{ 0 };
+    uint64 AppliedFrame = 0;
+
+    /** What the render proxy has absorbed, from the update futures: the generation (high 32
+     *  bits) and the first frame it can be on screen (low 32 bits, GFrameCounter truncated).
+     *  Updated as one value, only ever to a newer generation; 0 = nothing displayed. A
+     *  component has no scene proxy until the end-of-frame update after it is created, so
+     *  its first data counts as displayed two frames after creation (or after a "NoProxy"
+     *  apply). */
+    std::atomic<uint64> DisplayState{ 0 };
+
+    /** Bumped whenever the component is created or released, so a late future from an
+     *  earlier component can't mark the current one displayed. */
+    std::atomic<uint32> ComponentEpoch{ 0 };
+
+    /** GFrameCounter when the current component was created (game thread). */
+    uint64 ComponentCreatedFrame = 0;
+
+    /** Frames a retired chunk has waited in the destroy queue (game thread only). */
+    int32 RetireWaitFrames = 0;
+
     bool IsInitialized = false;
 
     /** True while this chunk is sitting in AAdaptiveVoxelActor::PendingApply, so the mesh
@@ -145,72 +189,108 @@ struct VOXELPLUGIN_API FMeshChunk {
      *  opens a hole. Cleared when the chunk is finally released. */
     TArray<TSharedPtr<FMeshChunk>> ReplacedBy;
 
-    /** Distance-gated collision. bWantsCollision is the desired state, set on a worker by
-     *  the collision pass from the player's distance to this chunk; bCollisionActive is what
-     *  the game thread last applied. Only near chunks cook a collision body -- that's the
-     *  perf win, since cooking (complex-as-simple) was the cost, not the query. Far / flight
-     *  chunks carry no body at all. */
-    bool bWantsCollision = false;
-    bool bCollisionActive = false;
-
-    /** True once a non-empty UpdateSectionGroup has actually created the poly-group section.
+    /** True once a non-empty UpdateBufferSet has actually created the poly-group section.
      *  Empty chunks (no triangles) never create one, so touching its config would throw
-     *  "Failed to find Section". Guards the collision config call. */
+     *  "Failed to find Section". */
     bool bHasSection = false;
-
-    /** Game thread: bring the component's collision in line with bEnable. Re-marks the
-     *  render section for complex-collision cooking (or drops it) and toggles query
-     *  collision. RealtimeMesh async-cooks, so enabling isn't instant -- the speed-scaled
-     *  lead distance is what covers that latency. No-op until the component exists. */
-    void SetCollisionActive(bool bEnable) {
-        URealtimeMeshSimple* Mesh = ChunkRtMesh.Get();
-        URealtimeMeshComponent* Comp = ChunkRtComponent.Get();
-        if (!Mesh || !Comp) { bWantsCollision = bEnable; return; }
-
-        // Only re-mark the section for cooking if it actually exists. Empty chunks have no
-        // section; their collision is moot and configuring it would throw. When such a chunk
-        // later gains geometry, ApplyToComponent's non-empty branch sets the cook flag then.
-        if (bHasSection)
-        {
-            FRealtimeMeshSectionKey SectionKey;
-            {
-                FScopeLock Lock(&MeshDataCS);
-                if (!SurfaceMeshData) return;
-                SectionKey = SurfaceMeshData->MeshSectionKey;
-            }
-            FRealtimeMeshSectionConfig Config(0);
-            Mesh->UpdateSectionConfig(SectionKey, Config, bEnable); // 3rd arg = bShouldCreateCollision
-        }
-        Comp->SetCollisionEnabled(bEnable ? ECollisionEnabled::QueryAndPhysics : ECollisionEnabled::NoCollision);
-        bCollisionActive = bEnable;
-    }
 
     TWeakObjectPtr<URealtimeMeshSimple> ChunkRtMesh;
     TWeakObjectPtr<URealtimeMeshComponent> ChunkRtComponent;
     FRealtimeMeshLODKey LODKey = FRealtimeMeshLODKey(0);
 
-    /** Sets spatial bounds and creates the stream data with section group/section keys. */
+    bool IsDirty() const {
+        return PublishedGen.load(std::memory_order_acquire) != AppliedGen.load(std::memory_order_acquire);
+    }
+
+    /** True once some generation of this chunk is on screen (game thread). */
+    bool IsDisplayed() const {
+        const uint64 State = DisplayState.load(std::memory_order_acquire);
+        if ((State >> 32) == 0) return false;
+        return (uint32)GFrameCounter >= (uint32)(State & 0xFFFFFFFFull);
+    }
+
+    /** Any thread: record that Gen of component Epoch is in the render proxy and can be on
+     *  screen from NotBeforeFrame. Ignored for an older component or an older generation. */
+    void MarkDisplayed(uint32 Epoch, uint32 Gen, uint64 NotBeforeFrame) {
+        if (ComponentEpoch.load(std::memory_order_acquire) != Epoch) return;
+        const uint64 NewState = ((uint64)Gen << 32) | (uint64)(uint32)NotBeforeFrame;
+        uint64 Old = DisplayState.load(std::memory_order_relaxed);
+        while ((Old >> 32) < Gen)
+        {
+            if (DisplayState.compare_exchange_weak(Old, NewState, std::memory_order_release, std::memory_order_relaxed))
+                break;
+        }
+    }
+
+    /** Game thread: the component changed identity (created or released). */
+    void ResetDisplayState() {
+        ComponentEpoch.fetch_add(1, std::memory_order_acq_rel);
+        DisplayState.store(0, std::memory_order_release);
+    }
+
+    /** Copy of the latest published stream pointer (keeps that stream alive). */
+    TSharedPtr<FMeshStreamData> GetPublished() {
+        FScopeLock Lock(&MeshDataCS);
+        return SurfaceMeshData;
+    }
+
+    /** Pass that produced the latest published stream (0 before the first publish). */
+    uint32 GetPublishedPass() {
+        FScopeLock Lock(&MeshDataCS);
+        return SurfaceMeshData ? SurfaceMeshData->PassId : 0;
+    }
+
+    /** A fresh, empty stream carrying this chunk's section keys. */
+    TSharedPtr<FMeshStreamData> MakeStream() {
+        TSharedPtr<FMeshStreamData> NewData = MakeShared<FMeshStreamData>();
+        FScopeLock Lock(&MeshDataCS);
+        NewData->MeshGroupKey = SurfaceMeshData->MeshGroupKey;
+        NewData->MeshSectionKey = SurfaceMeshData->MeshSectionKey;
+        return NewData;
+    }
+
+    /** Publishes a finished stream as the chunk's latest and marks the chunk dirty. Any
+     *  thread; the stream must not be modified afterwards. */
+    void Publish(const TSharedPtr<FMeshStreamData>& NewData, uint32 InPassId) {
+        FScopeLock Lock(&MeshDataCS);
+        if (!IsDirty())
+            FirstUnappliedPass.store(InPassId, std::memory_order_relaxed);
+        NewData->PassId = InPassId;
+        NewData->Generation = PublishedGen.load(std::memory_order_relaxed) + 1;
+        SurfaceMeshData = NewData;
+        PublishFrame.store(GFrameCounter, std::memory_order_relaxed);
+        PublishedGen.store(NewData->Generation, std::memory_order_release);
+    }
+
+    /** Game thread: Gen is now what the chunk shows (or, for a chunk with no component and
+     *  an empty stream, all it needs to show). If a newer stream was published meanwhile,
+     *  the oldest unapplied work is now that stream's pass. */
+    void MarkApplied(uint32 Gen) {
+        FScopeLock Lock(&MeshDataCS);
+        AppliedGen.store(Gen, std::memory_order_release);
+        AppliedFrame = GFrameCounter;
+        if (PublishedGen.load(std::memory_order_relaxed) != Gen && SurfaceMeshData)
+            FirstUnappliedPass.store(SurfaceMeshData->PassId, std::memory_order_relaxed);
+    }
+
+    /** Sets spatial bounds and creates an empty generation-0 stream holding the section
+     *  group/section keys. */
     void InitializeData(FVector InCenter, double InExtent) {
         SurfaceMeshData = MakeShared<FMeshStreamData>();
 
         ChunkCenter = InCenter;
         ChunkExtent = InExtent;
 
-        SurfaceMeshData->MeshGroupKey = FRealtimeMeshSectionGroupKey::Create(LODKey, FName("SURFACE"));
+        SurfaceMeshData->MeshGroupKey = FRealtimeMeshBufferSetKey::Create(LODKey, FName("SURFACE"));
         SurfaceMeshData->MeshSectionKey = FRealtimeMeshSectionKey::CreateForPolyGroup(SurfaceMeshData->MeshGroupKey, 0);
     };
 
-    /** Creates the RealtimeMesh UObject and component, attaches to the parent actor,
-     *  and configures collision. Called lazily from ApplyToComponent on the game thread. */
-    void InitializeComponent(ARealtimeMeshActor* InParentActor, USceneComponent* InAttachRoot, UMaterialInterface* InSurfaceMaterial, const FRealtimeMeshSectionGroupKey& InGroupKey) {
-        FRealtimeMeshCollisionConfiguration cConfig;
-        cConfig.bShouldFastCookMeshes = false;
-        cConfig.bUseComplexAsSimpleCollision = true;
-        cConfig.bDeformableMesh = false;
-        cConfig.bUseAsyncCook = true;
-
+    /** Creates the RealtimeMesh UObject and component and attaches it to the parent actor.
+     *  Render only: terrain collision comes from FVoxelCollisionBricks. The section group
+     *  starts empty, so the new component draws nothing until ApplyStream swaps a stream
+     *  in. Game thread. */
+    void InitializeComponent(ARealtimeMeshActor* InParentActor, USceneComponent* InAttachRoot, UMaterialInterface* InSurfaceMaterial, const FRealtimeMeshBufferSetKey& InGroupKey) {
         ChunkRtMesh = NewObject<URealtimeMeshSimple>(InParentActor);
-        ChunkRtMesh->SetCollisionConfig(cConfig);
         ChunkRtMesh->SetupMaterialSlot(0, "Surface Material");
 
         ChunkRtComponent = NewObject<URealtimeMeshComponent>(InParentActor, URealtimeMeshComponent::StaticClass());
@@ -231,8 +311,10 @@ struct VOXELPLUGIN_API FMeshChunk {
         ChunkRtComponent->SetRenderCustomDepth(true);
         ChunkRtComponent->SetVisibleInRayTracing(false);
 
-        ChunkRtMesh->CreateSectionGroup(InGroupKey, FRealtimeMeshStreamSet());
+        ChunkRtMesh->CreateBufferSet(InGroupKey, FRealtimeMeshStreamSet());
 
+        ResetDisplayState();
+        ComponentCreatedFrame = GFrameCounter;
         IsInitialized = true;
     }
 
@@ -254,72 +336,96 @@ struct VOXELPLUGIN_API FMeshChunk {
         return true;
     }
 
-    /** True until the RealtimeMesh component has been created. The throttled game-thread
-     *  apply checks this to decide whether this chunk counts against the per-frame
-     *  component-init budget (the RegisterComponent + section-group cost). */
-    bool NeedsComponentInit() const { return !IsInitialized; }
+    /** True if applying Data needs a component that doesn't exist yet (an empty stream on
+     *  a chunk without a component needs none). */
+    bool NeedsComponentFor(const TSharedPtr<FMeshStreamData>& Data) {
+        if (IsInitialized || bRetired) return false;
+        return Data.IsValid() && Data->NumTriangles() > 0;
+    }
 
-    /** Pushes current stream data to the RealtimeMesh component. MUST be called on the
-     *  game thread -- the caller batches and throttles these (see
-     *  AAdaptiveVoxelActor::DrainPendingApply), so unlike the old UpdateComponent this does
-     *  NOT dispatch its own AsyncTask. Lazily creates the component on first call, updates
-     *  the section group, and clears IsDirty. Clears the section group if there are no
-     *  triangles to render. */
-    void ApplyToComponent() {
-        // Retired by the chunk-cut pass -- never (re)create a component for it; the
-        // destroy drain will release any component it already had.
-        if (bRetired) return;
+    /** Game thread: creates the component if it doesn't exist. This is the expensive part
+     *  of a first apply (RegisterComponent + section group), so the drain budgets it
+     *  separately. Returns false if the owning actor or attach root is gone. */
+    bool EnsureComponent() {
+        if (IsInitialized) return true;
+        if (bRetired) return false;
+        ARealtimeMeshActor* Parent = CachedParentActor.Get();
+        USceneComponent* AttachRoot = CachedMeshAttachRoot.Get();
+        if (!Parent || !AttachRoot) return false;
 
-        // Capture the published stream once under the lock, up front, so nothing below --
-        // including lazy init's section-group create -- can tear the pointer against a
-        // concurrent worker re-mesh. The captured shared ptr keeps that FMeshStreamData
-        // alive and immutable for the whole call.
-        TSharedPtr<FMeshStreamData> SrfData;
+        FRealtimeMeshBufferSetKey GroupKey;
         {
             FScopeLock Lock(&MeshDataCS);
-            SrfData = SurfaceMeshData;
+            if (!SurfaceMeshData) return false;
+            GroupKey = SurfaceMeshData->MeshGroupKey;
         }
-        if (!SrfData) return;
+        InitializeComponent(Parent, AttachRoot, CachedSurfaceMaterial.Get(), GroupKey);
+        return true;
+    }
 
-        // 1. Lazy Init
-        if (!IsInitialized) {
-            ARealtimeMeshActor* Parent = CachedParentActor.Get();
-            USceneComponent* AttachRoot = CachedMeshAttachRoot.Get();
-            UMaterialInterface* SurfaceMaterial = CachedSurfaceMaterial.Get();
-            if (!Parent || !AttachRoot || !SurfaceMaterial) return;
-            InitializeComponent(Parent, AttachRoot, SurfaceMaterial, SrfData->MeshGroupKey);
+    /** Game thread: swaps Data (a stream this chunk published) into the component, creating
+     *  the component first if needed, and marks that generation applied. A stream published
+     *  after Data leaves the chunk dirty for a later apply. Clears the section group when
+     *  Data has no triangles. */
+    void ApplyStream(const TSharedPtr<FMeshStreamData>& Data) {
+        // Retired by the chunk-cut pass -- never (re)create a component for it; the
+        // destroy drain will release any component it already had.
+        if (bRetired || !Data) return;
+        if (Data->Generation <= AppliedGen.load(std::memory_order_acquire)) return;
+
+        const int32 SrfNumTris = Data->NumTriangles();
+        if (!IsInitialized)
+        {
+            // Nothing to draw and nothing on screen to clear.
+            if (SrfNumTris <= 0) { MarkApplied(Data->Generation); return; }
+            if (!EnsureComponent()) return;
         }
 
-        // 2. Ensure valid component pointers
         URealtimeMeshSimple* MeshPtr = ChunkRtMesh.Get();
         URealtimeMeshComponent* CompPtr = ChunkRtComponent.Get();
-        if (!MeshPtr || !CompPtr) return;
-        if (!IsDirty) return;
+        if (!MeshPtr || !CompPtr)
+        {
+            // The component went away under us; the next drain recreates it.
+            IsInitialized = false;
+            bHasSection = false;
+            ResetDisplayState();
+            return;
+        }
 
-        // 3. Surface update
-        auto* SrfTriStream = SrfData->MeshStream.Find(FRealtimeMeshStreams::Triangles);
-        int32 SrfNumTris = SrfTriStream ? SrfTriStream->Num() : 0;
+        TFuture<ERealtimeMeshProxyUpdateStatus> Update;
         if (SrfNumTris <= 0)
         {
-            MeshPtr->UpdateSectionGroup(SrfData->MeshGroupKey, FRealtimeMeshStreamSet());
+            Update = MeshPtr->UpdateBufferSet(Data->MeshGroupKey, FRealtimeMeshStreamSet());
             bHasSection = false; // empty stream clears the poly-group section
         }
         else
         {
-            MeshPtr->UpdateSectionGroup(SrfData->MeshGroupKey, SrfData->MeshStream);
-            bHasSection = true; // the poly-group section now exists
-            FRealtimeMeshSectionConfig SrfConfig(0); // material slot 0
-            // 3rd arg is bShouldCreateCollision -- gated on distance so only near chunks
-            // cook. Keeps collision correct across a re-mesh without a separate pass.
-            MeshPtr->UpdateSectionConfig(SrfData->MeshSectionKey, SrfConfig, bWantsCollision);
-            if (bCollisionActive != bWantsCollision)
-            {
-                CompPtr->SetCollisionEnabled(bWantsCollision ? ECollisionEnabled::QueryAndPhysics : ECollisionEnabled::NoCollision);
-                bCollisionActive = bWantsCollision;
-            }
+            Update = MeshPtr->UpdateBufferSet(Data->MeshGroupKey, Data->MeshStream);
+            // A new section gets its config (material slot 0, no collision); a re-upload
+            // keeps it.
+            if (!bHasSection)
+                MeshPtr->UpdateSectionConfig(Data->MeshSectionKey, FRealtimeMeshSectionConfig(0), false);
+            bHasSection = true;
         }
 
-        IsDirty = false;
+        MarkApplied(Data->Generation);
+
+        // Record when the render proxy has this generation. The continuation may run on any
+        // thread (inline if the future is already complete), so it only touches atomics.
+        const TWeakPtr<FMeshChunk> WeakSelf = AsShared();
+        const uint32 Gen = Data->Generation;
+        const uint32 Epoch = ComponentEpoch.load(std::memory_order_acquire);
+        const uint64 ApplyFrame = GFrameCounter;
+        const uint64 CreatedFrame = ComponentCreatedFrame;
+        Update.Next([WeakSelf, Gen, Epoch, ApplyFrame, CreatedFrame](ERealtimeMeshProxyUpdateStatus Status)
+            {
+                const TSharedPtr<FMeshChunk> Self = WeakSelf.Pin();
+                if (!Self) return;
+                uint64 NotBefore = CreatedFrame + 2;
+                if (Status == ERealtimeMeshProxyUpdateStatus::NoProxy)
+                    NotBefore = FMath::Max(NotBefore, ApplyFrame + 2);
+                Self->MarkDisplayed(Epoch, Gen, NotBefore);
+            });
     }
 
     /** Destroys this chunk's RealtimeMesh component. MUST be called on the game thread
@@ -331,6 +437,7 @@ struct VOXELPLUGIN_API FMeshChunk {
         ChunkRtComponent = nullptr;
         ChunkRtMesh = nullptr;
         IsInitialized = false;
+        ResetDisplayState();
     }
 };
 
