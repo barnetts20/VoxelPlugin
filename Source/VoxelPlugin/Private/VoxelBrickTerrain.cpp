@@ -13,6 +13,11 @@ static TAutoConsoleVariable<int32> CVarVoxelDebugBricks(
     TEXT("1: log each brick terrain task (wanted, meshed, samples, time)."),
     ECVF_Default);
 
+static TAutoConsoleVariable<int32> CVarVoxelBrickSeams(
+    TEXT("voxel.Render.BrickSeams"), 0,
+    TEXT("Seams between brick-terrain LOD levels. 0: stitched. 1: stitched, plus skirts. 2: skirts only (unstitched bricks)."),
+    ECVF_Default);
+
 namespace VoxelBrickTerrainDetail
 {
     constexpr double TaskInterval = 0.1;            // seconds between tasks
@@ -43,52 +48,241 @@ namespace VoxelBrickTerrainDetail
     {
         FVoxelBrickGrid Grid;
         Grid.Origin = Settings.Origin;
-        Grid.CellSize = Settings.FinestCell * FMath::Pow(2.0, (double)Level);
+        Grid.CellSize = Settings.FinestCell * (double)(1LL << Level);   // exact: stitched bricks share lattice points across levels
         Grid.CellsPerBrick = Settings.CellsPerBrick;
         return Grid;
     }
 
-    struct FWantedBrick
+    enum class ENode : uint8
     {
-        FVoxelBrickKey Key;
+        Internal,
+        Wanted,     // leaf that may hold surface
+        Culled      // leaf proven free of surface
+    };
+
+    struct FWantedInfo
+    {
         double Distance;
         bool bEdited;
     };
 
-    /** The LOD descent: drops bricks proven free of surface (unless edits reach them), splits
-     *  bricks the camera is close to, and collects the rest. */
-    void Descend(const FDensitySampleCompositor& Density, const FSparseEditStore* Edits, const FVoxelBrickTerrainSettings& Settings,
-        const FVector& Camera, const FVoxelBrickKey& Key, TArray<FWantedBrick>& Out, int64& InOutSamples)
+    FVoxelBrickKey ParentOf(const FVoxelBrickKey& Key)
     {
-        const FVoxelBrickGrid Grid = MakeGrid(Settings, Key.Level);
-        const double H = Grid.CellSize;
-        const FVector Min = Grid.BrickMin(Key.Coord);
-        const FBox Region(Min - FVector(2.0 * H), Min + FVector(Grid.BrickSize() + H));
-        const bool bEdited = Edits && Edits->HasEditsInBox(Region);
-        if (!bEdited)
+        FVoxelBrickKey Parent;
+        Parent.Level = Key.Level + 1;
+        Parent.Coord = FInt64Vector(FloorShift(Key.Coord.X, 1), FloorShift(Key.Coord.Y, 1), FloorShift(Key.Coord.Z, 1));
+        return Parent;
+    }
+
+    FVoxelBrickKey ChildOf(const FVoxelBrickKey& Key, int32 Index)
+    {
+        FVoxelBrickKey Child;
+        Child.Level = Key.Level - 1;
+        Child.Coord = FInt64Vector(2 * Key.Coord.X + (Index & 1), 2 * Key.Coord.Y + ((Index >> 1) & 1), 2 * Key.Coord.Z + ((Index >> 2) & 1));
+        return Child;
+    }
+
+    FVoxelBrickKey Offset(const FVoxelBrickKey& Key, int32 DX, int32 DY, int32 DZ)
+    {
+        FVoxelBrickKey Moved = Key;
+        Moved.Coord = FInt64Vector(Key.Coord.X + DX, Key.Coord.Y + DY, Key.Coord.Z + DZ);
+        return Moved;
+    }
+
+    /** The LOD tree of one task, over the whole root: every internal node has all eight
+     *  children, every leaf is wanted or culled. */
+    struct FTree
+    {
+        FTree(const FDensitySampleCompositor& InDensity, const FSparseEditStore* InEdits, const FVoxelBrickTerrainSettings& InSettings, const FVector& InCamera)
+            : Density(InDensity), Edits(InEdits), Settings(InSettings), Camera(InCamera)
         {
+        }
+
+        const FDensitySampleCompositor& Density;
+        const FSparseEditStore* Edits;
+        const FVoxelBrickTerrainSettings& Settings;
+        FVector Camera;
+
+        TMap<FVoxelBrickKey, ENode> Nodes;
+        TMap<FVoxelBrickKey, FWantedInfo> WantedInfo;
+        int64 Samples = 0;
+        int32 BalanceSplits = 0;
+
+        bool InRoot(const FVoxelBrickKey& Key) const
+        {
+            const int64 Count = 1LL << (Settings.MaxLevel - Key.Level);
+            return Key.Coord.X >= 0 && Key.Coord.Y >= 0 && Key.Coord.Z >= 0 && Key.Coord.X < Count && Key.Coord.Y < Count && Key.Coord.Z < Count;
+        }
+
+        double DistanceTo(const FVoxelBrickKey& Key) const
+        {
+            const FVoxelBrickGrid Grid = MakeGrid(Settings, Key.Level);
+            const FVector Min = Grid.BrickMin(Key.Coord);
+            return FMath::Sqrt(BoxDistanceSquared(FBox(Min, Min + FVector(Grid.BrickSize())), Camera));
+        }
+
+        /** False when the brick's centre sample proves it free of surface (never where edits
+         *  reach it). */
+        bool MayHoldSurface(const FVoxelBrickKey& Key, bool& bOutEdited)
+        {
+            const FVoxelBrickGrid Grid = MakeGrid(Settings, Key.Level);
+            const double H = Grid.CellSize;
+            const FVector Min = Grid.BrickMin(Key.Coord);
+            const FBox Region(Min - FVector(2.0 * H), Min + FVector(Grid.BrickSize() + H));
+            bOutEdited = Edits && Edits->HasEditsInBox(Region);
+            if (bOutEdited) return true;
+
             const FVector Centre = Region.GetCenter();
             double CX = Centre.X, CY = Centre.Y, CZ = Centre.Z;
             float D = 0.0f;
             Density.Sample(FSampleInput(&CX, &CY, &CZ, 1, H), &D);
-            InOutSamples++;
-            if (FMath::Abs((double)D) > Settings.SlopeBound * Region.GetExtent().Size()) return;
+            Samples++;
+            return FMath::Abs((double)D) <= Settings.SlopeBound * Region.GetExtent().Size();
         }
 
-        const double Distance = FMath::Sqrt(BoxDistanceSquared(FBox(Min, Min + FVector(Grid.BrickSize())), Camera));
-        if (Key.Level > 0 && Distance < Settings.LodDistanceFactor * Grid.BrickSize())
+        /** The LOD descent: culls bricks proven free of surface and splits bricks the camera
+         *  is close to. */
+        void Descend(const FVoxelBrickKey& Key)
         {
+            bool bEdited = false;
+            if (!MayHoldSurface(Key, bEdited))
+            {
+                Nodes.Add(Key, ENode::Culled);
+                return;
+            }
+            const double Distance = DistanceTo(Key);
+            if (Key.Level > 0 && Distance < Settings.LodDistanceFactor * MakeGrid(Settings, Key.Level).BrickSize())
+            {
+                Nodes.Add(Key, ENode::Internal);
+                for (int32 c = 0; c < 8; c++)
+                    Descend(ChildOf(Key, c));
+                return;
+            }
+            Nodes.Add(Key, ENode::Wanted);
+            WantedInfo.Add(Key, { Distance, bEdited });
+        }
+
+        /** Splits a leaf for the balance. A culled leaf's children are culled; a wanted leaf's
+         *  children are tested. */
+        void Split(const FVoxelBrickKey& Key, TArray<FVoxelBrickKey>& Work)
+        {
+            const ENode Was = Nodes.FindRef(Key);
+            Nodes.Add(Key, ENode::Internal);
+            WantedInfo.Remove(Key);
+            BalanceSplits++;
             for (int32 c = 0; c < 8; c++)
             {
-                FVoxelBrickKey Child;
-                Child.Level = Key.Level - 1;
-                Child.Coord = FInt64Vector(2 * Key.Coord.X + (c & 1), 2 * Key.Coord.Y + ((c >> 1) & 1), 2 * Key.Coord.Z + ((c >> 2) & 1));
-                Descend(Density, Edits, Settings, Camera, Child, Out, InOutSamples);
+                const FVoxelBrickKey Child = ChildOf(Key, c);
+                bool bEdited = false;
+                if (Was == ENode::Wanted && MayHoldSurface(Child, bEdited))
+                {
+                    Nodes.Add(Child, ENode::Wanted);
+                    WantedInfo.Add(Child, { DistanceTo(Child), bEdited });
+                }
+                else
+                {
+                    Nodes.Add(Child, ENode::Culled);
+                }
+                Work.Add(Child);
             }
-            return;
         }
-        Out.Add({ Key, Distance, bEdited });
-    }
+
+        /** Leaf covering a brick-sized region (the region itself, or the first ancestor in
+         *  the tree when the region lies inside a coarser leaf). */
+        FVoxelBrickKey CoveringNode(const FVoxelBrickKey& Key) const
+        {
+            FVoxelBrickKey Cover = Key;
+            while (Cover.Level < Settings.MaxLevel && !Nodes.Contains(Cover))
+                Cover = ParentOf(Cover);
+            return Cover;
+        }
+
+        /** Splits leaves until every two leaves that touch (faces, edges or corners) are at
+         *  most one level apart, over wanted and culled leaves alike, so every point of the
+         *  root has one owning leaf level that each neighbouring brick agrees on. */
+        void Balance()
+        {
+            TArray<FVoxelBrickKey> Work;
+            for (const TPair<FVoxelBrickKey, ENode>& Pair : Nodes)
+            {
+                if (Pair.Value != ENode::Internal)
+                    Work.Add(Pair.Key);
+            }
+            while (Work.Num() > 0)
+            {
+                const FVoxelBrickKey Key = Work.Pop();
+                const ENode* State = Nodes.Find(Key);
+                if (!State || *State == ENode::Internal) continue;
+
+                for (int32 d = 0; d < 27; d++)
+                {
+                    if (d == 13) continue;
+                    const FVoxelBrickKey Neighbour = Offset(Key, d % 3 - 1, (d / 3) % 3 - 1, d / 9 - 1);
+                    if (!InRoot(Neighbour)) continue;
+                    const FVoxelBrickKey Cover = CoveringNode(Neighbour);
+                    if (Cover.Level >= Key.Level + 2)
+                    {
+                        Split(Cover, Work);
+                        Work.Add(Key);   // the split may not be enough yet
+                        break;
+                    }
+                }
+            }
+        }
+
+        /** Level of the leaves touching Key in direction d, relative to Key (balanced tree),
+         *  and whether that neighbour is a wanted brick of Key's level. */
+        int32 NeighbourDelta(const FVoxelBrickKey& Key, int32 d, bool& bOutMeshed) const
+        {
+            bOutMeshed = false;
+            const FVoxelBrickKey Neighbour = Offset(Key, d % 3 - 1, (d / 3) % 3 - 1, d / 9 - 1);
+            if (!InRoot(Neighbour)) return 0;
+            if (const ENode* State = Nodes.Find(Neighbour))
+            {
+                bOutMeshed = *State == ENode::Wanted;
+                return *State == ENode::Internal ? -1 : 0;
+            }
+            return 1;
+        }
+
+        /** Wanted leaves touching Key. */
+        void TouchingWanted(const FVoxelBrickKey& Key, TArray<FVoxelBrickKey>& Out) const
+        {
+            for (int32 d = 0; d < 27; d++)
+            {
+                if (d == 13) continue;
+                const int32 Dir[3] = { d % 3 - 1, (d / 3) % 3 - 1, d / 9 - 1 };
+                const FVoxelBrickKey Neighbour = Offset(Key, Dir[0], Dir[1], Dir[2]);
+                if (!InRoot(Neighbour)) continue;
+                const ENode* State = Nodes.Find(Neighbour);
+                if (!State)
+                {
+                    const FVoxelBrickKey Parent = ParentOf(Neighbour);
+                    if (Nodes.FindRef(Parent) == ENode::Wanted)
+                        Out.AddUnique(Parent);
+                }
+                else if (*State == ENode::Wanted)
+                {
+                    Out.Add(Neighbour);
+                }
+                else if (*State == ENode::Internal)
+                {
+                    for (int32 c = 0; c < 8; c++)
+                    {
+                        bool bTouches = true;
+                        for (int32 Axis = 0; Axis < 3; Axis++)
+                        {
+                            const int32 Bit = (c >> Axis) & 1;
+                            bTouches &= Dir[Axis] == 0 || (Dir[Axis] < 0 ? Bit == 1 : Bit == 0);
+                        }
+                        const FVoxelBrickKey Child = ChildOf(Neighbour, c);
+                        if (bTouches && Nodes.FindRef(Child) == ENode::Wanted)
+                            Out.Add(Child);
+                    }
+                }
+            }
+        }
+    };
 
     FColor LevelColor(int32 Level)
     {
@@ -159,7 +353,7 @@ void FVoxelBrickTerrain::Initialize(AActor* InOwner, USceneComponent* InAttachRo
     AttachRoot = InAttachRoot;
     Density = InDensity;
     Settings = InSettings;
-    Settings.CellsPerBrick = FMath::Max(4, Settings.CellsPerBrick / 4 * 4);
+    Settings.CellsPerBrick = FMath::Max(8, Settings.CellsPerBrick / 4 * 4);
     Settings.MaxLevel = FMath::Max(0, Settings.MaxLevel);
     Settings.SlopeBound = FMath::Max(Settings.SlopeBound, 1.0);
 }
@@ -186,7 +380,11 @@ FVoxelBrickGrid FVoxelBrickTerrain::GridFor(int32 Level) const
 
 FBox FVoxelBrickTerrain::BoundsOf(const FVoxelBrickKey& Key) const
 {
-    return GridFor(Key.Level).DependencyBounds(Key.Coord);
+    // A stitched brick also solves cells of coarser neighbours, whose gradients reach four of
+    // its own cells beyond it.
+    const FVoxelBrickGrid Grid = GridFor(Key.Level);
+    const FVector Min = Grid.BrickMin(Key.Coord);
+    return FBox(Min - FVector(4.0 * Grid.CellSize), Min + FVector(Grid.BrickSize() + 4.0 * Grid.CellSize));
 }
 
 void FVoxelBrickTerrain::NotifyEdit(uint32 Sequence, const FVector& Center, double Radius)
@@ -219,12 +417,13 @@ void FVoxelBrickTerrain::Tick(const FVector& Camera)
     Input.Camera = Camera;
     Input.Density = Density;
     Input.Settings = Settings;
+    Input.SeamMode = FMath::Clamp(CVarVoxelBrickSeams.GetValueOnGameThread(), 0, 2);
     Input.Known.Reserve(Bricks.Num());
     for (TPair<FVoxelBrickKey, FBrick>& Pair : Bricks)
     {
         // Dirty stays set until a rebuilt mesh arrives (DrainResults), so a rebuild of a brick
         // that is not wanted this pass is not lost.
-        Input.Known.Add(Pair.Key);
+        Input.Known.Add(Pair.Key, Pair.Value.bHasPending ? Pair.Value.PendingSignature : Pair.Value.Signature);
         if (Pair.Value.bDirty && Wanted.Contains(Pair.Key))
             Input.Rebuild.Add(Pair.Key);
     }
@@ -243,57 +442,120 @@ void FVoxelBrickTerrain::RunTask(const TSharedRef<FVoxelBrickTerrain>& Self, FTa
     FTaskResult Result;
     Result.Generation = Input.Generation;
 
-    const FDensitySampleCompositor& Dens = *Input.Density;
     const TSharedPtr<FSparseEditStore> Edits = Input.Density->GetEditStore();
     Result.StartSequence = Edits.IsValid() ? Edits->GetLastSequence() : 0;
 
-    TArray<VBT::FWantedBrick> Found;
+    VBT::FTree Tree(*Input.Density, Edits.Get(), Input.Settings, Input.Camera);
     FVoxelBrickKey Root;
     Root.Level = Input.Settings.MaxLevel;
     Root.Coord = FInt64Vector(0, 0, 0);
-    VBT::Descend(Dens, Edits.Get(), Input.Settings, Input.Camera, Root, Found, Result.Samples);
+    Tree.Descend(Root);
+    if (Input.SeamMode != 2)
+        Tree.Balance();
+    Result.BalanceSplits = Tree.BalanceSplits;
 
-    // To mesh: wanted bricks to rebuild, then wanted bricks without a mesh, nearest first.
+    // Each wanted brick's neighbours, packed with the seam mode into its signature: per
+    // direction 0 finer, 1 same level and meshed, 2 same level and not meshed, 3 coarser.
+    struct FToMesh
+    {
+        FVoxelBrickKey Key;
+        double Distance;
+        bool bEdited;
+        uint64 Signature;
+        uint32 Meshed;
+        int8 Levels[27];
+    };
     TSet<FVoxelBrickKey> RebuildSet;
     RebuildSet.Append(Input.Rebuild);
-    TArray<VBT::FWantedBrick> ToMesh;
-    Result.Wanted.Reserve(Found.Num());
-    for (const VBT::FWantedBrick& W : Found)
+    TArray<FToMesh> Rebuilds, NewBricks, Restitches;
+    Result.Wanted.Reserve(Tree.WantedInfo.Num());
+    for (const TPair<FVoxelBrickKey, VBT::FWantedInfo>& Pair : Tree.WantedInfo)
     {
-        Result.Wanted.Add(W.Key);
-        if (RebuildSet.Contains(W.Key))
-            ToMesh.Add({ W.Key, -1.0, W.bEdited });
-        else if (!Input.Known.Contains(W.Key))
-            ToMesh.Add(W);
-    }
-    ToMesh.Sort([](const VBT::FWantedBrick& A, const VBT::FWantedBrick& B) { return A.Distance < B.Distance; });
-    int32 NumRebuild = 0;
-    while (NumRebuild < ToMesh.Num() && ToMesh[NumRebuild].Distance < 0.0) NumRebuild++;
+        FToMesh Entry;
+        Entry.Key = Pair.Key;
+        Entry.Distance = Pair.Value.Distance;
+        Entry.bEdited = Pair.Value.bEdited;
+        Entry.Signature = (1ULL << 63) | ((uint64)Input.SeamMode << 56);
+        Entry.Meshed = 0;
+        for (int32 d = 0, Slot = 0; d < 27; d++)
+        {
+            bool bMeshed = false;
+            const int32 Delta = Input.SeamMode == 2 ? 0 : Tree.NeighbourDelta(Pair.Key, d, bMeshed);
+            Entry.Levels[d] = (int8)Delta;
+            Entry.Meshed |= bMeshed ? (1u << d) : 0u;
+            if (d == 13) continue;
+            const uint64 State = Delta < 0 ? 0 : (Delta > 0 ? 3 : (bMeshed ? 1 : 2));
+            Entry.Signature |= State << (2 * Slot++);
+        }
+        Result.Wanted.Add(Pair.Key, Entry.Signature);
 
-    // New bricks left over when the budget runs out are found again next task; rebuilds are
-    // always finished.
-    std::atomic<int64> Samples{ 0 };
-    for (int32 Start = 0; Start < ToMesh.Num() && (Start < NumRebuild || Samples.load() < VBT::MaxSamplesPerTask); Start += VBT::MeshBatch)
-    {
-        const int32 Count = FMath::Min(VBT::MeshBatch, ToMesh.Num() - Start);
-        TArray<FBuilt> Batch;
-        Batch.SetNum(Count);
-        ParallelFor(Count, [&](int32 i)
-            {
-                const VBT::FWantedBrick& W = ToMesh[Start + i];
-                const FVoxelBrickGrid Grid = VBT::MakeGrid(Input.Settings, W.Key.Level);
-                FVoxelBrickMesh Mesh;
-                FVoxelBrickStats Stats;
-                VoxelBrickMesher::MeshBrick(Dens, Grid, W.Key.Coord, Input.Settings.SlopeBound, W.bEdited, Mesh, Stats);
-                if (Mesh.Indices.Num() > 0)
-                    VoxelBrickMesher::AddSkirts(Mesh, (float)(VBT::SkirtCells * Grid.CellSize));
-                Batch[i].Key = W.Key;
-                Batch[i].Stream = VBT::BuildRenderStream(Mesh, Grid.BrickMin(W.Key.Coord), W.Key.Level, (float)Input.Settings.TriplanarUVScale);
-                Samples.fetch_add(Stats.Samples, std::memory_order_relaxed);
-            });
-        Result.Built.Append(MoveTemp(Batch));
+        const uint64* Held = Input.Known.Find(Pair.Key);
+        if (!Held)
+            NewBricks.Add(Entry);
+        else if (RebuildSet.Contains(Pair.Key))
+            Rebuilds.Add(Entry);
+        else if (*Held != Entry.Signature)
+            Restitches.Add(Entry);
     }
-    Result.Samples += Samples.load();
+    NewBricks.Sort([](const FToMesh& X, const FToMesh& Y) { return X.Distance < Y.Distance; });
+
+    const double SkirtDepth = Input.SeamMode == 0 ? 0.0 : VBT::SkirtCells;
+    std::atomic<int64> Samples{ 0 };
+    auto MeshAll = [&Input, &Tree, &Result, &Samples, SkirtDepth](const TArray<FToMesh>& List, int32 First, int32 Count)
+        {
+            TArray<FBuilt> Batch;
+            Batch.SetNum(Count);
+            ParallelFor(Count, [&](int32 i)
+                {
+                    const FToMesh& Entry = List[First + i];
+                    const FVoxelBrickGrid Grid = VBT::MakeGrid(Input.Settings, Entry.Key.Level);
+                    FVoxelBrickMesh Mesh;
+                    FVoxelBrickStats Stats;
+                    if (Input.SeamMode == 2)
+                        VoxelBrickMesher::MeshBrick(*Input.Density, Grid, Entry.Key.Coord, Input.Settings.SlopeBound, Entry.bEdited, Mesh, Stats);
+                    else
+                        VoxelBrickMesher::MeshBrickStitched(*Input.Density, Grid, Entry.Key.Coord, Entry.Levels, Entry.Meshed, Input.Settings.SlopeBound, Entry.bEdited, Mesh, Stats);
+                    if (SkirtDepth > 0.0 && Mesh.Indices.Num() > 0)
+                        VoxelBrickMesher::AddSkirts(Mesh, (float)(SkirtDepth * Grid.CellSize));
+
+                    FBuilt& Built = Batch[i];
+                    Built.Key = Entry.Key;
+                    Built.Signature = Entry.Signature;
+                    Built.Stream = VBT::BuildRenderStream(Mesh, Grid.BrickMin(Entry.Key.Coord), Entry.Key.Level, (float)Input.Settings.TriplanarUVScale);
+                    Tree.TouchingWanted(Entry.Key, Built.Neighbours);
+                    Samples.fetch_add(Stats.Samples, std::memory_order_relaxed);
+                });
+            Result.Built.Append(MoveTemp(Batch));
+        };
+
+    // Edit rebuilds always finish. New bricks are meshed nearest first while the budget lasts;
+    // those left over are found again next task.
+    MeshAll(Rebuilds, 0, Rebuilds.Num());
+    for (int32 Start = 0; Start < NewBricks.Num() && Samples.load() < VBT::MaxSamplesPerTask; Start += VBT::MeshBatch)
+        MeshAll(NewBricks, Start, FMath::Min(VBT::MeshBatch, NewBricks.Num() - Start));
+
+    // Held bricks whose neighbours changed are restitched once every brick touching them is
+    // held or built, so the restitched mesh never waits long on screen for its neighbours.
+    TSet<FVoxelBrickKey> Available;
+    for (const FBuilt& Built : Result.Built)
+        Available.Add(Built.Key);
+    TArray<FToMesh> Ready;
+    TArray<FVoxelBrickKey> Touching;
+    for (const FToMesh& Entry : Restitches)
+    {
+        Touching.Reset();
+        Tree.TouchingWanted(Entry.Key, Touching);
+        bool bAvailable = true;
+        for (const FVoxelBrickKey& Key : Touching)
+            bAvailable &= Input.Known.Contains(Key) || Available.Contains(Key);
+        if (bAvailable)
+            Ready.Add(Entry);
+    }
+    Result.NumRestitched = Ready.Num();
+    for (int32 Start = 0; Start < Ready.Num(); Start += VBT::MeshBatch)
+        MeshAll(Ready, Start, FMath::Min(VBT::MeshBatch, Ready.Num() - Start));
+
+    Result.Samples = Tree.Samples + Samples.load();
     Result.Milliseconds = (FPlatformTime::Seconds() - T0) * 1000.0;
 
     {
@@ -316,8 +578,7 @@ void FVoxelBrickTerrain::DrainResults()
     {
         if (Result.Generation != Generation) continue;
 
-        Wanted.Reset();
-        Wanted.Append(Result.Wanted);
+        Wanted = MoveTemp(Result.Wanted);
         bHasWanted = true;
 
         int32 NumWithSurface = 0;
@@ -325,7 +586,15 @@ void FVoxelBrickTerrain::DrainResults()
         {
             FBrick& Brick = Bricks.FindOrAdd(Built.Key);
             Brick.Pending = MoveTemp(Built.Stream);
+            Brick.PendingSignature = Built.Signature;
             NumWithSurface += Brick.Pending.IsValid() ? 1 : 0;
+
+            // A mesh stitched to other neighbours than the one on screen waits until its new
+            // neighbours are on screen (ApplyQueued), then swaps in the same frame as the
+            // bricks they replace leave (RemoveReplaced).
+            Brick.WaitFor.Reset();
+            if (Brick.bApplied && Brick.Signature != Built.Signature)
+                Brick.WaitFor = MoveTemp(Built.Neighbours);
             if (!Brick.bHasPending)
             {
                 Brick.bHasPending = true;
@@ -345,8 +614,8 @@ void FVoxelBrickTerrain::DrainResults()
 
         if (CVarVoxelDebugBricks.GetValueOnGameThread() > 0)
         {
-            UE_LOG(LogTemp, Log, TEXT("[VoxelBricks] %d wanted, %d meshed (%d with surface), %lld samples, %.1f ms, %d bricks held"),
-                Result.Wanted.Num(), Result.Built.Num(), NumWithSurface, Result.Samples, Result.Milliseconds, Bricks.Num());
+            UE_LOG(LogTemp, Log, TEXT("[VoxelBricks] %d wanted (%d balance splits), %d meshed (%d with surface, %d restitched), %lld samples, %.1f ms, %d bricks held"),
+                Result.Wanted.Num(), Result.BalanceSplits, Result.Built.Num(), NumWithSurface, Result.NumRestitched, Result.Samples, Result.Milliseconds, Bricks.Num());
         }
     }
 }
@@ -361,11 +630,22 @@ void FVoxelBrickTerrain::ApplyQueued()
         FBrick* Brick = Bricks.Find(Key);
         if (!Brick || !Brick->bHasPending) continue;
 
+        bool bReady = true;
+        for (const FVoxelBrickKey& Neighbour : Brick->WaitFor)
+            bReady &= !Wanted.Contains(Neighbour) || IsOnScreen(Neighbour);
+        if (!bReady)
+        {
+            ApplyQueue[Kept++] = Key;
+            continue;
+        }
+        Brick->WaitFor.Reset();
+
         if (!Brick->Pending.IsValid())
         {
             DestroyComponent(*Brick);
             Brick->bHasPending = false;
             Brick->bApplied = true;
+            Brick->Signature = Brick->PendingSignature;
             continue;
         }
 
@@ -389,6 +669,7 @@ void FVoxelBrickTerrain::ApplyQueued()
         URealtimeMeshSimple* Mesh = Brick->Mesh.Get();
         const TSharedPtr<FMeshStreamData> Data = MoveTemp(Brick->Pending);
         Brick->bHasPending = false;
+        Brick->Signature = Brick->PendingSignature;
         TFuture<ERealtimeMeshProxyUpdateStatus> Update = Mesh->UpdateBufferSet(Data->MeshGroupKey, Data->MeshStream);
         if (!Brick->bHasSection)
         {
@@ -429,27 +710,78 @@ bool FVoxelBrickTerrain::IsOnScreen(const FVoxelBrickKey& Key) const
     return Frame != 0 && GFrameCounter >= Frame;
 }
 
-bool FVoxelBrickTerrain::IsCovered(const FVoxelBrickKey& Key) const
+bool FVoxelBrickTerrain::IsSettled(const FVoxelBrickKey& Key) const
 {
-    // A wanted ancestor replaces it on a merge.
-    for (int32 Level = Key.Level + 1; Level <= Settings.MaxLevel; Level++)
+    const FBrick* Brick = Bricks.Find(Key);
+    const uint64* Signature = Wanted.Find(Key);
+    return Brick && Signature && Brick->Signature == *Signature && IsOnScreen(Key);
+}
+
+void FVoxelBrickTerrain::TouchingWanted(const FVoxelBrickKey& Key, TArray<FVoxelBrickKey>& Out) const
+{
+    for (int32 d = 0; d < 27; d++)
+    {
+        if (d == 13) continue;
+        const int32 Dir[3] = { d % 3 - 1, (d / 3) % 3 - 1, d / 9 - 1 };
+        const FVoxelBrickKey Neighbour = VBT::Offset(Key, Dir[0], Dir[1], Dir[2]);
+        if (Wanted.Contains(Neighbour))
+        {
+            Out.AddUnique(Neighbour);
+            continue;
+        }
+        const FVoxelBrickKey Parent = VBT::ParentOf(Neighbour);
+        if (Wanted.Contains(Parent))
+        {
+            Out.AddUnique(Parent);
+            continue;
+        }
+        for (int32 c = 0; c < 8 && Neighbour.Level > 0; c++)
+        {
+            bool bTouches = true;
+            for (int32 Axis = 0; Axis < 3; Axis++)
+            {
+                const int32 Bit = (c >> Axis) & 1;
+                bTouches &= Dir[Axis] == 0 || (Dir[Axis] < 0 ? Bit == 1 : Bit == 0);
+            }
+            const FVoxelBrickKey Child = VBT::ChildOf(Neighbour, c);
+            if (bTouches && Wanted.Contains(Child))
+                Out.AddUnique(Child);
+        }
+    }
+}
+
+bool FVoxelBrickTerrain::IsCovered(const FVoxelBrickKey& Key, const TArray<FVoxelBrickKey>& Descendants) const
+{
+    // Replacements: a wanted ancestor on a merge, the wanted descendants on a split. None at
+    // all: its region holds no surface now.
+    TArray<FVoxelBrickKey> Replacements;
+    for (int32 Level = Key.Level + 1; Level <= Settings.MaxLevel && Replacements.Num() == 0; Level++)
     {
         const int32 Up = Level - Key.Level;
         FVoxelBrickKey Ancestor;
         Ancestor.Level = Level;
         Ancestor.Coord = FInt64Vector(VBT::FloorShift(Key.Coord.X, Up), VBT::FloorShift(Key.Coord.Y, Up), VBT::FloorShift(Key.Coord.Z, Up));
         if (Wanted.Contains(Ancestor))
-            return IsOnScreen(Ancestor);
+            Replacements.Add(Ancestor);
     }
+    if (Replacements.Num() == 0)
+        Replacements = Descendants;
 
-    // Wanted descendants replace it on a split. None at all: its region holds no surface now.
-    for (const FVoxelBrickKey& W : Wanted)
+    // The replacements and the bricks around them must show meshes stitched to the new tree,
+    // or removing this brick opens the cracks it was hiding.
+    for (const FVoxelBrickKey& Replacement : Replacements)
     {
-        if (W.Level >= Key.Level) continue;
-        const int32 Up = Key.Level - W.Level;
-        if (VBT::FloorShift(W.Coord.X, Up) == Key.Coord.X && VBT::FloorShift(W.Coord.Y, Up) == Key.Coord.Y && VBT::FloorShift(W.Coord.Z, Up) == Key.Coord.Z
-            && !IsOnScreen(W))
-            return false;
+        if (!IsSettled(Replacement)) return false;
+    }
+    TArray<FVoxelBrickKey> Around;
+    for (const FVoxelBrickKey& Replacement : Replacements)
+    {
+        Around.Reset();
+        TouchingWanted(Replacement, Around);
+        for (const FVoxelBrickKey& Neighbour : Around)
+        {
+            if (!IsSettled(Neighbour)) return false;
+        }
     }
     return true;
 }
@@ -458,11 +790,32 @@ void FVoxelBrickTerrain::RemoveReplaced()
 {
     if (!bHasWanted) return;
 
-    TArray<FVoxelBrickKey> Remove;
+    // Held bricks no longer wanted, each with its wanted descendants.
+    TMap<FVoxelBrickKey, TArray<FVoxelBrickKey>> Candidates;
+    int32 MaxCandidateLevel = -1;
     for (const TPair<FVoxelBrickKey, FBrick>& Pair : Bricks)
     {
-        if (!Wanted.Contains(Pair.Key) && IsCovered(Pair.Key))
-            Remove.Add(Pair.Key);
+        if (Wanted.Contains(Pair.Key)) continue;
+        Candidates.Add(Pair.Key);
+        MaxCandidateLevel = FMath::Max(MaxCandidateLevel, Pair.Key.Level);
+    }
+    if (Candidates.Num() == 0) return;
+    for (const TPair<FVoxelBrickKey, uint64>& Pair : Wanted)
+    {
+        FVoxelBrickKey Ancestor = Pair.Key;
+        while (Ancestor.Level < MaxCandidateLevel)
+        {
+            Ancestor = VBT::ParentOf(Ancestor);
+            if (TArray<FVoxelBrickKey>* Descendants = Candidates.Find(Ancestor))
+                Descendants->Add(Pair.Key);
+        }
+    }
+
+    TArray<FVoxelBrickKey> Remove;
+    for (const TPair<FVoxelBrickKey, TArray<FVoxelBrickKey>>& Candidate : Candidates)
+    {
+        if (IsCovered(Candidate.Key, Candidate.Value))
+            Remove.Add(Candidate.Key);
     }
     for (const FVoxelBrickKey& Key : Remove)
     {

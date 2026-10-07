@@ -69,6 +69,26 @@ namespace VoxelBrickMesher
     VOXELPLUGIN_API void MeshBrick(const FDensitySampleCompositor& Density, const FVoxelBrickGrid& Grid,
         const FInt64Vector& Brick, double SlopeBound, bool bNoSkip, FVoxelBrickMesh& Out, FVoxelBrickStats& OutStats);
 
+    /** Meshes Brick so that it meets neighbours one level finer or coarser without cracks.
+     *  NeighbourLevels holds the level of the leaf brick covering each of the 26 neighbouring
+     *  regions of this brick's size, relative to this brick (-1, 0 or +1; index
+     *  (dz+1)*9 + (dy+1)*3 + (dx+1), the centre ignored). The tree must be 2:1 balanced across
+     *  faces, edges and corners. Bit d of MeshedNeighbours is set when the neighbour in
+     *  direction d is a brick of this level that is meshed too; edges this brick shares only
+     *  with unmeshed bricks (culled, or outside the tree) are emitted here.
+     *
+     *  Dual contouring on the leaf cells, as for octrees: faces come from minimal edges (edges
+     *  of the finest cell touching them), and an edge whose cells are of different levels
+     *  gives a triangle instead of a quad. Each brick emits the minimal edges of its own
+     *  level, so the finer side of a transition stitches it. Every lattice point is sampled
+     *  with the cell size of the leaf owning it as footprint, so bricks that share a point or
+     *  a vertex compute it identically. CellsPerBrick must be at least 8.
+     *
+     *  Grid is this brick's level; the empty test is MeshBrick's. */
+    VOXELPLUGIN_API void MeshBrickStitched(const FDensitySampleCompositor& Density, const FVoxelBrickGrid& Grid,
+        const FInt64Vector& Brick, const int8 (&NeighbourLevels)[27], uint32 MeshedNeighbours, double SlopeBound, bool bNoSkip,
+        FVoxelBrickMesh& Out, FVoxelBrickStats& OutStats);
+
     /** Hangs a skirt from every open edge of Mesh: a strip pushed Depth into the solid along
      *  the vertex normals, wound to continue the surface. Hides the cracks between bricks of
      *  different LOD; between same-LOD bricks it stays under the neighbour's surface. */

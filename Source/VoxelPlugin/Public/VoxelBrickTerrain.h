@@ -50,12 +50,17 @@ struct FVoxelBrickTerrainSettings
 
 /** Brick terrain of one terrain actor.
  *
- *  Every TaskInterval a worker task walks the tree from the root brick: a brick is dropped
+ *  Every TaskInterval a worker task walks the tree from the root brick: a brick is culled
  *  when its centre sample proves it free of surface, split while the camera is within
- *  LodDistanceFactor brick sizes, and otherwise wanted. Wanted bricks without a mesh are
- *  meshed nearest first within a sample budget, with skirts over the cracks between levels.
+ *  LodDistanceFactor brick sizes, and otherwise wanted. The tree is then balanced so that
+ *  touching leaves differ by at most one level, and each wanted brick is meshed stitched to
+ *  its neighbours' levels (VoxelBrickMesher::MeshBrickStitched). Wanted bricks without a
+ *  mesh are meshed nearest first within a sample budget; held bricks whose neighbour levels
+ *  changed are meshed again.
+ *
  *  On the game thread a brick that is no longer wanted stays until the bricks replacing it
- *  are on screen, so the swap never opens a hole. */
+ *  are on screen, and a restitched mesh waits until the neighbours it was stitched to are on
+ *  screen, so swaps open neither holes nor cracks. */
 class VOXELPLUGIN_API FVoxelBrickTerrain : public TSharedFromThis<FVoxelBrickTerrain>
 {
 public:
@@ -84,6 +89,11 @@ private:
          *  component can be on screen, 0 until then. */
         TSharedPtr<std::atomic<uint64>> ShownFrame;
         uint64 CreatedFrame = 0;
+        /** Neighbour levels and seam mode the applied mesh was built for, and the pending one. */
+        uint64 Signature = 0;
+        uint64 PendingSignature = 0;
+        /** The pending mesh is stitched to these bricks and waits until they are on screen. */
+        TArray<FVoxelBrickKey> WaitFor;
         bool bHasPending = false;
         bool bApplied = false;        // a mesh (or, empty, nothing) has been applied
         bool bHasSection = false;
@@ -94,14 +104,17 @@ private:
     {
         FVoxelBrickKey Key;
         TSharedPtr<FMeshStreamData> Stream;   // null when the brick holds no surface
+        uint64 Signature = 0;
+        TArray<FVoxelBrickKey> Neighbours;    // wanted bricks touching it
     };
 
     struct FTaskInput
     {
         uint32 Generation = 0;
         FVector Camera = FVector::ZeroVector;
-        TSet<FVoxelBrickKey> Known;
+        TMap<FVoxelBrickKey, uint64> Known;   // held bricks and the signature of their newest mesh
         TArray<FVoxelBrickKey> Rebuild;
+        int32 SeamMode = 0;
         TSharedPtr<FDensitySampleCompositor> Density;
         FVoxelBrickTerrainSettings Settings;
     };
@@ -110,8 +123,10 @@ private:
     {
         uint32 Generation = 0;
         uint32 StartSequence = 0;
-        TArray<FVoxelBrickKey> Wanted;
+        TMap<FVoxelBrickKey, uint64> Wanted;   // and their signatures
         TArray<FBuilt> Built;
+        int32 BalanceSplits = 0;
+        int32 NumRestitched = 0;
         int64 Samples = 0;
         double Milliseconds = 0.0;
     };
@@ -127,7 +142,10 @@ private:
     FVoxelBrickGrid GridFor(int32 Level) const;
     FBox BoundsOf(const FVoxelBrickKey& Key) const;
     bool IsOnScreen(const FVoxelBrickKey& Key) const;
-    bool IsCovered(const FVoxelBrickKey& Key) const;
+    /** Wanted, on screen, and showing a mesh stitched to the current tree. */
+    bool IsSettled(const FVoxelBrickKey& Key) const;
+    void TouchingWanted(const FVoxelBrickKey& Key, TArray<FVoxelBrickKey>& Out) const;
+    bool IsCovered(const FVoxelBrickKey& Key, const TArray<FVoxelBrickKey>& Descendants) const;
 
     void DrainResults();
     void ApplyQueued();
@@ -142,7 +160,7 @@ private:
 
     // Game thread only.
     TMap<FVoxelBrickKey, FBrick> Bricks;
-    TSet<FVoxelBrickKey> Wanted;
+    TMap<FVoxelBrickKey, uint64> Wanted;   // bricks of the latest tree and their signatures
     TArray<FVoxelBrickKey> ApplyQueue;
     TArray<FRecentEdit> RecentEdits;
     uint32 Generation = 0;
