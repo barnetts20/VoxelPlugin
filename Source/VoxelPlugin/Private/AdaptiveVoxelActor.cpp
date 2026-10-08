@@ -908,6 +908,10 @@ void AAdaptiveVoxelActor::InitializeBrickTerrain(double RootExtent)
     Settings.SlopeBound = CollisionSlopeBound;
     Settings.TriplanarUVScale = 0.0001 * (80000000.0 / FMath::Max(GetActorScale3D().GetMax(), 1.0));
     Settings.Material = SurfaceMaterial;
+    // The plugin's collection when none is assigned (the planet spawns this actor).
+    if (!BrickMorphParameters)
+        BrickMorphParameters = Cast<UMaterialParameterCollection>(StaticLoadObject(UMaterialParameterCollection::StaticClass(), nullptr,
+            TEXT("/VoxelPlugin/MPC_VoxelMorph.MPC_VoxelMorph"), nullptr, LOAD_NoWarn | LOAD_Quiet));
     Settings.MorphParameters = BrickMorphParameters.Get();
     BrickTerrain->Initialize(this, BrickAttachmentRoot, DensityCompositor, Settings);
 }
@@ -984,13 +988,46 @@ void AAdaptiveVoxelActor::TickCollision(UWorld* World)
         CollisionBricks->DrawDebug(World, BrickAttachmentRoot->GetComponentTransform());
 }
 
+void AAdaptiveVoxelActor::RunDeferredOctreeEdits()
+{
+    TArray<FEditNotice> Edits;
+    {
+        FScopeLock Lock(&PendingApplyCS);
+        Edits = MoveTemp(DeferredOctreeEdits);
+        DeferredOctreeEdits.Reset();
+    }
+    if (Edits.Num() == 0 || IsDestroyed) return;
+
+    EditUpdateIsRunning = true;
+    TWeakObjectPtr<AAdaptiveVoxelActor> WeakThis(this);
+    FFunctionGraphTask::CreateAndDispatchWhenReady([WeakThis, Edits = MoveTemp(Edits)]()
+        {
+            AAdaptiveVoxelActor* Self = WeakThis.Get();
+            if (!Self || Self->IsDestroyed) return;
+            TArray<TSharedPtr<FMeshChunk>> DirtyChunks;
+            {
+                FRWScopeLock WriteLock(Self->OctreeLock, SLT_Write);
+                if (Self->AdaptiveOctree.IsValid())
+                {
+                    Self->AdaptiveOctree->BeginPass();
+                    for (const FEditNotice& Edit : Edits)
+                        Self->AdaptiveOctree->RefreshEdit(Edit.Center, Edit.Radius);
+                    Self->AdaptiveOctree->CollectDirtyChunks(DirtyChunks);
+                }
+            }
+            Self->EnqueueDirtyChunksForApply(DirtyChunks);
+            Self->EditUpdateIsRunning = false;
+        }, TStatId(), nullptr, ENamedThreads::AnyNormalThreadHiPriTask);
+}
+
 void AAdaptiveVoxelActor::RunEditUpdateTask(FVector InEditCenter, double InEditRadius, double InEditStrength, int InEditResolution)
 {
     if (EditUpdateIsRunning || IsDestroyed) return;
 
     EditUpdateIsRunning = true;
     TWeakObjectPtr<AAdaptiveVoxelActor> WeakThis(this);
-    FFunctionGraphTask::CreateAndDispatchWhenReady([WeakThis, InEditCenter, InEditRadius, InEditStrength, InEditResolution]()
+    const bool bStoreOnly = bBrickRenderActive;
+    FFunctionGraphTask::CreateAndDispatchWhenReady([WeakThis, InEditCenter, InEditRadius, InEditStrength, InEditResolution, bStoreOnly]()
         {
             double t0 = FPlatformTime::Seconds();
             AAdaptiveVoxelActor* Self = WeakThis.Get();
@@ -998,6 +1035,17 @@ void AAdaptiveVoxelActor::RunEditUpdateTask(FVector InEditCenter, double InEditR
 
             TArray<TSharedPtr<FMeshChunk>> DirtyChunks;
             bool bApplied = false;
+            const TSharedPtr<FSparseEditStore> Store = Self->DensityCompositor.IsValid() ? Self->DensityCompositor->GetEditStore() : nullptr;
+            if (bStoreOnly && Store.IsValid())
+            {
+                // The brick terrain and the collision read the edit store alone: no octree
+                // lock or rebuild. The octree catches up if it renders again.
+                Store->ApplySphericalEdit(InEditCenter, InEditRadius, InEditStrength, Store->GetDepthForBrushRadius(InEditRadius, InEditResolution));
+                bApplied = true;
+                FScopeLock Lock(&Self->PendingApplyCS);
+                Self->DeferredOctreeEdits.Add({ Store->GetLastSequence(), InEditCenter, InEditRadius });
+            }
+            else
             {
                 FRWScopeLock WriteLock(Self->OctreeLock, SLT_Write);
                 // The octree is built by the first data pass; an edit before that is dropped.
@@ -1010,14 +1058,11 @@ void AAdaptiveVoxelActor::RunEditUpdateTask(FVector InEditCenter, double InEditR
                 }
             }
 
-            // The collision bricks rebuild what this edit reaches.
-            TSharedPtr<FSparseEditStore> EditStore;
-            if (Self->DensityCompositor.IsValid())
-                EditStore = Self->DensityCompositor->GetEditStore();
-            if (bApplied && EditStore.IsValid())
+            // The collision bricks and the brick terrain rebuild what this edit reaches.
+            if (bApplied && Store.IsValid())
             {
                 FScopeLock Lock(&Self->PendingApplyCS);
-                Self->PendingEditNotices.Add({ EditStore->GetLastSequence(), InEditCenter, InEditRadius });
+                Self->PendingEditNotices.Add({ Store->GetLastSequence(), InEditCenter, InEditRadius });
             }
 
             double elapsed = (FPlatformTime::Seconds() - t0) * 1000.0;
@@ -1050,6 +1095,10 @@ void AAdaptiveVoxelActor::Tick(float DeltaTime)
     // appears under the hidden root.
     if (!bBrickRenderActive)
     {
+        // Edits made while the bricks rendered reach the octree first.
+        if (!EditUpdateIsRunning)
+            RunDeferredOctreeEdits();
+
         // Create components and swap in finished passes (component creation is time-sliced).
         DrainPendingApply();
 

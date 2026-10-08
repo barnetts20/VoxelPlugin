@@ -245,7 +245,11 @@ void FAdaptiveOctree::ApplyEdit(FVector InEditCenter, double InEditRadius, doubl
 
     const int EditDepth = EditStore->GetDepthForBrushRadius(InEditRadius, InEditResolution);
     EditStore->ApplySphericalEdit(InEditCenter, InEditRadius, InEditStrength, EditDepth);
+    RefreshEdit(InEditCenter, InEditRadius);
+}
 
+void FAdaptiveOctree::RefreshEdit(FVector InEditCenter, double InEditRadius)
+{
     // Every chunk root the brush touches, at whatever depth the chunk cut has it.
     TArray<TSharedPtr<FAdaptiveOctreeNode>> ChunkNodes;
     CollectChunkRootsInSphere(Root.Get(), InEditCenter, InEditRadius, ChunkNodes);

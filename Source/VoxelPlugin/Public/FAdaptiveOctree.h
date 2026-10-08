@@ -389,10 +389,14 @@ public:
      *  holds the write lock. */
     uint32 BeginPass() { return ++CurrentPassId; }
 
-    /** Applies an additive spherical brush edit. Writes to the edit store, reconstructs
-     *  every chunk root the brush touches, enforces LOD splits, and re-meshes those chunks
-     *  and their neighbours. */
+    /** Applies an additive spherical brush edit: writes it to the edit store, then
+     *  RefreshEdit. */
     void ApplyEdit(FVector InEditCenter, double InEditRadius, double InEditStrength, int InEditResolution);
+
+    /** The octree side of an edit already in the edit store: reconstructs every chunk root
+     *  the brush touches, enforces LOD splits, and re-meshes those chunks and their
+     *  neighbours. Caller holds the write lock. */
+    void RefreshEdit(FVector InEditCenter, double InEditRadius);
 
     /** Per-pass LOD update: evaluates split/merge for all chunks in parallel based on
      *  camera distance and screen-space threshold, then re-meshes the changed chunks and

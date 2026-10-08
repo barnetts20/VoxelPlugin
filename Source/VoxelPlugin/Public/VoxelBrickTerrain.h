@@ -7,6 +7,7 @@
 
 #include "CoreMinimal.h"
 #include "HAL/CriticalSection.h"
+#include "Misc/Optional.h"
 #include "VoxelBrickMesher.h"
 #include <atomic>
 
@@ -84,7 +85,9 @@ struct FVoxelBrickTerrainSettings
  *  (FVoxelBrickPages::Stage), then the result is committed to the pages whole, in one frame,
  *  once every page it touches is ready (FVoxelBrickPages::PrepareCommit), so the tree on screen
  *  switches from one frame to the next. Only the first fill, with nothing on screen, commits
- *  page by page. No task starts while a commit waits. */
+ *  page by page. The next task runs while a commit is meshed; its result waits for that
+ *  commit. Edits go to the pages directly: the held bricks in an edit's reach are meshed again
+ *  as the tree has them, in their own commit or with the next result's. */
 class VOXELPLUGIN_API FVoxelBrickTerrain : public TSharedFromThis<FVoxelBrickTerrain>
 {
 public:
@@ -146,6 +149,8 @@ private:
          *  again at the commit even if its signature is unchanged). */
         bool bInPage = false;
         bool bRemesh = false;
+        /** GPU backend: the committed mesh holds every edit up to this sequence. */
+        uint32 EditSequence = 0;
     };
 
     struct FBuilt
@@ -170,6 +175,7 @@ private:
         int32 Backend = 0;                    // 0 CPU meshes, 1 GPU pages
         TSharedPtr<FDensitySampleCompositor> Density;
         FVoxelBrickTerrainSettings Settings;
+        double LaunchTime = 0.0;
     };
 
     struct FTaskResult
@@ -182,11 +188,14 @@ private:
         int32 SeamMode = 0;
         bool bComplete = false;               // every wanted brick has a mesh for its signature
         int32 BalanceSplits = 0;
+        int32 NumNew = 0;
+        int32 NumRebuilt = 0;
         int32 NumRestitched = 0;
         int32 NumRestitchedEmpty = 0;
         int64 Samples = 0;
         double Milliseconds = 0.0;
         double TreeMilliseconds = 0.0;        // the descent and the balance
+        double LaunchTime = 0.0;
     };
 
     struct FRecentEdit
@@ -209,6 +218,8 @@ private:
     bool IsCovered(const FVoxelBrickKey& Key, const TArray<FVoxelBrickKey>& Descendants, int32* OutStall = nullptr) const;
 
     void DrainResults();
+    /** Takes a result's tree and bricks; GPU backend: builds its commit and stages it. */
+    void ApplyResult(FTaskResult& Result);
     /** CPU backend. */
     void ApplyQueued();
     void RemoveReplaced();
@@ -218,6 +229,13 @@ private:
     void BuildCommit(TArray<FVoxelBrickPageChange>& Out) const;
     /** Records committed changes on the bricks. */
     void ApplyCommitted(TConstArrayView<FVoxelBrickPageChange> Changes);
+    /** GPU backend: adds changes for the edited bricks (EditBacklog) that Changes doesn't hold,
+     *  once the GPU edit data has every edit they wait for. */
+    void MergeEdits(TArray<FVoxelBrickPageChange>& Changes);
+    /** GPU backend: commits the edited bricks on their own when no commit is pending. */
+    void StartEditCommit();
+    /** GPU backend: stages PendingChanges with the edits the GPU data holds. */
+    void StagePending();
     bool EnsureComponent(const FVoxelBrickKey& Key, FBrick& Brick);
     static void DestroyComponent(FBrick& Brick);
     /** The backend voxel.Render.BrickBackend asks for, if this terrain can run it. */
@@ -266,6 +284,18 @@ private:
     TArray<FVoxelBrickPageChange> PendingChanges;
     int32 NumInPage = 0;
     double CommitWaitSeconds = 0.0;
+    /** GPU backend: a result that finished while a commit was meshed, waiting for it; the
+     *  pending commit's task launch (0 for an edit commit) and the GPU edit data it is meshed
+     *  with; launch to screen, measured and filtered. */
+    TOptional<FTaskResult> HeldResult;
+    double CommitLaunchTime = 0.0;
+    uint32 CommitEditSequence = 0;
+    double MeasuredLatency = 0.0;
+    bool bLatencyMeasured = false;
+    /** GPU backend: held bricks in the reach of edits not yet committed, and the newest such
+     *  edit. */
+    TSet<FVoxelBrickKey> EditBacklog;
+    uint32 EditBacklogSequence = 0;
 
     int32 Backend = 0;
     FVector LastCamera = FVector::ZeroVector;   // the latest Tick's camera (actor-local)
@@ -279,6 +309,14 @@ private:
     TSharedPtr<const FVoxelDensityGPUData> GPUDensity;
     TSharedPtr<const FVoxelEditGPUData> GPUEdits;
     uint32 GPUEditsSequence = 0;
+    /** The edit tree flattened for the GPU on a worker (it grows with the edits). */
+    struct FEditBuild
+    {
+        TSharedPtr<const FVoxelEditGPUData> Data;
+        uint32 Sequence = 0;
+        std::atomic<bool> bDone{ false };
+    };
+    TSharedPtr<FEditBuild, ESPMode::ThreadSafe> EditBuild;
     bool bWarnedBackend = false;
     bool bReportedMorph = false;
 
@@ -296,6 +334,14 @@ private:
         double TreeMs = 0.0;
         int64 TaskSamples = 0;
         int32 TaskBuilt = 0;
+        int32 TaskNew = 0;
+        int32 TaskRestitched = 0;
+        int32 TaskRebuilt = 0;
+        int32 HeldResults = 0;         // results that waited for a commit
+        int32 EditCommits = 0;
+        double LatencyMs = 0.0;        // launch to screen, summed over the results committed
+        double MaxLatencyMs = 0.0;
+        int32 Latencies = 0;
     };
     FPerf Perf;
 

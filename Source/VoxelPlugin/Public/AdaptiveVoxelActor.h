@@ -185,7 +185,8 @@ public:
 
     /** Brick terrain (GPU): the collection the terrain material's morph node reads (vectors
      *  VoxelMorphCameraHigh, VoxelMorphCameraLow, VoxelMorphParams; Design/MeshingEngine.md
-     *  section 7). Without it LOD changes don't blend. */
+     *  section 7). Empty: /VoxelPlugin/MPC_VoxelMorph if it exists. Without one LOD changes
+     *  don't blend. */
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrain|Bricks")
     TObjectPtr<UMaterialParameterCollection> BrickMorphParameters = nullptr;
 
@@ -320,6 +321,14 @@ protected:
         double Radius;
     };
     TArray<FEditNotice> PendingEditNotices;
+
+    /** Edits written to the edit store alone while the brick terrain renders (it and the
+     *  collision read the store), replayed on the octree when the octree renders again.
+     *  Guarded by PendingApplyCS. */
+    TArray<FEditNotice> DeferredOctreeEdits;
+
+    /** Replays DeferredOctreeEdits on the octree in the edit task's slot. */
+    void RunDeferredOctreeEdits();
 
     /** Smoothed camera speed (cm/s) from position deltas, updated in Tick. Feeds the
      *  collision lead distance when a pawn reports no velocity. */
