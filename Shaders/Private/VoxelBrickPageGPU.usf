@@ -1,74 +1,67 @@
-// VoxelBrickPageGPU.usf - Packs a brick page's vertex streams, indices and indirect draw
-// arguments (VoxelBrickPages.cpp). Bricks the page held unchanged are copied from a snapshot
-// of its previous contents (Reuse* passes); the others come from the mesher's per-brick output
-// (VoxelBrickMesherGPU.usf).
+// VoxelBrickPageGPU.usf - The brick pages' passes (VoxelBrickPages.cpp).
 //
-// Commits are checked before they are drawn: the placement passes (OffsetsCS, ReuseOffsetsCS)
-// of every page in a frame run first, and any brick that doesn't fit clears Verdict. Then no
-// page of that frame writes anything (the passes below return early, ArgsCS keeps the old
-// draw arguments): the old tree stays on screen whole until the pages are resized.
+// StageCS runs ahead of a commit (async compute): it converts a mesher batch
+// (VoxelBrickMesherGPU.usf) into the mesh cache, each brick's vertices in the page format and
+// its indices brick-local, packed in order into the cache region the CPU reserved for the batch.
+// A brick that doesn't fit what is left is skipped (the CPU meshes it again). Per brick an entry
+// is read back: where it went, its counts and error bits.
 //
-// Geomorphing happens in the terrain material (VoxelMorph.ush). Each vertex is written at its
-// own position and normal, with its morph targets in texture coordinates 1 to 4 (cm, page
-// axes): 1 = parent offset x, y; 2 = parent offset z, grandparent offset x; 3 = grandparent
-// offset y, z; 4 = the parent and grandparent normals, octahedral 11 bits per axis, the
-// first plus 2^22 times the cell's level above the page's (0 or 1), as exact floats.
-// Texture coordinate 0 is the triplanar UV.
+// WriteCS runs in a page buffer set's compute run at the commit. A job is one brick: its
+// vertices and triangles copied from the cache to where the CPU placed them (indices rebased),
+// or the triangles a departed brick left cleared (degenerate). Group 0 writes the draw
+// arguments. Bricks a commit doesn't change are not touched.
+//
+// Page format: position (page-local, in units of the page's level: cm / 2^level, the component
+// carries the scale), tangent and normal (snorm8 x4), and texture coordinates 0 to 4 as ten
+// words: the triplanar UV, the parent and grandparent offsets (level units, page axes), and
+// their normals, octahedral 11 bits per axis, the parent's plus 2^22 times the cell's level
+// above the page's (0 or 1), as exact floats (VoxelMorph.ush). Colour is the page's.
 
 #include "/Engine/Public/Platform.ush"
 
-StructuredBuffer<uint> MesherCounters;     // per mesher row: faces, vertices, triangles, error bits
-StructuredBuffer<float> MesherVertices;    // per vertex: VoxelMesherVertexStride floats
+#define VOXEL_CACHE_WORDS 15u    // VoxelBrickPagesDetail::CacheWords
+#define VOXEL_ENTRY_WORDS 8u     // VoxelBrickPagesDetail::EntryWords
+#define VOXEL_JOB_WORDS 8u       // VoxelBrickPagesDetail::JobWords
+
+static const uint TexCoordWords = 10u;
+
+// StageCS
+StructuredBuffer<uint> MesherCounters;     // per brick: faces, vertices, triangles, error bits
+StructuredBuffer<float> MesherVertices;    // per vertex: VertexStride floats
 StructuredBuffer<uint> MesherIndices;
-StructuredBuffer<float4> BrickOffsets;     // brick min from the page origin (cm)
+StructuredBuffer<float4> StageBricks;      // per brick: min from the page origin (cm), 2^-level; UV offset, UV scale
+RWStructuredBuffer<uint> CacheVertices;    // VOXEL_CACHE_WORDS per vertex
+RWStructuredBuffer<uint> CacheIndices;     // 3 per triangle
+// Per brick: first vertex, vertices, first triangle, triangles (both 0 when skipped), error
+// bits, 1 if stored, and the vertices and triangles it has.
+RWStructuredBuffer<uint> StageEntries;
+uint NumBricks;
+uint VertexCap;
+uint TriangleCap;
+uint VertexStride;
+uint RegionVertexStart;
+uint RegionVertices;
+uint RegionTriangleStart;
+uint RegionTriangles;
 
-// 0 vertices needed, 1 triangles needed, 2 error bits, 3 vertices written, 4 triangles written,
-// 5 bricks dropped (did not fit), 6 vertex capacity, 7 triangle capacity, 8 verdict.
-RWStructuredBuffer<uint> PageState;
-RWStructuredBuffer<uint> Verdict;          // 1 until a page of the frame's batch doesn't fit (placement)
-StructuredBuffer<uint> CommitVerdict;      // the same, read by the passes that write
-RWStructuredBuffer<uint> BrickBase;        // per brick: first vertex, first triangle, written
-
+// WriteCS
+StructuredBuffer<uint> CachedVertices;
+StructuredBuffer<uint> CachedIndices;
+// Per job: kind (0 copy, 1 clear), cache vertex, page vertex, vertices, cache triangle, page
+// triangle, triangles, unused.
+StructuredBuffer<uint> Jobs;
 RWBuffer<float> OutPositions;
 RWBuffer<uint> OutTangents;                // two packed normals per vertex: tangent, normal
-RWBuffer<uint> OutTexCoords;               // TexCoordWords floats per vertex
+RWBuffer<uint> OutTexCoords;               // TexCoordWords per vertex
 RWBuffer<uint> OutColors;
 RWBuffer<uint> OutIndices;
 RWBuffer<uint> OutArgs;
-
-// Per member brick, 4 words: first vertex, vertices, first triangle, triangles (0 when it
-// didn't fit). The new table is written; the previous one is read by the Reuse passes.
-RWStructuredBuffer<uint> BrickTable;
-StructuredBuffer<uint> OldTable;
-StructuredBuffer<uint> OldPositions;       // snapshots of the previous contents
-StructuredBuffer<uint> OldTangents;
-StructuredBuffer<uint> OldTexCoords;
-StructuredBuffer<uint> OldIndices;
-// Per batch brick, 2 words: where it comes from (its row in the mesher output, or its row in
-// the previous table for the reuse batch) and its member index.
-StructuredBuffer<uint> BrickMap;
-
-uint NumBricks;
-uint VertexCap;          // mesher slots per brick
-uint TriangleCap;
-uint VertexCapacity;     // page buffers
+uint NumJobs;
+uint TriangleEnd;                          // triangles drawn
+uint VertexCapacity;                       // page buffers
 uint TriangleCapacity;
 uint Color;
-uint StreamMask;         // 1 tangents, 2 UVs, 4 colours: streams the page has
-uint VertexStride;       // mesher vertex record (VoxelMesherVertexStride)
-float3 UVOffset;         // frac(page origin * UVScale)
-float UVScale;
-uint GroupsX;
-
-static const uint TexCoordWords = 10u;     // five float2 channels
-
-uint ThreadIndex(uint3 GroupId, uint GroupThread)
-{
-    return (GroupId.y * GroupsX + GroupId.x) * 64u + GroupThread;
-}
-
-uint BrickVertices(uint B) { return min(MesherCounters[B * 4u + 1u], VertexCap); }
-uint BrickTriangles(uint B) { return min(MesherCounters[B * 4u + 2u], TriangleCap); }
+uint StreamMask;                           // 1 tangents, 2 UVs, 4 colours: streams the page has
 
 uint PackSnorm8(float4 V)
 {
@@ -79,77 +72,6 @@ uint PackSnorm8(float4 V)
 float3 SafeNormal(float3 N, float3 Fallback)
 {
     return dot(N, N) > 1.0e-8f ? normalize(N) : Fallback;
-}
-
-// Single thread: places the batch's bricks after those already written and records them in
-// the new table. A brick that doesn't fit whole is dropped (counted), so a page never shows
-// part of a brick. bReuse: the counts come from the previous table.
-void PlaceBricks(bool bReuse)
-{
-    uint Written[2] = { PageState[3], PageState[4] };
-    uint Needed[2] = { PageState[0], PageState[1] };
-    uint Errors = PageState[2];
-    uint Dropped = PageState[5];
-    [loop]
-    for (uint B = 0u; B < NumBricks; B++)
-    {
-        const uint Row = BrickMap[B * 2u];
-        const uint Member = BrickMap[B * 2u + 1u];
-        uint V = 0u;
-        uint T = 0u;
-        if (bReuse)
-        {
-            V = OldTable[Row * 4u + 1u];
-            T = OldTable[Row * 4u + 3u];
-        }
-        else
-        {
-            V = BrickVertices(Row);
-            T = BrickTriangles(Row);
-            Errors |= MesherCounters[Row * 4u + 3u];
-        }
-        Needed[0] += V;
-        Needed[1] += T;
-        const bool bFits = Written[0] + V <= VertexCapacity && Written[1] + T <= TriangleCapacity;
-        BrickBase[B * 3u] = Written[0];
-        BrickBase[B * 3u + 1u] = Written[1];
-        BrickBase[B * 3u + 2u] = bFits ? 1u : 0u;
-        BrickTable[Member * 4u] = Written[0];
-        BrickTable[Member * 4u + 1u] = bFits ? V : 0u;
-        BrickTable[Member * 4u + 2u] = Written[1];
-        BrickTable[Member * 4u + 3u] = bFits ? T : 0u;
-        if (bFits)
-        {
-            Written[0] += V;
-            Written[1] += T;
-        }
-        else
-        {
-            Dropped++;
-        }
-    }
-    PageState[0] = Needed[0];
-    PageState[1] = Needed[1];
-    PageState[2] = Errors;
-    PageState[3] = Written[0];
-    PageState[4] = Written[1];
-    PageState[5] = Dropped;
-    PageState[6] = VertexCapacity;
-    PageState[7] = TriangleCapacity;
-    if (Dropped > 0u)
-        Verdict[0] = 0u;
-}
-
-[numthreads(1, 1, 1)]
-void OffsetsCS()
-{
-    PlaceBricks(false);
-}
-
-[numthreads(1, 1, 1)]
-void ReuseOffsetsCS()
-{
-    PlaceBricks(true);
 }
 
 // Octahedral normal, 11 bits per axis, as an integer below 2^22.
@@ -163,153 +85,173 @@ uint PackOctahedral(float3 N)
     return Q.x | (Q.y << 11);
 }
 
+uint StageVertices(uint B) { return min(MesherCounters[B * 4u + 1u], VertexCap); }
+uint StageTriangles(uint B) { return min(MesherCounters[B * 4u + 2u], TriangleCap); }
+
+groupshared uint StageBase[3];   // first vertex, first triangle, stored
+
+// One group per brick of the batch.
 [numthreads(64, 1, 1)]
-void VerticesCS(uint3 GroupId : SV_GroupID, uint GroupThread : SV_GroupIndex)
+void StageCS(uint3 GroupId : SV_GroupID, uint GroupThread : SV_GroupIndex)
 {
-    const uint Id = ThreadIndex(GroupId, GroupThread);
-    if (CommitVerdict[0] == 0u) return;
-    const uint B = Id / VertexCap;
-    const uint V = Id - B * VertexCap;
-    if (B >= NumBricks || BrickBase[B * 3u + 2u] == 0u) return;
-    const uint Row = BrickMap[B * 2u];
-    if (V >= BrickVertices(Row)) return;
-
-    const uint Src = (Row * VertexCap + V) * VertexStride;
-    const float3 Own = float3(MesherVertices[Src], MesherVertices[Src + 1u], MesherVertices[Src + 2u]);
-    const float3 P = Own + BrickOffsets[B].xyz;
-    const float3 N = SafeNormal(float3(MesherVertices[Src + 3u], MesherVertices[Src + 4u], MesherVertices[Src + 5u]), float3(0.0f, 0.0f, 1.0f));
-    const float3 Parent = float3(MesherVertices[Src + 6u], MesherVertices[Src + 7u], MesherVertices[Src + 8u]) - Own;
-    const float3 ParentNormal = SafeNormal(float3(MesherVertices[Src + 9u], MesherVertices[Src + 10u], MesherVertices[Src + 11u]), N);
-    const float3 Grand = float3(MesherVertices[Src + 12u], MesherVertices[Src + 13u], MesherVertices[Src + 14u]) - Own;
-    const float3 GrandNormal = SafeNormal(float3(MesherVertices[Src + 15u], MesherVertices[Src + 16u], MesherVertices[Src + 17u]), ParentNormal);
-    const uint Rel = uint(MesherVertices[Src + 18u] + 0.5f);
-
-    const uint Dst = BrickBase[B * 3u] + V;
-    OutPositions[Dst * 3u] = P.x;
-    OutPositions[Dst * 3u + 1u] = P.y;
-    OutPositions[Dst * 3u + 2u] = P.z;
-    if (StreamMask & 1u)
+    const uint B = GroupId.x;
+    const uint V = StageVertices(B);
+    const uint T = StageTriangles(B);
+    if (GroupThread == 0u)
     {
-        const float3 Axis = abs(N.z) < 0.999f ? float3(0.0f, 0.0f, 1.0f) : float3(1.0f, 0.0f, 0.0f);
-        OutTangents[Dst * 2u] = PackSnorm8(float4(normalize(cross(Axis, N)), 1.0f));
-        OutTangents[Dst * 2u + 1u] = PackSnorm8(float4(N, 1.0f));
+        // The bricks before this one in order, each stored if it fits what is left.
+        uint UsedV = 0u;
+        uint UsedT = 0u;
+        [loop]
+        for (uint K = 0u; K < B; K++)
+        {
+            const uint KV = StageVertices(K);
+            const uint KT = StageTriangles(K);
+            if (UsedV + KV <= RegionVertices && UsedT + KT <= RegionTriangles)
+            {
+                UsedV += KV;
+                UsedT += KT;
+            }
+        }
+        const bool bFits = UsedV + V <= RegionVertices && UsedT + T <= RegionTriangles;
+        StageBase[0] = RegionVertexStart + UsedV;
+        StageBase[1] = RegionTriangleStart + UsedT;
+        StageBase[2] = bFits ? 1u : 0u;
+        const uint E = B * VOXEL_ENTRY_WORDS;
+        StageEntries[E] = StageBase[0];
+        StageEntries[E + 1u] = bFits ? V : 0u;
+        StageEntries[E + 2u] = StageBase[1];
+        StageEntries[E + 3u] = bFits ? T : 0u;
+        StageEntries[E + 4u] = MesherCounters[B * 4u + 3u];
+        StageEntries[E + 5u] = StageBase[2];
+        StageEntries[E + 6u] = V;
+        StageEntries[E + 7u] = T;
     }
-    if (StreamMask & 2u)
+    GroupMemoryBarrierWithGroupSync();
+    if (StageBase[2] == 0u) return;
+
+    const float4 Place = StageBricks[B * 2u];
+    const float4 UVs = StageBricks[B * 2u + 1u];
+    [loop]
+    for (uint I = GroupThread; I < V; I += 64u)
     {
-        // Triplanar UV as the CPU renderer picks it (the page origin's whole periods dropped).
+        const uint Src = (B * VertexCap + I) * VertexStride;
+        const float3 Own = float3(MesherVertices[Src], MesherVertices[Src + 1u], MesherVertices[Src + 2u]);
+        const float3 Cm = Own + Place.xyz;
+        const float3 N = SafeNormal(float3(MesherVertices[Src + 3u], MesherVertices[Src + 4u], MesherVertices[Src + 5u]), float3(0.0f, 0.0f, 1.0f));
+        const float3 Parent = (float3(MesherVertices[Src + 6u], MesherVertices[Src + 7u], MesherVertices[Src + 8u]) - Own) * Place.w;
+        const float3 ParentNormal = SafeNormal(float3(MesherVertices[Src + 9u], MesherVertices[Src + 10u], MesherVertices[Src + 11u]), N);
+        const float3 Grand = (float3(MesherVertices[Src + 12u], MesherVertices[Src + 13u], MesherVertices[Src + 14u]) - Own) * Place.w;
+        const float3 GrandNormal = SafeNormal(float3(MesherVertices[Src + 15u], MesherVertices[Src + 16u], MesherVertices[Src + 17u]), ParentNormal);
+        const uint Rel = uint(MesherVertices[Src + 18u] + 0.5f);
+
+        // Triplanar UV as the CPU renderer picks it, in cm (the page origin's whole periods dropped).
         const float3 A = abs(N);
-        float2 UV = float2(UVOffset.x, UVOffset.y) + P.xy * UVScale;
+        float2 UV = float2(UVs.x, UVs.y) + Cm.xy * UVs.w;
         if (A.x > A.y && A.x > A.z)
-            UV = float2(UVOffset.y, UVOffset.z) + P.yz * UVScale;
+            UV = float2(UVs.y, UVs.z) + Cm.yz * UVs.w;
         else if (A.y > A.x && A.y > A.z)
-            UV = float2(UVOffset.x, UVOffset.z) + P.xz * UVScale;
-        const uint T = Dst * TexCoordWords;
-        OutTexCoords[T] = asuint(UV.x);
-        OutTexCoords[T + 1u] = asuint(UV.y);
-        OutTexCoords[T + 2u] = asuint(Parent.x);
-        OutTexCoords[T + 3u] = asuint(Parent.y);
-        OutTexCoords[T + 4u] = asuint(Parent.z);
-        OutTexCoords[T + 5u] = asuint(Grand.x);
-        OutTexCoords[T + 6u] = asuint(Grand.y);
-        OutTexCoords[T + 7u] = asuint(Grand.z);
-        OutTexCoords[T + 8u] = asuint(float(PackOctahedral(ParentNormal) + (Rel << 22)));
-        OutTexCoords[T + 9u] = asuint(float(PackOctahedral(GrandNormal)));
+            UV = float2(UVs.x, UVs.z) + Cm.xz * UVs.w;
+
+        const float3 P = Cm * Place.w;
+        const float3 Axis = abs(N.z) < 0.999f ? float3(0.0f, 0.0f, 1.0f) : float3(1.0f, 0.0f, 0.0f);
+        const uint Dst = (StageBase[0] + I) * VOXEL_CACHE_WORDS;
+        CacheVertices[Dst] = asuint(P.x);
+        CacheVertices[Dst + 1u] = asuint(P.y);
+        CacheVertices[Dst + 2u] = asuint(P.z);
+        CacheVertices[Dst + 3u] = PackSnorm8(float4(normalize(cross(Axis, N)), 1.0f));
+        CacheVertices[Dst + 4u] = PackSnorm8(float4(N, 1.0f));
+        CacheVertices[Dst + 5u] = asuint(UV.x);
+        CacheVertices[Dst + 6u] = asuint(UV.y);
+        CacheVertices[Dst + 7u] = asuint(Parent.x);
+        CacheVertices[Dst + 8u] = asuint(Parent.y);
+        CacheVertices[Dst + 9u] = asuint(Parent.z);
+        CacheVertices[Dst + 10u] = asuint(Grand.x);
+        CacheVertices[Dst + 11u] = asuint(Grand.y);
+        CacheVertices[Dst + 12u] = asuint(Grand.z);
+        CacheVertices[Dst + 13u] = asuint(float(PackOctahedral(ParentNormal) + (Rel << 22)));
+        CacheVertices[Dst + 14u] = asuint(float(PackOctahedral(GrandNormal)));
     }
-    if (StreamMask & 4u)
-        OutColors[Dst] = Color;
-}
-
-// A reused brick's vertex: its streams as they were, at its new place.
-[numthreads(64, 1, 1)]
-void ReuseVerticesCS(uint3 GroupId : SV_GroupID, uint GroupThread : SV_GroupIndex)
-{
-    const uint Id = ThreadIndex(GroupId, GroupThread);
-    if (CommitVerdict[0] == 0u) return;
-    const uint B = Id / VertexCap;
-    const uint V = Id - B * VertexCap;
-    if (B >= NumBricks || BrickBase[B * 3u + 2u] == 0u) return;
-    const uint Old = BrickMap[B * 2u];
-    if (V >= OldTable[Old * 4u + 1u]) return;
-
-    const uint Src = OldTable[Old * 4u] + V;
-    const uint Dst = BrickBase[B * 3u] + V;
-    [unroll]
-    for (uint C = 0u; C < 3u; C++)
-        OutPositions[Dst * 3u + C] = asfloat(OldPositions[Src * 3u + C]);
-    if (StreamMask & 1u)
+    [loop]
+    for (uint J = GroupThread; J < T; J += 64u)
     {
-        OutTangents[Dst * 2u] = OldTangents[Src * 2u];
-        OutTangents[Dst * 2u + 1u] = OldTangents[Src * 2u + 1u];
-    }
-    if (StreamMask & 2u)
-    {
-        [unroll]
-        for (uint W = 0u; W < TexCoordWords; W++)
-            OutTexCoords[Dst * TexCoordWords + W] = OldTexCoords[Src * TexCoordWords + W];
-    }
-    if (StreamMask & 4u)
-        OutColors[Dst] = Color;
-}
-
-[numthreads(64, 1, 1)]
-void TrianglesCS(uint3 GroupId : SV_GroupID, uint GroupThread : SV_GroupIndex)
-{
-    const uint Id = ThreadIndex(GroupId, GroupThread);
-    if (CommitVerdict[0] == 0u) return;
-    const uint B = Id / TriangleCap;
-    const uint T = Id - B * TriangleCap;
-    if (B >= NumBricks || BrickBase[B * 3u + 2u] == 0u) return;
-    const uint Row = BrickMap[B * 2u];
-    if (T >= BrickTriangles(Row)) return;
-
-    const uint NumVertices = BrickVertices(Row);
-    const uint Base = BrickBase[B * 3u];
-    const uint Src = (Row * TriangleCap + T) * 3u;
-    uint I[3] = { MesherIndices[Src], MesherIndices[Src + 1u], MesherIndices[Src + 2u] };
-    if (I[0] >= NumVertices || I[1] >= NumVertices || I[2] >= NumVertices)
-    {
+        const uint Src = (B * TriangleCap + J) * 3u;
+        uint3 Tri = uint3(MesherIndices[Src], MesherIndices[Src + 1u], MesherIndices[Src + 2u]);
         // A vertex the mesher couldn't store (its error bits say so): degenerate.
-        I[0] = 0u;
-        I[1] = 0u;
-        I[2] = 0u;
+        if (Tri.x >= V || Tri.y >= V || Tri.z >= V)
+            Tri = uint3(0u, 0u, 0u);
+        const uint Dst = (StageBase[1] + J) * 3u;
+        CacheIndices[Dst] = Tri.x;
+        CacheIndices[Dst + 1u] = Tri.y;
+        CacheIndices[Dst + 2u] = Tri.z;
     }
-    const uint Dst = (BrickBase[B * 3u + 1u] + T) * 3u;
-    OutIndices[Dst] = Base + I[0];
-    OutIndices[Dst + 1u] = Base + I[1];
-    OutIndices[Dst + 2u] = Base + I[2];
 }
 
-// A reused brick's triangle, its indices moved with its vertices.
+// One group per job; group 0 also writes FRHIDrawIndexedIndirectParameters (index count,
+// instances, first index, base vertex, first instance).
 [numthreads(64, 1, 1)]
-void ReuseTrianglesCS(uint3 GroupId : SV_GroupID, uint GroupThread : SV_GroupIndex)
+void WriteCS(uint3 GroupId : SV_GroupID, uint GroupThread : SV_GroupIndex)
 {
-    const uint Id = ThreadIndex(GroupId, GroupThread);
-    if (CommitVerdict[0] == 0u) return;
-    const uint B = Id / TriangleCap;
-    const uint T = Id - B * TriangleCap;
-    if (B >= NumBricks || BrickBase[B * 3u + 2u] == 0u) return;
-    const uint Old = BrickMap[B * 2u];
-    if (T >= OldTable[Old * 4u + 3u]) return;
+    const uint Job = GroupId.x;
+    if (Job == 0u && GroupThread == 0u)
+    {
+        OutArgs[0] = min(TriangleEnd, TriangleCapacity) * 3u;
+        OutArgs[1] = 1u;
+        OutArgs[2] = 0u;
+        OutArgs[3] = 0u;
+        OutArgs[4] = 0u;
+    }
+    if (Job >= NumJobs) return;
 
-    const uint OldBase = OldTable[Old * 4u];
-    const uint Base = BrickBase[B * 3u];
-    const uint Src = (OldTable[Old * 4u + 2u] + T) * 3u;
-    const uint Dst = (BrickBase[B * 3u + 1u] + T) * 3u;
-    [unroll]
-    for (uint K = 0u; K < 3u; K++)
-        OutIndices[Dst + K] = OldIndices[Src + K] - OldBase + Base;
-}
-
-// FRHIDrawIndexedIndirectParameters: index count, instances, first index, base vertex, first
-// instance. Left as they are when the frame's commit was refused.
-[numthreads(1, 1, 1)]
-void ArgsCS()
-{
-    PageState[8] = CommitVerdict[0];
-    if (CommitVerdict[0] == 0u) return;
-    OutArgs[0] = PageState[4] * 3u;
-    OutArgs[1] = 1u;
-    OutArgs[2] = 0u;
-    OutArgs[3] = 0u;
-    OutArgs[4] = 0u;
+    const uint W = Job * VOXEL_JOB_WORDS;
+    const bool bCopy = Jobs[W] == 0u;
+    const uint DstV = Jobs[W + 2u];
+    const uint NumV = Jobs[W + 3u];
+    const uint SrcT = Jobs[W + 4u];
+    const uint DstT = Jobs[W + 5u];
+    const uint NumT = Jobs[W + 6u];
+    if (bCopy)
+    {
+        const uint SrcV = Jobs[W + 1u];
+        [loop]
+        for (uint I = GroupThread; I < NumV && DstV + I < VertexCapacity; I += 64u)
+        {
+            const uint Src = (SrcV + I) * VOXEL_CACHE_WORDS;
+            const uint Dst = DstV + I;
+            OutPositions[Dst * 3u] = asfloat(CachedVertices[Src]);
+            OutPositions[Dst * 3u + 1u] = asfloat(CachedVertices[Src + 1u]);
+            OutPositions[Dst * 3u + 2u] = asfloat(CachedVertices[Src + 2u]);
+            if (StreamMask & 1u)
+            {
+                OutTangents[Dst * 2u] = CachedVertices[Src + 3u];
+                OutTangents[Dst * 2u + 1u] = CachedVertices[Src + 4u];
+            }
+            if (StreamMask & 2u)
+            {
+                [unroll]
+                for (uint C = 0u; C < TexCoordWords; C++)
+                    OutTexCoords[Dst * TexCoordWords + C] = CachedVertices[Src + 5u + C];
+            }
+            if (StreamMask & 4u)
+                OutColors[Dst] = Color;
+        }
+    }
+    [loop]
+    for (uint J = GroupThread; J < NumT && DstT + J < TriangleCapacity; J += 64u)
+    {
+        const uint Dst = (DstT + J) * 3u;
+        if (bCopy)
+        {
+            const uint Src = (SrcT + J) * 3u;
+            OutIndices[Dst] = DstV + CachedIndices[Src];
+            OutIndices[Dst + 1u] = DstV + CachedIndices[Src + 1u];
+            OutIndices[Dst + 2u] = DstV + CachedIndices[Src + 2u];
+        }
+        else
+        {
+            OutIndices[Dst] = 0u;
+            OutIndices[Dst + 1u] = 0u;
+            OutIndices[Dst + 2u] = 0u;
+        }
+    }
 }

@@ -51,7 +51,7 @@ static TAutoConsoleVariable<int32> CVarVoxelBrickMorph(
 
 static TAutoConsoleVariable<int32> CVarVoxelBrickBackend(
     TEXT("voxel.Render.BrickBackend"), 1,
-    TEXT("Where brick-terrain bricks are meshed. 1 (default): GPU (pages of 4x4x4 bricks meshed by compute providers; stitched seams only). 0: CPU (one component per brick; also used when the GPU path is unavailable)."),
+    TEXT("Where brick-terrain bricks are meshed. 1 (default): GPU (pages of 8x8x8 bricks meshed ahead on async compute, written by compute providers; stitched seams only). 0: CPU (one component per brick; also used when the GPU path is unavailable)."),
     ECVF_Default);
 
 namespace VoxelBrickTerrainDetail
@@ -340,7 +340,7 @@ namespace VoxelBrickTerrainDetail
     };
 
     /** Neighbour levels and the meshed mask a signature packs (see RunTask). */
-    void DecodeSignature(uint64 Signature, int8 (&OutLevels)[27], uint32& OutMeshed)
+    void DecodeSignature(uint64 Signature, int8(&OutLevels)[27], uint32& OutMeshed)
     {
         OutLevels[13] = 0;
         OutMeshed = 1u << 13;
@@ -441,7 +441,7 @@ void FVoxelBrickTerrain::Initialize(AActor* InOwner, USceneComponent* InAttachRo
     GPUDensity.Reset();
     GPUEdits.Reset();
     bWarnedBackend = false;
-    bWarnedMorph = false;
+    bReportedMorph = false;
 }
 
 void FVoxelBrickTerrain::Reset()
@@ -542,7 +542,7 @@ void FVoxelBrickTerrain::FlushPages(double TaskInterval)
 void FVoxelBrickTerrain::SetMorphParameters(UMaterialParameterCollection* InCollection)
 {
     Settings.MorphParameters = InCollection;
-    bWarnedMorph = false;
+    bReportedMorph = false;
 }
 
 void FVoxelBrickTerrain::UpdateMorphParameters(double Slack)
@@ -555,10 +555,10 @@ void FVoxelBrickTerrain::UpdateMorphParameters(double Slack)
     UMaterialParameterCollectionInstance* Instance = Collection && World ? World->GetParameterCollectionInstance(Collection) : nullptr;
     if (!Instance || !Root)
     {
-        if (Mode != 0 && !bWarnedMorph)
+        if (Mode != 0 && !bReportedMorph)
             UE_LOG(LogTemp, Warning, TEXT("[VoxelBricks] No Brick Morph Parameters collection on %s: the GPU terrain's LOD changes won't blend (Design/MeshingEngine.md section 7)."),
                 OwnerActor ? *OwnerActor->GetName() : TEXT("the terrain"));
-        bWarnedMorph = true;
+        bReportedMorph = true;
         return;
     }
 
@@ -570,11 +570,18 @@ void FVoxelBrickTerrain::UpdateMorphParameters(double Slack)
     bool bSet = Instance->SetVectorParameterValue(VBT::MorphCameraHighName, FLinearColor(High.X, High.Y, High.Z, 0.0f));
     bSet &= Instance->SetVectorParameterValue(VBT::MorphCameraLowName, FLinearColor((float)Low.X, (float)Low.Y, (float)Low.Z, 0.0f));
     bSet &= Instance->SetVectorParameterValue(VBT::MorphParamsName, FLinearColor((float)(Slack * Scale), (float)Mode, 0.0f, 0.0f));
-    if (!bSet && !bWarnedMorph)
+    if (!bReportedMorph)
     {
-        UE_LOG(LogTemp, Warning, TEXT("[VoxelBricks] %s lacks a vector parameter VoxelMorphCameraHigh, VoxelMorphCameraLow or VoxelMorphParams (Design/MeshingEngine.md section 7)."),
-            *Collection->GetName());
-        bWarnedMorph = true;
+        if (bSet)
+        {
+            UE_LOG(LogTemp, Log, TEXT("[VoxelBricks] Morph parameters go to %s (mode %d)."), *Collection->GetPathName(), Mode);
+        }
+        else
+        {
+            UE_LOG(LogTemp, Warning, TEXT("[VoxelBricks] %s lacks a vector parameter VoxelMorphCameraHigh, VoxelMorphCameraLow or VoxelMorphParams (Design/MeshingEngine.md section 7)."),
+                *Collection->GetName());
+        }
+        bReportedMorph = true;
     }
 }
 
@@ -685,7 +692,7 @@ void FVoxelBrickTerrain::Tick(const FVector& Camera)
 
     if (bTaskRunning.load(std::memory_order_acquire) || bCommitPending || Now - LastLaunchTime < TaskInterval || !Density.IsValid()) return;
     SCOPE_CYCLE_COUNTER(STAT_VoxelBricksLaunch);
-    ON_SCOPE_EXIT { Lap(4); };
+    ON_SCOPE_EXIT{ Lap(4); };
 
     // The tree is on screen from about TreeLatency after the launch until the next one is,
     // an interval later: build it for the camera predicted halfway through.
@@ -1007,6 +1014,8 @@ void FVoxelBrickTerrain::DrainResults()
             CommitPendingFrame = GFrameCounter;
             PendingChanges.Reset();
             BuildCommit(PendingChanges);
+            // Meshed ahead of the commit, a few batches per frame.
+            Pages->Stage(PendingChanges, bCommitProgressive);
         }
 
         if (CVarVoxelDebugBricks.GetValueOnGameThread() > 0)
@@ -1100,8 +1109,8 @@ void FVoxelBrickTerrain::CommitPages()
     }
     else
     {
-        // Every page whose buffers are ready, committed together; pages that only lose bricks
-        // once every addition is in.
+        // Every page whose bricks are meshed and whose buffer sets are ready, committed together;
+        // pages that only lose bricks once every addition is in.
         TMap<FVoxelBrickKey, TArray<FVoxelBrickPageChange>> Groups;
         for (const FVoxelBrickPageChange& Change : PendingChanges)
             Groups.FindOrAdd(FVoxelBrickPages::PageOf(Change.Key)).Add(Change);

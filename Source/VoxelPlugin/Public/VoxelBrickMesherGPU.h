@@ -9,7 +9,7 @@
 #include "VoxelBrickMesher.h"
 #include "VoxelBrickTerrain.h"
 #include "VoxelDensityGPU.h"
-#include "RenderGraphFwd.h"
+#include "RenderGraphDefinitions.h"
 
 /** One brick of a GPU batch (FVoxelMesherBrick in VoxelBrickStitch.ush). */
 struct FVoxelMesherBrickGPU
@@ -115,9 +115,11 @@ namespace VoxelBrickMesherGPU
     /** Render thread. Uploads Density's octaves and Edits into GraphBuilder. */
     VOXELPLUGIN_API FInputs UploadInputs(FRDGBuilder& GraphBuilder, const FVoxelDensityGPUData& Density, const FVoxelEditGPUData& Edits);
 
-    /** Render thread. Records the eight mesher passes for 1..MaxBricks bricks. */
+    /** Render thread. Records the mesher passes for a batch of bricks (any number; the brick
+     *  pages batch BatchBricksFor of them), on PassFlags' pipe: AsyncCompute lets a batch whose
+     *  results are read in a later frame overlap the frame's rendering. */
     VOXELPLUGIN_API FOutputs AddMesherPasses(FRDGBuilder& GraphBuilder, const FVoxelDensityGPUData& Density, const FInputs& Inputs,
-        const FVoxelBrickMesherGPUSettings& Settings, TConstArrayView<FVoxelMesherBrickGPU> Bricks);
+        const FVoxelBrickMesherGPUSettings& Settings, TConstArrayView<FVoxelMesherBrickGPU> Bricks, ERDGPassFlags PassFlags = ERDGPassFlags::Compute);
 
     VOXELPLUGIN_API void MeshBricksAsync(TSharedRef<const FVoxelDensityGPUData> Density, TSharedRef<const FVoxelEditGPUData> Edits,
         const FVoxelBrickMesherGPUSettings& Settings, TArray<FVoxelBrickMesherGPURequest> Requests,

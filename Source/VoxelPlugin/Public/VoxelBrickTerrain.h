@@ -80,10 +80,11 @@ struct FVoxelBrickTerrainSettings
  *  replacing it are on screen, and a restitched mesh waits until the neighbours it was
  *  stitched to are on screen, so swaps open neither holes nor cracks.
  *
- *  GPU backend: each task result is committed to the pages whole, in one frame, once every
- *  page it touches is ready (FVoxelBrickPages::PrepareCommit), so the tree on screen switches
- *  from one frame to the next. Only the first fill, with nothing on screen, commits page by
- *  page. No task starts while a commit waits. */
+ *  GPU backend: the bricks a task result changes are meshed ahead of its commit
+ *  (FVoxelBrickPages::Stage), then the result is committed to the pages whole, in one frame,
+ *  once every page it touches is ready (FVoxelBrickPages::PrepareCommit), so the tree on screen
+ *  switches from one frame to the next. Only the first fill, with nothing on screen, commits
+ *  page by page. No task starts while a commit waits. */
 class VOXELPLUGIN_API FVoxelBrickTerrain : public TSharedFromThis<FVoxelBrickTerrain>
 {
 public:
@@ -279,7 +280,7 @@ private:
     TSharedPtr<const FVoxelEditGPUData> GPUEdits;
     uint32 GPUEditsSequence = 0;
     bool bWarnedBackend = false;
-    bool bWarnedMorph = false;
+    bool bReportedMorph = false;
 
     /** Time spent since the last voxel.Debug.BrickPerf line. Sections: drain, apply (GPU:
      *  commit), remove, flush pages, launch. */

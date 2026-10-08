@@ -127,7 +127,7 @@ namespace VoxelBrickMesherGPUDetail
     };
 
     template<typename TShader>
-    void AddMesherPass(FRDGBuilder& GraphBuilder, const FVoxelMesherParameters& Template, uint32 Mode, uint32 NumThreads, const TCHAR* Name)
+    void AddMesherPass(FRDGBuilder& GraphBuilder, ERDGPassFlags PassFlags, const FVoxelMesherParameters& Template, uint32 Mode, uint32 NumThreads, const TCHAR* Name)
     {
         const uint32 NumGroups = FMath::Max(FMath::DivideAndRoundUp(NumThreads, 64u), 1u);
         const uint32 GroupsX = FMath::Min(NumGroups, 32768u);
@@ -137,7 +137,7 @@ namespace VoxelBrickMesherGPUDetail
         Parameters->PassMode = Mode;
         Parameters->GroupsX = GroupsX;
         TShaderMapRef<TShader> Shader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
-        FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("VoxelMesher %s", Name), Shader, Parameters, FIntVector((int32)GroupsX, (int32)GroupsY, 1));
+        FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("VoxelMesher %s", Name), PassFlags, Shader, Parameters, FIntVector((int32)GroupsX, (int32)GroupsY, 1));
     }
 
     template<typename T>
@@ -229,7 +229,7 @@ VoxelBrickMesherGPU::FInputs VoxelBrickMesherGPU::UploadInputs(FRDGBuilder& Grap
 }
 
 VoxelBrickMesherGPU::FOutputs VoxelBrickMesherGPU::AddMesherPasses(FRDGBuilder& GraphBuilder, const FVoxelDensityGPUData& Density,
-    const FInputs& Inputs, const FVoxelBrickMesherGPUSettings& Settings, TConstArrayView<FVoxelMesherBrickGPU> Bricks)
+    const FInputs& Inputs, const FVoxelBrickMesherGPUSettings& Settings, TConstArrayView<FVoxelMesherBrickGPU> Bricks, ERDGPassFlags PassFlags)
 {
     using namespace VoxelBrickMesherGPUDetail;
     check(Bricks.Num() > 0);
@@ -304,29 +304,29 @@ VoxelBrickMesherGPU::FOutputs VoxelBrickMesherGPU::AddMesherPasses(FRDGBuilder& 
     Template.TargetHashKeys = GraphBuilder.CreateUAV(MakeBuffer(4, NB * Caps.TargetHashSize, TEXT("Voxel.MesherTargetHashKeys")));
     Template.TargetHashValues = GraphBuilder.CreateUAV(MakeBuffer(4, NB * Caps.TargetHashSize, TEXT("Voxel.MesherTargetHashValues")));
 
-    AddClearUAVPass(GraphBuilder, Template.HashKeys, 0u);
-    AddClearUAVPass(GraphBuilder, Template.HashValues, 0xffffffffu);
-    AddClearUAVPass(GraphBuilder, Template.SlotState, 0u);
-    AddClearUAVPass(GraphBuilder, Template.SlotVertex, 0xffffffffu);
-    AddClearUAVPass(GraphBuilder, Template.Counters, 0u);
-    AddClearUAVPass(GraphBuilder, Template.TargetState, 0u);
-    AddClearUAVPass(GraphBuilder, Template.TargetHashKeys, 0u);
-    AddClearUAVPass(GraphBuilder, Template.TargetHashValues, 0xffffffffu);
+    AddClearUAVPass(GraphBuilder, Template.HashKeys, 0u, PassFlags);
+    AddClearUAVPass(GraphBuilder, Template.HashValues, 0xffffffffu, PassFlags);
+    AddClearUAVPass(GraphBuilder, Template.SlotState, 0u, PassFlags);
+    AddClearUAVPass(GraphBuilder, Template.SlotVertex, 0xffffffffu, PassFlags);
+    AddClearUAVPass(GraphBuilder, Template.Counters, 0u, PassFlags);
+    AddClearUAVPass(GraphBuilder, Template.TargetState, 0u, PassFlags);
+    AddClearUAVPass(GraphBuilder, Template.TargetHashKeys, 0u, PassFlags);
+    AddClearUAVPass(GraphBuilder, Template.TargetHashValues, 0xffffffffu, PassFlags);
 
-    AddMesherPass<FVoxelMesherSampleCS>(GraphBuilder, Template, 0u, NB * DenseTotal, TEXT("Sample lattice"));
-    AddMesherPass<FVoxelMesherEdgesCS>(GraphBuilder, Template, 0u, NB * 3u * UN * (UN + 1u) * (UN + 1u), TEXT("Edges"));
-    AddMesherPass<FVoxelMesherRequestCS>(GraphBuilder, Template, 0u, NB * NumSlots, TEXT("Request edge ends"));
-    AddMesherPass<FVoxelMesherSampleCS>(GraphBuilder, Template, 1u, NB * Caps.HashSize, TEXT("Sample edge ends"));
-    AddMesherPass<FVoxelMesherRequestCS>(GraphBuilder, Template, 1u, NB * NumSlots, TEXT("Request gradients"));
-    AddMesherPass<FVoxelMesherSampleCS>(GraphBuilder, Template, 1u, NB * Caps.HashSize, TEXT("Sample gradients"));
-    AddMesherPass<FVoxelMesherSolveCS>(GraphBuilder, Template, 0u, NB * NumSlots, TEXT("Solve"));
-    AddMesherPass<FVoxelMesherTrianglesCS>(GraphBuilder, Template, 0u, NB * Caps.FaceCap, TEXT("Triangles"));
-    AddMesherPass<FVoxelMesherTargetRequestCS>(GraphBuilder, Template, 0u, NB * NumTargets, TEXT("Request target corners"));
-    AddMesherPass<FVoxelMesherSampleCS>(GraphBuilder, Template, 2u, NB * Caps.TargetHashSize, TEXT("Sample target corners"));
-    AddMesherPass<FVoxelMesherTargetRequestCS>(GraphBuilder, Template, 1u, NB * NumTargets, TEXT("Request target gradients"));
-    AddMesherPass<FVoxelMesherSampleCS>(GraphBuilder, Template, 2u, NB * Caps.TargetHashSize, TEXT("Sample target gradients"));
-    AddMesherPass<FVoxelMesherTargetSolveCS>(GraphBuilder, Template, 0u, NB * NumTargets, TEXT("Solve targets"));
-    AddMesherPass<FVoxelMesherVertexTargetsCS>(GraphBuilder, Template, 0u, NB * NumSlots, TEXT("Vertex targets"));
+    AddMesherPass<FVoxelMesherSampleCS>(GraphBuilder, PassFlags, Template, 0u, NB * DenseTotal, TEXT("Sample lattice"));
+    AddMesherPass<FVoxelMesherEdgesCS>(GraphBuilder, PassFlags, Template, 0u, NB * 3u * UN * (UN + 1u) * (UN + 1u), TEXT("Edges"));
+    AddMesherPass<FVoxelMesherRequestCS>(GraphBuilder, PassFlags, Template, 0u, NB * NumSlots, TEXT("Request edge ends"));
+    AddMesherPass<FVoxelMesherSampleCS>(GraphBuilder, PassFlags, Template, 1u, NB * Caps.HashSize, TEXT("Sample edge ends"));
+    AddMesherPass<FVoxelMesherRequestCS>(GraphBuilder, PassFlags, Template, 1u, NB * NumSlots, TEXT("Request gradients"));
+    AddMesherPass<FVoxelMesherSampleCS>(GraphBuilder, PassFlags, Template, 1u, NB * Caps.HashSize, TEXT("Sample gradients"));
+    AddMesherPass<FVoxelMesherSolveCS>(GraphBuilder, PassFlags, Template, 0u, NB * NumSlots, TEXT("Solve"));
+    AddMesherPass<FVoxelMesherTrianglesCS>(GraphBuilder, PassFlags, Template, 0u, NB * Caps.FaceCap, TEXT("Triangles"));
+    AddMesherPass<FVoxelMesherTargetRequestCS>(GraphBuilder, PassFlags, Template, 0u, NB * NumTargets, TEXT("Request target corners"));
+    AddMesherPass<FVoxelMesherSampleCS>(GraphBuilder, PassFlags, Template, 2u, NB * Caps.TargetHashSize, TEXT("Sample target corners"));
+    AddMesherPass<FVoxelMesherTargetRequestCS>(GraphBuilder, PassFlags, Template, 1u, NB * NumTargets, TEXT("Request target gradients"));
+    AddMesherPass<FVoxelMesherSampleCS>(GraphBuilder, PassFlags, Template, 2u, NB * Caps.TargetHashSize, TEXT("Sample target gradients"));
+    AddMesherPass<FVoxelMesherTargetSolveCS>(GraphBuilder, PassFlags, Template, 0u, NB * NumTargets, TEXT("Solve targets"));
+    AddMesherPass<FVoxelMesherVertexTargetsCS>(GraphBuilder, PassFlags, Template, 0u, NB * NumSlots, TEXT("Vertex targets"));
     return Outputs;
 }
 
