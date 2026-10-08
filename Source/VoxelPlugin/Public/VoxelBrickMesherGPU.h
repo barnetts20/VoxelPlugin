@@ -57,8 +57,9 @@ namespace VoxelBrickMesherGPU
      *  brick min, normal, the parent target's position and normal, the grandparent target's
      *  position and normal, the unstitched position and normal (the cell solved as if the
      *  finer leaves around it were of its level), the cell's level relative to the brick (0 or
-     *  1), pad. */
-    constexpr uint32 VertexStride = 26;
+     *  1), pad, the parent level's normal field at the unstitched position and the
+     *  grandparent level's at the parent target. */
+    constexpr uint32 VertexStride = 32;
 
     /** Per-brick slots, scaled with the brick's cell count (powers of two). */
     struct FCaps

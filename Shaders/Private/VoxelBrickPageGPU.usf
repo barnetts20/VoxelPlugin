@@ -12,19 +12,20 @@
 // arguments. Bricks a commit doesn't change are not touched.
 //
 // Page format: position (page-local, in units of the page's level: cm / 2^level, the component
-// carries the scale), tangent and normal (snorm8 x4), and texture coordinates 0 to 6 as 14
+// carries the scale), tangent and normal (snorm8 x4), and texture coordinates 0 to 7 as 16
 // words: the triplanar UV; the parent and grandparent offsets (level units, page axes); their
 // normals, octahedral 11 bits per axis, the parent's plus 2^22 times the cell's level above
-// the page's (0 or 1), as exact floats; the unstitched offset and its normal, packed the same
-// (VoxelMorph.ush). Colour is the page's.
+// the page's (0 or 1), as exact floats; the unstitched offset and its normal, packed the same;
+// the parent level's normal field at the unstitched position and the grandparent level's at
+// the parent target, packed the same (VoxelMorph.ush). Colour is the page's.
 
 #include "/Engine/Public/Platform.ush"
 
-#define VOXEL_CACHE_WORDS 19u    // VoxelBrickPagesDetail::CacheWords
+#define VOXEL_CACHE_WORDS 21u    // VoxelBrickPagesDetail::CacheWords
 #define VOXEL_ENTRY_WORDS 8u     // VoxelBrickPagesDetail::EntryWords
 #define VOXEL_JOB_WORDS 8u       // VoxelBrickPagesDetail::JobWords
 
-static const uint TexCoordWords = 14u;
+static const uint TexCoordWords = 16u;
 
 // StageCS
 StructuredBuffer<uint> MesherCounters;     // per brick: faces, vertices, triangles, error bits
@@ -147,6 +148,8 @@ void StageCS(uint3 GroupId : SV_GroupID, uint GroupThread : SV_GroupIndex)
         const float3 Unstitched = (float3(MesherVertices[Src + 18u], MesherVertices[Src + 19u], MesherVertices[Src + 20u]) - Own) * Place.w;
         const float3 UnstitchedNormal = SafeNormal(float3(MesherVertices[Src + 21u], MesherVertices[Src + 22u], MesherVertices[Src + 23u]), N);
         const uint Rel = uint(MesherVertices[Src + 24u] + 0.5f);
+        const float3 CoarseNormal = SafeNormal(float3(MesherVertices[Src + 26u], MesherVertices[Src + 27u], MesherVertices[Src + 28u]), ParentNormal);
+        const float3 ParentCoarseNormal = SafeNormal(float3(MesherVertices[Src + 29u], MesherVertices[Src + 30u], MesherVertices[Src + 31u]), GrandNormal);
 
         // Triplanar UV as the CPU renderer picks it, in cm (the page origin's whole periods dropped).
         const float3 A = abs(N);
@@ -178,6 +181,8 @@ void StageCS(uint3 GroupId : SV_GroupID, uint GroupThread : SV_GroupIndex)
         CacheVertices[Dst + 16u] = asuint(Unstitched.y);
         CacheVertices[Dst + 17u] = asuint(Unstitched.z);
         CacheVertices[Dst + 18u] = asuint(float(PackOctahedral(UnstitchedNormal)));
+        CacheVertices[Dst + 19u] = asuint(float(PackOctahedral(CoarseNormal)));
+        CacheVertices[Dst + 20u] = asuint(float(PackOctahedral(ParentCoarseNormal)));
     }
     [loop]
     for (uint J = GroupThread; J < T; J += 64u)

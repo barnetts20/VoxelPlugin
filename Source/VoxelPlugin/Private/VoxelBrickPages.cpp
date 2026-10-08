@@ -140,11 +140,11 @@ namespace VoxelBrickPagesDetail
     constexpr int32 MaxCacheTriangles = 1 << 24;
     constexpr uint64 CachePeakFrames = 300;          // window of the cache's peak use
     constexpr double CacheShrinkMargin = 1.5;        // an idle cache shrinks to a power of two above this times its peak
-    constexpr uint32 CacheWords = 19;                // VOXEL_CACHE_WORDS (VoxelBrickPageGPU.usf)
+    constexpr uint32 CacheWords = 21;                // VOXEL_CACHE_WORDS (VoxelBrickPageGPU.usf)
     constexpr uint32 EntryWords = 8;                 // VOXEL_ENTRY_WORDS
     constexpr uint32 JobWords = 8;                   // VOXEL_JOB_WORDS
-    constexpr int32 TexCoordChannels = 7;
-    constexpr int32 BytesPerVertex = 12 + 8 + 56 + 4;   // position, two packed normals, seven float2 UVs, colour
+    constexpr int32 TexCoordChannels = 8;
+    constexpr int32 BytesPerVertex = 12 + 8 + 64 + 4;   // position, two packed normals, eight float2 UVs, colour
     constexpr int32 BytesPerTriangle = 12;
 
     const FName PageGroupName(TEXT("BRICKPAGE"));

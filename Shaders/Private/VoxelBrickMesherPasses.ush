@@ -19,12 +19,14 @@
 //                     surface's side, and their parents
 //   TargetRequest (3) edge ends of those
 //   Sample (mode 2)   those points
-//   TargetRequest (1) gradient points of their crossed edges
+//   TargetRequest (1) gradient points of their crossed edges (of every corner, coarser
+//                     targets)
 //   Sample (mode 2)   those points
 //   TargetSolve       each target's vertex, as the brick of its level solves it once the
 //                     finer leaves around it have merged (its frame)
-//   VertexTargets     each vertex's parent target, that target's own target, and its
-//                     unstitched position
+//   VertexTargets     each vertex's parent target, that target's own target, its
+//                     unstitched position, and the coarser levels' normals at it and at
+//                     its parent target
 // All densities come from one function in one pass, so a point shared by two bricks gets the
 // same value in both, and a parent vertex here equals that cell's vertex in the coarser brick.
 //
@@ -35,7 +37,10 @@
 // surface whatever the parent's blend (Design/MeshingEngine.md section 4 B). A cell next to
 // finer leaves is solved from their edges (stitched); it also carries its unstitched solve,
 // toward which it blends as the finer level morphs into its own, so it shows that solve when
-// the finer leaves merge (section 4 F).
+// the finer leaves merge (section 4 F). Normals blend toward the coarser level's normal field
+// at the vertex's unstitched position and reach the parent's normal only as the vertex
+// reaches the parent: every vertex of a parent cell shares that normal, so blending straight
+// to it would make each parent cell one flat patch.
 //
 // Inputs, declared by the includer after VoxelBrickStitch.ush (which defines
 // FVoxelMesherBrick), besides those of VoxelDensitySample.ush and VoxelEditSample.ush:
@@ -55,7 +60,9 @@
 //                                           target position and normal, grandparent target
 //                                           position and normal, unstitched position and
 //                                           normal, level of the cell relative to the brick
-//                                           (0 or 1), pad
+//                                           (0 or 1), pad, the next level's normal field at
+//                                           the unstitched position and the level after's
+//                                           at the parent target
 //   RWStructuredBuffer<uint> Indices;       NumBricks * TriangleCap * 3
 //   uint TargetHashSize (power of two);
 //   RWStructuredBuffer<uint> TargetState;   NumBricks * targets: 1 needed, 2 solved, 3 no
@@ -74,7 +81,7 @@ static const uint VoxelMesherErrorVertices = 8u;
 static const uint VoxelMesherErrorTriangles = 16u;
 static const uint VoxelMesherUnsampled = 0xffffffffu;
 static const uint VoxelMesherNone = 0xffffffffu;
-static const uint VoxelMesherVertexStride = 26u;
+static const uint VoxelMesherVertexStride = 32u;
 
 VOXEL_FUNC FVoxelStitchBrick VoxelMesherStitchBrick(uint B)
 {
@@ -793,6 +800,12 @@ VOXEL_FUNC void VoxelMesherSolvePass(uint Id)
     }
     Vertices[Base + 24u] = float(Cell.Level);
     Vertices[Base + 25u] = 0.0f;
+    for (uint c = 26u; c < 32u; c += 3u)
+    {
+        Vertices[Base + c] = VertexNormal.x;
+        Vertices[Base + c + 1u] = VertexNormal.y;
+        Vertices[Base + c + 2u] = VertexNormal.z;
+    }
     SlotVertex[Id] = V;
     const uint Targets = B * VoxelMesherNumTargets();
     const uint ParentSlot = VoxelMesherTargetOf(Cell);
@@ -884,8 +897,8 @@ VOXEL_FUNC void VoxelMesherTrianglesPass(uint Id)
 // Mode 0: the ends of every edge of a needed target cell in its frame. Mode 2: a target of a
 // coarser level without a crossing marks its neighbours on the surface's side and their
 // parents, whose vertices its finer vertices may take (VoxelMesherTargetFor). Mode 3: mode 0
-// for those. Mode 1: the gradient points of every target's crossed edges. Each point at its
-// owner's level in the frame.
+// for those. Mode 1: the gradient points of every target's crossed edges, of every corner for
+// a coarser target. Each point at its owner's level in the frame.
 VOXEL_FUNC void VoxelMesherTargetRequestPass(uint Id, uint Mode)
 {
     if (Id >= NumBricks * VoxelMesherNumTargets() || TargetState[Id] == 0u) return;
@@ -903,6 +916,24 @@ VOXEL_FUNC void VoxelMesherTargetRequestPass(uint Id, uint Mode)
             if (X.Level < 0) continue;
             VoxelMesherMarkNeighbourTarget(B, X);
             if (X.Level < 3) VoxelMesherMarkNeighbourTarget(B, VoxelMesherParentCell(X));
+        }
+        return;
+    }
+    if (Mode == 1u && Cell.Level > 0)
+    {
+        // A coarser target's frame is all of its level: the gradient points of every corner
+        // (VoxelMesherCoarseNormal), which include those of its crossed edges.
+        VOXEL_LOOP
+        for (int c = 0; c < 8; c++)
+        {
+            const int3 Corner = Cell.Min + int3((c & 1) * Cell.Size, ((c >> 1) & 1) * Cell.Size, (c >> 2) * Cell.Size);
+            VOXEL_LOOP
+            for (int Axis = 0; Axis < 3; Axis++)
+            {
+                const int3 Step = VoxelSetAxis(int3(0, 0, 0), Axis, Cell.Size);
+                VoxelMesherTargetRequest(B, Corner + Step, VoxelMesherFrameTag(F, Corner + Step));
+                VoxelMesherTargetRequest(B, Corner - Step, VoxelMesherFrameTag(F, Corner - Step));
+            }
         }
         return;
     }
@@ -1076,9 +1107,32 @@ VOXEL_FUNC FVoxelMesherTarget VoxelMesherTargetFor(uint B, uint TargetSlot, floa
     return Out;
 }
 
+// The normal field of a coarser target cell's level at Point (units; clamped to the cell):
+// the central-difference gradients at its corners, interpolated trilinearly, which is
+// continuous from cell to cell. Fallback where the field is flat.
+VOXEL_FUNC float3 VoxelMesherCoarseNormal(uint B, uint TargetSlot, float3 Point, float3 Fallback)
+{
+    const FVoxelStitchCell T = VoxelMesherTargetCell(TargetSlot);
+    const FVoxelMesherFrame F = VoxelMesherTargetFrame(B, T);
+    const float3 R = (Point - VoxelToFloat3(T.Min)) / float(T.Size);
+    const float3 U = float3(saturate(R.x), saturate(R.y), saturate(R.z));
+    float3 G = float3(0.0f, 0.0f, 0.0f);
+    VOXEL_LOOP
+    for (int c = 0; c < 8; c++)
+    {
+        const int3 Corner = T.Min + int3((c & 1) * T.Size, ((c >> 1) & 1) * T.Size, (c >> 2) * T.Size);
+        const float W = ((c & 1) != 0 ? U.x : 1.0f - U.x) * ((c & 2) != 0 ? U.y : 1.0f - U.y) * ((c & 4) != 0 ? U.z : 1.0f - U.z);
+        G = G + VoxelMesherTargetGradient(B, F, Corner, T.Size) * W;
+    }
+    const float LengthSq = dot(G, G);
+    return LengthSq > 1.0e-12f ? G / sqrt(LengthSq) : Fallback;
+}
+
 // Each solved cell's targets into its vertex record (cm from the brick min): the parent's,
 // the parent target's own, as the brick of the parent's level computes it for that vertex,
-// and the cell's unstitched solve (its own position where no finer leaf touches it).
+// the cell's unstitched solve (its own position where no finer leaf touches it), and the
+// coarser levels' normals: the parent's level's at the unstitched position, and the level
+// after's at the parent target, which the parent's brick computes for that vertex too.
 VOXEL_FUNC void VoxelMesherVertexTargetsPass(uint Id)
 {
     if (Id >= NumBricks * VoxelMesherNumSlots()) return;
@@ -1093,7 +1147,8 @@ VOXEL_FUNC void VoxelMesherVertexTargetsPass(uint Id)
 
     const uint ParentSlot = VoxelMesherTargetOf(Cell);
     const FVoxelMesherTarget Parent = VoxelMesherTargetFor(B, ParentSlot, Own, OwnNormal, true);
-    const FVoxelMesherTarget Grand = VoxelMesherTargetFor(B, VoxelMesherTargetOf(VoxelMesherTargetCell(Parent.Slot)), Parent.Position, Parent.Normal, Parent.Slot == ParentSlot);
+    const uint GrandSlot = VoxelMesherTargetOf(VoxelMesherTargetCell(Parent.Slot));
+    const FVoxelMesherTarget Grand = VoxelMesherTargetFor(B, GrandSlot, Parent.Position, Parent.Normal, Parent.Slot == ParentSlot);
     Vertices[Base + 6u] = Parent.Position.x * Unit;
     Vertices[Base + 7u] = Parent.Position.y * Unit;
     Vertices[Base + 8u] = Parent.Position.z * Unit;
@@ -1117,6 +1172,14 @@ VOXEL_FUNC void VoxelMesherVertexTargetsPass(uint Id)
     Vertices[Base + 21u] = Unstitched.Normal.x;
     Vertices[Base + 22u] = Unstitched.Normal.y;
     Vertices[Base + 23u] = Unstitched.Normal.z;
+    const float3 Coarse = VoxelMesherCoarseNormal(B, ParentSlot, Unstitched.Position, Parent.Normal);
+    const float3 ParentCoarse = VoxelMesherCoarseNormal(B, GrandSlot, Parent.Position, Grand.Normal);
+    Vertices[Base + 26u] = Coarse.x;
+    Vertices[Base + 27u] = Coarse.y;
+    Vertices[Base + 28u] = Coarse.z;
+    Vertices[Base + 29u] = ParentCoarse.x;
+    Vertices[Base + 30u] = ParentCoarse.y;
+    Vertices[Base + 31u] = ParentCoarse.z;
 }
 
 #endif // VOXEL_BRICK_MESHER_PASSES_USH

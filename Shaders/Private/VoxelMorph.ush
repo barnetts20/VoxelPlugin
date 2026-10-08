@@ -6,14 +6,17 @@
 // targets, section 4 B). Level L blends over camera distances E0 2^(L-1) to E0 2^L, so the
 // bands of consecutive levels are contiguous. A cell next to finer leaves is meshed from
 // their edges; it first blends toward its unstitched solve by level L - 1's weight, so it
-// shows that solve when the finer leaves have merged (section 4 F). VoxelBrickPageGPU.usf
-// writes all of it into texture coordinates 1 to 6; a page component holds its level and E0
+// shows that solve when the finer leaves have merged (section 4 F). Normals blend toward the
+// parent level's normal field at the vertex, and reach the parent's normal only as the vertex
+// reaches the parent (every vertex of a parent cell shares that normal). VoxelBrickPageGPU.usf
+// writes all of it into texture coordinates 1 to 7; a page component holds its level and E0
 // (world units) in custom primitive data 0 and 1 (E0 is 0 on anything else, which keeps its
 // own position). Params: x slack (world units), y mode (0 off, 1 by distance, 2 fully
 // blended).
 // Custom node code:
-//   return VoxelMorph(Parameters, ToVertex, UV1, UV2, UV3, UV4, UV5, UV6, NormalWS, Level, BandEnd0, Params, MorphNormal);
-// The wiring without UV5 and UV6 also compiles and morphs, without the unstitched blend.
+//   return VoxelMorph(Parameters, ToVertex, UV1, UV2, UV3, UV4, UV5, UV6, UV7, NormalWS, Level, BandEnd0, Params, MorphNormal);
+// Wirings without UV7 (or UV5 and UV6) also compile and morph, with the plain normal blend
+// (and without the unstitched blend).
 
 #pragma once
 
@@ -37,8 +40,9 @@ float3 VoxelMorphDecodeNormal(uint Packed)
 
 // The body for either parameter type (a Custom node is compiled for the vertex shader here,
 // but the include is seen by every shader of the material). UV5 and UV6 are the unstitched
-// offset and its packed normal; Unstitched is false for the wiring without them.
-#define VOXEL_MORPH_BODY(Unstitched) \
+// offset and its packed normal; Unstitched is false for the wiring without them. UV7 holds
+// the coarser normal fields; Fields is false without it.
+#define VOXEL_MORPH_BODY(Unstitched, Fields) \
     MorphNormal = NormalWS; \
     if (Params.y < 0.5f || BandEnd0 <= 0.0f) return float3(0.0f, 0.0f, 0.0f); \
     const float3 Parent = TransformLocalVectorToWorld(Parameters, float3(UV1.x, UV1.y, UV2.x)); \
@@ -65,20 +69,41 @@ float3 VoxelMorphDecodeNormal(uint Packed)
     } \
     Base = Base * WF; \
     BaseNormal = lerp(NormalWS, BaseNormal, WF); \
-    const float3 N = lerp(BaseNormal, lerp(ParentNormal, GrandNormal, W1), W0); \
+    float3 N = lerp(BaseNormal, lerp(ParentNormal, GrandNormal, W1), W0); \
+    if (Fields) \
+    { \
+        const float3 Coarse = normalize(TransformLocalVectorToWorld(Parameters, VoxelMorphDecodeNormal(uint(UV7.x + 0.5f)))); \
+        const float3 ParentCoarse = normalize(TransformLocalVectorToWorld(Parameters, VoxelMorphDecodeNormal(uint(UV7.y + 0.5f)))); \
+        const float3 Target = lerp(ParentNormal, lerp(ParentCoarse, GrandNormal, W1), W1); \
+        N = lerp(BaseNormal, lerp(Coarse, Target, W0), W0); \
+    } \
     MorphNormal = dot(N, N) > 1.0e-12f ? normalize(N) : NormalWS; \
     return lerp(Base, lerp(Parent, Grand, W1), W0);
+
+float3 VoxelMorph(FMaterialVertexParameters Parameters, float3 ToVertex, float2 UV1, float2 UV2, float2 UV3, float2 UV4, float2 UV5, float2 UV6, float2 UV7,
+    float3 NormalWS, float Level, float BandEnd0, float4 Params, out float3 MorphNormal)
+{
+    VOXEL_MORPH_BODY(true, true)
+}
+
+float3 VoxelMorph(FMaterialPixelParameters Parameters, float3 ToVertex, float2 UV1, float2 UV2, float2 UV3, float2 UV4, float2 UV5, float2 UV6, float2 UV7,
+    float3 NormalWS, float Level, float BandEnd0, float4 Params, out float3 MorphNormal)
+{
+    VOXEL_MORPH_BODY(true, true)
+}
 
 float3 VoxelMorph(FMaterialVertexParameters Parameters, float3 ToVertex, float2 UV1, float2 UV2, float2 UV3, float2 UV4, float2 UV5, float2 UV6,
     float3 NormalWS, float Level, float BandEnd0, float4 Params, out float3 MorphNormal)
 {
-    VOXEL_MORPH_BODY(true)
+    const float2 UV7 = float2(0.0f, 0.0f);
+    VOXEL_MORPH_BODY(true, false)
 }
 
 float3 VoxelMorph(FMaterialPixelParameters Parameters, float3 ToVertex, float2 UV1, float2 UV2, float2 UV3, float2 UV4, float2 UV5, float2 UV6,
     float3 NormalWS, float Level, float BandEnd0, float4 Params, out float3 MorphNormal)
 {
-    VOXEL_MORPH_BODY(true)
+    const float2 UV7 = float2(0.0f, 0.0f);
+    VOXEL_MORPH_BODY(true, false)
 }
 
 float3 VoxelMorph(FMaterialVertexParameters Parameters, float3 ToVertex, float2 UV1, float2 UV2, float2 UV3, float2 UV4,
@@ -86,7 +111,8 @@ float3 VoxelMorph(FMaterialVertexParameters Parameters, float3 ToVertex, float2 
 {
     const float2 UV5 = float2(0.0f, 0.0f);
     const float2 UV6 = float2(0.0f, 0.0f);
-    VOXEL_MORPH_BODY(false)
+    const float2 UV7 = float2(0.0f, 0.0f);
+    VOXEL_MORPH_BODY(false, false)
 }
 
 float3 VoxelMorph(FMaterialPixelParameters Parameters, float3 ToVertex, float2 UV1, float2 UV2, float2 UV3, float2 UV4,
@@ -94,7 +120,8 @@ float3 VoxelMorph(FMaterialPixelParameters Parameters, float3 ToVertex, float2 U
 {
     const float2 UV5 = float2(0.0f, 0.0f);
     const float2 UV6 = float2(0.0f, 0.0f);
-    VOXEL_MORPH_BODY(false)
+    const float2 UV7 = float2(0.0f, 0.0f);
+    VOXEL_MORPH_BODY(false, false)
 }
 
 #undef VOXEL_MORPH_BODY
