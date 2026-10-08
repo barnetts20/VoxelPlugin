@@ -32,7 +32,8 @@ DECLARE_DWORD_COUNTER_STAT(TEXT("Pages: buffer sets recycled"), STAT_VoxelPagesR
 DECLARE_DWORD_ACCUMULATOR_STAT(TEXT("Pages"), STAT_VoxelPagesCount, STATGROUP_VoxelTerrain);
 DECLARE_DWORD_ACCUMULATOR_STAT(TEXT("Pages: pooled buffer sets"), STAT_VoxelPagesPooled, STATGROUP_VoxelTerrain);
 DECLARE_DWORD_ACCUMULATOR_STAT(TEXT("Pages: staged bricks"), STAT_VoxelPagesStaged, STATGROUP_VoxelTerrain);
-DECLARE_GPU_STAT(VoxelBrickMesh);
+DECLARE_GPU_STAT(VoxelBrickMesher);
+DECLARE_GPU_STAT(VoxelBrickPageWrite);
 
 using namespace RealtimeMesh;
 
@@ -102,27 +103,34 @@ static TAutoConsoleVariable<int32> CVarVoxelBrickMeshBatches(
     TEXT("Brick mesher batches sent per frame (128 bricks of 16 cells, fewer of larger ones), on async compute. The bricks a task changes are meshed at this rate ahead of their commit; four times as fast while nothing is on screen."),
     ECVF_Default);
 
+static TAutoConsoleVariable<int32> CVarVoxelBrickMeshBatchesBusy(
+    TEXT("voxel.Render.BrickMeshBatchesBusy"), 4,
+    TEXT("Brick mesher batches sent per frame while a newer task result waits for the commit being meshed (the terrain is behind the camera). At least voxel.Render.BrickMeshBatches."),
+    ECVF_Default);
+
 namespace VoxelBrickPagesDetail
 {
     constexpr int32 PageShift = 3;                   // pages of 8x8x8 bricks
     constexpr int32 BatchCells = 128 * 4096;         // cells per mesher batch (128 16-cell bricks)
     constexpr int32 MaxPooled = 32;                  // emptied buffer sets kept for reuse
-    constexpr int32 PoolSlack = 2;                   // a pooled set may be up to 2^this times larger on each count
+    constexpr int32 PoolSlack = 2;                   // a pooled set may be this many classes larger on each count
     constexpr double BoundsMarginCells = 12.0;       // page bounds beyond its bricks (cells of its level), with the morph
     constexpr int32 MinVertices = 4096;
     constexpr int32 MinTriangles = 8192;
-    constexpr int32 MaxVertices = 1 << 22;
-    constexpr int32 MaxTriangles = 1 << 22;
+    constexpr int32 SlabVertices = 1 << 16;          // a buffer set's size limit: 4 MB of vertices
+    constexpr int32 SlabTriangles = 1 << 17;         // and 1.5 MB of triangles
     constexpr uint64 KickFrames = 3;                 // frames before a run that didn't happen is asked for again
     constexpr uint64 UnusedFrames = 60;              // an unused spare is pooled after
     constexpr uint64 EmptyingTimeoutFrames = 60;     // an emptying run not recorded by then: destroyed instead
     constexpr uint64 CacheTimeoutFrames = 600;       // cache ranges of runs never recorded are freed after
     constexpr double CapacityMargin = 1.25;          // over the counts a new buffer set holds
+    constexpr double PlanarVertices = 1.0;           // a brick before any read back: N^2 vertices
+    constexpr double PlanarTriangles = 2.0;          // and 2 N^2 triangles
     constexpr int32 CreateRampFrames = 4;            // a waiting commit raises the creation budget every this many frames
     constexpr int32 MaxCreateRamp = 3;               // creation costs about 0.3 ms each on the game thread
     constexpr double UnknownBrickWeight = 1.5;       // a brick not yet meshed counts this many level averages
     constexpr double AverageBlend = 0.05;            // per surface brick read back
-    constexpr double RegionMargin = 1.5;             // a batch's cache region over its expected counts
+    constexpr double RegionMargin = 1.25;            // a batch's cache region over its expected counts
     constexpr int32 RegionAlign = 256;
     constexpr int32 MaxBatchesInFlight = 16;
     constexpr int32 FirstFillBatchScale = 4;
@@ -130,6 +138,8 @@ namespace VoxelBrickPagesDetail
     constexpr int32 InitialCacheTriangles = 1 << 19;
     constexpr int32 MaxCacheVertices = 1 << 23;
     constexpr int32 MaxCacheTriangles = 1 << 24;
+    constexpr uint64 CachePeakFrames = 300;          // window of the cache's peak use
+    constexpr double CacheShrinkMargin = 1.5;        // an idle cache shrinks to a power of two above this times its peak
     constexpr uint32 CacheWords = 15;                // VOXEL_CACHE_WORDS (VoxelBrickPageGPU.usf)
     constexpr uint32 EntryWords = 8;                 // VOXEL_ENTRY_WORDS
     constexpr uint32 JobWords = 8;                   // VOXEL_JOB_WORDS
@@ -146,9 +156,21 @@ namespace VoxelBrickPagesDetail
         return FMath::Clamp(BatchCells / FMath::Cube(VoxelBrickMesherGPU::CellsFor(Settings)), 8, 256);
     }
 
-    uint64 PoolKey(int32 VertexCapacity, int32 TriangleCapacity)
+    /** The capacity class holding Count: classes 2k and 2k - 1 are 2^k and 1.5 * 2^(k-1). */
+    int32 SizeClass(int32 Count)
     {
-        return ((uint64)FMath::FloorLog2((uint32)FMath::Max(1, VertexCapacity)) << 32) | (uint64)FMath::FloorLog2((uint32)FMath::Max(1, TriangleCapacity));
+        const int32 K = (int32)FMath::CeilLogTwo((uint32)FMath::Max(Count, 4));
+        return Count <= (3 << (K - 2)) ? 2 * K - 1 : 2 * K;
+    }
+
+    int32 ClassSize(int32 Class)
+    {
+        return (Class & 1) ? 3 << (Class / 2 - 1) : 1 << (Class / 2);
+    }
+
+    uint64 PoolKey(int32 VertexClass, int32 TriangleClass)
+    {
+        return ((uint64)(uint32)VertexClass << 32) | (uint64)(uint32)TriangleClass;
     }
 
     int64 FloorShift(int64 Value, int32 Levels)
@@ -284,6 +306,18 @@ struct FVoxelBrickPageGPU
     /** Once per frame, from the first view family rendered (FVoxelBrickMeshExtension). */
     void Run_RenderThread(FRDGBuilder& GraphBuilder, uint32 FrameNumber);
 
+    /** Nothing in the cache is in use: new buffers of these sizes in the next graph (graphs
+     *  already recorded keep the old ones). */
+    void ShrinkCache(int32 Vertices, int32 Triangles)
+    {
+        CacheVertices.SafeRelease();
+        CacheIndices.SafeRelease();
+        CacheVertexCapacity = 0;
+        CacheTriangleCapacity = 0;
+        WantedVertexCapacity = Vertices;
+        WantedTriangleCapacity = Triangles;
+    }
+
 private:
     void Poll();
     void Grow(FRDGBuilder& GraphBuilder);
@@ -356,7 +390,7 @@ void FVoxelBrickPageGPU::Run_RenderThread(FRDGBuilder& GraphBuilder, uint32 Fram
         return;
 
     // Async compute: nothing in this frame reads what these passes write.
-    RDG_EVENT_SCOPE(GraphBuilder, "VoxelBrickMesh staging (%d batches)", Queued.Num());
+    RDG_EVENT_SCOPE_STAT(GraphBuilder, VoxelBrickMesher, "VoxelBrickMesh staging (%d batches)", Queued.Num());
     FRDGBufferRef CacheV = GraphBuilder.RegisterExternalBuffer(CacheVertices);
     FRDGBufferRef CacheI = GraphBuilder.RegisterExternalBuffer(CacheIndices);
     TShaderMapRef<FVoxelPageStageCS> Shader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
@@ -524,7 +558,7 @@ void FVoxelBrickPageProvider::BuildComputePasses(FRDGBuilder& GraphBuilder, cons
     const uint32 VertexCapacity = (uint32)FMath::Max(0, Context.GetVertexCapacity());
     const uint32 TriangleCapacity = (uint32)FMath::Max(0, Context.GetIndexCapacity() / 3);
 
-    RDG_EVENT_SCOPE_STAT(GraphBuilder, VoxelBrickMesh, "VoxelBrickPage write");
+    RDG_EVENT_SCOPE_STAT(GraphBuilder, VoxelBrickPageWrite, "VoxelBrickPage write");
     TShaderMapRef<FVoxelPageWriteCS> Shader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
     for (const FState& State : States)
     {
@@ -577,6 +611,9 @@ void FVoxelBrickPages::Initialize(AActor* InOwner, USceneComponent* InAttachRoot
     MesherSettings.FinestCell = Settings.FinestCell;
     MesherSettings.CellsPerBrick = Settings.CellsPerBrick;
     MesherSettings.MaxDepth = Settings.MaxLevel + FMath::FloorLog2(FMath::Max(1, Settings.CellsPerBrick));
+    const VoxelBrickMesherGPU::FCaps Caps = VoxelBrickMesherGPU::CapsFor(MesherSettings);
+    MaxSlab = FIntPoint(FMath::Max(VBP::SlabVertices, 2 * (int32)FMath::RoundUpToPowerOfTwo(Caps.VertexCap)),
+        FMath::Max(VBP::SlabTriangles, 2 * (int32)FMath::RoundUpToPowerOfTwo(Caps.TriangleCap)));
     Density.Reset();
     Edits.Reset();
     if (!MeshExtension.IsValid() && GEngine && FApp::CanEverRender())
@@ -589,7 +626,8 @@ void FVoxelBrickPages::Reset()
     {
         for (FSlab& Slab : Pair.Value.Slabs)
             DestroyInstance(Slab.Instance);
-        DestroyInstance(Pair.Value.Spare);
+        for (FInstance& Spare : Pair.Value.Spares)
+            DestroyInstance(Spare);
     }
     Pages.Reset();
     for (TPair<uint64, TArray<FInstance>>& Pair : Pool)
@@ -614,7 +652,13 @@ void FVoxelBrickPages::Reset()
     CacheReleases.Reset();
     CacheVertices.Reset(CacheVertices.GetCapacity());
     CacheTriangles.Reset(CacheTriangles.GetCapacity());
+    CachePeak = FIntPoint::ZeroValue;
+    CachePeakBefore = FIntPoint::ZeroValue;
+    CachePeakFrame = GFrameCounter;
+    NoShrinkUntil = 0;
+    NewPages.Reset();
     bFirstFill = false;
+    bBusy = false;
     ENQUEUE_RENDER_COMMAND(VoxelBrickPagesReset)([GPURef = GPU](FRHICommandListImmediate&)
         {
             GPURef->Queued.Reset();
@@ -733,11 +777,13 @@ bool FVoxelBrickPages::IsReady(const FInstance& Instance)
 TArray<FVoxelBrickPages::FInstance>* FVoxelBrickPages::FindPooled(FIntPoint Capacity)
 {
     // Smallest total first.
+    const int32 VC = VBP::SizeClass(Capacity.X);
+    const int32 TC = VBP::SizeClass(Capacity.Y);
     for (int32 Extra = 0; Extra <= 2 * VBP::PoolSlack; Extra++)
     {
         for (int32 DV = FMath::Max(0, Extra - VBP::PoolSlack); DV <= FMath::Min(Extra, VBP::PoolSlack); DV++)
         {
-            TArray<FInstance>* Free = Pool.Find(VBP::PoolKey(Capacity.X << DV, Capacity.Y << (Extra - DV)));
+            TArray<FInstance>* Free = Pool.Find(VBP::PoolKey(VC + DV, TC + Extra - DV));
             if (Free && Free->Num() > 0) return Free;
         }
     }
@@ -781,16 +827,17 @@ void FVoxelBrickPages::PoolInstance(FInstance& Instance)
         DestroyInstance(Instance);
         return;
     }
-    Pool.FindOrAdd(VBP::PoolKey(Instance.VertexCapacity, Instance.TriangleCapacity)).Add(MoveTemp(Instance));
+    Pool.FindOrAdd(VBP::PoolKey(VBP::SizeClass(Instance.VertexCapacity), VBP::SizeClass(Instance.TriangleCapacity))).Add(MoveTemp(Instance));
     NumPooled++;
     Instance = FInstance();
 }
 
-FIntPoint FVoxelBrickPages::RoundCapacity(double Vertices, double Triangles)
+FIntPoint FVoxelBrickPages::RoundCapacity(double Vertices, double Triangles) const
 {
-    const int32 V = (int32)FMath::RoundUpToPowerOfTwo((uint32)FMath::Clamp(Vertices * VBP::CapacityMargin, (double)VBP::MinVertices, (double)VBP::MaxVertices));
-    const int32 T = (int32)FMath::RoundUpToPowerOfTwo((uint32)FMath::Clamp(Triangles * VBP::CapacityMargin, (double)VBP::MinTriangles, (double)VBP::MaxTriangles));
-    return FIntPoint(V, T);
+    // MaxSlab is a power of two, so a class size too.
+    const int32 V = (int32)FMath::Clamp(FMath::CeilToDouble(Vertices * VBP::CapacityMargin), (double)VBP::MinVertices, (double)MaxSlab.X);
+    const int32 T = (int32)FMath::Clamp(FMath::CeilToDouble(Triangles * VBP::CapacityMargin), (double)VBP::MinTriangles, (double)MaxSlab.Y);
+    return FIntPoint(VBP::ClassSize(VBP::SizeClass(V)), VBP::ClassSize(VBP::SizeClass(T)));
 }
 
 int32 FVoxelBrickPages::CreateBudget() const
@@ -801,37 +848,75 @@ int32 FVoxelBrickPages::CreateBudget() const
     return Base * FMath::Min(1 + Waited / VBP::CreateRampFrames, VBP::MaxCreateRamp);
 }
 
-bool FVoxelBrickPages::EnsureSpare(const FVoxelBrickKey& PageKey, FPage& Page, FIntPoint Capacity)
+void FVoxelBrickPages::BeginCreates()
+{
+    if (CreatesFrame == GFrameCounter) return;
+    CreatesFrame = GFrameCounter;
+    CreatesThisFrame = 0;
+}
+
+bool FVoxelBrickPages::AddSpare(const FVoxelBrickKey& PageKey, FPage& Page, FIntPoint Capacity)
 {
     Page.SpareUsedFrame = GFrameCounter;
-    if (Page.Spare.IsValid() && Page.Spare.VertexCapacity >= Capacity.X && Page.Spare.TriangleCapacity >= Capacity.Y)
-        return IsReady(Page.Spare);
     if (!FindPooled(Capacity) && CreatesThisFrame >= CreateBudget()) return false;
-    if (Page.Spare.IsValid())
-    {
-        PoolInstance(Page.Spare);
-        Perf.SpareSwaps++;
-    }
     const int32 CreatedBefore = Perf.Created;
-    Page.Spare = AcquireInstance(PageKey, Capacity);
+    FInstance Instance = AcquireInstance(PageKey, Capacity);
     CreatesThisFrame += Perf.Created - CreatedBefore;
-    return IsReady(Page.Spare);
+    if (!Instance.IsValid()) return false;
+    Page.Spares.Add(MoveTemp(Instance));
+    Perf.SparesAdded++;
+    return true;
+}
+
+void FVoxelBrickPages::PrepareNewPages()
+{
+    BeginCreates();
+    for (const TPair<FVoxelBrickKey, FIntPoint>& Entry : NewPages)
+    {
+        FPage& Page = Pages.FindOrAdd(Entry.Key);
+        if (Page.Spares.Num() > 0)
+            Page.SpareUsedFrame = GFrameCounter;
+        else if (Page.Slabs.Num() == 0)
+            AddSpares(Entry.Key, Page, Entry.Value, FIntPoint::ZeroValue);
+    }
+}
+
+void FVoxelBrickPages::AddSpares(const FVoxelBrickKey& PageKey, FPage& Page, FIntPoint Counts, FIntPoint MinCounts)
+{
+    // Sets of at most MaxSlab each: a large need takes several.
+    FIntPoint Left = Counts;
+    while (Left.X > 0 || Left.Y > 0)
+    {
+        const FIntPoint Capacity = RoundCapacity(FMath::Max(Left.X, MinCounts.X), FMath::Max(Left.Y, MinCounts.Y));
+        if (!AddSpare(PageKey, Page, Capacity)) return;
+        Left -= Capacity;
+    }
 }
 
 FIntPoint FVoxelBrickPages::ExpectedCounts(const FVoxelBrickKey& Key) const
 {
-    // What it held before, else the level's average surface brick, else a busy brick.
+    // What it held before, else the level's average surface brick (the largest level average
+    // before its first read back), else a planar brick; the latter with a margin.
     if (const FPage* Page = Pages.Find(PageOf(Key)))
     {
         const FMember* Member = Page->Members.Find(Key);
         if (Member && Member->Triangles > 0)
             return FIntPoint(Member->Vertices, Member->Triangles);
     }
-    const FVector2D Average = LevelAverages.FindRef(Key.Level) * VBP::UnknownBrickWeight;
-    if (Average.X > 0.0)
-        return FIntPoint(FMath::CeilToInt(Average.X), FMath::CeilToInt(Average.Y));
-    const int32 Square = Settings.CellsPerBrick * Settings.CellsPerBrick;
-    return FIntPoint(2 * Square, 4 * Square);
+    const FVector2D* LevelAverage = LevelAverages.Find(Key.Level);
+    FVector2D Average = LevelAverage ? *LevelAverage : FVector2D::ZeroVector;
+    if (Average.X <= 0.0)
+    {
+        for (const TPair<int32, FVector2D>& Pair : LevelAverages)
+            Average = Average.ComponentMax(Pair.Value);
+    }
+    if (Average.X <= 0.0)
+    {
+        const double Square = (double)Settings.CellsPerBrick * Settings.CellsPerBrick;
+        Average = FVector2D(VBP::PlanarVertices * Square, VBP::PlanarTriangles * Square);
+    }
+    Average *= VBP::UnknownBrickWeight;
+    return FIntPoint(FMath::CeilToInt(Average.X), FMath::CeilToInt(Average.Y));
 }
 
 void FVoxelBrickPages::Push(const FVoxelBrickKey& PageKey, FInstance& Instance, TArray<uint32>&& Jobs, int32 TriangleEnd)
@@ -936,6 +1021,20 @@ void FVoxelBrickPages::Stage(TConstArrayView<FVoxelBrickPageChange> Changes, boo
             if (PA.Y != PB.Y) return PA.Y < PB.Y;
             return PA.Z < PB.Z;
         });
+
+    // Pages without buffer sets, sized from the expected counts (without their margin).
+    TMap<FVoxelBrickKey, FVector2D> PageCounts;
+    for (const FQueued& Item : MeshQueue)
+    {
+        const FVoxelBrickKey PageKey = PageOf(Item.Key);
+        const FPage* Page = Pages.Find(PageKey);
+        if (Page && Page->Slabs.Num() > 0) continue;
+        const FIntPoint Counts = Staged.FindChecked(Item.Key).Expected;
+        PageCounts.FindOrAdd(PageKey, FVector2D::ZeroVector) += FVector2D(Counts.X, Counts.Y) / VBP::UnknownBrickWeight;
+    }
+    NewPages.Reset(PageCounts.Num());
+    for (const TPair<FVoxelBrickKey, FVector2D>& Pair : PageCounts)
+        NewPages.Emplace(Pair.Key, FIntPoint(FMath::CeilToInt(Pair.Value.X), FMath::CeilToInt(Pair.Value.Y)));
 }
 
 void FVoxelBrickPages::TakeBatchResults()
@@ -984,7 +1083,7 @@ void FVoxelBrickPages::TakeBatchResults()
             if (Brick->Triangles <= 0) continue;
             KeptVertices.Add(FIntPoint(Brick->CacheVertex, Brick->Vertices));
             KeptTriangles.Add(FIntPoint(Brick->CacheTriangle, Brick->Triangles));
-            FVector2D& Average = LevelAverages.FindOrAdd(Batch.Keys[b].Level);
+            FVector2D& Average = LevelAverages.FindOrAdd(Batch.Keys[b].Level, FVector2D::ZeroVector);
             const FVector2D Counts((double)Brick->Vertices, (double)Brick->Triangles);
             Average = Average.X <= 0.0 ? Counts : Average + (Counts - Average) * VBP::AverageBlend;
         }
@@ -1003,7 +1102,9 @@ void FVoxelBrickPages::TakeBatchResults()
 void FVoxelBrickPages::DispatchBatches()
 {
     if (!Density.IsValid() || !Edits.IsValid()) return;
-    const int32 Budget = FMath::Max(0, CVarVoxelBrickMeshBatches.GetValueOnGameThread()) * (bFirstFill ? VBP::FirstFillBatchScale : 1);
+    const int32 Base = FMath::Max(0, CVarVoxelBrickMeshBatches.GetValueOnGameThread());
+    const int32 Budget = bFirstFill ? Base * VBP::FirstFillBatchScale
+        : (bBusy ? FMath::Max(Base, CVarVoxelBrickMeshBatchesBusy.GetValueOnGameThread()) : Base);
     const int32 BatchBricks = VBP::BatchBricksFor(MesherSettings);
     const VoxelBrickMesherGPU::FCaps Caps = VoxelBrickMesherGPU::CapsFor(MesherSettings);
     for (int32 Sent = 0; Sent < Budget && QueueHead < MeshQueue.Num() && Batches.Num() < VBP::MaxBatchesInFlight; Sent++)
@@ -1091,11 +1192,7 @@ void FVoxelBrickPages::DispatchBatches()
 bool FVoxelBrickPages::PreparePages(TConstArrayView<FVoxelBrickPageChange> Changes)
 {
     SCOPE_CYCLE_COUNTER(STAT_VoxelPagesPrepare);
-    if (CreatesFrame != GFrameCounter)
-    {
-        CreatesFrame = GFrameCounter;
-        CreatesThisFrame = 0;
-    }
+    BeginCreates();
     TMap<FVoxelBrickKey, TArray<const FVoxelBrickPageChange*>> ByPage;
     for (const FVoxelBrickPageChange& Change : Changes)
         ByPage.FindOrAdd(PageOf(Change.Key)).Add(&Change);
@@ -1125,8 +1222,10 @@ bool FVoxelBrickPages::PreparePages(TConstArrayView<FVoxelBrickPageChange> Chang
                     MeshQueue.Add(FQueued{ Change->Key, New.Stamp });
                 Brick = &New;
             }
+            // Exact counts, or the expected ones without their margin.
             bPageMeshed &= Brick->State == EStage::Ready;
-            Estimate += Brick->State == EStage::Ready ? FIntPoint(Brick->Vertices, Brick->Triangles) : Brick->Expected;
+            Estimate += Brick->State == EStage::Ready ? FIntPoint(Brick->Vertices, Brick->Triangles)
+                : FIntPoint(FMath::CeilToInt(Brick->Expected.X / VBP::UnknownBrickWeight), FMath::CeilToInt(Brick->Expected.Y / VBP::UnknownBrickWeight));
         }
         if (!bAdds) continue;   // removals only: always ready
         FPage& Page = Pages.FindOrAdd(Pair.Key);
@@ -1134,20 +1233,28 @@ bool FVoxelBrickPages::PreparePages(TConstArrayView<FVoxelBrickPageChange> Chang
         {
             // A new page gets its first buffer set while its bricks are meshed.
             bMeshed = false;
-            if (Page.Spare.IsValid())
+            if (Page.Spares.Num() > 0)
                 Page.SpareUsedFrame = GFrameCounter;
             else if (Page.Slabs.Num() == 0)
-                EnsureSpare(Pair.Key, Page, RoundCapacity(Estimate.X, Estimate.Y));
+                AddSpares(Pair.Key, Page, Estimate, FIntPoint::ZeroValue);
             continue;
         }
-        const FIntPoint Overflow = PlanPage(Pair.Key, Page, Pair.Value, false, nullptr);
+        bool bUsesSpare = false;
+        const FIntPoint Overflow = PlanPage(Pair.Key, Page, Pair.Value, false, nullptr, &bUsesSpare);
+        if (bUsesSpare)
+        {
+            Page.SpareUsedFrame = GFrameCounter;
+            for (const FInstance& Spare : Page.Spares)
+                bReady &= IsReady(Spare);
+        }
         if (Overflow.X <= 0 && Overflow.Y <= 0) continue;
-        // A page that outgrows its sets gets one at least as large as what they hold, so a
-        // growing page needs a few sets, not one per commit.
+        // More spares, each at least as large as what the slabs hold (a growing page needs a
+        // few sets, not one per commit).
         FIntPoint Held(0, 0);
         for (const FSlab& Slab : Page.Slabs)
             Held += FIntPoint(Slab.Vertices.GetNumUsed(), Slab.Triangles.GetNumUsed());
-        bReady &= EnsureSpare(Pair.Key, Page, RoundCapacity(FMath::Max(Overflow.X, Held.X), FMath::Max(Overflow.Y, Held.Y)));
+        AddSpares(Pair.Key, Page, Overflow, Held);
+        bReady = false;
     }
     bPrepareMeshed = bMeshed;
     // Only a wait for buffer sets raises the creation budget.
@@ -1155,8 +1262,18 @@ bool FVoxelBrickPages::PreparePages(TConstArrayView<FVoxelBrickPageChange> Chang
     return bMeshed && bReady;
 }
 
-bool FVoxelBrickPages::PrepareCommit(TConstArrayView<FVoxelBrickPageChange> Changes)
+bool FVoxelBrickPages::PrepareCommit(TConstArrayView<FVoxelBrickPageChange> Changes, bool bWhole)
 {
+    // Changes are everything staged: until the mesher is done, only new pages need work.
+    if (bWhole && !IsMeshed())
+    {
+        SCOPE_CYCLE_COUNTER(STAT_VoxelPagesPrepare);
+        PrepareNewPages();
+        bPrepareMeshed = false;
+        WaitingSince = 0;
+        Perf.MeshWaits++;
+        return false;
+    }
     const bool bReady = PreparePages(Changes);
     if (!bReady)
     {
@@ -1166,22 +1283,22 @@ bool FVoxelBrickPages::PrepareCommit(TConstArrayView<FVoxelBrickPageChange> Chan
     return bReady;
 }
 
-FIntPoint FVoxelBrickPages::PlanPage(const FVoxelBrickKey& PageKey, FPage& Page, TConstArrayView<const FVoxelBrickPageChange*> PageChanges, bool bApply, FCacheRelease* Release)
+FIntPoint FVoxelBrickPages::PlanPage(const FVoxelBrickKey& PageKey, FPage& Page, TConstArrayView<const FVoxelBrickPageChange*> PageChanges, bool bApply,
+    FCacheRelease* Release, bool* bOutUsesSpare)
 {
-    // The slabs' space as the plan changes it; the spare (empty) last, used only when applying.
+    // The slabs' space as the plan changes it, then the spares (empty).
     const int32 NumSlabs = Page.Slabs.Num();
-    const bool bSpare = bApply && Page.Spare.IsValid();
     TArray<FPlanSlab> Plan;
-    Plan.SetNum(NumSlabs + (bSpare ? 1 : 0));
+    Plan.SetNum(NumSlabs + Page.Spares.Num());
     for (int32 s = 0; s < NumSlabs; s++)
     {
         Plan[s].Vertices = Page.Slabs[s].Vertices;
         Plan[s].Triangles = Page.Slabs[s].Triangles;
     }
-    if (bSpare)
+    for (int32 i = 0; i < Page.Spares.Num(); i++)
     {
-        Plan.Last().Vertices.Reset(Page.Spare.VertexCapacity);
-        Plan.Last().Triangles.Reset(Page.Spare.TriangleCapacity);
+        Plan[NumSlabs + i].Vertices.Reset(Page.Spares[i].VertexCapacity);
+        Plan[NumSlabs + i].Triangles.Reset(Page.Spares[i].TriangleCapacity);
     }
     auto SlotOf = [&Page, NumSlabs](uint32 Id)
         {
@@ -1237,18 +1354,39 @@ FIntPoint FVoxelBrickPages::PlanPage(const FVoxelBrickKey& PageKey, FPage& Page,
         if (PlacedSlot[c] == INDEX_NONE)
             Overflow += FIntPoint(Brick->Vertices, Brick->Triangles);
     }
+    if (bOutUsesSpare)
+    {
+        *bOutUsesSpare = false;
+        for (int32 s = NumSlabs; s < Plan.Num(); s++)
+            *bOutUsesSpare |= Plan[s].bTouched;
+    }
     if (!bApply) return Overflow;
 
     if (Overflow.X > 0 || Overflow.Y > 0)
-        UE_LOG(LogTemp, Warning, TEXT("[VoxelBricks] A page commit had no room for %d vertices and %d triangles: those bricks are not drawn until they change."), Overflow.X, Overflow.Y);
-    // The spare becomes a slab once it takes bricks (it is the last plan slot).
-    if (bSpare && Plan.Last().bTouched)
     {
-        FSlab& Slab = Page.Slabs.AddDefaulted_GetRef();
-        Slab.Instance = MoveTemp(Page.Spare);
-        Slab.Id = ++Page.NextSlabId;
-        Page.Spare = FInstance();
+        UE_LOG(LogTemp, Warning, TEXT("[VoxelBricks] A page commit had no room for %d vertices and %d triangles: those bricks are not drawn until they change."), Overflow.X, Overflow.Y);
     }
+    // Spares that take bricks become slabs, in plan order; SlabOf maps plan slots to slabs.
+    TArray<int32> SlabOf;
+    SlabOf.SetNum(Plan.Num());
+    for (int32 s = 0; s < NumSlabs; s++)
+        SlabOf[s] = s;
+    TArray<FInstance> Unused;
+    for (int32 i = 0; i < Page.Spares.Num(); i++)
+    {
+        const int32 s = NumSlabs + i;
+        if (!Plan[s].bTouched)
+        {
+            SlabOf[s] = INDEX_NONE;
+            Unused.Add(MoveTemp(Page.Spares[i]));
+            continue;
+        }
+        FSlab& Slab = Page.Slabs.AddDefaulted_GetRef();
+        Slab.Instance = MoveTemp(Page.Spares[i]);
+        Slab.Id = ++Page.NextSlabId;
+        SlabOf[s] = Page.Slabs.Num() - 1;
+    }
+    Page.Spares = MoveTemp(Unused);
 
     for (int32 c = 0; c < PageChanges.Num(); c++)
     {
@@ -1265,7 +1403,7 @@ FIntPoint FVoxelBrickPages::PlanPage(const FVoxelBrickKey& PageKey, FPage& Page,
         Member.Errors = Brick->Errors;
         if (PlacedSlot[c] != INDEX_NONE)
         {
-            Member.Slab = Page.Slabs[PlacedSlot[c]].Id;
+            Member.Slab = Page.Slabs[SlabOf[PlacedSlot[c]]].Id;
             Member.VertexStart = PlacedStart[c].X;
             Member.Vertices = Brick->Vertices;
             Member.TriangleStart = PlacedStart[c].Y;
@@ -1281,12 +1419,13 @@ FIntPoint FVoxelBrickPages::PlanPage(const FVoxelBrickKey& PageKey, FPage& Page,
     }
 
     // Each touched slab: its new space, the departed triangles no new brick covers cleared,
-    // and the triangles drawn. A slab left without bricks is emptied by that run.
+    // and the triangles drawn. A slab left without bricks is emptied by that run. Slots go
+    // by descending slab, so removing one leaves the others' indices.
     for (int32 s = Plan.Num() - 1; s >= 0; s--)
     {
         FPlanSlab& Slot = Plan[s];
         if (!Slot.bTouched) continue;
-        FSlab& Slab = Page.Slabs[s];
+        FSlab& Slab = Page.Slabs[SlabOf[s]];
         Slab.Vertices = MoveTemp(Slot.Vertices);
         Slab.Triangles = MoveTemp(Slot.Triangles);
         Slab.NumMembers += Slot.Joined - Slot.Left;
@@ -1304,7 +1443,7 @@ FIntPoint FVoxelBrickPages::PlanPage(const FVoxelBrickKey& PageKey, FPage& Page,
         Entry.Instance = MoveTemp(Slab.Instance);
         Entry.Version = Entry.Instance.PushedVersion;
         Entry.Frame = GFrameCounter;
-        Page.Slabs.RemoveAt(s);
+        Page.Slabs.RemoveAt(SlabOf[s]);
     }
     return Overflow;
 }
@@ -1332,7 +1471,8 @@ void FVoxelBrickPages::Commit(TConstArrayView<FVoxelBrickPageChange> Changes)
         PlanPage(Pair.Key, *Page, Pair.Value, true, &Release);
         if (Page->Members.Num() == 0 && Page->Slabs.Num() == 0)
         {
-            PoolInstance(Page->Spare);
+            for (FInstance& Spare : Page->Spares)
+                PoolInstance(Spare);
             Pages.Remove(Pair.Key);
         }
     }
@@ -1357,11 +1497,7 @@ void FVoxelBrickPages::Flush(const TSharedPtr<const FVoxelDensityGPUData>& InDen
     };
     Density = InDensity;
     Edits = InEdits;
-    if (CreatesFrame != GFrameCounter)
-    {
-        CreatesFrame = GFrameCounter;
-        CreatesThisFrame = 0;
-    }
+    BeginCreates();
     auto CollectCounters = [this](const FInstance& Instance)
         {
             if (!Instance.IsValid()) return;
@@ -1379,6 +1515,9 @@ void FVoxelBrickPages::Flush(const TSharedPtr<const FVoxelDensityGPUData>& InDen
     {
         FCacheRelease& Entry = CacheReleases[r];
         bool bDone = GFrameCounter > Entry.Frame + VBP::CacheTimeoutFrames;
+        // A run never recorded may still copy from these ranges: the cache keeps its size.
+        if (bDone && Entry.Runs.Num() > 0)
+            NoShrinkUntil = GFrameCounter + VBP::CacheTimeoutFrames;
         for (int32 i = 0; i < Entry.Runs.Num() && !bDone; i++)
         {
             const TSharedPtr<FVoxelBrickPageProvider, ESPMode::ThreadSafe> Provider = Entry.Runs[i].Key.Pin();
@@ -1425,11 +1564,17 @@ void FVoxelBrickPages::Flush(const TSharedPtr<const FVoxelDensityGPUData>& InDen
                 WarnedMissing |= MissingBits;
             }
         }
-        Advance(Page.Spare);
-        CollectCounters(Page.Spare);
-        if (Page.Spare.IsValid() && GFrameCounter > Page.SpareUsedFrame + VBP::UnusedFrames)
-            PoolInstance(Page.Spare);
-        if (Page.Members.Num() == 0 && Page.Slabs.Num() == 0 && !Page.Spare.IsValid())
+        const bool bUnused = GFrameCounter > Page.SpareUsedFrame + VBP::UnusedFrames;
+        for (FInstance& Spare : Page.Spares)
+        {
+            Advance(Spare);
+            CollectCounters(Spare);
+            if (bUnused)
+                PoolInstance(Spare);
+        }
+        if (bUnused)
+            Page.Spares.Reset();
+        if (Page.Members.Num() == 0 && Page.Slabs.Num() == 0 && Page.Spares.Num() == 0)
             Emptied.Add(Pair.Key);
     }
     for (const FVoxelBrickKey& Key : Emptied)
@@ -1444,9 +1589,41 @@ void FVoxelBrickPages::Flush(const TSharedPtr<const FVoxelDensityGPUData>& InDen
     }
 
     DispatchBatches();
+    ShrinkCache();
     SET_DWORD_STAT(STAT_VoxelPagesCount, Pages.Num());
     SET_DWORD_STAT(STAT_VoxelPagesPooled, NumPooled);
     SET_DWORD_STAT(STAT_VoxelPagesStaged, Staged.Num());
+}
+
+void FVoxelBrickPages::ShrinkCache()
+{
+    const FIntPoint Used(CacheVertices.GetNumUsed(), CacheTriangles.GetNumUsed());
+    CachePeak = CachePeak.ComponentMax(Used);
+    Perf.CacheUsed = Perf.CacheUsed.ComponentMax(Used);
+    if (GFrameCounter >= CachePeakFrame + VBP::CachePeakFrames)
+    {
+        CachePeakBefore = CachePeak;
+        CachePeak = Used;
+        CachePeakFrame = GFrameCounter;
+    }
+    // Only an empty cache shrinks: nothing staged, being meshed or waiting to be copied.
+    if (Used.X > 0 || Used.Y > 0 || Batches.Num() > 0 || CacheReleases.Num() > 0 || GFrameCounter < NoShrinkUntil) return;
+    const FIntPoint Peak = CachePeak.ComponentMax(CachePeakBefore);
+    auto Target = [](int32 PeakUsed, int32 Initial, int32 Current)
+        {
+            const uint32 Wanted = (uint32)FMath::CeilToInt(PeakUsed * VBP::CacheShrinkMargin);
+            return FMath::Min(Current, FMath::Max(Initial, (int32)FMath::RoundUpToPowerOfTwo(FMath::Max(Wanted, 1u))));
+        };
+    const int32 V = Target(Peak.X, VBP::InitialCacheVertices, CacheVertices.GetCapacity());
+    const int32 T = Target(Peak.Y, VBP::InitialCacheTriangles, CacheTriangles.GetCapacity());
+    if (V == CacheVertices.GetCapacity() && T == CacheTriangles.GetCapacity()) return;
+    CacheVertices.Reset(V);
+    CacheTriangles.Reset(T);
+    Perf.CacheShrinks++;
+    ENQUEUE_RENDER_COMMAND(VoxelBrickCacheShrink)([GPURef = GPU, V, T](FRHICommandListImmediate&)
+        {
+            GPURef->ShrinkCache(V, T);
+        });
 }
 
 FString FVoxelBrickPages::TakePerf()
@@ -1466,20 +1643,25 @@ FString FVoxelBrickPages::TakePerf()
             Count(Slab.Instance);
             Triangles += Slab.Triangles.GetNumUsed();
         }
-        Count(Pair.Value.Spare);
+        for (const FInstance& Spare : Pair.Value.Spares)
+            Count(Spare);
     }
     const int64 Meshed = GPU->BricksMeshed.exchange(0, std::memory_order_relaxed);
     const int64 StageMicros = GPU->StageMicros.exchange(0, std::memory_order_relaxed);
     const double PerFrame = 1.0 / FMath::Max(1, Perf.Frames);
     const double PerCommit = 1.0 / FMath::Max(1, Perf.Commits);
-    const double CacheMB = ((double)CacheVertices.GetCapacity() * VBP::CacheWords * 4.0 + (double)CacheTriangles.GetCapacity() * 12.0) / (1024.0 * 1024.0);
-    const FString Out = FString::Printf(TEXT("Pages: %d pages, %d buffer sets (+%d pooled), %.1f MB, %lld triangles. Commits: %d (%.0f changes, %.0f pages, %.0f buffer sets written and %.0f jobs on average; %d changes at most), %d frames waiting for the mesher, %d for buffer sets. Mesher per frame: %.2f batches, %.1f bricks sent, %.1f meshed (%d sent again), %.2f ms render thread; cache %.1f MB, %d bricks staged. Providers per frame: %.1f calls (%.1f idle), %.2f runs, %.2f ms render thread; buffer sets %.2f created (%.2f ms each, %.2f ms max), %.2f recycled, %d spares replaced. Flush %.2f ms average, %.2f ms max."),
+    auto CacheMB = [](int64 NumVertices, int64 NumTriangles)
+        {
+            return ((double)NumVertices * VBP::CacheWords * 4.0 + (double)NumTriangles * 12.0) / (1024.0 * 1024.0);
+        };
+    const FString Out = FString::Printf(TEXT("Pages: %d pages, %d buffer sets (+%d pooled), %.1f MB, %lld triangles. Commits: %d (%.0f changes, %.0f pages, %.0f buffer sets written and %.0f jobs on average; %d changes at most), %d frames waiting for the mesher, %d for buffer sets. Mesher per frame: %.2f batches, %.1f bricks sent, %.1f meshed (%d sent again), %.2f ms render thread; cache %.1f MB (%.1f MB used at most, %d shrinks), %d bricks staged. Providers per frame: %.1f calls (%.1f idle), %.2f runs, %.2f ms render thread; buffer sets %.2f created (%.2f ms each, %.2f ms max), %.2f recycled, %d spares added. Flush %.2f ms average, %.2f ms max."),
         Pages.Num(), Instances, NumPooled, Bytes / (1024.0 * 1024.0), Triangles,
         Perf.Commits, Perf.CommitChanges * PerCommit, Perf.CommitPages * PerCommit, Perf.CommitSlabs * PerCommit, Perf.CommitJobs * PerCommit, Perf.MaxCommitChanges,
         Perf.MeshWaits, Perf.SlabWaits,
-        Perf.Batches * PerFrame, Perf.BricksSent * PerFrame, Meshed * PerFrame, Perf.BricksBack, StageMicros * PerFrame / 1000.0, CacheMB, Staged.Num(),
+        Perf.Batches * PerFrame, Perf.BricksSent * PerFrame, Meshed * PerFrame, Perf.BricksBack, StageMicros * PerFrame / 1000.0,
+        CacheMB(CacheVertices.GetCapacity(), CacheTriangles.GetCapacity()), CacheMB(Perf.CacheUsed.X, Perf.CacheUsed.Y), Perf.CacheShrinks, Staged.Num(),
         Perf.Calls * PerFrame, Perf.IdleCalls * PerFrame, Perf.Runs * PerFrame, Perf.RenderMicros * PerFrame / 1000.0,
-        Perf.Created * PerFrame, Perf.Created > 0 ? Perf.CreateMs / Perf.Created : 0.0, Perf.MaxCreateMs, Perf.Recycled * PerFrame, Perf.SpareSwaps,
+        Perf.Created * PerFrame, Perf.Created > 0 ? Perf.CreateMs / Perf.Created : 0.0, Perf.MaxCreateMs, Perf.Recycled * PerFrame, Perf.SparesAdded,
         Perf.FlushMs * PerFrame, Perf.MaxFlushMs);
     Perf = FPerf();
     return Out;
@@ -1525,8 +1707,9 @@ FString FVoxelBrickPages::Describe() const
             Count(Slab.Instance);
             Triangles += Slab.Triangles.GetNumUsed();
         }
-        Spares += Page.Spare.IsValid() ? 1 : 0;
-        Count(Page.Spare);
+        Spares += Page.Spares.Num();
+        for (const FInstance& Spare : Page.Spares)
+            Count(Spare);
     }
     int32 Queued = 0, Meshing = 0;
     for (const TPair<FVoxelBrickKey, FStaged>& Pair : Staged)

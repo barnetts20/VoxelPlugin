@@ -44,11 +44,9 @@ struct FVoxelEditOp
  *  Queries pin the current root once and walk it without locks, so terrain and ocean
  *  can sample from any thread while an edit is being written.
  *
- *  Queried in three ways:
- *    - SampleAdd(): adds the edit delta at each position of a batch.
- *    - Sample(): the edit delta at one world position.
- *    - HasEditsAlongPath(): fast path check using a morton index, used to skip
- *      unedited subtrees during octree reconstruction. */
+ *  Queried by SampleAdd() (a batch of positions), Sample() (one position),
+ *  HasEditsAlongPath() (a morton path, to skip unedited octree subtrees) and
+ *  HasEditsInBox() (a box; against a snapshot for many queries from any thread). */
 class FSparseEditStore
 {
 public:
@@ -71,6 +69,12 @@ public:
 
     /** True if any node holding edits overlaps Box (a node's edits reach its whole box). */
     bool HasEditsInBox(const FBox& Box) const;
+
+    /** HasEditsInBox against a GetRootSnapshot snapshot, without the lock. */
+    bool HasEditsInBox(const FSparseEditNode* Snapshot, const FBox& Box) const
+    {
+        return HasEditsInBoxRecursive(Snapshot, Center, Extent, Box);
+    }
 
     /** Sequence number of the latest edit (0 if none). */
     uint32 GetLastSequence() const { return LastSequence.load(std::memory_order_acquire); }

@@ -67,15 +67,16 @@ struct FVoxelBrickTerrainSettings
 
 /** Brick terrain of one terrain actor.
  *
- *  Every TaskInterval a worker task walks the tree from the root brick, for the camera
- *  predicted to the time the tree will be on screen: a brick is culled
- *  when its centre sample proves it free of surface, split while the camera is within
+ *  Every TaskInterval a worker task walks the tree from the root brick, a level at a time in
+ *  parallel, for the camera predicted to the time the tree will be on screen: a brick is
+ *  culled when its centre sample proves it free of surface, split while the camera is within
  *  LodDistanceFactor brick sizes (1.15 times that if the previous tree split it), and
- *  otherwise wanted. The tree is then balanced so that
- *  touching leaves differ by at most one level, and each wanted brick is meshed stitched to
- *  its neighbours' levels (VoxelBrickMesher::MeshBrickStitched). Wanted bricks without a
- *  mesh are meshed nearest first within a sample budget; held bricks whose neighbour levels
- *  changed are meshed again.
+ *  otherwise wanted. Touching wanted leaves differ by at most one level (from a factor of
+ *  about 2.04 by the split rule alone, below it by an explicit balance), and each wanted
+ *  brick is meshed stitched to its neighbours' levels (VoxelBrickMesher::MeshBrickStitched);
+ *  culled neighbours count as its own level, since nothing they hold reaches its mesh.
+ *  Wanted bricks without a mesh are meshed nearest first within a sample budget; held bricks
+ *  whose neighbour levels changed are meshed again.
  *
  *  CPU backend: on the game thread a brick that is no longer wanted stays until the bricks
  *  replacing it are on screen, and a restitched mesh waits until the neighbours it was
@@ -85,8 +86,8 @@ struct FVoxelBrickTerrainSettings
  *  (FVoxelBrickPages::Stage), then the result is committed to the pages whole, in one frame,
  *  once every page it touches is ready (FVoxelBrickPages::PrepareCommit), so the tree on screen
  *  switches from one frame to the next. Only the first fill, with nothing on screen, commits
- *  page by page. The next task runs while a commit is meshed; its result waits for that
- *  commit. Edits go to the pages directly: the held bricks in an edit's reach are meshed again
+ *  page by page. The next task runs while a commit is meshed (which then meshes faster); its
+ *  result waits for that commit and is staged the frame after it. Edits go to the pages directly: the held bricks in an edit's reach are meshed again
  *  as the tree has them, in their own commit or with the next result's. */
 class VOXELPLUGIN_API FVoxelBrickTerrain : public TSharedFromThis<FVoxelBrickTerrain>
 {
@@ -171,6 +172,7 @@ private:
         TArray<FVoxelBrickKey> Rebuild;
         TSet<FVoxelBrickKey> ProvenEmpty;     // held bricks whose newest mesh the empty test skipped
         TMap<FVoxelBrickKey, uint64> PrevWanted;   // the latest tree (merge hysteresis)
+        bool bKnownIsPrevWanted = false;      // GPU backend: Known is left empty, PrevWanted serves
         int32 SeamMode = 0;
         int32 Backend = 0;                    // 0 CPU meshes, 1 GPU pages
         TSharedPtr<FDensitySampleCompositor> Density;
@@ -225,6 +227,8 @@ private:
     void RemoveReplaced();
     /** GPU backend: commits PendingChanges when their pages are ready. */
     void CommitPages();
+    /** GPU backend: applies the result that waited for the previous commit, once it is done. */
+    void TakeHeldResult();
     /** The page changes from the committed tree to Wanted. */
     void BuildCommit(TArray<FVoxelBrickPageChange>& Out) const;
     /** Records committed changes on the bricks. */

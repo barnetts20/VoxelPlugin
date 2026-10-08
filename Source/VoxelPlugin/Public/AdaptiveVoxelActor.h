@@ -174,7 +174,8 @@ public:
 
     /** Brick terrain: a brick splits within this many brick sizes of the camera. Detail goes
      *  with this times BrickCellsPerBrick; geomorphing needs it above about 2 (else level
-     *  changes step), so lower BrickCellsPerBrick for less detail. */
+     *  changes step), so lower BrickCellsPerBrick for less detail. Below about 2.04 every
+     *  terrain task also balances its tree, which costs time. */
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrain|Bricks", meta = (ClampMin = "0.5", UIMin = "2.0", UIMax = "6.0"))
     double BrickLodDistanceFactor = 2.5;
 

@@ -9,13 +9,16 @@
 //    vertex format. Their exact vertex and triangle counts are read back.
 // 2. Prepare: with the counts known, each page's changes are placed on the CPU: a brick goes
 //    to the lowest free range of the first buffer set with room for it. A page whose sets
-//    can't hold its new bricks gets one more set, from the pool or created.
+//    can't hold its new bricks gets more sets (spares), from the pool or created, each at
+//    most MaxSlab large so no creation stalls a frame.
 // 3. Commit: in one frame every touched buffer set runs once, copying its new bricks from the
 //    cache and clearing the triangles of bricks that left. Unchanged bricks stay where they
 //    are. The terrain switches from one tree to the next between two frames.
 //
 // Vertices are stored in units of the page's level (the component carries 2^level as its
-// scale), so any pooled buffer set can serve any page.
+// scale), so any pooled buffer set can serve any page. Buffer-set capacities come in classes
+// of 2^k and 1.5 * 2^k. The mesh cache grows as staging needs and shrinks back to its recent
+// peak when it empties.
 
 #pragma once
 
@@ -64,22 +67,30 @@ public:
      *  bFirstFill: nothing is on screen, so mesh faster. */
     void Stage(TConstArrayView<FVoxelBrickPageChange> Changes, bool bFirstFill);
 
+    /** Every staged brick is meshed and its counts read back. */
+    bool IsMeshed() const { return NumStagedReady >= Staged.Num(); }
+
+    /** The terrain is behind: a newer task result waits for the staged commit, which is then
+     *  meshed at voxel.Render.BrickMeshBatchesBusy batches per frame. */
+    void SetBusy(bool bInBusy) { bBusy = bInBusy; }
+
     /** True when Changes can be committed in this frame: every brick they add is meshed and
      *  its counts read back, and every page has room for its new bricks in ready buffer sets.
      *  Otherwise gets more buffer sets ready (within voxel.Render.BrickPageCreates new ones per
      *  frame) and returns false. */
     bool PreparePages(TConstArrayView<FVoxelBrickPageChange> Changes);
 
-    /** PreparePages, counted for the perf log. */
-    bool PrepareCommit(TConstArrayView<FVoxelBrickPageChange> Changes);
+    /** PreparePages, counted for the perf log. bWhole: Changes are everything staged, so
+     *  while the mesher is still at work only the new pages get buffer sets. */
+    bool PrepareCommit(TConstArrayView<FVoxelBrickPageChange> Changes, bool bWhole);
 
     /** Applies Changes; every buffer set they touch runs in this frame's graph. Call after
      *  PreparePages returned true for the same changes. */
     void Commit(TConstArrayView<FVoxelBrickPageChange> Changes);
 
     /** Once per frame, before any commit: takes meshing results, sends the next batches to the
-     *  mesher (with the density and edits given here), registers buffer sets and pools the
-     *  emptied ones. */
+     *  mesher (with the density and edits given here), registers buffer sets, pools the
+     *  emptied ones and shrinks an idle cache. */
     void Flush(const TSharedPtr<const FVoxelDensityGPUData>& Density, const TSharedPtr<const FVoxelEditGPUData>& Edits);
 
     /** Pages, buffer memory and staging, for the debug log. */
@@ -137,8 +148,8 @@ private:
     {
         TMap<FVoxelBrickKey, FMember> Members;
         TArray<FSlab> Slabs;
-        FInstance Spare;               // ready for bricks the slabs can't hold
-        uint64 SpareUsedFrame = 0;     // the last frame a commit wanted it
+        TArray<FInstance> Spares;      // ready for bricks the slabs can't hold
+        uint64 SpareUsedFrame = 0;     // the last frame a commit wanted them
         uint32 NextSlabId = 0;
     };
 
@@ -191,7 +202,7 @@ private:
         uint64 Frame = 0;
     };
 
-    /** A plan's view of one slab (the spare last). */
+    /** A plan's view of one slab (the spares last). */
     struct FPlanSlab
     {
         FVoxelRangeAllocator Vertices;
@@ -208,26 +219,38 @@ private:
     static void DestroyInstance(FInstance& Instance);
     /** Moves and scales the instance onto the page, with the page's level for the morph. */
     void PlaceInstance(const FVoxelBrickKey& PageKey, FInstance& Instance) const;
-    /** Pooled buffer sets holding at least Capacity, at most four times it on each count. */
+    /** Pooled buffer sets of Capacity's classes or up to VBP::PoolSlack classes larger on each
+     *  count (at most twice as large). */
     TArray<FInstance>* FindPooled(FIntPoint Capacity);
     /** A pooled buffer set or a new one, placed on the page; invalid when the owner is gone. */
     FInstance AcquireInstance(const FVoxelBrickKey& PageKey, FIntPoint Capacity);
     /** Keeps an instance that draws nothing for reuse, or destroys it. */
     void PoolInstance(FInstance& Instance);
-    /** Vertices and triangles with the margin, as powers of two within the limits. */
-    static FIntPoint RoundCapacity(double Vertices, double Triangles);
+    /** Vertices and triangles with the margin, rounded up to a capacity class, within
+     *  MinVertices / MinTriangles and MaxSlab. */
+    FIntPoint RoundCapacity(double Vertices, double Triangles) const;
     /** Buffer sets that may be created this frame (raised while a commit waits for them). */
     int32 CreateBudget() const;
+    /** Starts the creation count of a new frame. */
+    void BeginCreates();
     /** Registered, and past the frame it was registered or moved in. */
     static bool IsReady(const FInstance& Instance);
-    /** Makes sure the page's spare holds Capacity; true when it is ready. */
-    bool EnsureSpare(const FVoxelBrickKey& PageKey, FPage& Page, FIntPoint Capacity);
+    /** Gives the page one more spare holding Capacity, within the creation budget; false when
+     *  none could be had this frame. */
+    bool AddSpare(const FVoxelBrickKey& PageKey, FPage& Page, FIntPoint Capacity);
+    /** Spares for Counts more vertices and triangles, each holding at least MinCounts, as many
+     *  as the creation budget allows. */
+    void AddSpares(const FVoxelBrickKey& PageKey, FPage& Page, FIntPoint Counts, FIntPoint MinCounts);
+    /** While a whole commit is meshed: the pages it creates get their first buffer set. */
+    void PrepareNewPages();
     /** The counts a brick is expected to mesh to, before it is meshed. */
     FIntPoint ExpectedCounts(const FVoxelBrickKey& Key) const;
-    /** Places the page's changes (see the file comment). Returns what the slabs couldn't hold
-     *  (vertices, triangles). bApply: the spare takes that, and the page, its slabs and the
-     *  staged bricks are updated and the touched slabs pushed. */
-    FIntPoint PlanPage(const FVoxelBrickKey& PageKey, FPage& Page, TConstArrayView<const FVoxelBrickPageChange*> PageChanges, bool bApply, FCacheRelease* Release);
+    /** Places the page's changes (see the file comment) over its slabs, then its spares.
+     *  Returns what none of them could hold (vertices, triangles); bOutUsesSpare: some brick
+     *  goes to a spare. bApply: the page, its slabs and the staged bricks are updated (spares
+     *  that take bricks become slabs) and the touched slabs pushed. */
+    FIntPoint PlanPage(const FVoxelBrickKey& PageKey, FPage& Page, TConstArrayView<const FVoxelBrickPageChange*> PageChanges, bool bApply,
+        FCacheRelease* Release, bool* bOutUsesSpare = nullptr);
     /** Sends a state (copy and clear jobs, triangles drawn) to the instance's provider. */
     void Push(const FVoxelBrickKey& PageKey, FInstance& Instance, TArray<uint32>&& Jobs, int32 TriangleEnd);
     void Advance(FInstance& Instance) const;
@@ -237,12 +260,17 @@ private:
     void TakeBatchResults();
     /** Sends queued bricks to the mesher, voxel.Render.BrickMeshBatches batches per frame. */
     void DispatchBatches();
+    /** Tracks the cache's peak use and, once nothing is in it, shrinks it toward that peak. */
+    void ShrinkCache();
     static FString DescribeMissing(uint32 Bits);
 
     TWeakObjectPtr<AActor> Owner;
     TWeakObjectPtr<USceneComponent> AttachRoot;
     FVoxelBrickTerrainSettings Settings;
     FVoxelBrickMesherGPUSettings MesherSettings;
+    /** The largest buffer set (vertices, triangles): about 5 MB, and at least two of the
+     *  mesher's largest bricks. */
+    FIntPoint MaxSlab = FIntPoint::ZeroValue;
     TMap<FVoxelBrickKey, FPage> Pages;   // keyed by level and page coordinate
     TSharedPtr<const FVoxelDensityGPUData> Density;
     TSharedPtr<const FVoxelEditGPUData> Edits;
@@ -272,7 +300,16 @@ private:
     FVoxelRangeAllocator CacheVertices;
     FVoxelRangeAllocator CacheTriangles;
     TArray<FCacheRelease> CacheReleases;
+    /** The cache's peak use (vertices, triangles) in the current and the previous window of
+     *  VBP::CachePeakFrames. */
+    FIntPoint CachePeak = FIntPoint::ZeroValue;
+    FIntPoint CachePeakBefore = FIntPoint::ZeroValue;
+    uint64 CachePeakFrame = 0;
+    uint64 NoShrinkUntil = 0;      // after cache ranges were freed by the timeout
+    /** Pages the staged commit creates and their expected counts (vertices, triangles). */
+    TArray<TPair<FVoxelBrickKey, FIntPoint>> NewPages;
     bool bFirstFill = false;
+    bool bBusy = false;
     bool bPrepareMeshed = false;   // the last PreparePages found every brick meshed
 
     /** Since the last TakePerf. */
@@ -296,7 +333,9 @@ private:
         double CreateMs = 0.0;
         double MaxCreateMs = 0.0;
         int32 Recycled = 0;
-        int32 SpareSwaps = 0;          // a spare too small for the exact counts
+        int32 SparesAdded = 0;
+        int32 CacheShrinks = 0;
+        FIntPoint CacheUsed = FIntPoint::ZeroValue;   // peak
         int64 Calls = 0;               // as the providers counted them
         int64 IdleCalls = 0;
         int64 Runs = 0;

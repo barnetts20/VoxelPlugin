@@ -67,6 +67,12 @@ namespace VoxelBrickTerrainDetail
      *  split distance (Design/GPUPath.md section 4), and up to 1.15 times it level l + 1
      *  is unblended where level l is fully blended, for any F below 11. */
     constexpr double MergeHysteresis = 1.15;
+    /** At or above this LodDistanceFactor F the tree split by distance alone is balanced: a
+     *  leaf of level l (no nearer than F B_l) touching a split node of level l - 1 (nearer
+     *  than 1.15 F B_l / 2) lies within that node's diagonal, sqrt(3) B_l / 2, of it, which
+     *  needs F (1 - 1.15 / 2) < sqrt(3) / 2. Below it the tree is balanced explicitly. */
+    constexpr double BalancedFactor = UE_DOUBLE_SQRT_3 / (2.0 - MergeHysteresis);
+    constexpr int32 DescentChunk = 64;              // bricks per parallel batch of the descent (one density batch)
     constexpr int32 MaxCreatesPerTick = 32;         // component creations per frame
     constexpr int64 MaxSamplesPerTask = 4000000;    // CPU backend: density samples one task may spend on meshing
     constexpr double CommitWaitBlend = 0.5;          // filter of the commit wait
@@ -141,6 +147,14 @@ namespace VoxelBrickTerrainDetail
         return Moved;
     }
 
+    /** What the descent does with a brick. */
+    enum class EVisit : uint8
+    {
+        Cull,
+        Split,
+        Want
+    };
+
     /** The LOD tree of one task, over the whole root: every internal node has all eight
      *  children, every leaf is wanted or culled. */
     struct FTree
@@ -149,10 +163,14 @@ namespace VoxelBrickTerrainDetail
             const TSet<FVoxelBrickKey>* InSplitBefore)
             : Density(InDensity), Edits(InEdits), Settings(InSettings), Camera(InCamera), SplitBefore(InSplitBefore)
         {
+            // The whole walk sees one version of the edits.
+            if (Edits)
+                EditRoot = Edits->GetRootSnapshot();
         }
 
         const FDensitySampleCompositor& Density;
         const FSparseEditStore* Edits;
+        TSharedPtr<const FSparseEditNode> EditRoot;
         const FVoxelBrickTerrainSettings& Settings;
         FVector Camera;
         const TSet<FVoxelBrickKey>* SplitBefore;   // internal nodes of the previous tree
@@ -175,47 +193,129 @@ namespace VoxelBrickTerrainDetail
             return FMath::Sqrt(BoxDistanceSquared(FBox(Min, Min + FVector(Grid.BrickSize())), Camera));
         }
 
+        /** The region a brick's centre sample must prove free of surface: its cells and the
+         *  cells around them its stitched mesh reads. */
+        static FBox TestRegion(const FVoxelBrickGrid& Grid, const FVoxelBrickKey& Key)
+        {
+            const double H = Grid.CellSize;
+            const FVector Min = Grid.BrickMin(Key.Coord);
+            return FBox(Min - FVector(2.0 * H), Min + FVector(Grid.BrickSize() + H));
+        }
+
+        bool IsEdited(const FBox& Region) const
+        {
+            return Edits && Edits->HasEditsInBox(EditRoot.Get(), Region);
+        }
+
         /** False when the brick's centre sample proves it free of surface (never where edits
          *  reach it). */
         bool MayHoldSurface(const FVoxelBrickKey& Key, bool& bOutEdited)
         {
             const FVoxelBrickGrid Grid = MakeGrid(Settings, Key.Level);
-            const double H = Grid.CellSize;
-            const FVector Min = Grid.BrickMin(Key.Coord);
-            const FBox Region(Min - FVector(2.0 * H), Min + FVector(Grid.BrickSize() + H));
-            bOutEdited = Edits && Edits->HasEditsInBox(Region);
+            const FBox Region = TestRegion(Grid, Key);
+            bOutEdited = IsEdited(Region);
             if (bOutEdited) return true;
 
             const FVector Centre = Region.GetCenter();
             double CX = Centre.X, CY = Centre.Y, CZ = Centre.Z;
             float D = 0.0f;
-            Density.Sample(FSampleInput(&CX, &CY, &CZ, 1, H), &D);
+            Density.Sample(FSampleInput(&CX, &CY, &CZ, 1, Grid.CellSize), &D);
             Samples++;
             return FMath::Abs((double)D) <= Settings.SlopeBound * Region.GetExtent().Size();
         }
 
-        /** The LOD descent: culls bricks proven free of surface and splits bricks the camera
-         *  is close to. */
-        void Descend(const FVoxelBrickKey& Key)
+        /** Thread safe. The descent's verdict on bricks of one level: culled when the centre
+         *  sample proves the brick free of surface (one density batch for all of them), split
+         *  while the camera is close, wanted otherwise. */
+        void VisitChunk(TConstArrayView<FVoxelBrickKey> Keys, TArrayView<EVisit> OutVisits, TArrayView<FWantedInfo> OutInfos, int64& OutSamples) const
         {
-            bool bEdited = false;
-            if (!MayHoldSurface(Key, bEdited))
+            const FVoxelBrickGrid Grid = MakeGrid(Settings, Keys[0].Level);
+            const double SplitDistance = Settings.LodDistanceFactor * Grid.BrickSize();
+            const double Bound = Settings.SlopeBound * TestRegion(Grid, Keys[0]).GetExtent().Size();
+            TArray<double, TInlineAllocator<DescentChunk>> X, Y, Z;
+            TArray<int32, TInlineAllocator<DescentChunk>> Sampled;
+            for (int32 i = 0; i < Keys.Num(); i++)
             {
-                Nodes.Add(Key, ENode::Culled);
-                return;
+                const FBox Region = TestRegion(Grid, Keys[i]);
+                OutVisits[i] = EVisit::Want;
+                OutInfos[i].bEdited = IsEdited(Region);
+                if (OutInfos[i].bEdited) continue;
+                const FVector Centre = Region.GetCenter();
+                X.Add(Centre.X);
+                Y.Add(Centre.Y);
+                Z.Add(Centre.Z);
+                Sampled.Add(i);
             }
-            const double Distance = DistanceTo(Key);
-            const double SplitDistance = Settings.LodDistanceFactor * MakeGrid(Settings, Key.Level).BrickSize();
-            const bool bWasSplit = SplitBefore && SplitBefore->Contains(Key);
-            if (Key.Level > 0 && Distance < (bWasSplit ? MergeHysteresis * SplitDistance : SplitDistance))
+            if (Sampled.Num() > 0)
             {
-                Nodes.Add(Key, ENode::Internal);
-                for (int32 c = 0; c < 8; c++)
-                    Descend(ChildOf(Key, c));
-                return;
+                TArray<float, TInlineAllocator<DescentChunk>> D;
+                D.SetNumUninitialized(Sampled.Num());
+                Density.Sample(FSampleInput(X.GetData(), Y.GetData(), Z.GetData(), Sampled.Num(), Grid.CellSize), D.GetData());
+                for (int32 s = 0; s < Sampled.Num(); s++)
+                {
+                    if (FMath::Abs((double)D[s]) > Bound)
+                        OutVisits[Sampled[s]] = EVisit::Cull;
+                }
+                OutSamples += Sampled.Num();
             }
-            Nodes.Add(Key, ENode::Wanted);
-            WantedInfo.Add(Key, { Distance, bEdited });
+            for (int32 i = 0; i < Keys.Num(); i++)
+            {
+                if (OutVisits[i] == EVisit::Cull) continue;
+                const double Distance = DistanceTo(Keys[i]);
+                const bool bWasSplit = SplitBefore && SplitBefore->Contains(Keys[i]);
+                OutInfos[i].Distance = Distance;
+                if (Keys[i].Level > 0 && Distance < (bWasSplit ? MergeHysteresis * SplitDistance : SplitDistance))
+                    OutVisits[i] = EVisit::Split;
+            }
+        }
+
+        /** The LOD descent from the root, a level at a time with each level's bricks in
+         *  parallel. */
+        void Descend(const FVoxelBrickKey& Root)
+        {
+            TArray<FVoxelBrickKey> Level = { Root };
+            TArray<FVoxelBrickKey> Next;
+            TArray<EVisit> Visits;
+            TArray<FWantedInfo> Infos;
+            TArray<int64> ChunkSamples;
+            while (Level.Num() > 0)
+            {
+                const int32 NumKeys = Level.Num();
+                const int32 NumChunks = FMath::DivideAndRoundUp(NumKeys, DescentChunk);
+                Visits.SetNumUninitialized(NumKeys);
+                Infos.SetNumUninitialized(NumKeys);
+                ChunkSamples.Init(0, NumChunks);
+                ParallelFor(NumChunks, [&](int32 Chunk)
+                    {
+                        const int32 First = Chunk * DescentChunk;
+                        const int32 Count = FMath::Min(DescentChunk, NumKeys - First);
+                        VisitChunk(MakeArrayView(Level.GetData() + First, Count), MakeArrayView(Visits.GetData() + First, Count),
+                            MakeArrayView(Infos.GetData() + First, Count), ChunkSamples[Chunk]);
+                    }, NumChunks > 1 ? EParallelForFlags::None : EParallelForFlags::ForceSingleThread);
+                for (const int64 ChunkCount : ChunkSamples)
+                    Samples += ChunkCount;
+
+                Next.Reset();
+                for (int32 i = 0; i < NumKeys; i++)
+                {
+                    if (Visits[i] == EVisit::Cull)
+                    {
+                        Nodes.Add(Level[i], ENode::Culled);
+                    }
+                    else if (Visits[i] == EVisit::Want)
+                    {
+                        Nodes.Add(Level[i], ENode::Wanted);
+                        WantedInfo.Add(Level[i], Infos[i]);
+                    }
+                    else
+                    {
+                        Nodes.Add(Level[i], ENode::Internal);
+                        for (int32 c = 0; c < 8; c++)
+                            Next.Add(ChildOf(Level[i], c));
+                    }
+                }
+                Swap(Level, Next);
+            }
         }
 
         /** Splits a leaf for the balance. A culled leaf's children are culled; a wanted leaf's
@@ -254,8 +354,8 @@ namespace VoxelBrickTerrainDetail
         }
 
         /** Splits leaves until every two leaves that touch (faces, edges or corners) are at
-         *  most one level apart, over wanted and culled leaves alike, so every point of the
-         *  root has one owning leaf level that each neighbouring brick agrees on. */
+         *  most one level apart, over wanted and culled leaves alike. Only needed below
+         *  BalancedFactor. */
         void Balance()
         {
             TArray<FVoxelBrickKey> Work;
@@ -286,19 +386,41 @@ namespace VoxelBrickTerrainDetail
             }
         }
 
-        /** Level of the leaves touching Key in direction d, relative to Key (balanced tree),
-         *  and whether that neighbour is a wanted brick of Key's level. */
+        /** Whether a child of Node on the side facing back along Dir (touching the brick Node
+         *  neighbours in direction Dir) may hold surface. */
+        bool TouchesUnculledChild(const FVoxelBrickKey& Node, const int32 (&Dir)[3]) const
+        {
+            for (int32 c = 0; c < 8; c++)
+            {
+                bool bTouches = true;
+                for (int32 Axis = 0; Axis < 3; Axis++)
+                {
+                    const int32 Bit = (c >> Axis) & 1;
+                    bTouches &= Dir[Axis] == 0 || (Dir[Axis] < 0 ? Bit == 1 : Bit == 0);
+                }
+                if (bTouches && Nodes.FindRef(ChildOf(Node, c)) != ENode::Culled)
+                    return true;
+            }
+            return false;
+        }
+
+        /** Level of the leaves touching Key in direction d, relative to Key, and whether that
+         *  neighbour is a wanted brick of Key's level. Wanted leaves are balanced. Where only
+         *  culled leaves touch Key, their boxes are proven free of surface, so Key's mesh is
+         *  the same whatever their level: Key's own is reported, and the signature doesn't
+         *  change with theirs. */
         int32 NeighbourDelta(const FVoxelBrickKey& Key, int32 d, bool& bOutMeshed) const
         {
             bOutMeshed = false;
-            const FVoxelBrickKey Neighbour = Offset(Key, d % 3 - 1, (d / 3) % 3 - 1, d / 9 - 1);
+            const int32 Dir[3] = { d % 3 - 1, (d / 3) % 3 - 1, d / 9 - 1 };
+            const FVoxelBrickKey Neighbour = Offset(Key, Dir[0], Dir[1], Dir[2]);
             if (!InRoot(Neighbour)) return 0;
             if (const ENode* State = Nodes.Find(Neighbour))
             {
                 bOutMeshed = *State == ENode::Wanted;
-                return *State == ENode::Internal ? -1 : 0;
+                return *State == ENode::Internal && TouchesUnculledChild(Neighbour, Dir) ? -1 : 0;
             }
-            return 1;
+            return Nodes.FindRef(CoveringNode(Neighbour)) == ENode::Wanted ? 1 : 0;
         }
 
         /** Wanted leaves touching Key. */
@@ -314,7 +436,8 @@ namespace VoxelBrickTerrainDetail
                 if (!State)
                 {
                     const FVoxelBrickKey Parent = ParentOf(Neighbour);
-                    if (Nodes.FindRef(Parent) == ENode::Wanted)
+                    const ENode* ParentState = Nodes.Find(Parent);
+                    if (ParentState && *ParentState == ENode::Wanted)
                         Out.AddUnique(Parent);
                 }
                 else if (*State == ENode::Wanted)
@@ -332,7 +455,8 @@ namespace VoxelBrickTerrainDetail
                             bTouches &= Dir[Axis] == 0 || (Dir[Axis] < 0 ? Bit == 1 : Bit == 0);
                         }
                         const FVoxelBrickKey Child = ChildOf(Neighbour, c);
-                        if (bTouches && Nodes.FindRef(Child) == ENode::Wanted)
+                        const ENode* ChildState = Nodes.Find(Child);
+                        if (bTouches && ChildState && *ChildState == ENode::Wanted)
                             Out.Add(Child);
                     }
                 }
@@ -635,7 +759,7 @@ void FVoxelBrickTerrain::LogPerf(double Now)
     {
         const double PerFrame = 1.0 / FMath::Max(1, Perf.Frames);
         const double PerTask = 1.0 / FMath::Max(1, Perf.Tasks);
-        UE_LOG(LogTemp, Log, TEXT("[VoxelBrickPerf] %d frames in %.2f s. Game thread ms per frame (average / max): drain %.2f / %.2f, apply or commit %.2f / %.2f, remove %.2f / %.2f, flush pages %.2f / %.2f, launch %.2f / %.2f. Tasks: %d, %.1f ms average (tree %.1f), %.1f ms max, %lld samples, %d bricks built (%d new, %d restitched, %d rebuilt after edits). %d held, %d wanted, %d queued to apply; commits wait %.0f ms (filtered); launch to screen %.0f ms average, %.0f ms max over %d results, %d of them held for a commit; %d edit commits."),
+        UE_LOG(LogTemp, Log, TEXT("[VoxelBrickPerf] %d frames in %.2f s. Game thread ms per frame (average / max): take results %.2f / %.2f, apply or commit %.2f / %.2f, remove %.2f / %.2f, flush pages %.2f / %.2f, launch %.2f / %.2f. Tasks: %d, %.1f ms average (tree %.1f), %.1f ms max, %lld samples, %d bricks built (%d new, %d restitched, %d rebuilt after edits). %d held, %d wanted, %d queued to apply; commits wait %.0f ms (filtered); launch to screen %.0f ms average, %.0f ms max over %d results, %d of them held for a commit; %d edit commits."),
             Perf.Frames, Now - Perf.Start,
             Perf.SectionMs[0] * PerFrame, Perf.MaxSectionMs[0], Perf.SectionMs[1] * PerFrame, Perf.MaxSectionMs[1], Perf.SectionMs[2] * PerFrame, Perf.MaxSectionMs[2],
             Perf.SectionMs[3] * PerFrame, Perf.MaxSectionMs[3], Perf.SectionMs[4] * PerFrame, Perf.MaxSectionMs[4],
@@ -693,6 +817,8 @@ void FVoxelBrickTerrain::Tick(const FVector& Camera)
     {
         SCOPE_CYCLE_COUNTER(STAT_VoxelBricksDrain);
         DrainResults();
+        if (Backend == 1)
+            TakeHeldResult();
     }
     Lap(0);
     const double TaskInterval = Backend == 1 ? VBT::TaskIntervalGPU : VBT::TaskInterval;
@@ -702,6 +828,8 @@ void FVoxelBrickTerrain::Tick(const FVector& Camera)
         // (the task, any wait for the commit before it, its own commit), estimated before.
         TreeLatency = bLatencyMeasured ? MeasuredLatency : TaskSeconds + CommitWaitSeconds + FrameSeconds;
         StartEditCommit();
+        // While the next tree is on its way, the commit ahead of it is meshed faster.
+        Pages->SetBusy(bCommitPending && (HeldResult.IsSet() || bTaskRunning.load(std::memory_order_acquire)));
         {
             SCOPE_CYCLE_COUNTER(STAT_VoxelBricksFlush);
             FlushPages(TaskInterval);
@@ -769,11 +897,10 @@ void FVoxelBrickTerrain::Tick(const FVector& Camera)
     Input.Backend = Backend;
     Input.PrevWanted = Wanted;
     Input.LaunchTime = Now;
-    // GPU backend: the next result is a difference from the tree being committed (Wanted),
-    // whose bricks are tested; dirty ones are tested again.
-    if (Backend == 1)
-        Input.Known = Wanted;
-    else
+    // GPU backend: the next result is a difference from the tree being committed (Wanted,
+    // the task reads PrevWanted), whose bricks are tested; dirty ones are tested again.
+    Input.bKnownIsPrevWanted = Backend == 1;
+    if (Backend != 1)
         Input.Known.Reserve(Bricks.Num());
     for (TPair<FVoxelBrickKey, FBrick>& Pair : Bricks)
     {
@@ -827,9 +954,13 @@ void FVoxelBrickTerrain::RunTask(const TSharedRef<FVoxelBrickTerrain>& Self, FTa
     {
         SCOPE_CYCLE_COUNTER(STAT_VoxelBricksTaskTree);
         Tree.Descend(Root);
-        if (Input.SeamMode != 2)
+        // Unstitched bricks need no balance, and from BalancedFactor on the wanted leaves are
+        // balanced as split (culled leaves needn't be, see NeighbourDelta).
+        if (Input.SeamMode != 2 && Input.Settings.LodDistanceFactor < VBT::BalancedFactor)
             Tree.Balance();
     }
+    // GPU backend: the bricks the task knows are the previous tree's.
+    const TMap<FVoxelBrickKey, uint64>& Known = Input.bKnownIsPrevWanted ? Input.PrevWanted : Input.Known;
     Result.BalanceSplits = Tree.BalanceSplits;
     Result.TreeMilliseconds = (FPlatformTime::Seconds() - T0) * 1000.0;
 
@@ -846,35 +977,51 @@ void FVoxelBrickTerrain::RunTask(const TSharedRef<FVoxelBrickTerrain>& Self, FTa
     };
     TSet<FVoxelBrickKey> RebuildSet;
     RebuildSet.Append(Input.Rebuild);
-    TArray<FToMesh> Rebuilds, NewBricks, Restitches;
-    Result.Wanted.Reserve(Tree.WantedInfo.Num());
-    for (const TPair<FVoxelBrickKey, VBT::FWantedInfo>& Pair : Tree.WantedInfo)
+    TArray<FToMesh> Entries;
+    Entries.SetNum(Tree.WantedInfo.Num());
     {
-        FToMesh Entry;
-        Entry.Key = Pair.Key;
-        Entry.Distance = Pair.Value.Distance;
-        Entry.bEdited = Pair.Value.bEdited;
-        Entry.Signature = (1ULL << 63) | ((uint64)Input.SeamMode << 56);
-        Entry.Meshed = 0;
-        for (int32 d = 0, Slot = 0; d < 27; d++)
+        int32 i = 0;
+        for (const TPair<FVoxelBrickKey, VBT::FWantedInfo>& Pair : Tree.WantedInfo)
         {
-            bool bMeshed = false;
-            const int32 Delta = Input.SeamMode == 2 ? 0 : Tree.NeighbourDelta(Pair.Key, d, bMeshed);
-            Entry.Levels[d] = (int8)Delta;
-            Entry.Meshed |= bMeshed ? (1u << d) : 0u;
-            if (d == 13) continue;
-            const uint64 State = Delta < 0 ? 0 : (Delta > 0 ? 3 : (bMeshed ? 1 : 2));
-            Entry.Signature |= State << (2 * Slot++);
+            Entries[i].Key = Pair.Key;
+            Entries[i].Distance = Pair.Value.Distance;
+            Entries[i].bEdited = Pair.Value.bEdited;
+            i++;
         }
-        Result.Wanted.Add(Pair.Key, Entry.Signature);
-
-        const uint64* Held = Input.Known.Find(Pair.Key);
-        if (!Held)
-            NewBricks.Add(Entry);
-        else if (RebuildSet.Contains(Pair.Key))
-            Rebuilds.Add(Entry);
-        else if (*Held != Entry.Signature)
-            Restitches.Add(Entry);
+    }
+    // Signatures in parallel (the tree is only read), then each brick's kind: 0 held as it
+    // is, 1 new, 2 rebuilt after an edit, 3 restitched.
+    TArray<uint8> Kinds;
+    Kinds.SetNumZeroed(Entries.Num());
+    ParallelFor(Entries.Num(), [&](int32 i)
+        {
+            FToMesh& Entry = Entries[i];
+            Entry.Signature = (1ULL << 63) | ((uint64)Input.SeamMode << 56);
+            Entry.Meshed = 0;
+            for (int32 d = 0, Slot = 0; d < 27; d++)
+            {
+                bool bMeshed = false;
+                const int32 Delta = Input.SeamMode == 2 ? 0 : Tree.NeighbourDelta(Entry.Key, d, bMeshed);
+                Entry.Levels[d] = (int8)Delta;
+                Entry.Meshed |= bMeshed ? (1u << d) : 0u;
+                if (d == 13) continue;
+                const uint64 State = Delta < 0 ? 0 : (Delta > 0 ? 3 : (bMeshed ? 1 : 2));
+                Entry.Signature |= State << (2 * Slot++);
+            }
+            const uint64* Held = Known.Find(Entry.Key);
+            Kinds[i] = (uint8)(!Held ? 1 : (RebuildSet.Contains(Entry.Key) ? 2 : (*Held != Entry.Signature ? 3 : 0)));
+        });
+    TArray<FToMesh> Rebuilds, NewBricks, Restitches;
+    Result.Wanted.Reserve(Entries.Num());
+    for (int32 i = 0; i < Entries.Num(); i++)
+    {
+        Result.Wanted.Add(Entries[i].Key, Entries[i].Signature);
+        if (Kinds[i] == 1)
+            NewBricks.Add(Entries[i]);
+        else if (Kinds[i] == 2)
+            Rebuilds.Add(Entries[i]);
+        else if (Kinds[i] == 3)
+            Restitches.Add(Entries[i]);
     }
     NewBricks.Sort([](const FToMesh& X, const FToMesh& Y) { return X.Distance < Y.Distance; });
     Result.NumNew = NewBricks.Num();
@@ -946,7 +1093,7 @@ void FVoxelBrickTerrain::RunTask(const TSharedRef<FVoxelBrickTerrain>& Self, FTa
     {
         const uint64 SeamBits = 3ULL << 56;
         const bool bEmpty = Input.ProvenEmpty.Contains(Entry.Key);
-        if (Input.Backend != 1 && (!bEmpty || ((Input.Known[Entry.Key] ^ Entry.Signature) & SeamBits) != 0))
+        if (Input.Backend != 1 && (!bEmpty || ((Known[Entry.Key] ^ Entry.Signature) & SeamBits) != 0))
         {
             Remesh.Add(Entry);
             continue;
@@ -977,7 +1124,7 @@ void FVoxelBrickTerrain::RunTask(const TSharedRef<FVoxelBrickTerrain>& Self, FTa
         Tree.TouchingWanted(Entry.Key, Touching);
         bool bAvailable = true;
         for (const FVoxelBrickKey& Key : Touching)
-            bAvailable &= Input.Known.Contains(Key) || Available.Contains(Key);
+            bAvailable &= Known.Contains(Key) || Available.Contains(Key);
         if (bAvailable)
             Ready.Add(Entry);
     }
@@ -1012,7 +1159,7 @@ void FVoxelBrickTerrain::DrainResults()
         if (Result.Generation != Generation) continue;
         // GPU backend: a result is a difference from the tree being committed, so it waits for
         // that commit (CommitPages applies it).
-        if (Backend == 1 && bCommitPending)
+        if (Backend == 1 && (bCommitPending || HeldResult.IsSet()))
         {
             HeldResult = MoveTemp(Result);
             Perf.HeldResults++;
@@ -1224,7 +1371,7 @@ void FVoxelBrickTerrain::CommitPages()
     {
         if (PendingChanges.Num() > 0)
         {
-            if (!Pages->PrepareCommit(PendingChanges)) return;
+            if (!Pages->PrepareCommit(PendingChanges, true)) return;
             Pages->Commit(PendingChanges);
             ApplyCommitted(PendingChanges);
         }
@@ -1253,7 +1400,7 @@ void FVoxelBrickTerrain::CommitPages()
                     Left.Append(Group.Value);
             }
         }
-        if (Ready.Num() > 0 && Pages->PrepareCommit(Ready))
+        if (Ready.Num() > 0 && Pages->PrepareCommit(Ready, false))
         {
             Pages->Commit(Ready);
             ApplyCommitted(Ready);
@@ -1294,14 +1441,17 @@ void FVoxelBrickTerrain::CommitPages()
         Perf.Latencies++;
         CommitLaunchTime = 0.0;
     }
+}
 
-    // A result that finished meanwhile is staged at once.
-    if (HeldResult.IsSet())
-    {
-        FTaskResult Held = MoveTemp(HeldResult.GetValue());
-        HeldResult.Reset();
-        ApplyResult(Held);
-    }
+void FVoxelBrickTerrain::TakeHeldResult()
+{
+    // A result that finished during the previous commit, staged the frame after it, so no
+    // frame both commits a tree and stages the next. (The mesher takes its first batches in
+    // the next frame either way.)
+    if (bCommitPending || !HeldResult.IsSet()) return;
+    FTaskResult Held = MoveTemp(HeldResult.GetValue());
+    HeldResult.Reset();
+    ApplyResult(Held);
 }
 
 bool FVoxelBrickTerrain::IsNeighbourReady(const FVoxelBrickKey& Key) const

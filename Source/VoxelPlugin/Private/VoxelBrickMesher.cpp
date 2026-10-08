@@ -87,43 +87,94 @@ namespace
 
     /** True if lattice samples prove a stitched brick's face region empty: the closed box
      *  (points 0..N), whose edges are the only ones it emits faces for. Every 4th point
-     *  first, then every 2nd (each point of the box lies within 2 * sqrt(3) and sqrt(3)
-     *  cells of one of them). The extra cell allows for points the mesher samples at a finer
+     *  first, each covering the cube of side 4 cells around it (within 2 * sqrt(3) cells);
+     *  then, only around those too near the surface for that, every 2nd point (within
+     *  sqrt(3) cells). The extra cell allows for points the mesher samples at a finer
      *  neighbour's footprint. */
     bool IsStitchedProvablyEmpty(const FDensitySampleCompositor& Density, const FVector& Min, int32 N, double H, double Slope, int32& InOutSamples)
     {
+        const int32 C4 = N / 4 + 1;
+        const int32 C2 = N / 2 + 1;
+        auto Fine = [C2](int32 I, int32 J, int32 K) { return (K * C2 + J) * C2 + I; };
+        TArray<double> X, Y, Z;
+        TArray<float> D;
+        X.Reserve(C4 * C4 * C4);
+        Y.Reserve(C4 * C4 * C4);
+        Z.Reserve(C4 * C4 * C4);
+        for (int32 K = 0; K < C4; K++)
+            for (int32 J = 0; J < C4; J++)
+                for (int32 I = 0; I < C4; I++)
+                {
+                    X.Add(Min.X + 4 * I * H);
+                    Y.Add(Min.Y + 4 * J * H);
+                    Z.Add(Min.Z + 4 * K * H);
+                }
+        SamplePoints(Density, X, Y, Z, H, D);
+        InOutSamples += D.Num();
+
+        // Every value on the step-2 lattice (the step-4 points are on it), and the step-4
+        // points that don't clear their cube.
+        const double Margin4 = Slope * 2.0 * Sqrt3 * H + H;
+        const double Margin2 = Slope * Sqrt3 * H + H;
+        TArray<float> Values;
+        Values.SetNumUninitialized(C2 * C2 * C2);
+        TBitArray<> bHave(false, C2 * C2 * C2);
+        TArray<FIntVector> Near;
         bool bPositive = false, bNegative = false;
-        for (const int32 Step : { 4, 2 })
+        for (int32 K = 0, n = 0; K < C4; K++)
+            for (int32 J = 0; J < C4; J++)
+                for (int32 I = 0; I < C4; I++, n++)
+                {
+                    const float V = D[n];
+                    (V < 0.0f ? bNegative : bPositive) = true;
+                    Values[Fine(2 * I, 2 * J, 2 * K)] = V;
+                    bHave[Fine(2 * I, 2 * J, 2 * K)] = true;
+                    if (FMath::Abs((double)V) <= Margin4)
+                        Near.Add(FIntVector(2 * I, 2 * J, 2 * K));
+                }
+        if (bPositive && bNegative) return false;
+        if (Near.Num() == 0) return true;
+
+        // A near point's cube is covered by the step-2 points within one step of it.
+        TArray<int32> Required;
+        TArray<int32> Missing;
+        TBitArray<> bRequired(false, C2 * C2 * C2);
+        X.Reset();
+        Y.Reset();
+        Z.Reset();
+        for (const FIntVector& P : Near)
         {
-            const int32 C = N / Step + 1;
-            TArray<double> X, Y, Z;
-            X.SetNumUninitialized(C * C * C);
-            Y.SetNumUninitialized(C * C * C);
-            Z.SetNumUninitialized(C * C * C);
-            int32 n = 0;
-            for (int32 K = 0; K < C; K++)
-                for (int32 J = 0; J < C; J++)
-                    for (int32 I = 0; I < C; I++, n++)
+            for (int32 DK = -1; DK <= 1; DK++)
+                for (int32 DJ = -1; DJ <= 1; DJ++)
+                    for (int32 DI = -1; DI <= 1; DI++)
                     {
-                        X[n] = Min.X + Step * I * H;
-                        Y[n] = Min.Y + Step * J * H;
-                        Z[n] = Min.Z + Step * K * H;
+                        const FIntVector Q(P.X + DI, P.Y + DJ, P.Z + DK);
+                        if (Q.X < 0 || Q.Y < 0 || Q.Z < 0 || Q.X >= C2 || Q.Y >= C2 || Q.Z >= C2) continue;
+                        const int32 Index = Fine(Q.X, Q.Y, Q.Z);
+                        if (bRequired[Index]) continue;
+                        bRequired[Index] = true;
+                        Required.Add(Index);
+                        if (bHave[Index]) continue;
+                        Missing.Add(Index);
+                        X.Add(Min.X + 2 * Q.X * H);
+                        Y.Add(Min.Y + 2 * Q.Y * H);
+                        Z.Add(Min.Z + 2 * Q.Z * H);
                     }
-            TArray<float> D;
+        }
+        if (X.Num() > 0)
+        {
             SamplePoints(Density, X, Y, Z, H, D);
             InOutSamples += D.Num();
-
-            const double Margin = Slope * 0.5 * Step * Sqrt3 * H + H;
-            bool bClear = true;
-            for (const float V : D)
-            {
-                (V < 0.0f ? bNegative : bPositive) = true;
-                bClear &= FMath::Abs((double)V) > Margin;
-            }
-            if (bPositive && bNegative) return false;
-            if (bClear) return true;
+            for (int32 m = 0; m < Missing.Num(); m++)
+                Values[Missing[m]] = D[m];
         }
-        return false;
+        for (const int32 Index : Required)
+        {
+            const float V = Values[Index];
+            (V < 0.0f ? bNegative : bPositive) = true;
+            if (FMath::Abs((double)V) <= Margin2) return false;
+        }
+        return !(bPositive && bNegative);
     }
 
     /** QEF solution in cell units ([0,1] per axis), blended toward the mass point when it
