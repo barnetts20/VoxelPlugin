@@ -33,7 +33,8 @@ public class VoxelPlugin : ModuleRules
 				// Include RealtimeMeshSpatial
 				//Path.Combine(ModuleDirectory, "../RealTimeMesh/RealtimeMeshComponent/Source/RealtimeMeshSpatial/Public"),
 				//Path.Combine(ModuleDirectory, "../RealTimeMesh/RealtimeMeshComponent/Source/RealtimeMeshSpatial/Private")
-				Path.Combine(PluginDirectory, "Shaders", "Private")
+				Path.Combine(PluginDirectory, "Shaders", "Private"),
+
             }
         );
 
@@ -49,7 +50,8 @@ public class VoxelPlugin : ModuleRules
 				"Renderer",               
 				"Projects",
 				"RealtimeMeshComponent",
-				"GravPlugin",
+                "RealtimeMeshCompute",
+                "GravPlugin",
                 "UltraLargeScale",
 				"CloudAtmosphere",
 				//"RealtimeMeshExt",

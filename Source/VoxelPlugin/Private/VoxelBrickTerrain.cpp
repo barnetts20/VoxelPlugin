@@ -1,4 +1,7 @@
 #include "VoxelBrickTerrain.h"
+#include "VoxelBrickPages.h"
+#include "VoxelDensity.h"
+#include "VoxelDensityGPU.h"
 #include "FMeshingStructs.h"
 #include "FDensitySampleCompositor.h"
 #include "FSparseEditStore.h"
@@ -7,6 +10,7 @@
 #include "Async/TaskGraphInterfaces.h"
 #include "GameFramework/Actor.h"
 #include "HAL/IConsoleManager.h"
+#include "Misc/App.h"
 
 static TAutoConsoleVariable<int32> CVarVoxelDebugBricks(
     TEXT("voxel.Debug.Bricks"), 0,
@@ -16,6 +20,11 @@ static TAutoConsoleVariable<int32> CVarVoxelDebugBricks(
 static TAutoConsoleVariable<int32> CVarVoxelBrickSeams(
     TEXT("voxel.Render.BrickSeams"), 0,
     TEXT("Seams between brick-terrain LOD levels. 0: stitched. 1: stitched, plus skirts. 2: skirts only (unstitched bricks)."),
+    ECVF_Default);
+
+static TAutoConsoleVariable<int32> CVarVoxelBrickBackend(
+    TEXT("voxel.Render.BrickBackend"), 0,
+    TEXT("Where brick-terrain bricks are meshed. 0: CPU (one component per brick). 1: GPU (pages of 4x4x4 bricks meshed by compute providers; stitched seams only)."),
     ECVF_Default);
 
 namespace VoxelBrickTerrainDetail
@@ -345,6 +354,18 @@ namespace VoxelBrickTerrainDetail
 
 namespace VBT = VoxelBrickTerrainDetail;
 
+FVoxelBrickTerrain::FVoxelBrickTerrain()
+    : Pages(MakeUnique<FVoxelBrickPages>())
+{
+}
+
+FVoxelBrickTerrain::~FVoxelBrickTerrain() = default;
+
+FColor FVoxelBrickTerrain::LevelColor(int32 Level)
+{
+    return VBT::LevelColor(Level);
+}
+
 void FVoxelBrickTerrain::Initialize(AActor* InOwner, USceneComponent* InAttachRoot, TSharedPtr<FDensitySampleCompositor> InDensity,
     const FVoxelBrickTerrainSettings& InSettings)
 {
@@ -356,6 +377,10 @@ void FVoxelBrickTerrain::Initialize(AActor* InOwner, USceneComponent* InAttachRo
     Settings.CellsPerBrick = FMath::Max(8, Settings.CellsPerBrick / 4 * 4);
     Settings.MaxLevel = FMath::Max(0, Settings.MaxLevel);
     Settings.SlopeBound = FMath::Max(Settings.SlopeBound, 1.0);
+    Pages->Initialize(InOwner, InAttachRoot, Settings);
+    GPUDensity.Reset();
+    GPUEdits.Reset();
+    bWarnedBackend = false;
 }
 
 void FVoxelBrickTerrain::Reset()
@@ -363,6 +388,7 @@ void FVoxelBrickTerrain::Reset()
     for (TPair<FVoxelBrickKey, FBrick>& Pair : Bricks)
         DestroyComponent(Pair.Value);
     Bricks.Reset();
+    Pages->Reset();
     Wanted.Reset();
     bHasWanted = false;
     ApplyQueue.Reset();
@@ -400,11 +426,59 @@ void FVoxelBrickTerrain::NotifyEdit(uint32 Sequence, const FVector& Center, doub
     }
 }
 
+int32 FVoxelBrickTerrain::ResolveBackend()
+{
+    if (CVarVoxelBrickBackend.GetValueOnGameThread() != 1) return 0;
+
+    // The GPU lattice is centred on the root: Origin must be -HalfFinest * 2^MaxDepth.
+    const double RootExtent = 0.5 * Settings.FinestCell * FMath::Pow(2.0, (double)Pages->GetMesherSettings().MaxDepth);
+    const TCHAR* Reason = nullptr;
+    if (!FApp::CanEverRender())
+        Reason = TEXT("no renderer");
+    else if (!Density.IsValid() || !Density->GetBaseDensity().IsValid())
+        Reason = TEXT("the density has no GPU version");
+    else if (!Settings.Origin.Equals(FVector(-RootExtent), 1e-6 * RootExtent))
+        Reason = TEXT("the brick lattice is not centred on the root");
+    if (!Reason) return 1;
+
+    if (!bWarnedBackend)
+        UE_LOG(LogTemp, Warning, TEXT("[VoxelBricks] voxel.Render.BrickBackend 1 is not available (%s); meshing on the CPU."), Reason);
+    bWarnedBackend = true;
+    return 0;
+}
+
+void FVoxelBrickTerrain::FlushPages()
+{
+    if (!GPUDensity.IsValid())
+    {
+        const TSharedRef<FVoxelDensityGPUData> Data = MakeShared<FVoxelDensityGPUData>();
+        Density->GetBaseDensity()->BuildGPUData(*Data);
+        GPUDensity = Data;
+    }
+    const TSharedPtr<FSparseEditStore> Store = Density->GetEditStore();
+    const uint32 Sequence = Store.IsValid() ? Store->GetLastSequence() : 0;
+    if (!GPUEdits.IsValid() || Sequence != GPUEditsSequence)
+    {
+        GPUEdits = FVoxelEditGPUData::Build(Store.Get(), 0.5 * Settings.FinestCell, Pages->GetMesherSettings().MaxDepth);
+        GPUEditsSequence = Sequence;
+    }
+    Pages->Flush(GPUDensity, GPUEdits);
+}
+
 void FVoxelBrickTerrain::Tick(const FVector& Camera)
 {
+    const int32 WantedBackend = ResolveBackend();
+    if (WantedBackend != Backend)
+    {
+        Reset();
+        Backend = WantedBackend;
+    }
+
     DrainResults();
     ApplyQueued();
     RemoveReplaced();
+    if (Backend == 1)
+        FlushPages();
 
     const double Now = FPlatformTime::Seconds();
     if (bTaskRunning.load(std::memory_order_acquire) || Now - LastLaunchTime < VBT::TaskInterval || !Density.IsValid()) return;
@@ -414,7 +488,8 @@ void FVoxelBrickTerrain::Tick(const FVector& Camera)
     DrainResults();
 
     // Nothing to do: the latest result is complete for (about) this camera and nothing changed.
-    const int32 SeamMode = FMath::Clamp(CVarVoxelBrickSeams.GetValueOnGameThread(), 0, 2);
+    // The GPU mesher is stitched only.
+    const int32 SeamMode = Backend == 1 ? 0 : FMath::Clamp(CVarVoxelBrickSeams.GetValueOnGameThread(), 0, 2);
     if (bLastComplete && SeamMode == LastSeamMode && RecentEdits.Num() == 0
         && FVector::Dist(Camera, LastTaskCamera) < Settings.FinestCell * Settings.CellsPerBrick / 16.0)
     {
@@ -430,6 +505,7 @@ void FVoxelBrickTerrain::Tick(const FVector& Camera)
     Input.Density = Density;
     Input.Settings = Settings;
     Input.SeamMode = SeamMode;
+    Input.Backend = Backend;
     Input.Known.Reserve(Bricks.Num());
     for (TPair<FVoxelBrickKey, FBrick>& Pair : Bricks)
     {
@@ -523,6 +599,24 @@ void FVoxelBrickTerrain::RunTask(const TSharedRef<FVoxelBrickTerrain>& Self, FTa
                 {
                     const FToMesh& Entry = List[First + i];
                     const FVoxelBrickGrid Grid = VBT::MakeGrid(Input.Settings, Entry.Key.Level);
+                    FBuilt& Built = Batch[i];
+                    Built.Key = Entry.Key;
+                    Built.Signature = Entry.Signature;
+                    Tree.TouchingWanted(Entry.Key, Built.Neighbours);
+
+                    // GPU backend: only the empty test runs here; the page meshes the brick.
+                    if (Input.Backend == 1)
+                    {
+                        int32 TestSamples = 0;
+                        Built.bGPU = true;
+                        Built.bProvenEmpty = !Entry.bEdited
+                            && VoxelBrickMesher::IsBrickProvablyEmpty(*Input.Density, Grid, Entry.Key.Coord, Input.Settings.SlopeBound, TestSamples);
+                        FMemory::Memcpy(Built.Levels, Entry.Levels, sizeof(Built.Levels));
+                        Built.Meshed = Entry.Meshed;
+                        Samples.fetch_add(TestSamples, std::memory_order_relaxed);
+                        return;
+                    }
+
                     FVoxelBrickMesh Mesh;
                     FVoxelBrickStats Stats;
                     if (Input.SeamMode == 2)
@@ -532,12 +626,8 @@ void FVoxelBrickTerrain::RunTask(const TSharedRef<FVoxelBrickTerrain>& Self, FTa
                     if (SkirtDepth > 0.0 && Mesh.Indices.Num() > 0)
                         VoxelBrickMesher::AddSkirts(Mesh, (float)(SkirtDepth * Grid.CellSize));
 
-                    FBuilt& Built = Batch[i];
-                    Built.Key = Entry.Key;
-                    Built.Signature = Entry.Signature;
                     Built.Stream = VBT::BuildRenderStream(Mesh, Grid.BrickMin(Entry.Key.Coord), Entry.Key.Level, (float)Input.Settings.TriplanarUVScale);
                     Built.bProvenEmpty = Stats.bSkipped;
-                    Tree.TouchingWanted(Entry.Key, Built.Neighbours);
                     Samples.fetch_add(Stats.Samples, std::memory_order_relaxed);
                 });
             Result.Built.Append(MoveTemp(Batch));
@@ -570,6 +660,7 @@ void FVoxelBrickTerrain::RunTask(const TSharedRef<FVoxelBrickTerrain>& Self, FTa
         Built.Key = Entry.Key;
         Built.Signature = Entry.Signature;
         Built.bProvenEmpty = true;
+        Built.bGPU = Input.Backend == 1;
         Tree.TouchingWanted(Entry.Key, Built.Neighbours);
         Result.NumRestitchedEmpty++;
     }
@@ -634,7 +725,10 @@ void FVoxelBrickTerrain::DrainResults()
             Brick.Pending = MoveTemp(Built.Stream);
             Brick.PendingSignature = Built.Signature;
             Brick.bProvenEmpty = Built.bProvenEmpty;
-            NumWithSurface += Brick.Pending.IsValid() ? 1 : 0;
+            Brick.bPendingGPU = Built.bGPU;
+            FMemory::Memcpy(Brick.PendingLevels, Built.Levels, sizeof(Brick.PendingLevels));
+            Brick.PendingMeshed = Built.Meshed;
+            NumWithSurface += (Built.bGPU ? !Built.bProvenEmpty : Brick.Pending.IsValid()) ? 1 : 0;
 
             // A mesh stitched to other neighbours than the one on screen waits until its new
             // neighbours are on screen (ApplyQueued), then swaps in the same frame as the
@@ -664,6 +758,10 @@ void FVoxelBrickTerrain::DrainResults()
             UE_LOG(LogTemp, Log, TEXT("[VoxelBricks] %d wanted (%d balance splits), %d meshed (%d with surface, %d restitched, %d empty bricks restitched without meshing), %lld samples, %.1f ms, %d bricks held%s"),
                 Wanted.Num(), Result.BalanceSplits, Result.Built.Num() - Result.NumRestitchedEmpty, NumWithSurface, Result.NumRestitched, Result.NumRestitchedEmpty,
                 Result.Samples, Result.Milliseconds, Bricks.Num(), Result.bComplete ? TEXT(", complete") : TEXT(""));
+            UE_LOG(LogTemp, Log, TEXT("[VoxelBricks] Removal: %d held bricks not wanted, %d removed in the last pass; kept because a replacement or neighbour is not held %d, not applied %d, stitched to other neighbours %d, in a page not yet drawn %d, on a component not yet drawn %d"),
+                RemovalCandidates, RemovalRemoved, RemovalStalls[1], RemovalStalls[2], RemovalStalls[3], RemovalStalls[4], RemovalStalls[5]);
+            if (Backend == 1)
+                UE_LOG(LogTemp, Log, TEXT("[VoxelBricks] %s"), *Pages->Describe());
         }
     }
 }
@@ -687,6 +785,27 @@ void FVoxelBrickTerrain::ApplyQueued()
             continue;
         }
         Brick->WaitFor.Reset();
+
+        if (Brick->bPendingGPU)
+        {
+            // GPU backend: the brick joins (or leaves) its page; the page draws it once flushed.
+            Brick->bHasPending = false;
+            Brick->bPendingGPU = false;
+            Brick->bApplied = true;
+            Brick->Signature = Brick->PendingSignature;
+            if (Brick->bProvenEmpty)
+            {
+                if (Brick->bInPage)
+                    Pages->RemoveBrick(Key);
+                Brick->bInPage = false;
+            }
+            else
+            {
+                Brick->PageVersion = Pages->SetBrick(Key, Brick->PendingLevels, Brick->PendingMeshed);
+                Brick->bInPage = true;
+            }
+            continue;
+        }
 
         if (!Brick->Pending.IsValid())
         {
@@ -753,6 +872,7 @@ bool FVoxelBrickTerrain::IsOnScreen(const FVoxelBrickKey& Key) const
 {
     const FBrick* Brick = Bricks.Find(Key);
     if (!Brick || !Brick->bApplied) return false;
+    if (Brick->bInPage) return Pages->IsShown(Key, Brick->PageVersion);
     if (!Brick->Component.IsValid()) return true;   // applied empty: nothing to show
     const uint64 Frame = Brick->ShownFrame.IsValid() ? Brick->ShownFrame->load(std::memory_order_acquire) : 0;
     return Frame != 0 && GFrameCounter >= Frame;
@@ -761,7 +881,7 @@ bool FVoxelBrickTerrain::IsOnScreen(const FVoxelBrickKey& Key) const
 bool FVoxelBrickTerrain::HoldsSurface(const FVoxelBrickKey& Key) const
 {
     const FBrick* Brick = Bricks.Find(Key);
-    return Brick && Brick->Component.IsValid();
+    return Brick && (Brick->Component.IsValid() || Brick->bInPage);
 }
 
 bool FVoxelBrickTerrain::IsSettled(const FVoxelBrickKey& Key) const
@@ -804,7 +924,18 @@ void FVoxelBrickTerrain::TouchingWanted(const FVoxelBrickKey& Key, TArray<FVoxel
     }
 }
 
-bool FVoxelBrickTerrain::IsCovered(const FVoxelBrickKey& Key, const TArray<FVoxelBrickKey>& Descendants) const
+int32 FVoxelBrickTerrain::StallOf(const FVoxelBrickKey& Key) const
+{
+    const FBrick* Brick = Bricks.Find(Key);
+    const uint64* Signature = Wanted.Find(Key);
+    if (!Brick) return 1;
+    if (!Signature || !Brick->bApplied) return 2;
+    if (Brick->Signature != *Signature) return 3;
+    if (!IsOnScreen(Key)) return Brick->bInPage ? 4 : 5;
+    return 0;
+}
+
+bool FVoxelBrickTerrain::IsCovered(const FVoxelBrickKey& Key, const TArray<FVoxelBrickKey>& Descendants, int32* OutStall) const
 {
     // Replacements: a wanted ancestor on a merge, the wanted descendants on a split. None at
     // all: its region holds no surface now.
@@ -825,7 +956,11 @@ bool FVoxelBrickTerrain::IsCovered(const FVoxelBrickKey& Key, const TArray<FVoxe
     // or removing this brick opens the cracks it was hiding.
     for (const FVoxelBrickKey& Replacement : Replacements)
     {
-        if (!IsSettled(Replacement)) return false;
+        if (!IsSettled(Replacement))
+        {
+            if (OutStall) *OutStall = StallOf(Replacement);
+            return false;
+        }
     }
     TArray<FVoxelBrickKey> Around;
     for (const FVoxelBrickKey& Replacement : Replacements)
@@ -834,7 +969,11 @@ bool FVoxelBrickTerrain::IsCovered(const FVoxelBrickKey& Key, const TArray<FVoxe
         TouchingWanted(Replacement, Around);
         for (const FVoxelBrickKey& Neighbour : Around)
         {
-            if (!IsSettled(Neighbour)) return false;
+            if (!IsSettled(Neighbour))
+            {
+                if (OutStall) *OutStall = StallOf(Neighbour);
+                return false;
+            }
         }
     }
     return true;
@@ -853,7 +992,13 @@ void FVoxelBrickTerrain::RemoveReplaced()
         Candidates.Add(Pair.Key);
         MaxCandidateLevel = FMath::Max(MaxCandidateLevel, Pair.Key.Level);
     }
-    if (Candidates.Num() == 0) return;
+    if (Candidates.Num() == 0)
+    {
+        RemovalCandidates = 0;
+        RemovalRemoved = 0;
+        FMemory::Memzero(RemovalStalls);
+        return;
+    }
     for (const TPair<FVoxelBrickKey, uint64>& Pair : Wanted)
     {
         FVoxelBrickKey Ancestor = Pair.Key;
@@ -866,13 +1011,21 @@ void FVoxelBrickTerrain::RemoveReplaced()
     }
 
     TArray<FVoxelBrickKey> Remove;
+    FMemory::Memzero(RemovalStalls);
     for (const TPair<FVoxelBrickKey, TArray<FVoxelBrickKey>>& Candidate : Candidates)
     {
-        if (IsCovered(Candidate.Key, Candidate.Value))
+        int32 Stall = 0;
+        if (IsCovered(Candidate.Key, Candidate.Value, &Stall))
             Remove.Add(Candidate.Key);
+        else
+            RemovalStalls[FMath::Clamp(Stall, 0, 5)]++;
     }
+    RemovalCandidates = Candidates.Num();
+    RemovalRemoved = Remove.Num();
     for (const FVoxelBrickKey& Key : Remove)
     {
+        if (Bricks[Key].bInPage)
+            Pages->RemoveBrick(Key);
         DestroyComponent(Bricks[Key]);
         Bricks.Remove(Key);
     }

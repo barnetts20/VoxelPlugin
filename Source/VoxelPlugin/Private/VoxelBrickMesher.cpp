@@ -651,6 +651,16 @@ void VoxelBrickMesher::MeshBrick(const FDensitySampleCompositor& Density, const 
     OutStats.MaxGradient = MaxGradient;
 }
 
+bool VoxelBrickMesher::IsBrickProvablyEmpty(const FDensitySampleCompositor& Density, const FVoxelBrickGrid& Grid,
+    const FInt64Vector& Brick, double SlopeBound, int32& InOutSamples)
+{
+    FVoxelBrickGrid BrickGrid = Grid;
+    BrickGrid.CellsPerBrick = FMath::Max(8, Grid.CellsPerBrick / 4 * 4);
+    const int8 Levels[27] = {};
+    const FStitcher Stitcher(Density, BrickGrid, Brick, Levels, 0u);
+    return IsProvablyEmpty(Density, Stitcher.BrickMin(), BrickGrid.CellsPerBrick, Grid.CellSize, FMath::Max(SlopeBound, 1.0), InOutSamples);
+}
+
 void VoxelBrickMesher::MeshBrickStitched(const FDensitySampleCompositor& Density, const FVoxelBrickGrid& Grid,
     const FInt64Vector& Brick, const int8 (&NeighbourLevels)[27], uint32 MeshedNeighbours, double SlopeBound, bool bNoSkip,
     FVoxelBrickMesh& Out, FVoxelBrickStats& OutStats)

@@ -1,6 +1,7 @@
 // VoxelBrickMesherGPU.h - The stitched brick mesher (VoxelBrickMesher::MeshBrickStitched) on
-// the GPU, with edits. Stage (b) of Design/GPUPath.md: meshes a batch of bricks and reads the
-// meshes back, to check them against the CPU. Rendering from GPU buffers is stage (c).
+// the GPU, with edits. AddMesherPasses records the passes into a render graph (the brick pages
+// of VoxelBrickPages render from them); MeshBricksAsync reads the meshes back to check them
+// against the CPU (Design/GPUPath.md stage b).
 
 #pragma once
 
@@ -8,6 +9,7 @@
 #include "VoxelBrickMesher.h"
 #include "VoxelBrickTerrain.h"
 #include "VoxelDensityGPU.h"
+#include "RenderGraphFwd.h"
 
 /** One brick of a GPU batch (FVoxelMesherBrick in VoxelBrickStitch.ush). */
 struct FVoxelMesherBrickGPU
@@ -48,8 +50,13 @@ struct FVoxelBrickMesherGPUStats
 
 namespace VoxelBrickMesherGPU
 {
-    /** Bricks per call (buffers are sized for it). */
+    /** Bricks per MeshBricksAsync call and per AddMesherPasses batch. */
     constexpr int32 MaxBricks = 32;
+
+    /** Output slots per brick: vertices (6 floats: position from the brick min, normal) and
+     *  triangles (3 indices into the brick's vertices). */
+    constexpr uint32 VertexCap = 8192;
+    constexpr uint32 TriangleCap = 16384;
 
     /** Error bit for a request that wasn't meshed (beyond MaxBricks, or out of the 32-bit
      *  lattice range). */
@@ -60,6 +67,45 @@ namespace VoxelBrickMesherGPU
      *  MeshBrickStitched). Results arrive a few frames later (readback); empty arrays when the
      *  GPU can't run the shaders. CellsPerBrick is clamped to 8..64. Call from any thread but
      *  the render thread. */
+    /** Cells per brick edge the shaders use for Settings: CellsPerBrick rounded down to a
+     *  multiple of 4, clamped to 8..64. */
+    VOXELPLUGIN_API int32 CellsFor(const FVoxelBrickMesherGPUSettings& Settings);
+
+    /** The shader's record of a brick. False when its lattice indices, with the points
+     *  sampled around it, don't fit 32 bits (the brick can't be meshed on the GPU). */
+    VOXELPLUGIN_API bool MakeBrick(const FVoxelBrickKey& Key, const int8 (&NeighbourLevels)[27], uint32 MeshedNeighbours,
+        const FVoxelBrickMesherGPUSettings& Settings, FVoxelMesherBrickGPU& Out);
+
+    /** Render thread. True when every mesher pass is compiled for this platform. */
+    VOXELPLUGIN_API bool AreShadersReady();
+
+    /** The density octaves and the flattened edit tree as graph buffers. */
+    struct FInputs
+    {
+        FRDGBufferRef Octaves = nullptr;
+        FRDGBufferRef EditCorners = nullptr;
+        FRDGBufferRef EditChildren = nullptr;
+        FRDGBufferRef EditFlags = nullptr;
+        uint32 EditNodeCount = 0;
+        int32 EditRootExtent = 0;
+    };
+
+    /** Per brick b of a batch: Counters[4b..4b+3] = faces, vertices, triangles, error bits;
+     *  vertices from b * VertexCap, triangles from b * TriangleCap. */
+    struct FOutputs
+    {
+        FRDGBufferRef Counters = nullptr;
+        FRDGBufferRef Vertices = nullptr;
+        FRDGBufferRef Indices = nullptr;
+    };
+
+    /** Render thread. Uploads Density's octaves and Edits into GraphBuilder. */
+    VOXELPLUGIN_API FInputs UploadInputs(FRDGBuilder& GraphBuilder, const FVoxelDensityGPUData& Density, const FVoxelEditGPUData& Edits);
+
+    /** Render thread. Records the eight mesher passes for 1..MaxBricks bricks. */
+    VOXELPLUGIN_API FOutputs AddMesherPasses(FRDGBuilder& GraphBuilder, const FVoxelDensityGPUData& Density, const FInputs& Inputs,
+        const FVoxelBrickMesherGPUSettings& Settings, TConstArrayView<FVoxelMesherBrickGPU> Bricks);
+
     VOXELPLUGIN_API void MeshBricksAsync(TSharedRef<const FVoxelDensityGPUData> Density, TSharedRef<const FVoxelEditGPUData> Edits,
         const FVoxelBrickMesherGPUSettings& Settings, TArray<FVoxelBrickMesherGPURequest> Requests,
         TFunction<void(TArray<FVoxelBrickMesh>&&, TArray<FVoxelBrickMesherGPUStats>&&)> OnDone);

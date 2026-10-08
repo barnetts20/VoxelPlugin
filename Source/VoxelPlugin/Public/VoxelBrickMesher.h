@@ -89,6 +89,11 @@ namespace VoxelBrickMesher
         const FInt64Vector& Brick, const int8 (&NeighbourLevels)[27], uint32 MeshedNeighbours, double SlopeBound, bool bNoSkip,
         FVoxelBrickMesh& Out, FVoxelBrickStats& OutStats);
 
+    /** MeshBrickStitched's empty test alone: true when it would skip Brick (without bNoSkip).
+     *  Adds the samples it took to InOutSamples. */
+    VOXELPLUGIN_API bool IsBrickProvablyEmpty(const FDensitySampleCompositor& Density, const FVoxelBrickGrid& Grid,
+        const FInt64Vector& Brick, double SlopeBound, int32& InOutSamples);
+
     /** Hangs a skirt from every open edge of Mesh: a strip pushed Depth into the solid along
      *  the vertex normals, wound to continue the surface. Hides the cracks between bricks of
      *  different LOD; between same-LOD bricks it stays under the neighbour's surface. */

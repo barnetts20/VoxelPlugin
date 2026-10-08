@@ -97,8 +97,6 @@ namespace VoxelBrickMesherGPUDetail
 {
     constexpr uint32 HashSize = 16384;     // per brick; a 32-cell brick requests a few thousand points at most
     constexpr uint32 FaceCap = 8192;
-    constexpr uint32 VertexCap = 8192;
-    constexpr uint32 TriangleCap = 16384;
 
     FVector2f MesherDoubleFloat(double V)
     {
@@ -133,14 +131,156 @@ namespace VoxelBrickMesherGPUDetail
     }
 
     template<typename T>
-    FRDGBufferRef UploadBuffer(FRDGBuilder& GraphBuilder, const TCHAR* Name, const TArray<T>& Data)
+    FRDGBufferRef UploadBuffer(FRDGBuilder& GraphBuilder, const TCHAR* Name, TConstArrayView<T> Data)
     {
         // A structured buffer can't be empty.
-        TArray<T> Copy = Data;
-        if (Copy.Num() == 0)
-            Copy.AddZeroed();
-        return CreateStructuredBuffer(GraphBuilder, Name, sizeof(T), Copy.Num(), Copy.GetData(), sizeof(T) * Copy.Num());
+        static const T Zero{};
+        if (Data.Num() == 0)
+            return CreateStructuredBuffer(GraphBuilder, Name, sizeof(T), 1, &Zero, sizeof(T));
+        return CreateStructuredBuffer(GraphBuilder, Name, sizeof(T), Data.Num(), Data.GetData(), sizeof(T) * Data.Num());
     }
+}
+
+int32 VoxelBrickMesherGPU::CellsFor(const FVoxelBrickMesherGPUSettings& Settings)
+{
+    // The caps are sized for 32-cell bricks; the hash key holds points of up to 250.
+    return FMath::Clamp(Settings.CellsPerBrick / 4 * 4, 8, 64);
+}
+
+bool VoxelBrickMesherGPU::MakeBrick(const FVoxelBrickKey& Key, const int8 (&NeighbourLevels)[27], uint32 MeshedNeighbours,
+    const FVoxelBrickMesherGPUSettings& Settings, FVoxelMesherBrickGPU& Out)
+{
+    // The brick's lattice indices, with the points sampled around it, must fit 32 bits.
+    const int32 N = CellsFor(Settings);
+    const int64 Unit = 1LL << Key.Level;
+    const int64 Scale = 2LL * N * Unit;
+    const int64 Reach = (2LL * N + 16) * Unit;
+    const int64 Origin = 1LL << Settings.MaxDepth;
+    const int64 Min[3] = { Key.Coord.X * Scale - Origin, Key.Coord.Y * Scale - Origin, Key.Coord.Z * Scale - Origin };
+    if (FMath::Abs(Min[0]) + Reach >= MAX_int32 || FMath::Abs(Min[1]) + Reach >= MAX_int32 || FMath::Abs(Min[2]) + Reach >= MAX_int32)
+        return false;
+
+    Out = FVoxelMesherBrickGPU();
+    Out.MinIndex = FIntVector((int32)Min[0], (int32)Min[1], (int32)Min[2]);
+    Out.Level = Key.Level;
+    for (int32 d = 0; d < 27; d++)
+    {
+        const uint32 Bits = d == 13 ? 1u : (uint32)(FMath::Clamp((int32)NeighbourLevels[d], -1, 1) + 1);
+        if (d < 16)
+            Out.LevelsLo |= Bits << (2 * d);
+        else
+            Out.LevelsHi |= Bits << (2 * (d - 16));
+    }
+    Out.Meshed = MeshedNeighbours;
+    return true;
+}
+
+bool VoxelBrickMesherGPU::AreShadersReady()
+{
+    // GetShader by type returns an empty reference when the shader isn't compiled for this
+    // platform (TShaderMapRef would assert).
+    FGlobalShaderMap* ShaderMap = GetGlobalShaderMap(GMaxRHIFeatureLevel);
+    return ShaderMap
+        && ShaderMap->GetShader(&FVoxelMesherSampleCS::GetStaticType(), 0).IsValid()
+        && ShaderMap->GetShader(&FVoxelMesherEdgesCS::GetStaticType(), 0).IsValid()
+        && ShaderMap->GetShader(&FVoxelMesherRequestCS::GetStaticType(), 0).IsValid()
+        && ShaderMap->GetShader(&FVoxelMesherSolveCS::GetStaticType(), 0).IsValid()
+        && ShaderMap->GetShader(&FVoxelMesherTrianglesCS::GetStaticType(), 0).IsValid();
+}
+
+VoxelBrickMesherGPU::FInputs VoxelBrickMesherGPU::UploadInputs(FRDGBuilder& GraphBuilder, const FVoxelDensityGPUData& Density, const FVoxelEditGPUData& Edits)
+{
+    using namespace VoxelBrickMesherGPUDetail;
+    FInputs Inputs;
+    Inputs.Octaves = UploadBuffer(GraphBuilder, TEXT("Voxel.MesherOctaves"), MakeArrayView(Density.Octaves));
+    Inputs.EditCorners = UploadBuffer(GraphBuilder, TEXT("Voxel.EditCorners"), MakeArrayView(Edits.Corners));
+    Inputs.EditChildren = UploadBuffer(GraphBuilder, TEXT("Voxel.EditChildren"), MakeArrayView(Edits.Children));
+    Inputs.EditFlags = UploadBuffer(GraphBuilder, TEXT("Voxel.EditFlags"), MakeArrayView(Edits.Flags));
+    Inputs.EditNodeCount = (uint32)Edits.Flags.Num();
+    Inputs.EditRootExtent = Edits.RootExtent;
+    return Inputs;
+}
+
+VoxelBrickMesherGPU::FOutputs VoxelBrickMesherGPU::AddMesherPasses(FRDGBuilder& GraphBuilder, const FVoxelDensityGPUData& Density,
+    const FInputs& Inputs, const FVoxelBrickMesherGPUSettings& Settings, TConstArrayView<FVoxelMesherBrickGPU> Bricks)
+{
+    using namespace VoxelBrickMesherGPUDetail;
+    check(Bricks.Num() > 0);
+
+    const uint32 NB = (uint32)Bricks.Num();
+    const uint32 UN = (uint32)CellsFor(Settings);
+    const uint32 DenseSide = UN + 4u;
+    const uint32 DenseTotal = DenseSide * DenseSide * DenseSide;
+    const uint32 OwnSide = UN + 2u;
+    const uint32 CoarseSide = UN / 2u + 2u;
+    const uint32 NumSlots = OwnSide * OwnSide * OwnSide + CoarseSide * CoarseSide * CoarseSide;
+
+    auto MakeBuffer = [&GraphBuilder](uint32 Stride, uint32 Count, const TCHAR* Name)
+        {
+            return GraphBuilder.CreateBuffer(FRDGBufferDesc::CreateStructuredDesc(Stride, FMath::Max(Count, 1u)), Name);
+        };
+    FOutputs Outputs;
+    Outputs.Counters = MakeBuffer(4, NB * 4u, TEXT("Voxel.MesherCounters"));
+    Outputs.Vertices = MakeBuffer(4, NB * VertexCap * 6u, TEXT("Voxel.MesherVertices"));
+    Outputs.Indices = MakeBuffer(4, NB * TriangleCap * 3u, TEXT("Voxel.MesherIndices"));
+
+    FVoxelMesherParameters Template;
+    Template.Octaves = GraphBuilder.CreateSRV(Inputs.Octaves);
+    Template.HalfFinest = MesherDoubleFloat(0.5 * Settings.FinestCell);
+    Template.ContinentOctaves = Density.ContinentOctaves;
+    Template.MountainOctaves = Density.MountainOctaves;
+    Template.DetailOctaves = Density.DetailOctaves;
+    Template.InvNormContinent = Density.InvNormContinent;
+    Template.InvNormMountain = Density.InvNormMountain;
+    Template.InvNormDetail = Density.InvNormDetail;
+    Template.PlanetRadius = Density.PlanetRadius;
+    Template.NoiseAmplitude = Density.NoiseAmplitude;
+    Template.ContinentWeight = Density.ContinentWeight;
+    Template.MountainWeight = Density.MountainWeight;
+    Template.MountainStart = Density.MountainStart;
+    Template.MountainBlend = Density.MountainBlend;
+    Template.DetailWeight = Density.DetailWeight;
+    Template.RidgeGain = Density.RidgeGain;
+    Template.SlopeDamping = Density.SlopeDamping;
+    Template.EditCorners = GraphBuilder.CreateSRV(Inputs.EditCorners);
+    Template.EditChildren = GraphBuilder.CreateSRV(Inputs.EditChildren);
+    Template.EditFlags = GraphBuilder.CreateSRV(Inputs.EditFlags);
+    Template.EditNodeCount = Inputs.EditNodeCount;
+    Template.EditRootExtent = Inputs.EditRootExtent;
+    Template.Bricks = GraphBuilder.CreateSRV(UploadBuffer(GraphBuilder, TEXT("Voxel.MesherBricks"), Bricks));
+    Template.CellsPerBrick = (int32)UN;
+    Template.NumBricks = NB;
+    Template.HashSize = HashSize;
+    Template.FaceCap = FaceCap;
+    Template.VertexCap = VertexCap;
+    Template.TriangleCap = TriangleCap;
+    Template.FinestCell = (float)Settings.FinestCell;
+    Template.MinFootprint = (float)Density.MinFootprint;
+    Template.Dense = GraphBuilder.CreateUAV(MakeBuffer(4, NB * DenseTotal, TEXT("Voxel.MesherDense")));
+    Template.HashKeys = GraphBuilder.CreateUAV(MakeBuffer(4, NB * HashSize, TEXT("Voxel.MesherHashKeys")));
+    Template.HashValues = GraphBuilder.CreateUAV(MakeBuffer(4, NB * HashSize, TEXT("Voxel.MesherHashValues")));
+    Template.SlotState = GraphBuilder.CreateUAV(MakeBuffer(4, NB * NumSlots, TEXT("Voxel.MesherSlotState")));
+    Template.SlotVertex = GraphBuilder.CreateUAV(MakeBuffer(4, NB * NumSlots, TEXT("Voxel.MesherSlotVertex")));
+    Template.Faces = GraphBuilder.CreateUAV(MakeBuffer(4, NB * FaceCap * 4u, TEXT("Voxel.MesherFaces")));
+    Template.Counters = GraphBuilder.CreateUAV(Outputs.Counters);
+    Template.Vertices = GraphBuilder.CreateUAV(Outputs.Vertices);
+    Template.Indices = GraphBuilder.CreateUAV(Outputs.Indices);
+
+    AddClearUAVPass(GraphBuilder, Template.HashKeys, 0u);
+    AddClearUAVPass(GraphBuilder, Template.HashValues, 0xffffffffu);
+    AddClearUAVPass(GraphBuilder, Template.SlotState, 0u);
+    AddClearUAVPass(GraphBuilder, Template.SlotVertex, 0xffffffffu);
+    AddClearUAVPass(GraphBuilder, Template.Counters, 0u);
+
+    AddMesherPass<FVoxelMesherSampleCS>(GraphBuilder, Template, 0u, NB * DenseTotal, TEXT("Sample lattice"));
+    AddMesherPass<FVoxelMesherEdgesCS>(GraphBuilder, Template, 0u, NB * 3u * UN * (UN + 1u) * (UN + 1u), TEXT("Edges"));
+    AddMesherPass<FVoxelMesherRequestCS>(GraphBuilder, Template, 0u, NB * NumSlots, TEXT("Request edge ends"));
+    AddMesherPass<FVoxelMesherSampleCS>(GraphBuilder, Template, 1u, NB * HashSize, TEXT("Sample edge ends"));
+    AddMesherPass<FVoxelMesherRequestCS>(GraphBuilder, Template, 1u, NB * NumSlots, TEXT("Request gradients"));
+    AddMesherPass<FVoxelMesherSampleCS>(GraphBuilder, Template, 1u, NB * HashSize, TEXT("Sample gradients"));
+    AddMesherPass<FVoxelMesherSolveCS>(GraphBuilder, Template, 0u, NB * NumSlots, TEXT("Solve"));
+    AddMesherPass<FVoxelMesherTrianglesCS>(GraphBuilder, Template, 0u, NB * FaceCap, TEXT("Triangles"));
+    return Outputs;
 }
 
 void VoxelBrickMesherGPU::MeshBricksAsync(TSharedRef<const FVoxelDensityGPUData> Density, TSharedRef<const FVoxelEditGPUData> Edits,
@@ -152,38 +292,17 @@ void VoxelBrickMesherGPU::MeshBricksAsync(TSharedRef<const FVoxelDensityGPUData>
 
     const TSharedRef<FMesherReadback, ESPMode::ThreadSafe> State = MakeShared<FMesherReadback, ESPMode::ThreadSafe>();
     State->OnDone = MoveTemp(OnDone);
-    // The caps below are sized for 32-cell bricks; the hash key holds points of up to 250.
-    const int32 N = FMath::Clamp(Settings.CellsPerBrick / 4 * 4, 8, 64);
 
-    // Brick records, one per request (the first MaxBricks). A brick whose lattice indices,
-    // including the points sampled around it, don't fit 32 bits gets an empty mesh and
-    // ErrorNotMeshed.
+    // Brick records, one per request (the first MaxBricks). A brick out of the 32-bit lattice
+    // range gets an empty mesh and ErrorNotMeshed.
     TArray<FVoxelMesherBrickGPU> Bricks;
     TArray<int32> RequestOfBrick;
     State->NumRequests = Requests.Num();
-    for (int32 r = 0; r < Requests.Num(); r++)
+    for (int32 r = 0; r < Requests.Num() && Bricks.Num() < MaxBricks; r++)
     {
-        const FVoxelBrickMesherGPURequest& Request = Requests[r];
-        if (Bricks.Num() >= MaxBricks) break;
         FVoxelMesherBrickGPU Brick;
-        const int64 Unit = 1LL << Request.Key.Level;
-        const int64 Scale = 2LL * N * Unit;
-        const int64 Reach = (2LL * N + 16) * Unit;
-        const int64 Origin = 1LL << Settings.MaxDepth;
-        const int64 Min[3] = { Request.Key.Coord.X * Scale - Origin, Request.Key.Coord.Y * Scale - Origin, Request.Key.Coord.Z * Scale - Origin };
-        if (FMath::Abs(Min[0]) + Reach >= MAX_int32 || FMath::Abs(Min[1]) + Reach >= MAX_int32 || FMath::Abs(Min[2]) + Reach >= MAX_int32)
+        if (!MakeBrick(Requests[r].Key, Requests[r].NeighbourLevels, Requests[r].MeshedNeighbours, Settings, Brick))
             continue;
-        Brick.MinIndex = FIntVector((int32)Min[0], (int32)Min[1], (int32)Min[2]);
-        Brick.Level = Request.Key.Level;
-        for (int32 d = 0; d < 27; d++)
-        {
-            const uint32 Bits = d == 13 ? 1u : (uint32)(FMath::Clamp((int32)Request.NeighbourLevels[d], -1, 1) + 1);
-            if (d < 16)
-                Brick.LevelsLo |= Bits << (2 * d);
-            else
-                Brick.LevelsHi |= Bits << (2 * (d - 16));
-        }
-        Brick.Meshed = Request.MeshedNeighbours;
         Bricks.Add(Brick);
         RequestOfBrick.Add(r);
     }
@@ -195,11 +314,9 @@ void VoxelBrickMesherGPU::MeshBricksAsync(TSharedRef<const FVoxelDensityGPUData>
         return;
     }
 
-    ENQUEUE_RENDER_COMMAND(VoxelMesherGPU)([Density, Edits, Settings, N, Bricks = MoveTemp(Bricks), State](FRHICommandListImmediate& RHICmdList)
+    ENQUEUE_RENDER_COMMAND(VoxelMesherGPU)([Density, Edits, Settings, Bricks = MoveTemp(Bricks), State](FRHICommandListImmediate& RHICmdList)
         {
-            // GetShader by type returns an empty reference when the shader isn't compiled for
-            // this platform (TShaderMapRef would assert).
-            if (!GetGlobalShaderMap(GMaxRHIFeatureLevel)->GetShader(&FVoxelMesherTrianglesCS::GetStaticType(), 0).IsValid())
+            if (!AreShadersReady())
             {
                 State->bDone.store(true, std::memory_order_release);
                 AsyncTask(ENamedThreads::GameThread, [State]() { State->OnDone(TArray<FVoxelBrickMesh>(), TArray<FVoxelBrickMesherGPUStats>()); });
@@ -207,91 +324,16 @@ void VoxelBrickMesherGPU::MeshBricksAsync(TSharedRef<const FVoxelDensityGPUData>
             }
 
             const uint32 NB = (uint32)Bricks.Num();
-            const uint32 UN = (uint32)N;
-            const uint32 DenseSide = UN + 4u;
-            const uint32 DenseTotal = DenseSide * DenseSide * DenseSide;
-            const uint32 OwnSide = UN + 2u;
-            const uint32 CoarseSide = UN / 2u + 2u;
-            const uint32 NumSlots = OwnSide * OwnSide * OwnSide + CoarseSide * CoarseSide * CoarseSide;
-
             FRDGBuilder GraphBuilder(RHICmdList);
-            auto MakeBuffer = [&GraphBuilder](uint32 Stride, uint32 Count, const TCHAR* Name)
-                {
-                    return GraphBuilder.CreateBuffer(FRDGBufferDesc::CreateStructuredDesc(Stride, FMath::Max(Count, 1u)), Name);
-                };
-            FRDGBufferRef DenseBuffer = MakeBuffer(4, NB * DenseTotal, TEXT("Voxel.MesherDense"));
-            FRDGBufferRef HashKeysBuffer = MakeBuffer(4, NB * HashSize, TEXT("Voxel.MesherHashKeys"));
-            FRDGBufferRef HashValuesBuffer = MakeBuffer(4, NB * HashSize, TEXT("Voxel.MesherHashValues"));
-            FRDGBufferRef SlotStateBuffer = MakeBuffer(4, NB * NumSlots, TEXT("Voxel.MesherSlotState"));
-            FRDGBufferRef SlotVertexBuffer = MakeBuffer(4, NB * NumSlots, TEXT("Voxel.MesherSlotVertex"));
-            FRDGBufferRef FacesBuffer = MakeBuffer(4, NB * FaceCap * 4u, TEXT("Voxel.MesherFaces"));
-            FRDGBufferRef CountersBuffer = MakeBuffer(4, NB * 4u, TEXT("Voxel.MesherCounters"));
-            FRDGBufferRef VerticesBuffer = MakeBuffer(4, NB * VertexCap * 6u, TEXT("Voxel.MesherVertices"));
-            FRDGBufferRef IndicesBuffer = MakeBuffer(4, NB * TriangleCap * 3u, TEXT("Voxel.MesherIndices"));
-
-            FVoxelMesherParameters Template;
-            Template.Octaves = GraphBuilder.CreateSRV(UploadBuffer(GraphBuilder, TEXT("Voxel.MesherOctaves"), Density->Octaves));
-            Template.HalfFinest = MesherDoubleFloat(0.5 * Settings.FinestCell);
-            Template.ContinentOctaves = Density->ContinentOctaves;
-            Template.MountainOctaves = Density->MountainOctaves;
-            Template.DetailOctaves = Density->DetailOctaves;
-            Template.InvNormContinent = Density->InvNormContinent;
-            Template.InvNormMountain = Density->InvNormMountain;
-            Template.InvNormDetail = Density->InvNormDetail;
-            Template.PlanetRadius = Density->PlanetRadius;
-            Template.NoiseAmplitude = Density->NoiseAmplitude;
-            Template.ContinentWeight = Density->ContinentWeight;
-            Template.MountainWeight = Density->MountainWeight;
-            Template.MountainStart = Density->MountainStart;
-            Template.MountainBlend = Density->MountainBlend;
-            Template.DetailWeight = Density->DetailWeight;
-            Template.RidgeGain = Density->RidgeGain;
-            Template.SlopeDamping = Density->SlopeDamping;
-            Template.EditCorners = GraphBuilder.CreateSRV(UploadBuffer(GraphBuilder, TEXT("Voxel.EditCorners"), Edits->Corners));
-            Template.EditChildren = GraphBuilder.CreateSRV(UploadBuffer(GraphBuilder, TEXT("Voxel.EditChildren"), Edits->Children));
-            Template.EditFlags = GraphBuilder.CreateSRV(UploadBuffer(GraphBuilder, TEXT("Voxel.EditFlags"), Edits->Flags));
-            Template.EditNodeCount = (uint32)Edits->Flags.Num();
-            Template.EditRootExtent = Edits->RootExtent;
-            Template.Bricks = GraphBuilder.CreateSRV(UploadBuffer(GraphBuilder, TEXT("Voxel.MesherBricks"), Bricks));
-            Template.CellsPerBrick = N;
-            Template.NumBricks = NB;
-            Template.HashSize = HashSize;
-            Template.FaceCap = FaceCap;
-            Template.VertexCap = VertexCap;
-            Template.TriangleCap = TriangleCap;
-            Template.FinestCell = (float)Settings.FinestCell;
-            Template.MinFootprint = (float)Density->MinFootprint;
-            Template.Dense = GraphBuilder.CreateUAV(DenseBuffer);
-            Template.HashKeys = GraphBuilder.CreateUAV(HashKeysBuffer);
-            Template.HashValues = GraphBuilder.CreateUAV(HashValuesBuffer);
-            Template.SlotState = GraphBuilder.CreateUAV(SlotStateBuffer);
-            Template.SlotVertex = GraphBuilder.CreateUAV(SlotVertexBuffer);
-            Template.Faces = GraphBuilder.CreateUAV(FacesBuffer);
-            Template.Counters = GraphBuilder.CreateUAV(CountersBuffer);
-            Template.Vertices = GraphBuilder.CreateUAV(VerticesBuffer);
-            Template.Indices = GraphBuilder.CreateUAV(IndicesBuffer);
-
-            AddClearUAVPass(GraphBuilder, Template.HashKeys, 0u);
-            AddClearUAVPass(GraphBuilder, Template.HashValues, 0xffffffffu);
-            AddClearUAVPass(GraphBuilder, Template.SlotState, 0u);
-            AddClearUAVPass(GraphBuilder, Template.SlotVertex, 0xffffffffu);
-            AddClearUAVPass(GraphBuilder, Template.Counters, 0u);
-
-            AddMesherPass<FVoxelMesherSampleCS>(GraphBuilder, Template, 0u, NB * DenseTotal, TEXT("Sample lattice"));
-            AddMesherPass<FVoxelMesherEdgesCS>(GraphBuilder, Template, 0u, NB * 3u * UN * (UN + 1u) * (UN + 1u), TEXT("Edges"));
-            AddMesherPass<FVoxelMesherRequestCS>(GraphBuilder, Template, 0u, NB * NumSlots, TEXT("Request edge ends"));
-            AddMesherPass<FVoxelMesherSampleCS>(GraphBuilder, Template, 1u, NB * HashSize, TEXT("Sample edge ends"));
-            AddMesherPass<FVoxelMesherRequestCS>(GraphBuilder, Template, 1u, NB * NumSlots, TEXT("Request gradients"));
-            AddMesherPass<FVoxelMesherSampleCS>(GraphBuilder, Template, 1u, NB * HashSize, TEXT("Sample gradients"));
-            AddMesherPass<FVoxelMesherSolveCS>(GraphBuilder, Template, 0u, NB * NumSlots, TEXT("Solve"));
-            AddMesherPass<FVoxelMesherTrianglesCS>(GraphBuilder, Template, 0u, NB * FaceCap, TEXT("Triangles"));
+            const FInputs Inputs = UploadInputs(GraphBuilder, *Density, *Edits);
+            const FOutputs Outputs = AddMesherPasses(GraphBuilder, *Density, Inputs, Settings, Bricks);
 
             State->Counters = MakeUnique<FRHIGPUBufferReadback>(TEXT("Voxel.MesherCountersReadback"));
             State->Vertices = MakeUnique<FRHIGPUBufferReadback>(TEXT("Voxel.MesherVerticesReadback"));
             State->Indices = MakeUnique<FRHIGPUBufferReadback>(TEXT("Voxel.MesherIndicesReadback"));
-            AddEnqueueCopyPass(GraphBuilder, State->Counters.Get(), CountersBuffer, NB * 4u * 4u);
-            AddEnqueueCopyPass(GraphBuilder, State->Vertices.Get(), VerticesBuffer, NB * VertexCap * 6u * 4u);
-            AddEnqueueCopyPass(GraphBuilder, State->Indices.Get(), IndicesBuffer, NB * TriangleCap * 3u * 4u);
+            AddEnqueueCopyPass(GraphBuilder, State->Counters.Get(), Outputs.Counters, NB * 4u * 4u);
+            AddEnqueueCopyPass(GraphBuilder, State->Vertices.Get(), Outputs.Vertices, NB * VertexCap * 6u * 4u);
+            AddEnqueueCopyPass(GraphBuilder, State->Indices.Get(), Outputs.Indices, NB * TriangleCap * 3u * 4u);
             GraphBuilder.Execute();
         });
 
