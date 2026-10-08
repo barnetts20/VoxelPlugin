@@ -11,6 +11,25 @@
 #include "GameFramework/Actor.h"
 #include "HAL/IConsoleManager.h"
 #include "Misc/App.h"
+#include "Misc/ScopeExit.h"
+#include "VoxelTerrainStats.h"
+
+DECLARE_CYCLE_STAT(TEXT("Bricks: tick"), STAT_VoxelBricksTick, STATGROUP_VoxelTerrain);
+DECLARE_CYCLE_STAT(TEXT("Bricks: drain task results"), STAT_VoxelBricksDrain, STATGROUP_VoxelTerrain);
+DECLARE_CYCLE_STAT(TEXT("Bricks: apply queue or commit"), STAT_VoxelBricksApply, STATGROUP_VoxelTerrain);
+DECLARE_CYCLE_STAT(TEXT("Bricks: remove replaced"), STAT_VoxelBricksRemove, STATGROUP_VoxelTerrain);
+DECLARE_CYCLE_STAT(TEXT("Bricks: flush pages"), STAT_VoxelBricksFlush, STATGROUP_VoxelTerrain);
+DECLARE_CYCLE_STAT(TEXT("Bricks: launch task"), STAT_VoxelBricksLaunch, STATGROUP_VoxelTerrain);
+DECLARE_CYCLE_STAT(TEXT("Bricks: task (worker)"), STAT_VoxelBricksTask, STATGROUP_VoxelTerrain);
+DECLARE_CYCLE_STAT(TEXT("Bricks: task tree (worker)"), STAT_VoxelBricksTaskTree, STATGROUP_VoxelTerrain);
+DECLARE_DWORD_ACCUMULATOR_STAT(TEXT("Bricks held"), STAT_VoxelBricksHeld, STATGROUP_VoxelTerrain);
+DECLARE_DWORD_ACCUMULATOR_STAT(TEXT("Bricks wanted"), STAT_VoxelBricksWanted, STATGROUP_VoxelTerrain);
+DECLARE_DWORD_ACCUMULATOR_STAT(TEXT("Bricks queued to apply"), STAT_VoxelBricksQueued, STATGROUP_VoxelTerrain);
+
+static TAutoConsoleVariable<int32> CVarVoxelBrickPerf(
+    TEXT("voxel.Debug.BrickPerf"), 0,
+    TEXT("1: once a second, log where the brick terrain spent its time (game thread sections, tasks, page work and render-thread time)."),
+    ECVF_Default);
 
 static TAutoConsoleVariable<int32> CVarVoxelDebugBricks(
     TEXT("voxel.Debug.Bricks"), 0,
@@ -30,8 +49,19 @@ static TAutoConsoleVariable<int32> CVarVoxelBrickBackend(
 namespace VoxelBrickTerrainDetail
 {
     constexpr double TaskInterval = 0.1;            // seconds between tasks
+    constexpr double TaskIntervalGPU = 0.05;        // GPU backend: meshing costs the task nothing
+    constexpr double VelocitySmoothing = 0.15;      // seconds: camera velocity filter
+    constexpr double MaxCameraStep = 0.5;           // seconds: a longer frame resets the velocity
+    constexpr double MaxCameraJumpBricks = 8.0;     // finest bricks: a longer step in a frame too
+    constexpr double SlackFraction = 0.25;          // of the distance flown in the tree's latency
+    /** A brick split in the previous tree stays split until this many times the split
+     *  distance. Free for the morph: level-l vertices still meet level l + 1 only beyond the
+     *  split distance (Design/GPUPath.md section 4), and up to 1.15 times it level l + 1
+     *  is unblended where level l is fully blended, for any F below 11. */
+    constexpr double MergeHysteresis = 1.15;
     constexpr int32 MaxCreatesPerTick = 32;         // component creations per frame
-    constexpr int64 MaxSamplesPerTask = 4000000;    // density samples one task may spend on meshing
+    constexpr int64 MaxSamplesPerTask = 4000000;    // CPU backend: density samples one task may spend on meshing
+    constexpr double CommitWaitBlend = 0.5;          // filter of the commit wait
     constexpr int32 MeshBatch = 16;                 // bricks meshed per parallel batch
     constexpr double SkirtCells = 2.5;              // skirt depth in cells of the brick's level
 
@@ -102,8 +132,9 @@ namespace VoxelBrickTerrainDetail
      *  children, every leaf is wanted or culled. */
     struct FTree
     {
-        FTree(const FDensitySampleCompositor& InDensity, const FSparseEditStore* InEdits, const FVoxelBrickTerrainSettings& InSettings, const FVector& InCamera)
-            : Density(InDensity), Edits(InEdits), Settings(InSettings), Camera(InCamera)
+        FTree(const FDensitySampleCompositor& InDensity, const FSparseEditStore* InEdits, const FVoxelBrickTerrainSettings& InSettings, const FVector& InCamera,
+            const TSet<FVoxelBrickKey>* InSplitBefore)
+            : Density(InDensity), Edits(InEdits), Settings(InSettings), Camera(InCamera), SplitBefore(InSplitBefore)
         {
         }
 
@@ -111,6 +142,7 @@ namespace VoxelBrickTerrainDetail
         const FSparseEditStore* Edits;
         const FVoxelBrickTerrainSettings& Settings;
         FVector Camera;
+        const TSet<FVoxelBrickKey>* SplitBefore;   // internal nodes of the previous tree
 
         TMap<FVoxelBrickKey, ENode> Nodes;
         TMap<FVoxelBrickKey, FWantedInfo> WantedInfo;
@@ -160,7 +192,9 @@ namespace VoxelBrickTerrainDetail
                 return;
             }
             const double Distance = DistanceTo(Key);
-            if (Key.Level > 0 && Distance < Settings.LodDistanceFactor * MakeGrid(Settings, Key.Level).BrickSize())
+            const double SplitDistance = Settings.LodDistanceFactor * MakeGrid(Settings, Key.Level).BrickSize();
+            const bool bWasSplit = SplitBefore && SplitBefore->Contains(Key);
+            if (Key.Level > 0 && Distance < (bWasSplit ? MergeHysteresis * SplitDistance : SplitDistance))
             {
                 Nodes.Add(Key, ENode::Internal);
                 for (int32 c = 0; c < 8; c++)
@@ -293,6 +327,20 @@ namespace VoxelBrickTerrainDetail
         }
     };
 
+    /** Neighbour levels and the meshed mask a signature packs (see RunTask). */
+    void DecodeSignature(uint64 Signature, int8 (&OutLevels)[27], uint32& OutMeshed)
+    {
+        OutLevels[13] = 0;
+        OutMeshed = 1u << 13;
+        for (int32 d = 0, Slot = 0; d < 27; d++)
+        {
+            if (d == 13) continue;
+            const uint32 State = (uint32)(Signature >> (2 * Slot++)) & 3u;
+            OutLevels[d] = State == 0u ? (int8)-1 : (State == 3u ? (int8)1 : (int8)0);
+            OutMeshed |= State == 1u ? (1u << d) : 0u;
+        }
+    }
+
     FColor LevelColor(int32 Level)
     {
         static const FColor Palette[8] = {
@@ -396,6 +444,13 @@ void FVoxelBrickTerrain::Reset()
     Generation++;
     LastLaunchTime = 0.0;
     bLastComplete = false;
+    CameraVelocity = FVector::ZeroVector;
+    LastTickTime = 0.0;
+    bCommitPending = false;
+    bCommitProgressive = false;
+    PendingChanges.Reset();
+    NumInPage = 0;
+    CommitWaitSeconds = 0.0;
     FScopeLock Lock(&ResultCS);
     Results.Reset();
 }
@@ -447,7 +502,7 @@ int32 FVoxelBrickTerrain::ResolveBackend()
     return 0;
 }
 
-void FVoxelBrickTerrain::FlushPages()
+void FVoxelBrickTerrain::FlushPages(double TaskInterval)
 {
     if (!GPUDensity.IsValid())
     {
@@ -462,11 +517,60 @@ void FVoxelBrickTerrain::FlushPages()
         GPUEdits = FVoxelEditGPUData::Build(Store.Get(), 0.5 * Settings.FinestCell, Pages->GetMesherSettings().MaxDepth);
         GPUEditsSequence = Sequence;
     }
-    Pages->Flush(GPUDensity, GPUEdits);
+    // The tree is built for the camera predicted half an interval past its latency; what the
+    // prediction misses (half an interval of flight, a guess at the rest) narrows the morph
+    // band so the tree on screen still meets the morph's assumptions.
+    const double Speed = CameraVelocity.Size();
+    const double Slack = Speed * (0.5 * TaskInterval + VBT::SlackFraction * TreeLatency);
+    Pages->Flush(GPUDensity, GPUEdits, LastCamera, Slack);
+}
+
+void FVoxelBrickTerrain::LogPerf(double Now)
+{
+    Perf.Frames++;
+    if (Perf.Start == 0.0) Perf.Start = Now;
+    if (Now - Perf.Start < 1.0) return;
+    if (CVarVoxelBrickPerf.GetValueOnGameThread() > 0)
+    {
+        const double PerFrame = 1.0 / FMath::Max(1, Perf.Frames);
+        const double PerTask = 1.0 / FMath::Max(1, Perf.Tasks);
+        UE_LOG(LogTemp, Log, TEXT("[VoxelBrickPerf] %d frames in %.2f s. Game thread ms per frame (average / max): drain %.2f / %.2f, apply or commit %.2f / %.2f, remove %.2f / %.2f, flush pages %.2f / %.2f, launch %.2f / %.2f. Tasks: %d, %.1f ms average (tree %.1f), %.1f ms max, %lld samples, %d bricks built. %d held, %d wanted, %d queued to apply; commits wait %.0f ms (filtered)."),
+            Perf.Frames, Now - Perf.Start,
+            Perf.SectionMs[0] * PerFrame, Perf.MaxSectionMs[0], Perf.SectionMs[1] * PerFrame, Perf.MaxSectionMs[1], Perf.SectionMs[2] * PerFrame, Perf.MaxSectionMs[2],
+            Perf.SectionMs[3] * PerFrame, Perf.MaxSectionMs[3], Perf.SectionMs[4] * PerFrame, Perf.MaxSectionMs[4],
+            Perf.Tasks, Perf.TaskMs * PerTask, Perf.TreeMs * PerTask, Perf.MaxTaskMs, Perf.TaskSamples, Perf.TaskBuilt, Bricks.Num(), Wanted.Num(), ApplyQueue.Num(),
+            CommitWaitSeconds * 1000.0);
+        if (Backend == 1)
+            UE_LOG(LogTemp, Log, TEXT("[VoxelBrickPerf] %s"), *Pages->TakePerf());
+    }
+    else if (Backend == 1)
+    {
+        Pages->TakePerf();
+    }
+    Perf = FPerf();
+    Perf.Start = Now;
 }
 
 void FVoxelBrickTerrain::Tick(const FVector& Camera)
 {
+    SCOPE_CYCLE_COUNTER(STAT_VoxelBricksTick);
+    const double Now = FPlatformTime::Seconds();
+    const double Step = Now - LastTickTime;
+    // A long frame or a jump of many bricks (a teleport) restarts the velocity.
+    const double JumpDistance = VBT::MaxCameraJumpBricks * Settings.FinestCell * Settings.CellsPerBrick;
+    if (LastTickTime > 0.0 && Step > 0.0 && Step < VBT::MaxCameraStep && FVector::DistSquared(Camera, LastCamera) < FMath::Square(JumpDistance))
+    {
+        const double Blend = 1.0 - FMath::Exp(-Step / VBT::VelocitySmoothing);
+        CameraVelocity += ((Camera - LastCamera) / Step - CameraVelocity) * Blend;
+        FrameSeconds += (Step - FrameSeconds) * Blend;
+    }
+    else
+    {
+        CameraVelocity = FVector::ZeroVector;
+    }
+    LastTickTime = Now;
+    LastCamera = Camera;
+
     const int32 WantedBackend = ResolveBackend();
     if (WantedBackend != Backend)
     {
@@ -474,24 +578,77 @@ void FVoxelBrickTerrain::Tick(const FVector& Camera)
         Backend = WantedBackend;
     }
 
-    DrainResults();
-    ApplyQueued();
-    RemoveReplaced();
+    // Each section timed for voxel.Debug.BrickPerf.
+    double Mark = FPlatformTime::Seconds();
+    auto Lap = [this, &Mark](int32 Section)
+        {
+            const double Now2 = FPlatformTime::Seconds();
+            const double Ms = (Now2 - Mark) * 1000.0;
+            Perf.SectionMs[Section] += Ms;
+            Perf.MaxSectionMs[Section] = FMath::Max(Perf.MaxSectionMs[Section], Ms);
+            Mark = Now2;
+        };
+    {
+        SCOPE_CYCLE_COUNTER(STAT_VoxelBricksDrain);
+        DrainResults();
+    }
+    Lap(0);
+    const double TaskInterval = Backend == 1 ? VBT::TaskIntervalGPU : VBT::TaskInterval;
     if (Backend == 1)
-        FlushPages();
+    {
+        // From a task's launch until its tree is drawn: the task, the wait for its commit,
+        // and the frame it is committed in.
+        TreeLatency = TaskSeconds + CommitWaitSeconds + FrameSeconds;
+        {
+            SCOPE_CYCLE_COUNTER(STAT_VoxelBricksFlush);
+            FlushPages(TaskInterval);
+        }
+        Lap(3);
+        {
+            SCOPE_CYCLE_COUNTER(STAT_VoxelBricksApply);
+            CommitPages();
+        }
+        Lap(1);
+    }
+    else
+    {
+        // The task, then the component update and its two frames.
+        TreeLatency = TaskSeconds + 3.0 * FrameSeconds;
+        {
+            SCOPE_CYCLE_COUNTER(STAT_VoxelBricksApply);
+            ApplyQueued();
+        }
+        Lap(1);
+        {
+            SCOPE_CYCLE_COUNTER(STAT_VoxelBricksRemove);
+            RemoveReplaced();
+        }
+        Lap(2);
+    }
+    SET_DWORD_STAT(STAT_VoxelBricksHeld, Bricks.Num());
+    SET_DWORD_STAT(STAT_VoxelBricksWanted, Wanted.Num());
+    SET_DWORD_STAT(STAT_VoxelBricksQueued, ApplyQueue.Num());
+    LogPerf(Now);
 
-    const double Now = FPlatformTime::Seconds();
-    if (bTaskRunning.load(std::memory_order_acquire) || Now - LastLaunchTime < VBT::TaskInterval || !Density.IsValid()) return;
-    LastLaunchTime = Now;
+    if (bTaskRunning.load(std::memory_order_acquire) || bCommitPending || Now - LastLaunchTime < TaskInterval || !Density.IsValid()) return;
+    SCOPE_CYCLE_COUNTER(STAT_VoxelBricksLaunch);
+    ON_SCOPE_EXIT { Lap(4); };
 
-    // A task that finished since the drain above must be in Known before the next starts.
+    // The tree is on screen from about TreeLatency after the launch until the next one is,
+    // an interval later: build it for the camera predicted halfway through.
+    const FVector TaskCamera = Camera + CameraVelocity * (TreeLatency + 0.5 * TaskInterval);
+
+    // A task that finished since the drain above must be in Known (CPU) or committed (GPU)
+    // before the next starts.
     DrainResults();
+    if (bCommitPending) return;
+    LastLaunchTime = Now;
 
     // Nothing to do: the latest result is complete for (about) this camera and nothing changed.
     // The GPU mesher is stitched only.
     const int32 SeamMode = Backend == 1 ? 0 : FMath::Clamp(CVarVoxelBrickSeams.GetValueOnGameThread(), 0, 2);
     if (bLastComplete && SeamMode == LastSeamMode && RecentEdits.Num() == 0
-        && FVector::Dist(Camera, LastTaskCamera) < Settings.FinestCell * Settings.CellsPerBrick / 16.0)
+        && FVector::Dist(TaskCamera, LastTaskCamera) < Settings.FinestCell * Settings.CellsPerBrick / 16.0)
     {
         bool bAnyDirty = false;
         for (const TPair<FVoxelBrickKey, FBrick>& Pair : Bricks)
@@ -501,11 +658,12 @@ void FVoxelBrickTerrain::Tick(const FVector& Camera)
 
     FTaskInput Input;
     Input.Generation = Generation;
-    Input.Camera = Camera;
+    Input.Camera = TaskCamera;
     Input.Density = Density;
     Input.Settings = Settings;
     Input.SeamMode = SeamMode;
     Input.Backend = Backend;
+    Input.PrevWanted = Wanted;
     Input.Known.Reserve(Bricks.Num());
     for (TPair<FVoxelBrickKey, FBrick>& Pair : Bricks)
     {
@@ -528,6 +686,7 @@ void FVoxelBrickTerrain::Tick(const FVector& Camera)
 
 void FVoxelBrickTerrain::RunTask(const TSharedRef<FVoxelBrickTerrain>& Self, FTaskInput Input)
 {
+    SCOPE_CYCLE_COUNTER(STAT_VoxelBricksTask);
     const double T0 = FPlatformTime::Seconds();
     FTaskResult Result;
     Result.Generation = Input.Generation;
@@ -535,14 +694,32 @@ void FVoxelBrickTerrain::RunTask(const TSharedRef<FVoxelBrickTerrain>& Self, FTa
     const TSharedPtr<FSparseEditStore> Edits = Input.Density->GetEditStore();
     Result.StartSequence = Edits.IsValid() ? Edits->GetLastSequence() : 0;
 
-    VBT::FTree Tree(*Input.Density, Edits.Get(), Input.Settings, Input.Camera);
+    // The previous tree's internal nodes: every ancestor of a brick it wanted.
+    TSet<FVoxelBrickKey> SplitBefore;
+    SplitBefore.Reserve(Input.PrevWanted.Num());
+    for (const TPair<FVoxelBrickKey, uint64>& Pair : Input.PrevWanted)
+    {
+        FVoxelBrickKey Ancestor = Pair.Key;
+        while (Ancestor.Level < Input.Settings.MaxLevel)
+        {
+            Ancestor = VBT::ParentOf(Ancestor);
+            bool bAlready = false;
+            SplitBefore.Add(Ancestor, &bAlready);
+            if (bAlready) break;
+        }
+    }
+    VBT::FTree Tree(*Input.Density, Edits.Get(), Input.Settings, Input.Camera, &SplitBefore);
     FVoxelBrickKey Root;
     Root.Level = Input.Settings.MaxLevel;
     Root.Coord = FInt64Vector(0, 0, 0);
-    Tree.Descend(Root);
-    if (Input.SeamMode != 2)
-        Tree.Balance();
+    {
+        SCOPE_CYCLE_COUNTER(STAT_VoxelBricksTaskTree);
+        Tree.Descend(Root);
+        if (Input.SeamMode != 2)
+            Tree.Balance();
+    }
     Result.BalanceSplits = Tree.BalanceSplits;
+    Result.TreeMilliseconds = (FPlatformTime::Seconds() - T0) * 1000.0;
 
     // Each wanted brick's neighbours, packed with the seam mode into its signature: per
     // direction 0 finer, 1 same level and meshed, 2 same level and not meshed, 3 coarser.
@@ -602,20 +779,19 @@ void FVoxelBrickTerrain::RunTask(const TSharedRef<FVoxelBrickTerrain>& Self, FTa
                     FBuilt& Built = Batch[i];
                     Built.Key = Entry.Key;
                     Built.Signature = Entry.Signature;
-                    Tree.TouchingWanted(Entry.Key, Built.Neighbours);
 
-                    // GPU backend: only the empty test runs here; the page meshes the brick.
+                    // GPU backend: only the empty test runs here; the page meshes the brick with
+                    // the levels in its signature.
                     if (Input.Backend == 1)
                     {
                         int32 TestSamples = 0;
                         Built.bGPU = true;
                         Built.bProvenEmpty = !Entry.bEdited
                             && VoxelBrickMesher::IsBrickProvablyEmpty(*Input.Density, Grid, Entry.Key.Coord, Input.Settings.SlopeBound, TestSamples);
-                        FMemory::Memcpy(Built.Levels, Entry.Levels, sizeof(Built.Levels));
-                        Built.Meshed = Entry.Meshed;
                         Samples.fetch_add(TestSamples, std::memory_order_relaxed);
                         return;
                     }
+                    Tree.TouchingWanted(Entry.Key, Built.Neighbours);
 
                     FVoxelBrickMesh Mesh;
                     FVoxelBrickStats Stats;
@@ -633,13 +809,16 @@ void FVoxelBrickTerrain::RunTask(const TSharedRef<FVoxelBrickTerrain>& Self, FTa
             Result.Built.Append(MoveTemp(Batch));
         };
 
-    // Edit rebuilds always finish. New bricks are meshed nearest first while the budget lasts;
-    // those left over are found again next task.
+    // Edit rebuilds always finish. New bricks are meshed nearest first while the budget lasts
+    // (GPU backend: all of them, a result is committed whole); those left over are found
+    // again next task.
+    // GPU backend: one parallel batch (only the empty test runs here).
+    const int32 BatchSize = Input.Backend == 1 ? FMath::Max(1, FMath::Max(NewBricks.Num(), Restitches.Num())) : VBT::MeshBatch;
     MeshAll(Rebuilds, 0, Rebuilds.Num());
     int32 NewMeshed = 0;
-    for (int32 Start = 0; Start < NewBricks.Num() && Samples.load() < VBT::MaxSamplesPerTask; Start += VBT::MeshBatch)
+    for (int32 Start = 0; Start < NewBricks.Num() && (Input.Backend == 1 || Samples.load() < VBT::MaxSamplesPerTask); Start += BatchSize)
     {
-        const int32 Count = FMath::Min(VBT::MeshBatch, NewBricks.Num() - Start);
+        const int32 Count = FMath::Min(BatchSize, NewBricks.Num() - Start);
         MeshAll(NewBricks, Start, Count);
         NewMeshed += Count;
     }
@@ -661,7 +840,8 @@ void FVoxelBrickTerrain::RunTask(const TSharedRef<FVoxelBrickTerrain>& Self, FTa
         Built.Signature = Entry.Signature;
         Built.bProvenEmpty = true;
         Built.bGPU = Input.Backend == 1;
-        Tree.TouchingWanted(Entry.Key, Built.Neighbours);
+        if (!Built.bGPU)
+            Tree.TouchingWanted(Entry.Key, Built.Neighbours);
         Result.NumRestitchedEmpty++;
     }
 
@@ -683,8 +863,8 @@ void FVoxelBrickTerrain::RunTask(const TSharedRef<FVoxelBrickTerrain>& Self, FTa
             Ready.Add(Entry);
     }
     Result.NumRestitched = Ready.Num();
-    for (int32 Start = 0; Start < Ready.Num(); Start += VBT::MeshBatch)
-        MeshAll(Ready, Start, FMath::Min(VBT::MeshBatch, Ready.Num() - Start));
+    for (int32 Start = 0; Start < Ready.Num(); Start += BatchSize)
+        MeshAll(Ready, Start, FMath::Min(BatchSize, Ready.Num() - Start));
     Result.Camera = Input.Camera;
     Result.SeamMode = Input.SeamMode;
     Result.bComplete = NewMeshed == NewBricks.Num() && Ready.Num() == Remesh.Num();
@@ -716,30 +896,43 @@ void FVoxelBrickTerrain::DrainResults()
         bHasWanted = true;
         bLastComplete = Result.bComplete;
         LastTaskCamera = Result.Camera;
+        TaskSeconds += (Result.Milliseconds / 1000.0 - TaskSeconds) * 0.5;
+        Perf.Tasks++;
+        Perf.TaskMs += Result.Milliseconds;
+        Perf.MaxTaskMs = FMath::Max(Perf.MaxTaskMs, Result.Milliseconds);
+        Perf.TreeMs += Result.TreeMilliseconds;
+        Perf.TaskSamples += Result.Samples;
+        Perf.TaskBuilt += Result.Built.Num();
         LastSeamMode = Result.SeamMode;
 
         int32 NumWithSurface = 0;
         for (FBuilt& Built : Result.Built)
         {
             FBrick& Brick = Bricks.FindOrAdd(Built.Key);
-            Brick.Pending = MoveTemp(Built.Stream);
-            Brick.PendingSignature = Built.Signature;
             Brick.bProvenEmpty = Built.bProvenEmpty;
-            Brick.bPendingGPU = Built.bGPU;
-            FMemory::Memcpy(Brick.PendingLevels, Built.Levels, sizeof(Brick.PendingLevels));
-            Brick.PendingMeshed = Built.Meshed;
-            NumWithSurface += (Built.bGPU ? !Built.bProvenEmpty : Brick.Pending.IsValid()) ? 1 : 0;
-
-            // A mesh stitched to other neighbours than the one on screen waits until its new
-            // neighbours are on screen (ApplyQueued), then swaps in the same frame as the
-            // bricks they replace leave (RemoveReplaced).
-            Brick.WaitFor.Reset();
-            if (Brick.bApplied && Brick.Signature != Built.Signature)
-                Brick.WaitFor = MoveTemp(Built.Neighbours);
-            if (!Brick.bHasPending)
+            if (Built.bGPU)
             {
-                Brick.bHasPending = true;
-                ApplyQueue.Add(Built.Key);
+                // Committed with the whole result (CommitPages).
+                Brick.bRemesh = true;
+                NumWithSurface += Built.bProvenEmpty ? 0 : 1;
+            }
+            else
+            {
+                Brick.Pending = MoveTemp(Built.Stream);
+                Brick.PendingSignature = Built.Signature;
+                NumWithSurface += Brick.Pending.IsValid() ? 1 : 0;
+
+                // A mesh stitched to other neighbours than the one on screen waits until its new
+                // neighbours are on screen (ApplyQueued), then swaps in the same frame as the
+                // bricks they replace leave (RemoveReplaced).
+                Brick.WaitFor.Reset();
+                if (Brick.bApplied && Brick.Signature != Built.Signature)
+                    Brick.WaitFor = MoveTemp(Built.Neighbours);
+                if (!Brick.bHasPending)
+                {
+                    Brick.bHasPending = true;
+                    ApplyQueue.Add(Built.Key);
+                }
             }
 
             // An edit published after the task read the edit store isn't in this mesh.
@@ -752,24 +945,165 @@ void FVoxelBrickTerrain::DrainResults()
             }
         }
         RecentEdits.RemoveAll([&Result](const FRecentEdit& Edit) { return Edit.Sequence <= Result.StartSequence; });
+        if (Backend == 1)
+        {
+            // The whole difference in one frame; page by page only while nothing is on screen
+            // (the first fill), where a partly filled tree hides nothing.
+            bCommitProgressive = NumInPage == 0;
+            bCommitPending = true;
+            CommitPendingFrame = GFrameCounter;
+            PendingChanges.Reset();
+            BuildCommit(PendingChanges);
+        }
 
         if (CVarVoxelDebugBricks.GetValueOnGameThread() > 0)
         {
-            UE_LOG(LogTemp, Log, TEXT("[VoxelBricks] %d wanted (%d balance splits), %d meshed (%d with surface, %d restitched, %d empty bricks restitched without meshing), %lld samples, %.1f ms, %d bricks held%s"),
+            UE_LOG(LogTemp, Log, TEXT("[VoxelBricks] %d wanted (%d balance splits), %d meshed (%d with surface, %d restitched, %d empty bricks restitched without meshing), %lld samples, %.1f ms, %d bricks held%s; camera %.0f m/s, tree latency %.0f ms"),
                 Wanted.Num(), Result.BalanceSplits, Result.Built.Num() - Result.NumRestitchedEmpty, NumWithSurface, Result.NumRestitched, Result.NumRestitchedEmpty,
-                Result.Samples, Result.Milliseconds, Bricks.Num(), Result.bComplete ? TEXT(", complete") : TEXT(""));
-            int32 Waiting = 0;
-            for (const FVoxelBrickKey& Queued : ApplyQueue)
-            {
-                const FBrick* QueuedBrick = Bricks.Find(Queued);
-                Waiting += QueuedBrick && QueuedBrick->bHasPending && QueuedBrick->WaitFor.Num() > 0 ? 1 : 0;
-            }
-            UE_LOG(LogTemp, Log, TEXT("[VoxelBricks] Removal: %d held bricks not wanted, %d removed in the last pass; kept because a replacement or neighbour is not held %d, not applied %d, stitched to other neighbours %d, in a page not yet drawn %d, on a component not yet drawn %d. %d meshes queued, %d waiting for neighbours"),
-                RemovalCandidates, RemovalRemoved, RemovalStalls[1], RemovalStalls[2], RemovalStalls[3], RemovalStalls[4], RemovalStalls[5], ApplyQueue.Num(), Waiting);
+                Result.Samples, Result.Milliseconds, Bricks.Num(), Result.bComplete ? TEXT(", complete") : TEXT(""),
+                CameraVelocity.Size() / 100.0, TreeLatency * 1000.0);
             if (Backend == 1)
-                UE_LOG(LogTemp, Log, TEXT("[VoxelBricks] %s"), *Pages->Describe());
+            {
+                UE_LOG(LogTemp, Log, TEXT("[VoxelBricks] %d page members committed; commits wait %.0f ms (filtered). %s"),
+                    NumInPage, CommitWaitSeconds * 1000.0, *Pages->Describe());
+            }
+            else
+            {
+                int32 Waiting = 0;
+                for (const FVoxelBrickKey& Queued : ApplyQueue)
+                {
+                    const FBrick* QueuedBrick = Bricks.Find(Queued);
+                    Waiting += QueuedBrick && QueuedBrick->bHasPending && QueuedBrick->WaitFor.Num() > 0 ? 1 : 0;
+                }
+                UE_LOG(LogTemp, Log, TEXT("[VoxelBricks] Removal: %d held bricks not wanted, %d removed in the last pass; kept because a replacement or neighbour is not held %d, not applied %d, stitched to other neighbours %d, not yet drawn %d. %d meshes queued, %d waiting for neighbours"),
+                    RemovalCandidates, RemovalRemoved, RemovalStalls[1], RemovalStalls[2], RemovalStalls[3], RemovalStalls[4], ApplyQueue.Num(), Waiting);
+            }
         }
     }
+}
+
+void FVoxelBrickTerrain::BuildCommit(TArray<FVoxelBrickPageChange>& Out) const
+{
+    for (const TPair<FVoxelBrickKey, uint64>& Pair : Wanted)
+    {
+        // A brick no task has tested (possible only after a reset race) may hold surface.
+        const FBrick* Brick = Bricks.Find(Pair.Key);
+        const bool bInPage = Brick && Brick->bInPage;
+        const bool bWantPage = !(Brick && Brick->bProvenEmpty);
+        if (bWantPage && (!bInPage || Brick->Signature != Pair.Value || Brick->bRemesh))
+        {
+            FVoxelBrickPageChange& Change = Out.AddDefaulted_GetRef();
+            Change.Key = Pair.Key;
+            VBT::DecodeSignature(Pair.Value, Change.Levels, Change.Meshed);
+        }
+        else if (!bWantPage && bInPage)
+        {
+            FVoxelBrickPageChange& Change = Out.AddDefaulted_GetRef();
+            Change.Key = Pair.Key;
+            Change.bRemove = true;
+        }
+    }
+    for (const TPair<FVoxelBrickKey, FBrick>& Pair : Bricks)
+    {
+        if (Pair.Value.bInPage && !Wanted.Contains(Pair.Key))
+        {
+            FVoxelBrickPageChange& Change = Out.AddDefaulted_GetRef();
+            Change.Key = Pair.Key;
+            Change.bRemove = true;
+        }
+    }
+}
+
+void FVoxelBrickTerrain::ApplyCommitted(TConstArrayView<FVoxelBrickPageChange> Changes)
+{
+    for (const FVoxelBrickPageChange& Change : Changes)
+    {
+        FBrick& Brick = Bricks.FindOrAdd(Change.Key);
+        if (Change.bRemove)
+        {
+            NumInPage -= Brick.bInPage ? 1 : 0;
+            Brick.bInPage = false;
+            continue;
+        }
+        NumInPage += Brick.bInPage ? 0 : 1;
+        Brick.bInPage = true;
+        Brick.bApplied = true;
+        Brick.bRemesh = false;
+        Brick.Signature = Wanted.FindRef(Change.Key);
+    }
+}
+
+void FVoxelBrickTerrain::CommitPages()
+{
+    if (!bCommitPending) return;
+    if (!bCommitProgressive)
+    {
+        if (PendingChanges.Num() > 0)
+        {
+            if (!Pages->PrepareCommit(PendingChanges)) return;
+            Pages->Commit(PendingChanges);
+            ApplyCommitted(PendingChanges);
+        }
+    }
+    else
+    {
+        // Every page whose buffers are ready, committed together; pages that only lose bricks
+        // once every addition is in.
+        TMap<FVoxelBrickKey, TArray<FVoxelBrickPageChange>> Groups;
+        for (const FVoxelBrickPageChange& Change : PendingChanges)
+            Groups.FindOrAdd(FVoxelBrickPages::PageOf(Change.Key)).Add(Change);
+        TArray<FVoxelBrickPageChange> Ready;
+        TArray<FVoxelBrickPageChange> Left;
+        for (int32 Pass = 0; Pass < 2; Pass++)
+        {
+            const bool bAdditionsLeft = Left.Num() > 0;
+            for (const TPair<FVoxelBrickKey, TArray<FVoxelBrickPageChange>>& Group : Groups)
+            {
+                bool bAdds = false;
+                for (const FVoxelBrickPageChange& Change : Group.Value)
+                    bAdds |= !Change.bRemove;
+                if (bAdds != (Pass == 0)) continue;
+                if (!bAdditionsLeft && Pages->PreparePages(Group.Value))
+                    Ready.Append(Group.Value);
+                else
+                    Left.Append(Group.Value);
+            }
+        }
+        if (Ready.Num() > 0 && Pages->PrepareCommit(Ready))
+        {
+            Pages->Commit(Ready);
+            ApplyCommitted(Ready);
+        }
+        else
+        {
+            Left.Append(Ready);
+        }
+        PendingChanges = MoveTemp(Left);
+        if (PendingChanges.Num() > 0) return;
+    }
+
+    // The tree on screen is Wanted.
+    for (auto It = Bricks.CreateIterator(); It; ++It)
+    {
+        const uint64* Signature = Wanted.Find(It.Key());
+        if (!Signature)
+        {
+            It.RemoveCurrent();
+            continue;
+        }
+        It.Value().Signature = *Signature;
+        It.Value().bApplied = true;
+        It.Value().bRemesh = false;
+    }
+    bCommitPending = false;
+    PendingChanges.Reset();
+    const double Wait = (double)(GFrameCounter - CommitPendingFrame) * FrameSeconds;
+    CommitWaitSeconds += (Wait - CommitWaitSeconds) * VBT::CommitWaitBlend;
+}
+
+bool FVoxelBrickTerrain::IsNeighbourReady(const FVoxelBrickKey& Key) const
+{
+    return !Wanted.Contains(Key) || IsOnScreen(Key);
 }
 
 void FVoxelBrickTerrain::ApplyQueued()
@@ -784,40 +1118,13 @@ void FVoxelBrickTerrain::ApplyQueued()
 
         bool bReady = true;
         for (const FVoxelBrickKey& Neighbour : Brick->WaitFor)
-            bReady &= !Wanted.Contains(Neighbour) || IsOnScreen(Neighbour);
+            bReady &= IsNeighbourReady(Neighbour);
         if (!bReady)
         {
             ApplyQueue[Kept++] = Key;
             continue;
         }
         Brick->WaitFor.Reset();
-
-        if (Brick->bPendingGPU)
-        {
-            // GPU backend: the brick joins (or leaves) its page; the page draws it once flushed.
-            Brick->bHasPending = false;
-            Brick->bPendingGPU = false;
-            Brick->bApplied = true;
-            Brick->Signature = Brick->PendingSignature;
-            if (Brick->bProvenEmpty)
-            {
-                if (Brick->bInPage)
-                    Pages->RemoveBrick(Key);
-                Brick->bInPage = false;
-            }
-            else
-            {
-                // On screen from the first page version that holds it, as a component is from
-                // its first mesh: a restitch doesn't take it off screen until the page has
-                // run again, or bricks waiting on each other only apply one link per frame or
-                // two and fall behind while the camera moves.
-                const uint64 Version = Pages->SetBrick(Key, Brick->PendingLevels, Brick->PendingMeshed);
-                if (!Brick->bInPage)
-                    Brick->PageVersion = Version;
-                Brick->bInPage = true;
-            }
-            continue;
-        }
 
         if (!Brick->Pending.IsValid())
         {
@@ -858,8 +1165,8 @@ void FVoxelBrickTerrain::ApplyQueued()
         Brick->bApplied = true;
 
         // The future completes once the render proxy has the mesh. A component has no proxy
-        // until the end-of-frame update after its creation, so the mesh counts from two
-        // frames after that (or after the apply, when it found no proxy). Same rule as
+        // until the end-of-frame update after its creation, so the mesh counts from two frames
+        // after that (or after the apply, when it found no proxy). Same rule as
         // FMeshChunk::ApplyStream.
         const TSharedPtr<std::atomic<uint64>> Shown = Brick->ShownFrame;
         const uint64 CreatedFrame = Brick->CreatedFrame;
@@ -884,7 +1191,7 @@ bool FVoxelBrickTerrain::IsOnScreen(const FVoxelBrickKey& Key) const
 {
     const FBrick* Brick = Bricks.Find(Key);
     if (!Brick || !Brick->bApplied) return false;
-    if (Brick->bInPage) return Pages->IsShown(Key, Brick->PageVersion);
+    if (Brick->bInPage) return true;                // committed: drawn from the commit's frame
     if (!Brick->Component.IsValid()) return true;   // applied empty: nothing to show
     const uint64 Frame = Brick->ShownFrame.IsValid() ? Brick->ShownFrame->load(std::memory_order_acquire) : 0;
     return Frame != 0 && GFrameCounter >= Frame;
@@ -943,7 +1250,7 @@ int32 FVoxelBrickTerrain::StallOf(const FVoxelBrickKey& Key) const
     if (!Brick) return 1;
     if (!Signature || !Brick->bApplied) return 2;
     if (Brick->Signature != *Signature) return 3;
-    if (!IsOnScreen(Key)) return Brick->bInPage ? 4 : 5;
+    if (!IsOnScreen(Key)) return 4;
     return 0;
 }
 
@@ -1030,14 +1337,12 @@ void FVoxelBrickTerrain::RemoveReplaced()
         if (IsCovered(Candidate.Key, Candidate.Value, &Stall))
             Remove.Add(Candidate.Key);
         else
-            RemovalStalls[FMath::Clamp(Stall, 0, 5)]++;
+            RemovalStalls[FMath::Clamp(Stall, 0, 4)]++;
     }
     RemovalCandidates = Candidates.Num();
     RemovalRemoved = Remove.Num();
     for (const FVoxelBrickKey& Key : Remove)
     {
-        if (Bricks[Key].bInPage)
-            Pages->RemoveBrick(Key);
         DestroyComponent(Bricks[Key]);
         Bricks.Remove(Key);
     }

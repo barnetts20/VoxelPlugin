@@ -85,6 +85,47 @@ namespace
         return !(bPositive && bNegative);
     }
 
+    /** True if lattice samples prove a stitched brick's face region empty: the closed box
+     *  (points 0..N), whose edges are the only ones it emits faces for. Every 4th point
+     *  first, then every 2nd (each point of the box lies within 2 * sqrt(3) and sqrt(3)
+     *  cells of one of them). The extra cell allows for points the mesher samples at a finer
+     *  neighbour's footprint. */
+    bool IsStitchedProvablyEmpty(const FDensitySampleCompositor& Density, const FVector& Min, int32 N, double H, double Slope, int32& InOutSamples)
+    {
+        bool bPositive = false, bNegative = false;
+        for (const int32 Step : { 4, 2 })
+        {
+            const int32 C = N / Step + 1;
+            TArray<double> X, Y, Z;
+            X.SetNumUninitialized(C * C * C);
+            Y.SetNumUninitialized(C * C * C);
+            Z.SetNumUninitialized(C * C * C);
+            int32 n = 0;
+            for (int32 K = 0; K < C; K++)
+                for (int32 J = 0; J < C; J++)
+                    for (int32 I = 0; I < C; I++, n++)
+                    {
+                        X[n] = Min.X + Step * I * H;
+                        Y[n] = Min.Y + Step * J * H;
+                        Z[n] = Min.Z + Step * K * H;
+                    }
+            TArray<float> D;
+            SamplePoints(Density, X, Y, Z, H, D);
+            InOutSamples += D.Num();
+
+            const double Margin = Slope * 0.5 * Step * Sqrt3 * H + H;
+            bool bClear = true;
+            for (const float V : D)
+            {
+                (V < 0.0f ? bNegative : bPositive) = true;
+                bClear &= FMath::Abs((double)V) > Margin;
+            }
+            if (bPositive && bNegative) return false;
+            if (bClear) return true;
+        }
+        return false;
+    }
+
     /** QEF solution in cell units ([0,1] per axis), blended toward the mass point when it
      *  drifts or the planes disagree, as in FAdaptiveOctreeNode::SolveVertex. */
     FVector BlendedVertex(const FQEF& Qef, const FVector& MassPoint)
@@ -658,7 +699,7 @@ bool VoxelBrickMesher::IsBrickProvablyEmpty(const FDensitySampleCompositor& Dens
     BrickGrid.CellsPerBrick = FMath::Max(8, Grid.CellsPerBrick / 4 * 4);
     const int8 Levels[27] = {};
     const FStitcher Stitcher(Density, BrickGrid, Brick, Levels, 0u);
-    return IsProvablyEmpty(Density, Stitcher.BrickMin(), BrickGrid.CellsPerBrick, Grid.CellSize, FMath::Max(SlopeBound, 1.0), InOutSamples);
+    return IsStitchedProvablyEmpty(Density, Stitcher.BrickMin(), BrickGrid.CellsPerBrick, Grid.CellSize, FMath::Max(SlopeBound, 1.0), InOutSamples);
 }
 
 void VoxelBrickMesher::MeshBrickStitched(const FDensitySampleCompositor& Density, const FVoxelBrickGrid& Grid,
@@ -675,7 +716,7 @@ void VoxelBrickMesher::MeshBrickStitched(const FDensitySampleCompositor& Density
     const int32 N = BrickGrid.CellsPerBrick;
     FStitcher Stitcher(Density, BrickGrid, Brick, NeighbourLevels, MeshedNeighbours);
 
-    if (!bNoSkip && IsProvablyEmpty(Density, Stitcher.BrickMin(), N, Grid.CellSize, FMath::Max(SlopeBound, 1.0), OutStats.Samples))
+    if (!bNoSkip && IsStitchedProvablyEmpty(Density, Stitcher.BrickMin(), N, Grid.CellSize, FMath::Max(SlopeBound, 1.0), OutStats.Samples))
     {
         OutStats.bSkipped = true;
         return;

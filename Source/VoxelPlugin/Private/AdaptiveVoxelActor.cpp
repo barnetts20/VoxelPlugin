@@ -7,6 +7,14 @@
 #include "GameFramework/Pawn.h"
 #include "GameFramework/PlayerController.h"
 #include "HAL/IConsoleManager.h"
+#include "VoxelTerrainStats.h"
+
+DECLARE_CYCLE_STAT(TEXT("Actor tick"), STAT_VoxelActorTick, STATGROUP_VoxelTerrain);
+DECLARE_CYCLE_STAT(TEXT("Octree: apply chunks"), STAT_VoxelOctreeApply, STATGROUP_VoxelTerrain);
+DECLARE_CYCLE_STAT(TEXT("Octree: destroy chunks"), STAT_VoxelOctreeDestroy, STATGROUP_VoxelTerrain);
+DECLARE_CYCLE_STAT(TEXT("Octree: data task (worker)"), STAT_VoxelOctreeDataTask, STATGROUP_VoxelTerrain);
+DECLARE_CYCLE_STAT(TEXT("Octree: mesh task (worker)"), STAT_VoxelOctreeMeshTask, STATGROUP_VoxelTerrain);
+DECLARE_CYCLE_STAT(TEXT("Collision tick"), STAT_VoxelCollisionTick, STATGROUP_VoxelTerrain);
 
 static TAutoConsoleVariable<int32> CVarVoxelRenderBricks(
     TEXT("voxel.Render.Bricks"), 1,
@@ -117,7 +125,8 @@ void AAdaptiveVoxelActor::PostEditChangeProperty(FPropertyChangedEvent& Property
         return;
     }
 
-    if (PropName == GET_MEMBER_NAME_CHECKED(AAdaptiveVoxelActor, BrickLodDistanceFactor))
+    if (PropName == GET_MEMBER_NAME_CHECKED(AAdaptiveVoxelActor, BrickLodDistanceFactor)
+        || PropName == GET_MEMBER_NAME_CHECKED(AAdaptiveVoxelActor, BrickCellsPerBrick))
     {
         const double ActorPlanetRadius = GetActorScale3D().GetMax();
         InitializeBrickTerrain(VoxelDensity::RootExtentFor(ActorPlanetRadius, ActorPlanetRadius * NoiseAmplitudeRatio));
@@ -456,6 +465,7 @@ void AAdaptiveVoxelActor::RunDataUpdateTask()
 
     FFunctionGraphTask::CreateAndDispatchWhenReady([WeakThis]()
         {
+            SCOPE_CYCLE_COUNTER(STAT_VoxelOctreeDataTask);
             AAdaptiveVoxelActor* Self = WeakThis.Get();
             if (!Self || Self->IsDestroyed) return;
 
@@ -558,6 +568,7 @@ void AAdaptiveVoxelActor::RunMeshUpdateTask()
 
     FFunctionGraphTask::CreateAndDispatchWhenReady([WeakThis]()
         {
+            SCOPE_CYCLE_COUNTER(STAT_VoxelOctreeMeshTask);
             AAdaptiveVoxelActor* Self = WeakThis.Get();
             if (!Self || Self->IsDestroyed) return;
 
@@ -639,6 +650,7 @@ void AAdaptiveVoxelActor::EnqueueDirtyChunksForApply(const TArray<TSharedPtr<FMe
 
 void AAdaptiveVoxelActor::DrainPendingApply()
 {
+    SCOPE_CYCLE_COUNTER(STAT_VoxelOctreeApply);
     if (!Initialized || IsDestroyed) return;
 
     TArray<TSharedPtr<FMeshChunk>> Queue;
@@ -809,6 +821,7 @@ static bool IsChunkSettled(const FMeshChunk* Chunk)
 
 void AAdaptiveVoxelActor::DrainPendingDestroy()
 {
+    SCOPE_CYCLE_COUNTER(STAT_VoxelOctreeDestroy);
     if (IsDestroyed) return;
 
     TArray<TSharedPtr<FMeshChunk>> ToProcess;
@@ -877,12 +890,13 @@ void AAdaptiveVoxelActor::InitializeBrickTerrain(double RootExtent)
     if (!BrickTerrain.IsValid())
         BrickTerrain = MakeShared<FVoxelBrickTerrain>();
 
-    // 32-cell bricks: level MaxDepth - 5 is a single brick covering the whole root.
+    // Bricks of 2^k cells: level MaxDepth - k is a single brick covering the whole root.
+    const int32 BrickLog2 = FMath::Clamp(FMath::RoundToInt(FMath::Log2((double)FMath::Max(BrickCellsPerBrick, 1))), 3, 6);
     FVoxelBrickTerrainSettings Settings;
     Settings.Origin = FVector(-RootExtent);
     Settings.FinestCell = ActualPrecision;
-    Settings.CellsPerBrick = 32;
-    Settings.MaxLevel = FMath::Max(0, MaxDepth - 5);
+    Settings.CellsPerBrick = 1 << BrickLog2;
+    Settings.MaxLevel = FMath::Max(0, MaxDepth - BrickLog2);
     Settings.LodDistanceFactor = BrickLodDistanceFactor;
     Settings.SlopeBound = CollisionSlopeBound;
     Settings.TriplanarUVScale = 0.0001 * (80000000.0 / FMath::Max(GetActorScale3D().GetMax(), 1.0));
@@ -917,6 +931,7 @@ void AAdaptiveVoxelActor::LogEditHit(const FHitResult& Hit, const FVector& Local
 
 void AAdaptiveVoxelActor::TickCollision(UWorld* World)
 {
+    SCOPE_CYCLE_COUNTER(STAT_VoxelCollisionTick);
     if (!CollisionBricks.IsValid() || !World) return;
 
     TArray<FEditNotice> Notices;
@@ -1015,6 +1030,7 @@ bool AAdaptiveVoxelActor::ShouldTickIfViewportsOnly() const
 
 void AAdaptiveVoxelActor::Tick(float DeltaTime)
 {
+    SCOPE_CYCLE_COUNTER(STAT_VoxelActorTick);
     Super::Tick(DeltaTime);
     if (!Initialized) return;
 

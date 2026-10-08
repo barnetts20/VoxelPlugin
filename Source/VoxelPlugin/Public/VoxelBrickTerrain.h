@@ -39,6 +39,15 @@ struct FVoxelBrickKey
     }
 };
 
+/** One brick change of a GPU page commit (FVoxelBrickPages::Commit). */
+struct FVoxelBrickPageChange
+{
+    FVoxelBrickKey Key;
+    bool bRemove = false;
+    int8 Levels[27] = {};          // neighbour levels relative to the brick (VoxelBrickMesher)
+    uint32 Meshed = 0;             // same-level neighbours that are meshed
+};
+
 /** Inputs of the brick terrain, fixed until the next Initialize. */
 struct FVoxelBrickTerrainSettings
 {
@@ -54,17 +63,24 @@ struct FVoxelBrickTerrainSettings
 
 /** Brick terrain of one terrain actor.
  *
- *  Every TaskInterval a worker task walks the tree from the root brick: a brick is culled
+ *  Every TaskInterval a worker task walks the tree from the root brick, for the camera
+ *  predicted to the time the tree will be on screen: a brick is culled
  *  when its centre sample proves it free of surface, split while the camera is within
- *  LodDistanceFactor brick sizes, and otherwise wanted. The tree is then balanced so that
+ *  LodDistanceFactor brick sizes (1.15 times that if the previous tree split it), and
+ *  otherwise wanted. The tree is then balanced so that
  *  touching leaves differ by at most one level, and each wanted brick is meshed stitched to
  *  its neighbours' levels (VoxelBrickMesher::MeshBrickStitched). Wanted bricks without a
  *  mesh are meshed nearest first within a sample budget; held bricks whose neighbour levels
  *  changed are meshed again.
  *
- *  On the game thread a brick that is no longer wanted stays until the bricks replacing it
- *  are on screen, and a restitched mesh waits until the neighbours it was stitched to are on
- *  screen, so swaps open neither holes nor cracks. */
+ *  CPU backend: on the game thread a brick that is no longer wanted stays until the bricks
+ *  replacing it are on screen, and a restitched mesh waits until the neighbours it was
+ *  stitched to are on screen, so swaps open neither holes nor cracks.
+ *
+ *  GPU backend: each task result is committed to the pages whole, in one frame, once every
+ *  page it touches is ready (FVoxelBrickPages::PrepareCommit), so the tree on screen switches
+ *  from one frame to the next. Only the first fill, with nothing on screen, commits page by
+ *  page. No task starts while a commit waits. */
 class VOXELPLUGIN_API FVoxelBrickTerrain : public TSharedFromThis<FVoxelBrickTerrain>
 {
 public:
@@ -92,7 +108,7 @@ public:
     const FVoxelBrickTerrainSettings& GetSettings() const { return Settings; }
 
     /** Game thread. True if the brick holds a mesh with surface (a component), or on the
-     *  GPU backend may hold surface (a page member). */
+     *  GPU backend may hold surface (a member of a page, as committed). */
     bool HoldsSurface(const FVoxelBrickKey& Key) const;
 
     /** Debug vertex colour of a level (voxel.Debug.ChunkColor). */
@@ -108,22 +124,21 @@ private:
          *  component can be on screen, 0 until then. */
         TSharedPtr<std::atomic<uint64>> ShownFrame;
         uint64 CreatedFrame = 0;
-        /** Neighbour levels and seam mode the applied mesh was built for, and the pending one. */
+        /** Neighbour levels and seam mode the applied (GPU: committed) mesh was built for, and
+         *  the pending one. */
         uint64 Signature = 0;
         uint64 PendingSignature = 0;
         /** The pending mesh is stitched to these bricks and waits until they are on screen. */
         TArray<FVoxelBrickKey> WaitFor;
         bool bHasPending = false;
-        bool bApplied = false;        // a mesh (or, empty, nothing) has been applied
+        bool bApplied = false;        // a mesh (or, empty, nothing) has been applied or committed
         bool bHasSection = false;
         bool bDirty = false;
         bool bProvenEmpty = false;    // the newest mesh is empty by the empty test
-        /** GPU backend: the pending entry is neighbour levels for a page, not a mesh. */
-        bool bPendingGPU = false;
-        bool bInPage = false;         // a member of a GPU page
-        uint64 PageVersion = 0;       // the first page version that showed it (FVoxelBrickPages::IsShown)
-        int8 PendingLevels[27] = {};
-        uint32 PendingMeshed = 0;
+        /** GPU backend: a page member as committed, and built by the pending result (meshed
+         *  again at the commit even if its signature is unchanged). */
+        bool bInPage = false;
+        bool bRemesh = false;
     };
 
     struct FBuilt
@@ -133,9 +148,7 @@ private:
         uint64 Signature = 0;
         TArray<FVoxelBrickKey> Neighbours;    // wanted bricks touching it
         bool bProvenEmpty = false;            // the empty test skipped it
-        bool bGPU = false;                    // GPU backend: Levels and Meshed instead of a stream
-        int8 Levels[27] = {};
-        uint32 Meshed = 0;
+        bool bGPU = false;                    // GPU backend: tested only, meshed by the pages
     };
 
     struct FTaskInput
@@ -145,6 +158,7 @@ private:
         TMap<FVoxelBrickKey, uint64> Known;   // held bricks and the signature of their newest mesh
         TArray<FVoxelBrickKey> Rebuild;
         TSet<FVoxelBrickKey> ProvenEmpty;     // held bricks whose newest mesh the empty test skipped
+        TMap<FVoxelBrickKey, uint64> PrevWanted;   // the latest tree (merge hysteresis)
         int32 SeamMode = 0;
         int32 Backend = 0;                    // 0 CPU meshes, 1 GPU pages
         TSharedPtr<FDensitySampleCompositor> Density;
@@ -165,6 +179,7 @@ private:
         int32 NumRestitchedEmpty = 0;
         int64 Samples = 0;
         double Milliseconds = 0.0;
+        double TreeMilliseconds = 0.0;        // the descent and the balance
     };
 
     struct FRecentEdit
@@ -180,22 +195,33 @@ private:
     bool IsOnScreen(const FVoxelBrickKey& Key) const;
     /** Wanted, on screen, and showing a mesh stitched to the current tree. */
     bool IsSettled(const FVoxelBrickKey& Key) const;
-    /** Why a brick is not settled (debug counts): 0 settled, 1 not held, 2 not wanted or not
-     *  applied, 3 stitched to other neighbours, 4 in a GPU page not yet drawn, 5 on a component
-     *  not yet drawn. */
+    /** Why a brick is not settled (CPU backend, debug counts): 0 settled, 1 not held, 2 not
+     *  wanted or not applied, 3 stitched to other neighbours, 4 on a component not yet drawn. */
     int32 StallOf(const FVoxelBrickKey& Key) const;
     void TouchingWanted(const FVoxelBrickKey& Key, TArray<FVoxelBrickKey>& Out) const;
     bool IsCovered(const FVoxelBrickKey& Key, const TArray<FVoxelBrickKey>& Descendants, int32* OutStall = nullptr) const;
 
     void DrainResults();
+    /** CPU backend. */
     void ApplyQueued();
     void RemoveReplaced();
+    /** GPU backend: commits PendingChanges when their pages are ready. */
+    void CommitPages();
+    /** The page changes from the committed tree to Wanted. */
+    void BuildCommit(TArray<FVoxelBrickPageChange>& Out) const;
+    /** Records committed changes on the bricks. */
+    void ApplyCommitted(TConstArrayView<FVoxelBrickPageChange> Changes);
     bool EnsureComponent(const FVoxelBrickKey& Key, FBrick& Brick);
     static void DestroyComponent(FBrick& Brick);
     /** The backend voxel.Render.BrickBackend asks for, if this terrain can run it. */
     int32 ResolveBackend();
-    /** GPU backend: sends page changes with the current density and edits. */
-    void FlushPages();
+    /** voxel.Debug.BrickPerf: once a second, logs and resets Perf. */
+    void LogPerf(double Now);
+    /** GPU backend: hands the pages the current density and edits, and the camera with the
+     *  morph slack the tree's latency calls for. */
+    void FlushPages(double TaskInterval);
+    /** CPU backend: a brick a pending mesh is stitched to is on screen (or no longer wanted). */
+    bool IsNeighbourReady(const FVoxelBrickKey& Key) const;
 
     TWeakObjectPtr<AActor> Owner;
     TWeakObjectPtr<USceneComponent> AttachRoot;
@@ -220,14 +246,47 @@ private:
      *  the kept ones by the first StallOf reason that blocked them. */
     int32 RemovalCandidates = 0;
     int32 RemovalRemoved = 0;
-    int32 RemovalStalls[6] = {};
+    int32 RemovalStalls[5] = {};
+
+    /** GPU backend: Wanted waits to be committed since CommitPendingFrame, with the changes
+     *  left (page by page when progressive); page members as committed; the wait, filtered. */
+    bool bCommitPending = false;
+    bool bCommitProgressive = false;
+    uint64 CommitPendingFrame = 0;
+    TArray<FVoxelBrickPageChange> PendingChanges;
+    int32 NumInPage = 0;
+    double CommitWaitSeconds = 0.0;
 
     int32 Backend = 0;
+    FVector LastCamera = FVector::ZeroVector;   // the latest Tick's camera (actor-local)
+    /** Camera motion, filtered, for the task's camera prediction and the morph slack. */
+    FVector CameraVelocity = FVector::ZeroVector;
+    double LastTickTime = 0.0;
+    double FrameSeconds = 1.0 / 60.0;
+    double TaskSeconds = 0.0;      // a task's run time, filtered
+    double TreeLatency = 0.0;      // seconds from a task's launch until its tree is drawn
     TUniquePtr<FVoxelBrickPages> Pages;
     TSharedPtr<const FVoxelDensityGPUData> GPUDensity;
     TSharedPtr<const FVoxelEditGPUData> GPUEdits;
     uint32 GPUEditsSequence = 0;
     bool bWarnedBackend = false;
+
+    /** Time spent since the last voxel.Debug.BrickPerf line. Sections: drain, apply (GPU:
+     *  commit), remove, flush pages, launch. */
+    struct FPerf
+    {
+        double Start = 0.0;
+        int32 Frames = 0;
+        double SectionMs[5] = {};
+        double MaxSectionMs[5] = {};
+        int32 Tasks = 0;
+        double TaskMs = 0.0;
+        double MaxTaskMs = 0.0;
+        double TreeMs = 0.0;
+        int64 TaskSamples = 0;
+        int32 TaskBuilt = 0;
+    };
+    FPerf Perf;
 
     std::atomic<bool> bTaskRunning{ false };
     FCriticalSection ResultCS;

@@ -3,24 +3,34 @@
 // the same passes in sequence. The dispatcher is VoxelBrickMesherGPU.cpp.
 //
 // Per batch of bricks, in order:
-//   Sample (mode 0)   density on each brick's own lattice (points -2..N+1)
+//   Sample (mode 0)   density on each brick's own lattice (points 0..N)
 //   Edges             minimal edges of the brick's level that it emits; marks their cells
 //   Request (mode 0)  edge ends of marked cells off the own lattice, into a per-brick hash
 //   Sample (mode 1)   those points
 //   Request (mode 1)  gradient points of crossed edges off the own lattice
 //   Sample (mode 1)   those points
-//   Solve             one vertex per marked cell
+//   Solve             one vertex per marked cell; marks the cell's parent (morph target)
 //   Triangles         faces to triangles (a quad, or a triangle where a coarser cell covers
 //                     two quadrants)
+//   TargetRequest (0) corners of marked parents, into a second hash with their level
+//   Sample (mode 2)   those points, at the parent's footprint
+//   TargetRequest (1) gradient points of their crossed edges
+//   Sample (mode 2)   those points
+//   TargetSolve       each parent's vertex, as the brick one level coarser solves it
+//   VertexTargets     copies each vertex's parent vertex into its record
 // All densities come from one function in one pass, so a point shared by two bricks gets the
-// same value in both.
+// same value in both, and a parent vertex here equals that cell's vertex in the coarser brick.
+//
+// Morph targets (geomorphing): a vertex of a cell of level l also carries the vertex of the
+// cell of level l + 1 containing it. VoxelBrickPageGPU.usf blends toward it with distance so
+// that the mesh matches the coarser level wherever the LOD may switch to it.
 //
 // Inputs, declared by the includer after VoxelBrickStitch.ush (which defines
 // FVoxelMesherBrick), besides those of VoxelDensitySample.ush and VoxelEditSample.ush:
 //   StructuredBuffer<FVoxelMesherBrick> Bricks;
 //   int CellsPerBrick; uint NumBricks; uint HashSize (power of two); uint FaceCap;
 //   uint VertexCap; uint TriangleCap; float FinestCell; float MinFootprint;
-//   RWStructuredBuffer<float> Dense;        NumBricks * (N+4)^3
+//   RWStructuredBuffer<float> Dense;        NumBricks * (N+1)^3
 //   RWStructuredBuffer<uint> HashKeys;      NumBricks * HashSize, 0 = empty
 //   RWStructuredBuffer<uint> HashValues;    density bits, 0xffffffff until sampled
 //   RWStructuredBuffer<uint> SlotState;     NumBricks * slots, 1 = cell needs a vertex
@@ -28,9 +38,17 @@
 //   RWStructuredBuffer<uint> Faces;         NumBricks * FaceCap * 4 cell slots (bit 31 of the
 //                                           first: flip)
 //   RWStructuredBuffer<uint> Counters;      per brick: faces, vertices, triangles, error bits
-//   RWStructuredBuffer<float> Vertices;     NumBricks * VertexCap * 6 (position cm from the
-//                                           brick min, normal)
+//   RWStructuredBuffer<float> Vertices;     NumBricks * VertexCap * VoxelMesherVertexStride:
+//                                           position cm from the brick min, normal, target
+//                                           position, target normal, level of the cell
+//                                           relative to the brick (0 or 1), pad
 //   RWStructuredBuffer<uint> Indices;       NumBricks * TriangleCap * 3
+//   uint TargetHashSize (power of two);
+//   RWStructuredBuffer<uint> TargetState;   NumBricks * targets: 1 needed, 2 solved, 3 no
+//                                           crossing (each vertex projects onto the parent's
+//                                           trilinear field)
+//   RWStructuredBuffer<float> TargetData;   NumBricks * targets * 6: vertex (units), normal
+//   RWStructuredBuffer<uint> TargetHashKeys, TargetHashValues;   NumBricks * TargetHashSize
 
 #ifndef VOXEL_BRICK_MESHER_PASSES_USH
 #define VOXEL_BRICK_MESHER_PASSES_USH
@@ -42,6 +60,7 @@ static const uint VoxelMesherErrorVertices = 8u;
 static const uint VoxelMesherErrorTriangles = 16u;
 static const uint VoxelMesherUnsampled = 0xffffffffu;
 static const uint VoxelMesherNone = 0xffffffffu;
+static const uint VoxelMesherVertexStride = 14u;
 
 VOXEL_FUNC FVoxelStitchBrick VoxelMesherStitchBrick(uint B)
 {
@@ -54,7 +73,9 @@ VOXEL_FUNC FVoxelStitchBrick VoxelMesherStitchBrick(uint B)
     return S;
 }
 
-VOXEL_FUNC uint VoxelMesherDenseSide() { return uint(CellsPerBrick + 4); }
+// The own lattice, points 0..N. Points around it (neighbour cells, gradient points at the
+// faces) are requested and sampled only where a crossing needs them.
+VOXEL_FUNC uint VoxelMesherDenseSide() { return uint(CellsPerBrick + 1); }
 VOXEL_FUNC uint VoxelMesherDenseTotal() { const uint D = VoxelMesherDenseSide(); return D * D * D; }
 VOXEL_FUNC uint VoxelMesherOwnSide() { return uint(CellsPerBrick + 2); }
 VOXEL_FUNC uint VoxelMesherCoarseSide() { return uint(CellsPerBrick / 2 + 2); }
@@ -92,16 +113,132 @@ VOXEL_FUNC FVoxelStitchCell VoxelMesherCellOf(uint Slot)
     return C;
 }
 
+VOXEL_FUNC uint VoxelMesherHashStartOf(uint Key, uint Size)
+{
+    return ((Key * 2654435761u) >> 12u) & (Size - 1u);
+}
+
+VOXEL_FUNC uint VoxelMesherHashStart(uint Key)
+{
+    return VoxelMesherHashStartOf(Key, HashSize);
+}
+
+// Morph targets: parents of own cells (level +1, 4 units, the coarse grid) and of coarse
+// cells (level +2, 8 units).
+VOXEL_FUNC uint VoxelMesherTargetSide1() { return uint(CellsPerBrick / 2 + 2); }
+VOXEL_FUNC uint VoxelMesherTargetSide2() { return uint(CellsPerBrick / 4 + 2); }
+VOXEL_FUNC uint VoxelMesherTargets1() { const uint S = VoxelMesherTargetSide1(); return S * S * S; }
+VOXEL_FUNC uint VoxelMesherNumTargets() { const uint S = VoxelMesherTargetSide2(); return VoxelMesherTargets1() + S * S * S; }
+
+VOXEL_FUNC uint VoxelMesherTargetOf(FVoxelStitchCell C)
+{
+    if (C.Level == 0)
+    {
+        const uint S = VoxelMesherTargetSide1();
+        return (uint(VoxelFloorTo(C.Min.z, 4) / 4 + 1) * S + uint(VoxelFloorTo(C.Min.y, 4) / 4 + 1)) * S + uint(VoxelFloorTo(C.Min.x, 4) / 4 + 1);
+    }
+    const uint T = VoxelMesherTargetSide2();
+    return VoxelMesherTargets1() + (uint(VoxelFloorTo(C.Min.z, 8) / 8 + 1) * T + uint(VoxelFloorTo(C.Min.y, 8) / 8 + 1)) * T + uint(VoxelFloorTo(C.Min.x, 8) / 8 + 1);
+}
+
+VOXEL_FUNC FVoxelStitchCell VoxelMesherTargetCell(uint Target)
+{
+    FVoxelStitchCell C;
+    if (Target < VoxelMesherTargets1())
+    {
+        const uint S = VoxelMesherTargetSide1();
+        C.Level = 1;
+        C.Size = 4;
+        C.Min = int3(4 * (int(Target % S) - 1), 4 * (int((Target / S) % S) - 1), 4 * (int(Target / (S * S)) - 1));
+        return C;
+    }
+    const uint T = VoxelMesherTargetSide2();
+    const uint R = Target - VoxelMesherTargets1();
+    C.Level = 2;
+    C.Size = 8;
+    C.Min = int3(8 * (int(R % T) - 1), 8 * (int((R / T) % T) - 1), 8 * (int(R / (T * T)) - 1));
+    return C;
+}
+
+// Lower end of edge e (0..11) of a cell with no finer neighbour: axis e / 4, in the order
+// VoxelStitchCellEdge gives its whole edges.
+VOXEL_FUNC int3 VoxelMesherRegularEdgeLo(FVoxelStitchCell C, int e)
+{
+    const int Axis = e / 4;
+    const int Corner = e % 4;
+    return VoxelAddAxis(VoxelAddAxis(C.Min, (Axis + 1) % 3, (Corner & 1) * C.Size), (Axis + 2) % 3, (Corner >> 1) * C.Size);
+}
+
+// Target points are multiples of 4 units; the key holds P / 4 (8 bits per axis, offset 8)
+// and the level the point is sampled at.
+VOXEL_FUNC uint VoxelMesherTargetKey(int3 P, int Tag)
+{
+    return (uint(P.x / 4 + 8) | (uint(P.y / 4 + 8) << 8u) | (uint(P.z / 4 + 8) << 16u) | (uint(Tag) << 24u)) + 1u;
+}
+
+VOXEL_FUNC int3 VoxelMesherTargetKeyPoint(uint Key)
+{
+    const uint K = Key - 1u;
+    return int3(4 * (int(K & 255u) - 8), 4 * (int((K >> 8u) & 255u) - 8), 4 * (int((K >> 16u) & 255u) - 8));
+}
+
+VOXEL_FUNC int VoxelMesherTargetKeyTag(uint Key)
+{
+    return int(((Key - 1u) >> 24u) & 255u);
+}
+
+VOXEL_FUNC void VoxelMesherTargetRequest(uint B, int3 P, int Tag)
+{
+    const uint Key = VoxelMesherTargetKey(P, Tag);
+    uint H = VoxelMesherHashStartOf(Key, TargetHashSize);
+    for (uint i = 0u; i < TargetHashSize; i++)
+    {
+        uint Previous = 0u;
+        InterlockedCompareExchange(TargetHashKeys[B * TargetHashSize + H], 0u, Key, Previous);
+        if (Previous == 0u || Previous == Key) return;
+        H = (H + 1u) & (TargetHashSize - 1u);
+    }
+    InterlockedOr(Counters[B * 4u + 3u], VoxelMesherErrorHash);
+}
+
+VOXEL_FUNC float VoxelMesherTargetSampleAt(uint B, int3 P, int Tag)
+{
+    const uint Key = VoxelMesherTargetKey(P, Tag);
+    uint H = VoxelMesherHashStartOf(Key, TargetHashSize);
+    for (uint i = 0u; i < TargetHashSize; i++)
+    {
+        const uint Stored = TargetHashKeys[B * TargetHashSize + H];
+        if (Stored == Key)
+        {
+            const uint Value = TargetHashValues[B * TargetHashSize + H];
+            if (Value != VoxelMesherUnsampled) return asfloat(Value);
+            break;
+        }
+        if (Stored == 0u) break;
+        H = (H + 1u) & (TargetHashSize - 1u);
+    }
+    InterlockedOr(Counters[B * 4u + 3u], VoxelMesherErrorMissing);
+    return 0.0f;
+}
+
+VOXEL_FUNC float3 VoxelMesherTargetGradient(uint B, int3 P, int Step, int Tag)
+{
+    return float3(
+        VoxelMesherTargetSampleAt(B, P + int3(Step, 0, 0), Tag) - VoxelMesherTargetSampleAt(B, P - int3(Step, 0, 0), Tag),
+        VoxelMesherTargetSampleAt(B, P + int3(0, Step, 0), Tag) - VoxelMesherTargetSampleAt(B, P - int3(0, Step, 0), Tag),
+        VoxelMesherTargetSampleAt(B, P + int3(0, 0, Step), Tag) - VoxelMesherTargetSampleAt(B, P - int3(0, 0, Step), Tag));
+}
+
 VOXEL_FUNC bool VoxelMesherIsDense(int3 P)
 {
-    const int Hi = 2 * CellsPerBrick + 2;
-    return ((P.x | P.y | P.z) & 1) == 0 && P.x >= -4 && P.y >= -4 && P.z >= -4 && P.x <= Hi && P.y <= Hi && P.z <= Hi;
+    const int Hi = 2 * CellsPerBrick;
+    return ((P.x | P.y | P.z) & 1) == 0 && P.x >= 0 && P.y >= 0 && P.z >= 0 && P.x <= Hi && P.y <= Hi && P.z <= Hi;
 }
 
 VOXEL_FUNC uint VoxelMesherDenseIndex(uint B, int3 P)
 {
     const uint D = VoxelMesherDenseSide();
-    return B * VoxelMesherDenseTotal() + (uint((P.z + 4) / 2) * D + uint((P.y + 4) / 2)) * D + uint((P.x + 4) / 2);
+    return B * VoxelMesherDenseTotal() + (uint(P.z / 2) * D + uint(P.y / 2)) * D + uint(P.x / 2);
 }
 
 // 10 bits per axis, offset 256: points -8..2N+8 fit for N up to 250 (the dispatcher allows 64).
@@ -114,11 +251,6 @@ VOXEL_FUNC int3 VoxelMesherKeyPoint(uint Key)
 {
     const uint K = Key - 1u;
     return int3(int(K & 1023u) - 256, int((K >> 10u) & 1023u) - 256, int((K >> 20u) & 1023u) - 256);
-}
-
-VOXEL_FUNC uint VoxelMesherHashStart(uint Key)
-{
-    return ((Key * 2654435761u) >> 12u) & (HashSize - 1u);
 }
 
 VOXEL_FUNC void VoxelMesherRequest(uint B, int3 P)
@@ -175,16 +307,17 @@ VOXEL_FUNC int3 VoxelMesherLatticeIndex(uint B, int3 P)
     return int3(Brick.MinIndex.x + P.x * Scale, Brick.MinIndex.y + P.y * Scale, Brick.MinIndex.z + P.z * Scale);
 }
 
-// The density of a point, band-limited to the cell size of the leaf owning it, with edits.
-VOXEL_FUNC float VoxelMesherDensity(uint B, int3 P)
+// The density of a point band-limited to the cell size of level Level, with edits.
+VOXEL_FUNC float VoxelMesherDensity(uint B, int3 P, int Level)
 {
-    const int Owner = VoxelStitchOwnerLevel(VoxelMesherStitchBrick(B), P.x, P.y, P.z);
-    const float Footprint = max(ldexp(FinestCell, Bricks[B].Level + Owner), MinFootprint);
+    const float Footprint = max(ldexp(FinestCell, Level), MinFootprint);
     const int3 Index = VoxelMesherLatticeIndex(B, P);
     return VoxelSampleDensityDF(Index.x, Index.y, Index.z, Footprint) + VoxelEditDelta(Index.x, Index.y, Index.z);
 }
 
-// Mode 0: the own lattice of every brick. Mode 1: requested points not sampled yet.
+// Mode 0: the own lattice of every brick. Mode 1: requested points not sampled yet. Points
+// are band-limited to the cell size of the leaf owning them. Mode 2: requested target
+// points, band-limited to the level they were requested at.
 // The density is evaluated at a single call site: two inlined copies could be compiled with
 // different rounding (fused multiply-adds), and a point sampled on one brick's lattice and on
 // another brick's hash must get the same value.
@@ -192,29 +325,43 @@ VOXEL_FUNC void VoxelMesherSamplePass(uint Id, uint Mode)
 {
     uint B = 0u;
     int3 P = int3(0, 0, 0);
+    int Level = 0;
     if (Mode == 0u)
     {
         if (Id >= NumBricks * VoxelMesherDenseTotal()) return;
         B = Id / VoxelMesherDenseTotal();
         const uint I = Id % VoxelMesherDenseTotal();
         const uint D = VoxelMesherDenseSide();
-        P = int3(2 * int(I % D) - 4, 2 * int((I / D) % D) - 4, 2 * int(I / (D * D)) - 4);
+        P = int3(2 * int(I % D), 2 * int((I / D) % D), 2 * int(I / (D * D)));
+        Level = Bricks[B].Level + VoxelStitchOwnerLevel(VoxelMesherStitchBrick(B), P.x, P.y, P.z);
     }
-    else
+    else if (Mode == 1u)
     {
         if (Id >= NumBricks * HashSize) return;
         const uint Key = HashKeys[Id];
         if (Key == 0u || HashValues[Id] != VoxelMesherUnsampled) return;
         B = Id / HashSize;
         P = VoxelMesherKeyPoint(Key);
+        Level = Bricks[B].Level + VoxelStitchOwnerLevel(VoxelMesherStitchBrick(B), P.x, P.y, P.z);
+    }
+    else
+    {
+        if (Id >= NumBricks * TargetHashSize) return;
+        const uint Key = TargetHashKeys[Id];
+        if (Key == 0u || TargetHashValues[Id] != VoxelMesherUnsampled) return;
+        B = Id / TargetHashSize;
+        P = VoxelMesherTargetKeyPoint(Key);
+        Level = Bricks[B].Level + VoxelMesherTargetKeyTag(Key);
     }
 
-    const float Density = VoxelMesherDensity(B, P);
+    const float Density = VoxelMesherDensity(B, P, Level);
 
     if (Mode == 0u)
         Dense[Id] = Density;
-    else
+    else if (Mode == 1u)
         HashValues[Id] = asuint(Density);
+    else
+        TargetHashValues[Id] = asuint(Density);
 }
 
 // One candidate edge of a brick's level touching the brick: lower end at cells 0..N-1 along
@@ -368,19 +515,29 @@ VOXEL_FUNC void VoxelMesherSolvePass(uint Id)
         return;
     }
     const float Unit = ldexp(FinestCell, Bricks[B].Level - 1);
-    const uint Base = (B * VertexCap + V) * 6u;
+    const uint Base = (B * VertexCap + V) * VoxelMesherVertexStride;
     Vertices[Base] = Local.x * Unit;
     Vertices[Base + 1u] = Local.y * Unit;
     Vertices[Base + 2u] = Local.z * Unit;
     Vertices[Base + 3u] = VertexNormal.x;
     Vertices[Base + 4u] = VertexNormal.y;
     Vertices[Base + 5u] = VertexNormal.z;
+    // The target until VertexTargets sets it.
+    Vertices[Base + 6u] = Local.x * Unit;
+    Vertices[Base + 7u] = Local.y * Unit;
+    Vertices[Base + 8u] = Local.z * Unit;
+    Vertices[Base + 9u] = VertexNormal.x;
+    Vertices[Base + 10u] = VertexNormal.y;
+    Vertices[Base + 11u] = VertexNormal.z;
+    Vertices[Base + 12u] = float(Cell.Level);
+    Vertices[Base + 13u] = 0.0f;
     SlotVertex[Id] = V;
+    TargetState[B * VoxelMesherNumTargets() + VoxelMesherTargetOf(Cell)] = 1u;
 }
 
 VOXEL_FUNC float3 VoxelMesherVertexPosition(uint B, uint V)
 {
-    const uint Base = (B * VertexCap + V) * 6u;
+    const uint Base = (B * VertexCap + V) * VoxelMesherVertexStride;
     return float3(Vertices[Base], Vertices[Base + 1u], Vertices[Base + 2u]);
 }
 
@@ -454,6 +611,170 @@ VOXEL_FUNC void VoxelMesherTrianglesPass(uint Id)
         VoxelMesherEmitTriangle(B, Ring[0], Ring[1], Ring[2], bFlip);
         VoxelMesherEmitTriangle(B, Ring[0], Ring[2], Ring[3], bFlip);
     }
+}
+
+// Mode 0: the corners of every needed parent cell. Mode 1: the gradient points of its crossed
+// edges. Each point at the parent's level.
+VOXEL_FUNC void VoxelMesherTargetRequestPass(uint Id, uint Mode)
+{
+    if (Id >= NumBricks * VoxelMesherNumTargets() || TargetState[Id] == 0u) return;
+    const uint B = Id / VoxelMesherNumTargets();
+    const FVoxelStitchCell Cell = VoxelMesherTargetCell(Id % VoxelMesherNumTargets());
+    const int S = Cell.Size;
+    if (Mode == 0u)
+    {
+        for (int c = 0; c < 8; c++)
+            VoxelMesherTargetRequest(B, Cell.Min + int3((c & 1) * S, ((c >> 1) & 1) * S, (c >> 2) * S), Cell.Level);
+        return;
+    }
+    VOXEL_LOOP
+    for (int e = 0; e < 12; e++)
+    {
+        const int3 Lo = VoxelMesherRegularEdgeLo(Cell, e);
+        const int3 Hi = VoxelAddAxis(Lo, e / 4, S);
+        if ((VoxelMesherTargetSampleAt(B, Lo, Cell.Level) < 0.0f) == (VoxelMesherTargetSampleAt(B, Hi, Cell.Level) < 0.0f)) continue;
+        VOXEL_LOOP
+        for (int Axis = 0; Axis < 3; Axis++)
+        {
+            const int3 Step = VoxelSetAxis(int3(0, 0, 0), Axis, S);
+            VoxelMesherTargetRequest(B, Lo + Step, Cell.Level);
+            VoxelMesherTargetRequest(B, Lo - Step, Cell.Level);
+            VoxelMesherTargetRequest(B, Hi + Step, Cell.Level);
+            VoxelMesherTargetRequest(B, Hi - Step, Cell.Level);
+        }
+    }
+}
+
+// A parent cell's vertex as VoxelMesherSolvePass computes it in the brick of the parent's
+// level when no finer cell touches it: the same edges in the same order, the same samples.
+// Without a crossing the state is 3 and VoxelMesherVertexTargetsPass places each vertex.
+VOXEL_FUNC void VoxelMesherTargetSolvePass(uint Id)
+{
+    if (Id >= NumBricks * VoxelMesherNumTargets() || TargetState[Id] == 0u) return;
+    const uint B = Id / VoxelMesherNumTargets();
+    const FVoxelStitchCell Cell = VoxelMesherTargetCell(Id % VoxelMesherNumTargets());
+    const float S = float(Cell.Size);
+
+    FVoxelQef Q = VoxelQefBegin();
+    VOXEL_LOOP
+    for (int e = 0; e < 12; e++)
+    {
+        const int3 Lo = VoxelMesherRegularEdgeLo(Cell, e);
+        const int Axis = e / 4;
+        const int3 Hi = VoxelAddAxis(Lo, Axis, Cell.Size);
+        const float D0 = VoxelMesherTargetSampleAt(B, Lo, Cell.Level);
+        const float D1 = VoxelMesherTargetSampleAt(B, Hi, Cell.Level);
+        if ((D0 < 0.0f) == (D1 < 0.0f)) continue;
+
+        const float Denominator = D0 - D1;
+        const float T = abs(Denominator) < 1.0e-12f ? 0.5f : saturate(D0 / Denominator);
+        const float3 P = VoxelAddAxisF(VoxelToFloat3(Lo - Cell.Min), Axis, T * float(Cell.Size)) / S;
+
+        const float3 G0 = VoxelMesherTargetGradient(B, Lo, Cell.Size, Cell.Level);
+        const float3 G1 = VoxelMesherTargetGradient(B, Hi, Cell.Size, Cell.Level);
+        float3 Normal = G0 + (G1 - G0) * T;
+        const float NormalLengthSq = dot(Normal, Normal);
+        if (NormalLengthSq > 1.0e-8f)
+            Normal = Normal / sqrt(NormalLengthSq);
+        else
+        {
+            const int3 Index = VoxelMesherLatticeIndex(B, Lo);
+            const float3 Radial = float3(float(Index.x), float(Index.y), float(Index.z));
+            Normal = Radial / max(length(Radial), 1.0e-6f);
+        }
+        Q = VoxelQefAdd(Q, P, Normal);
+    }
+
+    const uint Base = Id * 6u;
+    if (Q.Count == 0)
+    {
+        const float3 Centre = VoxelToFloat3(Cell.Min) + float3(0.5f * S, 0.5f * S, 0.5f * S);
+        TargetData[Base] = Centre.x;
+        TargetData[Base + 1u] = Centre.y;
+        TargetData[Base + 2u] = Centre.z;
+        TargetState[Id] = 3u;
+        return;
+    }
+    const float3 Local = VoxelToFloat3(Cell.Min) + VoxelQefVertex(Q) * S;
+    float3 VertexNormal = Q.NormalSum;
+    const float VertexLengthSq = dot(VertexNormal, VertexNormal);
+    if (VertexLengthSq > 1.0e-8f)
+        VertexNormal = VertexNormal / sqrt(VertexLengthSq);
+    else
+    {
+        const int3 Index = VoxelMesherLatticeIndex(B, int3(Cell.Min.x, Cell.Min.y, Cell.Min.z));
+        const float3 Radial = float3(float(Index.x), float(Index.y), float(Index.z));
+        VertexNormal = Radial / max(length(Radial), 1.0e-6f);
+    }
+    TargetData[Base] = Local.x;
+    TargetData[Base + 1u] = Local.y;
+    TargetData[Base + 2u] = Local.z;
+    TargetData[Base + 3u] = VertexNormal.x;
+    TargetData[Base + 4u] = VertexNormal.y;
+    TargetData[Base + 5u] = VertexNormal.z;
+    TargetState[Id] = 2u;
+}
+
+// Each solved cell's parent vertex into its vertex record (cm from the brick min).
+//
+// A parent without a crossing has no vertex at the coarser level: the surface there is detail
+// the coarser lattice doesn't see. The vertex then moves onto the zero set of the parent's
+// trilinear field (one Newton step from its own position, at most a parent cell), so the
+// detail flattens onto the coarser surface instead of collapsing to a point.
+VOXEL_FUNC void VoxelMesherVertexTargetsPass(uint Id)
+{
+    if (Id >= NumBricks * VoxelMesherNumSlots()) return;
+    const uint V = SlotVertex[Id];
+    if (V == VoxelMesherNone || V >= VertexCap) return;
+    const uint B = Id / VoxelMesherNumSlots();
+    const FVoxelStitchCell Cell = VoxelMesherCellOf(Id % VoxelMesherNumSlots());
+    const uint TargetSlot = VoxelMesherTargetOf(Cell);
+    const uint Target = B * VoxelMesherNumTargets() + TargetSlot;
+    const uint State = TargetState[Target];
+    if (State < 2u) return;
+
+    const float Unit = ldexp(FinestCell, Bricks[B].Level - 1);
+    const uint Base = (B * VertexCap + V) * VoxelMesherVertexStride;
+    if (State == 2u)
+    {
+        Vertices[Base + 6u] = TargetData[Target * 6u] * Unit;
+        Vertices[Base + 7u] = TargetData[Target * 6u + 1u] * Unit;
+        Vertices[Base + 8u] = TargetData[Target * 6u + 2u] * Unit;
+        Vertices[Base + 9u] = TargetData[Target * 6u + 3u];
+        Vertices[Base + 10u] = TargetData[Target * 6u + 4u];
+        Vertices[Base + 11u] = TargetData[Target * 6u + 5u];
+        return;
+    }
+
+    const FVoxelStitchCell Parent = VoxelMesherTargetCell(TargetSlot);
+    const float S = float(Parent.Size);
+    float D[8];
+    for (int c = 0; c < 8; c++)
+        D[c] = VoxelMesherTargetSampleAt(B, Parent.Min + int3((c & 1) * Parent.Size, ((c >> 1) & 1) * Parent.Size, (c >> 2) * Parent.Size), Parent.Level);
+    const float3 Own = float3(Vertices[Base], Vertices[Base + 1u], Vertices[Base + 2u]) / Unit;
+    const float3 U = (Own - VoxelToFloat3(Parent.Min)) / S;
+    const float X0 = 1.0f - U.x;
+    const float Y0 = 1.0f - U.y;
+    const float Z0 = 1.0f - U.z;
+    const float F = Z0 * (Y0 * (X0 * D[0] + U.x * D[1]) + U.y * (X0 * D[2] + U.x * D[3]))
+        + U.z * (Y0 * (X0 * D[4] + U.x * D[5]) + U.y * (X0 * D[6] + U.x * D[7]));
+    const float3 G = float3(
+        Z0 * (Y0 * (D[1] - D[0]) + U.y * (D[3] - D[2])) + U.z * (Y0 * (D[5] - D[4]) + U.y * (D[7] - D[6])),
+        Z0 * (X0 * (D[2] - D[0]) + U.x * (D[3] - D[1])) + U.z * (X0 * (D[6] - D[4]) + U.x * (D[7] - D[5])),
+        Y0 * (X0 * (D[4] - D[0]) + U.x * (D[5] - D[1])) + U.y * (X0 * (D[6] - D[2]) + U.x * (D[7] - D[3])));
+    const float GG = dot(G, G);
+    if (GG < 1.0e-12f) return;
+    float3 Step = G * (-F / GG);
+    const float StepLength = length(Step);
+    if (StepLength > 1.0f) Step = Step / StepLength;
+    const float3 Moved = Own + Step * S;
+    const float3 Normal = G / sqrt(GG);
+    Vertices[Base + 6u] = Moved.x * Unit;
+    Vertices[Base + 7u] = Moved.y * Unit;
+    Vertices[Base + 8u] = Moved.z * Unit;
+    Vertices[Base + 9u] = Normal.x;
+    Vertices[Base + 10u] = Normal.y;
+    Vertices[Base + 11u] = Normal.z;
 }
 
 #endif // VOXEL_BRICK_MESHER_PASSES_USH

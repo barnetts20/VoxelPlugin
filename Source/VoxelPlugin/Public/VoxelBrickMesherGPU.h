@@ -53,10 +53,20 @@ namespace VoxelBrickMesherGPU
     /** Bricks per MeshBricksAsync call and per AddMesherPasses batch. */
     constexpr int32 MaxBricks = 32;
 
-    /** Output slots per brick: vertices (6 floats: position from the brick min, normal) and
-     *  triangles (3 indices into the brick's vertices). */
-    constexpr uint32 VertexCap = 8192;
-    constexpr uint32 TriangleCap = 16384;
+    /** A vertex record is VertexStride floats (VoxelMesherVertexStride): position cm from the
+     *  brick min, normal, morph target position and normal (the parent cell's vertex), the
+     *  cell's level relative to the brick (0 or 1), pad. */
+    constexpr uint32 VertexStride = 14;
+
+    /** Per-brick slots, scaled with the brick's cell count (powers of two). */
+    struct FCaps
+    {
+        uint32 HashSize = 0;          // points off the own lattice
+        uint32 TargetHashSize = 0;    // parent corners and gradient points
+        uint32 FaceCap = 0;
+        uint32 VertexCap = 0;
+        uint32 TriangleCap = 0;
+    };
 
     /** Error bit for a request that wasn't meshed (beyond MaxBricks, or out of the 32-bit
      *  lattice range). */
@@ -70,6 +80,8 @@ namespace VoxelBrickMesherGPU
     /** Cells per brick edge the shaders use for Settings: CellsPerBrick rounded down to a
      *  multiple of 4, clamped to 8..64. */
     VOXELPLUGIN_API int32 CellsFor(const FVoxelBrickMesherGPUSettings& Settings);
+
+    VOXELPLUGIN_API FCaps CapsFor(const FVoxelBrickMesherGPUSettings& Settings);
 
     /** The shader's record of a brick. False when its lattice indices, with the points
      *  sampled around it, don't fit 32 bits (the brick can't be meshed on the GPU). */
@@ -91,9 +103,10 @@ namespace VoxelBrickMesherGPU
     };
 
     /** Per brick b of a batch: Counters[4b..4b+3] = faces, vertices, triangles, error bits;
-     *  vertices from b * VertexCap, triangles from b * TriangleCap. */
+     *  vertices from b * Caps.VertexCap, triangles from b * Caps.TriangleCap. */
     struct FOutputs
     {
+        FCaps Caps;
         FRDGBufferRef Counters = nullptr;
         FRDGBufferRef Vertices = nullptr;
         FRDGBufferRef Indices = nullptr;

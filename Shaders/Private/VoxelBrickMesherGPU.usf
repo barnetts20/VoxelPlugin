@@ -53,6 +53,11 @@ RWStructuredBuffer<uint> Faces;
 RWStructuredBuffer<uint> Counters;
 RWStructuredBuffer<float> Vertices;
 RWStructuredBuffer<uint> Indices;
+uint TargetHashSize;
+RWStructuredBuffer<uint> TargetState;
+RWStructuredBuffer<float> TargetData;
+RWStructuredBuffer<uint> TargetHashKeys;
+RWStructuredBuffer<uint> TargetHashValues;
 
 #include "/Plugin/VoxelPlugin/Private/VoxelDensitySample.ush"
 #include "/Plugin/VoxelPlugin/Private/VoxelEditSample.ush"
@@ -93,4 +98,22 @@ void SolveCS(uint3 GroupId : SV_GroupID, uint GroupThread : SV_GroupIndex)
 void TrianglesCS(uint3 GroupId : SV_GroupID, uint GroupThread : SV_GroupIndex)
 {
     VoxelMesherTrianglesPass(ThreadIndex(GroupId, GroupThread));
+}
+
+[numthreads(64, 1, 1)]
+void TargetRequestCS(uint3 GroupId : SV_GroupID, uint GroupThread : SV_GroupIndex)
+{
+    VoxelMesherTargetRequestPass(ThreadIndex(GroupId, GroupThread), PassMode);
+}
+
+[numthreads(64, 1, 1)]
+void TargetSolveCS(uint3 GroupId : SV_GroupID, uint GroupThread : SV_GroupIndex)
+{
+    VoxelMesherTargetSolvePass(ThreadIndex(GroupId, GroupThread));
+}
+
+[numthreads(64, 1, 1)]
+void VertexTargetsCS(uint3 GroupId : SV_GroupID, uint GroupThread : SV_GroupIndex)
+{
+    VoxelMesherVertexTargetsPass(ThreadIndex(GroupId, GroupThread));
 }

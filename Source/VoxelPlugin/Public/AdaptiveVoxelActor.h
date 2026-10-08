@@ -1,12 +1,6 @@
-// AdaptiveVoxelActor.h — Standalone or planet-driven terrain actor that owns an
-// adaptive octree and manages its async LOD/mesh/edit update pipeline.
-//
-// Scale determines planet radius (max component, in cm). The octree is built at
-// world scale in actor-local space. Position and rotation are handled live by the
-// actor transform; scale changes trigger full reconstruction.
-//
-// When spawned by APlanetActor (bIsPlanetOwned=true), the compositor is shared
-// and planet-driven properties become read-only on this actor.
+// AdaptiveVoxelActor.h — Terrain actor (standalone or driven by APlanetActor) owning an adaptive
+// octree and its async LOD/mesh/edit pipeline. Scale (max component, cm) is the planet radius;
+// scale changes rebuild, position and rotation are live.
 
 #pragma once
 
@@ -21,18 +15,10 @@
 #include "RealtimeMeshActor.h"
 #include "AdaptiveVoxelActor.generated.h"
 
-/** Terrain actor that owns an adaptive octree and drives its async update pipeline.
- *
- *  Three async task chains run on background threads, gated by atomic flags:
- *    - DataUpdate: LOD split/merge and chunk cut (writes octree)
- *    - MeshUpdate: collects dirty chunks for the game-thread apply (reads octree)
- *    - EditUpdate: applies brush edits and rebuilds affected chunks (writes octree)
- *
- *  DataUpdate and MeshUpdate chain continuously with a configurable minimum interval.
- *  EditUpdate runs independently when triggered. All three acquire OctreeLock.
- *  The game thread applies finished meshes in Tick, a whole octree pass at a time.
- *  Collision is separate: FVoxelCollisionBricks meshes the density around each pawn at the
- *  finest cell size on its own worker task, without the octree lock. */
+/** Three task chains, each under OctreeLock: DataUpdate (LOD split/merge, chunk cut) chained
+ *  with MeshUpdate (collects dirty chunks) at a minimum interval, and EditUpdate when
+ *  triggered. Tick applies finished meshes a whole pass at a time. Collision
+ *  (FVoxelCollisionBricks) and the brick terrain run on their own tasks without the lock. */
 UCLASS()
 class VOXELPLUGIN_API AAdaptiveVoxelActor : public ARealtimeMeshActor
 {
@@ -130,32 +116,23 @@ public:
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrain|Octree", meta = (ClampMin = "2"))
     int MinChunkDepth = 3;
 
-    /** Deepest a chunk root may sit — the near-camera precision ceiling. Chunks under the
-     *  camera promote toward this until their float jitter is sub-pixel. Raise it for very
-     *  large terrestrial planets that need walking-precision on the surface (a 10,000 km
-     *  planet wants ~12-14 for sub-mm); lower it to cap near-camera component count. Must
-     *  be <= MaxDepth. */
+    /** Deepest a chunk root may sit (<= MaxDepth): chunks under the camera promote toward it
+     *  until their float jitter is sub-pixel (a 10,000 km planet wants ~12-14 for sub-mm). */
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrain|Octree", meta = (ClampMin = "2"))
     int MaxChunkDepth = 14;
 
-    /** Screen-space tolerance for chunk float jitter (fraction of the view). A chunk
-     *  promotes when its worst-case FVector3f jitter would project larger than this at the
-     *  camera's near distance. Smaller = promote sooner / finer origins / more components.
-     *  ~5e-4 targets roughly half a pixel at 1080p. */
+    /** Chunk float jitter tolerance (fraction of the view) at the camera's near distance;
+     *  smaller promotes sooner. ~5e-4 is about half a pixel at 1080p. */
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrain|Octree", meta = (ClampMin = "0.00001"))
     double ChunkPrecisionThreshold = 5e-4;
 
-    /** Demote hysteresis (0-1]. A promoted chunk only collapses back once its parent is
-     *  precise to ChunkPrecisionThreshold * this. Lower = wider dead zone / less
-     *  create-destroy churn near the promote/demote boundary, at the cost of holding finer
-     *  chunks slightly longer as you leave. */
+    /** Demote hysteresis: a promoted chunk collapses once its parent is precise to
+     *  ChunkPrecisionThreshold * this. Lower = less churn, finer chunks held longer. */
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrain|Octree", meta = (ClampMin = "0.05", ClampMax = "1.0"))
     double ChunkDemoteHysteresis = 0.5;
 
-    /** Restricted-octree balance: largest depth gap allowed between face-adjacent chunks.
-     *  Chunks force-refine (and demotes are refused) to hold this, preventing the >2-level
-     *  boundaries the mesher can't stitch. 1 = strict 2:1 balance (most components, safest);
-     *  2 = steeper funnel / fewer components, usually still crack-free. */
+    /** Largest depth gap between face-adjacent chunks (forced refines, refused demotes).
+     *  1 = strict 2:1 (safest); 2 = fewer components, usually still crack-free. */
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrain|Octree", meta = (ClampMin = "1", ClampMax = "2"))
     int MaxChunkDepthDelta = 1;
 
@@ -194,10 +171,16 @@ public:
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrain|Collision", meta = (ClampMin = "1.0", UIMax = "8.0"))
     double CollisionSlopeBound = 3.5;
 
-    /** Brick terrain (voxel.Render.Bricks 1): a brick splits while the camera is closer than
-     *  this many brick sizes. Higher is finer and costs more bricks. */
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrain|Bricks", meta = (ClampMin = "0.5", UIMin = "1.0", UIMax = "6.0"))
+    /** Brick terrain: a brick splits within this many brick sizes of the camera. Detail goes
+     *  with this times BrickCellsPerBrick; geomorphing needs it above about 2 (else level
+     *  changes step), so lower BrickCellsPerBrick for less detail. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrain|Bricks", meta = (ClampMin = "0.5", UIMin = "2.0", UIMax = "6.0"))
     double BrickLodDistanceFactor = 2.5;
+
+    /** Brick terrain: cells along a brick edge, a power of two. 16 at factor 2.5 has about
+     *  the detail of 32 at 1.25, and geomorphs. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrain|Bricks", meta = (ClampMin = "8", ClampMax = "64"))
+    int32 BrickCellsPerBrick = 16;
 
     /** Minimum subdivision depth maintained regardless of camera distance. */
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrain|Octree")
@@ -209,9 +192,8 @@ public:
         meta = (ClampMin = "1.0"))
     double TargetPrecision = 150.0;
 
-    /** Computed from TargetPrecision and planet radius at init time.
-     *  Clamped to [MinDepth, MaxKeyDepth].
-     *  At default scale (100M radius, 0.15 NAR, TargetPrecision=100): MaxDepth=22. */
+    /** From TargetPrecision and the planet radius at init, in [MinDepth, MaxKeyDepth] (22 at
+     *  the default scale). */
     UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Terrain|Octree")
     int MaxDepth = 22;
 
@@ -239,11 +221,8 @@ public:
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrain|LOD")
     double VelocityLookAheadFactor = 2.0;
 
-    /** Per-frame game-thread time budget (milliseconds) for creating chunk components
-     *  (RegisterComponent + section-group setup), the expensive part of a chunk's first
-     *  appearance. Creation runs oldest work first; mesh swaps are not budgeted, since a
-     *  group of chunks meshed together must appear in the same frame. The drain runs every
-     *  frame, not on the slower data/mesh loop cadence. */
+    /** Per-frame budget (ms) for creating chunk components, oldest work first. Mesh swaps are
+     *  not budgeted: chunks meshed together appear in the same frame. */
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrain|LOD", meta = (ClampMin = "0.1"))
     double ChunkApplyBudgetMs = 2.0;
 
@@ -279,10 +258,8 @@ public:
     /** The brick terrain (exists once initialized; holds bricks while voxel.Render.Bricks is on). */
     TSharedPtr<FVoxelBrickTerrain> GetBrickTerrain() const { return BrickTerrain; }
 
-    /** Called by APlanetActor — uses the provided compositor (shared noise + edit store)
-     *  instead of creating one. InScale sets the actor's scale (= planet radius) before
-     *  initialization reads it. If InAttachParent is provided, MeshAttachmentRoot is
-     *  re-parented to it. */
+    /** Called by APlanetActor: uses its compositor (shared density and edits), sets the scale
+     *  (planet radius) first, and re-parents MeshAttachmentRoot to InAttachParent if given. */
     void InitializeFromPlanet(TSharedPtr<FDensitySampleCompositor> InCompositor,
         USceneComponent* InAttachParent = nullptr,
         FVector InScale = FVector::ZeroVector);
@@ -380,13 +357,10 @@ protected:
      *  thread -- takes only PendingApplyCS. */
     void EnqueueDirtyChunksForApply(const TArray<TSharedPtr<FMeshChunk>>& DirtyChunks);
 
-    /** Game thread, every Tick. Captures each queued chunk's latest stream, creates missing
-     *  components oldest work first within ChunkApplyBudgetMs, then applies: initial-build
-     *  chunks as soon as their component exists, later work in groups of overlapping pass
-     *  ranges, each group in one frame once all its components exist -- chunks meshed
-     *  together (a changed chunk and its neighbours) appear together. The oldest waiting
-     *  group holds back newer ones for a bounded number of frames. No octree lock: each
-     *  apply reads an immutable published stream. */
+    /** Game thread, every Tick. Creates missing components within ChunkApplyBudgetMs, then
+     *  applies initial-build chunks at once and later work in groups of overlapping pass
+     *  ranges, a group in one frame once its components exist (the oldest waiting group holds
+     *  newer ones back for a bounded time). No lock: streams are immutable. */
     void DrainPendingApply();
 
     /** Game-thread: destroys the RealtimeMesh components of chunks retired by the chunk-cut
