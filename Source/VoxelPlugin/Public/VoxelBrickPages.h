@@ -11,8 +11,8 @@
 // no holes or overlaps. The GPU places every page's bricks before writing any: if one doesn't
 // fit, nothing of that frame is drawn and the old tree stays; the pages are then resized to
 // the exact counts read back and committed again together. No commit starts until the last
-// one's verdict is read back. Pages whose vertices are partly blended toward the next coarser level
-// (voxel.Render.BrickMorph) are morphed again when the camera moves.
+// one's verdict is read back. Each vertex carries its morph targets; the terrain material
+// blends them with distance (VoxelMorph.ush).
 
 #pragma once
 
@@ -92,11 +92,9 @@ public:
     void Commit(TConstArrayView<FVoxelBrickPageChange> Changes);
 
     /** Once per frame, before any commit: registers buffer sets, reads back commit verdicts
-     *  and commits refused pages again, collects the counters, and hands the camera (actor-local) to
-     *  the morph, with the slack (cm) by which it may differ from the camera the tree on
-     *  screen was built for. Commits push the density and edits given here. */
-    void Flush(const TSharedPtr<const FVoxelDensityGPUData>& Density, const TSharedPtr<const FVoxelEditGPUData>& Edits, const FVector& Camera,
-        double MorphSlack);
+     *  and commits refused pages again, and collects the counters. Commits push the density
+     *  and edits given here. */
+    void Flush(const TSharedPtr<const FVoxelDensityGPUData>& Density, const TSharedPtr<const FVoxelEditGPUData>& Edits);
 
     /** Pages, buffer memory and the latest counters, for the debug log. */
     FString Describe() const;
@@ -125,9 +123,6 @@ private:
         uint64 LastKickFrame = 0;
         uint64 RegisteredFrame = 0;
         uint64 ReadyFrame = 0;         // no contents before (a recycled instance moves first)
-        uint32 MorphCode = ~0u;        // what the last morph request covered
-        FVector MorphCamera = FVector(1.0e30);
-        float MorphSlack = 0.0f;
 
         bool IsValid() const { return Provider.IsValid(); }
     };
@@ -198,9 +193,6 @@ private:
     /** Sends the members to the instance's provider at Version. */
     void Push(const FVoxelBrickKey& PageKey, const TMap<FVoxelBrickKey, FMember>& Members, uint64 Version, FInstance& Instance) const;
     void Advance(FInstance& Instance) const;
-    /** Asks the provider for a morph when the camera moved through the page's blend bands. */
-    bool RequestMorph(const FVoxelBrickKey& PageKey, FInstance& Instance, const FVector& Camera, float Slack, uint32 Mode) const;
-    FBox PageBounds(const FVoxelBrickKey& PageKey) const;
     static FString DescribeMissing(uint32 Bits);
 
     TWeakObjectPtr<AActor> Owner;
@@ -242,11 +234,9 @@ private:
         double CreateMs = 0.0;
         double MaxCreateMs = 0.0;
         int32 Recycled = 0;
-        int32 MorphRequests = 0;
         int64 Calls = 0;               // as the providers counted them
         int64 IdleCalls = 0;
         int64 Runs = 0;
-        int64 MorphRuns = 0;
         int64 BricksMeshed = 0;
         int64 BricksReused = 0;
         int64 RenderMicros = 0;

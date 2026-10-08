@@ -167,7 +167,7 @@ VoxelBrickMesherGPU::FCaps VoxelBrickMesherGPU::CapsFor(const FVoxelBrickMesherG
     Caps.FaceCap = Caps.VertexCap;
     Caps.TriangleCap = 2u * Caps.VertexCap;
     Caps.HashSize = FMath::Clamp(FMath::RoundUpToPowerOfTwo(Cells / 2u), 4096u, 65536u);
-    Caps.TargetHashSize = Caps.HashSize / 2u;
+    Caps.TargetHashSize = Caps.HashSize;   // parents and grandparents
     return Caps;
 }
 
@@ -241,9 +241,10 @@ VoxelBrickMesherGPU::FOutputs VoxelBrickMesherGPU::AddMesherPasses(FRDGBuilder& 
     const uint32 OwnSide = UN + 2u;
     const uint32 CoarseSide = UN / 2u + 2u;
     const uint32 NumSlots = OwnSide * OwnSide * OwnSide + CoarseSide * CoarseSide * CoarseSide;
-    const uint32 TargetSide1 = UN / 2u + 2u;
-    const uint32 TargetSide2 = UN / 4u + 2u;
-    const uint32 NumTargets = TargetSide1 * TargetSide1 * TargetSide1 + TargetSide2 * TargetSide2 * TargetSide2;
+    // Target sets 1 to 3 (VoxelMesherTargetSide): parents and grandparents of own and coarse cells.
+    uint32 NumTargets = 0;
+    for (uint32 K = 1u; K <= 3u; K++)
+        NumTargets += FMath::Cube((UN >> K) + 2u);
 
     auto MakeBuffer = [&GraphBuilder](uint32 Stride, uint32 Count, const TCHAR* Name)
         {
@@ -320,11 +321,11 @@ VoxelBrickMesherGPU::FOutputs VoxelBrickMesherGPU::AddMesherPasses(FRDGBuilder& 
     AddMesherPass<FVoxelMesherSampleCS>(GraphBuilder, Template, 1u, NB * Caps.HashSize, TEXT("Sample gradients"));
     AddMesherPass<FVoxelMesherSolveCS>(GraphBuilder, Template, 0u, NB * NumSlots, TEXT("Solve"));
     AddMesherPass<FVoxelMesherTrianglesCS>(GraphBuilder, Template, 0u, NB * Caps.FaceCap, TEXT("Triangles"));
-    AddMesherPass<FVoxelMesherTargetRequestCS>(GraphBuilder, Template, 0u, NB * NumTargets, TEXT("Request parent corners"));
-    AddMesherPass<FVoxelMesherSampleCS>(GraphBuilder, Template, 2u, NB * Caps.TargetHashSize, TEXT("Sample parent corners"));
-    AddMesherPass<FVoxelMesherTargetRequestCS>(GraphBuilder, Template, 1u, NB * NumTargets, TEXT("Request parent gradients"));
-    AddMesherPass<FVoxelMesherSampleCS>(GraphBuilder, Template, 2u, NB * Caps.TargetHashSize, TEXT("Sample parent gradients"));
-    AddMesherPass<FVoxelMesherTargetSolveCS>(GraphBuilder, Template, 0u, NB * NumTargets, TEXT("Solve parents"));
+    AddMesherPass<FVoxelMesherTargetRequestCS>(GraphBuilder, Template, 0u, NB * NumTargets, TEXT("Request target corners"));
+    AddMesherPass<FVoxelMesherSampleCS>(GraphBuilder, Template, 2u, NB * Caps.TargetHashSize, TEXT("Sample target corners"));
+    AddMesherPass<FVoxelMesherTargetRequestCS>(GraphBuilder, Template, 1u, NB * NumTargets, TEXT("Request target gradients"));
+    AddMesherPass<FVoxelMesherSampleCS>(GraphBuilder, Template, 2u, NB * Caps.TargetHashSize, TEXT("Sample target gradients"));
+    AddMesherPass<FVoxelMesherTargetSolveCS>(GraphBuilder, Template, 0u, NB * NumTargets, TEXT("Solve targets"));
     AddMesherPass<FVoxelMesherVertexTargetsCS>(GraphBuilder, Template, 0u, NB * NumSlots, TEXT("Vertex targets"));
     return Outputs;
 }

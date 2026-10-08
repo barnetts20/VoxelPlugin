@@ -1,23 +1,24 @@
-// VoxelBrickPageGPU.usf - Packs a brick page's buffers (VoxelBrickPages.cpp): the morph data per
-// vertex (position and normal, and the parent cell's), triplanar UVs, colours, indices and the
-// indirect draw arguments. Bricks the page held unchanged are copied from a snapshot of its
-// previous contents (Reuse* passes); the others come from the mesher's per-brick output
-// (VoxelBrickMesherGPU.usf). MorphCS writes positions and tangents from the morph data.
+// VoxelBrickPageGPU.usf - Packs a brick page's vertex streams, indices and indirect draw
+// arguments (VoxelBrickPages.cpp). Bricks the page held unchanged are copied from a snapshot
+// of its previous contents (Reuse* passes); the others come from the mesher's per-brick output
+// (VoxelBrickMesherGPU.usf).
 //
 // Commits are checked before they are drawn: the placement passes (OffsetsCS, ReuseOffsetsCS)
 // of every page in a frame run first, and any brick that doesn't fit clears Verdict. Then no
 // page of that frame writes anything (the passes below return early, ArgsCS keeps the old
 // draw arguments): the old tree stays on screen whole until the pages are resized.
 //
-// Geomorphing: a vertex of a cell of level l blends toward its parent cell's vertex as its
-// distance d goes from MorphStart0 * 2^l to MorphEnd0 * 2^l (VoxelBrickPages.cpp,
-// MorphDistances): fully morphed wherever level l can meet level l + 1, not morphed at all
-// where a level l + 1 brick may still be splitting into level l.
+// Geomorphing happens in the terrain material (VoxelMorph.ush). Each vertex is written at its
+// own position and normal, with its morph targets in texture coordinates 1 to 4 (cm, page
+// axes): 1 = parent offset x, y; 2 = parent offset z, grandparent offset x; 3 = grandparent
+// offset y, z; 4 = the parent and grandparent normals, octahedral 11 bits per axis, the
+// first plus 2^22 times the cell's level above the page's (0 or 1), as exact floats.
+// Texture coordinate 0 is the triplanar UV.
 
 #include "/Engine/Public/Platform.ush"
 
 StructuredBuffer<uint> MesherCounters;     // per mesher row: faces, vertices, triangles, error bits
-StructuredBuffer<float> MesherVertices;    // per vertex: position from the brick min, normal
+StructuredBuffer<float> MesherVertices;    // per vertex: VoxelMesherVertexStride floats
 StructuredBuffer<uint> MesherIndices;
 StructuredBuffer<float4> BrickOffsets;     // brick min from the page origin (cm)
 
@@ -30,19 +31,18 @@ RWStructuredBuffer<uint> BrickBase;        // per brick: first vertex, first tri
 
 RWBuffer<float> OutPositions;
 RWBuffer<uint> OutTangents;                // two packed normals per vertex: tangent, normal
-RWBuffer<uint> OutTexCoords;               // half2
+RWBuffer<uint> OutTexCoords;               // TexCoordWords floats per vertex
 RWBuffer<uint> OutColors;
 RWBuffer<uint> OutIndices;
 RWBuffer<uint> OutArgs;
-
-RWStructuredBuffer<uint> MorphData;        // per vertex, MorphStride words
-RWStructuredBuffer<uint> MorphCount;       // vertices written
 
 // Per member brick, 4 words: first vertex, vertices, first triangle, triangles (0 when it
 // didn't fit). The new table is written; the previous one is read by the Reuse passes.
 RWStructuredBuffer<uint> BrickTable;
 StructuredBuffer<uint> OldTable;
-StructuredBuffer<uint> OldMorphData;       // snapshots of the previous contents
+StructuredBuffer<uint> OldPositions;       // snapshots of the previous contents
+StructuredBuffer<uint> OldTangents;
+StructuredBuffer<uint> OldTexCoords;
 StructuredBuffer<uint> OldIndices;
 // Per batch brick, 2 words: where it comes from (its row in the mesher output, or its row in
 // the previous table for the reuse batch) and its member index.
@@ -55,23 +55,17 @@ uint VertexCapacity;     // page buffers
 uint TriangleCapacity;
 uint Color;
 uint StreamMask;         // 1 tangents, 2 UVs, 4 colours: streams the page has
-int PageLevel;
 uint VertexStride;       // mesher vertex record (VoxelMesherVertexStride)
-float3 CameraRel;        // camera from the page origin
-float MorphStart0;       // level-0 morph distances (cm)
-float MorphEnd0;
-uint MorphMode;          // 0 off, 1 by distance, 2 fully morphed
-float MorphSlack;        // cm the camera may be ahead of the tree: narrows the band
 float3 UVOffset;         // frac(page origin * UVScale)
 float UVScale;
 uint GroupsX;
+
+static const uint TexCoordWords = 10u;     // five float2 channels
 
 uint ThreadIndex(uint3 GroupId, uint GroupThread)
 {
     return (GroupId.y * GroupsX + GroupId.x) * 64u + GroupThread;
 }
-
-static const uint MorphStride = 9u;   // position, target position, level, normal, target normal
 
 uint BrickVertices(uint B) { return min(MesherCounters[B * 4u + 1u], VertexCap); }
 uint BrickTriangles(uint B) { return min(MesherCounters[B * 4u + 2u], TriangleCap); }
@@ -80,12 +74,6 @@ uint PackSnorm8(float4 V)
 {
     const int4 I = int4(round(clamp(V, -1.0f, 1.0f) * 127.0f));
     return (uint(I.x) & 0xffu) | ((uint(I.y) & 0xffu) << 8) | ((uint(I.z) & 0xffu) << 16) | ((uint(I.w) & 0xffu) << 24);
-}
-
-float3 UnpackSnorm8(uint P)
-{
-    const int3 I = int3(int(P << 24) >> 24, int(P << 16) >> 24, int(P << 8) >> 24);
-    return float3(I) / 127.0f;
 }
 
 float3 SafeNormal(float3 N, float3 Fallback)
@@ -164,20 +152,15 @@ void ReuseOffsetsCS()
     PlaceBricks(true);
 }
 
-// The streams derived from a vertex's position and normal: triplanar UVs as the CPU renderer
-// picks them (the page origin's whole periods dropped), and the colour.
-void WriteDerived(uint Dst, float3 P, float3 N)
+// Octahedral normal, 11 bits per axis, as an integer below 2^22.
+uint PackOctahedral(float3 N)
 {
-    const float3 A = abs(N);
-    float2 UV = float2(UVOffset.x, UVOffset.y) + P.xy * UVScale;
-    if (A.x > A.y && A.x > A.z)
-        UV = float2(UVOffset.y, UVOffset.z) + P.yz * UVScale;
-    else if (A.y > A.x && A.y > A.z)
-        UV = float2(UVOffset.x, UVOffset.z) + P.xz * UVScale;
-    if (StreamMask & 2u)
-        OutTexCoords[Dst] = f32tof16(UV.x) | (f32tof16(UV.y) << 16);
-    if (StreamMask & 4u)
-        OutColors[Dst] = Color;
+    N = N / max(abs(N.x) + abs(N.y) + abs(N.z), 1.0e-20f);
+    float2 P = float2(N.x, N.y);
+    if (N.z < 0.0f)
+        P = float2((1.0f - abs(N.y)) * (N.x >= 0.0f ? 1.0f : -1.0f), (1.0f - abs(N.x)) * (N.y >= 0.0f ? 1.0f : -1.0f));
+    const uint2 Q = uint2(round(saturate(P * 0.5f + 0.5f) * 2047.0f));
+    return Q.x | (Q.y << 11);
 }
 
 [numthreads(64, 1, 1)]
@@ -192,29 +175,51 @@ void VerticesCS(uint3 GroupId : SV_GroupID, uint GroupThread : SV_GroupIndex)
     if (V >= BrickVertices(Row)) return;
 
     const uint Src = (Row * VertexCap + V) * VertexStride;
-    const float3 Offset = BrickOffsets[B].xyz;
-    const float3 P = float3(MesherVertices[Src], MesherVertices[Src + 1u], MesherVertices[Src + 2u]) + Offset;
+    const float3 Own = float3(MesherVertices[Src], MesherVertices[Src + 1u], MesherVertices[Src + 2u]);
+    const float3 P = Own + BrickOffsets[B].xyz;
     const float3 N = SafeNormal(float3(MesherVertices[Src + 3u], MesherVertices[Src + 4u], MesherVertices[Src + 5u]), float3(0.0f, 0.0f, 1.0f));
-    const float3 TP = float3(MesherVertices[Src + 6u], MesherVertices[Src + 7u], MesherVertices[Src + 8u]) + Offset;
-    const float3 TN = SafeNormal(float3(MesherVertices[Src + 9u], MesherVertices[Src + 10u], MesherVertices[Src + 11u]), N);
-    const uint Level = uint(PageLevel + int(MesherVertices[Src + 12u] + 0.5f));
+    const float3 Parent = float3(MesherVertices[Src + 6u], MesherVertices[Src + 7u], MesherVertices[Src + 8u]) - Own;
+    const float3 ParentNormal = SafeNormal(float3(MesherVertices[Src + 9u], MesherVertices[Src + 10u], MesherVertices[Src + 11u]), N);
+    const float3 Grand = float3(MesherVertices[Src + 12u], MesherVertices[Src + 13u], MesherVertices[Src + 14u]) - Own;
+    const float3 GrandNormal = SafeNormal(float3(MesherVertices[Src + 15u], MesherVertices[Src + 16u], MesherVertices[Src + 17u]), ParentNormal);
+    const uint Rel = uint(MesherVertices[Src + 18u] + 0.5f);
 
     const uint Dst = BrickBase[B * 3u] + V;
-    const uint M = Dst * MorphStride;
-    MorphData[M] = asuint(P.x);
-    MorphData[M + 1u] = asuint(P.y);
-    MorphData[M + 2u] = asuint(P.z);
-    MorphData[M + 3u] = asuint(TP.x);
-    MorphData[M + 4u] = asuint(TP.y);
-    MorphData[M + 5u] = asuint(TP.z);
-    MorphData[M + 6u] = Level;
-    MorphData[M + 7u] = PackSnorm8(float4(N, 1.0f));
-    MorphData[M + 8u] = PackSnorm8(float4(TN, 1.0f));
-    // From the packed normal, as a copy of this vertex (ReuseVerticesCS) does.
-    WriteDerived(Dst, P, UnpackSnorm8(MorphData[M + 7u]));
+    OutPositions[Dst * 3u] = P.x;
+    OutPositions[Dst * 3u + 1u] = P.y;
+    OutPositions[Dst * 3u + 2u] = P.z;
+    if (StreamMask & 1u)
+    {
+        const float3 Axis = abs(N.z) < 0.999f ? float3(0.0f, 0.0f, 1.0f) : float3(1.0f, 0.0f, 0.0f);
+        OutTangents[Dst * 2u] = PackSnorm8(float4(normalize(cross(Axis, N)), 1.0f));
+        OutTangents[Dst * 2u + 1u] = PackSnorm8(float4(N, 1.0f));
+    }
+    if (StreamMask & 2u)
+    {
+        // Triplanar UV as the CPU renderer picks it (the page origin's whole periods dropped).
+        const float3 A = abs(N);
+        float2 UV = float2(UVOffset.x, UVOffset.y) + P.xy * UVScale;
+        if (A.x > A.y && A.x > A.z)
+            UV = float2(UVOffset.y, UVOffset.z) + P.yz * UVScale;
+        else if (A.y > A.x && A.y > A.z)
+            UV = float2(UVOffset.x, UVOffset.z) + P.xz * UVScale;
+        const uint T = Dst * TexCoordWords;
+        OutTexCoords[T] = asuint(UV.x);
+        OutTexCoords[T + 1u] = asuint(UV.y);
+        OutTexCoords[T + 2u] = asuint(Parent.x);
+        OutTexCoords[T + 3u] = asuint(Parent.y);
+        OutTexCoords[T + 4u] = asuint(Parent.z);
+        OutTexCoords[T + 5u] = asuint(Grand.x);
+        OutTexCoords[T + 6u] = asuint(Grand.y);
+        OutTexCoords[T + 7u] = asuint(Grand.z);
+        OutTexCoords[T + 8u] = asuint(float(PackOctahedral(ParentNormal) + (Rel << 22)));
+        OutTexCoords[T + 9u] = asuint(float(PackOctahedral(GrandNormal)));
+    }
+    if (StreamMask & 4u)
+        OutColors[Dst] = Color;
 }
 
-// A reused brick's vertex: its morph data as it was, at its new place.
+// A reused brick's vertex: its streams as they were, at its new place.
 [numthreads(64, 1, 1)]
 void ReuseVerticesCS(uint3 GroupId : SV_GroupID, uint GroupThread : SV_GroupIndex)
 {
@@ -226,13 +231,24 @@ void ReuseVerticesCS(uint3 GroupId : SV_GroupID, uint GroupThread : SV_GroupInde
     const uint Old = BrickMap[B * 2u];
     if (V >= OldTable[Old * 4u + 1u]) return;
 
-    const uint Src = (OldTable[Old * 4u] + V) * MorphStride;
+    const uint Src = OldTable[Old * 4u] + V;
     const uint Dst = BrickBase[B * 3u] + V;
     [unroll]
-    for (uint W = 0u; W < MorphStride; W++)
-        MorphData[Dst * MorphStride + W] = OldMorphData[Src + W];
-    const float3 P = float3(asfloat(OldMorphData[Src]), asfloat(OldMorphData[Src + 1u]), asfloat(OldMorphData[Src + 2u]));
-    WriteDerived(Dst, P, UnpackSnorm8(OldMorphData[Src + 7u]));
+    for (uint C = 0u; C < 3u; C++)
+        OutPositions[Dst * 3u + C] = asfloat(OldPositions[Src * 3u + C]);
+    if (StreamMask & 1u)
+    {
+        OutTangents[Dst * 2u] = OldTangents[Src * 2u];
+        OutTangents[Dst * 2u + 1u] = OldTangents[Src * 2u + 1u];
+    }
+    if (StreamMask & 2u)
+    {
+        [unroll]
+        for (uint W = 0u; W < TexCoordWords; W++)
+            OutTexCoords[Dst * TexCoordWords + W] = OldTexCoords[Src * TexCoordWords + W];
+    }
+    if (StreamMask & 4u)
+        OutColors[Dst] = Color;
 }
 
 [numthreads(64, 1, 1)]
@@ -291,51 +307,9 @@ void ArgsCS()
 {
     PageState[8] = CommitVerdict[0];
     if (CommitVerdict[0] == 0u) return;
-    MorphCount[0] = PageState[3];
     OutArgs[0] = PageState[4] * 3u;
     OutArgs[1] = 1u;
     OutArgs[2] = 0u;
     OutArgs[3] = 0u;
     OutArgs[4] = 0u;
-}
-
-// Positions and tangents of the page's vertices for the current camera.
-[numthreads(64, 1, 1)]
-void MorphCS(uint3 GroupId : SV_GroupID, uint GroupThread : SV_GroupIndex)
-{
-    const uint V = ThreadIndex(GroupId, GroupThread);
-    if (V >= MorphCount[0] || V >= VertexCapacity) return;
-    const uint M = V * MorphStride;
-    const float3 P = float3(asfloat(MorphData[M]), asfloat(MorphData[M + 1u]), asfloat(MorphData[M + 2u]));
-    const float3 TP = float3(asfloat(MorphData[M + 3u]), asfloat(MorphData[M + 4u]), asfloat(MorphData[M + 5u]));
-    const float Scale = exp2(float(MorphData[M + 6u]));
-
-    float T = MorphMode == 2u ? 1.0f : 0.0f;
-    if (MorphMode == 1u)
-    {
-        const float Start = MorphStart0 * Scale + MorphSlack;
-        const float End = MorphEnd0 * Scale - MorphSlack;
-        const float Distance = length(P - CameraRel);
-        if (End > Start)
-        {
-            const float X = saturate((Distance - Start) / (End - Start));
-            T = X * X * (3.0f - 2.0f * X);
-        }
-        else
-        {
-            T = Distance >= 0.5f * (Start + End) ? 1.0f : 0.0f;
-        }
-    }
-    const float3 Position = lerp(P, TP, T);
-    OutPositions[V * 3u] = Position.x;
-    OutPositions[V * 3u + 1u] = Position.y;
-    OutPositions[V * 3u + 2u] = Position.z;
-
-    if ((StreamMask & 1u) == 0u) return;
-    const float3 N0 = UnpackSnorm8(MorphData[M + 7u]);
-    const float3 N = SafeNormal(lerp(N0, UnpackSnorm8(MorphData[M + 8u]), T), N0);
-    const float3 Axis = abs(N.z) < 0.999f ? float3(0.0f, 0.0f, 1.0f) : float3(1.0f, 0.0f, 0.0f);
-    const float3 Tangent = normalize(cross(Axis, N));
-    OutTangents[V * 2u] = PackSnorm8(float4(Tangent, 1.0f));
-    OutTangents[V * 2u + 1u] = PackSnorm8(float4(N, 1.0f));
 }

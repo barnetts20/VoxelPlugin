@@ -54,15 +54,15 @@ namespace VoxelBrickMesherGPU
     constexpr int32 MaxBricks = 32;
 
     /** A vertex record is VertexStride floats (VoxelMesherVertexStride): position cm from the
-     *  brick min, normal, morph target position and normal (the parent cell's vertex), the
-     *  cell's level relative to the brick (0 or 1), pad. */
-    constexpr uint32 VertexStride = 14;
+     *  brick min, normal, the parent target's position and normal, the grandparent target's
+     *  position and normal, the cell's level relative to the brick (0 or 1), pad. */
+    constexpr uint32 VertexStride = 20;
 
     /** Per-brick slots, scaled with the brick's cell count (powers of two). */
     struct FCaps
     {
         uint32 HashSize = 0;          // points off the own lattice
-        uint32 TargetHashSize = 0;    // parent corners and gradient points
+        uint32 TargetHashSize = 0;    // target corners and gradient points
         uint32 FaceCap = 0;
         uint32 VertexCap = 0;
         uint32 TriangleCap = 0;

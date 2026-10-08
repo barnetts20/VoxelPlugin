@@ -12,6 +12,9 @@
 #include "HAL/IConsoleManager.h"
 #include "Misc/App.h"
 #include "Misc/ScopeExit.h"
+#include "Engine/World.h"
+#include "Materials/MaterialParameterCollection.h"
+#include "Materials/MaterialParameterCollectionInstance.h"
 #include "VoxelTerrainStats.h"
 
 DECLARE_CYCLE_STAT(TEXT("Bricks: tick"), STAT_VoxelBricksTick, STATGROUP_VoxelTerrain);
@@ -41,6 +44,11 @@ static TAutoConsoleVariable<int32> CVarVoxelBrickSeams(
     TEXT("Seams between brick-terrain LOD levels. 0: stitched. 1: stitched, plus skirts. 2: skirts only (unstitched bricks)."),
     ECVF_Default);
 
+static TAutoConsoleVariable<int32> CVarVoxelBrickMorph(
+    TEXT("voxel.Render.BrickMorph"), 1,
+    TEXT("Geomorphing of the GPU brick terrain, in the terrain material (VoxelMorph.ush, through the actor's Brick Morph Parameters collection). 1: vertices blend toward the next coarser level with distance, so LOD changes don't pop. 0: off. 2: fully blended everywhere (shows the coarser levels; for checking)."),
+    ECVF_Default);
+
 static TAutoConsoleVariable<int32> CVarVoxelBrickBackend(
     TEXT("voxel.Render.BrickBackend"), 1,
     TEXT("Where brick-terrain bricks are meshed. 1 (default): GPU (pages of 4x4x4 bricks meshed by compute providers; stitched seams only). 0: CPU (one component per brick; also used when the GPU path is unavailable)."),
@@ -66,6 +74,10 @@ namespace VoxelBrickTerrainDetail
     constexpr double SkirtCells = 2.5;              // skirt depth in cells of the brick's level
 
     const FName RenderGroupName(TEXT("BRICK"));
+    // Vectors of the morph collection (VoxelMorph.ush).
+    const FName MorphCameraHighName(TEXT("VoxelMorphCameraHigh"));
+    const FName MorphCameraLowName(TEXT("VoxelMorphCameraLow"));
+    const FName MorphParamsName(TEXT("VoxelMorphParams"));
 
     double BoxDistanceSquared(const FBox& Box, const FVector& P)
     {
@@ -429,6 +441,7 @@ void FVoxelBrickTerrain::Initialize(AActor* InOwner, USceneComponent* InAttachRo
     GPUDensity.Reset();
     GPUEdits.Reset();
     bWarnedBackend = false;
+    bWarnedMorph = false;
 }
 
 void FVoxelBrickTerrain::Reset()
@@ -517,12 +530,52 @@ void FVoxelBrickTerrain::FlushPages(double TaskInterval)
         GPUEdits = FVoxelEditGPUData::Build(Store.Get(), 0.5 * Settings.FinestCell, Pages->GetMesherSettings().MaxDepth);
         GPUEditsSequence = Sequence;
     }
+    Pages->Flush(GPUDensity, GPUEdits);
+
     // The tree is built for the camera predicted half an interval past its latency; what the
-    // prediction misses (half an interval of flight, a guess at the rest) narrows the morph
-    // band so the tree on screen still meets the morph's assumptions.
+    // prediction misses (half an interval of flight, a guess at the rest) moves the morph bands
+    // nearer, so a level is still fully blended wherever the tree on screen meets the next.
     const double Speed = CameraVelocity.Size();
-    const double Slack = Speed * (0.5 * TaskInterval + VBT::SlackFraction * TreeLatency);
-    Pages->Flush(GPUDensity, GPUEdits, LastCamera, Slack);
+    UpdateMorphParameters(Speed * (0.5 * TaskInterval + VBT::SlackFraction * TreeLatency));
+}
+
+void FVoxelBrickTerrain::SetMorphParameters(UMaterialParameterCollection* InCollection)
+{
+    Settings.MorphParameters = InCollection;
+    bWarnedMorph = false;
+}
+
+void FVoxelBrickTerrain::UpdateMorphParameters(double Slack)
+{
+    const int32 Mode = FMath::Clamp(CVarVoxelBrickMorph.GetValueOnGameThread(), 0, 2);
+    UMaterialParameterCollection* Collection = Settings.MorphParameters.Get();
+    AActor* OwnerActor = Owner.Get();
+    USceneComponent* Root = AttachRoot.Get();
+    UWorld* World = OwnerActor ? OwnerActor->GetWorld() : nullptr;
+    UMaterialParameterCollectionInstance* Instance = Collection && World ? World->GetParameterCollectionInstance(Collection) : nullptr;
+    if (!Instance || !Root)
+    {
+        if (Mode != 0 && !bWarnedMorph)
+            UE_LOG(LogTemp, Warning, TEXT("[VoxelBricks] No Brick Morph Parameters collection on %s: the GPU terrain's LOD changes won't blend (Design/MeshingEngine.md section 7)."),
+                OwnerActor ? *OwnerActor->GetName() : TEXT("the terrain"));
+        bWarnedMorph = true;
+        return;
+    }
+
+    // The camera as a float and the rest, so the material subtracts it at full precision.
+    const FVector Camera = Root->GetComponentTransform().TransformPosition(LastCamera);
+    const FVector3f High(Camera);
+    const FVector Low = Camera - FVector(High);
+    const double Scale = Root->GetComponentScale().X;
+    bool bSet = Instance->SetVectorParameterValue(VBT::MorphCameraHighName, FLinearColor(High.X, High.Y, High.Z, 0.0f));
+    bSet &= Instance->SetVectorParameterValue(VBT::MorphCameraLowName, FLinearColor((float)Low.X, (float)Low.Y, (float)Low.Z, 0.0f));
+    bSet &= Instance->SetVectorParameterValue(VBT::MorphParamsName, FLinearColor((float)(Slack * Scale), (float)Mode, 0.0f, 0.0f));
+    if (!bSet && !bWarnedMorph)
+    {
+        UE_LOG(LogTemp, Warning, TEXT("[VoxelBricks] %s lacks a vector parameter VoxelMorphCameraHigh, VoxelMorphCameraLow or VoxelMorphParams (Design/MeshingEngine.md section 7)."),
+            *Collection->GetName());
+        bWarnedMorph = true;
+    }
 }
 
 void FVoxelBrickTerrain::LogPerf(double Now)

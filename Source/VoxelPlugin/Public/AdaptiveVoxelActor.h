@@ -7,6 +7,7 @@
 #include "CoreMinimal.h"
 #include "GameFramework/Actor.h"
 #include "Materials/Material.h"
+#include "Materials/MaterialParameterCollection.h"
 #include "MaterialDomain.h"
 #include "FAdaptiveOctree.h"
 #include "VoxelDensity.h"
@@ -181,6 +182,12 @@ public:
      *  the detail of 32 at 1.25, and geomorphs. */
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrain|Bricks", meta = (ClampMin = "8", ClampMax = "64"))
     int32 BrickCellsPerBrick = 16;
+
+    /** Brick terrain (GPU): the collection the terrain material's morph node reads (vectors
+     *  VoxelMorphCameraHigh, VoxelMorphCameraLow, VoxelMorphParams; Design/MeshingEngine.md
+     *  section 7). Without it LOD changes don't blend. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrain|Bricks")
+    TObjectPtr<UMaterialParameterCollection> BrickMorphParameters = nullptr;
 
     /** Minimum subdivision depth maintained regardless of camera distance. */
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrain|Octree")

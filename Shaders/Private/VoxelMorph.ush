@@ -1,0 +1,68 @@
+// VoxelMorph.ush - Geomorphing of the GPU brick terrain in the vertex shader, for a Custom node
+// in the terrain material (setup and wiring: Design/MeshingEngine.md section 7).
+//
+// A vertex of a cell of level L blends toward what level L + 1 draws at that moment: its
+// parent vertex, itself blended toward the grandparent by level L + 1's weight (chained
+// targets, section 4 B). Level L blends over camera distances E0 2^(L-1) to E0 2^L, so the
+// bands of consecutive levels are contiguous. VoxelBrickPageGPU.usf writes the targets into
+// texture coordinates 1 to 4; a page component holds its level and E0 (world units) in
+// custom primitive data 0 and 1 (E0 is 0 on anything else, which keeps its own position).
+// Params: x slack (world units), y mode (0 off, 1 by distance, 2 fully blended).
+// Custom node code:
+//   return VoxelMorph(Parameters, ToVertex, UV1, UV2, UV3, UV4, NormalWS, Level, BandEnd0, Params, MorphNormal);
+
+#pragma once
+
+// Blend weight of level L at distance D: 0 nearer than E0 2^(L-1), 1 beyond E0 2^L. Slack
+// moves the band nearer by how far the camera may be ahead of the tree on screen.
+float VoxelMorphWeight(float D, float L, float BandEnd0, float Slack)
+{
+    const float X = saturate(2.0f * (D + Slack) / (BandEnd0 * exp2(L)) - 1.0f);
+    return X * X * (3.0f - 2.0f * X);
+}
+
+float3 VoxelMorphDecodeNormal(uint Packed)
+{
+    const float2 P = float2(float(Packed & 2047u), float((Packed >> 11) & 2047u)) / 2047.0f * 2.0f - 1.0f;
+    float3 N = float3(P.x, P.y, 1.0f - abs(P.x) - abs(P.y));
+    const float T = saturate(-N.z);
+    N.x += N.x >= 0.0f ? -T : T;
+    N.y += N.y >= 0.0f ? -T : T;
+    return normalize(N);
+}
+
+// The body for either parameter type (a Custom node is compiled for the vertex shader here,
+// but the include is seen by every shader of the material).
+#define VOXEL_MORPH_BODY \
+    MorphNormal = NormalWS; \
+    if (Params.y < 0.5f || BandEnd0 <= 0.0f) return float3(0.0f, 0.0f, 0.0f); \
+    const float3 Parent = TransformLocalVectorToWorld(Parameters, float3(UV1.x, UV1.y, UV2.x)); \
+    const float3 Grand = TransformLocalVectorToWorld(Parameters, float3(UV2.y, UV3.x, UV3.y)); \
+    const uint Packed = uint(UV4.x + 0.5f); \
+    const float L = Level + float(Packed >> 22); \
+    const float3 ParentNormal = normalize(TransformLocalVectorToWorld(Parameters, VoxelMorphDecodeNormal(Packed & 0x3fffffu))); \
+    const float3 GrandNormal = normalize(TransformLocalVectorToWorld(Parameters, VoxelMorphDecodeNormal(uint(UV4.y + 0.5f)))); \
+    float W0 = 1.0f; \
+    float W1 = 1.0f; \
+    if (Params.y < 1.5f) \
+    { \
+        W0 = VoxelMorphWeight(length(ToVertex), L, BandEnd0, Params.x); \
+        W1 = VoxelMorphWeight(length(ToVertex + Parent), L + 1.0f, BandEnd0, Params.x); \
+    } \
+    const float3 N = lerp(NormalWS, lerp(ParentNormal, GrandNormal, W1), W0); \
+    MorphNormal = dot(N, N) > 1.0e-12f ? normalize(N) : NormalWS; \
+    return W0 * lerp(Parent, Grand, W1);
+
+float3 VoxelMorph(FMaterialVertexParameters Parameters, float3 ToVertex, float2 UV1, float2 UV2, float2 UV3, float2 UV4,
+    float3 NormalWS, float Level, float BandEnd0, float4 Params, out float3 MorphNormal)
+{
+    VOXEL_MORPH_BODY
+}
+
+float3 VoxelMorph(FMaterialPixelParameters Parameters, float3 ToVertex, float2 UV1, float2 UV2, float2 UV3, float2 UV4,
+    float3 NormalWS, float Level, float BandEnd0, float4 Params, out float3 MorphNormal)
+{
+    VOXEL_MORPH_BODY
+}
+
+#undef VOXEL_MORPH_BODY

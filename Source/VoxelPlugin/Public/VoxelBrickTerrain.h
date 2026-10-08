@@ -13,6 +13,7 @@
 class AActor;
 class USceneComponent;
 class UMaterialInterface;
+class UMaterialParameterCollection;
 class URealtimeMeshSimple;
 class URealtimeMeshComponent;
 class FDensitySampleCompositor;
@@ -59,6 +60,8 @@ struct FVoxelBrickTerrainSettings
     double SlopeBound = 3.5;
     double TriplanarUVScale = 0.0001;
     TWeakObjectPtr<UMaterialInterface> Material;
+    /** GPU backend: receives the camera and morph slack every frame (VoxelMorph.ush). */
+    TWeakObjectPtr<UMaterialParameterCollection> MorphParameters;
 };
 
 /** Brick terrain of one terrain actor.
@@ -93,6 +96,9 @@ public:
 
     /** Game thread. Destroys every brick's component; results of a running task are dropped. */
     void Reset();
+
+    /** Game thread. The collection the terrain material's morph reads (Settings.MorphParameters). */
+    void SetMorphParameters(UMaterialParameterCollection* InCollection);
 
     /** Game thread. See FVoxelCollisionBricks::NotifyEdit. */
     void NotifyEdit(uint32 Sequence, const FVector& Center, double Radius);
@@ -217,9 +223,12 @@ private:
     int32 ResolveBackend();
     /** voxel.Debug.BrickPerf: once a second, logs and resets Perf. */
     void LogPerf(double Now);
-    /** GPU backend: hands the pages the current density and edits, and the camera with the
-     *  morph slack the tree's latency calls for. */
+    /** GPU backend: hands the pages the current density and edits, and the material the
+     *  camera with the morph slack the tree's latency calls for. */
     void FlushPages(double TaskInterval);
+    /** Sets the morph collection's camera (world, as a float and the rest), slack (world
+     *  units) and voxel.Render.BrickMorph mode. */
+    void UpdateMorphParameters(double Slack);
     /** CPU backend: a brick a pending mesh is stitched to is on screen (or no longer wanted). */
     bool IsNeighbourReady(const FVoxelBrickKey& Key) const;
 
@@ -270,6 +279,7 @@ private:
     TSharedPtr<const FVoxelEditGPUData> GPUEdits;
     uint32 GPUEditsSequence = 0;
     bool bWarnedBackend = false;
+    bool bWarnedMorph = false;
 
     /** Time spent since the last voxel.Debug.BrickPerf line. Sections: drain, apply (GPU:
      *  commit), remove, flush pages, launch. */

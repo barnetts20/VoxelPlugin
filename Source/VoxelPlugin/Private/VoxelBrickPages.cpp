@@ -22,14 +22,12 @@ DECLARE_CYCLE_STAT(TEXT("Pages: frame batch (render thread)"), STAT_VoxelPagesBa
 DECLARE_DWORD_COUNTER_STAT(TEXT("Pages: re-mesh runs"), STAT_VoxelPagesRemeshRuns, STATGROUP_VoxelTerrain);
 DECLARE_DWORD_COUNTER_STAT(TEXT("Pages: bricks meshed"), STAT_VoxelPagesBricksMeshed, STATGROUP_VoxelTerrain);
 DECLARE_DWORD_COUNTER_STAT(TEXT("Pages: bricks copied"), STAT_VoxelPagesBricksReused, STATGROUP_VoxelTerrain);
-DECLARE_DWORD_COUNTER_STAT(TEXT("Pages: morph runs"), STAT_VoxelPagesMorphRuns, STATGROUP_VoxelTerrain);
 DECLARE_DWORD_COUNTER_STAT(TEXT("Pages: idle provider calls"), STAT_VoxelPagesIdleCalls, STATGROUP_VoxelTerrain);
 DECLARE_DWORD_COUNTER_STAT(TEXT("Pages: buffer sets created"), STAT_VoxelPagesCreated, STATGROUP_VoxelTerrain);
 DECLARE_DWORD_COUNTER_STAT(TEXT("Pages: buffer sets recycled"), STAT_VoxelPagesRecycled, STATGROUP_VoxelTerrain);
 DECLARE_DWORD_ACCUMULATOR_STAT(TEXT("Pages"), STAT_VoxelPagesCount, STATGROUP_VoxelTerrain);
 DECLARE_DWORD_ACCUMULATOR_STAT(TEXT("Pages: pooled buffer sets"), STAT_VoxelPagesPooled, STATGROUP_VoxelTerrain);
 DECLARE_GPU_STAT(VoxelBrickMesh);
-DECLARE_GPU_STAT(VoxelBrickMorph);
 
 using namespace RealtimeMesh;
 
@@ -55,20 +53,14 @@ BEGIN_SHADER_PARAMETER_STRUCT(FVoxelPageParameters, )
     SHADER_PARAMETER(uint32, TriangleCapacity)
     SHADER_PARAMETER(uint32, Color)
     SHADER_PARAMETER(uint32, StreamMask)
-    SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint>, MorphData)
-    SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint>, MorphCount)
     SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint>, BrickTable)
     SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, OldTable)
-    SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, OldMorphData)
+    SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, OldPositions)
+    SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, OldTangents)
+    SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, OldTexCoords)
     SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, OldIndices)
     SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, BrickMap)
-    SHADER_PARAMETER(int32, PageLevel)
     SHADER_PARAMETER(uint32, VertexStride)
-    SHADER_PARAMETER(FVector3f, CameraRel)
-    SHADER_PARAMETER(float, MorphStart0)
-    SHADER_PARAMETER(float, MorphEnd0)
-    SHADER_PARAMETER(uint32, MorphMode)
-    SHADER_PARAMETER(float, MorphSlack)
     SHADER_PARAMETER(FVector3f, UVOffset)
     SHADER_PARAMETER(float, UVScale)
     SHADER_PARAMETER(uint32, GroupsX)
@@ -94,7 +86,6 @@ VOXEL_PAGE_SHADER(FVoxelPageReuseOffsetsCS)
 VOXEL_PAGE_SHADER(FVoxelPageReuseVerticesCS)
 VOXEL_PAGE_SHADER(FVoxelPageReuseTrianglesCS)
 VOXEL_PAGE_SHADER(FVoxelPageArgsCS)
-VOXEL_PAGE_SHADER(FVoxelPageMorphCS)
 #undef VOXEL_PAGE_SHADER
 
 IMPLEMENT_GLOBAL_SHADER(FVoxelPageOffsetsCS, "/Plugin/VoxelPlugin/Private/VoxelBrickPageGPU.usf", "OffsetsCS", SF_Compute);
@@ -104,12 +95,6 @@ IMPLEMENT_GLOBAL_SHADER(FVoxelPageReuseOffsetsCS, "/Plugin/VoxelPlugin/Private/V
 IMPLEMENT_GLOBAL_SHADER(FVoxelPageReuseVerticesCS, "/Plugin/VoxelPlugin/Private/VoxelBrickPageGPU.usf", "ReuseVerticesCS", SF_Compute);
 IMPLEMENT_GLOBAL_SHADER(FVoxelPageReuseTrianglesCS, "/Plugin/VoxelPlugin/Private/VoxelBrickPageGPU.usf", "ReuseTrianglesCS", SF_Compute);
 IMPLEMENT_GLOBAL_SHADER(FVoxelPageArgsCS, "/Plugin/VoxelPlugin/Private/VoxelBrickPageGPU.usf", "ArgsCS", SF_Compute);
-IMPLEMENT_GLOBAL_SHADER(FVoxelPageMorphCS, "/Plugin/VoxelPlugin/Private/VoxelBrickPageGPU.usf", "MorphCS", SF_Compute);
-
-static TAutoConsoleVariable<int32> CVarVoxelBrickMorph(
-    TEXT("voxel.Render.BrickMorph"), 1,
-    TEXT("Geomorphing of GPU brick pages. 1: vertices blend toward the next coarser level with distance, so LOD changes don't pop. 0: off. 2: fully morphed everywhere (shows the coarser level's mesh; for checking)."),
-    ECVF_Default);
 
 static TAutoConsoleVariable<int32> CVarVoxelBrickPageCreates(
     TEXT("voxel.Render.BrickPageCreates"), 4,
@@ -122,7 +107,7 @@ namespace VoxelBrickPagesDetail
     constexpr int32 BatchCells = 128 * 4096;         // cells per mesher dispatch set in the frame batch (128 16-cell bricks)
     constexpr int32 MaxPooled = 64;                  // emptied buffer sets kept for reuse
     constexpr int32 PoolSlack = 2;                   // a pooled set may be up to 2^this times larger on each count
-    constexpr double BoundsMarginCells = 8.0;        // page bounds beyond its bricks (cells of its level)
+    constexpr double BoundsMarginCells = 12.0;       // page bounds beyond its bricks (cells of its level), with the morph
     constexpr int32 MinVertices = 4096;
     constexpr int32 MinTriangles = 8192;
     constexpr int32 MaxVertices = 1 << 22;
@@ -131,14 +116,14 @@ namespace VoxelBrickPagesDetail
     constexpr uint64 UnusedFrames = 60;              // an empty page or an unused replacement is released after
     constexpr double CapacityMargin = 1.25;          // over the estimated contents
     constexpr int32 CreateRampFrames = 4;            // a waiting commit raises the creation budget every this many frames
-    constexpr int32 MaxCreateRamp = 8;
+    constexpr int32 MaxCreateRamp = 3;               // creation costs about 0.25 ms each on the game thread
     constexpr double UnknownBrickWeight = 1.5;       // a brick not yet meshed counts this many level averages
     constexpr double AverageBlend = 0.05;            // per surface brick read back
     constexpr int32 MaxPendingReadbacks = 4;
     constexpr uint32 PageStateWords = 9;             // VoxelBrickPageGPU.usf PageState
     constexpr uint64 VerifyTimeoutFrames = 60;       // a commit not read back by then counts as drawn
-    constexpr int32 BytesPerVertex = 28 + 36;        // position, two packed normals, half2 UV, colour; morph data
-    constexpr uint32 MorphStride = 9;                // words per vertex (VoxelBrickPageGPU.usf)
+    constexpr int32 BytesPerVertex = 12 + 8 + 40 + 4;   // position, two packed normals, five float2 UVs, colour
+    constexpr int32 TexCoordChannels = 5;            // VoxelBrickPageGPU.usf
     constexpr int32 BytesPerTriangle = 12;
 
     const FName PageGroupName(TEXT("BRICKPAGE"));
@@ -156,15 +141,6 @@ namespace VoxelBrickPagesDetail
             ^ (uint64)(uint32)FMath::FloorLog2((uint32)FMath::Max(1, TriangleCapacity));
     }
 
-    /** Blend over a distance range for one level: 0 none, 1 partial, 2 full (as MorphCS). */
-    uint32 MorphClass(double Near, double Far, double Start, double End)
-    {
-        if (End > Start)
-            return Far <= Start ? 0u : (Near >= End ? 2u : 1u);
-        const double Mid = 0.5 * (Start + End);
-        return Far < Mid ? 0u : (Near >= Mid ? 2u : 1u);
-    }
-
     int64 FloorShift(int64 Value, int32 Levels)
     {
         return Value >= 0 ? (Value >> Levels) : -((-Value + (1LL << Levels) - 1) >> Levels);
@@ -180,24 +156,15 @@ namespace VoxelBrickPagesDetail
         return FRealtimeMeshSectionKey::CreateForPolyGroup(GroupKey(), 0);
     }
 
-    /** Level-0 morph distances; level l uses them times 2^l. With F = LodDistanceFactor, B
-     *  the level-l brick size and h its cell, a level l + 1 brick P splits once the camera
-     *  comes within F * 2B of it.
-     *  - Where level l meets level l + 1 (a seam, or P merging), level-l vertices are at least
-     *    2F * B away, less a cell diagonal for cells just outside a brick: they must be fully
-     *    morphed there, so End = 2F * B - 2 * sqrt(3) * h.
-     *  - When P splits, its far side is up to a diagonal (sqrt(3) * 2B, plus a cell) beyond
-     *    its near side: P's vertices must not be morphed at all yet, so level l + 1 starts no
-     *    nearer than 2F * B + 2 * sqrt(3) * (B + h), i.e. Start = (F + sqrt(3)) * B + sqrt(3) * h.
-     *  The band is (F - sqrt(3)) * B - 3 * sqrt(3) * h wide: it needs F above about 2. Below
-     *  that, or while the camera outruns the tree (MorphSlack narrows the band), the blend
-     *  becomes a step halfway. */
-    void MorphDistances(const FVoxelBrickTerrainSettings& InSettings, float& OutStart, float& OutEnd)
+    /** Where level 0's morph band ends (cm; level l's is 2^l times it, VoxelMorph.ush). With F
+     *  = LodDistanceFactor, B the brick size and h the cell of a level, a level-l vertex can
+     *  meet level l + 1 (a seam, or a merge) no nearer than 2F * B, less a cell diagonal for
+     *  cells just outside a brick, so it must be fully blended from 2F * B - 2 * sqrt(3) * h.
+     *  With chained targets the band can start where level l - 1's ends. */
+    double MorphBandEnd0(const FVoxelBrickTerrainSettings& InSettings)
     {
         const double Cell = InSettings.FinestCell;
-        const double Brick = InSettings.CellsPerBrick * Cell;
-        OutStart = (float)((InSettings.LodDistanceFactor + UE_DOUBLE_SQRT_3) * Brick + UE_DOUBLE_SQRT_3 * Cell);
-        OutEnd = (float)(2.0 * InSettings.LodDistanceFactor * Brick - 2.0 * UE_DOUBLE_SQRT_3 * Cell);
+        return 2.0 * InSettings.LodDistanceFactor * InSettings.CellsPerBrick * Cell - 2.0 * UE_DOUBLE_SQRT_3 * Cell;
     }
 
     bool ArePageShadersReady()
@@ -210,8 +177,7 @@ namespace VoxelBrickPagesDetail
             && ShaderMap->GetShader(&FVoxelPageReuseOffsetsCS::GetStaticType(), 0).IsValid()
             && ShaderMap->GetShader(&FVoxelPageReuseVerticesCS::GetStaticType(), 0).IsValid()
             && ShaderMap->GetShader(&FVoxelPageReuseTrianglesCS::GetStaticType(), 0).IsValid()
-            && ShaderMap->GetShader(&FVoxelPageArgsCS::GetStaticType(), 0).IsValid()
-            && ShaderMap->GetShader(&FVoxelPageMorphCS::GetStaticType(), 0).IsValid();
+            && ShaderMap->GetShader(&FVoxelPageArgsCS::GetStaticType(), 0).IsValid();
     }
 
     template<typename TShader>
@@ -234,9 +200,6 @@ namespace VBP = VoxelBrickPagesDetail;
  *  and uploaded again only when the data changes. */
 struct FVoxelBrickPageGPUInputs
 {
-    FVector Camera = FVector::ZeroVector;   // actor-local, set every frame by Flush
-    uint32 MorphMode = 1;                   // voxel.Render.BrickMorph
-    float MorphSlack = 0.0f;                // cm the camera may be ahead of the tree
     TSharedPtr<const FVoxelDensityGPUData> Density;
     TSharedPtr<const FVoxelEditGPUData> Edits;
     TRefCountPtr<FRDGPooledBuffer> Octaves;
@@ -301,10 +264,6 @@ public:
         int32 VertexCapacity = 0;
         int32 TriangleCapacity = 0;
         uint64 Version = 0;
-        FVector PageOrigin = FVector::ZeroVector;   // actor-local
-        int32 PageLevel = 0;
-        float MorphStart0 = 0.0f;                   // level-0 morph distances (cm)
-        float MorphEnd0 = 0.0f;
     };
 
     explicit FVoxelBrickPageProvider(const TSharedRef<FVoxelBrickPageGPUInputs, ESPMode::ThreadSafe>& InInputs)
@@ -340,16 +299,13 @@ public:
     /** False when the buffers already hold the current state. */
     bool MakePlan(FPlan& Out) const
     {
-        if (!State.Density.IsValid() || !State.Edits.IsValid() || !bStatePushed) return false;
-        const uint32 MorphWords = (uint32)FMath::Max(1, State.VertexCapacity) * VBP::MorphStride;
-        const bool bMorphDataValid = MorphData.IsValid() && MorphData->Desc.NumElements == MorphWords;
-        if (MeshedVersion == State.Version && bMorphDataValid) return false;
+        if (!State.Density.IsValid() || !State.Edits.IsValid() || !bStatePushed || MeshedVersion == State.Version) return false;
 
         Out = FPlan();
         Out.Version = State.Version;
         // Bricks the buffers hold at the same stamp are copied; the rest are meshed. Nothing is
         // copied while the last run's verdict is unknown (the buffers may hold either table).
-        const bool bCanReuse = !State.bFull && bMorphDataValid && Table.IsValid() && TentativeVersion == 0;
+        const bool bCanReuse = !State.bFull && Table.IsValid() && TentativeVersion == 0;
         for (int32 i = 0; i < State.Bricks.Num(); i++)
         {
             const int32* Row = bCanReuse ? TableRows.Find(State.Keys[i]) : nullptr;
@@ -492,12 +448,11 @@ public:
     std::atomic<uint32> Runs{ 0 };
     std::atomic<uint32> Missing{ 0 };
     /** For voxel.Debug.BrickPerf, taken and reset by Flush: calls from the driver, calls
-     *  that did nothing, re-mesh runs, morphs (every run that did something), bricks meshed
-     *  and copied, and the render-thread time spent here. */
+     *  that did nothing, re-mesh runs, bricks meshed and copied, and the render-thread time
+     *  spent here. */
     std::atomic<uint32> Calls{ 0 };
     std::atomic<uint32> IdleCalls{ 0 };
     std::atomic<uint32> PerfRuns{ 0 };
-    std::atomic<uint32> MorphRuns{ 0 };
     std::atomic<uint32> BricksMeshed{ 0 };
     std::atomic<uint32> BricksReused{ 0 };
     std::atomic<uint64> RenderMicros{ 0 };
@@ -515,11 +470,8 @@ private:
 
     TSharedRef<FVoxelBrickPageGPUInputs, ESPMode::ThreadSafe> Inputs;
     FState State;
-    // Render thread: the version the buffers hold, the morph data kept between frames, and
-    // the camera, slack and mode of the last morph.
+    // Render thread: the version the buffers hold.
     uint64 MeshedVersion = 0;
-    TRefCountPtr<FRDGPooledBuffer> MorphData;
-    TRefCountPtr<FRDGPooledBuffer> MorphCount;
     // Where each brick of the meshed state sits in the buffers (BrickTable rows, in the
     // state's order), and the stamp it was meshed at.
     TRefCountPtr<FRDGPooledBuffer> Table;
@@ -534,9 +486,6 @@ private:
     uint64 TentativeVersion = 0;
     bool bPrevValid = false;
     bool bStatePushed = false;   // State has not been meshed since SetState_RenderThread
-    FVector MorphedCamera = FVector(1.0e30);
-    float MorphedSlack = 0.0f;
-    uint32 MorphedMode = ~0u;
     TArray<FPendingReadback> Readbacks;
     FCriticalSection StatsCS;
 
@@ -686,16 +635,9 @@ void FVoxelBrickPageProvider::BuildComputePasses(FRDGBuilder& GraphBuilder, cons
     }
     if (!State.Density.IsValid() || !State.Edits.IsValid()) return;
 
-    // Run when Flush marked it: mesh when the state changed, morph when the camera moved
-    // through a blend band, otherwise nothing.
-    const uint32 Mode = Inputs->MorphMode;
-    const uint32 MorphWords = (uint32)FMath::Max(1, State.VertexCapacity) * VBP::MorphStride;
-    // Only a pushed state is meshed: after a refused run the buffers keep the previous one
-    // until the game thread commits again.
-    const bool bRemesh = bStatePushed && (MeshedVersion != State.Version || !MorphData.IsValid() || MorphData->Desc.NumElements != MorphWords);
-    const bool bCameraMoved = Mode == 1u && (FVector::DistSquared(Inputs->Camera, MorphedCamera) > FMath::Square(1.0e-3 * State.MorphStart0)
-        || FMath::Abs(Inputs->MorphSlack - MorphedSlack) > 1.0e-3f * State.MorphStart0);
-    if (!bRemesh && !bCameraMoved && Mode == MorphedMode)
+    // Run when a commit pushed a new state; only a pushed state is meshed (after a refused
+    // run the buffers keep the previous one until the game thread commits again).
+    if (!bStatePushed || MeshedVersion == State.Version)
     {
         IdleCalls.fetch_add(1, std::memory_order_relaxed);
         INC_DWORD_STAT(STAT_VoxelPagesIdleCalls);
@@ -726,20 +668,15 @@ void FVoxelBrickPageProvider::BuildComputePasses(FRDGBuilder& GraphBuilder, cons
         SkippedRuns.fetch_add(1, std::memory_order_relaxed);
         return;
     }
-    if (bRemesh)
-    {
-        Runs.fetch_add(1, std::memory_order_relaxed);
-        PerfRuns.fetch_add(1, std::memory_order_relaxed);
-        INC_DWORD_STAT(STAT_VoxelPagesRemeshRuns);
-    }
-    MorphRuns.fetch_add(1, std::memory_order_relaxed);
-    INC_DWORD_STAT(STAT_VoxelPagesMorphRuns);
+    Runs.fetch_add(1, std::memory_order_relaxed);
+    PerfRuns.fetch_add(1, std::memory_order_relaxed);
+    INC_DWORD_STAT(STAT_VoxelPagesRemeshRuns);
 
     // The placement the frame batch recorded for this state, or, for a run the batch didn't
-    // plan (pushed before registration, or asked for again), a plan made now (before the morph
-    // data is created, which rules out copying), meshed and placed here with its own verdict.
+    // plan (pushed before registration, or asked for again), a plan made now, meshed and
+    // placed here with its own verdict.
     const uint32 Frame = Context.GetFrame().FrameNumber;
-    if (bRemesh && (Layout.Frame != Frame || Layout.Graph != &GraphBuilder || Layout.Version != State.Version))
+    if (Layout.Frame != Frame || Layout.Graph != &GraphBuilder || Layout.Version != State.Version)
     {
         RDG_EVENT_SCOPE_STAT(GraphBuilder, VoxelBrickMesh, "VoxelBrickPage own mesh");
         MakePlan(Plan);
@@ -783,29 +720,6 @@ void FVoxelBrickPageProvider::BuildComputePasses(FRDGBuilder& GraphBuilder, cons
     const uint32 VertexCapacity = (uint32)FMath::Max(0, FMath::Min(State.VertexCapacity, Context.GetVertexCapacity()));
     const uint32 TriangleCapacity = (uint32)FMath::Max(0, FMath::Min(State.TriangleCapacity, Context.GetIndexCapacity() / 3));
 
-    // The morph data outlives the frame; it is (re)created with the page's capacity.
-    FRDGBufferRef MorphDataBuffer = nullptr;
-    FRDGBufferRef MorphCountBuffer = nullptr;
-    if (!MorphData.IsValid() || MorphData->Desc.NumElements != MorphWords)
-    {
-        MorphDataBuffer = GraphBuilder.CreateBuffer(FRDGBufferDesc::CreateStructuredDesc(sizeof(uint32), MorphWords), TEXT("Voxel.PageMorphData"));
-        MorphData = GraphBuilder.ConvertToExternalBuffer(MorphDataBuffer);
-    }
-    else
-    {
-        MorphDataBuffer = GraphBuilder.RegisterExternalBuffer(MorphData);
-    }
-    if (!MorphCount.IsValid())
-    {
-        MorphCountBuffer = GraphBuilder.CreateBuffer(FRDGBufferDesc::CreateStructuredDesc(sizeof(uint32), 1), TEXT("Voxel.PageMorphCount"));
-        MorphCount = GraphBuilder.ConvertToExternalBuffer(MorphCountBuffer);
-        AddClearUAVPass(GraphBuilder, GraphBuilder.CreateUAV(MorphCountBuffer), 0u);
-    }
-    else
-    {
-        MorphCountBuffer = GraphBuilder.RegisterExternalBuffer(MorphCount);
-    }
-
     FVoxelPageParameters Template;
     Template.OutPositions = Positions;
     Template.OutTangents = Tangents;
@@ -813,23 +727,14 @@ void FVoxelBrickPageProvider::BuildComputePasses(FRDGBuilder& GraphBuilder, cons
     Template.OutColors = Colors;
     Template.OutIndices = Triangles;
     Template.OutArgs = Args;
-    Template.MorphData = GraphBuilder.CreateUAV(MorphDataBuffer);
-    Template.MorphCount = GraphBuilder.CreateUAV(MorphCountBuffer);
     Template.VertexCapacity = VertexCapacity;
     Template.TriangleCapacity = TriangleCapacity;
     Template.Color = State.Color;
     Template.StreamMask = StreamMask;
     Template.UVOffset = State.UVOffset;
     Template.UVScale = State.UVScale;
-    Template.PageLevel = State.PageLevel;
     Template.VertexStride = VoxelBrickMesherGPU::VertexStride;
-    Template.CameraRel = FVector3f(Inputs->Camera - State.PageOrigin);
-    Template.MorphStart0 = State.MorphStart0;
-    Template.MorphEnd0 = State.MorphEnd0;
-    Template.MorphMode = Mode;
-    Template.MorphSlack = Inputs->MorphSlack;
 
-    if (bRemesh)
     {
         RDG_EVENT_SCOPE_STAT(GraphBuilder, VoxelBrickMesh, "VoxelBrickPage Mesh");
         Template.PageState = GraphBuilder.CreateUAV(Layout.PageState);
@@ -839,17 +744,25 @@ void FVoxelBrickPageProvider::BuildComputePasses(FRDGBuilder& GraphBuilder, cons
         const uint32 NumReused = (uint32)Plan.Reuse.Num() / 2u;
         if (NumReused > 0)
         {
-            // Snapshots: the passes below overwrite what they copy from.
-            FRDGBufferRef OldMorph = GraphBuilder.CreateBuffer(FRDGBufferDesc::CreateStructuredDesc(sizeof(uint32), MorphWords), TEXT("Voxel.PageOldMorphData"));
-            AddCopyBufferPass(GraphBuilder, OldMorph, MorphDataBuffer);
-            FRDGBufferRef IndexBuffer = Context.GetStreamBuffer(FRealtimeMeshStreams::Triangles);
-            FRDGBufferRef OldIndices = GraphBuilder.CreateBuffer(FRDGBufferDesc::CreateStructuredDesc(sizeof(uint32), IndexBuffer->Desc.GetSize() / sizeof(uint32)), TEXT("Voxel.PageOldIndices"));
-            AddCopyBufferPass(GraphBuilder, OldIndices, IndexBuffer);
-
+            // Snapshots: the passes below overwrite what they copy from. Streams the driver
+            // doesn't expose are not written either: a word stands in.
+            auto Snapshot = [&GraphBuilder, &Context](const FRealtimeMeshStreamKey& Key, const TCHAR* Name)
+                {
+                    FRDGBufferRef Stream = Context.GetStreamBuffer(Key);
+                    FRDGBufferRef Copy = GraphBuilder.CreateBuffer(FRDGBufferDesc::CreateStructuredDesc(sizeof(uint32),
+                        Stream ? FMath::Max<uint32>(1u, Stream->Desc.GetSize() / sizeof(uint32)) : 1u), Name);
+                    if (Stream)
+                        AddCopyBufferPass(GraphBuilder, Copy, Stream);
+                    else
+                        AddClearUAVPass(GraphBuilder, GraphBuilder.CreateUAV(Copy), 0u);
+                    return GraphBuilder.CreateSRV(Copy);
+                };
             FVoxelPageParameters Pass = Template;
+            Pass.OldPositions = Snapshot(FRealtimeMeshStreams::Position, TEXT("Voxel.PageOldPositions"));
+            Pass.OldTangents = Snapshot(FRealtimeMeshStreams::Tangents, TEXT("Voxel.PageOldTangents"));
+            Pass.OldTexCoords = Snapshot(FRealtimeMeshStreams::TexCoords, TEXT("Voxel.PageOldTexCoords"));
+            Pass.OldIndices = Snapshot(FRealtimeMeshStreams::Triangles, TEXT("Voxel.PageOldIndices"));
             Pass.OldTable = GraphBuilder.CreateSRV(GraphBuilder.RegisterExternalBuffer(Table));
-            Pass.OldMorphData = GraphBuilder.CreateSRV(OldMorph);
-            Pass.OldIndices = GraphBuilder.CreateSRV(OldIndices);
             Pass.BrickMap = GraphBuilder.CreateSRV(Layout.ReuseMap);
             Pass.BrickBase = GraphBuilder.CreateUAV(Layout.ReuseBase);
             Pass.NumBricks = NumReused;
@@ -913,16 +826,7 @@ void FVoxelBrickPageProvider::BuildComputePasses(FRDGBuilder& GraphBuilder, cons
         bStatePushed = false;
     }
 
-    {
-        RDG_EVENT_SCOPE_STAT(GraphBuilder, VoxelBrickMorph, "VoxelBrickPage Morph");
-        VBP::AddPagePass<FVoxelPageMorphCS>(GraphBuilder, Template, VertexCapacity, 64u, TEXT("Morph"));
-    }
-    MorphedCamera = Inputs->Camera;
-    MorphedSlack = Inputs->MorphSlack;
-    MorphedMode = Mode;
-
-    if (bRemesh)
-        ShownVersion.store(State.Version, std::memory_order_release);
+    ShownVersion.store(State.Version, std::memory_order_release);
 }
 
 FVoxelBrickPages::FVoxelBrickPages()
@@ -979,18 +883,6 @@ FVoxelBrickKey FVoxelBrickPages::PageOf(const FVoxelBrickKey& Key)
     return Page;
 }
 
-FBox FVoxelBrickPages::PageBounds(const FVoxelBrickKey& PageKey) const
-{
-    // The page's bricks, and the cells of neighbours they solve around them.
-    FVoxelBrickGrid Grid;
-    Grid.Origin = Settings.Origin;
-    Grid.CellSize = Settings.FinestCell * (double)(1LL << PageKey.Level);
-    Grid.CellsPerBrick = Settings.CellsPerBrick;
-    const FVector Min = Grid.BrickMin(PageKey.Coord * (1LL << VBP::PageShift));
-    const double Margin = VBP::BoundsMarginCells * Grid.CellSize;
-    return FBox(Min - FVector(Margin), Min + FVector((double)(1LL << VBP::PageShift) * Grid.BrickSize() + Margin));
-}
-
 FVoxelBrickPages::FInstance FVoxelBrickPages::CreateInstance(const FVoxelBrickKey& PageKey, int32 VertexCapacity, int32 TriangleCapacity)
 {
     SCOPE_CYCLE_COUNTER(STAT_VoxelPagesCreate);
@@ -1029,20 +921,25 @@ FVoxelBrickPages::FInstance FVoxelBrickPages::CreateInstance(const FVoxelBrickKe
     Component->SetRealtimeMesh(Mesh);
     Component->SetRenderCustomDepth(true);
     Component->SetVisibleInRayTracing(false);
+    // For the morph in the material (VoxelMorph.ush): the page's level, and where level 0's
+    // band ends in world units. A buffer set is only ever reused for pages of its level.
+    Component->SetCustomPrimitiveDataFloat(0, (float)PageKey.Level);
+    Component->SetCustomPrimitiveDataFloat(1, (float)(VBP::MorphBandEnd0(Settings) * Root->GetComponentScale().X));
 
     // The uploaded streams only size the buffers; the provider writes them. Two corner
-    // positions give the page its bounds (bricks reach 4 cells past their box).
+    // positions give the page its bounds: bricks reach a few cells past their box, and the
+    // morph (VoxelMorph.ush) moves vertices toward coarser cells up to 8 cells across.
     FRealtimeMeshStreamSet Streams;
     FRealtimeMeshStream& Positions = Streams.AddStream(FRealtimeMeshStreams::Position, GetRealtimeMeshBufferLayout<FVector3f>());
     Positions.SetNumZeroed(VertexCapacity);
-    const double Margin = 4.0 * Grid.CellSize;
+    const double Margin = VBP::BoundsMarginCells * Grid.CellSize;
     const double Extent = (double)(1LL << VBP::PageShift) * Grid.BrickSize();
     TArrayView<FVector3f> PositionView = Positions.GetArrayView<FVector3f>();
     PositionView[0] = FVector3f((float)-Margin);
     PositionView[1] = FVector3f((float)(Extent + Margin));
     // Nothing draws these before the provider writes them: no need to clear them here.
     Streams.AddStream(FRealtimeMeshStreams::Tangents, GetRealtimeMeshBufferLayout<FRealtimeMeshTangentsNormalPrecision>()).SetNumUninitialized(VertexCapacity);
-    Streams.AddStream(FRealtimeMeshStreams::TexCoords, GetRealtimeMeshBufferLayout<FVector2DHalf>()).SetNumUninitialized(VertexCapacity);
+    Streams.AddStream(FRealtimeMeshStreams::TexCoords, GetRealtimeMeshBufferLayout<TRealtimeMeshTexCoords<FVector2f, VBP::TexCoordChannels>>()).SetNumUninitialized(VertexCapacity);
     Streams.AddStream(FRealtimeMeshStreams::Color, GetRealtimeMeshBufferLayout<FColor>()).SetNumUninitialized(VertexCapacity);
     Streams.AddStream(FRealtimeMeshStreams::Triangles, GetRealtimeMeshBufferLayout<TIndex3<uint32>>()).SetNumZeroed(TriangleCapacity);
     // No PolyGroups stream: the buffer set then makes one section over every vertex and index.
@@ -1117,8 +1014,6 @@ FVoxelBrickPages::FInstance FVoxelBrickPages::AcquireInstance(const FVoxelBrickK
         Grid.CellsPerBrick = Settings.CellsPerBrick;
         Component->SetRelativeLocation(Grid.BrickMin(PageKey.Coord * (1LL << VBP::PageShift)));
         Instance.ReadyFrame = GFrameCounter + 1;
-        Instance.MorphCode = ~0u;
-        Instance.MorphCamera = FVector(1.0e30);
         Perf.Recycled++;
         INC_DWORD_STAT(STAT_VoxelPagesRecycled);
         return Instance;
@@ -1427,9 +1322,6 @@ void FVoxelBrickPages::Push(const FVoxelBrickKey& PageKey, const TMap<FVoxelBric
     State.Version = Version;
     State.bFull = Instance.PushedVersion == 0;
     State.UVScale = (float)Settings.TriplanarUVScale;
-    State.PageOrigin = PageOrigin;
-    State.PageLevel = PageKey.Level;
-    VBP::MorphDistances(Settings, State.MorphStart0, State.MorphEnd0);
     const FVector UVOrigin = PageOrigin * Settings.TriplanarUVScale;
     State.UVOffset = FVector3f((float)FMath::Frac(UVOrigin.X), (float)FMath::Frac(UVOrigin.Y), (float)FMath::Frac(UVOrigin.Z));
     State.Color = (CVarVoxelDebugChunkColor.GetValueOnGameThread() > 0 ? FVoxelBrickTerrain::LevelColor(PageKey.Level) : FColor::White).DWColor();
@@ -1481,14 +1373,13 @@ void FVoxelBrickPages::Advance(FInstance& Instance) const
         Registration.BufferSetKey = VBP::GroupKey();
         Registration.SectionKey = VBP::SectionKey();
         Registration.Provider = Instance.Provider;
-        // On demand: Flush marks a provider when its page changes or needs a morph, so idle
-        // pages cost the driver nothing.
+        // On demand: a commit marks a provider when its page changes, so idle pages cost the
+        // driver nothing.
         Registration.Trigger = ERealtimeMeshComputeTrigger::OnDemand;
         Registration.bUseIndirect = true;
         Instance.Handle = RegisterRealtimeMeshComputeProvider(Registration);
         Instance.LastKickFrame = GFrameCounter;
         Instance.RegisteredFrame = GFrameCounter;
-        Instance.MorphCode = ~0u;
         return;
     }
 
@@ -1500,42 +1391,7 @@ void FVoxelBrickPages::Advance(FInstance& Instance) const
     }
 }
 
-bool FVoxelBrickPages::RequestMorph(const FVoxelBrickKey& PageKey, FInstance& Instance, const FVector& Camera, float Slack, uint32 Mode) const
-{
-    if (!Instance.IsValid() || Instance.Handle == 0) return false;
-    // Each level the page's vertices have (its own, and coarser neighbours' cells): wholly
-    // unblended, partly blended, or wholly blended over the page's distance range.
-    const FBox Bounds = PageBounds(PageKey);
-    const double Near = FMath::Sqrt(Bounds.ComputeSquaredDistanceToPoint(Camera));
-    double Far = 0.0;
-    for (int32 Corner = 0; Corner < 8; Corner++)
-    {
-        const FVector P((Corner & 1) ? Bounds.Max.X : Bounds.Min.X, (Corner & 2) ? Bounds.Max.Y : Bounds.Min.Y, (Corner & 4) ? Bounds.Max.Z : Bounds.Min.Z);
-        Far = FMath::Max(Far, FVector::Dist(P, Camera));
-    }
-    float Start0 = 0.0f, End0 = 0.0f;
-    VBP::MorphDistances(Settings, Start0, End0);
-    uint32 Code = Mode;
-    bool bPartial = false;
-    for (int32 Rel = 0; Rel < 2; Rel++)
-    {
-        const double Scale = (double)(1LL << (PageKey.Level + Rel));
-        const uint32 Class = VBP::MorphClass(Near, Far, Start0 * Scale + Slack, End0 * Scale - Slack);
-        Code |= Class << (2 + 2 * Rel);
-        bPartial |= Mode == 1 && Class == 1;
-    }
-    const bool bMoved = FVector::DistSquared(Camera, Instance.MorphCamera) > FMath::Square(1.0e-3 * Start0)
-        || FMath::Abs(Slack - Instance.MorphSlack) > 1.0e-3f * Start0;
-    if (Code == Instance.MorphCode && !(bPartial && bMoved)) return false;
-    Instance.MorphCode = Code;
-    Instance.MorphCamera = Camera;
-    Instance.MorphSlack = Slack;
-    MarkRealtimeMeshComputeProviderDirty(Instance.Handle);
-    return true;
-}
-
-void FVoxelBrickPages::Flush(const TSharedPtr<const FVoxelDensityGPUData>& InDensity, const TSharedPtr<const FVoxelEditGPUData>& InEdits, const FVector& Camera,
-    double InMorphSlack)
+void FVoxelBrickPages::Flush(const TSharedPtr<const FVoxelDensityGPUData>& InDensity, const TSharedPtr<const FVoxelEditGPUData>& InEdits)
 {
     SCOPE_CYCLE_COUNTER(STAT_VoxelPagesFlush);
     const double StartTime = FPlatformTime::Seconds();
@@ -1555,15 +1411,6 @@ void FVoxelBrickPages::Flush(const TSharedPtr<const FVoxelDensityGPUData>& InDen
         CreatesThisFrame = 0;
     }
 
-    const uint32 MorphMode = (uint32)FMath::Clamp(CVarVoxelBrickMorph.GetValueOnGameThread(), 0, 2);
-    const float MorphSlack = (float)FMath::Max(InMorphSlack, 0.0);
-    ENQUEUE_RENDER_COMMAND(VoxelBrickPageCamera)([Inputs = GPUInputs, Camera, MorphMode, MorphSlack](FRHICommandListImmediate&)
-        {
-            Inputs->Camera = Camera;
-            Inputs->MorphMode = MorphMode;
-            Inputs->MorphSlack = MorphSlack;
-        });
-
     TArray<TSharedPtr<FVoxelBrickPageProvider, ESPMode::ThreadSafe>> Poll;
     auto CollectCounters = [this](const FInstance& Instance)
         {
@@ -1572,7 +1419,6 @@ void FVoxelBrickPages::Flush(const TSharedPtr<const FVoxelDensityGPUData>& InDen
             Perf.Calls += Provider.Calls.exchange(0, std::memory_order_relaxed);
             Perf.IdleCalls += Provider.IdleCalls.exchange(0, std::memory_order_relaxed);
             Perf.Runs += Provider.PerfRuns.exchange(0, std::memory_order_relaxed);
-            Perf.MorphRuns += Provider.MorphRuns.exchange(0, std::memory_order_relaxed);
             Perf.BricksMeshed += Provider.BricksMeshed.exchange(0, std::memory_order_relaxed);
             Perf.BricksReused += Provider.BricksReused.exchange(0, std::memory_order_relaxed);
             Perf.RenderMicros += Provider.RenderMicros.exchange(0, std::memory_order_relaxed);
@@ -1664,8 +1510,6 @@ void FVoxelBrickPages::Flush(const TSharedPtr<const FVoxelDensityGPUData>& InDen
         if (Page.Next.IsValid() && !Page.bRecommit && GFrameCounter > Page.NextUsedFrame + VBP::UnusedFrames)
             ReleaseInstance(PageKey, Page.Next);
 
-        Perf.MorphRequests += RequestMorph(PageKey, Page.Current, Camera, MorphSlack, MorphMode) ? 1 : 0;
-
         if (Page.Current.IsValid())
         {
             const uint32 MissingBits = Page.Current.Provider->Missing.load(std::memory_order_relaxed);
@@ -1711,13 +1555,13 @@ FString FVoxelBrickPages::TakePerf()
     }
     const int64 Batched = GPUInputs->BatchBricks.exchange(0, std::memory_order_relaxed);
     const double PerFrame = 1.0 / FMath::Max(1, Perf.Frames);
-    const FString Out = FString::Printf(TEXT("Pages: %d pages, %d buffer sets (+%d pooled), %.1f MB, %lld triangles. Commits: %d (%d changes and %d pages on average, %d changes at most), %d frames waiting (%d of them for a verdict), %d pages refused by the GPU, %d re-commits. Per frame (average): %.1f provider calls of which %.1f idle, %.2f re-mesh runs, %.1f bricks meshed (%.1f in frame batches; %.0f lattice samples), %.1f copied unchanged, %.1f morph runs (%.1f requested), %.2f ms render thread in providers; buffer sets %.2f created (%.2f ms each, %.2f ms max), %.2f recycled. Flush %.2f ms average, %.2f ms max."),
+    const FString Out = FString::Printf(TEXT("Pages: %d pages, %d buffer sets (+%d pooled), %.1f MB, %lld triangles. Commits: %d (%d changes and %d pages on average, %d changes at most), %d frames waiting (%d of them for a verdict), %d pages refused by the GPU, %d re-commits. Per frame (average): %.1f provider calls of which %.1f idle, %.2f re-mesh runs, %.1f bricks meshed (%.1f in frame batches; %.0f lattice samples), %.1f copied unchanged, %.2f ms render thread in providers; buffer sets %.2f created (%.2f ms each, %.2f ms max), %.2f recycled. Flush %.2f ms average, %.2f ms max."),
         Pages.Num(), Instances, NumPooled, Bytes / (1024.0 * 1024.0), Triangles,
         Perf.Commits, Perf.Commits > 0 ? Perf.CommitChanges / Perf.Commits : 0, Perf.Commits > 0 ? Perf.CommitPages / Perf.Commits : 0, Perf.MaxCommitChanges,
         Perf.PrepareWaits, Perf.VerifyWaits, Perf.Refused, Perf.Recommits,
         Perf.Calls * PerFrame, Perf.IdleCalls * PerFrame, Perf.Runs * PerFrame, Perf.BricksMeshed * PerFrame, Batched * PerFrame,
         Perf.BricksMeshed * PerFrame * FMath::Cube((double)VoxelBrickMesherGPU::CellsFor(MesherSettings) + 1.0),
-        Perf.BricksReused * PerFrame, Perf.MorphRuns * PerFrame, Perf.MorphRequests * PerFrame, Perf.RenderMicros * PerFrame / 1000.0,
+        Perf.BricksReused * PerFrame, Perf.RenderMicros * PerFrame / 1000.0,
         Perf.Created * PerFrame, Perf.Created > 0 ? Perf.CreateMs / Perf.Created : 0.0, Perf.MaxCreateMs, Perf.Recycled * PerFrame,
         Perf.FlushMs * PerFrame, Perf.MaxFlushMs);
     Perf = FPerf();

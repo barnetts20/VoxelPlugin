@@ -125,6 +125,13 @@ void AAdaptiveVoxelActor::PostEditChangeProperty(FPropertyChangedEvent& Property
         return;
     }
 
+    if (PropName == GET_MEMBER_NAME_CHECKED(AAdaptiveVoxelActor, BrickMorphParameters))
+    {
+        if (BrickTerrain.IsValid())
+            BrickTerrain->SetMorphParameters(BrickMorphParameters.Get());
+        return;
+    }
+
     if (PropName == GET_MEMBER_NAME_CHECKED(AAdaptiveVoxelActor, BrickLodDistanceFactor)
         || PropName == GET_MEMBER_NAME_CHECKED(AAdaptiveVoxelActor, BrickCellsPerBrick))
     {
@@ -901,6 +908,7 @@ void AAdaptiveVoxelActor::InitializeBrickTerrain(double RootExtent)
     Settings.SlopeBound = CollisionSlopeBound;
     Settings.TriplanarUVScale = 0.0001 * (80000000.0 / FMath::Max(GetActorScale3D().GetMax(), 1.0));
     Settings.Material = SurfaceMaterial;
+    Settings.MorphParameters = BrickMorphParameters.Get();
     BrickTerrain->Initialize(this, BrickAttachmentRoot, DensityCompositor, Settings);
 }
 
