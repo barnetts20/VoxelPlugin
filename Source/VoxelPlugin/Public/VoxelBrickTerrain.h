@@ -121,7 +121,7 @@ private:
         /** GPU backend: the pending entry is neighbour levels for a page, not a mesh. */
         bool bPendingGPU = false;
         bool bInPage = false;         // a member of a GPU page
-        uint64 PageVersion = 0;       // the page version that shows it (FVoxelBrickPages::IsShown)
+        uint64 PageVersion = 0;       // the first page version that showed it (FVoxelBrickPages::IsShown)
         int8 PendingLevels[27] = {};
         uint32 PendingMeshed = 0;
     };

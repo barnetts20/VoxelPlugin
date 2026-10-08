@@ -23,8 +23,8 @@ static TAutoConsoleVariable<int32> CVarVoxelBrickSeams(
     ECVF_Default);
 
 static TAutoConsoleVariable<int32> CVarVoxelBrickBackend(
-    TEXT("voxel.Render.BrickBackend"), 0,
-    TEXT("Where brick-terrain bricks are meshed. 0: CPU (one component per brick). 1: GPU (pages of 4x4x4 bricks meshed by compute providers; stitched seams only)."),
+    TEXT("voxel.Render.BrickBackend"), 1,
+    TEXT("Where brick-terrain bricks are meshed. 1 (default): GPU (pages of 4x4x4 bricks meshed by compute providers; stitched seams only). 0: CPU (one component per brick; also used when the GPU path is unavailable)."),
     ECVF_Default);
 
 namespace VoxelBrickTerrainDetail
@@ -758,8 +758,14 @@ void FVoxelBrickTerrain::DrainResults()
             UE_LOG(LogTemp, Log, TEXT("[VoxelBricks] %d wanted (%d balance splits), %d meshed (%d with surface, %d restitched, %d empty bricks restitched without meshing), %lld samples, %.1f ms, %d bricks held%s"),
                 Wanted.Num(), Result.BalanceSplits, Result.Built.Num() - Result.NumRestitchedEmpty, NumWithSurface, Result.NumRestitched, Result.NumRestitchedEmpty,
                 Result.Samples, Result.Milliseconds, Bricks.Num(), Result.bComplete ? TEXT(", complete") : TEXT(""));
-            UE_LOG(LogTemp, Log, TEXT("[VoxelBricks] Removal: %d held bricks not wanted, %d removed in the last pass; kept because a replacement or neighbour is not held %d, not applied %d, stitched to other neighbours %d, in a page not yet drawn %d, on a component not yet drawn %d"),
-                RemovalCandidates, RemovalRemoved, RemovalStalls[1], RemovalStalls[2], RemovalStalls[3], RemovalStalls[4], RemovalStalls[5]);
+            int32 Waiting = 0;
+            for (const FVoxelBrickKey& Queued : ApplyQueue)
+            {
+                const FBrick* QueuedBrick = Bricks.Find(Queued);
+                Waiting += QueuedBrick && QueuedBrick->bHasPending && QueuedBrick->WaitFor.Num() > 0 ? 1 : 0;
+            }
+            UE_LOG(LogTemp, Log, TEXT("[VoxelBricks] Removal: %d held bricks not wanted, %d removed in the last pass; kept because a replacement or neighbour is not held %d, not applied %d, stitched to other neighbours %d, in a page not yet drawn %d, on a component not yet drawn %d. %d meshes queued, %d waiting for neighbours"),
+                RemovalCandidates, RemovalRemoved, RemovalStalls[1], RemovalStalls[2], RemovalStalls[3], RemovalStalls[4], RemovalStalls[5], ApplyQueue.Num(), Waiting);
             if (Backend == 1)
                 UE_LOG(LogTemp, Log, TEXT("[VoxelBricks] %s"), *Pages->Describe());
         }
@@ -801,7 +807,13 @@ void FVoxelBrickTerrain::ApplyQueued()
             }
             else
             {
-                Brick->PageVersion = Pages->SetBrick(Key, Brick->PendingLevels, Brick->PendingMeshed);
+                // On screen from the first page version that holds it, as a component is from
+                // its first mesh: a restitch doesn't take it off screen until the page has
+                // run again, or bricks waiting on each other only apply one link per frame or
+                // two and fall behind while the camera moves.
+                const uint64 Version = Pages->SetBrick(Key, Brick->PendingLevels, Brick->PendingMeshed);
+                if (!Brick->bInPage)
+                    Brick->PageVersion = Version;
                 Brick->bInPage = true;
             }
             continue;

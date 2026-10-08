@@ -9,8 +9,8 @@
 #include "HAL/IConsoleManager.h"
 
 static TAutoConsoleVariable<int32> CVarVoxelRenderBricks(
-    TEXT("voxel.Render.Bricks"), 0,
-    TEXT("1: render terrain from LOD bricks (VoxelBrickTerrain) instead of the octree; the octree's chunks are hidden and its LOD passes paused."),
+    TEXT("voxel.Render.Bricks"), 1,
+    TEXT("1 (default): render terrain from LOD bricks (VoxelBrickTerrain) instead of the octree; the octree's chunks are hidden and its LOD passes paused. 0: the octree."),
     ECVF_Default);
 
 //Pipeline log thresholds... log if the pipelines take longer than the set value in MS
