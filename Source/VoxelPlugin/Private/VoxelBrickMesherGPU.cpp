@@ -153,8 +153,10 @@ namespace VoxelBrickMesherGPUDetail
 
 int32 VoxelBrickMesherGPU::CellsFor(const FVoxelBrickMesherGPUSettings& Settings)
 {
-    // The caps are sized for 32-cell bricks; the hash key holds points of up to 250.
-    return FMath::Clamp(Settings.CellsPerBrick / 4 * 4, 8, 64);
+    // A multiple of 8, so that the cells of the target sets (up to 8 cells across) line up
+    // with the coarser bricks'. The caps are sized for 32-cell bricks; the hash key holds
+    // points of up to 250.
+    return FMath::Clamp(Settings.CellsPerBrick / 8 * 8, 8, 64);
 }
 
 VoxelBrickMesherGPU::FCaps VoxelBrickMesherGPU::CapsFor(const FVoxelBrickMesherGPUSettings& Settings)
@@ -167,7 +169,7 @@ VoxelBrickMesherGPU::FCaps VoxelBrickMesherGPU::CapsFor(const FVoxelBrickMesherG
     Caps.FaceCap = Caps.VertexCap;
     Caps.TriangleCap = 2u * Caps.VertexCap;
     Caps.HashSize = FMath::Clamp(FMath::RoundUpToPowerOfTwo(Cells / 2u), 4096u, 65536u);
-    Caps.TargetHashSize = Caps.HashSize;   // parents and grandparents
+    Caps.TargetHashSize = Caps.HashSize;   // the target cells' corner and gradient points
     return Caps;
 }
 
@@ -178,7 +180,7 @@ bool VoxelBrickMesherGPU::MakeBrick(const FVoxelBrickKey& Key, const int8 (&Neig
     const int32 N = CellsFor(Settings);
     const int64 Unit = 1LL << Key.Level;
     const int64 Scale = 2LL * N * Unit;
-    const int64 Reach = (2LL * N + 16) * Unit;
+    const int64 Reach = (2LL * N + 48) * Unit;   // the target points reach 48 units past the brick
     const int64 Origin = 1LL << Settings.MaxDepth;
     const int64 Min[3] = { Key.Coord.X * Scale - Origin, Key.Coord.Y * Scale - Origin, Key.Coord.Z * Scale - Origin };
     if (FMath::Abs(Min[0]) + Reach >= MAX_int32 || FMath::Abs(Min[1]) + Reach >= MAX_int32 || FMath::Abs(Min[2]) + Reach >= MAX_int32)
@@ -241,10 +243,11 @@ VoxelBrickMesherGPU::FOutputs VoxelBrickMesherGPU::AddMesherPasses(FRDGBuilder& 
     const uint32 OwnSide = UN + 2u;
     const uint32 CoarseSide = UN / 2u + 2u;
     const uint32 NumSlots = OwnSide * OwnSide * OwnSide + CoarseSide * CoarseSide * CoarseSide;
-    // Target sets 1 to 3 (VoxelMesherTargetSide): parents and grandparents of own and coarse cells.
-    uint32 NumTargets = 0;
+    // Target sets 0 to 3 (VoxelMesherTargetSetSize): unstitched solves of own cells (the shell
+    // within two cells of the faces), then parents and grandparents two cells around the brick.
+    uint32 NumTargets = FMath::Cube(UN + 2u) - FMath::Cube(UN - 2u);
     for (uint32 K = 1u; K <= 3u; K++)
-        NumTargets += FMath::Cube((UN >> K) + 2u);
+        NumTargets += FMath::Cube((UN >> K) + 4u);
 
     auto MakeBuffer = [&GraphBuilder](uint32 Stride, uint32 Count, const TCHAR* Name)
         {
@@ -323,6 +326,9 @@ VoxelBrickMesherGPU::FOutputs VoxelBrickMesherGPU::AddMesherPasses(FRDGBuilder& 
     AddMesherPass<FVoxelMesherTrianglesCS>(GraphBuilder, PassFlags, Template, 0u, NB * Caps.FaceCap, TEXT("Triangles"));
     AddMesherPass<FVoxelMesherTargetRequestCS>(GraphBuilder, PassFlags, Template, 0u, NB * NumTargets, TEXT("Request target corners"));
     AddMesherPass<FVoxelMesherSampleCS>(GraphBuilder, PassFlags, Template, 2u, NB * Caps.TargetHashSize, TEXT("Sample target corners"));
+    AddMesherPass<FVoxelMesherTargetRequestCS>(GraphBuilder, PassFlags, Template, 2u, NB * NumTargets, TEXT("Mark target neighbours"));
+    AddMesherPass<FVoxelMesherTargetRequestCS>(GraphBuilder, PassFlags, Template, 3u, NB * NumTargets, TEXT("Request neighbour corners"));
+    AddMesherPass<FVoxelMesherSampleCS>(GraphBuilder, PassFlags, Template, 2u, NB * Caps.TargetHashSize, TEXT("Sample neighbour corners"));
     AddMesherPass<FVoxelMesherTargetRequestCS>(GraphBuilder, PassFlags, Template, 1u, NB * NumTargets, TEXT("Request target gradients"));
     AddMesherPass<FVoxelMesherSampleCS>(GraphBuilder, PassFlags, Template, 2u, NB * Caps.TargetHashSize, TEXT("Sample target gradients"));
     AddMesherPass<FVoxelMesherTargetSolveCS>(GraphBuilder, PassFlags, Template, 0u, NB * NumTargets, TEXT("Solve targets"));

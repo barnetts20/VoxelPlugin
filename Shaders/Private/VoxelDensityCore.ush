@@ -26,8 +26,10 @@ struct FVoxelFbmState
     float RidgeWeight;   // ridged multifractal feedback
 };
 
-// One octave of a layer, as FVoxelDensityCPU::BuildGPUData uploads it (48 bytes; matches
-// FVoxelDensityGPUOctave). Double values are double-float pairs (see VoxelDF64.ush).
+// One octave of a layer, as FVoxelDensityCPU::BuildGPUData uploads it (80 bytes; matches
+// FVoxelDensityGPUOctave). Double values are double-float pairs (see VoxelDF64.ush). With a
+// lacunarity of 2 an octave's lattice coordinate is the layer's finest one shifted right, so
+// it is taken in fixed point (VoxelFixedLattice) instead of double-float.
 struct FVoxelOctave
 {
     float2 Frequency;    // cycles per cm
@@ -37,8 +39,48 @@ struct FVoxelOctave
     float Wavelength;    // cm, for the band weight
     float Amplitude;     // gain^octave
     uint Seed;
-    uint Pad;
+    uint Shift;          // octaves below the layer's finest, or VoxelNoFixedPoint
+    uint OffsetCellX;    // the offset in 32.32 fixed point: integer part (wrapping) and fraction
+    uint OffsetCellY;
+    uint OffsetCellZ;
+    uint OffsetFracX;
+    uint OffsetFracY;
+    uint OffsetFracZ;
+    uint Pad0;
+    uint Pad1;
 };
+
+static const uint VoxelNoFixedPoint = 0xffffffffu;
+
+// A coordinate in 32.32 fixed point: its integer part (two's complement, wrapping at 2^32)
+// and its fraction times 2^32.
+struct FVoxelFixed
+{
+    uint Cell;
+    uint Frac;
+};
+
+// The lattice cell and the fraction inside it of a fixed-point coordinate shifted right by
+// Shift (0..31), plus an offset. Integer arithmetic: a point gets the same cell and fraction
+// whichever brick samples it, at any planet radius.
+VOXEL_FUNC FVoxelFixed VoxelFixedLattice(FVoxelFixed Coord, uint Shift, uint OffsetCell, uint OffsetFrac)
+{
+    const uint Lo = (Coord.Frac >> Shift) | ((Coord.Cell << (31u - Shift)) << 1u);
+    const uint Hi = uint(int(Coord.Cell) >> int(Shift));
+    const uint Sum = Lo + OffsetFrac;
+    FVoxelFixed Out;
+    Out.Cell = Hi + OffsetCell + (Sum < Lo ? 1u : 0u);
+    Out.Frac = Sum;
+    return Out;
+}
+
+// A fixed-point fraction as a float, rounded as the float of the exact value (as the CPU
+// rounds its double fraction): a coarse octave's small fractions keep their low bits. It can
+// round up to 1, where the noise equals the next cell's at 0.
+VOXEL_FUNC float VoxelFixedFraction(uint Frac)
+{
+    return float(Frac >> 8u) * (1.0f / 16777216.0f) + float(Frac & 255u) * (1.0f / 4294967296.0f);
+}
 
 // 32-bit hash of a lattice cell (lowbias32 finalizer).
 VOXEL_FUNC uint VoxelHash(uint3 Cell, uint Seed)

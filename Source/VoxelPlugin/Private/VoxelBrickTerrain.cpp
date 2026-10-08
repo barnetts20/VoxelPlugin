@@ -49,6 +49,11 @@ static TAutoConsoleVariable<int32> CVarVoxelBrickMorph(
     TEXT("Geomorphing of the GPU brick terrain, in the terrain material (VoxelMorph.ush, through the actor's Brick Morph Parameters collection). 1: vertices blend toward the next coarser level with distance, so LOD changes don't pop. 0: off. 2: fully blended everywhere (shows the coarser levels; for checking)."),
     ECVF_Default);
 
+static TAutoConsoleVariable<float> CVarVoxelBrickPrediction(
+    TEXT("voxel.Render.BrickPrediction"), 0.75f,
+    TEXT("How far ahead of the camera the brick terrain builds its tree, as a fraction of the time from a task's launch to the middle of its tree's time on screen (both measured). 1: centred on the camera in steady flight; lower overshoots less when the camera stops suddenly but trails further in flight, where the morph bands move nearer to match. 0: no prediction."),
+    ECVF_Default);
+
 static TAutoConsoleVariable<int32> CVarVoxelBrickBackend(
     TEXT("voxel.Render.BrickBackend"), 1,
     TEXT("Where brick-terrain bricks are meshed. 1 (default): GPU (pages of 8x8x8 bricks meshed ahead on async compute, written by compute providers; stitched seams only). 0: CPU (one component per brick; also used when the GPU path is unavailable)."),
@@ -59,9 +64,9 @@ namespace VoxelBrickTerrainDetail
     constexpr double TaskInterval = 0.1;            // seconds between tasks
     constexpr double TaskIntervalGPU = 0.05;        // GPU backend: meshing costs the task nothing
     constexpr double VelocitySmoothing = 0.15;      // seconds: camera velocity filter
+    constexpr double VelocityRelease = 0.04;        // seconds: the prediction's, while slowing down
     constexpr double MaxCameraStep = 0.5;           // seconds: a longer frame resets the velocity
     constexpr double MaxCameraJumpBricks = 8.0;     // finest bricks: a longer step in a frame too
-    constexpr double SlackFraction = 0.25;          // of the distance flown in the tree's latency
     /** A brick split in the previous tree stays split until this many times the split
      *  distance. Free for the morph: level-l vertices still meet level l + 1 only beyond the
      *  split distance (Design/GPUPath.md section 4), and up to 1.15 times it level l + 1
@@ -559,7 +564,7 @@ void FVoxelBrickTerrain::Initialize(AActor* InOwner, USceneComponent* InAttachRo
     AttachRoot = InAttachRoot;
     Density = InDensity;
     Settings = InSettings;
-    Settings.CellsPerBrick = FMath::Max(8, Settings.CellsPerBrick / 4 * 4);
+    Settings.CellsPerBrick = FMath::Clamp(Settings.CellsPerBrick / 8 * 8, 8, 64);   // as VoxelBrickMesherGPU::CellsFor
     Settings.MaxLevel = FMath::Max(0, Settings.MaxLevel);
     Settings.SlopeBound = FMath::Max(Settings.SlopeBound, 1.0);
     Pages->Initialize(InOwner, InAttachRoot, Settings);
@@ -584,6 +589,7 @@ void FVoxelBrickTerrain::Reset()
     LastLaunchTime = 0.0;
     bLastComplete = false;
     CameraVelocity = FVector::ZeroVector;
+    PredictionVelocity = FVector::ZeroVector;
     LastTickTime = 0.0;
     bCommitPending = false;
     bCommitProgressive = false;
@@ -595,6 +601,8 @@ void FVoxelBrickTerrain::Reset()
     CommitEditSequence = 0;
     MeasuredLatency = 0.0;
     bLatencyMeasured = false;
+    ScreenPeriod = 0.0;
+    LastScreenCommitTime = 0.0;
     EditBacklog.Reset();
     EditBacklogSequence = 0;
     FScopeLock Lock(&ResultCS);
@@ -659,7 +667,7 @@ int32 FVoxelBrickTerrain::ResolveBackend()
     return 0;
 }
 
-void FVoxelBrickTerrain::FlushPages(double TaskInterval)
+void FVoxelBrickTerrain::FlushPages()
 {
     if (!GPUDensity.IsValid())
     {
@@ -696,12 +704,21 @@ void FVoxelBrickTerrain::FlushPages(double TaskInterval)
             }, TStatId(), nullptr, ENamedThreads::AnyBackgroundThreadNormalTask);
     }
     Pages->Flush(GPUDensity, GPUEdits);
+}
 
-    // The tree is built for the camera predicted half an interval past its latency; what the
-    // prediction misses (half an interval of flight, a guess at the rest) moves the morph bands
-    // nearer, so a level is still fully blended wherever the tree on screen meets the next.
-    const double Speed = CameraVelocity.Size();
-    UpdateMorphParameters(Speed * (0.5 * TaskInterval + VBT::SlackFraction * TreeLatency));
+double FVoxelBrickTerrain::MorphSlack(double ScreenTime, double Prediction) const
+{
+    // A tree meets the next level at distances from the camera it was built for; moving the
+    // bands nearer by how far the camera can be from it keeps each level fully blended where
+    // it meets the next. In steady flight a tree built for Prediction of the time to the
+    // middle of its time on screen is behind the camera by up to (1 - Prediction) Latency +
+    // (1 - Prediction / 2) ScreenTime of flight (ahead, above 1, by the opposite at its
+    // start); a quarter of the latency more covers changes of speed and latency. From the
+    // filtered speed, so the slack changes smoothly: a jump would move every blending vertex
+    // at once.
+    const double Behind = (1.0 - Prediction) * TreeLatency + (1.0 - 0.5 * Prediction) * ScreenTime;
+    const double Ahead = (Prediction - 1.0) * TreeLatency + 0.5 * Prediction * ScreenTime;
+    return CameraVelocity.Size() * (FMath::Max3(Behind, Ahead, 0.0) + 0.25 * TreeLatency);
 }
 
 void FVoxelBrickTerrain::SetMorphParameters(UMaterialParameterCollection* InCollection)
@@ -759,13 +776,15 @@ void FVoxelBrickTerrain::LogPerf(double Now)
     {
         const double PerFrame = 1.0 / FMath::Max(1, Perf.Frames);
         const double PerTask = 1.0 / FMath::Max(1, Perf.Tasks);
-        UE_LOG(LogTemp, Log, TEXT("[VoxelBrickPerf] %d frames in %.2f s. Game thread ms per frame (average / max): take results %.2f / %.2f, apply or commit %.2f / %.2f, remove %.2f / %.2f, flush pages %.2f / %.2f, launch %.2f / %.2f. Tasks: %d, %.1f ms average (tree %.1f), %.1f ms max, %lld samples, %d bricks built (%d new, %d restitched, %d rebuilt after edits). %d held, %d wanted, %d queued to apply; commits wait %.0f ms (filtered); launch to screen %.0f ms average, %.0f ms max over %d results, %d of them held for a commit; %d edit commits."),
+        UE_LOG(LogTemp, Log, TEXT("[VoxelBrickPerf] %d frames in %.2f s. Game thread ms per frame (average / max): take results %.2f / %.2f, apply or commit %.2f / %.2f, remove %.2f / %.2f, flush pages %.2f / %.2f, launch %.2f / %.2f. Tasks: %d, %.1f ms average (tree %.1f), %.1f ms max, %lld samples, %d bricks built (%d new, %d restitched, %d rebuilt after edits). %d held, %d wanted, %d queued to apply; commits wait %.0f ms (filtered); launch to screen %.0f ms average, %.0f ms max over %d results, %d of them held for a commit; %d edit commits. Camera %.0f m/s; trees built %.1f m ahead of it (average, %.1f max over %d tasks); morph slack %.1f m average, %.1f max."),
             Perf.Frames, Now - Perf.Start,
             Perf.SectionMs[0] * PerFrame, Perf.MaxSectionMs[0], Perf.SectionMs[1] * PerFrame, Perf.MaxSectionMs[1], Perf.SectionMs[2] * PerFrame, Perf.MaxSectionMs[2],
             Perf.SectionMs[3] * PerFrame, Perf.MaxSectionMs[3], Perf.SectionMs[4] * PerFrame, Perf.MaxSectionMs[4],
             Perf.Tasks, Perf.TaskMs * PerTask, Perf.TreeMs * PerTask, Perf.MaxTaskMs, Perf.TaskSamples, Perf.TaskBuilt, Perf.TaskNew, Perf.TaskRestitched, Perf.TaskRebuilt,
             Bricks.Num(), Wanted.Num(), ApplyQueue.Num(),
-            CommitWaitSeconds * 1000.0, Perf.Latencies > 0 ? Perf.LatencyMs / Perf.Latencies : 0.0, Perf.MaxLatencyMs, Perf.Latencies, Perf.HeldResults, Perf.EditCommits);
+            CommitWaitSeconds * 1000.0, Perf.Latencies > 0 ? Perf.LatencyMs / Perf.Latencies : 0.0, Perf.MaxLatencyMs, Perf.Latencies, Perf.HeldResults, Perf.EditCommits,
+            CameraVelocity.Size() / 100.0, Perf.Launches > 0 ? Perf.Lead / Perf.Launches / 100.0 : 0.0, Perf.MaxLead / 100.0, Perf.Launches,
+            Perf.Slack * PerFrame / 100.0, Perf.MaxSlack / 100.0);
         if (Backend == 1)
             UE_LOG(LogTemp, Log, TEXT("[VoxelBrickPerf] %s"), *Pages->TakePerf());
     }
@@ -786,13 +805,19 @@ void FVoxelBrickTerrain::Tick(const FVector& Camera)
     const double JumpDistance = VBT::MaxCameraJumpBricks * Settings.FinestCell * Settings.CellsPerBrick;
     if (LastTickTime > 0.0 && Step > 0.0 && Step < VBT::MaxCameraStep && FVector::DistSquared(Camera, LastCamera) < FMath::Square(JumpDistance))
     {
+        const FVector Instant = (Camera - LastCamera) / Step;
         const double Blend = 1.0 - FMath::Exp(-Step / VBT::VelocitySmoothing);
-        CameraVelocity += ((Camera - LastCamera) / Step - CameraVelocity) * Blend;
+        CameraVelocity += (Instant - CameraVelocity) * Blend;
         FrameSeconds += (Step - FrameSeconds) * Blend;
+        // The prediction lets go of speed faster than it picks it up, so the trees launched
+        // after a sudden stop aren't built ahead of the camera.
+        const double Smoothing = Instant.SizeSquared() < PredictionVelocity.SizeSquared() ? VBT::VelocityRelease : VBT::VelocitySmoothing;
+        PredictionVelocity += (Instant - PredictionVelocity) * (1.0 - FMath::Exp(-Step / Smoothing));
     }
     else
     {
         CameraVelocity = FVector::ZeroVector;
+        PredictionVelocity = FVector::ZeroVector;
     }
     LastTickTime = Now;
     LastCamera = Camera;
@@ -822,6 +847,10 @@ void FVoxelBrickTerrain::Tick(const FVector& Camera)
     }
     Lap(0);
     const double TaskInterval = Backend == 1 ? VBT::TaskIntervalGPU : VBT::TaskInterval;
+    // A tree is on screen until the next is: a task interval, or the measured time between
+    // commits.
+    const double ScreenTime = Backend == 1 && ScreenPeriod > 0.0 ? ScreenPeriod : TaskInterval;
+    const double Prediction = FMath::Max(0.0, (double)CVarVoxelBrickPrediction.GetValueOnGameThread());
     if (Backend == 1)
     {
         // From a task's launch until its tree is drawn: measured once a result is committed
@@ -832,13 +861,17 @@ void FVoxelBrickTerrain::Tick(const FVector& Camera)
         Pages->SetBusy(bCommitPending && (HeldResult.IsSet() || bTaskRunning.load(std::memory_order_acquire)));
         {
             SCOPE_CYCLE_COUNTER(STAT_VoxelBricksFlush);
-            FlushPages(TaskInterval);
+            FlushPages();
         }
         Lap(3);
         {
             SCOPE_CYCLE_COUNTER(STAT_VoxelBricksApply);
             CommitPages();
         }
+        const double Slack = MorphSlack(ScreenTime, Prediction);
+        UpdateMorphParameters(Slack);
+        Perf.Slack += Slack;
+        Perf.MaxSlack = FMath::Max(Perf.MaxSlack, Slack);
         Lap(1);
     }
     else
@@ -866,9 +899,10 @@ void FVoxelBrickTerrain::Tick(const FVector& Camera)
     SCOPE_CYCLE_COUNTER(STAT_VoxelBricksLaunch);
     ON_SCOPE_EXIT { Lap(4); };
 
-    // The tree is on screen from about TreeLatency after the launch until the next one is,
-    // an interval later: build it for the camera predicted halfway through.
-    const FVector TaskCamera = Camera + CameraVelocity * (TreeLatency + 0.5 * TaskInterval);
+    // The tree is on screen from about TreeLatency after the launch for ScreenTime: build it
+    // for the camera predicted halfway through, scaled by voxel.Render.BrickPrediction (a
+    // sudden stop then overshoots less).
+    const FVector TaskCamera = Camera + PredictionVelocity * (Prediction * (TreeLatency + 0.5 * ScreenTime));
 
     // A task that finished since the drain above must be in Known (CPU) or applied (GPU)
     // before the next starts.
@@ -913,6 +947,11 @@ void FVoxelBrickTerrain::Tick(const FVector& Camera)
         if (Pair.Value.bProvenEmpty)
             Input.ProvenEmpty.Add(Pair.Key);
     }
+
+    const double Lead = FVector::Dist(TaskCamera, Camera);
+    Perf.Lead += Lead;
+    Perf.MaxLead = FMath::Max(Perf.MaxLead, Lead);
+    Perf.Launches++;
 
     bTaskRunning.store(true, std::memory_order_release);
     TSharedRef<FVoxelBrickTerrain> Self = AsShared();
@@ -1433,13 +1472,21 @@ void FVoxelBrickTerrain::CommitPages()
         }
         const double Wait = (double)(GFrameCounter - CommitPendingFrame) * FrameSeconds;
         CommitWaitSeconds += (Wait - CommitWaitSeconds) * VBT::CommitWaitBlend;
-        const double Latency = FPlatformTime::Seconds() - CommitLaunchTime;
+        const double Now = FPlatformTime::Seconds();
+        const double Latency = Now - CommitLaunchTime;
         MeasuredLatency = bLatencyMeasured ? MeasuredLatency + (Latency - MeasuredLatency) * VBT::LatencyBlend : Latency;
         bLatencyMeasured = true;
         Perf.LatencyMs += Latency * 1000.0;
         Perf.MaxLatencyMs = FMath::Max(Perf.MaxLatencyMs, Latency * 1000.0);
         Perf.Latencies++;
         CommitLaunchTime = 0.0;
+        // That result's tree is on screen until the next result's commit.
+        if (LastScreenCommitTime > 0.0)
+        {
+            const double Period = FMath::Clamp(Now - LastScreenCommitTime, VBT::TaskIntervalGPU, FMath::Max(MeasuredLatency, VBT::TaskIntervalGPU));
+            ScreenPeriod = ScreenPeriod > 0.0 ? ScreenPeriod + (Period - ScreenPeriod) * VBT::LatencyBlend : Period;
+        }
+        LastScreenCommitTime = Now;
     }
 }
 

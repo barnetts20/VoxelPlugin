@@ -114,7 +114,7 @@ namespace VoxelBrickPagesDetail
     constexpr int32 BatchCells = 128 * 4096;         // cells per mesher batch (128 16-cell bricks)
     constexpr int32 MaxPooled = 32;                  // emptied buffer sets kept for reuse
     constexpr int32 PoolSlack = 2;                   // a pooled set may be this many classes larger on each count
-    constexpr double BoundsMarginCells = 12.0;       // page bounds beyond its bricks (cells of its level), with the morph
+    constexpr double BoundsMarginCells = 20.0;       // page bounds beyond its bricks (cells of its level), with the morph
     constexpr int32 MinVertices = 4096;
     constexpr int32 MinTriangles = 8192;
     constexpr int32 SlabVertices = 1 << 16;          // a buffer set's size limit: 4 MB of vertices
@@ -140,17 +140,17 @@ namespace VoxelBrickPagesDetail
     constexpr int32 MaxCacheTriangles = 1 << 24;
     constexpr uint64 CachePeakFrames = 300;          // window of the cache's peak use
     constexpr double CacheShrinkMargin = 1.5;        // an idle cache shrinks to a power of two above this times its peak
-    constexpr uint32 CacheWords = 15;                // VOXEL_CACHE_WORDS (VoxelBrickPageGPU.usf)
+    constexpr uint32 CacheWords = 19;                // VOXEL_CACHE_WORDS (VoxelBrickPageGPU.usf)
     constexpr uint32 EntryWords = 8;                 // VOXEL_ENTRY_WORDS
     constexpr uint32 JobWords = 8;                   // VOXEL_JOB_WORDS
-    constexpr int32 TexCoordChannels = 5;
-    constexpr int32 BytesPerVertex = 12 + 8 + 40 + 4;   // position, two packed normals, five float2 UVs, colour
+    constexpr int32 TexCoordChannels = 7;
+    constexpr int32 BytesPerVertex = 12 + 8 + 56 + 4;   // position, two packed normals, seven float2 UVs, colour
     constexpr int32 BytesPerTriangle = 12;
 
     const FName PageGroupName(TEXT("BRICKPAGE"));
 
-    /** Bricks per mesher batch: the scratch buffers grow with the cells per brick (about 50 MB
-     *  per batch). */
+    /** Bricks per mesher batch: the scratch buffers grow with the cells per brick (about 75 MB
+     *  per batch at 16 cells). */
     int32 BatchBricksFor(const FVoxelBrickMesherGPUSettings& Settings)
     {
         return FMath::Clamp(BatchCells / FMath::Cube(VoxelBrickMesherGPU::CellsFor(Settings)), 8, 256);
@@ -712,8 +712,8 @@ FVoxelBrickPages::FInstance FVoxelBrickPages::CreateInstance(int32 VertexCapacit
 
     // The uploaded streams only size the buffers; the provider writes them. Two corner
     // positions give the bounds, the same for every level (positions are in level units):
-    // bricks reach a few cells past their box, and the morph moves vertices toward coarser
-    // cells up to 8 cells across.
+    // bricks reach a few cells past their box, and the morph moves vertices toward the
+    // vertices of coarser cells (up to 8 cells across) as far as two of those past the brick.
     FRealtimeMeshStreamSet Streams;
     FRealtimeMeshStream& Positions = Streams.AddStream(FRealtimeMeshStreams::Position, GetRealtimeMeshBufferLayout<FVector3f>());
     Positions.SetNumZeroed(VertexCapacity);

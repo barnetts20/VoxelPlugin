@@ -22,17 +22,48 @@ VOXEL_FUNC float2 VoxelLayerSumDF(uint First, uint Count, uint Kind, float2 SPX,
 {
     FVoxelFbmState State = VoxelFbmBegin();
     float2 Sum = float2(0.0f, 0.0f);
+    if (Count == 0u) return Sum;
+
+    // Lacunarity 2: the finest octave's coordinate once, in fixed point; each octave shifts it.
+    const bool bFixed = Octaves[First].Shift != VoxelNoFixedPoint;
+    FVoxelFixed FX;
+    FVoxelFixed FY;
+    FVoxelFixed FZ;
+    FX.Cell = 0u; FX.Frac = 0u;
+    FY = FX;
+    FZ = FX;
+    if (bFixed)
+    {
+        const float2 Finest = Octaves[First + Count - 1u].Frequency;
+        FX = VoxelDFToFixed(VoxelDFMul(SPX, Finest));
+        FY = VoxelDFToFixed(VoxelDFMul(SPY, Finest));
+        FZ = VoxelDFToFixed(VoxelDFMul(SPZ, Finest));
+    }
     for (uint o = 0u; o < Count; o++)
     {
         const FVoxelOctave Oct = Octaves[First + o];
         const float Band = VoxelOctaveBandWeight(Oct.Wavelength, Footprint);
         if (Band <= 0.0f) break;
 
-        const FVoxelLatticeSplit LX = VoxelDFLatticeSplit(VoxelDFAdd(VoxelDFMul(SPX, Oct.Frequency), Oct.OffsetX));
-        const FVoxelLatticeSplit LY = VoxelDFLatticeSplit(VoxelDFAdd(VoxelDFMul(SPY, Oct.Frequency), Oct.OffsetY));
-        const FVoxelLatticeSplit LZ = VoxelDFLatticeSplit(VoxelDFAdd(VoxelDFMul(SPZ, Oct.Frequency), Oct.OffsetZ));
-        const FVoxelNoiseSample N = VoxelGradientNoise(uint3(asuint(LX.Cell), asuint(LY.Cell), asuint(LZ.Cell)),
-            float3(LX.Frac, LY.Frac, LZ.Frac), Oct.Seed);
+        uint3 Cell;
+        float3 Frac;
+        if (bFixed)
+        {
+            const FVoxelFixed LX = VoxelFixedLattice(FX, Oct.Shift, Oct.OffsetCellX, Oct.OffsetFracX);
+            const FVoxelFixed LY = VoxelFixedLattice(FY, Oct.Shift, Oct.OffsetCellY, Oct.OffsetFracY);
+            const FVoxelFixed LZ = VoxelFixedLattice(FZ, Oct.Shift, Oct.OffsetCellZ, Oct.OffsetFracZ);
+            Cell = uint3(LX.Cell, LY.Cell, LZ.Cell);
+            Frac = float3(VoxelFixedFraction(LX.Frac), VoxelFixedFraction(LY.Frac), VoxelFixedFraction(LZ.Frac));
+        }
+        else
+        {
+            const FVoxelLatticeSplit LX = VoxelDFLatticeSplit(VoxelDFAdd(VoxelDFMul(SPX, Oct.Frequency), Oct.OffsetX));
+            const FVoxelLatticeSplit LY = VoxelDFLatticeSplit(VoxelDFAdd(VoxelDFMul(SPY, Oct.Frequency), Oct.OffsetY));
+            const FVoxelLatticeSplit LZ = VoxelDFLatticeSplit(VoxelDFAdd(VoxelDFMul(SPZ, Oct.Frequency), Oct.OffsetZ));
+            Cell = uint3(asuint(LX.Cell), asuint(LY.Cell), asuint(LZ.Cell));
+            Frac = float3(LX.Frac, LY.Frac, LZ.Frac);
+        }
+        const FVoxelNoiseSample N = VoxelGradientNoise(Cell, Frac, Oct.Seed);
 
         // Each octave's contribution is taken from a zeroed float sum and added in
         // double-float, as the CPU adds them in double.

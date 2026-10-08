@@ -246,9 +246,12 @@ private:
     int32 ResolveBackend();
     /** voxel.Debug.BrickPerf: once a second, logs and resets Perf. */
     void LogPerf(double Now);
-    /** GPU backend: hands the pages the current density and edits, and the material the
-     *  camera with the morph slack the tree's latency calls for. */
-    void FlushPages(double TaskInterval);
+    /** GPU backend: hands the pages the current density and edits. */
+    void FlushPages();
+    /** GPU backend: how far the tree on screen can be from the camera in steady flight (actor
+     *  units), which moves the morph bands nearer. ScreenTime: how long a tree stays on
+     *  screen; Prediction: voxel.Render.BrickPrediction. */
+    double MorphSlack(double ScreenTime, double Prediction) const;
     /** Sets the morph collection's camera (world, as a float and the rest), slack (world
      *  units) and voxel.Render.BrickMorph mode. */
     void UpdateMorphParameters(double Slack);
@@ -296,6 +299,10 @@ private:
     uint32 CommitEditSequence = 0;
     double MeasuredLatency = 0.0;
     bool bLatencyMeasured = false;
+    /** GPU backend: how long a tree stays on screen (between result commits, at most the
+     *  latency), filtered; the latest such commit. */
+    double ScreenPeriod = 0.0;
+    double LastScreenCommitTime = 0.0;
     /** GPU backend: held bricks in the reach of edits not yet committed, and the newest such
      *  edit. */
     TSet<FVoxelBrickKey> EditBacklog;
@@ -303,8 +310,10 @@ private:
 
     int32 Backend = 0;
     FVector LastCamera = FVector::ZeroVector;   // the latest Tick's camera (actor-local)
-    /** Camera motion, filtered, for the task's camera prediction and the morph slack. */
+    /** Camera motion, filtered (the morph slack); the prediction's, which lets go of speed
+     *  faster than it picks it up. */
     FVector CameraVelocity = FVector::ZeroVector;
+    FVector PredictionVelocity = FVector::ZeroVector;
     double LastTickTime = 0.0;
     double FrameSeconds = 1.0 / 60.0;
     double TaskSeconds = 0.0;      // a task's run time, filtered
@@ -346,6 +355,11 @@ private:
         double LatencyMs = 0.0;        // launch to screen, summed over the results committed
         double MaxLatencyMs = 0.0;
         int32 Latencies = 0;
+        double Lead = 0.0;             // prediction ahead of the camera at launch, summed over tasks
+        double MaxLead = 0.0;
+        int32 Launches = 0;
+        double Slack = 0.0;            // morph slack, summed over frames
+        double MaxSlack = 0.0;
     };
     FPerf Perf;
 

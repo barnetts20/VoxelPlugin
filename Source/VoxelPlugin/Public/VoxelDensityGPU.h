@@ -19,9 +19,12 @@ struct FVoxelDensityGPUOctave
     float Wavelength = 0.0f;
     float Amplitude = 0.0f;
     uint32 Seed = 0;
-    uint32 Pad = 0;
+    uint32 Shift = 0xffffffffu;      // fixed-point path (VoxelNoFixedPoint when off)
+    uint32 OffsetCell[3] = {};       // the offset in 32.32 fixed point
+    uint32 OffsetFrac[3] = {};
+    uint32 Pad[2] = {};
 };
-static_assert(sizeof(FVoxelDensityGPUOctave) == 48, "Must match FVoxelOctave in VoxelDensityCore.ush");
+static_assert(sizeof(FVoxelDensityGPUOctave) == 80, "Must match FVoxelOctave in VoxelDensityCore.ush");
 
 /** Everything the shader needs to evaluate one planet's density (without edits). */
 struct FVoxelDensityGPUData

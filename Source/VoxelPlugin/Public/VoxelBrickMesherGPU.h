@@ -55,8 +55,10 @@ namespace VoxelBrickMesherGPU
 
     /** A vertex record is VertexStride floats (VoxelMesherVertexStride): position cm from the
      *  brick min, normal, the parent target's position and normal, the grandparent target's
-     *  position and normal, the cell's level relative to the brick (0 or 1), pad. */
-    constexpr uint32 VertexStride = 20;
+     *  position and normal, the unstitched position and normal (the cell solved as if the
+     *  finer leaves around it were of its level), the cell's level relative to the brick (0 or
+     *  1), pad. */
+    constexpr uint32 VertexStride = 26;
 
     /** Per-brick slots, scaled with the brick's cell count (powers of two). */
     struct FCaps
@@ -78,7 +80,7 @@ namespace VoxelBrickMesherGPU
      *  GPU can't run the shaders. CellsPerBrick is clamped to 8..64. Call from any thread but
      *  the render thread. */
     /** Cells per brick edge the shaders use for Settings: CellsPerBrick rounded down to a
-     *  multiple of 4, clamped to 8..64. */
+     *  multiple of 8, clamped to 8..64. */
     VOXELPLUGIN_API int32 CellsFor(const FVoxelBrickMesherGPUSettings& Settings);
 
     VOXELPLUGIN_API FCaps CapsFor(const FVoxelBrickMesherGPUSettings& Settings);

@@ -23,6 +23,16 @@ namespace
         return FVector2f(Hi, (float)(V - (double)Hi));
     }
 
+    /** A coordinate in 32.32 fixed point (VoxelShader::FVoxelFixed). |V| below 2^31. */
+    VoxelShader::FVoxelFixed ToFixed(double V)
+    {
+        const double Floor = FMath::FloorToDouble(V);
+        VoxelShader::FVoxelFixed Out;
+        Out.Cell = (uint32)(int64)Floor;
+        Out.Frac = (uint32)FMath::Min((V - Floor) * 4294967296.0, 4294967295.0);
+        return Out;
+    }
+
     /** Splits a lattice coordinate into a cell (wrapped to 32 bits) and the fraction in it. */
     void SplitLattice(const FVector& L, VoxelShader::uint3& OutCell, VoxelShader::float3& OutFrac)
     {
@@ -71,6 +81,10 @@ FVoxelDensityCPU::FLayer FVoxelDensityCPU::MakeLayer(uint32 Kind, double Wavelen
     const int32 NumOctaves = FMath::Max(InOctaves, 0);
 
     double Frequency = 1.0 / FMath::Max(WavelengthFraction * InPlanetRadius, 1e-3);
+    // Lacunarity 2 keeps every octave's frequency the finest one's over a power of two. The
+    // finest coordinate (up to the radius times its frequency) must fit the 32-bit cell.
+    const bool bFixed = Lacunarity == 2.0 && NumOctaves > 0 && NumOctaves <= 32
+        && InPlanetRadius * Frequency * FMath::Pow(2.0, (double)(NumOctaves - 1)) < 1073741824.0;
     float Amplitude = 1.0f;
     double AmpSum = 0.0;
     double AmpSquareSum = 0.0;
@@ -89,6 +103,16 @@ FVoxelDensityCPU::FLayer FVoxelDensityCPU::MakeLayer(uint32 Kind, double Wavelen
         // A per-octave shift of the lattice, so octaves don't share zero crossings.
         const uint32 H = VoxelShader::VoxelHashSeed(InSeed, 0x51ed27u + (uint32)o);
         Octave.Offset = FVector((H & 0x3ffu) * 0.618034, ((H >> 10) & 0x3ffu) * 0.414214, ((H >> 20) & 0x3ffu) * 0.732051);
+        if (bFixed)
+        {
+            Octave.Shift = (uint32)(NumOctaves - 1 - o);
+            for (int32 Axis = 0; Axis < 3; Axis++)
+            {
+                const VoxelShader::FVoxelFixed F = ToFixed(Octave.Offset[Axis]);
+                Octave.OffsetCell[Axis] = F.Cell;
+                Octave.OffsetFrac[Axis] = F.Frac;
+            }
+        }
 
         Frequency *= Lacunarity;
         Amplitude *= (float)InGain;
@@ -111,6 +135,17 @@ double FVoxelDensityCPU::EvaluateLayer(const FLayer& Layer, const FVector& Surfa
     // zeroed sum and added here in double, so the total keeps double precision.
     FVoxelFbmState State = VoxelFbmBegin();
     double Sum = 0.0;
+    if (Layer.Octaves.Num() == 0) return 0.0;
+
+    // Lacunarity 2: the finest octave's coordinate once, in fixed point, as the GPU takes it.
+    const bool bFixed = Layer.Octaves[0].Shift != VoxelNoFixedPoint;
+    FVoxelFixed Finest[3] = {};
+    if (bFixed)
+    {
+        const FVector Coord = SurfacePoint * Layer.Octaves.Last().Frequency;
+        for (int32 Axis = 0; Axis < 3; Axis++)
+            Finest[Axis] = ToFixed(Coord[Axis]);
+    }
     for (const FOctave& Octave : Layer.Octaves)
     {
         const float Band = VoxelOctaveBandWeight(Octave.Wavelength, (float)Footprint);
@@ -118,7 +153,18 @@ double FVoxelDensityCPU::EvaluateLayer(const FLayer& Layer, const FVector& Surfa
 
         uint3 Cell;
         float3 Frac;
-        SplitLattice(SurfacePoint * Octave.Frequency + Octave.Offset, Cell, Frac);
+        if (bFixed)
+        {
+            FVoxelFixed L[3];
+            for (int32 Axis = 0; Axis < 3; Axis++)
+                L[Axis] = VoxelFixedLattice(Finest[Axis], Octave.Shift, Octave.OffsetCell[Axis], Octave.OffsetFrac[Axis]);
+            Cell = uint3(L[0].Cell, L[1].Cell, L[2].Cell);
+            Frac = float3(VoxelFixedFraction(L[0].Frac), VoxelFixedFraction(L[1].Frac), VoxelFixedFraction(L[2].Frac));
+        }
+        else
+        {
+            SplitLattice(SurfacePoint * Octave.Frequency + Octave.Offset, Cell, Frac);
+        }
         const FVoxelNoiseSample N = VoxelGradientNoise(Cell, Frac, Octave.Seed);
 
         State.Sum = 0.0f;
@@ -194,6 +240,12 @@ void FVoxelDensityCPU::BuildGPUData(FVoxelDensityGPUData& Out) const
             G.Wavelength = Octave.Wavelength;
             G.Amplitude = Octave.Amplitude;
             G.Seed = Octave.Seed;
+            G.Shift = Octave.Shift;
+            for (int32 Axis = 0; Axis < 3; Axis++)
+            {
+                G.OffsetCell[Axis] = Octave.OffsetCell[Axis];
+                G.OffsetFrac[Axis] = Octave.OffsetFrac[Axis];
+            }
         }
     }
     Out.ContinentOctaves = (uint32)Continent.Octaves.Num();

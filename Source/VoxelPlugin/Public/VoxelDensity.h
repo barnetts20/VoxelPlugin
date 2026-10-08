@@ -113,7 +113,10 @@ public:
     double GetNoiseAmplitude() const { return NoiseAmplitude; }
 
 private:
-    /** One octave, fixed at construction; both backends read these. */
+    /** One octave, fixed at construction; both backends read these. With a lacunarity of 2,
+     *  at most 32 octaves and the finest coordinate below 2^30 (radius times the finest
+     *  frequency), its lattice coordinate is the layer's finest one shifted right by Shift, in
+     *  fixed point (VoxelFixedLattice); otherwise Shift is VoxelNoFixedPoint. */
     struct FOctave
     {
         double Frequency = 0.0;       // cycles per cm
@@ -121,6 +124,9 @@ private:
         float Wavelength = 0.0f;      // cm, for the band weight
         float Amplitude = 1.0f;       // gain^octave, accumulated in float
         uint32 Seed = 0;
+        uint32 Shift = 0xffffffffu;
+        uint32 OffsetCell[3] = {};    // Offset in 32.32 fixed point
+        uint32 OffsetFrac[3] = {};
     };
 
     struct FLayer

@@ -5,6 +5,7 @@
 // Dekker/Knuth error-free transformations without fused multiply-add: every operation
 // marked VOXEL_PRECISE must round exactly as written. Division and square root start from
 // the hardware result and correct it, so approximate GPU division and sqrt are fine.
+// Include after VoxelDensityCore.ush (FVoxelFixed).
 
 #ifndef VOXEL_DF64_USH
 #define VOXEL_DF64_USH
@@ -114,6 +115,30 @@ VOXEL_FUNC float2 VoxelDFClamp01(float2 A)
     if (A.x < 0.0f || (A.x == 0.0f && A.y < 0.0f)) return float2(0.0f, 0.0f);
     if (A.x > 1.0f || (A.x == 1.0f && A.y > 0.0f)) return float2(1.0f, 0.0f);
     return A;
+}
+
+// A double-float in 32.32 fixed point (FVoxelFixed, VoxelDensityCore.ush): the cell as
+// VoxelDFLatticeSplit takes it, then the fraction's top 24 bits and the next 8 (borrowing
+// from the top when the low float is negative). |A| must stay below 2^31.
+VOXEL_FUNC FVoxelFixed VoxelDFToFixed(float2 A)
+{
+    const float F = floor(A.x);
+    float2 R = VoxelDFSub(A, float2(F, 0.0f));
+    float G = floor(R.x);
+    if (R.x == G && R.y < 0.0f) G -= 1.0f;
+    R = VoxelDFSub(R, float2(G, 0.0f));
+    float Top = floor(R.x * 16777216.0f);
+    float2 Rest = VoxelDFSub(R, float2(Top * (1.0f / 16777216.0f), 0.0f));
+    if (Rest.x < 0.0f && Top > 0.0f)
+    {
+        Top -= 1.0f;
+        Rest = VoxelDFAdd(Rest, float2(1.0f / 16777216.0f, 0.0f));
+    }
+    const float Bottom = clamp(floor((Rest.x + Rest.y) * 4294967296.0f), 0.0f, 255.0f);
+    FVoxelFixed Out;
+    Out.Cell = asuint(int(F) + int(G));
+    Out.Frac = (uint(Top) << 8u) | uint(Bottom);
+    return Out;
 }
 
 // A lattice coordinate split into its cell (floor) and the fraction inside it.
