@@ -8,6 +8,13 @@
 
 class FSparseEditStore;
 
+/** A double as the shaders take it (VoxelDF64.ush): the nearest float and the remainder. */
+inline FVector2f VoxelDoubleFloat(double V)
+{
+    const float Hi = (float)V;
+    return FVector2f(Hi, (float)(V - (double)Hi));
+}
+
 /** One noise octave as the shader reads it (FVoxelOctave in VoxelDensityCore.ush). Double
  *  values are double-float pairs (high float, remainder). */
 struct FVoxelDensityGPUOctave

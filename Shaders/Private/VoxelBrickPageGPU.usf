@@ -3,7 +3,7 @@
 // StageCS runs ahead of a commit (async compute): it converts a mesher batch
 // (VoxelBrickMesherGPU.usf) into the mesh cache, each brick's vertices in the page format and
 // its indices brick-local, packed in order into the cache region the CPU reserved for the batch.
-// A brick that doesn't fit what is left is skipped (the CPU meshes it again). Per brick an entry
+// A brick that doesn't fit what is left is skipped (it is queued and meshed again). Per brick an entry
 // is read back: where it went, its counts and error bits.
 //
 // WriteCS runs in a page buffer set's compute run at the commit. A job is one brick: its
@@ -151,7 +151,7 @@ void StageCS(uint3 GroupId : SV_GroupID, uint GroupThread : SV_GroupIndex)
         const float3 CoarseNormal = SafeNormal(float3(MesherVertices[Src + 26u], MesherVertices[Src + 27u], MesherVertices[Src + 28u]), ParentNormal);
         const float3 ParentCoarseNormal = SafeNormal(float3(MesherVertices[Src + 29u], MesherVertices[Src + 30u], MesherVertices[Src + 31u]), GrandNormal);
 
-        // Triplanar UV as the CPU renderer picks it, in cm (the page origin's whole periods dropped).
+        // Triplanar UV from the dominant normal axis, in cm (the page origin's whole periods dropped).
         const float3 A = abs(N);
         float2 UV = float2(UVs.x, UVs.y) + Cm.xy * UVs.w;
         if (A.x > A.y && A.x > A.z)

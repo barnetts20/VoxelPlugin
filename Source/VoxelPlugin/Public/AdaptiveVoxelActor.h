@@ -62,9 +62,10 @@ public:
     UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Terrain")
     bool bIsPlanetOwned = false;
 
-    /** Surface material applied to all mesh chunks. When standalone, auto-loads the
-     *  plugin's triplanar material on first init. When planet-owned, set by the planet. */
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrain|Materials",
+    /** Surface material of the terrain bricks. When standalone, auto-loads the plugin's
+     *  triplanar material on first init. When planet-owned, set by the planet. Change it at
+     *  run time with SetSurfaceMaterial. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, BlueprintSetter = SetSurfaceMaterial, Category = "Terrain|Materials",
         meta = (EditCondition = "!bIsPlanetOwned"))
     UMaterialInterface* SurfaceMaterial = nullptr;
 
@@ -128,7 +129,7 @@ public:
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrain|Bricks", meta = (ClampMin = "8", ClampMax = "64"))
     int32 BrickCellsPerBrick = 16;
 
-    /** Brick terrain (GPU): the collection the terrain material's morph node reads (vectors
+    /** Brick terrain: the collection the terrain material's morph node reads (vectors
      *  VoxelMorphCameraHigh, VoxelMorphCameraLow, VoxelMorphParams; Design/MeshingEngine.md
      *  section 7). Empty: /VoxelPlugin/MPC_VoxelMorph if it exists. Without one LOD changes
      *  don't blend. */
@@ -199,6 +200,11 @@ public:
      *  and BeginPlay; InitializeFromPlanet does the same with the planet's density. */
     void Initialize();
 
+    /** Changes the terrain material on every brick page without a rebuild (null: the
+     *  plugin's triplanar material). */
+    UFUNCTION(BlueprintCallable, Category = "Terrain|Materials")
+    void SetSurfaceMaterial(UMaterialInterface* InMaterial);
+
 protected:
     /** The density every terrain consumer samples (set by Initialize / InitializeFromPlanet). */
     TSharedPtr<FDensitySampleCompositor> DensityCompositor;
@@ -254,6 +260,15 @@ protected:
 
     /** Diagnostics (voxel.Debug.Collision): logs what the edit trace hit. */
     void LogEditHit(const FHitResult& Hit, const FVector& LocalHit) const;
+
+    /** The plugin's triplanar material, or the engine default when the plugin content is
+     *  missing. */
+    static UMaterialInterface* DefaultSurfaceMaterial();
+
+    /** Example edit flow (E adds, Q removes), not in shipping builds: traces from the camera
+     *  along the control rotation and edits this terrain where the trace hits one of its
+     *  collision bricks. */
+    void TickDebugEdits(UWorld* World);
 
     /** Background task: writes a spherical brush edit to the edit store and queues its notice.
      *  InEditResolution: edit-tree levels below the brush-sized node. */

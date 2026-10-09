@@ -1,7 +1,5 @@
 #include "VoxelBrickPages.h"
-#include "VoxelMeshStream.h"
-#include "FDensitySampleCompositor.h"
-#include "FSparseEditStore.h"
+#include "VoxelPlugin.h"
 #include "HAL/IConsoleManager.h"
 #include "Misc/ScopeLock.h"
 #include "RealtimeMeshSimple.h"
@@ -114,11 +112,27 @@ static TAutoConsoleVariable<int32> CVarVoxelBrickMeshBatchesBusy(
 
 namespace VoxelBrickPagesDetail
 {
+    /** What a page's compute run lacked. Runs missing a Required item are skipped. */
+    enum class EMissing : uint32
+    {
+        PageShaders = 1 << 0,
+        Positions = 1 << 1,
+        Tangents = 1 << 2,
+        TexCoords = 1 << 3,
+        Colors = 1 << 4,
+        Triangles = 1 << 5,
+        Args = 1 << 6,
+        Capacity = 1 << 7,
+        Required = PageShaders | Positions | Triangles | Args | Capacity
+    };
+
     constexpr int32 PageShift = 3;                   // pages of 8x8x8 bricks
     constexpr int32 BatchCells = 128 * 4096;         // cells per mesher batch (128 16-cell bricks)
     constexpr int32 MaxPooled = 32;                  // emptied buffer sets kept for reuse
     constexpr int32 PoolSlack = 2;                   // a pooled set may be this many classes larger on each count
-    constexpr double BoundsMarginCells = 20.0;       // page bounds beyond its bricks (cells of its level), with the morph
+    /** Page bounds beyond its bricks (cells of its level): the morph moves vertices toward
+     *  coarser cells' vertices, no farther than the mesher reads. */
+    constexpr double BoundsMarginCells = (double)VoxelBrickMesherGPU::TargetReachCells;
     constexpr int32 MinVertices = 4096;
     constexpr int32 MinTriangles = 8192;
     constexpr int32 SlabVertices = 1 << 16;          // a buffer set's size limit: 4 MB of vertices
@@ -177,23 +191,9 @@ namespace VoxelBrickPagesDetail
         return ((uint64)(uint32)VertexClass << 32) | (uint64)(uint32)TriangleClass;
     }
 
-    int64 FloorShift(int64 Value, int32 Levels)
-    {
-        return Value >= 0 ? (Value >> Levels) : -((-Value + (1LL << Levels) - 1) >> Levels);
-    }
-
-    FVoxelBrickGrid GridFor(const FVoxelBrickTerrainSettings& Settings, int32 Level)
-    {
-        FVoxelBrickGrid Grid;
-        Grid.Origin = Settings.Origin;
-        Grid.CellSize = Settings.FinestCell * (double)(1LL << Level);
-        Grid.CellsPerBrick = Settings.CellsPerBrick;
-        return Grid;
-    }
-
     FVector PageOrigin(const FVoxelBrickTerrainSettings& Settings, const FVoxelBrickKey& PageKey)
     {
-        return GridFor(Settings, PageKey.Level).BrickMin(PageKey.Coord * (1LL << PageShift));
+        return Settings.GridFor(PageKey.Level).BrickMin(PageKey.Coord * (1LL << PageShift));
     }
 
     FRealtimeMeshBufferSetKey GroupKey()
@@ -489,7 +489,7 @@ public:
     /** The newest state version recorded into a frame's graph. */
     std::atomic<uint64> ShownVersion{ 0 };
     /** Runs that found no shaders or a required stream missing, runs recorded, and the
-     *  OR of EVoxelPageMissing bits seen (optional streams missing don't skip a run). */
+     *  OR of the VBP::EMissing bits seen (optional streams missing don't skip a run). */
     std::atomic<uint32> SkippedRuns{ 0 };
     std::atomic<uint32> Runs{ 0 };
     std::atomic<uint32> Missing{ 0 };
@@ -528,17 +528,17 @@ void FVoxelBrickPageProvider::BuildComputePasses(FRDGBuilder& GraphBuilder, cons
     FRDGBufferUAVRef Triangles = Context.GetStreamUAV(FRealtimeMeshStreams::Triangles, PF_R32_UINT);
     FRDGBufferUAVRef Args = Context.GetIndirectArgsUAV();
     uint32 MissingNow = 0;
-    MissingNow |= VBP::ArePageShadersReady() ? 0u : (uint32)EVoxelPageMissing::PageShaders;
-    MissingNow |= Positions ? 0u : (uint32)EVoxelPageMissing::Positions;
-    MissingNow |= Tangents ? 0u : (uint32)EVoxelPageMissing::Tangents;
-    MissingNow |= TexCoords ? 0u : (uint32)EVoxelPageMissing::TexCoords;
-    MissingNow |= Colors ? 0u : (uint32)EVoxelPageMissing::Colors;
-    MissingNow |= Triangles ? 0u : (uint32)EVoxelPageMissing::Triangles;
-    MissingNow |= Args ? 0u : (uint32)EVoxelPageMissing::Args;
+    MissingNow |= VBP::ArePageShadersReady() ? 0u : (uint32)VBP::EMissing::PageShaders;
+    MissingNow |= Positions ? 0u : (uint32)VBP::EMissing::Positions;
+    MissingNow |= Tangents ? 0u : (uint32)VBP::EMissing::Tangents;
+    MissingNow |= TexCoords ? 0u : (uint32)VBP::EMissing::TexCoords;
+    MissingNow |= Colors ? 0u : (uint32)VBP::EMissing::Colors;
+    MissingNow |= Triangles ? 0u : (uint32)VBP::EMissing::Triangles;
+    MissingNow |= Args ? 0u : (uint32)VBP::EMissing::Args;
     if (Context.GetVertexCapacity() <= 0 || Context.GetIndexCapacity() <= 0)
-        MissingNow |= (uint32)EVoxelPageMissing::Capacity;
+        MissingNow |= (uint32)VBP::EMissing::Capacity;
     Missing.fetch_or(MissingNow, std::memory_order_relaxed);
-    if (MissingNow & (uint32)EVoxelPageMissing::Required)
+    if (MissingNow & (uint32)VBP::EMissing::Required)
     {
         SkippedRuns.fetch_add(1, std::memory_order_relaxed);
         return;
@@ -671,11 +671,35 @@ void FVoxelBrickPages::Reset()
         });
 }
 
+void FVoxelBrickPages::SetMaterial(UMaterialInterface* InMaterial)
+{
+    Settings.Material = InMaterial;
+    auto Apply = [InMaterial](FInstance& Instance)
+        {
+            if (URealtimeMeshComponent* Component = Instance.Component.Get())
+                Component->SetMaterial(0, InMaterial);
+        };
+    for (TPair<FVoxelBrickKey, FPage>& Pair : Pages)
+    {
+        for (FSlab& Slab : Pair.Value.Slabs)
+            Apply(Slab.Instance);
+        for (FInstance& Spare : Pair.Value.Spares)
+            Apply(Spare);
+    }
+    for (TPair<uint64, TArray<FInstance>>& Pair : Pool)
+    {
+        for (FInstance& Instance : Pair.Value)
+            Apply(Instance);
+    }
+    for (FReleasing& Entry : Releasing)
+        Apply(Entry.Instance);
+}
+
 FVoxelBrickKey FVoxelBrickPages::PageOf(const FVoxelBrickKey& Key)
 {
-    FVoxelBrickKey Page;
-    Page.Level = Key.Level;
-    Page.Coord = FInt64Vector(VBP::FloorShift(Key.Coord.X, VBP::PageShift), VBP::FloorShift(Key.Coord.Y, VBP::PageShift), VBP::FloorShift(Key.Coord.Z, VBP::PageShift));
+    FVoxelBrickKey Page = Key;
+    Page.Coord = FInt64Vector(FVoxelBrickKey::FloorShift(Key.Coord.X, VBP::PageShift), FVoxelBrickKey::FloorShift(Key.Coord.Y, VBP::PageShift),
+        FVoxelBrickKey::FloorShift(Key.Coord.Z, VBP::PageShift));
     return Page;
 }
 
@@ -708,7 +732,6 @@ FVoxelBrickPages::FInstance FVoxelBrickPages::CreateInstance(int32 VertexCapacit
     Component->SetMobility(EComponentMobility::Movable);
     Component->SetCollisionEnabled(ECollisionEnabled::NoCollision);
     Component->SetRealtimeMesh(Mesh);
-    Component->SetRenderCustomDepth(true);
     Component->SetVisibleInRayTracing(false);
     // For the morph (VoxelMorph.ush): where level 0's band ends in world units. Data 0, the
     // level, is set with the page (PlaceInstance).
@@ -717,7 +740,7 @@ FVoxelBrickPages::FInstance FVoxelBrickPages::CreateInstance(int32 VertexCapacit
     // The uploaded streams only size the buffers; the provider writes them. Two corner
     // positions give the bounds, the same for every level (positions are in level units):
     // bricks reach a few cells past their box, and the morph moves vertices toward the
-    // vertices of coarser cells (up to 8 cells across) as far as two of those past the brick.
+    // vertices of coarser cells, within VBP::BoundsMarginCells of the brick.
     FRealtimeMeshStreamSet Streams;
     FRealtimeMeshStream& Positions = Streams.AddStream(FRealtimeMeshStreams::Position, GetRealtimeMeshBufferLayout<FVector3f>());
     Positions.SetNumZeroed(VertexCapacity);
@@ -929,7 +952,7 @@ void FVoxelBrickPages::Push(const FVoxelBrickKey& PageKey, FInstance& Instance, 
     FVoxelBrickPageProvider::FState State;
     State.Jobs = MoveTemp(Jobs);
     State.TriangleEnd = (uint32)FMath::Max(0, TriangleEnd);
-    State.Color = (CVarVoxelDebugChunkColor.GetValueOnGameThread() > 0 ? FVoxelBrickTerrain::LevelColor(PageKey.Level) : FColor::White).DWColor();
+    State.Color = (CVarVoxelDebugLevelColor.GetValueOnGameThread() > 0 ? FVoxelBrickTerrain::LevelColor(PageKey.Level) : FColor::White).DWColor();
     State.Version = NextVersion++;
     Instance.PushedVersion = State.Version;
     // The state reaches the provider before the dirty mark: both are render commands.
@@ -1055,6 +1078,12 @@ void FVoxelBrickPages::TakeBatchResults()
         if (!Batches.RemoveAndCopyValue(Result.Id, Batch)) continue;
         const int32 NumBricks = Batch.Keys.Num();
         const bool bRead = Result.Entries.Num() >= NumBricks * (int32)VBP::EntryWords;
+        if (!bRead && !bWarnedReadback)
+        {
+            UE_LOG(LogVoxelPlugin, Warning, TEXT("[VoxelBricks] A brick mesher readback returned nothing (%d of %d words); its %d bricks are meshed again. (Logged once.)"),
+                Result.Entries.Num(), NumBricks * (int32)VBP::EntryWords, NumBricks);
+            bWarnedReadback = true;
+        }
         TArray<FIntPoint> KeptVertices;
         TArray<FIntPoint> KeptTriangles;
         for (int32 b = 0; b < NumBricks; b++)
@@ -1129,7 +1158,7 @@ void FVoxelBrickPages::DispatchBatches()
             // Page-local placement (cm) and level scale, then the page's triplanar UV origin.
             const FVoxelBrickKey PageKey = PageOf(Item.Key);
             const FInt64Vector Local = Item.Key.Coord - PageKey.Coord * (1LL << VBP::PageShift);
-            const double BrickSize = VBP::GridFor(Settings, Item.Key.Level).BrickSize();
+            const double BrickSize = Settings.GridFor(Item.Key.Level).BrickSize();
             const FVector UVOrigin = VBP::PageOrigin(Settings, PageKey) * Settings.TriplanarUVScale;
             Work.Bricks.Add(Brick->Brick);
             Work.Places.Add(FVector4f((float)(Local.X * BrickSize), (float)(Local.Y * BrickSize), (float)(Local.Z * BrickSize),
@@ -1368,7 +1397,7 @@ FIntPoint FVoxelBrickPages::PlanPage(const FVoxelBrickKey& PageKey, FPage& Page,
 
     if (Overflow.X > 0 || Overflow.Y > 0)
     {
-        UE_LOG(LogTemp, Warning, TEXT("[VoxelBricks] A page commit had no room for %d vertices and %d triangles: those bricks are not drawn until they change."), Overflow.X, Overflow.Y);
+        UE_LOG(LogVoxelPlugin, Warning, TEXT("[VoxelBricks] A page commit had no room for %d vertices and %d triangles: those bricks are not drawn until they change."), Overflow.X, Overflow.Y);
     }
     // Spares that take bricks become slabs, in plan order; SlabOf maps plan slots to slabs.
     TArray<int32> SlabOf;
@@ -1563,8 +1592,8 @@ void FVoxelBrickPages::Flush(const TSharedPtr<const FVoxelDensityGPUData>& InDen
             const uint32 MissingBits = Slab.Instance.IsValid() ? Slab.Instance.Provider->Missing.load(std::memory_order_relaxed) : 0u;
             if (MissingBits != 0 && (MissingBits & ~WarnedMissing) != 0)
             {
-                UE_LOG(LogTemp, Warning, TEXT("[VoxelBricks] A brick page's compute run is missing: %s%s."), *DescribeMissing(MissingBits),
-                    (MissingBits & (uint32)EVoxelPageMissing::Required) ? TEXT(" (run skipped, retried)") : TEXT(" (written elsewhere, run continues)"));
+                UE_LOG(LogVoxelPlugin, Warning, TEXT("[VoxelBricks] A brick page's compute run is missing: %s%s."), *DescribeMissing(MissingBits),
+                    (MissingBits & (uint32)VBP::EMissing::Required) ? TEXT(" (run skipped, retried)") : TEXT(" (written elsewhere, run continues)"));
                 WarnedMissing |= MissingBits;
             }
         }
@@ -1673,7 +1702,8 @@ FString FVoxelBrickPages::TakePerf()
 
 FString FVoxelBrickPages::DescribeMissing(uint32 Bits)
 {
-    static const TCHAR* Names[] = { TEXT("mesher shaders"), TEXT("page shaders"), TEXT("Position stream"), TEXT("Tangents stream"),
+    // VBP::EMissing, bit by bit.
+    static const TCHAR* Names[] = { TEXT("page shaders"), TEXT("Position stream"), TEXT("Tangents stream"),
         TEXT("TexCoords stream"), TEXT("Color stream"), TEXT("Triangles stream"), TEXT("indirect args"), TEXT("capacity") };
     FString Out;
     for (int32 i = 0; i < UE_ARRAY_COUNT(Names); i++)

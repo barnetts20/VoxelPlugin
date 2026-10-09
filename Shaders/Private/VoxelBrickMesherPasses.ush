@@ -48,10 +48,12 @@
 //   int CellsPerBrick; uint NumBricks; uint HashSize (power of two); uint FaceCap;
 //   uint VertexCap; uint TriangleCap; float FinestCell; float MinFootprint;
 //   RWStructuredBuffer<float> Dense;        NumBricks * (N+1)^3
-//   RWStructuredBuffer<uint> HashKeys;      NumBricks * HashSize, 0 = empty
-//   RWStructuredBuffer<uint> HashValues;    density bits, 0xffffffff until sampled
-//   RWStructuredBuffer<uint> SlotState;     NumBricks * slots, 1 = cell needs a vertex
-//   RWStructuredBuffer<uint> SlotVertex;    vertex index, 0xffffffff = none
+//   RWStructuredBuffer<uint> HashKeys;      NumBricks * HashSize, 0 = empty (cleared)
+//   RWStructuredBuffer<uint> HashValues;    density bits, 0xffffffff until sampled; not
+//                                           cleared: set where a key is taken
+//   RWStructuredBuffer<uint> SlotState;     NumBricks * slots, 1 = cell needs a vertex (cleared)
+//   RWStructuredBuffer<uint> SlotVertex;    vertex index, 0xffffffff = none; not cleared: set
+//                                           where a slot is marked
 //   RWStructuredBuffer<uint> Faces;         NumBricks * FaceCap * 4 cell slots (bit 31 of the
 //                                           first: flip)
 //   RWStructuredBuffer<uint> Counters;      per brick: faces, vertices, triangles, error bits
@@ -69,7 +71,8 @@
 //                                           crossing (VoxelMesherTargetFor), 4 needed as a
 //                                           neighbour of a target without a crossing
 //   RWStructuredBuffer<float> TargetData;   NumBricks * targets * 6: vertex (units), normal
-//   RWStructuredBuffer<uint> TargetHashKeys, TargetHashValues;   NumBricks * TargetHashSize
+//   RWStructuredBuffer<uint> TargetHashKeys, TargetHashValues;   NumBricks * TargetHashSize,
+//                                           as HashKeys and HashValues
 
 #ifndef VOXEL_BRICK_MESHER_PASSES_USH
 #define VOXEL_BRICK_MESHER_PASSES_USH
@@ -289,7 +292,7 @@ VOXEL_FUNC FVoxelStitchCell VoxelMesherTargetCell(uint Target)
 }
 
 // Target points are multiples of 2 units; the key holds P / 2 (8 bits per axis, offset 32:
-// room for -64..2N+190 with N up to 64; the points reach -48..2N+48) and the level the point
+// room for -64..446, which holds the points' -48..2N+48 for N up to 64) and the level the point
 // is sampled at.
 VOXEL_FUNC uint VoxelMesherTargetKey(int3 P, int Tag)
 {
@@ -377,6 +380,8 @@ VOXEL_FUNC int VoxelMesherTargetKeyTag(uint Key)
     return int(((Key - 1u) >> 24u) & 255u);
 }
 
+// The thread that takes a slot marks its value unsampled (the values buffer is not cleared);
+// a slot taken earlier keeps the value it was given.
 VOXEL_FUNC void VoxelMesherTargetRequest(uint B, int3 P, int Tag)
 {
     const uint Key = VoxelMesherTargetKey(P, Tag);
@@ -385,7 +390,12 @@ VOXEL_FUNC void VoxelMesherTargetRequest(uint B, int3 P, int Tag)
     {
         uint Previous = 0u;
         InterlockedCompareExchange(TargetHashKeys[B * TargetHashSize + H], 0u, Key, Previous);
-        if (Previous == 0u || Previous == Key) return;
+        if (Previous == 0u)
+        {
+            TargetHashValues[B * TargetHashSize + H] = VoxelMesherUnsampled;
+            return;
+        }
+        if (Previous == Key) return;
         H = (H + 1u) & (TargetHashSize - 1u);
     }
     InterlockedOr(Counters[B * 4u + 3u], VoxelMesherErrorHash);
@@ -507,7 +517,7 @@ VOXEL_FUNC uint VoxelMesherDenseIndex(uint B, int3 P)
     return B * VoxelMesherDenseTotal() + (uint(P.z / 2) * D + uint(P.y / 2)) * D + uint(P.x / 2);
 }
 
-// 10 bits per axis, offset 256: points -8..2N+8 fit for N up to 250 (the dispatcher allows 64).
+// 10 bits per axis, offset 256: points -8..2N+8 fit for N up to 379 (the dispatcher allows 64).
 VOXEL_FUNC uint VoxelMesherKey(int3 P)
 {
     return (uint(P.x + 256) | (uint(P.y + 256) << 10u) | (uint(P.z + 256) << 20u)) + 1u;
@@ -519,6 +529,7 @@ VOXEL_FUNC int3 VoxelMesherKeyPoint(uint Key)
     return int3(int(K & 1023u) - 256, int((K >> 10u) & 1023u) - 256, int((K >> 20u) & 1023u) - 256);
 }
 
+// As VoxelMesherTargetRequest: the thread that takes a slot marks its value unsampled.
 VOXEL_FUNC void VoxelMesherRequest(uint B, int3 P)
 {
     if (VoxelMesherIsDense(P)) return;
@@ -528,7 +539,12 @@ VOXEL_FUNC void VoxelMesherRequest(uint B, int3 P)
     {
         uint Previous = 0u;
         InterlockedCompareExchange(HashKeys[B * HashSize + H], 0u, Key, Previous);
-        if (Previous == 0u || Previous == Key) return;
+        if (Previous == 0u)
+        {
+            HashValues[B * HashSize + H] = VoxelMesherUnsampled;
+            return;
+        }
+        if (Previous == Key) return;
         H = (H + 1u) & (HashSize - 1u);
     }
     InterlockedOr(Counters[B * 4u + 3u], VoxelMesherErrorHash);
@@ -684,8 +700,13 @@ VOXEL_FUNC void VoxelMesherEdgesPass(uint Id)
     Faces[Base + 1u] = Slots[1];
     Faces[Base + 2u] = Slots[2];
     Faces[Base + 3u] = Slots[3];
+    // Marked, with no vertex until VoxelMesherSolvePass gives one (SlotVertex is not cleared:
+    // only marked slots are ever read).
     for (int k = 0; k < 4; k++)
+    {
         SlotState[B * VoxelMesherNumSlots() + Slots[k]] = 1u;
+        SlotVertex[B * VoxelMesherNumSlots() + Slots[k]] = VoxelMesherNone;
+    }
 }
 
 // Mode 0: the ends of every edge of a marked cell. Mode 1: the gradient points of its crossed
@@ -721,6 +742,26 @@ VOXEL_FUNC void VoxelMesherRequestPass(uint Id, uint Mode)
     }
 }
 
+// A unit normal from a gradient sum, or the radial direction at the lattice point Radial
+// when the sum is shorter than sqrt(MinLengthSq) (the CPU mesher's tolerance, in the sum's
+// units).
+VOXEL_FUNC float3 VoxelMesherSafeNormal(float3 N, float MinLengthSq, float3 Radial)
+{
+    const float LengthSq = dot(N, N);
+    if (LengthSq > MinLengthSq)
+        return N / sqrt(LengthSq);
+    return Radial / max(length(Radial), 1.0e-6f);
+}
+
+// The CPU mesher normalises gradients in density per cm (central differences over 2 Length
+// units) and treats a squared length below 1e-8 as flat; the passes use raw differences, so
+// that tolerance scales by the span squared.
+VOXEL_FUNC float VoxelMesherGradientTolerance(int Length, float Unit)
+{
+    const float Span = 2.0f * float(Length) * Unit;
+    return 1.0e-8f * Span * Span;
+}
+
 // The vertex of a marked cell: QEF over the crossings of its minimal edges.
 VOXEL_FUNC void VoxelMesherSolvePass(uint Id)
 {
@@ -729,6 +770,7 @@ VOXEL_FUNC void VoxelMesherSolvePass(uint Id)
     const FVoxelStitchBrick Brick = VoxelMesherStitchBrick(B);
     const FVoxelStitchCell Cell = VoxelMesherCellOf(Id % VoxelMesherNumSlots());
     const float S = float(Cell.Size);
+    const float Unit = ldexp(FinestCell, Bricks[B].Level - 1);
 
     FVoxelQef Q = VoxelQefBegin();
     VOXEL_LOOP
@@ -747,31 +789,17 @@ VOXEL_FUNC void VoxelMesherSolvePass(uint Id)
 
         const float3 G0 = VoxelMesherGradient(B, E.Lo, E.Length);
         const float3 G1 = VoxelMesherGradient(B, Hi, E.Length);
-        float3 Normal = G0 + (G1 - G0) * T;
-        const float NormalLengthSq = dot(Normal, Normal);
-        if (NormalLengthSq > 1.0e-8f)
-            Normal = Normal / sqrt(NormalLengthSq);
-        else
-        {
-            const int3 Index = VoxelMesherLatticeIndex(B, E.Lo);
-            const float3 Radial = float3(float(Index.x), float(Index.y), float(Index.z));
-            Normal = Radial / max(length(Radial), 1.0e-6f);
-        }
+        const float3 Normal = VoxelMesherSafeNormal(G0 + (G1 - G0) * T, VoxelMesherGradientTolerance(E.Length, Unit),
+            VoxelToFloat3(VoxelMesherLatticeIndex(B, E.Lo)));
         Q = VoxelQefAdd(Q, P, Normal);
     }
     if (Q.Count == 0) return;
 
+    // Without a normal sum, the radial direction at the vertex (the lattice index of the
+    // brick min plus the vertex's offset in lattice units), as the CPU mesher.
     const float3 Local = VoxelToFloat3(Cell.Min) + VoxelQefVertex(Q) * S;
-    float3 VertexNormal = Q.NormalSum;
-    const float VertexLengthSq = dot(VertexNormal, VertexNormal);
-    if (VertexLengthSq > 1.0e-8f)
-        VertexNormal = VertexNormal / sqrt(VertexLengthSq);
-    else
-    {
-        const int3 Index = VoxelMesherLatticeIndex(B, int3(Cell.Min.x, Cell.Min.y, Cell.Min.z));
-        const float3 Radial = float3(float(Index.x), float(Index.y), float(Index.z));
-        VertexNormal = Radial / max(length(Radial), 1.0e-6f);
-    }
+    const float3 VertexNormal = VoxelMesherSafeNormal(Q.NormalSum, 1.0e-8f,
+        VoxelToFloat3(VoxelMesherLatticeIndex(B, int3(0, 0, 0))) + Local * float(1u << uint(Bricks[B].Level)));
 
     uint V = 0u;
     InterlockedAdd(Counters[B * 4u + 1u], 1u, V);
@@ -780,7 +808,6 @@ VOXEL_FUNC void VoxelMesherSolvePass(uint Id)
         InterlockedOr(Counters[B * 4u + 3u], VoxelMesherErrorVertices);
         return;
     }
-    const float Unit = ldexp(FinestCell, Bricks[B].Level - 1);
     const uint Base = (B * VertexCap + V) * VoxelMesherVertexStride;
     Vertices[Base] = Local.x * Unit;
     Vertices[Base + 1u] = Local.y * Unit;
@@ -788,24 +815,9 @@ VOXEL_FUNC void VoxelMesherSolvePass(uint Id)
     Vertices[Base + 3u] = VertexNormal.x;
     Vertices[Base + 4u] = VertexNormal.y;
     Vertices[Base + 5u] = VertexNormal.z;
-    // The targets and the unstitched solve until VertexTargets sets them.
-    for (uint k = 0u; k < 3u; k++)
-    {
-        Vertices[Base + 6u + 6u * k] = Local.x * Unit;
-        Vertices[Base + 7u + 6u * k] = Local.y * Unit;
-        Vertices[Base + 8u + 6u * k] = Local.z * Unit;
-        Vertices[Base + 9u + 6u * k] = VertexNormal.x;
-        Vertices[Base + 10u + 6u * k] = VertexNormal.y;
-        Vertices[Base + 11u + 6u * k] = VertexNormal.z;
-    }
+    // Floats 6 to 23 and 26 to 31 are written by VoxelMesherVertexTargetsPass for every vertex
+    // stored here; 25 is unused.
     Vertices[Base + 24u] = float(Cell.Level);
-    Vertices[Base + 25u] = 0.0f;
-    for (uint c = 26u; c < 32u; c += 3u)
-    {
-        Vertices[Base + c] = VertexNormal.x;
-        Vertices[Base + c + 1u] = VertexNormal.y;
-        Vertices[Base + c + 2u] = VertexNormal.z;
-    }
     SlotVertex[Id] = V;
     const uint Targets = B * VoxelMesherNumTargets();
     const uint ParentSlot = VoxelMesherTargetOf(Cell);
@@ -972,6 +984,7 @@ VOXEL_FUNC void VoxelMesherTargetSolvePass(uint Id)
     const FVoxelStitchCell Cell = VoxelMesherTargetCell(Id % VoxelMesherNumTargets());
     const FVoxelMesherFrame F = VoxelMesherTargetFrame(B, Cell);
     const float S = float(Cell.Size);
+    const float Unit = ldexp(FinestCell, Bricks[B].Level - 1);
 
     FVoxelQef Q = VoxelQefBegin();
     VOXEL_LOOP
@@ -990,40 +1003,22 @@ VOXEL_FUNC void VoxelMesherTargetSolvePass(uint Id)
 
         const float3 G0 = VoxelMesherTargetGradient(B, F, E.Lo, E.Length);
         const float3 G1 = VoxelMesherTargetGradient(B, F, Hi, E.Length);
-        float3 Normal = G0 + (G1 - G0) * T;
-        const float NormalLengthSq = dot(Normal, Normal);
-        if (NormalLengthSq > 1.0e-8f)
-            Normal = Normal / sqrt(NormalLengthSq);
-        else
-        {
-            const int3 Index = VoxelMesherLatticeIndex(B, E.Lo);
-            const float3 Radial = float3(float(Index.x), float(Index.y), float(Index.z));
-            Normal = Radial / max(length(Radial), 1.0e-6f);
-        }
+        const float3 Normal = VoxelMesherSafeNormal(G0 + (G1 - G0) * T, VoxelMesherGradientTolerance(E.Length, Unit),
+            VoxelToFloat3(VoxelMesherLatticeIndex(B, E.Lo)));
         Q = VoxelQefAdd(Q, P, Normal);
     }
 
-    const uint Base = Id * 6u;
+    // No crossing: state 3, and VoxelMesherTargetFor places each vertex from the corners
+    // (TargetData is read for state 2 only).
     if (Q.Count == 0)
     {
-        const float3 Centre = VoxelToFloat3(Cell.Min) + float3(0.5f * S, 0.5f * S, 0.5f * S);
-        TargetData[Base] = Centre.x;
-        TargetData[Base + 1u] = Centre.y;
-        TargetData[Base + 2u] = Centre.z;
         TargetState[Id] = 3u;
         return;
     }
+    const uint Base = Id * 6u;
     const float3 Local = VoxelToFloat3(Cell.Min) + VoxelQefVertex(Q) * S;
-    float3 VertexNormal = Q.NormalSum;
-    const float VertexLengthSq = dot(VertexNormal, VertexNormal);
-    if (VertexLengthSq > 1.0e-8f)
-        VertexNormal = VertexNormal / sqrt(VertexLengthSq);
-    else
-    {
-        const int3 Index = VoxelMesherLatticeIndex(B, int3(Cell.Min.x, Cell.Min.y, Cell.Min.z));
-        const float3 Radial = float3(float(Index.x), float(Index.y), float(Index.z));
-        VertexNormal = Radial / max(length(Radial), 1.0e-6f);
-    }
+    const float3 VertexNormal = VoxelMesherSafeNormal(Q.NormalSum, 1.0e-8f,
+        VoxelToFloat3(VoxelMesherLatticeIndex(B, int3(0, 0, 0))) + Local * float(1u << uint(Bricks[B].Level)));
     TargetData[Base] = Local.x;
     TargetData[Base + 1u] = Local.y;
     TargetData[Base + 2u] = Local.z;
@@ -1135,7 +1130,7 @@ VOXEL_FUNC float3 VoxelMesherCoarseNormal(uint B, uint TargetSlot, float3 Point,
 // after's at the parent target, which the parent's brick computes for that vertex too.
 VOXEL_FUNC void VoxelMesherVertexTargetsPass(uint Id)
 {
-    if (Id >= NumBricks * VoxelMesherNumSlots()) return;
+    if (Id >= NumBricks * VoxelMesherNumSlots() || SlotState[Id] == 0u) return;
     const uint V = SlotVertex[Id];
     if (V == VoxelMesherNone || V >= VertexCap) return;
     const uint B = Id / VoxelMesherNumSlots();

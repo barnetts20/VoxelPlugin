@@ -1,13 +1,11 @@
 #include "VoxelDensityGPU.h"
+#include "VoxelGPUCommon.h"
+#include "VoxelPlugin.h"
 #include "FSparseEditStore.h"
 #include "GlobalShader.h"
 #include "DataDrivenShaderPlatformInfo.h"
 #include "ShaderParameterStruct.h"
-#include "RenderGraphBuilder.h"
-#include "RenderGraphUtils.h"
 #include "RHIGPUReadback.h"
-#include "RenderingThread.h"
-#include "Containers/Ticker.h"
 #include "Async/Async.h"
 #include "Misc/App.h"
 #include <atomic>
@@ -73,22 +71,6 @@ IMPLEMENT_GLOBAL_SHADER(FVoxelDensityCS, "/Plugin/VoxelPlugin/Private/VoxelDensi
 
 namespace VoxelDensityGPUDetail
 {
-    FVector2f GPUDoubleFloat(double V)
-    {
-        const float Hi = (float)V;
-        return FVector2f(Hi, (float)(V - (double)Hi));
-    }
-
-    template<typename T>
-    FRDGBufferRef UploadDensityBuffer(FRDGBuilder& GraphBuilder, const TCHAR* Name, const TArray<T>& Data)
-    {
-        // A structured buffer can't be empty.
-        TArray<T> Copy = Data;
-        if (Copy.Num() == 0)
-            Copy.AddZeroed();
-        return CreateStructuredBuffer(GraphBuilder, Name, sizeof(T), Copy.Num(), Copy.GetData(), sizeof(T) * Copy.Num());
-    }
-
     struct FReadbackState
     {
         TUniquePtr<FRHIGPUBufferReadback> Buffer;
@@ -128,19 +110,13 @@ void VoxelDensityGPU::SampleBlocksAsync(TSharedRef<const FVoxelDensityGPUData> D
             const uint32 NumBytes = (uint32)State->Count * (uint32)sizeof(float);
             FRDGBuilder GraphBuilder(RHICmdList);
 
-            // A structured buffer can't be empty.
-            TArray<FVoxelDensityGPUOctave> Octaves = Data->Octaves;
-            if (Octaves.Num() == 0)
-                Octaves.AddDefaulted();
-            FRDGBufferRef OctaveBuffer = CreateStructuredBuffer(GraphBuilder, TEXT("Voxel.DensityOctaves"),
-                sizeof(FVoxelDensityGPUOctave), Octaves.Num(), Octaves.GetData(), sizeof(FVoxelDensityGPUOctave) * Octaves.Num());
             FRDGBufferRef OutBuffer = GraphBuilder.CreateBuffer(FRDGBufferDesc::CreateStructuredDesc(sizeof(float), State->Count), TEXT("Voxel.DensityOut"));
-            FRDGBufferSRVRef OctaveSRV = GraphBuilder.CreateSRV(OctaveBuffer);
+            FRDGBufferSRVRef OctaveSRV = GraphBuilder.CreateSRV(VoxelGPUCommon::UploadStructuredBuffer(GraphBuilder, TEXT("Voxel.DensityOctaves"), MakeArrayView(Data->Octaves)));
             const FVoxelEditGPUData NoEdits;
             const FVoxelEditGPUData& EditData = Edits.IsValid() ? *Edits : NoEdits;
-            FRDGBufferSRVRef EditCornersSRV = GraphBuilder.CreateSRV(UploadDensityBuffer(GraphBuilder, TEXT("Voxel.DensityEditCorners"), EditData.Corners));
-            FRDGBufferSRVRef EditChildrenSRV = GraphBuilder.CreateSRV(UploadDensityBuffer(GraphBuilder, TEXT("Voxel.DensityEditChildren"), EditData.Children));
-            FRDGBufferSRVRef EditFlagsSRV = GraphBuilder.CreateSRV(UploadDensityBuffer(GraphBuilder, TEXT("Voxel.DensityEditFlags"), EditData.Flags));
+            FRDGBufferSRVRef EditCornersSRV = GraphBuilder.CreateSRV(VoxelGPUCommon::UploadStructuredBuffer(GraphBuilder, TEXT("Voxel.DensityEditCorners"), MakeArrayView(EditData.Corners)));
+            FRDGBufferSRVRef EditChildrenSRV = GraphBuilder.CreateSRV(VoxelGPUCommon::UploadStructuredBuffer(GraphBuilder, TEXT("Voxel.DensityEditChildren"), MakeArrayView(EditData.Children)));
+            FRDGBufferSRVRef EditFlagsSRV = GraphBuilder.CreateSRV(VoxelGPUCommon::UploadStructuredBuffer(GraphBuilder, TEXT("Voxel.DensityEditFlags"), MakeArrayView(EditData.Flags)));
             // Blocks write disjoint ranges, so their passes need no barrier between them.
             FRDGBufferUAVRef OutUAV = GraphBuilder.CreateUAV(OutBuffer, ERDGUnorderedAccessViewFlags::SkipBarrier);
             TShaderMapRef<FVoxelDensityCS> Shader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
@@ -163,7 +139,7 @@ void VoxelDensityGPU::SampleBlocksAsync(TSharedRef<const FVoxelDensityGPUData> D
                 Parameters->EditFlags = EditFlagsSRV;
                 Parameters->EditNodeCount = (uint32)EditData.Flags.Num();
                 Parameters->EditRootExtent = EditData.RootExtent;
-                Parameters->HalfFinest = GPUDoubleFloat(HalfFinest);
+                Parameters->HalfFinest = VoxelDoubleFloat(HalfFinest);
                 Parameters->ContinentOctaves = Data->ContinentOctaves;
                 Parameters->MountainOctaves = Data->MountainOctaves;
                 Parameters->DetailOctaves = Data->DetailOctaves;
@@ -190,26 +166,23 @@ void VoxelDensityGPU::SampleBlocksAsync(TSharedRef<const FVoxelDensityGPUData> D
         });
 
     // Poll the readback once per frame on the render thread; hand the result to the game thread.
-    FTSTicker::GetCoreTicker().AddTicker(FTickerDelegate::CreateLambda([State](float) -> bool
+    VoxelGPUCommon::PollRenderThread([State]() -> bool
         {
-            if (State->bDone.load(std::memory_order_acquire)) return false;
-            ENQUEUE_RENDER_COMMAND(VoxelDensityGPUPoll)([State](FRHICommandListImmediate&)
-                {
-                    if (State->bDone.load(std::memory_order_acquire) || !State->Buffer.IsValid() || !State->Buffer->IsReady()) return;
-                    const uint32 NumBytes = (uint32)State->Count * (uint32)sizeof(float);
-                    TArray<float> Result;
-                    if (const void* Source = State->Buffer->Lock(NumBytes))
-                    {
-                        Result.SetNumUninitialized(State->Count);
-                        FMemory::Memcpy(Result.GetData(), Source, NumBytes);
-                        State->Buffer->Unlock();
-                    }
-                    State->Buffer.Reset();
-                    State->bDone.store(true, std::memory_order_release);
-                    AsyncTask(ENamedThreads::GameThread, [State, Result = MoveTemp(Result)]() mutable { State->OnDone(MoveTemp(Result)); });
-                });
+            if (State->bDone.load(std::memory_order_acquire)) return true;
+            if (!State->Buffer.IsValid() || !State->Buffer->IsReady()) return false;
+            const uint32 NumBytes = (uint32)State->Count * (uint32)sizeof(float);
+            TArray<float> Result;
+            if (const void* Source = State->Buffer->Lock(NumBytes))
+            {
+                Result.SetNumUninitialized(State->Count);
+                FMemory::Memcpy(Result.GetData(), Source, NumBytes);
+                State->Buffer->Unlock();
+            }
+            State->Buffer.Reset();
+            State->bDone.store(true, std::memory_order_release);
+            AsyncTask(ENamedThreads::GameThread, [State, Result = MoveTemp(Result)]() mutable { State->OnDone(MoveTemp(Result)); });
             return true;
-        }));
+        });
 }
 
 TSharedRef<FVoxelEditGPUData> FVoxelEditGPUData::Build(const FSparseEditStore* Store, double HalfFinest, int32 MaxDepth)
@@ -225,7 +198,7 @@ TSharedRef<FVoxelEditGPUData> FVoxelEditGPUData::Build(const FSparseEditStore* S
     const double Expected = HalfFinest * (double)Data->RootExtent;
     if (!Store->GetCenter().IsNearlyZero() || FMath::Abs(Store->GetExtent() / Expected - 1.0) > 1e-9)
     {
-        UE_LOG(LogTemp, Warning, TEXT("[VoxelMesherGPU] Edit tree (extent %.6g) is not the terrain root (%.6g); edits are left out on the GPU."), Store->GetExtent(), Expected);
+        UE_LOG(LogVoxelPlugin, Warning, TEXT("[VoxelMesherGPU] Edit tree (extent %.6g) is not the terrain root (%.6g); edits are left out on the GPU."), Store->GetExtent(), Expected);
         return Data;
     }
 

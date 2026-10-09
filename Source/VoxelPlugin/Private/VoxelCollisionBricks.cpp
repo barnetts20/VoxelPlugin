@@ -1,5 +1,6 @@
 #include "VoxelCollisionBricks.h"
 #include "VoxelMeshStream.h"
+#include "VoxelPlugin.h"
 #include "Misc/ScopeLock.h"
 #include "FDensitySampleCompositor.h"
 #include "FSparseEditStore.h"
@@ -385,7 +386,7 @@ void FVoxelCollisionBricks::DrainResults()
         {
             if (!bWarnedSlope)
             {
-                UE_LOG(LogTemp, Warning, TEXT("[VoxelCollision] Surface gradient %.2f exceeds CollisionSlopeBound %.2f; raising the bound to %.2f. Raise CollisionSlopeBound for these surface settings."),
+                UE_LOG(LogVoxelPlugin, Warning, TEXT("[VoxelCollision] Surface gradient %.2f exceeds CollisionSlopeBound %.2f; raising the bound to %.2f. Raise CollisionSlopeBound for these surface settings."),
                     Result.MaxGradient, SlopeBound, Result.MaxGradient * 1.25);
                 bWarnedSlope = true;
             }
@@ -401,7 +402,7 @@ void FVoxelCollisionBricks::DrainResults()
 
         if (bDebug)
         {
-            UE_LOG(LogTemp, Log, TEXT("[VoxelCollision] %d candidates, %d meshed (%d with surface, %d proven empty), %lld samples, %.1f ms, %d bricks known"),
+            UE_LOG(LogVoxelPlugin, Log, TEXT("[VoxelCollision] %d candidates, %d meshed (%d with surface, %d proven empty), %lld samples, %.1f ms, %d bricks known"),
                 Result.NumCandidates, Result.Built.Num(), NumWithSurface, Result.NumSkipped, Result.Samples, Result.Milliseconds, Bricks.Num());
         }
     }
@@ -470,7 +471,7 @@ void FVoxelCollisionBricks::ApplyQueued()
                 LastResult->store((int32)Result);
                 if (bDebug && Result != ERealtimeMeshCollisionUpdateResult::Updated && Result != ERealtimeMeshCollisionUpdateResult::Ignored)
                 {
-                    UE_LOG(LogTemp, Warning, TEXT("[VoxelCollision] Cook of brick (%lld, %lld, %lld) failed (result %d)"),
+                    UE_LOG(LogVoxelPlugin, Warning, TEXT("[VoxelCollision] Cook of brick (%lld, %lld, %lld) failed (result %d)"),
                         BrickCoord.X, BrickCoord.Y, BrickCoord.Z, (int32)Result);
                 }
             });

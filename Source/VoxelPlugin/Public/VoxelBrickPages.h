@@ -1,4 +1,4 @@
-// VoxelBrickPages.h - The GPU backend of the brick terrain (Design/MeshingEngine.md). Bricks
+// VoxelBrickPages.h - The renderer of the brick terrain (Design/MeshingEngine.md). Bricks
 // that may hold surface are grouped into pages of 8x8x8 bricks of one level; a page draws
 // through one or more buffer sets (RealtimeMesh components whose compute-writable buffers an
 // on-demand compute provider fills).
@@ -33,23 +33,9 @@ class USceneComponent;
 class URealtimeMeshSimple;
 class URealtimeMeshComponent;
 class ISceneViewExtension;
+class UMaterialInterface;
 class FVoxelBrickPageProvider;
 struct FVoxelBrickPageGPU;
-
-/** What a page's compute run lacked. Runs missing a Required item are skipped. */
-enum class EVoxelPageMissing : uint32
-{
-    MesherShaders = 1 << 0,
-    PageShaders = 1 << 1,
-    Positions = 1 << 2,
-    Tangents = 1 << 3,
-    TexCoords = 1 << 4,
-    Colors = 1 << 5,
-    Triangles = 1 << 6,
-    Args = 1 << 7,
-    Capacity = 1 << 8,
-    Required = PageShaders | Positions | Triangles | Args | Capacity
-};
 
 /** Game thread. The pages of one brick terrain. */
 class FVoxelBrickPages
@@ -63,12 +49,12 @@ public:
     /** Destroys every page and drops what is being meshed. */
     void Reset();
 
+    /** Changes the material of every buffer set's component (the pages keep their contents). */
+    void SetMaterial(UMaterialInterface* InMaterial);
+
     /** Queues the bricks Changes add or change for meshing, replacing whatever was staged.
      *  bFirstFill: nothing is on screen, so mesh faster. */
     void Stage(TConstArrayView<FVoxelBrickPageChange> Changes, bool bFirstFill);
-
-    /** Every staged brick is meshed and its counts read back. */
-    bool IsMeshed() const { return NumStagedReady >= Staged.Num(); }
 
     /** The terrain is behind: a newer task result waits for the staged commit, which is then
      *  meshed at voxel.Render.BrickMeshBatchesBusy batches per frame. */
@@ -215,6 +201,8 @@ private:
         bool bTouched = false;
     };
 
+    /** Every staged brick is meshed and its counts read back. */
+    bool IsMeshed() const { return NumStagedReady >= Staged.Num(); }
     FInstance CreateInstance(int32 VertexCapacity, int32 TriangleCapacity);
     static void DestroyInstance(FInstance& Instance);
     /** Moves and scales the instance onto the page, with the page's level for the morph. */
@@ -276,7 +264,8 @@ private:
     TSharedPtr<const FVoxelEditGPUData> Edits;
     TSharedRef<FVoxelBrickPageGPU, ESPMode::ThreadSafe> GPU;
     TSharedPtr<ISceneViewExtension, ESPMode::ThreadSafe> MeshExtension;
-    uint32 WarnedMissing = 0;   // EVoxelPageMissing bits already logged
+    uint32 WarnedMissing = 0;   // missing-item bits already logged (VoxelBrickPagesDetail::EMissing)
+    bool bWarnedReadback = false;   // a mesher readback that returned nothing was logged
     uint64 NextVersion = 1;     // over all buffer sets
     int32 CreatesThisFrame = 0;
     uint64 CreatesFrame = 0;

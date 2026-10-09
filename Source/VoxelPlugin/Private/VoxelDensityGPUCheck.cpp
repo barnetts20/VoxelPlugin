@@ -4,6 +4,7 @@
 #include "AdaptiveVoxelActor.h"
 #include "VoxelDensity.h"
 #include "VoxelDensityGPU.h"
+#include "VoxelPlugin.h"
 #include "FSparseEditStore.h"
 #include "EngineUtils.h"
 #include "Engine/World.h"
@@ -38,7 +39,7 @@ namespace VoxelDensityGPUCheck
         }
         if (!Terrain)
         {
-            UE_LOG(LogTemp, Warning, TEXT("[VoxelDensityGPU] No initialized terrain in this world."));
+            UE_LOG(LogVoxelPlugin, Warning, TEXT("[VoxelDensityGPU] No initialized terrain in this world."));
             return;
         }
 
@@ -118,7 +119,7 @@ namespace VoxelDensityGPUCheck
         }
         const double CpuMs = (FPlatformTime::Seconds() - CpuStart) * 1000.0;
 
-        UE_LOG(LogTemp, Log, TEXT("[VoxelDensityGPU] %s: %d blocks, %d samples, %d edit nodes; CPU %.1f ms. Waiting for the GPU..."),
+        UE_LOG(LogVoxelPlugin, Log, TEXT("[VoxelDensityGPU] %s: %d blocks, %d samples, %d edit nodes; CPU %.1f ms. Waiting for the GPU..."),
             Output == EVoxelDensityGPUOutput::Radial ? TEXT("|p| - R only") : (Output == EVoxelDensityGPUOutput::Edits ? TEXT("edit deltas only") : TEXT("density")),
             Blocks.Num(), Cpu.Num(), EditData->Flags.Num(), CpuMs);
         const double GpuStart = FPlatformTime::Seconds();
@@ -127,10 +128,10 @@ namespace VoxelDensityGPUCheck
             {
                 if (Gpu.Num() != Cpu.Num())
                 {
-                    UE_LOG(LogTemp, Error, TEXT("[VoxelDensityGPU] GPU returned %d samples, expected %d."), Gpu.Num(), Cpu.Num());
+                    UE_LOG(LogVoxelPlugin, Error, TEXT("[VoxelDensityGPU] GPU returned %d samples, expected %d."), Gpu.Num(), Cpu.Num());
                     return;
                 }
-                UE_LOG(LogTemp, Log, TEXT("[VoxelDensityGPU] GPU result after %.0f ms (dispatch to readback)."), (FPlatformTime::Seconds() - GpuStart) * 1000.0);
+                UE_LOG(LogVoxelPlugin, Log, TEXT("[VoxelDensityGPU] GPU result after %.0f ms (dispatch to readback)."), (FPlatformTime::Seconds() - GpuStart) * 1000.0);
 
                 int32 First = 0;
                 for (int32 b = 0; b < Blocks.Num();)
@@ -164,7 +165,7 @@ namespace VoxelDensityGPUCheck
                             }
                         }
                     }
-                    UE_LOG(LogTemp, Log, TEXT("[VoxelDensityGPU] level %2d (cell %.1f cm): max |gpu-cpu| %.4g cm, rms %.3g; within a cell of the surface %d (max %.4g cm); sign flips %d; non-finite %d; CPU non-zero %d"),
+                    UE_LOG(LogVoxelPlugin, Log, TEXT("[VoxelDensityGPU] level %2d (cell %.1f cm): max |gpu-cpu| %.4g cm, rms %.3g; within a cell of the surface %d (max %.4g cm); sign flips %d; non-finite %d; CPU non-zero %d"),
                         Level, Cell, MaxDiff, Count > 0 ? FMath::Sqrt(SumSq / Count) : 0.0, Near, MaxNear, SignFlips, NonFinite, NonZero);
                 }
             }, Output, EditData);

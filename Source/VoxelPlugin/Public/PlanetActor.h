@@ -129,16 +129,19 @@ public:
 #endif
 
 private:
+    // The child actors. Not exported with a copy or a duplicate of the planet (the copy
+    // spawns its own; SpawnChildActors also drops a child another planet owns).
+
     /** Terrain child actor (AAdaptiveVoxelActor). Scale = PlanetRadius. */
-    UPROPERTY()
+    UPROPERTY(TextExportTransient)
     AAdaptiveVoxelActor* TerrainActor = nullptr;
 
     /** Ocean child actor (AOceanSphereActor). Scale = OceanRadius. */
-    UPROPERTY()
+    UPROPERTY(TextExportTransient)
     AOceanSphereActor* OceanActor = nullptr;
 
     /** Gravity zone child actor (APlanetGravityZone). Centered on planet. */
-    UPROPERTY()
+    UPROPERTY(TextExportTransient)
     APlanetGravityZone* GravityZone = nullptr;
 
     /** Shared compositor (surface density + edit store) passed to both terrain and

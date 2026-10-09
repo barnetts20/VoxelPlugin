@@ -3,8 +3,10 @@
 
 #include "AdaptiveVoxelActor.h"
 #include "VoxelBrickMesherGPU.h"
+#include "VoxelBrickTerrain.h"
 #include "VoxelDensity.h"
 #include "VoxelDensityGPU.h"
+#include "VoxelPlugin.h"
 #include "FSparseEditStore.h"
 #include "EngineUtils.h"
 #include "Engine/World.h"
@@ -12,22 +14,6 @@
 
 namespace VoxelBrickMesherGPUCheck
 {
-    /** Neighbour levels and meshed mask from a brick-terrain signature (VoxelBrickTerrain.cpp,
-     *  RunTask: 2 bits per direction, 0 finer, 1 same and meshed, 2 same, 3 coarser). */
-    void DecodeSignature(uint64 Signature, int8 (&OutLevels)[27], uint32& OutMeshed)
-    {
-        OutMeshed = 0;
-        for (int32 d = 0, Slot = 0; d < 27; d++)
-        {
-            OutLevels[d] = 0;
-            if (d == 13) continue;
-            const uint32 State = (uint32)(Signature >> (2 * Slot++)) & 3u;
-            OutLevels[d] = State == 0 ? -1 : (State == 3 ? 1 : 0);
-            if (State == 1)
-                OutMeshed |= 1u << d;
-        }
-    }
-
     /** Welds the bricks' vertices by position and counts edges used by one triangle only. */
     struct FSeamCounter
     {
@@ -157,7 +143,7 @@ namespace VoxelBrickMesherGPUCheck
         }
         if (!Terrain)
         {
-            UE_LOG(LogTemp, Warning, TEXT("[VoxelMesherGPU] No brick terrain with bricks in this world."));
+            UE_LOG(LogVoxelPlugin, Warning, TEXT("[VoxelMesherGPU] No brick terrain with bricks in this world."));
             return;
         }
 
@@ -180,21 +166,13 @@ namespace VoxelBrickMesherGPUCheck
         TArray<FCandidate> Candidates;
         for (const TPair<FVoxelBrickKey, uint64>& Pair : Wanted)
         {
-            if (((Pair.Value >> 56) & 3u) == 2u)
-            {
-                UE_LOG(LogTemp, Warning, TEXT("[VoxelMesherGPU] voxel.Render.BrickSeams is 2 (unstitched); set it to 0 to compare stitched bricks."));
-                return;
-            }
             int8 Levels[27];
             uint32 Meshed = 0;
-            DecodeSignature(Pair.Value, Levels, Meshed);
+            FVoxelBrickTerrain::DecodeSignature(Pair.Value, Levels, Meshed);
             bool bTransition = false;
             for (const int8 Level : Levels)
                 bTransition |= Level != 0;
-            FVoxelBrickGrid Grid;
-            Grid.Origin = Settings.Origin;
-            Grid.CellSize = Settings.FinestCell * (double)(1LL << Pair.Key.Level);
-            Grid.CellsPerBrick = Settings.CellsPerBrick;
+            const FVoxelBrickGrid Grid = Settings.GridFor(Pair.Key.Level);
             const FVector Min = Grid.BrickMin(Pair.Key.Coord);
             const FBox Box(Min, Min + FVector(Grid.BrickSize()));
             Candidates.Add({ Pair.Key, Pair.Value, FMath::Sqrt(Box.ComputeSquaredDistanceToPoint(Camera)), bTransition, BrickTerrain->HoldsSurface(Pair.Key) });
@@ -227,12 +205,9 @@ namespace VoxelBrickMesherGPUCheck
         {
             FVoxelBrickMesherGPURequest& Request = Requests.AddDefaulted_GetRef();
             Request.Key = C.Key;
-            DecodeSignature(C.Signature, Request.NeighbourLevels, Request.MeshedNeighbours);
+            FVoxelBrickTerrain::DecodeSignature(C.Signature, Request.NeighbourLevels, Request.MeshedNeighbours);
 
-            FVoxelBrickGrid Grid;
-            Grid.Origin = Settings.Origin;
-            Grid.CellSize = Settings.FinestCell * (double)(1LL << C.Key.Level);
-            Grid.CellsPerBrick = Settings.CellsPerBrick;
+            const FVoxelBrickGrid Grid = Settings.GridFor(C.Key.Level);
             FVoxelBrickStats Stats;
             VoxelBrickMesher::MeshBrickStitched(*Compositor, Grid, C.Key.Coord, Request.NeighbourLevels, Request.MeshedNeighbours,
                 Settings.SlopeBound, true, CpuMeshes.AddDefaulted_GetRef(), Stats);
@@ -241,15 +216,12 @@ namespace VoxelBrickMesherGPUCheck
         }
         const double CpuMs = (FPlatformTime::Seconds() - CpuStart) * 1000.0;
 
+        // The terrain's own GPU settings, so the check meshes what the pages mesh.
+        const FVoxelBrickMesherGPUSettings GpuSettings = BrickTerrain->GetMesherSettings();
         const TSharedRef<FVoxelDensityGPUData> DensityData = MakeShared<FVoxelDensityGPUData>();
         Compositor->GetBaseDensity()->BuildGPUData(*DensityData);
         const TSharedPtr<FSparseEditStore> EditStore = Compositor->GetEditStore();
-        const TSharedRef<FVoxelEditGPUData> EditData = FVoxelEditGPUData::Build(EditStore.Get(), 0.5 * Settings.FinestCell, Terrain->MaxDepth);
-
-        FVoxelBrickMesherGPUSettings GpuSettings;
-        GpuSettings.FinestCell = Settings.FinestCell;
-        GpuSettings.MaxDepth = Terrain->MaxDepth;
-        GpuSettings.CellsPerBrick = Settings.CellsPerBrick;
+        const TSharedRef<FVoxelEditGPUData> EditData = FVoxelEditGPUData::Build(EditStore.Get(), 0.5 * GpuSettings.FinestCell, GpuSettings.MaxDepth);
 
         int32 Transitions = 0, Levels = 0, WithSurface = 0;
         for (const FCandidate& C : Chosen)
@@ -264,7 +236,7 @@ namespace VoxelBrickMesherGPUCheck
             if (Levels & (1 << L))
                 LevelList += FString::Printf(TEXT("%s%d"), LevelList.IsEmpty() ? TEXT("") : TEXT(","), L);
         }
-        UE_LOG(LogTemp, Log, TEXT("[VoxelMesherGPU] %d bricks (%d showing surface, %d at level transitions, levels %s), %d edit nodes; CPU %.1f ms. Waiting for the GPU..."),
+        UE_LOG(LogVoxelPlugin, Log, TEXT("[VoxelMesherGPU] %d bricks (%d showing surface, %d at level transitions, levels %s), %d edit nodes; CPU %.1f ms. Waiting for the GPU..."),
             Requests.Num(), WithSurface, Transitions, *LevelList, EditData->Flags.Num(), CpuMs);
 
         const double GpuStart = FPlatformTime::Seconds();
@@ -276,10 +248,10 @@ namespace VoxelBrickMesherGPUCheck
             {
                 if (GpuMeshes.Num() != CpuMeshes.Num())
                 {
-                    UE_LOG(LogTemp, Error, TEXT("[VoxelMesherGPU] GPU returned %d meshes, expected %d."), GpuMeshes.Num(), CpuMeshes.Num());
+                    UE_LOG(LogVoxelPlugin, Error, TEXT("[VoxelMesherGPU] GPU returned %d meshes, expected %d."), GpuMeshes.Num(), CpuMeshes.Num());
                     return;
                 }
-                UE_LOG(LogTemp, Log, TEXT("[VoxelMesherGPU] GPU result after %.0f ms (dispatch to readback)."), (FPlatformTime::Seconds() - GpuStart) * 1000.0);
+                UE_LOG(LogVoxelPlugin, Log, TEXT("[VoxelMesherGPU] GPU result after %.0f ms (dispatch to readback)."), (FPlatformTime::Seconds() - GpuStart) * 1000.0);
 
                 int32 CountMismatches = 0, ErrorBricks = 0, FarTotal = 0;
                 int64 GpuTriangles = 0, CpuTriangles = 0;
@@ -301,7 +273,7 @@ namespace VoxelBrickMesherGPUCheck
                     ErrorBricks += GpuStats[b].Errors != 0 ? 1 : 0;
                     if (bMismatch || GpuStats[b].Errors != 0 || Far > 0)
                     {
-                        UE_LOG(LogTemp, Log, TEXT("[VoxelMesherGPU]   brick L%d (%lld,%lld,%lld): GPU %d verts %d tris, CPU %d verts %d tris; max vertex offset %.3g cm, %d farther than a quarter cell; errors 0x%x"),
+                        UE_LOG(LogVoxelPlugin, Log, TEXT("[VoxelMesherGPU]   brick L%d (%lld,%lld,%lld): GPU %d verts %d tris, CPU %d verts %d tris; max vertex offset %.3g cm, %d farther than a quarter cell; errors 0x%x"),
                             Keys[b].Level, Keys[b].Coord.X, Keys[b].Coord.Y, Keys[b].Coord.Z, G.Positions.Num(), G.NumTriangles(), C.Positions.Num(), C.NumTriangles(),
                             Distance, Far, GpuStats[b].Errors);
                     }
@@ -322,7 +294,7 @@ namespace VoxelBrickMesherGPUCheck
                 }
                 const int32 GpuCracks = GpuSeams.InteriorOpenEdges(Boxes, 1.5 * MaxCell);
                 const int32 CpuCracks = CpuSeams.InteriorOpenEdges(Boxes, 1.5 * MaxCell);
-                UE_LOG(LogTemp, Log, TEXT("[VoxelMesherGPU] %d bricks: triangles GPU %lld / CPU %lld; %d bricks with different counts; worst vertex offset %.3g cells; %d vertices farther than a quarter cell; %d bricks with GPU errors; open edges after welding GPU %d / CPU %d, of them inside the set (cracks) GPU %d / CPU %d"),
+                UE_LOG(LogVoxelPlugin, Log, TEXT("[VoxelMesherGPU] %d bricks: triangles GPU %lld / CPU %lld; %d bricks with different counts; worst vertex offset %.3g cells; %d vertices farther than a quarter cell; %d bricks with GPU errors; open edges after welding GPU %d / CPU %d, of them inside the set (cracks) GPU %d / CPU %d"),
                     GpuMeshes.Num(), GpuTriangles, CpuTriangles, CountMismatches, WorstCells, FarTotal, ErrorBricks, GpuSeams.OpenEdges(), CpuSeams.OpenEdges(), GpuCracks, CpuCracks);
             });
     }

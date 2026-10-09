@@ -3,6 +3,10 @@
 #pragma once
 
 #include "Modules/ModuleManager.h"
+#include "Logging/LogMacros.h"
+
+/** The plugin's log category: terrain, pages, mesher, density and collision messages. */
+VOXELPLUGIN_API DECLARE_LOG_CATEGORY_EXTERN(LogVoxelPlugin, Log, All);
 
 class FVoxelPluginModule : public IModuleInterface
 {

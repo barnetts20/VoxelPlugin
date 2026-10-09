@@ -566,63 +566,6 @@ namespace
     };
 }
 
-void VoxelBrickMesher::AddSkirts(FVoxelBrickMesh& Mesh, float Depth)
-{
-    // Directed edges keyed by their sorted ends; an undirected edge used once is open.
-    struct FEdge
-    {
-        uint64 Key;
-        int32 From;
-        int32 To;
-    };
-    const int32 NumTris = Mesh.Indices.Num() / 3;
-    TArray<FEdge> Edges;
-    Edges.Reserve(NumTris * 3);
-    for (int32 t = 0; t < NumTris; t++)
-    {
-        for (int32 e = 0; e < 3; e++)
-        {
-            const int32 A = Mesh.Indices[3 * t + e];
-            const int32 B = Mesh.Indices[3 * t + (e + 1) % 3];
-            const uint64 Lo = (uint64)(uint32)FMath::Min(A, B);
-            const uint64 Hi = (uint64)(uint32)FMath::Max(A, B);
-            Edges.Add({ (Lo << 32) | Hi, A, B });
-        }
-    }
-    Edges.Sort([](const FEdge& X, const FEdge& Y) { return X.Key < Y.Key; });
-
-    TArray<int32> SkirtVertex;
-    SkirtVertex.Init(INDEX_NONE, Mesh.Positions.Num());
-    auto GetSkirtVertex = [&](int32 V) -> int32
-        {
-            if (SkirtVertex[V] == INDEX_NONE)
-            {
-                SkirtVertex[V] = Mesh.Positions.Num();
-                const FVector3f Normal = Mesh.Normals[V];
-                const FVector3f Pos = Mesh.Positions[V];
-                Mesh.Positions.Add(FVector3f(Pos.X - Normal.X * Depth, Pos.Y - Normal.Y * Depth, Pos.Z - Normal.Z * Depth));
-                Mesh.Normals.Add(Normal);
-            }
-            return SkirtVertex[V];
-        };
-
-    for (int32 i = 0; i < Edges.Num();)
-    {
-        int32 j = i + 1;
-        while (j < Edges.Num() && Edges[j].Key == Edges[i].Key) j++;
-        if (j - i == 1)
-        {
-            // The surface runs From->To along this edge; the skirt runs To->From, so the strip
-            // keeps the surface's orientation as it folds into the solid.
-            const int32 A = Edges[i].From, B = Edges[i].To;
-            const int32 SA = GetSkirtVertex(A), SB = GetSkirtVertex(B);
-            Mesh.Indices.Add(B); Mesh.Indices.Add(A); Mesh.Indices.Add(SA);
-            Mesh.Indices.Add(B); Mesh.Indices.Add(SA); Mesh.Indices.Add(SB);
-        }
-        i = j;
-    }
-}
-
 void VoxelBrickMesher::MeshBrick(const FDensitySampleCompositor& Density, const FVoxelBrickGrid& Grid,
     const FInt64Vector& Brick, double SlopeBound, bool bNoSkip, FVoxelBrickMesh& Out, FVoxelBrickStats& OutStats)
 {

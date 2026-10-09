@@ -6,8 +6,8 @@
 #pragma once
 
 #include "CoreMinimal.h"
+#include "VoxelBrickKey.h"
 #include "VoxelBrickMesher.h"
-#include "VoxelBrickTerrain.h"
 #include "VoxelDensityGPU.h"
 #include "RenderGraphDefinitions.h"
 
@@ -61,6 +61,13 @@ namespace VoxelBrickMesherGPU
      *  grandparent level's at the parent target. */
     constexpr uint32 VertexStride = 32;
 
+    /** How far past a brick's box the mesher reads the density, in cells of the brick's
+     *  level: the grandparent-level target cells two of theirs (16 own cells) around the
+     *  brick, and their gradient samples one more (8 own cells). The lattice-range test
+     *  (MakeBrick), the bricks an edit reaches (FVoxelBrickTerrain) and the page bounds
+     *  (FVoxelBrickPages) are all sized from it. */
+    constexpr int32 TargetReachCells = 24;
+
     /** Per-brick slots, scaled with the brick's cell count (powers of two). */
     struct FCaps
     {
@@ -71,15 +78,10 @@ namespace VoxelBrickMesherGPU
         uint32 TriangleCap = 0;
     };
 
-    /** Error bit for a request that wasn't meshed (beyond MaxBricks, or out of the 32-bit
-     *  lattice range). */
+    /** Error bit for a request that wasn't meshed (beyond MaxBricks, out of the 32-bit
+     *  lattice range, or the shaders can't run). */
     constexpr uint32 ErrorNotMeshed = 0x100;
 
-    /** Meshes up to MaxBricks bricks on the GPU and calls OnDone on the game thread with one
-     *  mesh and one stats entry per request (positions relative to the brick min, as
-     *  MeshBrickStitched). Results arrive a few frames later (readback); empty arrays when the
-     *  GPU can't run the shaders. CellsPerBrick is clamped to 8..64. Call from any thread but
-     *  the render thread. */
     /** Cells per brick edge the shaders use for Settings: CellsPerBrick rounded down to a
      *  multiple of 8, clamped to 8..64. */
     VOXELPLUGIN_API int32 CellsFor(const FVoxelBrickMesherGPUSettings& Settings);
@@ -90,6 +92,11 @@ namespace VoxelBrickMesherGPU
      *  sampled around it, don't fit 32 bits (the brick can't be meshed on the GPU). */
     VOXELPLUGIN_API bool MakeBrick(const FVoxelBrickKey& Key, const int8 (&NeighbourLevels)[27], uint32 MeshedNeighbours,
         const FVoxelBrickMesherGPUSettings& Settings, FVoxelMesherBrickGPU& Out);
+
+    /** The coarsest level every brick of which MakeBrick accepts (-1 when not even level 0
+     *  fits): lattice indices count half finest cells from the root centre in 32 bits, so a
+     *  deep lattice can't mesh its coarsest levels. */
+    VOXELPLUGIN_API int32 CoarsestMeshableLevel(const FVoxelBrickMesherGPUSettings& Settings);
 
     /** Render thread. True when every mesher pass is compiled for this platform. */
     VOXELPLUGIN_API bool AreShadersReady();
@@ -124,6 +131,12 @@ namespace VoxelBrickMesherGPU
     VOXELPLUGIN_API FOutputs AddMesherPasses(FRDGBuilder& GraphBuilder, const FVoxelDensityGPUData& Density, const FInputs& Inputs,
         const FVoxelBrickMesherGPUSettings& Settings, TConstArrayView<FVoxelMesherBrickGPU> Bricks, ERDGPassFlags PassFlags = ERDGPassFlags::Compute);
 
+    /** Meshes up to MaxBricks bricks on the GPU and calls OnDone on the game thread with one
+     *  mesh and one stats entry per request (positions relative to the brick min, as
+     *  MeshBrickStitched). Results arrive a few frames later (readback). A request beyond
+     *  MaxBricks, out of the lattice range, or every request when the GPU can't run the
+     *  shaders, gets an empty mesh with ErrorNotMeshed. Call from any thread but the render
+     *  thread. */
     VOXELPLUGIN_API void MeshBricksAsync(TSharedRef<const FVoxelDensityGPUData> Density, TSharedRef<const FVoxelEditGPUData> Edits,
         const FVoxelBrickMesherGPUSettings& Settings, TArray<FVoxelBrickMesherGPURequest> Requests,
         TFunction<void(TArray<FVoxelBrickMesh>&&, TArray<FVoxelBrickMesherGPUStats>&&)> OnDone);

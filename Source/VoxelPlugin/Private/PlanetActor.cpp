@@ -70,15 +70,11 @@ void APlanetActor::PostEditChangeProperty(FPropertyChangedEvent& PropertyChanged
 
     FName PropName = PropertyChangedEvent.GetPropertyName();
 
-    // Material swaps — push to child actor and reinitialize via the public
-    // InitializeFromPlanet entry point (reuses existing compositor).
+    // The terrain material changes in place (no rebuild).
     if (PropName == GET_MEMBER_NAME_CHECKED(APlanetActor, TerrainMaterial))
     {
-        if (TerrainActor && TerrainMaterial)
-        {
-            TerrainActor->SurfaceMaterial = TerrainMaterial;
-            TerrainActor->InitializeFromPlanet(SharedCompositor, PlanetRoot);
-        }
+        if (TerrainActor)
+            TerrainActor->SetSurfaceMaterial(TerrainMaterial);
         return;
     }
 
@@ -172,8 +168,7 @@ void APlanetActor::Initialize()
     SharedCompositor = NewCompositor;
 
     // --- Terrain actor ---
-    if (TerrainMaterial)
-        TerrainActor->SurfaceMaterial = TerrainMaterial;
+    TerrainActor->SetSurfaceMaterial(TerrainMaterial);
     TerrainActor->NoiseAmplitudeRatio = NoiseAmplitudeRatio;
     TerrainActor->SurfaceSettings = SurfaceSettings;
     TerrainActor->InitializeFromPlanet(SharedCompositor, PlanetRoot, FVector(PlanetRadius));
@@ -253,6 +248,11 @@ void APlanetActor::SpawnChildActors()
     SpawnParams.Owner = this;
     SpawnParams.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AlwaysSpawn;
 
+    // A child another planet owns (this planet is a copy of it) is not ours to configure.
+    if (TerrainActor && TerrainActor->GetOwner() != this) TerrainActor = nullptr;
+    if (OceanActor && OceanActor->GetOwner() != this) OceanActor = nullptr;
+    if (GravityZone && GravityZone->GetOwner() != this) GravityZone = nullptr;
+
     if (!TerrainActor)
     {
         TerrainActor = World->SpawnActor<AAdaptiveVoxelActor>(
@@ -312,21 +312,16 @@ void APlanetActor::SpawnChildActors()
 
 void APlanetActor::DestroyChildActors()
 {
-    if (TerrainActor)
-    {
+    // Only children this planet spawned (see SpawnChildActors).
+    if (TerrainActor && TerrainActor->GetOwner() == this)
         TerrainActor->Destroy();
-        TerrainActor = nullptr;
-    }
-    if (OceanActor)
-    {
+    TerrainActor = nullptr;
+    if (OceanActor && OceanActor->GetOwner() == this)
         OceanActor->Destroy();
-        OceanActor = nullptr;
-    }
-    if (GravityZone)
-    {
+    OceanActor = nullptr;
+    if (GravityZone && GravityZone->GetOwner() == this)
         GravityZone->Destroy();
-        GravityZone = nullptr;
-    }
+    GravityZone = nullptr;
 }
 
 double APlanetActor::ComputeOceanRadius(double PlanetRadius, double NoiseAmplitude) const

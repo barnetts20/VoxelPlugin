@@ -1,7 +1,8 @@
 #include "VoxelDensity.h"
-#include "Async/ParallelFor.h"
 #include "VoxelDensityGPU.h"
+#include "VoxelPlugin.h"
 #include "VoxelShaderCompat.h"
+#include "Async/ParallelFor.h"
 
 namespace VoxelShader
 {
@@ -16,12 +17,6 @@ namespace
 
     /** Standard deviation of one octave of VoxelGradientNoise (measured over 400k points). */
     constexpr double SingleOctaveSigma = 0.1914;
-
-    FVector2f DoubleFloat(double V)
-    {
-        const float Hi = (float)V;
-        return FVector2f(Hi, (float)(V - (double)Hi));
-    }
 
     /** A coordinate in 32.32 fixed point (VoxelShader::FVoxelFixed). |V| below 2^31. */
     VoxelShader::FVoxelFixed ToFixed(double V)
@@ -180,9 +175,11 @@ double FVoxelDensityCPU::HeightAt(const FVector& Dir, double Footprint) const
     if (Len <= 1e-12 || NoiseAmplitude <= 0.0) return 0.0;
     const FVector SurfacePoint = Dir * (PlanetRadius / Len);
 
-    const double C = EvaluateLayer(Continent, SurfacePoint, Footprint);
-    const double R = EvaluateLayer(Mountain, SurfacePoint, Footprint);
-    const double D = EvaluateLayer(Detail, SurfacePoint, Footprint);
+    // Footprints below the finest cell are raised to it, as Sample does (and the GPU).
+    const double Band = FMath::Max(Footprint, MinFootprint);
+    const double C = EvaluateLayer(Continent, SurfacePoint, Band);
+    const double R = EvaluateLayer(Mountain, SurfacePoint, Band);
+    const double D = EvaluateLayer(Detail, SurfacePoint, Band);
 
     // In double: a float height in [0, 1] would quantise the surface to NoiseAmplitude * 6e-8
     // (several cm on an Earth-sized planet). VoxelSampleDensityDF mirrors this in double-float.
@@ -233,10 +230,10 @@ void FVoxelDensityCPU::BuildGPUData(FVoxelDensityGPUData& Out) const
         for (const FOctave& Octave : Layer->Octaves)
         {
             FVoxelDensityGPUOctave& G = Out.Octaves.AddDefaulted_GetRef();
-            G.Frequency = DoubleFloat(Octave.Frequency);
-            G.OffsetX = DoubleFloat(Octave.Offset.X);
-            G.OffsetY = DoubleFloat(Octave.Offset.Y);
-            G.OffsetZ = DoubleFloat(Octave.Offset.Z);
+            G.Frequency = VoxelDoubleFloat(Octave.Frequency);
+            G.OffsetX = VoxelDoubleFloat(Octave.Offset.X);
+            G.OffsetY = VoxelDoubleFloat(Octave.Offset.Y);
+            G.OffsetZ = VoxelDoubleFloat(Octave.Offset.Z);
             G.Wavelength = Octave.Wavelength;
             G.Amplitude = Octave.Amplitude;
             G.Seed = Octave.Seed;
@@ -251,16 +248,16 @@ void FVoxelDensityCPU::BuildGPUData(FVoxelDensityGPUData& Out) const
     Out.ContinentOctaves = (uint32)Continent.Octaves.Num();
     Out.MountainOctaves = (uint32)Mountain.Octaves.Num();
     Out.DetailOctaves = (uint32)Detail.Octaves.Num();
-    Out.InvNormContinent = DoubleFloat(Continent.InvNorm);
-    Out.InvNormMountain = DoubleFloat(Mountain.InvNorm);
-    Out.InvNormDetail = DoubleFloat(Detail.InvNorm);
-    Out.PlanetRadius = DoubleFloat(PlanetRadius);
-    Out.NoiseAmplitude = DoubleFloat(NoiseAmplitude);
-    Out.ContinentWeight = DoubleFloat(Settings.ContinentWeight);
-    Out.MountainWeight = DoubleFloat(Settings.MountainWeight);
-    Out.MountainStart = DoubleFloat(Settings.MountainStart);
-    Out.MountainBlend = DoubleFloat(FMath::Max(Settings.MountainBlend, 1e-6));
-    Out.DetailWeight = DoubleFloat(Settings.DetailWeight);
+    Out.InvNormContinent = VoxelDoubleFloat(Continent.InvNorm);
+    Out.InvNormMountain = VoxelDoubleFloat(Mountain.InvNorm);
+    Out.InvNormDetail = VoxelDoubleFloat(Detail.InvNorm);
+    Out.PlanetRadius = VoxelDoubleFloat(PlanetRadius);
+    Out.NoiseAmplitude = VoxelDoubleFloat(NoiseAmplitude);
+    Out.ContinentWeight = VoxelDoubleFloat(Settings.ContinentWeight);
+    Out.MountainWeight = VoxelDoubleFloat(Settings.MountainWeight);
+    Out.MountainStart = VoxelDoubleFloat(Settings.MountainStart);
+    Out.MountainBlend = VoxelDoubleFloat(FMath::Max(Settings.MountainBlend, 1e-6));
+    Out.DetailWeight = VoxelDoubleFloat(Settings.DetailWeight);
     Out.RidgeGain = (float)Settings.RidgeGain;
     Out.SlopeDamping = (float)Settings.DetailSlopeDamping;
     Out.MinFootprint = MinFootprint;
@@ -276,7 +273,7 @@ void FVoxelDensityCPU::BuildGPUData(FVoxelDensityGPUData& Out) const
     }
     if (PlanetRadius * MaxFrequency + 750.0 >= 2147483648.0)
     {
-        UE_LOG(LogTemp, Warning, TEXT("[VoxelDensity] The finest octave reaches lattice coordinate %.3g (limit 2^31): GPU and CPU densities will differ. Use fewer octaves or a longer wavelength."),
+        UE_LOG(LogVoxelPlugin, Warning, TEXT("[VoxelDensity] The finest octave reaches lattice coordinate %.3g (limit 2^31): GPU and CPU densities will differ. Use fewer octaves or a longer wavelength."),
             PlanetRadius * MaxFrequency + 750.0);
     }
 }

@@ -1,5 +1,6 @@
 #include "AdaptiveVoxelActor.h"
 #include "PlanetActor.h"
+#include "VoxelPlugin.h"
 #include "DrawDebugHelpers.h"
 #include "Kismet/GameplayStatics.h"
 #include "TimerManager.h"
@@ -76,11 +77,10 @@ void AAdaptiveVoxelActor::PostEditChangeProperty(FPropertyChangedEvent& Property
 
     FName PropName = PropertyChangedEvent.GetPropertyName();
 
-    // Changes to the density, the lattice or the material rebuild everything.
+    // Changes to the density or the lattice rebuild everything.
     static const TSet<FName> RebuildProps = {
         GET_MEMBER_NAME_CHECKED(AAdaptiveVoxelActor, NoiseAmplitudeRatio),
         GET_MEMBER_NAME_CHECKED(AAdaptiveVoxelActor, TargetPrecision),
-        GET_MEMBER_NAME_CHECKED(AAdaptiveVoxelActor, SurfaceMaterial),
     };
 
     // A change inside SurfaceSettings reports the inner field as the property; the member
@@ -98,6 +98,12 @@ void AAdaptiveVoxelActor::PostEditChangeProperty(FPropertyChangedEvent& Property
             Planet->RequestRebuild();
         else
             Initialize();
+        return;
+    }
+
+    if (PropName == GET_MEMBER_NAME_CHECKED(AAdaptiveVoxelActor, SurfaceMaterial))
+    {
+        SetSurfaceMaterial(SurfaceMaterial);
         return;
     }
 
@@ -200,6 +206,20 @@ void AAdaptiveVoxelActor::CleanSceneRoot()
     }
 }
 
+UMaterialInterface* AAdaptiveVoxelActor::DefaultSurfaceMaterial()
+{
+    UMaterialInterface* PluginMaterial = Cast<UMaterialInterface>(StaticLoadObject(UMaterialInterface::StaticClass(), nullptr,
+        TEXT("/VoxelPlugin/MT_TriPlanar.MT_TriPlanar"), nullptr, LOAD_NoWarn | LOAD_Quiet));
+    return PluginMaterial ? PluginMaterial : UMaterial::GetDefaultMaterial(EMaterialDomain::MD_Surface);
+}
+
+void AAdaptiveVoxelActor::SetSurfaceMaterial(UMaterialInterface* InMaterial)
+{
+    SurfaceMaterial = InMaterial ? InMaterial : DefaultSurfaceMaterial();
+    if (BrickTerrain.IsValid())
+        BrickTerrain->SetMaterial(SurfaceMaterial);
+}
+
 void AAdaptiveVoxelActor::Initialize()
 {
     Initialized = false;
@@ -207,13 +227,7 @@ void AAdaptiveVoxelActor::Initialize()
     // The plugin's triplanar material for standalone use, when none is assigned (the
     // constructor sets the engine default as a fallback).
     if (!SurfaceMaterial || SurfaceMaterial == UMaterial::GetDefaultMaterial(EMaterialDomain::MD_Surface))
-    {
-        UMaterialInterface* PluginMaterial = Cast<UMaterialInterface>(
-            StaticLoadObject(UMaterialInterface::StaticClass(), nullptr,
-                TEXT("/VoxelPlugin/MT_TriPlanar.MT_Surface")));
-        if (PluginMaterial)
-            SurfaceMaterial = PluginMaterial;
-    }
+        SurfaceMaterial = DefaultSurfaceMaterial();
 
     // The terrain is built at world scale in actor-local space; the actor's scale is the
     // planet radius.
@@ -340,7 +354,7 @@ void AAdaptiveVoxelActor::LogEditHit(const FHitResult& Hit, const FVector& Local
 {
     static IConsoleVariable* DebugCollision = IConsoleManager::Get().FindConsoleVariable(TEXT("voxel.Debug.Collision"));
     if (!DebugCollision || DebugCollision->GetInt() <= 0 || !CollisionBricks.IsValid()) return;
-    UE_LOG(LogTemp, Log, TEXT("[VoxelCollision] Edit trace: %s"), *CollisionBricks->DescribeHit(Hit.GetComponent(), LocalHit));
+    UE_LOG(LogVoxelPlugin, Log, TEXT("[VoxelCollision] Edit trace: %s"), *CollisionBricks->DescribeHit(Hit.GetComponent(), LocalHit));
 }
 
 void AAdaptiveVoxelActor::TickCollision(UWorld* World)
@@ -411,7 +425,7 @@ void AAdaptiveVoxelActor::RunEditUpdateTask(FVector InEditCenter, double InEditR
             const double ElapsedMs = (FPlatformTime::Seconds() - StartTime) * 1000.0;
             if (ElapsedMs > EditLogThresholdMs)
             {
-                UE_LOG(LogTemp, Log, TEXT("[VoxelEdit] Edit applied in %.2f ms"), ElapsedMs);
+                UE_LOG(LogVoxelPlugin, Log, TEXT("[VoxelEdit] Edit applied in %.2f ms"), ElapsedMs);
             }
 
             // Cleared last: Rebuild waits on the flag and then clears the notices, so a
@@ -459,47 +473,38 @@ void AAdaptiveVoxelActor::Tick(float DeltaTime)
         if (BrickTerrain.IsValid())
             BrickTerrain->Tick(CameraPosition);
 
-        //Example of edit flow, would want to move off tick for actual implementation
+#if !UE_BUILD_SHIPPING
         if (world->IsGameWorld())
-        {
-            FTransform NoScaleTransform(GetActorRotation(), GetActorLocation());
-            FVector WorldCamPos = NoScaleTransform.TransformPosition(CameraPosition);
-            double TraceDistance = GetActorScale3D().GetMax() * 3.0;
-            double InEditRadius = 300;
-            double InEditStrength = 300 * 2;
-            int InEditResolution = 3;
-            float DebugDrawTime = .1f;
-            APlayerController* PC = UGameplayStatics::GetPlayerController(world, 0);
-            if (PC && PC->IsInputKeyDown(EKeys::E) && !EditQueue->bRunning)
-            {
-                FVector Start = WorldCamPos;
-                FVector Forward = PC->GetControlRotation().Vector();
-                FVector End = Start + Forward * TraceDistance;
-
-                FHitResult Hit;
-                if (world->LineTraceSingleByChannel(Hit, Start, End, ECC_Visibility))
-                {
-                    FVector LocalHit = NoScaleTransform.InverseTransformPosition(Hit.ImpactPoint);
-                    LogEditHit(Hit, LocalHit);
-                    RunEditUpdateTask(LocalHit, InEditRadius, InEditStrength, InEditResolution);
-                    DrawDebugSphere(world, Hit.ImpactPoint, InEditRadius, 32, FColor::Red, false, DebugDrawTime);
-                }
-            }
-            if (PC && PC->IsInputKeyDown(EKeys::Q) && !EditQueue->bRunning)
-            {
-                FVector Start = WorldCamPos;
-                FVector Forward = PC->GetControlRotation().Vector();
-                FVector End = Start + Forward * TraceDistance;
-
-                FHitResult Hit;
-                if (world->LineTraceSingleByChannel(Hit, Start, End, ECC_Visibility))
-                {
-                    FVector LocalHit = NoScaleTransform.InverseTransformPosition(Hit.ImpactPoint);
-                    LogEditHit(Hit, LocalHit);
-                    RunEditUpdateTask(LocalHit, InEditRadius, -InEditStrength, 3);
-                    DrawDebugSphere(world, Hit.ImpactPoint, InEditRadius, 32, FColor::Green, false, DebugDrawTime);
-                }
-            }
-        }
+            TickDebugEdits(world);
+#endif
     }
 }
+
+#if !UE_BUILD_SHIPPING
+void AAdaptiveVoxelActor::TickDebugEdits(UWorld* World)
+{
+    // Example of the edit flow; a real tool would run this off the tick. Only this terrain's
+    // collision bricks count as a hit, so with several planets each edits its own surface.
+    APlayerController* PC = UGameplayStatics::GetPlayerController(World, 0);
+    if (!PC || EditQueue->bRunning) return;
+    const bool bAdd = PC->IsInputKeyDown(EKeys::E);
+    const bool bRemove = PC->IsInputKeyDown(EKeys::Q);
+    if (!bAdd && !bRemove) return;
+
+    const double EditRadius = 300.0;
+    const double EditStrength = 600.0;
+    const int32 EditResolution = 3;
+    const float DebugDrawTime = 0.1f;
+
+    const FTransform NoScaleTransform(GetActorRotation(), GetActorLocation());
+    const FVector Start = NoScaleTransform.TransformPosition(CameraPosition);
+    const FVector End = Start + PC->GetControlRotation().Vector() * (GetActorScale3D().GetMax() * 3.0);
+    FHitResult Hit;
+    if (!World->LineTraceSingleByChannel(Hit, Start, End, ECC_Visibility) || Hit.GetActor() != this) return;
+
+    const FVector LocalHit = NoScaleTransform.InverseTransformPosition(Hit.ImpactPoint);
+    LogEditHit(Hit, LocalHit);
+    RunEditUpdateTask(LocalHit, EditRadius, bAdd ? EditStrength : -EditStrength, EditResolution);
+    DrawDebugSphere(World, Hit.ImpactPoint, (float)EditRadius, 32, bAdd ? FColor::Red : FColor::Green, false, DebugDrawTime);
+}
+#endif

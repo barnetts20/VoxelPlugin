@@ -7,6 +7,8 @@
 
 #define LOCTEXT_NAMESPACE "FVoxelPluginModule"
 
+DEFINE_LOG_CATEGORY(LogVoxelPlugin);
+
 void FVoxelPluginModule::StartupModule()
 {
 	// The module loads at PostConfigInit (VoxelPlugin.uplugin) so its global shaders register
@@ -27,5 +29,5 @@ void FVoxelPluginModule::ShutdownModule()
 }
 
 #undef LOCTEXT_NAMESPACE
-	
+
 IMPLEMENT_MODULE(FVoxelPluginModule, VoxelPlugin)

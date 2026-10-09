@@ -1,14 +1,10 @@
 #include "VoxelBrickMesherGPU.h"
 #include "VoxelDensityGPU.h"
-#include "FSparseEditStore.h"
+#include "VoxelGPUCommon.h"
 #include "GlobalShader.h"
 #include "DataDrivenShaderPlatformInfo.h"
 #include "ShaderParameterStruct.h"
-#include "RenderGraphBuilder.h"
-#include "RenderGraphUtils.h"
 #include "RHIGPUReadback.h"
-#include "RenderingThread.h"
-#include "Containers/Ticker.h"
 #include "Async/Async.h"
 #include "Misc/App.h"
 #include <atomic>
@@ -106,13 +102,6 @@ IMPLEMENT_GLOBAL_SHADER(FVoxelMesherVertexTargetsCS, "/Plugin/VoxelPlugin/Privat
 
 namespace VoxelBrickMesherGPUDetail
 {
-
-    FVector2f MesherDoubleFloat(double V)
-    {
-        const float Hi = (float)V;
-        return FVector2f(Hi, (float)(V - (double)Hi));
-    }
-
     struct FMesherReadback
     {
         TUniquePtr<FRHIGPUBufferReadback> Counters;
@@ -140,14 +129,11 @@ namespace VoxelBrickMesherGPUDetail
         FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("VoxelMesher %s", Name), PassFlags, Shader, Parameters, FIntVector((int32)GroupsX, (int32)GroupsY, 1));
     }
 
-    template<typename T>
-    FRDGBufferRef UploadBuffer(FRDGBuilder& GraphBuilder, const TCHAR* Name, TConstArrayView<T> Data)
+    /** How far the sampled points reach past a brick's min corner, in half cells of the
+     *  brick's level: its own cells and TargetReachCells beyond them. */
+    int64 ReachUnits(int32 Cells)
     {
-        // A structured buffer can't be empty.
-        static const T Zero{};
-        if (Data.Num() == 0)
-            return CreateStructuredBuffer(GraphBuilder, Name, sizeof(T), 1, &Zero, sizeof(T));
-        return CreateStructuredBuffer(GraphBuilder, Name, sizeof(T), Data.Num(), Data.GetData(), sizeof(T) * Data.Num());
+        return 2LL * Cells + 2LL * VoxelBrickMesherGPU::TargetReachCells;
     }
 }
 
@@ -180,7 +166,7 @@ bool VoxelBrickMesherGPU::MakeBrick(const FVoxelBrickKey& Key, const int8 (&Neig
     const int32 N = CellsFor(Settings);
     const int64 Unit = 1LL << Key.Level;
     const int64 Scale = 2LL * N * Unit;
-    const int64 Reach = (2LL * N + 48) * Unit;   // the target points reach 48 units past the brick
+    const int64 Reach = VoxelBrickMesherGPUDetail::ReachUnits(N) * Unit;
     const int64 Origin = 1LL << Settings.MaxDepth;
     const int64 Min[3] = { Key.Coord.X * Scale - Origin, Key.Coord.Y * Scale - Origin, Key.Coord.Z * Scale - Origin };
     if (FMath::Abs(Min[0]) + Reach >= MAX_int32 || FMath::Abs(Min[1]) + Reach >= MAX_int32 || FMath::Abs(Min[2]) + Reach >= MAX_int32)
@@ -201,6 +187,18 @@ bool VoxelBrickMesherGPU::MakeBrick(const FVoxelBrickKey& Key, const int8 (&Neig
     return true;
 }
 
+int32 VoxelBrickMesherGPU::CoarsestMeshableLevel(const FVoxelBrickMesherGPUSettings& Settings)
+{
+    // The farthest brick of a level starts at the root's edge, 2^MaxDepth units from the
+    // centre: MakeBrick's test for it, level by level.
+    const int64 Origin = 1LL << FMath::Clamp(Settings.MaxDepth, 0, 62);
+    const int64 Reach = VoxelBrickMesherGPUDetail::ReachUnits(CellsFor(Settings));
+    int32 Level = -1;
+    while (Level < 62 && Origin + Reach * (1LL << (Level + 1)) < MAX_int32)
+        Level++;
+    return Level;
+}
+
 bool VoxelBrickMesherGPU::AreShadersReady()
 {
     // GetShader by type returns an empty reference when the shader isn't compiled for this
@@ -219,12 +217,12 @@ bool VoxelBrickMesherGPU::AreShadersReady()
 
 VoxelBrickMesherGPU::FInputs VoxelBrickMesherGPU::UploadInputs(FRDGBuilder& GraphBuilder, const FVoxelDensityGPUData& Density, const FVoxelEditGPUData& Edits)
 {
-    using namespace VoxelBrickMesherGPUDetail;
+    using VoxelGPUCommon::UploadStructuredBuffer;
     FInputs Inputs;
-    Inputs.Octaves = UploadBuffer(GraphBuilder, TEXT("Voxel.MesherOctaves"), MakeArrayView(Density.Octaves));
-    Inputs.EditCorners = UploadBuffer(GraphBuilder, TEXT("Voxel.EditCorners"), MakeArrayView(Edits.Corners));
-    Inputs.EditChildren = UploadBuffer(GraphBuilder, TEXT("Voxel.EditChildren"), MakeArrayView(Edits.Children));
-    Inputs.EditFlags = UploadBuffer(GraphBuilder, TEXT("Voxel.EditFlags"), MakeArrayView(Edits.Flags));
+    Inputs.Octaves = UploadStructuredBuffer(GraphBuilder, TEXT("Voxel.MesherOctaves"), MakeArrayView(Density.Octaves));
+    Inputs.EditCorners = UploadStructuredBuffer(GraphBuilder, TEXT("Voxel.EditCorners"), MakeArrayView(Edits.Corners));
+    Inputs.EditChildren = UploadStructuredBuffer(GraphBuilder, TEXT("Voxel.EditChildren"), MakeArrayView(Edits.Children));
+    Inputs.EditFlags = UploadStructuredBuffer(GraphBuilder, TEXT("Voxel.EditFlags"), MakeArrayView(Edits.Flags));
     Inputs.EditNodeCount = (uint32)Edits.Flags.Num();
     Inputs.EditRootExtent = Edits.RootExtent;
     return Inputs;
@@ -262,7 +260,7 @@ VoxelBrickMesherGPU::FOutputs VoxelBrickMesherGPU::AddMesherPasses(FRDGBuilder& 
 
     FVoxelMesherParameters Template;
     Template.Octaves = GraphBuilder.CreateSRV(Inputs.Octaves);
-    Template.HalfFinest = MesherDoubleFloat(0.5 * Settings.FinestCell);
+    Template.HalfFinest = VoxelDoubleFloat(0.5 * Settings.FinestCell);
     Template.ContinentOctaves = Density.ContinentOctaves;
     Template.MountainOctaves = Density.MountainOctaves;
     Template.DetailOctaves = Density.DetailOctaves;
@@ -283,7 +281,7 @@ VoxelBrickMesherGPU::FOutputs VoxelBrickMesherGPU::AddMesherPasses(FRDGBuilder& 
     Template.EditFlags = GraphBuilder.CreateSRV(Inputs.EditFlags);
     Template.EditNodeCount = Inputs.EditNodeCount;
     Template.EditRootExtent = Inputs.EditRootExtent;
-    Template.Bricks = GraphBuilder.CreateSRV(UploadBuffer(GraphBuilder, TEXT("Voxel.MesherBricks"), Bricks));
+    Template.Bricks = GraphBuilder.CreateSRV(VoxelGPUCommon::UploadStructuredBuffer(GraphBuilder, TEXT("Voxel.MesherBricks"), Bricks));
     Template.CellsPerBrick = (int32)UN;
     Template.NumBricks = NB;
     Template.HashSize = Caps.HashSize;
@@ -307,14 +305,14 @@ VoxelBrickMesherGPU::FOutputs VoxelBrickMesherGPU::AddMesherPasses(FRDGBuilder& 
     Template.TargetHashKeys = GraphBuilder.CreateUAV(MakeBuffer(4, NB * Caps.TargetHashSize, TEXT("Voxel.MesherTargetHashKeys")));
     Template.TargetHashValues = GraphBuilder.CreateUAV(MakeBuffer(4, NB * Caps.TargetHashSize, TEXT("Voxel.MesherTargetHashValues")));
 
+    // Only the buffers whose zero means "empty" are cleared. HashValues and TargetHashValues
+    // are set to unsampled by the thread that takes a slot (VoxelMesherRequest), and SlotVertex
+    // to none where VoxelMesherEdgesPass marks a slot; nothing reads them elsewhere.
     AddClearUAVPass(GraphBuilder, Template.HashKeys, 0u, PassFlags);
-    AddClearUAVPass(GraphBuilder, Template.HashValues, 0xffffffffu, PassFlags);
     AddClearUAVPass(GraphBuilder, Template.SlotState, 0u, PassFlags);
-    AddClearUAVPass(GraphBuilder, Template.SlotVertex, 0xffffffffu, PassFlags);
     AddClearUAVPass(GraphBuilder, Template.Counters, 0u, PassFlags);
     AddClearUAVPass(GraphBuilder, Template.TargetState, 0u, PassFlags);
     AddClearUAVPass(GraphBuilder, Template.TargetHashKeys, 0u, PassFlags);
-    AddClearUAVPass(GraphBuilder, Template.TargetHashValues, 0xffffffffu, PassFlags);
 
     AddMesherPass<FVoxelMesherSampleCS>(GraphBuilder, PassFlags, Template, 0u, NB * DenseTotal, TEXT("Sample lattice"));
     AddMesherPass<FVoxelMesherEdgesCS>(GraphBuilder, PassFlags, Template, 0u, NB * 3u * UN * (UN + 1u) * (UN + 1u), TEXT("Edges"));
@@ -361,18 +359,33 @@ void VoxelBrickMesherGPU::MeshBricksAsync(TSharedRef<const FVoxelDensityGPUData>
     }
     State->NumBricks = Bricks.Num();
     State->RequestOfBrick = RequestOfBrick;
+
+    // Nothing meshed: one empty entry per request, so callers can index them.
+    auto FinishNotMeshed = [State]()
+        {
+            State->bDone.store(true, std::memory_order_release);
+            AsyncTask(ENamedThreads::GameThread, [State]()
+                {
+                    TArray<FVoxelBrickMesh> Meshes;
+                    TArray<FVoxelBrickMesherGPUStats> Stats;
+                    Meshes.SetNum(State->NumRequests);
+                    Stats.SetNum(State->NumRequests);
+                    for (FVoxelBrickMesherGPUStats& S : Stats)
+                        S.Errors = VoxelBrickMesherGPU::ErrorNotMeshed;
+                    State->OnDone(MoveTemp(Meshes), MoveTemp(Stats));
+                });
+        };
     if (Bricks.Num() == 0 || !FApp::CanEverRender())
     {
-        AsyncTask(ENamedThreads::GameThread, [State]() { State->OnDone(TArray<FVoxelBrickMesh>(), TArray<FVoxelBrickMesherGPUStats>()); });
+        FinishNotMeshed();
         return;
     }
 
-    ENQUEUE_RENDER_COMMAND(VoxelMesherGPU)([Density, Edits, Settings, Bricks = MoveTemp(Bricks), State](FRHICommandListImmediate& RHICmdList)
+    ENQUEUE_RENDER_COMMAND(VoxelMesherGPU)([Density, Edits, Settings, Bricks = MoveTemp(Bricks), State, FinishNotMeshed](FRHICommandListImmediate& RHICmdList)
         {
             if (!AreShadersReady())
             {
-                State->bDone.store(true, std::memory_order_release);
-                AsyncTask(ENamedThreads::GameThread, [State]() { State->OnDone(TArray<FVoxelBrickMesh>(), TArray<FVoxelBrickMesherGPUStats>()); });
+                FinishNotMeshed();
                 return;
             }
 
@@ -395,66 +408,62 @@ void VoxelBrickMesherGPU::MeshBricksAsync(TSharedRef<const FVoxelDensityGPUData>
 
     // Poll the readbacks once per frame on the render thread; build the meshes there and hand
     // them to the game thread.
-    FTSTicker::GetCoreTicker().AddTicker(FTickerDelegate::CreateLambda([State](float) -> bool
+    VoxelGPUCommon::PollRenderThread([State]() -> bool
         {
-            if (State->bDone.load(std::memory_order_acquire)) return false;
-            ENQUEUE_RENDER_COMMAND(VoxelMesherGPUPoll)([State](FRHICommandListImmediate&)
+            if (State->bDone.load(std::memory_order_acquire)) return true;
+            if (!State->Counters.IsValid() || !State->Counters->IsReady() || !State->Vertices->IsReady() || !State->Indices->IsReady())
+                return false;
+
+            const uint32 NB = (uint32)State->NumBricks;
+            const uint32 VertexCap = State->Caps.VertexCap;
+            const uint32 TriangleCap = State->Caps.TriangleCap;
+            TArray<FVoxelBrickMesh> Meshes;
+            TArray<FVoxelBrickMesherGPUStats> Stats;
+            Meshes.SetNum(State->NumRequests);
+            Stats.SetNum(State->NumRequests);
+            for (FVoxelBrickMesherGPUStats& S : Stats)
+                S.Errors = VoxelBrickMesherGPU::ErrorNotMeshed;
+            const uint32* Counters = (const uint32*)State->Counters->Lock(NB * 4u * 4u);
+            const float* Vertices = (const float*)State->Vertices->Lock(NB * VertexCap * VertexStride * 4u);
+            const uint32* Indices = (const uint32*)State->Indices->Lock(NB * TriangleCap * 3u * 4u);
+            if (Counters && Vertices && Indices)
+            {
+                for (uint32 b = 0; b < NB; b++)
                 {
-                    if (State->bDone.load(std::memory_order_acquire) || !State->Counters.IsValid()
-                        || !State->Counters->IsReady() || !State->Vertices->IsReady() || !State->Indices->IsReady())
-                        return;
+                    const int32 r = State->RequestOfBrick[b];
+                    FVoxelBrickMesherGPUStats& S = Stats[r];
+                    S.Faces = Counters[b * 4u];
+                    S.Vertices = Counters[b * 4u + 1u];
+                    S.Triangles = Counters[b * 4u + 2u];
+                    S.Errors = Counters[b * 4u + 3u];
 
-                    const uint32 NB = (uint32)State->NumBricks;
-                    const uint32 VertexCap = State->Caps.VertexCap;
-                    const uint32 TriangleCap = State->Caps.TriangleCap;
-                    TArray<FVoxelBrickMesh> Meshes;
-                    TArray<FVoxelBrickMesherGPUStats> Stats;
-                    Meshes.SetNum(State->NumRequests);
-                    Stats.SetNum(State->NumRequests);
-                    for (FVoxelBrickMesherGPUStats& S : Stats)
-                        S.Errors = VoxelBrickMesherGPU::ErrorNotMeshed;
-                    const uint32* Counters = (const uint32*)State->Counters->Lock(NB * 4u * 4u);
-                    const float* Vertices = (const float*)State->Vertices->Lock(NB * VertexCap * VertexStride * 4u);
-                    const uint32* Indices = (const uint32*)State->Indices->Lock(NB * TriangleCap * 3u * 4u);
-                    if (Counters && Vertices && Indices)
+                    FVoxelBrickMesh& Mesh = Meshes[r];
+                    const uint32 NumVertices = FMath::Min(S.Vertices, VertexCap);
+                    const uint32 NumTriangles = FMath::Min(S.Triangles, TriangleCap);
+                    Mesh.Positions.SetNumUninitialized(NumVertices);
+                    Mesh.Normals.SetNumUninitialized(NumVertices);
+                    for (uint32 v = 0; v < NumVertices; v++)
                     {
-                        for (uint32 b = 0; b < NB; b++)
-                        {
-                            const int32 r = State->RequestOfBrick[b];
-                            FVoxelBrickMesherGPUStats& S = Stats[r];
-                            S.Faces = Counters[b * 4u];
-                            S.Vertices = Counters[b * 4u + 1u];
-                            S.Triangles = Counters[b * 4u + 2u];
-                            S.Errors = Counters[b * 4u + 3u];
-
-                            FVoxelBrickMesh& Mesh = Meshes[r];
-                            const uint32 NumVertices = FMath::Min(S.Vertices, VertexCap);
-                            const uint32 NumTriangles = FMath::Min(S.Triangles, TriangleCap);
-                            Mesh.Positions.SetNumUninitialized(NumVertices);
-                            Mesh.Normals.SetNumUninitialized(NumVertices);
-                            for (uint32 v = 0; v < NumVertices; v++)
-                            {
-                                const float* V = Vertices + (b * VertexCap + v) * VertexStride;
-                                Mesh.Positions[v] = FVector3f(V[0], V[1], V[2]);
-                                Mesh.Normals[v] = FVector3f(V[3], V[4], V[5]);
-                            }
-                            Mesh.Indices.SetNumUninitialized(NumTriangles * 3u);
-                            for (uint32 i = 0; i < NumTriangles * 3u; i++)
-                                Mesh.Indices[i] = (int32)Indices[b * TriangleCap * 3u + i];
-                        }
+                        const float* V = Vertices + (b * VertexCap + v) * VertexStride;
+                        Mesh.Positions[v] = FVector3f(V[0], V[1], V[2]);
+                        Mesh.Normals[v] = FVector3f(V[3], V[4], V[5]);
                     }
-                    if (Counters) State->Counters->Unlock();
-                    if (Vertices) State->Vertices->Unlock();
-                    if (Indices) State->Indices->Unlock();
-                    State->Counters.Reset();
-                    State->Vertices.Reset();
-                    State->Indices.Reset();
-                    State->bDone.store(true, std::memory_order_release);
-                    AsyncTask(ENamedThreads::GameThread, [State, Meshes = MoveTemp(Meshes), Stats = MoveTemp(Stats)]() mutable
-                        {
-                            State->OnDone(MoveTemp(Meshes), MoveTemp(Stats));
-                        });
+                    Mesh.Indices.SetNumUninitialized(NumTriangles * 3u);
+                    for (uint32 i = 0; i < NumTriangles * 3u; i++)
+                        Mesh.Indices[i] = (int32)Indices[b * TriangleCap * 3u + i];
+                }
+            }
+            if (Counters) State->Counters->Unlock();
+            if (Vertices) State->Vertices->Unlock();
+            if (Indices) State->Indices->Unlock();
+            State->Counters.Reset();
+            State->Vertices.Reset();
+            State->Indices.Reset();
+            State->bDone.store(true, std::memory_order_release);
+            AsyncTask(ENamedThreads::GameThread, [State, Meshes = MoveTemp(Meshes), Stats = MoveTemp(Stats)]() mutable
+                {
+                    State->OnDone(MoveTemp(Meshes), MoveTemp(Stats));
                 });
             return true;
-        }));
+        });
 }
