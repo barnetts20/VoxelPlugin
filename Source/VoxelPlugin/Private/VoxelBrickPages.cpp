@@ -1,5 +1,9 @@
 #include "VoxelBrickPages.h"
-#include "FAdaptiveOctree.h"
+#include "VoxelMeshStream.h"
+#include "FDensitySampleCompositor.h"
+#include "FSparseEditStore.h"
+#include "HAL/IConsoleManager.h"
+#include "Misc/ScopeLock.h"
 #include "RealtimeMeshSimple.h"
 #include "RealtimeMeshComponent.h"
 #include "Compute/RealtimeMeshComputeProvider.h"
@@ -948,8 +952,8 @@ void FVoxelBrickPages::Advance(FInstance& Instance) const
 
     if (Instance.Handle == 0)
     {
-        // Registered once the buffers exist and the component has a proxy (two frames, as
-        // FMeshChunk::ApplyStream); the driver runs an OnDemand provider when registered.
+        // Registered once the buffers exist and the component has a proxy (two frames after
+        // its creation); the driver runs an OnDemand provider when registered.
         if (!Instance.bBuffersReady->load(std::memory_order_acquire) || GFrameCounter < Instance.CreatedFrame + 2 || Instance.PushedVersion == 0)
             return;
         // Shown first: the driver binds the indirect args to the section proxy, and a later

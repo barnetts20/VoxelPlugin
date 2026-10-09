@@ -844,7 +844,7 @@ VOXEL_FUNC float3 VoxelSafeNormalize(float3 V)
 }
 
 // One face: the vertices of its four cells, deduplicated around the ring, as one or two
-// triangles with the octree mesher's split choice and winding.
+// triangles with the CPU mesher's split choice and winding.
 VOXEL_FUNC void VoxelMesherTrianglesPass(uint Id)
 {
     if (Id >= NumBricks * FaceCap) return;

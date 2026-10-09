@@ -158,10 +158,10 @@ namespace VoxelDensity
     VOXELPLUGIN_API TSharedPtr<FDensitySampleCompositor> MakeCompositor(const FVoxelSurfaceSettings& Settings,
         double PlanetRadius, double NoiseAmplitude, TSharedPtr<FSparseEditStore> EditStore, double MinFootprint = 0.0);
 
-    /** Root half-extent of a terrain octree for a planet: holds every possible surface point. */
+    /** Root half-extent of a planet's terrain lattice: holds every possible surface point. */
     inline double RootExtentFor(double PlanetRadius, double NoiseAmplitude) { return (PlanetRadius + NoiseAmplitude) * 1.05; }
 
-    /** Cell size (cm) of the finest terrain octree level. */
+    /** Cell size (cm) of the finest terrain lattice level (MaxDepth halvings of the root). */
     inline double TerrainFinestCell(double PlanetRadius, double NoiseAmplitude, int32 MaxDepth)
     {
         return 2.0 * RootExtentFor(PlanetRadius, NoiseAmplitude) / FMath::Pow(2.0, (double)MaxDepth);

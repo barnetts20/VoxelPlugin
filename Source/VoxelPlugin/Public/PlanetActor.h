@@ -91,6 +91,10 @@ public:
     UFUNCTION(BlueprintCallable, Category = "Planet")
     APlanetGravityZone* GetGravityZone() const { return GravityZone; }
 
+    /** Rebuilds the compositor and every child on the next Tick (a child's structural
+     *  setting changed, e.g. the terrain's TargetPrecision). */
+    void RequestRebuild() { bPendingInitialize = true; }
+
     // --- Lifecycle ---
 
     virtual void OnConstruction(const FTransform& Transform) override;
@@ -176,7 +180,7 @@ private:
     void DestroyChildActors();
 
     /** Builds the shared compositor (VoxelDensity::MakeCompositor) with a fresh
-     *  FSparseEditStore covering the terrain octree's bounds down to MaxDepth. */
+     *  FSparseEditStore covering the terrain lattice's root box down to MaxDepth. */
     TSharedPtr<FDensitySampleCompositor> BuildCompositor(double PlanetRadius, double NoiseAmplitude, double RootExtent, int32 MaxDepth);
 
     /** Computes ocean radius from planet radius, noise amplitude, and SeaLevel.

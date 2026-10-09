@@ -1,6 +1,7 @@
-// AdaptiveVoxelActor.h — Terrain actor (standalone or driven by APlanetActor) owning an adaptive
-// octree and its async LOD/mesh/edit pipeline. Scale (max component, cm) is the planet radius;
-// scale changes rebuild, position and rotation are live.
+// AdaptiveVoxelActor.h - Terrain actor (standalone or driven by APlanetActor): renders the
+// planet from LOD bricks (FVoxelBrickTerrain), keeps collision bricks around the pawns
+// (FVoxelCollisionBricks) and applies edits to the shared edit store. Scale (max component,
+// cm) is the planet radius; scale changes rebuild, position and rotation are live.
 
 #pragma once
 
@@ -9,53 +10,29 @@
 #include "Materials/Material.h"
 #include "Materials/MaterialParameterCollection.h"
 #include "MaterialDomain.h"
-#include "FAdaptiveOctree.h"
 #include "VoxelDensity.h"
 #include "VoxelCollisionBricks.h"
 #include "VoxelBrickTerrain.h"
 #include "RealtimeMeshActor.h"
+#include <atomic>
 #include "AdaptiveVoxelActor.generated.h"
 
-/** Three task chains, each under OctreeLock: DataUpdate (LOD split/merge, chunk cut) chained
- *  with MeshUpdate (collects dirty chunks) at a minimum interval, and EditUpdate when
- *  triggered. Tick applies finished meshes a whole pass at a time. Collision
- *  (FVoxelCollisionBricks) and the brick terrain run on their own tasks without the lock. */
+/** The brick terrain and the collision bricks run their own tasks; edits are written to the
+ *  edit store on a task and forwarded to both from Tick. */
 UCLASS()
 class VOXELPLUGIN_API AAdaptiveVoxelActor : public ARealtimeMeshActor
 {
     GENERATED_BODY()
 
 private:
-    /** The adaptive octree that holds all terrain data. Created on the background
-     *  thread during the first RunDataUpdateTask after Initialize sets PendingParams. */
-    TSharedPtr<FAdaptiveOctree> AdaptiveOctree;
-
-    /** Deferred construction: params are stored on Initialize (game thread),
-     *  octree is built on the first RunDataUpdateTask (background thread). */
-    TSharedPtr<FOctreeParams> PendingParams;
-
-    /** Mesh chunks attach to this component. Inherits actor position and rotation
-     *  but uses absolute scale (1,1,1). Octree is built at world scale; scale changes
-     *  trigger full reconstruction via OnConstruction. */
-    UPROPERTY()
-    TObjectPtr<USceneComponent> MeshAttachmentRoot;
-
-    /** Collision bricks and brick-terrain components attach to this one, placed like
-     *  MeshAttachmentRoot. Kept apart so hiding the octree's chunks leaves them alone. */
+    /** Collision bricks and brick-terrain components attach to this one. It inherits the
+     *  actor's position and rotation but uses absolute scale (1,1,1): the terrain is built at
+     *  world scale, and scale changes rebuild it (OnConstruction). */
     UPROPERTY()
     TObjectPtr<USceneComponent> BrickAttachmentRoot;
 
     /** Camera position in actor-local space, updated each tick from the viewport. */
     FVector CameraPosition = FVector::ZeroVector;
-
-    /** Last position used for an LOD update — compared against current to detect movement. */
-    FVector LastLodUpdatePosition = FVector(FLT_MAX);
-
-    double CameraFOV = 90;
-
-    /** Read-write lock protecting AdaptiveOctree. DataUpdate and EditUpdate acquire
-     *  write; MeshUpdate acquires read-only. */
-    FRWLock OctreeLock;
 
     bool bTickInEditor = true;
 
@@ -103,39 +80,6 @@ public:
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrain",
         meta = (EditCondition = "!bIsPlanetOwned"))
     FVoxelSurfaceSettings SurfaceSettings;
-
-    // --- Octree Structure ---
-
-    /** Computed at init: the depth the chunk cut is built at (= MinChunkDepth). Shown for
-     *  reference. Chunks promote deeper than this near the camera. */
-    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Terrain|Octree")
-    int ChunkDepth = 4;
-
-    /** Shallow floor the chunk cut is built at — the spawn / far-away chunk depth. Keep it
-     *  low (2-3) so spawn and distant terrain use few, large components. Precision is
-     *  recovered near the camera by promoting toward MaxChunkDepth. */
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrain|Octree", meta = (ClampMin = "2"))
-    int MinChunkDepth = 3;
-
-    /** Deepest a chunk root may sit (<= MaxDepth): chunks under the camera promote toward it
-     *  until their float jitter is sub-pixel (a 10,000 km planet wants ~12-14 for sub-mm). */
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrain|Octree", meta = (ClampMin = "2"))
-    int MaxChunkDepth = 14;
-
-    /** Chunk float jitter tolerance (fraction of the view) at the camera's near distance;
-     *  smaller promotes sooner. ~5e-4 is about half a pixel at 1080p. */
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrain|Octree", meta = (ClampMin = "0.00001"))
-    double ChunkPrecisionThreshold = 5e-4;
-
-    /** Demote hysteresis: a promoted chunk collapses once its parent is precise to
-     *  ChunkPrecisionThreshold * this. Lower = less churn, finer chunks held longer. */
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrain|Octree", meta = (ClampMin = "0.05", ClampMax = "1.0"))
-    double ChunkDemoteHysteresis = 0.5;
-
-    /** Largest depth gap between face-adjacent chunks (forced refines, refused demotes).
-     *  1 = strict 2:1 (safest); 2 = fewer components, usually still crack-free. */
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrain|Octree", meta = (ClampMin = "1", ClampMax = "2"))
-    int MaxChunkDepthDelta = 1;
 
     /** Master switch for terrain collision. When on, collision bricks are built within the
      *  collision distance of every player pawn (of the camera when there is none). */
@@ -191,49 +135,28 @@ public:
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrain|Bricks")
     TObjectPtr<UMaterialParameterCollection> BrickMorphParameters = nullptr;
 
-    /** Minimum subdivision depth maintained regardless of camera distance. */
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrain|Octree")
-    int MinDepth = 5;
-
-    /** Target voxel spacing in world units (cm). MaxDepth is computed automatically
-     *  so the finest LOD voxel cells are approximately this size. */
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrain|Octree",
+    /** Target cell size of the finest terrain lattice level in world units (cm). MaxDepth is
+     *  computed so the finest cells are about this size. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrain|Lattice",
         meta = (ClampMin = "1.0"))
     double TargetPrecision = 150.0;
 
-    /** From TargetPrecision and the planet radius at init, in [MinDepth, MaxKeyDepth] (22 at
-     *  the default scale). */
-    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Terrain|Octree")
-    int MaxDepth = 22;
+    /** Halvings of the root box down to the finest lattice level, from TargetPrecision and the
+     *  planet radius at init (21 at the default scale). */
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Terrain|Lattice")
+    int MaxDepth = 21;
 
-    /** The actual voxel spacing (cm) achieved at MaxDepth after key-limit clamping. */
-    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Terrain|Octree")
+    /** The finest cell size (cm) MaxDepth gives. */
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Terrain|Lattice")
     double ActualPrecision = 0.0;
 
-    /** Hard limit imposed by FMortonIndex (3 bits per level, 126 bits across two uint64s). */
-    static constexpr int32 MaxKeyDepth = 42;
+    /** Deepest lattice: the bricks address points by 32-bit indices in half finest cells
+     *  from the root centre. */
+    static constexpr int32 MaxLatticeDepth = 30;
 
-    // --- LOD ---
-
-    /** Screen-space size threshold for LOD split/merge decisions. Smaller values
-     *  produce finer detail at greater distance. */
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrain|LOD")
-    double ScreenSpaceThreshold = 0.075;
-
-    /** Minimum interval (seconds) between LOD update passes. Prevents the
-     *  DataUpdate→MeshUpdate chain from saturating the thread pool. */
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrain|LOD")
-    double MinDataUpdateInterval = 0.05;
-
-    /** Multiplier on camera velocity for predictive LOD. Higher values split nodes
-     *  earlier in the direction of camera movement. */
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrain|LOD")
-    double VelocityLookAheadFactor = 2.0;
-
-    /** Per-frame budget (ms) for creating chunk components, oldest work first. Mesh swaps are
-     *  not budgeted: chunks meshed together appear in the same frame. */
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrain|LOD", meta = (ClampMin = "0.1"))
-    double ChunkApplyBudgetMs = 2.0;
+    /** MaxDepth for a root half-extent and target cell size, in [6, MaxLatticeDepth] (the
+     *  coarsest brick level must exist). */
+    static int32 MaxDepthFor(double RootExtent, double InTargetPrecision);
 
     // --- Lifecycle Overrides ---
 
@@ -256,80 +179,55 @@ public:
 
     // --- Public API ---
 
-    USceneComponent* GetMeshAttachmentRoot() const { return MeshAttachmentRoot; }
-
     /** The density this terrain samples (null before initialization). */
     TSharedPtr<FDensitySampleCompositor> GetDensityCompositor() const { return DensityCompositor; }
 
     /** The camera position last seen by Tick, in actor space without scale. */
     FVector GetCameraPositionLocal() const { return CameraPosition; }
 
-    /** The brick terrain (exists once initialized; holds bricks while voxel.Render.Bricks is on). */
+    /** The brick terrain (exists once initialized). */
     TSharedPtr<FVoxelBrickTerrain> GetBrickTerrain() const { return BrickTerrain; }
 
     /** Called by APlanetActor: uses its compositor (shared density and edits), sets the scale
-     *  (planet radius) first, and re-parents MeshAttachmentRoot to InAttachParent if given. */
+     *  (planet radius) first, and re-parents BrickAttachmentRoot to InAttachParent if given. */
     void InitializeFromPlanet(TSharedPtr<FDensitySampleCompositor> InCompositor,
         USceneComponent* InAttachParent = nullptr,
         FVector InScale = FVector::ZeroVector);
 
-    /** Tears down the current octree and rebuilds from scratch using current property values.
-     *  Called by OnConstruction (scale change), PostEditChangeProperty (structural param change),
-     *  InitializeFromPlanet (planet-driven init), and BeginPlay. */
+    /** Rebuilds the density, collision and brick terrain from the current property values.
+     *  Called by OnConstruction (scale change), PostEditChangeProperty (structural param change)
+     *  and BeginPlay; InitializeFromPlanet does the same with the planet's density. */
     void Initialize();
 
 protected:
-    // --- Async Task Flags ---
-    // Each flag gates its corresponding task so only one instance runs at a time.
-
-    std::atomic<bool> DataUpdateIsRunning = false;
-    std::atomic<bool> MeshUpdateIsRunning = false;
-    std::atomic<bool> EditUpdateIsRunning = false;
-
-    /** Timer handle for the MinDataUpdateInterval delay between MeshUpdate completion
-     *  and the next DataUpdate kickoff. */
-    FTimerHandle DataUpdateTimerHandle;
-
-    /** Game-thread apply queue. The mesh/edit tasks enqueue dirty chunks here (deduped
-     *  via FMeshChunk::bApplyQueued); Tick drains it (DrainPendingApply). Guarded by
-     *  PendingApplyCS. */
-    TArray<TSharedPtr<FMeshChunk>> PendingApply;
-    FCriticalSection PendingApplyCS;
-
-    /** Chunks retired by the chunk-cut pass (coarse parents replaced by finer children).
-     *  Their RealtimeMesh components must be destroyed on the game thread; Tick drains this
-     *  after DrainPendingApply so the finer children get a chance to appear first. Guarded
-     *  by PendingApplyCS (same low-contention queue family as PendingApply). */
-    TArray<TSharedPtr<FMeshChunk>> PendingDestroy;
-
     /** The density every terrain consumer samples (set by Initialize / InitializeFromPlanet). */
     TSharedPtr<FDensitySampleCompositor> DensityCompositor;
 
     /** Collision around the pawns, built from DensityCompositor. */
     TSharedPtr<FVoxelCollisionBricks> CollisionBricks;
 
-    /** Terrain rendered from bricks while voxel.Render.Bricks is 1 (the octree's chunks are
-     *  hidden and its LOD passes paused meanwhile). */
+    /** The rendered terrain. */
     TSharedPtr<FVoxelBrickTerrain> BrickTerrain;
-    bool bBrickRenderActive = false;
 
-    /** Edits applied by the edit task, for the collision bricks (drained in Tick). Guarded by
-     *  PendingApplyCS. */
+    /** An edit written to the edit store, for the collision bricks and the brick terrain. */
     struct FEditNotice
     {
         uint32 Sequence;
         FVector Center;
         double Radius;
     };
-    TArray<FEditNotice> PendingEditNotices;
 
-    /** Edits written to the edit store alone while the brick terrain renders (it and the
-     *  collision read the store), replayed on the octree when the octree renders again.
-     *  Guarded by PendingApplyCS. */
-    TArray<FEditNotice> DeferredOctreeEdits;
-
-    /** Replays DeferredOctreeEdits on the octree in the edit task's slot. */
-    void RunDeferredOctreeEdits();
+    /** State shared with the edit task, which holds a reference instead of the actor so it
+     *  can finish after the actor is destroyed. */
+    struct FEditQueue
+    {
+        /** An edit is being written to the edit store (one at a time). */
+        std::atomic<bool> bRunning = false;
+        /** Finished edits, drained in Tick. Guarded by CS. */
+        TArray<FEditNotice> Notices;
+        FCriticalSection CS;
+    };
+    TSharedRef<FEditQueue> EditQueue = MakeShared<FEditQueue>();
 
     /** Smoothed camera speed (cm/s) from position deltas, updated in Tick. Feeds the
      *  collision lead distance when a pawn reports no velocity. */
@@ -337,62 +235,18 @@ protected:
     FVector PrevSpeedSamplePos = FVector::ZeroVector;
     bool bHasSpeedSample = false;
 
-    // --- Flicker diagnostics (voxel.Debug.Flicker) ---
-
-    /** Actor-local bounds of chunks the last stale-seam check flagged, and when it ran.
-     *  Written by the data task, drawn by Tick. Guarded by PendingApplyCS. */
-    TArray<FBox> DebugStaleBounds;
-    double DebugStaleBoundsTime = 0.0;
-
-    /** Actor-local bounds of chunks whose current mesh holds folded triangles, refreshed
-     *  every data pass. Guarded by PendingApplyCS. */
-    TArray<FBox> DebugFoldedBounds;
-
-    /** Data passes since init (data task only); paces the stale-seam check. */
-    uint32 DebugDataPassCount = 0;
-
-    /** Last time the mesh task logged chunk statistics (mesh task only). */
-    double DebugLastStatsTime = 0.0;
-
-    /** Consecutive frames the oldest apply group has been waiting for component creation
-     *  (game thread only). Caps how long it holds newer groups back. */
-    int32 ApplyHeldFrames = 0;
-
-    /** Destroys all RealtimeMesh components attached to MeshAttachmentRoot and BrickAttachmentRoot. */
+    /** Destroys all RealtimeMesh components attached to BrickAttachmentRoot. */
     void CleanSceneRoot();
 
-    /** Background task: builds the octree (if PendingParams set), then runs one LOD
-     *  update pass. Chains to RunMeshUpdateTask on completion. */
-    void RunDataUpdateTask();
-
-    /** Background task: collects dirty chunks (under the read lock) and enqueues them for
-     *  the game-thread drain via EnqueueDirtyChunksForApply, then chains the next
-     *  RunDataUpdateTask on the normal interval. The apply itself is decoupled (Tick). */
-    void RunMeshUpdateTask();
-
-    /** Adds dirty chunks to PendingApply, skipping any already queued. Callable from any
-     *  thread -- takes only PendingApplyCS. */
-    void EnqueueDirtyChunksForApply(const TArray<TSharedPtr<FMeshChunk>>& DirtyChunks);
-
-    /** Game thread, every Tick. Creates missing components within ChunkApplyBudgetMs, then
-     *  applies initial-build chunks at once and later work in groups of overlapping pass
-     *  ranges, a group in one frame once its components exist (the oldest waiting group holds
-     *  newer ones back for a bounded time). No lock: streams are immutable. */
-    void DrainPendingApply();
-
-    /** Game-thread: destroys the RealtimeMesh components of chunks retired by the chunk-cut
-     *  pass. Called from Tick after DrainPendingApply. No octree lock needed (touches only
-     *  the retired chunks' own components). */
-    void DrainPendingDestroy();
+    /** Game thread: waits for the edit task, drops queued notices and components, then builds
+     *  the collision and brick terrain for Compositor at the actor's current scale. */
+    void Rebuild(TSharedPtr<FDensitySampleCompositor> Compositor);
 
     /** Game thread: (re)starts the collision bricks for the current density and precision. */
     void InitializeCollision(double RootExtent);
 
     /** Game thread: (re)starts the brick terrain for the current density and precision. */
     void InitializeBrickTerrain(double RootExtent);
-
-    /** Game thread: switches rendering between the octree and the brick terrain. */
-    void SetBrickRender(bool bOn);
 
     /** Game thread: forwards finished edits, gathers the collision sources (player pawns, or
      *  the camera) and ticks the collision bricks. */
@@ -401,7 +255,7 @@ protected:
     /** Diagnostics (voxel.Debug.Collision): logs what the edit trace hit. */
     void LogEditHit(const FHitResult& Hit, const FVector& LocalHit) const;
 
-    /** Background task: applies a spherical brush edit, reconstructs affected subtrees,
-     *  and pushes updated meshes. Runs independently of the Data/Mesh chain. */
+    /** Background task: writes a spherical brush edit to the edit store and queues its notice.
+     *  InEditResolution: edit-tree levels below the brush-sized node. */
     void RunEditUpdateTask(FVector InEditCenter, double InEditRadius, double InEditStrength, int InEditResolution);
 };

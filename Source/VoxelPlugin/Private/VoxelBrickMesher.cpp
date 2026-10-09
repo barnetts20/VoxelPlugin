@@ -6,8 +6,8 @@ namespace
 {
     constexpr double Sqrt3 = 1.7320508075688772;
 
-    /** Perpendicular axes of an edge along each axis, in the order the octree mesher walks
-     *  the four cells around an edge (so triangles get the same winding). */
+    /** Perpendicular axes of an edge along each axis, in the order the four cells around an
+     *  edge are walked (which sets the triangles' winding). */
     constexpr int32 PerpA[3] = { 1, 2, 0 };
     constexpr int32 PerpB[3] = { 2, 0, 1 };
 
@@ -178,7 +178,7 @@ namespace
     }
 
     /** QEF solution in cell units ([0,1] per axis), blended toward the mass point when it
-     *  drifts or the planes disagree, as in FAdaptiveOctreeNode::SolveVertex. */
+     *  drifts or the planes disagree. */
     FVector BlendedVertex(const FQEF& Qef, const FVector& MassPoint)
     {
         const FVector CellCentre(0.5);
@@ -206,7 +206,7 @@ namespace
     }
 
     /** Dual-contour vertex of the cell whose min corner is lattice point (I,J,K), solved in
-     *  cell units ([0,1] per axis) the same way as FAdaptiveOctreeNode::SolveVertex. */
+     *  cell units ([0,1] per axis) with BlendedVertex. */
     bool SolveCell(const FBrickSamples& S, int32 I, int32 J, int32 K, FVector& OutLocal, FVector& OutNormal)
     {
         FQEF Qef;
@@ -274,7 +274,7 @@ namespace
         int32 Length;   // units
     };
 
-    /** A minimal edge this brick emits, with its four cells in the octree mesher's order. */
+    /** A minimal edge this brick emits, with its four cells in walking order (PerpA, PerpB). */
     struct FStitchFace
     {
         int32 Cells[4];
@@ -707,7 +707,7 @@ void VoxelBrickMesher::MeshBrick(const FDensitySampleCompositor& Density, const 
 
                     MaxGradient = FMath::Max(MaxGradient, (float)S.Gradient(I, J, K).Size());
 
-                    // The four cells around the edge, in the octree mesher's order:
+                    // The four cells around the edge, in walking order:
                     // (+A,+B), (-A,+B), (-A,-B), (+A,-B).
                     int32 Quad[4];
                     bool bValid = true;
@@ -721,7 +721,7 @@ void VoxelBrickMesher::MeshBrick(const FDensitySampleCompositor& Density, const 
                     }
                     if (!bValid) continue;
 
-                    // Same split choice and winding as FAdaptiveOctree::UpdateMeshChunkStreamData.
+                    // Split along the diagonal that folds the quad least; winding from the edge's sign.
                     const FVector P0(Out.Positions[Quad[0]]), P1(Out.Positions[Quad[1]]);
                     const FVector P2(Out.Positions[Quad[2]]), P3(Out.Positions[Quad[3]]);
                     const double FoldA = FVector::DotProduct(((P1 - P0) ^ (P2 - P0)).GetSafeNormal(), ((P2 - P0) ^ (P3 - P0)).GetSafeNormal());
@@ -900,7 +900,7 @@ void VoxelBrickMesher::MeshBrickStitched(const FDensitySampleCompositor& Density
             continue;
         }
 
-        // Same split choice and winding as FAdaptiveOctree::UpdateMeshChunkStreamData.
+        // Split along the diagonal that folds the quad least; winding from the edge's sign.
         const FVector P0(Out.Positions[Ring[0]]), P1(Out.Positions[Ring[1]]);
         const FVector P2(Out.Positions[Ring[2]]), P3(Out.Positions[Ring[3]]);
         const double FoldA = FVector::DotProduct(((P1 - P0) ^ (P2 - P0)).GetSafeNormal(), ((P2 - P0) ^ (P3 - P0)).GetSafeNormal());

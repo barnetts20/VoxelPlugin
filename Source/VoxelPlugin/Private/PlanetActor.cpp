@@ -163,14 +163,9 @@ void APlanetActor::Initialize()
 
     SpawnChildActors();
 
-    // Max depth for the edit store (mirrors AdaptiveVoxelActor::Initialize logic)
-    int32 TempMaxDepth;
-    {
-        double Ratio = 2.0 * RootExtent / TerrainActor->TargetPrecision;
-        TempMaxDepth = FMath::Clamp(
-            (int32)FMath::CeilToInt(FMath::Log2(Ratio)),
-            TerrainActor->MinDepth, AAdaptiveVoxelActor::MaxKeyDepth);
-    }
+    // The terrain lattice depth the terrain actor derives in Rebuild: the edit store and the
+    // compositor's finest footprint must match it.
+    const int32 TempMaxDepth = AAdaptiveVoxelActor::MaxDepthFor(RootExtent, TerrainActor->TargetPrecision);
 
     TSharedPtr<FDensitySampleCompositor> NewCompositor =
         BuildCompositor(PlanetRadius, NoiseAmplitude, RootExtent, TempMaxDepth);
@@ -353,7 +348,7 @@ void APlanetActor::SetDormant(bool bDormant)
     if (TerrainActor)
     {
         TerrainActor->SetActorHiddenInGame(bDormant);
-        TerrainActor->SetActorTickEnabled(bActive);   // gate the adaptive LOD meshing pump
+        TerrainActor->SetActorTickEnabled(bActive);   // stops the brick LOD updates and edits
         TerrainActor->SetActorEnableCollision(bActive); // its collision bricks stop updating while parked
     }
     if (OceanActor)

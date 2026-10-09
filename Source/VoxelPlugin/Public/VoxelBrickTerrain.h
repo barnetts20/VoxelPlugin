@@ -1,15 +1,18 @@
 // VoxelBrickTerrain.h - Terrain rendered from bricks (VoxelBrickMesher) in a level-of-detail
 // tree around the camera. The tree is built on the CPU; the bricks are meshed on the CPU (one
 // component per brick) or on the GPU (VoxelBrickPages), chosen with voxel.Render.BrickBackend.
-// Switched against the octree renderer with voxel.Render.Bricks.
 
 #pragma once
 
 #include "CoreMinimal.h"
 #include "HAL/CriticalSection.h"
+#include "HAL/IConsoleManager.h"
 #include "Misc/Optional.h"
 #include "VoxelBrickMesher.h"
 #include <atomic>
+
+/** voxel.Debug.ChunkColor: vertex colour of newly meshed bricks by level (0 off). */
+extern TAutoConsoleVariable<int32> CVarVoxelDebugChunkColor;
 
 class AActor;
 class USceneComponent;

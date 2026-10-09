@@ -103,7 +103,7 @@ VOXEL_FUNC float3 VoxelToFloat3(int3 P)
 }
 
 // Edge Slot (0..47) of a cell, in the order MeshBrickStitched accumulates them:
-//   0..23: cell edge e = Slot / 2 (axis e / 4, in the octree mesher's corner order). Half 0 is
+//   0..23: cell edge e = Slot / 2 (axis e / 4, in the CPU mesher's corner order). Half 0 is
 //          the whole edge unless a finer cell touches it; then halves 0 and 1 are its halves.
 //   24..47: four half-edges across face (Slot - 24) / 4 (its two midlines), only when the cell
 //          across that face is finer.

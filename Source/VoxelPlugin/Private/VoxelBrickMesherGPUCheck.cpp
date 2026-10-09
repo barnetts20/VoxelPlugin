@@ -157,7 +157,7 @@ namespace VoxelBrickMesherGPUCheck
         }
         if (!Terrain)
         {
-            UE_LOG(LogTemp, Warning, TEXT("[VoxelMesherGPU] No brick terrain with bricks in this world; run voxel.Render.Bricks 1 first."));
+            UE_LOG(LogTemp, Warning, TEXT("[VoxelMesherGPU] No brick terrain with bricks in this world."));
             return;
         }
 
@@ -329,6 +329,6 @@ namespace VoxelBrickMesherGPUCheck
 
     FAutoConsoleCommandWithWorldAndArgs Command(
         TEXT("voxel.Debug.MesherGPUCheck"),
-        TEXT("Meshes bricks of the brick terrain near the camera on the GPU and the CPU and logs how they compare (needs voxel.Render.Bricks 1). Arg: number of bricks (default 24, max 32)."),
+        TEXT("Meshes bricks of the brick terrain near the camera on the GPU and the CPU and logs how they compare. Arg: number of bricks (default 24, max 32)."),
         FConsoleCommandWithWorldAndArgsDelegate::CreateStatic(&Run));
 }

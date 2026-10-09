@@ -1,5 +1,6 @@
 #include "VoxelCollisionBricks.h"
-#include "FMeshingStructs.h"
+#include "VoxelMeshStream.h"
+#include "Misc/ScopeLock.h"
 #include "FDensitySampleCompositor.h"
 #include "FSparseEditStore.h"
 #include "Async/ParallelFor.h"
@@ -468,8 +469,10 @@ void FVoxelCollisionBricks::ApplyQueued()
                 InFlight->fetch_sub(1);
                 LastResult->store((int32)Result);
                 if (bDebug && Result != ERealtimeMeshCollisionUpdateResult::Updated && Result != ERealtimeMeshCollisionUpdateResult::Ignored)
+                {
                     UE_LOG(LogTemp, Warning, TEXT("[VoxelCollision] Cook of brick (%lld, %lld, %lld) failed (result %d)"),
                         BrickCoord.X, BrickCoord.Y, BrickCoord.Z, (int32)Result);
+                }
             });
     }
     ApplyQueue.SetNum(Kept);

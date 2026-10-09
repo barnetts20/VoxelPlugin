@@ -2,10 +2,10 @@
 #include "VoxelBrickPages.h"
 #include "VoxelDensity.h"
 #include "VoxelDensityGPU.h"
-#include "FMeshingStructs.h"
+#include "VoxelMeshStream.h"
 #include "FDensitySampleCompositor.h"
 #include "FSparseEditStore.h"
-#include "FAdaptiveOctree.h"
+#include "Misc/ScopeLock.h"
 #include "Async/ParallelFor.h"
 #include "Async/TaskGraphInterfaces.h"
 #include "GameFramework/Actor.h"
@@ -28,6 +28,11 @@ DECLARE_CYCLE_STAT(TEXT("Bricks: task tree (worker)"), STAT_VoxelBricksTaskTree,
 DECLARE_DWORD_ACCUMULATOR_STAT(TEXT("Bricks held"), STAT_VoxelBricksHeld, STATGROUP_VoxelTerrain);
 DECLARE_DWORD_ACCUMULATOR_STAT(TEXT("Bricks wanted"), STAT_VoxelBricksWanted, STATGROUP_VoxelTerrain);
 DECLARE_DWORD_ACCUMULATOR_STAT(TEXT("Bricks queued to apply"), STAT_VoxelBricksQueued, STATGROUP_VoxelTerrain);
+
+TAutoConsoleVariable<int32> CVarVoxelDebugChunkColor(
+    TEXT("voxel.Debug.ChunkColor"), 0,
+    TEXT("1: vertex colour of newly meshed terrain bricks by level (the material must show vertex colour). 0: white."),
+    ECVF_Default);
 
 static TAutoConsoleVariable<int32> CVarVoxelBrickPerf(
     TEXT("voxel.Debug.BrickPerf"), 0,
@@ -662,7 +667,9 @@ int32 FVoxelBrickTerrain::ResolveBackend()
     if (!Reason) return 1;
 
     if (!bWarnedBackend)
+    {
         UE_LOG(LogTemp, Warning, TEXT("[VoxelBricks] voxel.Render.BrickBackend 1 is not available (%s); meshing on the CPU."), Reason);
+    }
     bWarnedBackend = true;
     return 0;
 }
@@ -738,8 +745,10 @@ void FVoxelBrickTerrain::UpdateMorphParameters(double Slack)
     if (!Instance || !Root)
     {
         if (Mode != 0 && !bReportedMorph)
+        {
             UE_LOG(LogTemp, Warning, TEXT("[VoxelBricks] No Brick Morph Parameters collection on %s: the GPU terrain's LOD changes won't blend (Design/MeshingEngine.md section 7)."),
                 OwnerActor ? *OwnerActor->GetName() : TEXT("the terrain"));
+        }
         bReportedMorph = true;
         return;
     }
@@ -786,7 +795,9 @@ void FVoxelBrickTerrain::LogPerf(double Now)
             CameraVelocity.Size() / 100.0, Perf.Launches > 0 ? Perf.Lead / Perf.Launches / 100.0 : 0.0, Perf.MaxLead / 100.0, Perf.Launches,
             Perf.Slack * PerFrame / 100.0, Perf.MaxSlack / 100.0);
         if (Backend == 1)
+        {
             UE_LOG(LogTemp, Log, TEXT("[VoxelBrickPerf] %s"), *Pages->TakePerf());
+        }
     }
     else if (Backend == 1)
     {
@@ -846,10 +857,10 @@ void FVoxelBrickTerrain::Tick(const FVector& Camera)
             TakeHeldResult();
     }
     Lap(0);
-    const double TaskInterval = Backend == 1 ? VBT::TaskIntervalGPU : VBT::TaskInterval;
+    const double LaunchInterval = Backend == 1 ? VBT::TaskIntervalGPU : VBT::TaskInterval;
     // A tree is on screen until the next is: a task interval, or the measured time between
     // commits.
-    const double ScreenTime = Backend == 1 && ScreenPeriod > 0.0 ? ScreenPeriod : TaskInterval;
+    const double ScreenTime = Backend == 1 && ScreenPeriod > 0.0 ? ScreenPeriod : LaunchInterval;
     const double Prediction = FMath::Max(0.0, (double)CVarVoxelBrickPrediction.GetValueOnGameThread());
     if (Backend == 1)
     {
@@ -895,7 +906,7 @@ void FVoxelBrickTerrain::Tick(const FVector& Camera)
     LogPerf(Now);
 
     // GPU backend: the next task runs while a commit is meshed, and its result waits for it.
-    if (bTaskRunning.load(std::memory_order_acquire) || HeldResult.IsSet() || Now - LastLaunchTime < TaskInterval || !Density.IsValid()) return;
+    if (bTaskRunning.load(std::memory_order_acquire) || HeldResult.IsSet() || Now - LastLaunchTime < LaunchInterval || !Density.IsValid()) return;
     SCOPE_CYCLE_COUNTER(STAT_VoxelBricksLaunch);
     ON_SCOPE_EXIT { Lap(4); };
 
@@ -1566,8 +1577,7 @@ void FVoxelBrickTerrain::ApplyQueued()
 
         // The future completes once the render proxy has the mesh. A component has no proxy
         // until the end-of-frame update after its creation, so the mesh counts from two frames
-        // after that (or after the apply, when it found no proxy). Same rule as
-        // FMeshChunk::ApplyStream.
+        // after that (or after the apply, when it found no proxy).
         const TSharedPtr<std::atomic<uint64>> Shown = Brick->ShownFrame;
         const uint64 CreatedFrame = Brick->CreatedFrame;
         const uint64 ApplyFrame = GFrameCounter;

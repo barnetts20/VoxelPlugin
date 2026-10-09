@@ -2,6 +2,14 @@
 #include "Async/ParallelFor.h"
 #include "Misc/ScopeLock.h"
 
+namespace
+{
+    /** Child (or corner) c's direction from a node's centre: bit 0 +X, bit 1 +Y, bit 2 +Z. */
+    const FVector EditChildOffsets[8] = {
+        FVector(-1, -1, -1), FVector(1, -1, -1), FVector(-1, 1, -1), FVector(1, 1, -1),
+        FVector(-1, -1, 1), FVector(1, -1, 1), FVector(-1, 1, 1), FVector(1, 1, 1) };
+}
+
 FSparseEditStore::FSparseEditStore(FVector InCenter, double InExtent, int InMaxDepth)
     : Center(InCenter), Extent(InExtent), MaxDepth(InMaxDepth) {}
 
@@ -57,40 +65,11 @@ double FSparseEditStore::SampleTree(const FSparseEditNode* TreeRoot, const FVect
         if (!Child) break;
 
         NodeExtent *= 0.5;
-        NodeCenter = NodeCenter + OctreeConstants::Offsets[ChildIndex] * NodeExtent;
+        NodeCenter = NodeCenter + EditChildOffsets[ChildIndex] * NodeExtent;
         Current = Child;
     }
 
     return Sum;
-}
-
-bool FSparseEditStore::HasEditsAlongPath(const FMortonIndex& Index) const
-{
-    const TSharedPtr<FSparseEditNode> Tree = PinRoot();
-    const FSparseEditNode* Current = Tree.Get();
-    if (!Current) return false;
-
-    for (uint8 Level = 0; Level < Index.Depth; Level++)
-    {
-        if (Current->HasEdits) return true;
-
-        uint8 ChildIdx = Index.GetChildAtLevel(Level);
-        const FSparseEditNode* Child = Current->Children[ChildIdx].Get();
-        if (!Child) return false;
-
-        Current = Child;
-    }
-
-    if (Current->HasEdits) return true;
-
-    // Check if this node has any children - if so,
-    // edits exist at finer resolution within this region
-    for (int i = 0; i < 8; i++)
-    {
-        if (Current->Children[i]) return true;
-    }
-
-    return false;
 }
 
 bool FSparseEditStore::HasEditsInBox(const FBox& Box) const
@@ -111,7 +90,7 @@ bool FSparseEditStore::HasEditsInBoxRecursive(const FSparseEditNode* Node, const
     const double ChildExtent = NodeExtent * 0.5;
     for (int i = 0; i < 8; i++)
     {
-        if (HasEditsInBoxRecursive(Node->Children[i].Get(), NodeCenter + OctreeConstants::Offsets[i] * ChildExtent, ChildExtent, Box))
+        if (HasEditsInBoxRecursive(Node->Children[i].Get(), NodeCenter + EditChildOffsets[i] * ChildExtent, ChildExtent, Box))
             return true;
     }
     return false;
@@ -201,7 +180,7 @@ void FSparseEditStore::ApplyEditRecursive(FSparseEditNode& Node, FVector NodeCen
     double ChildExtent = NodeExtent * 0.5;
     for (int i = 0; i < 8; i++)
     {
-        FVector ChildCenter = NodeCenter + OctreeConstants::Offsets[i] * ChildExtent;
+        FVector ChildCenter = NodeCenter + EditChildOffsets[i] * ChildExtent;
 
         FVector ChildClosest;
         ChildClosest.X = FMath::Clamp(BrushCenter.X, ChildCenter.X - ChildExtent, ChildCenter.X + ChildExtent);
@@ -244,7 +223,7 @@ int FSparseEditStore::GetChildIndex(FVector Position, FVector NodeCenter) const
 
 FVector FSparseEditStore::GetCornerPosition(FVector NodeCenter, double NodeExtent, int CornerIndex) const
 {
-    return NodeCenter + OctreeConstants::Offsets[CornerIndex] * NodeExtent;
+    return NodeCenter + EditChildOffsets[CornerIndex] * NodeExtent;
 }
 
 double FSparseEditStore::InterpolateCorners(const FSparseEditNode& Node, FVector NodeCenter, double NodeExtent, FVector Position) const

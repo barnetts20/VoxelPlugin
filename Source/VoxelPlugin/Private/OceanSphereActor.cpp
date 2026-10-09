@@ -286,9 +286,8 @@ void AOceanSphereActor::InitializeInternal(TSharedPtr<FDensitySampleCompositor> 
 // ---------------------------------------------------------------------------
 // RunInitialBuildTask
 //
-// Worker-thread initial tree build. Mirrors AAdaptiveVoxelActor's deferred octree
-// construction: the game thread does only the (cheap) teardown + compositor publish
-// in InitializeInternal, then kicks this task. Everything here -- the 6 face roots,
+// Worker-thread initial tree build: the game thread does only the (cheap) teardown +
+// compositor publish in InitializeInternal, then kicks this task. Everything here -- the 6 face roots,
 // the split-to-ChunkDepth walk, and the mesh-gen ParallelFor -- runs off the game
 // thread, so the spawn frame no longer stalls on the ocean build.
 //

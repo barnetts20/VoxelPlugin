@@ -9,12 +9,10 @@
 #include "CoreMinimal.h"
 #include "HAL/CriticalSection.h"
 #include <atomic>
-#include "FOctreeConstants.h"
-#include "FNodeStructs.h"
 
 /** A single node in the sparse edit octree. Only allocated where brush strokes
  *  have reached. CornerDensities stores additive density deltas at the 8 corners
- *  (same layout as OctreeConstants::Offsets). HasEdits is true if this node was
+ *  (corner c: bit 0 +X, bit 1 +Y, bit 2 +Z; children the same). HasEdits is true if this node was
  *  directly written to by a brush stroke (vs. just existing as a path ancestor). */
 struct FSparseEditNode
 {
@@ -35,7 +33,7 @@ struct FVoxelEditOp
 };
 
 /** Sparse octree that stores user-applied density edits (e.g. terrain sculpting).
- *  Mirrors the spatial bounds of the main adaptive octree but only allocates nodes
+ *  Covers the terrain lattice's root box but only allocates nodes
  *  where edits exist. Edits are written at a target depth determined by brush radius
  *  and applied as additive density deltas with smoothstep falloff.
  *
@@ -44,8 +42,7 @@ struct FVoxelEditOp
  *  Queries pin the current root once and walk it without locks, so terrain and ocean
  *  can sample from any thread while an edit is being written.
  *
- *  Queried by SampleAdd() (a batch of positions), Sample() (one position),
- *  HasEditsAlongPath() (a morton path, to skip unedited octree subtrees) and
+ *  Queried by SampleAdd() (a batch of positions), Sample() (one position) and
  *  HasEditsInBox() (a box; against a snapshot for many queries from any thread). */
 class FSparseEditStore
 {
@@ -60,12 +57,6 @@ public:
     /** Adds the edit delta at each of Count positions (double SoA) to DensityInOut, all
      *  from one snapshot of the tree. Parallel above 128 positions. */
     void SampleAdd(const double* X, const double* Y, const double* Z, int32 Count, float* DensityInOut) const;
-
-    /** Returns true if the edit store has any nodes along the path defined by
-     *  the given morton index. Walks the edit tree level by level - if any
-     *  node along the path exists and has edits, or if the path can be walked
-     *  to the target depth, edits exist in that region. */
-    bool HasEditsAlongPath(const FMortonIndex& Index) const;
 
     /** True if any node holding edits overlaps Box (a node's edits reach its whole box). */
     bool HasEditsInBox(const FBox& Box) const;
