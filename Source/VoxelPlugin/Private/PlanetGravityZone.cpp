@@ -1,4 +1,4 @@
-// PlanetGravityZone.cpp — C++ equivalent of BP_PlanetGravitySphere,
+// PlanetGravityZone.cpp - C++ equivalent of BP_PlanetGravitySphere,
 // using actor scale for the inner radius (same pattern as atmosphere actor).
 
 #include "PlanetGravityZone.h"
@@ -27,7 +27,7 @@ APlanetGravityZone::APlanetGravityZone()
     Sphere->SetCollisionEnabled(ECollisionEnabled::QueryOnly);
     Sphere->SetHiddenInGame(true);
 
-    // Default BaseVector: 980 cm/s² magnitude (direction unused for spherical gravity).
+    // Default BaseVector: 980 cm/s^2 magnitude (direction unused for spherical gravity).
     BaseVector = FVector(0.0, 0.0, -980.0);
 
     // Default inner radius: 1010 km = 101,000,000 cm (slightly above default
@@ -36,7 +36,7 @@ APlanetGravityZone::APlanetGravityZone()
 }
 
 // ---------------------------------------------------------------------------
-// Lifecycle — mirrors Construction Script + BeginPlay from the blueprint
+// Lifecycle - mirrors Construction Script + BeginPlay from the blueprint
 // ---------------------------------------------------------------------------
 
 void APlanetGravityZone::OnConstruction(const FTransform& Transform)
@@ -49,7 +49,7 @@ void APlanetGravityZone::BeginPlay()
 {
     Super::BeginPlay();
 
-    // Bind actor overlap delegates — this is exactly what the BP
+    // Bind actor overlap delegates - this is exactly what the BP
     // "Event ActorBeginOverlap" / "Event ActorEndOverlap" nodes bind to.
     OnActorBeginOverlap.AddDynamic(this, &APlanetGravityZone::OnActorOverlapBegin);
     OnActorEndOverlap.AddDynamic(this, &APlanetGravityZone::OnActorOverlapEnd);
@@ -68,7 +68,7 @@ void APlanetGravityZone::BeginPlay()
         Sphere->UpdateOverlaps();
     }
 
-    // Register any actors already inside the zone — overlap events don't
+    // Register any actors already inside the zone - overlap events don't
     // fire for objects that were already overlapping when the component registered.
     TArray<AActor*> AlreadyOverlapping;
     GetOverlappingActors(AlreadyOverlapping);
@@ -97,7 +97,7 @@ void APlanetGravityZone::UpdateInfluenceSphereRadius()
 }
 
 // ---------------------------------------------------------------------------
-// Gravity calculation — matches BP_PlanetGravitySphere::GetGravityVector
+// Gravity calculation - matches BP_PlanetGravitySphere::GetGravityVector
 // ---------------------------------------------------------------------------
 
 FVector APlanetGravityZone::GetGravityVector_Implementation(const FVector& InWorldPosition) const
@@ -142,7 +142,7 @@ void APlanetGravityZone::InitializeFromPlanet()
     bIsPlanetOwned = true;
     UpdateInfluenceSphereRadius();
 
-    // Bind the transform guard — uses _Direct setters to avoid lag.
+    // Bind the transform guard - uses _Direct setters to avoid lag.
     if (USceneComponent* Root = GetRootComponent())
     {
         Root->TransformUpdated.RemoveAll(this);
@@ -151,7 +151,7 @@ void APlanetGravityZone::InitializeFromPlanet()
 }
 
 // ---------------------------------------------------------------------------
-// Overlap forwarding — bound to OnActorBeginOverlap / OnActorEndOverlap
+// Overlap forwarding - bound to OnActorBeginOverlap / OnActorEndOverlap
 // delegates, which is exactly what BP "Event ActorBeginOverlap" binds to.
 // ---------------------------------------------------------------------------
 
@@ -245,7 +245,7 @@ void APlanetGravityZone::PostEditMove(bool bFinished)
         }
     }
 
-    // Scale may have changed via gizmo — update influence sphere.
+    // Scale may have changed via gizmo - update influence sphere.
     UpdateInfluenceSphereRadius();
 }
 

@@ -1,4 +1,4 @@
-// FOceanSharedStructs.h — Cube-sphere topology types shared between
+// FOceanSharedStructs.h - Cube-sphere topology types shared between
 // FOceanQuadTreeNode and AOceanSphereActor: face/edge enums, cube-face
 // transform tables, and the FQuadIndex path encoding for quadtree traversal.
 

@@ -1,4 +1,4 @@
-// PlanetGravityZone.h — Spherical gravity zone subclass for planets.
+// PlanetGravityZone.h - Spherical gravity zone subclass for planets.
 // C++ equivalent of BP_PlanetGravitySphere, adapted to use actor scale
 // for the inner radius (same pattern as PlanetAtmosphereActor).
 //
@@ -53,9 +53,9 @@ public:
     bool bIsPlanetOwned = false;
 
     // --- Inherited from AGravityZone ---
-    // Priority      — int32, zone ordering
-    // ExcludeTags   — TArray<FName>, actors with these tags are excluded
-    // BaseVector    — FVector, magnitude = max gravity acceleration (direction unused)
+    // Priority      - int32, zone ordering
+    // ExcludeTags   - TArray<FName>, actors with these tags are excluded
+    // BaseVector    - FVector, magnitude = max gravity acceleration (direction unused)
 
     virtual FVector GetGravityVector_Implementation(const FVector& InWorldPosition) const override;
 
@@ -83,22 +83,22 @@ public:
 #endif
 
 private:
-    /** Root scene component — provides the transform gizmo in the editor.
+    /** Root scene component - provides the transform gizmo in the editor.
      *  Matches the BP's DefaultSceneRoot. */
     UPROPERTY(VisibleAnywhere, Category = "Gravity Zone")
     TObjectPtr<USceneComponent> DefaultSceneRoot;
 
-    /** Inner sphere — display only, unit radius (1.0). Scaled by actor
+    /** Inner sphere - display only, unit radius (1.0). Scaled by actor
      *  transform so its effective world radius = actor scale. */
     UPROPERTY(VisibleAnywhere, Category = "Gravity Zone")
     TObjectPtr<USphereComponent> Planet;
 
-    /** Outer sphere — overlap events, absolute scale. Radius set explicitly
+    /** Outer sphere - overlap events, absolute scale. Radius set explicitly
      *  to ActorScale * InfluenceRatio via UpdateInfluenceSphereRadius. */
     UPROPERTY(VisibleAnywhere, Category = "Gravity Zone")
     TObjectPtr<USphereComponent> Sphere;
 
-    /** Bound to OnActorBeginOverlap / OnActorEndOverlap delegates —
+    /** Bound to OnActorBeginOverlap / OnActorEndOverlap delegates -
      *  exactly what BP "Event ActorBeginOverlap" nodes bind to. */
     UFUNCTION()
     void OnActorOverlapBegin(AActor* OverlappedActor, AActor* OtherActor);
@@ -107,6 +107,6 @@ private:
     void OnActorOverlapEnd(AActor* OverlappedActor, AActor* OtherActor);
 
     /** Bound to RootComponent->TransformUpdated when planet-owned.
-     *  Snaps location and rotation back — using _Direct setters to avoid lag. */
+     *  Snaps location and rotation back - using _Direct setters to avoid lag. */
     void OnTransformUpdated(USceneComponent* Component, EUpdateTransformFlags Flags, ETeleportType Teleport);
 };
