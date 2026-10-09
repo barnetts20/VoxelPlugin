@@ -1,0 +1,66 @@
+// VoxelOcean.ush - The ocean surface in its material (Design/OceanMeshing.md): the morph between
+// tile levels in the vertex shader, for a Custom node (wiring: STAGE_O1c_NOTES.md). Later
+// stages add the wave hook (VoxelOceanWaves) and the underwater pass here.
+//
+// Every odd vertex of a level-L tile collapses onto a vertex of its parent tile (an even vertex
+// is one already); the targets are chained, as the terrain's (VoxelMorph.ush). The vertex
+// blends, with weight W0 at its own position, toward what level L - 1 draws there at that
+// moment: its target (morph offset: TexCoord 0 and the x of TexCoord 1), itself blended with
+// W1, level L - 1's weight at the target's position, toward its own target (TexCoord 3 and the
+// x of TexCoord 4). Offsets are in page axes and units; the component's transform takes them to
+// world. A weight runs from 0 at StartFraction of the level's morph end to 1 at MorphEnd0 2^-L
+// (VoxelOceanTiles::MorphWeight), from the camera the selection on screen was built for; with
+// StartFraction 0.5 the levels' bands touch, so the mesh morphs continuously with distance.
+// Where a tile meets a coarser one its vertices are fully collapsed onto the coarser tile's
+// vertices as that tile draws them, so the boundary stays closed. Waves (stage O4) are sampled
+// at the morphed point, which keeps it closed under any displacement. Level 0 doesn't morph.
+//
+// Inputs: ToVertex = the vertex's absolute world position (excluding material offsets) minus
+// VoxelOceanCameraHigh minus VoxelOceanCameraLow; UV0 to UV4 = TexCoord 0 to 4; Level and
+// MorphEnd0 = custom primitive data 0 and 1 (0 and 0 on components that aren't ocean pages,
+// which keep their position); Params = VoxelOceanParams masked to R G (x: mode 0 off, 1 by
+// distance, 2 fully morphed; y: StartFraction).
+// Outputs: the World Position Offset; Depth, the terrain depth under the sea at the vertex
+// (cm, positive under water; 0 until stage O2), morphed with the vertex.
+//
+// Custom node code:
+//   return VoxelOceanVertex(Parameters, ToVertex, UV0, UV1, UV2, UV3, UV4, Level, MorphEnd0, Params, Depth);
+
+#pragma once
+
+// Morph weight of a level-L vertex D (world units) from the selection camera.
+float VoxelOceanMorphWeight(float D, float Level, float MorphEnd0, float2 Params)
+{
+    if (Params.x < 0.5f || MorphEnd0 <= 0.0f || Level < 0.5f) return 0.0f;
+    if (Params.x > 1.5f) return 1.0f;
+    const float End = MorphEnd0 * exp2(-Level);
+    const float Start = End * Params.y;
+    const float X = saturate((D - Start) / max(End - Start, 1.0e-6f));
+    return X * X * (3.0f - 2.0f * X);
+}
+
+// The body for either parameter type (a Custom node is compiled for the vertex shader here,
+// but the include is seen by every shader of the material).
+#define VOXEL_OCEAN_VERTEX_BODY \
+    Depth = UV1.y; \
+    const float W0 = VoxelOceanMorphWeight(length(ToVertex), Level, MorphEnd0, Params); \
+    if (W0 <= 0.0f) return float3(0.0f, 0.0f, 0.0f); \
+    const float3 Parent = TransformLocalVectorToWorld(Parameters, float3(UV0.x, UV0.y, UV1.x)); \
+    const float3 Grand = TransformLocalVectorToWorld(Parameters, float3(UV3.x, UV3.y, UV4.x)); \
+    const float W1 = VoxelOceanMorphWeight(length(ToVertex + Parent), Level - 1.0f, MorphEnd0, Params); \
+    Depth = lerp(UV1.y, lerp(UV2.x, UV4.y, W1), W0); \
+    return (Parent + Grand * W1) * W0;
+
+float3 VoxelOceanVertex(FMaterialVertexParameters Parameters, float3 ToVertex, float2 UV0, float2 UV1, float2 UV2,
+    float2 UV3, float2 UV4, float Level, float MorphEnd0, float2 Params, out float Depth)
+{
+    VOXEL_OCEAN_VERTEX_BODY
+}
+
+float3 VoxelOceanVertex(FMaterialPixelParameters Parameters, float3 ToVertex, float2 UV0, float2 UV1, float2 UV2,
+    float2 UV3, float2 UV4, float Level, float MorphEnd0, float2 Params, out float Depth)
+{
+    VOXEL_OCEAN_VERTEX_BODY
+}
+
+#undef VOXEL_OCEAN_VERTEX_BODY

@@ -1,0 +1,123 @@
+// VoxelOceanPage.usf - Writes ocean tiles into a page's buffer set (VoxelOceanPages.cpp), in the
+// page's compute run. A job is one tile slot: its vertices from the tile's upload and its
+// triangles from the fixed grid pattern, or its triangles cleared (degenerate) when the tile
+// left. Group 0 also writes the draw arguments: every slot up to the highest in use.
+//
+// Page format: position (page units from the page origin; the component carries the unit),
+// tangent and normal (snorm8 x4), and five texture coordinates as ten words: the morph offset
+// (to the parent vertex the vertex collapses into) x, y | z, terrain depth | the depth at that
+// target, shore distance | the target's own morph offset (toward the grandparent grid) x, y |
+// z, the depth at its target (depths and shore 0 until stage O2; VoxelOcean.ush reads them).
+// Colour is the page's (voxel.Debug.LevelColor).
+
+#include "/Engine/Public/Platform.ush"
+
+#define VOXEL_OCEAN_JOB_WORDS 4u       // VoxelOceanPagesDetail::JobWords
+#define VOXEL_OCEAN_VERTEX_WORDS 11u   // FVoxelOceanPages::VertexWords
+
+static const uint TexCoordWords = 10u;
+
+// Per job: kind (0 write, 1 clear), slot, first word of the tile's vertices, unused.
+StructuredBuffer<uint> Jobs;
+// Per vertex: position (3), morph offset (3), packed tangent, packed normal, target's morph offset (3).
+StructuredBuffer<uint> VertexWords;
+RWBuffer<float> OutPositions;
+RWBuffer<uint> OutTangents;          // two packed normals per vertex: tangent, normal
+RWBuffer<uint> OutTexCoords;         // TexCoordWords per vertex
+RWBuffer<uint> OutColors;
+RWBuffer<uint> OutIndices;
+RWBuffer<uint> OutArgs;
+uint NumJobs;
+uint TileQuads;
+uint DrawSlots;                      // slots drawn: up to the highest in use
+uint VertexCapacity;                 // page buffers
+uint TriangleCapacity;
+uint Color;
+uint StreamMask;                     // 1 tangents, 2 texture coordinates, 4 colours: streams the page has
+uint FlipWinding;
+
+// One group per job; group 0 also writes FRHIDrawIndexedIndirectParameters (index count,
+// instances, first index, base vertex, first instance).
+[numthreads(64, 1, 1)]
+void WriteCS(uint3 GroupId : SV_GroupID, uint GroupThread : SV_GroupIndex)
+{
+    const uint N = TileQuads + 1u;
+    const uint TileVertices = N * N;
+    const uint TileTriangles = 2u * TileQuads * TileQuads;
+    const uint Job = GroupId.x;
+    if (Job == 0u && GroupThread == 0u)
+    {
+        OutArgs[0] = min(DrawSlots * TileTriangles, TriangleCapacity) * 3u;
+        OutArgs[1] = 1u;
+        OutArgs[2] = 0u;
+        OutArgs[3] = 0u;
+        OutArgs[4] = 0u;
+    }
+    if (Job >= NumJobs) return;
+
+    const uint W = Job * VOXEL_OCEAN_JOB_WORDS;
+    const bool bWrite = Jobs[W] == 0u;
+    const uint Slot = Jobs[W + 1u];
+    const uint Source = Jobs[W + 2u];
+    const uint BaseVertex = Slot * TileVertices;
+    const uint BaseTriangle = Slot * TileTriangles;
+
+    if (bWrite)
+    {
+        [loop]
+        for (uint I = GroupThread; I < TileVertices && BaseVertex + I < VertexCapacity; I += 64u)
+        {
+            const uint Src = Source + I * VOXEL_OCEAN_VERTEX_WORDS;
+            const uint Dst = BaseVertex + I;
+            OutPositions[Dst * 3u] = asfloat(VertexWords[Src]);
+            OutPositions[Dst * 3u + 1u] = asfloat(VertexWords[Src + 1u]);
+            OutPositions[Dst * 3u + 2u] = asfloat(VertexWords[Src + 2u]);
+            if ((StreamMask & 1u) != 0u)
+            {
+                OutTangents[Dst * 2u] = VertexWords[Src + 6u];
+                OutTangents[Dst * 2u + 1u] = VertexWords[Src + 7u];
+            }
+            if ((StreamMask & 2u) != 0u)
+            {
+                const uint T = Dst * TexCoordWords;
+                OutTexCoords[T] = VertexWords[Src + 3u];
+                OutTexCoords[T + 1u] = VertexWords[Src + 4u];
+                OutTexCoords[T + 2u] = VertexWords[Src + 5u];
+                OutTexCoords[T + 3u] = asuint(0.0f);    // terrain depth (stage O2)
+                OutTexCoords[T + 4u] = asuint(0.0f);    // the depth at the morph target
+                OutTexCoords[T + 5u] = asuint(0.0f);    // shore distance (reserved)
+                OutTexCoords[T + 6u] = VertexWords[Src + 8u];
+                OutTexCoords[T + 7u] = VertexWords[Src + 9u];
+                OutTexCoords[T + 8u] = VertexWords[Src + 10u];
+                OutTexCoords[T + 9u] = asuint(0.0f);    // the depth at the target's target
+            }
+            if ((StreamMask & 4u) != 0u)
+                OutColors[Dst] = Color;
+        }
+    }
+
+    [loop]
+    for (uint T = GroupThread; T < TileTriangles && BaseTriangle + T < TriangleCapacity; T += 64u)
+    {
+        const uint Dst = (BaseTriangle + T) * 3u;
+        uint3 Tri = uint3(0u, 0u, 0u);
+        if (bWrite)
+        {
+            // VoxelOceanTiles::QuadTriangles: quad (A, B), split along V00 - V11.
+            const uint Quad = T >> 1u;
+            const uint A = Quad % TileQuads;
+            const uint B = Quad / TileQuads;
+            const uint V00 = BaseVertex + B * N + A;
+            const uint V10 = V00 + 1u;
+            const uint V01 = V00 + N;
+            const uint V11 = V01 + 1u;
+            if ((T & 1u) == 0u)
+                Tri = FlipWinding != 0u ? uint3(V00, V10, V11) : uint3(V00, V11, V10);
+            else
+                Tri = FlipWinding != 0u ? uint3(V00, V11, V01) : uint3(V00, V01, V11);
+        }
+        OutIndices[Dst] = Tri.x;
+        OutIndices[Dst + 1u] = Tri.y;
+        OutIndices[Dst + 2u] = Tri.z;
+    }
+}

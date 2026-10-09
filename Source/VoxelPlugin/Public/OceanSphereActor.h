@@ -1,30 +1,25 @@
-// OceanSphereActor.h — Ocean surface actor using a cube-sphere quadtree.
-// Renders the ocean as 6 quadtree faces projected onto a sphere at OceanRadius,
-// with LOD-driven subdivision and depth-based triangle culling where terrain
-// pokes above the waterline.
+// OceanSphereActor.h - The ocean of a planet (or standalone): a sphere at sea level drawn from GPU
+// pages of a cube-sphere quadtree (FVoxelOceanSurface, Design/OceanMeshing.md). Scale (max
+// component, cm) is the ocean radius; a planet sets it from its sea level and drives the actor.
 //
-// Scale determines OceanRadius. When planet-owned, the terrain compositor is
-// shared so ocean depth = OceanRadius - terrain SDF (positive = underwater).
+// Stage O1: the plain sphere, its level-of-detail selection, the GPU pages and the morph. The
+// terrain depth under the sea, the underwater view and the wave and query interfaces come in
+// the next stages.
 
 #pragma once
 
 #include "CoreMinimal.h"
-#include "Misc/ScopeLock.h"
 #include "RealtimeMeshActor.h"
-#include "FOceanSharedStructs.h"
-#include "FOceanQuadTreeNode.h"
 #include "FDensitySampleCompositor.h"
 #include "VoxelDensity.h"
 #include "OceanSphereActor.generated.h"
 
-/** Ocean surface actor. Manages a cube-sphere quadtree (6 face roots) that
- *  subdivides based on screen-space size and rebuilds mesh chunks with
- *  LOD-matched edge stitching.
- *
- *  The ocean samples the terrain compositor to determine depth at each vertex.
- *  Chunks where all vertices are above water (terrain exposed) are culled.
- *  An async LOD update task runs on a background thread with a configurable
- *  minimum interval, similar to AAdaptiveVoxelActor's pipeline. */
+class FVoxelOceanSurface;
+class UMaterialInstanceDynamic;
+
+/** The ocean surface: every frame the tiles the camera selects are committed to GPU pages
+ *  (one frame per change, the previous tiles kept until the new ones can be drawn), and the
+ *  camera they were selected for goes to the material for the morph between levels. */
 UCLASS()
 class VOXELPLUGIN_API AOceanSphereActor : public ARealtimeMeshActor
 {
@@ -33,118 +28,81 @@ class VOXELPLUGIN_API AOceanSphereActor : public ARealtimeMeshActor
 public:
     AOceanSphereActor();
 
-    /** True when spawned and driven by APlanetActor. Planet-driven properties
-     *  become read-only -- edit them on the planet instead. */
+    /** True when spawned and driven by APlanetActor. Planet-driven properties become
+     *  read-only: edit them on the planet instead. */
     UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Ocean")
     bool bIsPlanetOwned = false;
 
-    /** Ocean surface material. When standalone, auto-loads the plugin's ocean material. */
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Ocean|Material",
+    /** Ocean surface material (setup: STAGE_O1_NOTES.md). Empty: the plugin's MT_Ocean. Change it
+     *  at run time with SetOceanMaterial. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, BlueprintSetter = SetOceanMaterial, Category = "Ocean|Material",
         meta = (EditCondition = "!bIsPlanetOwned"))
     UMaterialInterface* OceanMaterial = nullptr;
 
     // --- Shape ---
 
-    /** Derived from actor scale at init time. The sphere radius of the ocean surface. */
+    /** The sea sphere's radius (cm): the actor's scale at initialization. */
     UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Ocean|Shape")
     double OceanRadius = 107500000.0;
 
-    /** Must match the terrain actor's scale. Used to compute ocean depth:
-     *  depth = OceanRadius - (TerrainPlanetRadius + NoiseHeight).
-     *  Positive = underwater, negative = terrain above water (land). */
+    /** The terrain's planet radius (cm), for the standalone ocean's density (terrain depth,
+     *  from stage O2). A planet sets it. */
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Ocean|Shape",
         meta = (ClampMin = "1.0", EditCondition = "!bIsPlanetOwned"))
     double TerrainPlanetRadius = 100000000.0;
 
-    /** Must match the terrain actor's NoiseAmplitudeRatio. Used by the standalone
-     *  compositor to generate matching terrain density for depth calculation. */
+    /** The terrain's noise amplitude ratio, for the standalone ocean's density. A planet sets it. */
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Ocean|Shape",
         meta = (ClampMin = "0.01", ClampMax = "1.0", EditCondition = "!bIsPlanetOwned"))
     double NoiseAmplitudeRatio = 0.15;
 
-    /** Must match the terrain actor's SurfaceSettings. Used by the standalone compositor;
-     *  when planet-owned, the planet's settings are used. */
+    /** The terrain's surface settings, for the standalone ocean's density. A planet sets them. */
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Ocean|Shape",
         meta = (EditCondition = "!bIsPlanetOwned"))
     FVoxelSurfaceSettings SurfaceSettings;
 
     // --- Mesh ---
 
-    /** Number of vertices per edge within each quadtree leaf node.
-     *  Higher values produce smoother patches but cost more triangles per node. */
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Ocean|Mesh",
-        meta = (ClampMin = "3"))
-    int32 FaceResolution = 3;
+    /** Spacing between vertices at the finest level near the camera (cm). The finest level is
+     *  the one at or just under it (ActualSpacing). */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Ocean|Mesh", meta = (ClampMin = "1.0", UIMin = "10.0", UIMax = "1000.0"))
+    double FinestSpacing = 50.0;
 
-    // --- LOD ---
+    /** Quads along a tile edge: 8, 16 or 32 (rounded to one of them). The number of tiles
+     *  doesn't depend on it, so the triangle count grows with its square. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Ocean|Mesh", meta = (ClampMin = "8", ClampMax = "32"))
+    int32 TileQuads = 16;
 
-    /** Quadtree depth at which nodes become mesh chunks. Fixed at 3 for the ocean
-     *  quadtree -- cube-sphere faces have coarser float precision requirements
-     *  than the voxel octree. */
-    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Ocean|LOD")
-    int32 ChunkDepth = 3;
+    /** A tile splits while the camera is within this many tile sizes of it. Higher: more
+     *  detail and a wider morph band. At least 2.25 (the morph band closes below it). */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Ocean|Mesh", meta = (ClampMin = "2.25", UIMax = "6.0"))
+    double LodDistanceFactor = 2.5;
 
-    /** Minimum subdivision depth maintained regardless of camera distance. */
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Ocean|LOD")
-    int32 MinDepth = 4;
+    /** Buffer sets kept ready, so a commit doesn't wait for one to be created. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Ocean|Mesh", meta = (ClampMin = "0", UIMax = "32"))
+    int32 SpareBufferSets = 8;
 
-    /** Target vertex spacing in world units (cm). MaxDepth is computed automatically
-     *  so the finest LOD achieves roughly this spacing between adjacent vertices. */
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Ocean|LOD",
-        meta = (ClampMin = "1.0"))
-    double TargetPrecision = 200.0;
+    /** The finest tile level (from FinestSpacing and the radius). */
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Ocean|Mesh")
+    int32 MaxLevel = 0;
 
-    /** Computed from TargetPrecision and OceanRadius at init time.
-     *  At default scale (107.5M radius, FaceRes=3, TargetPrecision=200): MaxDepth=20. */
-    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Ocean|LOD")
-    int32 MaxDepth = 20;
+    /** The spacing (cm) between vertices at MaxLevel, through a face's centre. */
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Ocean|Mesh")
+    double ActualSpacing = 0.0;
 
-    /** The actual vertex spacing (cm) achieved at MaxDepth after key-limit clamping. */
-    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Ocean|LOD")
-    double ActualPrecision = 0.0;
+    // --- Accessors ---
 
-    /** Hard limit imposed by FQuadIndex (2 bits per level, 62 path bits + 2 sentinel = 64). */
-    static constexpr int32 MaxKeyDepth = 31;
-
-    /** Screen-space size threshold for LOD split/merge. The node is subdivided by
-     *  FaceResolution, so the effective per-vertex threshold is
-     *  ScreenSpaceThreshold / (FaceResolution - 1). */
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Ocean|LOD",
-        meta = (ClampMin = "0.001"))
-    double ScreenSpaceThreshold = 0.225;
-
-    /** Minimum interval (seconds) between LOD update passes. */
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Ocean|LOD")
-    double MinLodInterval = 0.05;
-
-    /** Multiplier on camera velocity for predictive LOD. */
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Ocean|LOD")
-    double VelocityLookAheadFactor = 2.0;
-
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Ocean|LOD")
-    bool bTickInEditor = true;
-
-    // --- Culling ---
-
-    /** Per-triangle terrain SDF threshold for culling. Triangles where all 3 vertices
-     *  have depth below this value are culled (terrain fully above water). Negative
-     *  values extend the mesh skirt above the waterline to prevent WPO waves from
-     *  exposing gaps. e.g. -50000 = keep triangles up to 500m above the ocean surface. */
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Ocean|Culling")
-    float TriangleCullDepthThreshold = -500000.f;
-
-    // --- Public Accessors ---
-
-    FVector GetCameraPosition() const { return CameraPosition; }
-    double  GetCameraFOV()      const { return CameraFOV; }
     USceneComponent* GetMeshAttachmentRoot() const { return MeshAttachmentRoot; }
     TSharedPtr<FDensitySampleCompositor> GetCompositor() const { return Compositor; }
+    /** The camera last seen by Tick, in the planet frame (actor space without scale). */
+    FVector GetCameraPosition() const { return CameraPosition; }
 
     // --- Lifecycle ---
 
     virtual void OnConstruction(const FTransform& Transform) override;
     virtual void BeginPlay() override;
-    virtual void BeginDestroy() override;
+    virtual void EndPlay(const EEndPlayReason::Type EndPlayReason) override;
+    virtual void Destroyed() override;
     virtual bool ShouldTickIfViewportsOnly() const override;
     virtual void Tick(float DeltaTime) override;
 
@@ -159,115 +117,56 @@ public:
     virtual void EditorApplyScale(const FVector& DeltaScale, const FVector* PivotLocation, bool bAltDown, bool bShiftDown, bool bCtrlDown) override;
 #endif
 
-    /** Called by APlanetActor -- uses the provided compositor (shared with terrain)
-     *  instead of creating one. InScale sets the actor's scale (= ocean radius) before
-     *  initialization reads it. */
+    /** Called by APlanetActor: uses its compositor (shared with the terrain), sets the scale
+     *  (ocean radius) first, and re-parents the mesh root to InAttachParent if given. */
     void InitializeFromPlanet(TSharedPtr<FDensitySampleCompositor> InCompositor,
         USceneComponent* InAttachParent = nullptr,
         FVector InScale = FVector::ZeroVector);
 
-    /** Tears down the current quadtree and rebuilds from scratch. */
+    /** Rebuilds the surface from the current property values (standalone: also the density). */
     void Initialize();
 
+    /** Changes the ocean material on every page without a rebuild (null: the plugin's MT_Ocean). */
+    UFUNCTION(BlueprintCallable, Category = "Ocean|Material")
+    void SetOceanMaterial(UMaterialInterface* InMaterial);
+
 private:
-    /** The 6 cube-face quadtree roots. Each face is an independent tree that
-     *  shares topology via FQuadIndex cross-face neighbor lookups. */
-    TSharedPtr<FOceanQuadTreeNode> RootNodes[6];
-
-    /** Maps chunk-depth quadtree nodes to their mesh chunks. */
-    TMap<TSharedPtr<FOceanQuadTreeNode>, TSharedPtr<FOceanMeshChunk>> ChunkMap;
-
-    /** Serializes ChunkMap access between the async LOD task (snapshot read) and
- *  GT teardown (InitializeInternal / BeginDestroy free it). Chunk values are
- *  TWeakObjectPtr-only, so releasing the snapshot's shared refs on the worker
- *  is safe; this lock only protects the map container itself. */
-    FCriticalSection ChunkMapCS;
-
-    /** Mesh chunks attach to this component. Inherits actor position/rotation,
-     *  uses absolute scale. */
+    /** Page components attach to this one. It inherits the actor's position and rotation but
+     *  uses absolute scale (1, 1, 1): the surface is built at world scale. */
     UPROPERTY()
     TObjectPtr<USceneComponent> MeshAttachmentRoot;
 
-    /** Density compositor -- either shared from PlanetActor or built standalone.
-     *  Provides terrain SDF density at ocean vertex positions for depth calculation. */
+    /** The material instance every page draws with; the surface writes the selection camera
+     *  into it every frame. */
+    UPROPERTY(Transient)
+    TObjectPtr<UMaterialInstanceDynamic> SurfaceMaterialInstance;
+
+    /** The density (shared with the terrain when planet-owned); the terrain depth reads it from
+     *  stage O2. */
     TSharedPtr<FDensitySampleCompositor> Compositor;
 
-    // --- Camera State ---
+    /** The rendered surface. */
+    TSharedPtr<FVoxelOceanSurface> Surface;
+
     FVector CameraPosition = FVector::ZeroVector;
-    FVector LastLodCameraPos = FVector(FLT_MAX);
-    double  CameraFOV = 90.0;
-
-    // --- Async State ---
-
-    /** Set after Initialize completes. Gates Tick and LOD updates. */
-    std::atomic<bool>   bInitialized = false;
-
-    /** Set in BeginDestroy to prevent async tasks from touching a dying actor. */
-    std::atomic<bool>   bIsDestroyed = false;
-
-    /** True while the background LOD update task is in flight. */
-    std::atomic<bool>   bLodUpdateRunning = false;
-
-    /** Monotonically increasing generation counter. Incremented on each Initialize
-     *  so in-flight async tasks from a previous generation can detect they're stale
-     *  and exit without touching the new tree state. */
-    std::atomic<uint32> InitGeneration = 0;
-
-    /** True from the start of InitializeInternal until the async initial build task
-     *  publishes the tree. Read on the game thread (OnConstruction) to prevent
-     *  re-entrant init; cleared on the worker once the build completes, so it must
-     *  be atomic. */
-    std::atomic<bool>   bIsInitializing = false;
-
-    // --- Change Detection ---
+    bool bInitialized = false;
     FVector LastInitScale = FVector::ZeroVector;
-    double  LastTerrainPlanetRadius = 0.0;
-
-    /** Timer for MinLodInterval delay between LOD update completions. */
-    FTimerHandle LodTimerHandle;
 
     /** Cached scale set by the planet actor, used by the transform guard. */
     FVector PlanetDrivenScale = FVector::OneVector;
 
-    /** Bound to RootComponent->TransformUpdated when planet-owned.
-     *  Snaps transforms back to planet-driven values. */
+    /** Bound to RootComponent->TransformUpdated when planet-owned: snaps transforms back to the
+     *  planet-driven values. */
     void OnTransformUpdated(USceneComponent* Component, EUpdateTransformFlags Flags, ETeleportType Teleport);
 
-    /** Internal init path shared by Initialize and InitializeFromPlanet.
-     *  Builds the quadtree, populates chunks, and kicks off the first LOD pass. */
+    /** Shared by Initialize and InitializeFromPlanet: the material instance, the finest level
+     *  and the surface. */
     void InitializeInternal(TSharedPtr<FDensitySampleCompositor> InCompositor);
 
-    /** Destroys all RealtimeMesh components and clears the chunk map. */
-    void CleanupComponents();
+    /** Destroys RealtimeMesh components left on the mesh root (an old level may have saved the
+     *  previous ocean's chunks with it). */
+    void CleanSceneRoot();
 
-    /** Worker task that performs the initial tree build off the game thread: builds
-     *  the 6 face roots, splits each to ChunkDepth, and generates the initial mesh
-     *  chunks (all into locals), then publishes RootNodes/ChunkMap under ChunkMapCS
-     *  with a generation re-check and chains to RunLodUpdateTask. Kicked from
-     *  InitializeInternal after the game-thread teardown + compositor publish.
-     *
-     *  This replaces the old synchronous game-thread PopulateChunks build, which was
-     *  the dominant spawn-time GT hitch (the split/sample and the blocking mesh-gen
-     *  ParallelFor both ran on the game thread before this). */
-    void RunInitialBuildTask();
-
-    /** Rebuilds vertex positions, normals, UVs, and triangles (inner + edge) for a
-     *  single chunk. Handles edge stitching based on neighbor LOD differences and
-     *  per-triangle depth culling. Static so it can run in a ParallelFor.
-     *
-     *  CompPin is the density compositor, pinned by the caller (snapshotted under
-     *  ChunkMapCS at task start). Grid is a caller-owned triangle grid built once per
-     *  task on a single thread; Res is the resolution it was built with. Both are
-     *  passed in rather than fetched off the Actor so nothing shared is touched on
-     *  workers and a concurrent re-init can't invalidate them mid-rebuild. */
-    static void RebuildChunkStreamData(TSharedPtr<FOceanMeshChunk> Chunk,
-        TSharedPtr<FOceanQuadTreeNode> ChunkNode,
-        const TSharedPtr<FDensitySampleCompositor>& CompPin,
-        const FOceanMeshGrid& Grid,
-        int32 Res);
-
-    /** Background LOD update task: evaluates split/merge for all leaves, checks
-     *  neighbor LODs, rebuilds dirty chunks, and pushes mesh updates. Chains back
-     *  to itself after MinLodInterval. */
-    void RunLodUpdateTask();
-};
+    /** The plugin's MT_Ocean, or the engine default material when the plugin content is missing. */
+    static UMaterialInterface* DefaultOceanMaterial();
+};

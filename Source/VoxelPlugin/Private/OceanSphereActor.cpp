@@ -1,8 +1,14 @@
 #include "OceanSphereActor.h"
-#include "FOceanQuadTreeNode.h"
-#include "FDensitySampleCompositor.h"
-#include "Kismet/GameplayStatics.h"
-#include "TimerManager.h"
+#include "PlanetActor.h"
+#include "VoxelPlugin.h"
+#include "VoxelOceanSurface.h"
+#include "VoxelTerrainStats.h"
+#include "RealtimeMeshComponent.h"
+#include "Materials/Material.h"
+#include "Materials/MaterialInstanceDynamic.h"
+#include "MaterialDomain.h"
+
+DECLARE_CYCLE_STAT(TEXT("Ocean: actor tick"), STAT_VoxelOceanActorTick, STATGROUP_VoxelTerrain);
 
 AOceanSphereActor::AOceanSphereActor()
 {
@@ -10,7 +16,7 @@ AOceanSphereActor::AOceanSphereActor()
     PrimaryActorTick.bStartWithTickEnabled = true;
 
     // Default scale = ocean radius matching APlanetActor defaults:
-    // PlanetRadius(100M) + SeaLevel(0.5) * NoiseAmplitude(15M) = 107,500,000 cm
+    // PlanetRadius (100M) + SeaLevel (0.5) * NoiseAmplitude (15M) = 107,500,000 cm.
     SetActorScale3D(FVector(107500000.0));
 
     MeshAttachmentRoot = CreateDefaultSubobject<USceneComponent>(TEXT("MeshAttachmentRoot"));
@@ -21,34 +27,35 @@ AOceanSphereActor::AOceanSphereActor()
 void AOceanSphereActor::OnConstruction(const FTransform& Transform)
 {
     Super::OnConstruction(Transform);
-    if (bIsInitializing) return;
-    if (!GetWorld() || GetWorld()->IsPreviewWorld() || !bTickInEditor) return;
-    if (!bInitialized
-        || !GetActorScale3D().Equals(LastInitScale, 0.01)
-        || LastTerrainPlanetRadius != TerrainPlanetRadius)
+
+    // A planet's ocean is initialized by the planet (InitializeFromPlanet).
+    if (GetOwner() && GetOwner()->IsA<APlanetActor>()) return;
+    if (!GetWorld() || GetWorld()->IsPreviewWorld()) return;
+    if (!bInitialized || !GetActorScale3D().Equals(LastInitScale, 0.01))
         Initialize();
 }
 
 void AOceanSphereActor::BeginPlay()
 {
     Super::BeginPlay();
+    if (GetOwner() && GetOwner()->IsA<APlanetActor>()) return;
     Initialize();
 }
 
-void AOceanSphereActor::BeginDestroy()
+void AOceanSphereActor::EndPlay(const EEndPlayReason::Type EndPlayReason)
 {
-    bIsDestroyed = true;
-    ++InitGeneration;   // force any in-flight LOD task to bail at its next check
-    if (UWorld* W = GetWorld())
-        W->GetTimerManager().ClearAllTimersForObject(this);
+    if (Surface.IsValid())
+        Surface->Reset();
+    bInitialized = false;
+    Super::EndPlay(EndPlayReason);
+}
 
-    // Drain any in-flight snapshot read, then empty the map under the lock so the
-    // TMap's own destruction (when the UObject is reclaimed) can't race a worker.
-    {
-        FScopeLock Lock(&ChunkMapCS);
-        ChunkMap.Empty();
-    }
-    Super::BeginDestroy();
+void AOceanSphereActor::Destroyed()
+{
+    if (Surface.IsValid())
+        Surface->Reset();
+    bInitialized = false;
+    Super::Destroyed();
 }
 
 #if WITH_EDITOR
@@ -57,33 +64,41 @@ void AOceanSphereActor::PostEditChangeProperty(FPropertyChangedEvent& PropertyCh
     Super::PostEditChangeProperty(PropertyChangedEvent);
     if (!bInitialized) return;
 
-    FName PropName = PropertyChangedEvent.GetPropertyName();
+    const FName PropName = PropertyChangedEvent.GetPropertyName();
 
-    // Level 0 — LOD params read live each tick, no rebuild needed:
-    // VelocityLookAheadFactor, MinLodInterval, bTickInEditor
-
-    // Structural changes require quadtree rebuild:
-    static const TSet<FName> RebuildProps = {
-        GET_MEMBER_NAME_CHECKED(AOceanSphereActor, FaceResolution),
-        GET_MEMBER_NAME_CHECKED(AOceanSphereActor, TargetPrecision),
-        GET_MEMBER_NAME_CHECKED(AOceanSphereActor, MinDepth),
-        GET_MEMBER_NAME_CHECKED(AOceanSphereActor, NoiseAmplitudeRatio),
-        GET_MEMBER_NAME_CHECKED(AOceanSphereActor, TerrainPlanetRadius),
-        GET_MEMBER_NAME_CHECKED(AOceanSphereActor, TriangleCullDepthThreshold),
-        GET_MEMBER_NAME_CHECKED(AOceanSphereActor, OceanMaterial),
-        GET_MEMBER_NAME_CHECKED(AOceanSphereActor, ScreenSpaceThreshold),
-    };
-
-    // A change inside SurfaceSettings reports the inner field; the member property is the
-    // struct. Slider drags rebuild once, on release.
-    const bool bSurfaceChanged = !bIsPlanetOwned && PropertyChangedEvent.ChangeType != EPropertyChangeType::Interactive
-        && PropertyChangedEvent.MemberProperty
-        && PropertyChangedEvent.MemberProperty->GetFName() == GET_MEMBER_NAME_CHECKED(AOceanSphereActor, SurfaceSettings);
-
-    if (RebuildProps.Contains(PropName) || bSurfaceChanged)
+    if (PropName == GET_MEMBER_NAME_CHECKED(AOceanSphereActor, OceanMaterial))
     {
-        Initialize();
+        SetOceanMaterial(OceanMaterial);
+        return;
     }
+
+    if (PropName == GET_MEMBER_NAME_CHECKED(AOceanSphereActor, LodDistanceFactor))
+    {
+        if (PropertyChangedEvent.ChangeType != EPropertyChangeType::Interactive && Surface.IsValid())
+            Surface->SetLodDistanceFactor(LodDistanceFactor);
+        return;
+    }
+
+    // The mesh rebuilds; slider drags rebuild once, on release.
+    if (PropertyChangedEvent.ChangeType == EPropertyChangeType::Interactive) return;
+    static const TSet<FName> MeshProps = {
+        GET_MEMBER_NAME_CHECKED(AOceanSphereActor, FinestSpacing),
+        GET_MEMBER_NAME_CHECKED(AOceanSphereActor, TileQuads),
+        GET_MEMBER_NAME_CHECKED(AOceanSphereActor, SpareBufferSets),
+    };
+    if (MeshProps.Contains(PropName))
+    {
+        InitializeInternal(Compositor);
+        return;
+    }
+
+    // A standalone ocean's density follows the terrain's settings.
+    const bool bDensityChanged = !bIsPlanetOwned && PropertyChangedEvent.MemberProperty
+        && (PropertyChangedEvent.MemberProperty->GetFName() == GET_MEMBER_NAME_CHECKED(AOceanSphereActor, SurfaceSettings)
+            || PropName == GET_MEMBER_NAME_CHECKED(AOceanSphereActor, TerrainPlanetRadius)
+            || PropName == GET_MEMBER_NAME_CHECKED(AOceanSphereActor, NoiseAmplitudeRatio));
+    if (bDensityChanged)
+        Initialize();
 }
 
 bool AOceanSphereActor::CanEditChange(const FProperty* InProperty) const
@@ -140,17 +155,31 @@ void AOceanSphereActor::PostEditMove(bool bFinished)
 
 bool AOceanSphereActor::ShouldTickIfViewportsOnly() const
 {
-    return bTickInEditor && bInitialized;
+    return bInitialized;
 }
 
-// ---------------------------------------------------------------------------
-// Initialize
-// ---------------------------------------------------------------------------
+UMaterialInterface* AOceanSphereActor::DefaultOceanMaterial()
+{
+    UMaterialInterface* PluginMaterial = Cast<UMaterialInterface>(StaticLoadObject(UMaterialInterface::StaticClass(), nullptr,
+        TEXT("/VoxelPlugin/MT_Ocean.MT_Ocean"), nullptr, LOAD_NoWarn | LOAD_Quiet));
+    return PluginMaterial ? PluginMaterial : UMaterial::GetDefaultMaterial(EMaterialDomain::MD_Surface);
+}
+
+void AOceanSphereActor::SetOceanMaterial(UMaterialInterface* InMaterial)
+{
+    OceanMaterial = InMaterial ? InMaterial : DefaultOceanMaterial();
+    if (!bInitialized) return;
+    SurfaceMaterialInstance = UMaterialInstanceDynamic::Create(OceanMaterial, this);
+    if (Surface.IsValid())
+        Surface->SetMaterial(SurfaceMaterialInstance);
+}
 
 void AOceanSphereActor::Initialize()
 {
-    MinDepth = FMath::Max(MinDepth, ChunkDepth);
-    InitializeInternal(nullptr);
+    // Standalone: a density of its own from the terrain settings (no edits).
+    const TSharedPtr<FDensitySampleCompositor> Own = VoxelDensity::MakeCompositor(SurfaceSettings, TerrainPlanetRadius,
+        TerrainPlanetRadius * NoiseAmplitudeRatio, nullptr);
+    InitializeInternal(Own);
 }
 
 void AOceanSphereActor::OnTransformUpdated(USceneComponent* Component, EUpdateTransformFlags Flags, ETeleportType Teleport)
@@ -174,10 +203,10 @@ void AOceanSphereActor::OnTransformUpdated(USceneComponent* Component, EUpdateTr
 void AOceanSphereActor::InitializeFromPlanet(TSharedPtr<FDensitySampleCompositor> InCompositor,
     USceneComponent* InAttachParent, FVector InScale)
 {
-    MinDepth = FMath::Max(MinDepth, ChunkDepth);
     bIsPlanetOwned = true;
-    // Apply scale BEFORE binding the transform guard — prevents the old guard
-    // from reverting a scale change that the planet actor intends.
+
+    // Apply scale BEFORE binding the transform guard, so the old guard doesn't revert a scale
+    // change the planet intends.
     if (USceneComponent* Root = GetRootComponent())
         Root->TransformUpdated.RemoveAll(this);
 
@@ -186,12 +215,10 @@ void AOceanSphereActor::InitializeFromPlanet(TSharedPtr<FDensitySampleCompositor
 
     PlanetDrivenScale = GetActorScale3D();
 
-    // Re-bind the guard now that PlanetDrivenScale reflects the new scale.
     if (USceneComponent* Root = GetRootComponent())
         Root->TransformUpdated.AddUObject(this, &AOceanSphereActor::OnTransformUpdated);
 
-    // Re-parent MeshAttachmentRoot to the planet's component hierarchy
-    // so mesh chunks follow the planet's position/rotation.
+    // The pages follow the planet's position and rotation directly.
     if (InAttachParent && MeshAttachmentRoot)
     {
         MeshAttachmentRoot->AttachToComponent(InAttachParent,
@@ -200,679 +227,66 @@ void AOceanSphereActor::InitializeFromPlanet(TSharedPtr<FDensitySampleCompositor
     InitializeInternal(InCompositor);
 }
 
-void AOceanSphereActor::InitializeInternal(TSharedPtr<FDensitySampleCompositor> InCompositor)
-{
-    bIsInitializing = true;
-    bInitialized = false;
-    ++InitGeneration;
-
-    if (UWorld* W = GetWorld())
-        W->GetTimerManager().ClearTimer(LodTimerHandle);
-
-    bLodUpdateRunning = false;
-
-    {
-        // Serialize the free against the LOD task's snapshot read (Site 1).
-        FScopeLock Lock(&ChunkMapCS);
-        CleanupComponents();
-        ChunkMap.Empty();
-        for (int32 i = 0; i < 6; ++i)
-            RootNodes[i].Reset();
-    }
-
-    // Load default plugin material if none assigned by the user.
-    if (!OceanMaterial)
-    {
-        OceanMaterial = Cast<UMaterialInterface>(
-            StaticLoadObject(UMaterialInterface::StaticClass(), nullptr,
-                TEXT("/VoxelPlugin/MT_Ocean.MT_Ocean")));
-    }
-
-    double ActorRadius = GetActorScale3D().GetMax();
-    OceanRadius = ActorRadius;
-    double TerrainNoiseAmplitude = TerrainPlanetRadius * NoiseAmplitudeRatio;
-
-    // Compute MaxDepth from TargetPrecision.
-    {
-        double EffectiveRes = FMath::Max((double)(FaceResolution - 1), 1.0);
-        double Ratio = 2.0 * OceanRadius / (EffectiveRes * TargetPrecision);
-        int32 IdealDepth = (int32)FMath::CeilToInt(FMath::Log2(Ratio));
-        MaxDepth = FMath::Clamp(IdealDepth, MinDepth, MaxKeyDepth);
-        ActualPrecision = 2.0 * OceanRadius / (EffectiveRes * FMath::Pow(2.0, (double)MaxDepth));
-    }
-
-    // Build the new compositor into a local first, then publish it to the member
-    // under ChunkMapCS (below). The LOD task snapshots Compositor under the same
-    // lock, so an in-flight task either sees the stale generation and bails, or
-    // pins the *old* compositor and keeps it alive for its run. Assigning the
-    // member directly here would let a worker mid-Sample() read a torn/freed
-    // TSharedPtr during a re-init (the parallax spawn-and-move crash).
-    TSharedPtr<FDensitySampleCompositor> NewCompositor;
-
-    if (InCompositor.IsValid())
-    {
-        // Use planet-provided compositor
-        NewCompositor = InCompositor;
-    }
-    else
-    {
-        // Standalone: build our own compositor (no edit store; the terrain's depth is not
-        // known here, so every octave is kept).
-        NewCompositor = VoxelDensity::MakeCompositor(SurfaceSettings, TerrainPlanetRadius, TerrainNoiseAmplitude, nullptr);
-    }
-
-    // Publish the compositor under the same lock the LOD task reads it with.
-    {
-        FScopeLock Lock(&ChunkMapCS);
-        Compositor = NewCompositor;
-    }
-
-    // The quadtree build (6 face roots -> split-to-ChunkDepth -> initial mesh gen)
-    // used to run here, synchronously on the game thread, and only then kicked the
-    // async LOD pass. On a planet spawn that inline build was the dominant GT hitch:
-    // both the split/sample walk and the "parallel" mesh-gen ParallelFor block the
-    // calling (game) thread. It now runs on a worker via RunInitialBuildTask, which
-    // builds into locals, publishes RootNodes/ChunkMap under ChunkMapCS with a
-    // generation re-check, then chains to RunLodUpdateTask.
-    //
-    // bInitialized / bIsInitializing are flipped inside that task once the tree is
-    // published, so nothing here marks the actor ready -- InitializeInternal now
-    // returns almost immediately, mirroring the terrain actor's deferred build.
-    LastInitScale = GetActorScale3D();
-    LastTerrainPlanetRadius = TerrainPlanetRadius;
-    RunInitialBuildTask();
-}
-
-// ---------------------------------------------------------------------------
-// RunInitialBuildTask
-//
-// Worker-thread initial tree build: the game thread does only the (cheap) teardown +
-// compositor publish in InitializeInternal, then kicks this task. Everything here -- the 6 face roots,
-// the split-to-ChunkDepth walk, and the mesh-gen ParallelFor -- runs off the game
-// thread, so the spawn frame no longer stalls on the ocean build.
-//
-// Concurrency contract (same tokens the LOD task uses):
-//   - Build into locals only. RootNodes/ChunkMap are published under ChunkMapCS with
-//     a final InitGeneration re-check, so a re-init (which bumps the generation and
-//     tears down under the same lock) can never observe a half-built tree, and a
-//     superseded build drops its locals instead of clobbering the new one.
-//   - Geometry params are snapshotted by value on the GT before dispatch; the
-//     compositor is pinned under ChunkMapCS so the whole build samples one object.
-//   - bInitialized / bIsInitializing flip only after a successful publish.
-// ---------------------------------------------------------------------------
-
-void AOceanSphereActor::RunInitialBuildTask()
-{
-    TWeakObjectPtr<AOceanSphereActor> WeakThis(this);
-    const uint32 CapturedGen = InitGeneration;
-
-    // Snapshot the (build-immutable) geometry params on the game thread so the worker
-    // never reads live actor members that a concurrent re-init could mutate.
-    const double CapOceanRadius = OceanRadius;
-    const int32  CapMinDepth = MinDepth;
-    const int32  CapMaxDepth = MaxDepth;
-    const int32  CapChunkDepth = ChunkDepth;
-    const int32  CapFaceRes = FaceResolution;
-
-    // Pin the compositor under the lock InitializeInternal published it with, so this
-    // build can't tear-read a TSharedPtr the GT is swapping during a re-init.
-    TSharedPtr<FDensitySampleCompositor> CompPin;
-    {
-        FScopeLock Lock(&ChunkMapCS);
-        CompPin = Compositor;
-    }
-
-    FFunctionGraphTask::CreateAndDispatchWhenReady(
-        [WeakThis, CapturedGen, CompPin, CapOceanRadius, CapMinDepth, CapMaxDepth, CapChunkDepth, CapFaceRes]()
-        {
-            AOceanSphereActor* Self = WeakThis.Get();
-            if (!Self || Self->bIsDestroyed || Self->InitGeneration != CapturedGen)
-                return;
-
-            // --- Build 6 face roots + split to ChunkDepth (pure geometry, no actor state) ---
-            const double Size = 2.0;
-            const double HalfSize = 1.0;
-            const FVector FaceCenters[6] = {
-                FVector(HalfSize,        0,        0),
-                FVector(-HalfSize,        0,        0),
-                FVector(0,  HalfSize,        0),
-                FVector(0, -HalfSize,        0),
-                FVector(0,        0,  HalfSize),
-                FVector(0,        0, -HalfSize),
-            };
-
-            TSharedPtr<FOceanQuadTreeNode> LocalRoots[6];
-            for (int32 i = 0; i < 6; ++i)
-            {
-                LocalRoots[i] = MakeShared<FOceanQuadTreeNode>(
-                    Self, FCubeTransform::FaceTransforms[i], FQuadIndex((uint8)i),
-                    FaceCenters[i], Size, CapOceanRadius, CapMinDepth, CapMaxDepth, CapChunkDepth);
-                LocalRoots[i]->ChunkAnchorCenter = LocalRoots[i]->SphereCenter;
-            }
-            for (int32 i = 0; i < 6; ++i)
-                LocalRoots[i]->SplitToDepth(CapChunkDepth);
-
-            if (Self->bIsDestroyed || Self->InitGeneration != CapturedGen) return;
-
-            // --- Collect chunk-depth nodes from the locals ---
-            TArray<TSharedPtr<FOceanQuadTreeNode>> ChunkNodes;
-            for (int32 i = 0; i < 6; ++i)
-            {
-                TArray<TSharedPtr<FOceanQuadTreeNode>> Stack;
-                Stack.Push(LocalRoots[i]);
-                while (Stack.Num() > 0)
-                {
-                    TSharedPtr<FOceanQuadTreeNode> Node = Stack.Pop(EAllowShrinking::No);
-                    if (!Node.IsValid()) continue;
-                    if (Node->GetDepth() == CapChunkDepth)
-                        ChunkNodes.Add(Node);
-                    else
-                        for (auto& Child : Node->Children)
-                            if (Child.IsValid()) Stack.Add(Child);
-                }
-            }
-
-            // --- Initial mesh generation (parallel; task-local grid + pinned compositor) ---
-            TArray<TSharedPtr<FOceanMeshChunk>> NewChunks;
-            NewChunks.SetNum(ChunkNodes.Num());
-
-            FOceanMeshGrid Grid;
-            Grid.Build(CapFaceRes);
-
-            ParallelFor(ChunkNodes.Num(), [&](int32 i)
-                {
-                    if (Self->InitGeneration != CapturedGen) return;
-                    NewChunks[i] = MakeShared<FOceanMeshChunk>();
-                    NewChunks[i]->CachedOwner = Self;
-                    NewChunks[i]->InitializeData(ChunkNodes[i]->SphereCenter);
-                    RebuildChunkStreamData(NewChunks[i], ChunkNodes[i], CompPin, Grid, CapFaceRes);
-                    NewChunks[i]->IsDirty = true;
-                });
-
-            // --- Publish under the lock, with a final staleness re-check ---
-            {
-                FScopeLock Lock(&Self->ChunkMapCS);
-                if (Self->bIsDestroyed || Self->InitGeneration != CapturedGen)
-                    return;  // superseded or destroyed: drop locals; GT teardown owns cleanup
-
-                for (int32 i = 0; i < 6; ++i)
-                    Self->RootNodes[i] = LocalRoots[i];
-
-                Self->ChunkMap.Empty(ChunkNodes.Num());
-                for (int32 i = 0; i < ChunkNodes.Num(); ++i)
-                    Self->ChunkMap.Add(ChunkNodes[i], NewChunks[i]);
-            }
-
-            // Publish complete -- mark ready and hand off to the LOD/apply pass. The
-            // atomic store on bInitialized releases the map writes above to any reader
-            // that acquires it (the LOD task re-reads ChunkMap under ChunkMapCS anyway).
-            Self->bIsInitializing = false;
-            Self->bInitialized = true;
-            Self->RunLodUpdateTask();
-
-        }, TStatId(), nullptr, ENamedThreads::AnyNormalThreadHiPriTask);
-}
-
-// ---------------------------------------------------------------------------
-// RebuildChunkStreamData
-//
-// Generates vertex positions/normals/UVs/depths on the fly from node topology.
-// Triangle indices come from a caller-provided FOceanMeshGrid (built once per task
-// on a single thread and passed in) — no shared cache touched on workers.
-//
-// Per-leaf vertex layout: (Res+2) x (Res+2) extended grid, row-major ix*ExtRes+iy.
-// SpherePos  = (CubeCenter + CubeOffset).GetSafeNormal() * OceanRadius
-// LocalPos   = SpherePos - ChunkAnchorCenter
-// ---------------------------------------------------------------------------
-
-void AOceanSphereActor::RebuildChunkStreamData(
-    TSharedPtr<FOceanMeshChunk>    Chunk,
-    TSharedPtr<FOceanQuadTreeNode> ChunkNode,
-    const TSharedPtr<FDensitySampleCompositor>& CompPin,
-    const FOceanMeshGrid& Grid,
-    int32                          Res)
-{
-    if (!Chunk.IsValid() || !ChunkNode.IsValid()) return;
-    if (!Chunk->InnerMeshData.IsValid() || !Chunk->EdgeMeshData.IsValid()) return;
-
-    AOceanSphereActor* Actor = ChunkNode->Owner;
-
-    // Caller pins the compositor (snapshotted under ChunkMapCS at task start) so
-    // it stays alive for this whole call even if the GT swaps Compositor during a
-    // concurrent re-init. Do NOT fetch it raw off the Actor here — that raw ptr
-    // would dangle when the old compositor is freed mid-Sample().
-    FDensitySampleCompositor* Comp = CompPin.Get();
-
-    const float TriCullThreshold = Actor ? Actor->TriangleCullDepthThreshold : -10000.f;
-    // Res is passed in (matching the grid built by the caller) rather than re-read
-    // off the Actor, so vertex-array sizing and Grid triangle indices stay consistent
-    // even if FaceResolution changes on the GT mid-task.
-    const int32 ExtRes = Res + 2;
-    const int32 Total = ExtRes * ExtRes;
-
-    TArray<TSharedPtr<FOceanQuadTreeNode>> Leaves;
-    FOceanQuadTreeNode::CollectLeaves(ChunkNode, Leaves);
-
-    // ---------------------------------------------------------------------------
-    // Inner stream
-    // ---------------------------------------------------------------------------
-    TSharedPtr<FOceanStreamData> NewInner = MakeShared<FOceanStreamData>();
-    NewInner->MeshGroupKey = Chunk->InnerMeshData->MeshGroupKey;
-    NewInner->MeshSectionKey = Chunk->InnerMeshData->MeshSectionKey;
-
-    auto InnerPos = NewInner->GetPositionStream();
-    auto InnerTan = NewInner->GetTangentStream();
-    auto InnerTex = NewInner->GetTexCoordStream();
-    auto InnerCol = NewInner->GetColorStream();
-    auto InnerTri = NewInner->GetTriangleStream();
-    auto InnerPG = NewInner->GetPolygroupStream();
-
-    // ---------------------------------------------------------------------------
-    // Edge stream
-    // ---------------------------------------------------------------------------
-    TSharedPtr<FOceanStreamData> NewEdge = MakeShared<FOceanStreamData>();
-    NewEdge->MeshGroupKey = Chunk->EdgeMeshData->MeshGroupKey;
-    NewEdge->MeshSectionKey = Chunk->EdgeMeshData->MeshSectionKey;
-
-    auto EdgePos = NewEdge->GetPositionStream();
-    auto EdgeTan = NewEdge->GetTangentStream();
-    auto EdgeTex = NewEdge->GetTexCoordStream();
-    auto EdgeCol = NewEdge->GetColorStream();
-    auto EdgeTri = NewEdge->GetTriangleStream();
-    auto EdgePG = NewEdge->GetPolygroupStream();
-
-    // ---------------------------------------------------------------------------
-    // Per-leaf: generate vertex data on the fly, emit triangles from grid cache.
-    // Triangles where all 3 vertices are above water (depth < 0) are culled.
-    // ---------------------------------------------------------------------------
-    for (auto& Leaf : Leaves)
-    {
-        const double Step = Leaf->Size / (double)(Res - 1);
-
-        // Build vertex data for this leaf's (Res+2)x(Res+2) extended grid.
-        TArray<FVector>   LeafPos;   LeafPos.SetNumUninitialized(Total);
-        TArray<FVector3f> LeafNorm;  LeafNorm.SetNumUninitialized(Total);
-        TArray<float>     LeafDepth; LeafDepth.SetNumUninitialized(Total);
-        TArray<FColor>    LeafColor; LeafColor.SetNumUninitialized(Total);
-
-        // Stage 1: positions, normals, sphere positions for sampling
-        TArray<double> SX, SY, SZ;
-        SX.SetNumUninitialized(Total);
-        SY.SetNumUninitialized(Total);
-        SZ.SetNumUninitialized(Total);
-
-        for (int32 ix = 0; ix < ExtRes; ++ix)
-        {
-            for (int32 iy = 0; iy < ExtRes; ++iy)
-            {
-                double normX = -Leaf->HalfSize + Step * (ix - 1);
-                double normY = -Leaf->HalfSize + Step * (iy - 1);
-
-                FVector CubeOffset = FVector::ZeroVector;
-                CubeOffset[Leaf->FaceTransform.AxisMap[0]] = Leaf->FaceTransform.AxisDir[0] * normX;
-                CubeOffset[Leaf->FaceTransform.AxisMap[1]] = Leaf->FaceTransform.AxisDir[1] * normY;
-
-                FVector SpherePos = (Leaf->CubeCenter + CubeOffset).GetSafeNormal() * Leaf->OceanRadius;
-                int32   vi = ix * ExtRes + iy;
-
-                LeafPos[vi] = SpherePos - Leaf->ChunkAnchorCenter;
-                FVector Normal = SpherePos.GetSafeNormal();
-                LeafNorm[vi] = FVector3f(Normal);
-
-                SX[vi] = SpherePos.X;
-                SY[vi] = SpherePos.Y;
-                SZ[vi] = SpherePos.Z;
-            }
-        }
-
-        // Stage 2: batch compositor sample → depths + encoded colors
-        if (Comp)
-        {
-            TArray<float> DensityOut;
-            DensityOut.SetNumUninitialized(Total);
-            FSampleInput Input(SX.GetData(), SY.GetData(), SZ.GetData(), Total);
-            Comp->Sample(Input, DensityOut.GetData());
-
-            float NewMaxDepth = -FLT_MAX;
-            for (int32 i = 0; i < Total; ++i)
-            {
-                float depth = DensityOut[i];
-                NewMaxDepth = FMath::Max(NewMaxDepth, depth);
-                LeafDepth[i] = depth;
-                float absDepth = FMath::Max(depth, 0.0f);
-                uint32 id = (uint32)FMath::Min(absDepth * 1000.0f, 4294967040.0f);
-                LeafColor[i] = FColor((id >> 24) & 0xFF, (id >> 16) & 0xFF, (id >> 8) & 0xFF, id & 0xFF);
-            }
-            Leaf->MaxVertexDepth = NewMaxDepth;
-        }
-        else
-        {
-            for (int32 i = 0; i < Total; ++i)
-            {
-                LeafDepth[i] = 0.f;
-                LeafColor[i] = FColor(0, 0, 0, 0);
-            }
-            Leaf->MaxVertexDepth = 0.f;
-        }
-
-        // Stage 3: emit inner triangles — cull if all 3 verts above water
-        const bool bFlip = Leaf->FaceTransform.bFlipWinding;
-
-        for (FIndex3UI Tri : Grid.PatchTriangles)
-        {
-            if (bFlip)
-                Tri = FIndex3UI(Tri.V0, Tri.V2, Tri.V1);
-
-            if (LeafDepth[Tri.V0] < TriCullThreshold && LeafDepth[Tri.V1] < TriCullThreshold && LeafDepth[Tri.V2] < TriCullThreshold)
-                continue;
-
-            for (int32 v = 0; v < 3; ++v)
-            {
-                uint32 vi = (v == 0) ? Tri.V0 : (v == 1) ? Tri.V1 : Tri.V2;
-                InnerPos.Add(LeafPos[vi]);
-                FRealtimeMeshTangentsHighPrecision T; T.SetNormal(LeafNorm[vi]);
-                InnerTan.Add(T);
-                InnerTex.Add(FVector2f(LeafDepth[vi], 0.f));
-                InnerCol.Add(LeafColor[vi]);
-            }
-            uint32 base = (uint32)InnerPos.Num() - 3;
-            InnerTri.Add(FIndex3UI(base, base + 1, base + 2));
-            InnerPG.Add(0);
-        }
-
-        // Stage 4: emit edge stitch triangles — same per-tri cull
-        uint8 EdgeFlags =
-            ((Leaf->GetDepth() > Leaf->NeighborLods[(uint8)EdgeOrientation::LEFT]) ? 0x1 : 0) |
-            ((Leaf->GetDepth() > Leaf->NeighborLods[(uint8)EdgeOrientation::RIGHT]) ? 0x2 : 0) |
-            ((Leaf->GetDepth() > Leaf->NeighborLods[(uint8)EdgeOrientation::UP]) ? 0x4 : 0) |
-            ((Leaf->GetDepth() > Leaf->NeighborLods[(uint8)EdgeOrientation::DOWN]) ? 0x8 : 0);
-
-        for (FIndex3UI Tri : Grid.EdgeTriangles[EdgeFlags])
-        {
-            if (bFlip)
-                Tri = FIndex3UI(Tri.V0, Tri.V2, Tri.V1);
-
-            if (LeafDepth[Tri.V0] < TriCullThreshold && LeafDepth[Tri.V1] < TriCullThreshold && LeafDepth[Tri.V2] < TriCullThreshold)
-                continue;
-
-            for (int32 v = 0; v < 3; ++v)
-            {
-                uint32 vi = (v == 0) ? Tri.V0 : (v == 1) ? Tri.V1 : Tri.V2;
-                EdgePos.Add(LeafPos[vi]);
-                FRealtimeMeshTangentsHighPrecision T; T.SetNormal(LeafNorm[vi]);
-                EdgeTan.Add(T);
-                EdgeTex.Add(FVector2f(LeafDepth[vi], 0.f));
-                EdgeCol.Add(LeafColor[vi]);
-            }
-            uint32 base = (uint32)EdgePos.Num() - 3;
-            EdgeTri.Add(FIndex3UI(base, base + 1, base + 2));
-            EdgePG.Add(0);
-        }
-    }
-
-    Chunk->InnerMeshData = NewInner;
-    Chunk->EdgeMeshData = NewEdge;
-    Chunk->IsDirty = true;
-}
-
-// ---------------------------------------------------------------------------
-// CleanupComponents
-// ---------------------------------------------------------------------------
-
-void AOceanSphereActor::CleanupComponents()
+void AOceanSphereActor::CleanSceneRoot()
 {
     if (!MeshAttachmentRoot) return;
-    TArray<USceneComponent*> Attached;
-    MeshAttachmentRoot->GetChildrenComponents(false, Attached);
-    for (USceneComponent* Child : Attached)
-        if (URealtimeMeshComponent* RtComp = Cast<URealtimeMeshComponent>(Child))
-            RtComp->DestroyComponent();
+    const TArray<TObjectPtr<USceneComponent>> Attached = MeshAttachmentRoot->GetAttachChildren();
+    for (const TObjectPtr<USceneComponent>& Child : Attached)
+    {
+        if (URealtimeMeshComponent* MeshComponent = Cast<URealtimeMeshComponent>(Child))
+            MeshComponent->DestroyComponent();
+    }
 }
 
-// ---------------------------------------------------------------------------
-// Tick
-// ---------------------------------------------------------------------------
+void AOceanSphereActor::InitializeInternal(TSharedPtr<FDensitySampleCompositor> InCompositor)
+{
+    bInitialized = false;
+    if (Surface.IsValid())
+        Surface->Reset();
+    CleanSceneRoot();
+    Compositor = InCompositor;
+
+    OceanRadius = GetActorScale3D().GetMax();
+    // 8, 16 or 32 quads per tile edge.
+    TileQuads = 1 << FMath::Clamp(FMath::RoundToInt(FMath::Log2((double)FMath::Max(TileQuads, 1))), 3, 5);
+    LodDistanceFactor = FMath::Max(LodDistanceFactor, VoxelOceanTiles::MinLodDistanceFactor);
+    MaxLevel = VoxelOceanTiles::LevelForSpacing(OceanRadius, TileQuads, FinestSpacing);
+    ActualSpacing = VoxelOceanTiles::NominalArc(MaxLevel) * OceanRadius / TileQuads;
+
+    if (!OceanMaterial)
+        OceanMaterial = DefaultOceanMaterial();
+    SurfaceMaterialInstance = UMaterialInstanceDynamic::Create(OceanMaterial, this);
+
+    FVoxelOceanSurfaceSettings Settings;
+    Settings.Radius = OceanRadius;
+    Settings.TileQuads = TileQuads;
+    Settings.MaxLevel = MaxLevel;
+    Settings.LodDistanceFactor = LodDistanceFactor;
+    Settings.SpareBufferSets = SpareBufferSets;
+    Settings.Material = SurfaceMaterialInstance.Get();
+    if (!Surface.IsValid())
+        Surface = MakeShared<FVoxelOceanSurface>();
+    Surface->Initialize(this, MeshAttachmentRoot, Settings);
+
+    LastInitScale = GetActorScale3D();
+    bInitialized = true;
+}
 
 void AOceanSphereActor::Tick(float DeltaTime)
 {
+    SCOPE_CYCLE_COUNTER(STAT_VoxelOceanActorTick);
     Super::Tick(DeltaTime);
-    if (!bInitialized) return;
+    if (!bInitialized || !Surface.IsValid()) return;
 
-    if (UWorld* W = GetWorld())
+    if (UWorld* World = GetWorld())
     {
-        const TArray<FVector>& Views = W->ViewLocationsRenderedLastFrame;
+        const TArray<FVector>& Views = World->ViewLocationsRenderedLastFrame;
         if (Views.Num() > 0)
         {
-            FTransform NoScaleTransform(GetActorRotation(), GetActorLocation());
+            // The planet frame: position and rotation only (the surface is built at world scale).
+            const FTransform NoScaleTransform(GetActorRotation(), GetActorLocation());
             CameraPosition = NoScaleTransform.InverseTransformPosition(Views[0]);
         }
-        APlayerCameraManager* Cam = UGameplayStatics::GetPlayerCameraManager(W, 0);
-        if (Cam) CameraFOV = Cam->GetFOVAngle();
     }
-}
-
-// ---------------------------------------------------------------------------
-// LOD pipeline
-// ---------------------------------------------------------------------------
-
-void AOceanSphereActor::RunLodUpdateTask()
-{
-    if (bLodUpdateRunning || bIsDestroyed) return;
-    bLodUpdateRunning = true;
-
-    TWeakObjectPtr<AOceanSphereActor> WeakThis(this);
-    uint32 CapturedGen = InitGeneration;
-
-    FFunctionGraphTask::CreateAndDispatchWhenReady([WeakThis, CapturedGen]()
-        {
-            AOceanSphereActor* Self = WeakThis.Get();
-            if (!Self || Self->bIsDestroyed || Self->InitGeneration != CapturedGen)
-            {
-                if (Self) Self->bLodUpdateRunning = false;
-                return;
-            }
-
-            FVector Velocity = Self->CameraPosition - Self->LastLodCameraPos;
-            FVector Predicted = Self->CameraPosition + Velocity * Self->VelocityLookAheadFactor;
-            Self->LastLodCameraPos = Self->CameraPosition;
-
-            double FOVScale = 1.0 / FMath::Tan(FMath::DegreesToRadians(Self->CameraFOV * 0.5));
-            double ThresholdSq = Self->ScreenSpaceThreshold * Self->ScreenSpaceThreshold;
-            double MergeThresholdSq = (Self->ScreenSpaceThreshold * 0.5) * (Self->ScreenSpaceThreshold * 0.5);
-
-            TArray<TSharedPtr<FOceanQuadTreeNode>> ChunkNodes;
-            TArray<TSharedPtr<FOceanMeshChunk>>    MeshChunks;
-            TSharedPtr<FDensitySampleCompositor>   CompPin;
-            TSharedPtr<FOceanQuadTreeNode>         RootsPin[6];
-            {
-                // Serialize with InitializeInternal / BeginDestroy, which free
-                // ChunkMap on the GT. Re-check staleness under the lock: if a
-                // teardown bumped the generation between the outer guard and
-                // here, bail before snapshotting a map that's about to die.
-                FScopeLock Lock(&Self->ChunkMapCS);
-                if (Self->bIsDestroyed || Self->InitGeneration != CapturedGen)
-                {
-                    Self->bLodUpdateRunning = false;
-                    return;
-                }
-                Self->ChunkMap.GenerateKeyArray(ChunkNodes);
-                for (auto& CN : ChunkNodes)
-                    MeshChunks.Add(Self->ChunkMap[CN]);
-
-                // Pin the compositor for this task's entire lifetime. Reading it
-                // under the same lock InitializeInternal publishes it with avoids
-                // a torn read; holding the shared ref keeps the object alive even
-                // if the GT swaps Compositor mid-pass.
-                CompPin = Self->Compositor;
-
-                // Same for the face roots: neighbour lookups walk this snapshot, never the
-                // live RootNodes a re-init resets on the game thread.
-                for (int32 i = 0; i < 6; ++i)
-                    RootsPin[i] = Self->RootNodes[i];
-            }
-
-            int32 NumChunks = ChunkNodes.Num();
-
-            // Build the triangle grid once on this task thread (before any ParallelFor)
-            // and pass it into the Phase-3 rebuild. Immutable and Res-only, so the
-            // task-local copy is race-free -- workers never touch shared cache state,
-            // and a GT re-init clearing actor state can't pull the grid out from under
-            // an in-flight worker. Res is captured here so grid and vertex sizing match.
-            const int32 GridRes = Self->FaceResolution;
-            FOceanMeshGrid Grid;
-            Grid.Build(GridRes);
-
-            TArray<TArray<TSharedPtr<FOceanQuadTreeNode>>> AllChunkLeaves;
-            AllChunkLeaves.SetNum(NumChunks);
-            TArray<bool> ChunkTreeChanged;
-            ChunkTreeChanged.SetNumZeroed(NumChunks);
-
-            // Phase 1: LOD pass
-            ParallelFor(NumChunks, [&](int32 idx)
-                {
-                    if (Self->InitGeneration != CapturedGen) return;
-                    TSharedPtr<FOceanQuadTreeNode> ChunkNode = ChunkNodes[idx];
-                    if (!ChunkNode.IsValid()) return;
-
-                    // Back-face cull: skip chunks on the far side of the planet.
-                    // If the chunk center and camera are on opposite sides of the origin,
-                    // and the angle between them exceeds ~78 degrees, skip LOD work.
-                    double Dot = FVector::DotProduct(Predicted, ChunkNode->SphereCenter);
-                    if (Dot < 0.0)
-                    {
-                        double CamDistSq = Predicted.SizeSquared();
-                        double NodeDistSq = ChunkNode->SphereCenter.SizeSquared();
-                        if ((Dot * Dot) > (0.04 * CamDistSq * NodeDistSq))
-                        {
-                            FOceanQuadTreeNode::CollectLeaves(ChunkNode, AllChunkLeaves[idx]);
-                            return;
-                        }
-                    }
-
-                    double DistSq = FMath::Max(FVector::DistSquared(ChunkNode->SphereCenter, Predicted), 1e-12);
-                    double ChunkLhs = 2.0 * ChunkNode->WorldExtent * FOVScale;
-                    bool CouldSplit = (ChunkLhs * ChunkLhs) > (ThresholdSq * DistSq)
-                        || ChunkNode->GetDepth() < ChunkNode->MinDepth;
-
-                    double SmallestExtent = ChunkNode->WorldExtent /
-                        (double)(1 << (ChunkNode->MaxDepth - ChunkNode->GetDepth()));
-                    double SmallLhs = 2.0 * SmallestExtent * FOVScale;
-                    bool CouldMerge = (SmallLhs * SmallLhs) < (MergeThresholdSq * DistSq);
-
-                    if (!CouldSplit && !CouldMerge)
-                    {
-                        FOceanQuadTreeNode::CollectLeaves(ChunkNode, AllChunkLeaves[idx]);
-                        return;
-                    }
-
-                    TArray<TSharedPtr<FOceanQuadTreeNode>> Leaves;
-                    FOceanQuadTreeNode::CollectLeaves(ChunkNode, Leaves);
-
-                    bool bAnyChanged = false;
-                    for (auto& Leaf : Leaves)
-                        if (Leaf->TrySetLod(Predicted, ThresholdSq, MergeThresholdSq, FOVScale))
-                            bAnyChanged = true;
-
-                    if (bAnyChanged)
-                    {
-                        AllChunkLeaves[idx].Reset();
-                        FOceanQuadTreeNode::CollectLeaves(ChunkNode, AllChunkLeaves[idx]);
-                        ChunkTreeChanged[idx] = true;
-                    }
-                    else
-                    {
-                        AllChunkLeaves[idx] = MoveTemp(Leaves);
-                    }
-                });
-
-            if (Self->InitGeneration != CapturedGen) { Self->bLodUpdateRunning = false; return; }
-
-            // Phase 2: Neighbor stitch — CheckNeighbors now has no HasGenerated guard
-            TArray<bool> ChunkEdgeChanged;
-            ChunkEdgeChanged.SetNumZeroed(NumChunks);
-
-            ParallelFor(NumChunks, [&](int32 idx)
-                {
-                    if (Self->InitGeneration != CapturedGen) return;
-                    bool bAnyEdgeChanged = false;
-                    for (auto& Leaf : AllChunkLeaves[idx])
-                        if (Leaf->CheckNeighbors(RootsPin))
-                            bAnyEdgeChanged = true;
-                    ChunkEdgeChanged[idx] = bAnyEdgeChanged;
-                });
-
-            if (Self->InitGeneration != CapturedGen) { Self->bLodUpdateRunning = false; return; }
-
-            // Phase 3: Rebuild stream data for changed chunks
-            ParallelFor(NumChunks, [&](int32 idx)
-                {
-                    if (Self->InitGeneration != CapturedGen) return;
-                    if (ChunkTreeChanged[idx] || ChunkEdgeChanged[idx])
-                        RebuildChunkStreamData(MeshChunks[idx], ChunkNodes[idx], CompPin, Grid, GridRes);
-                });
-
-            Self->bLodUpdateRunning = false;
-
-            // Phase 4: Game-thread component updates
-            TArray<TSharedPtr<FOceanMeshChunk>> DirtyChunks;
-            for (int32 idx = 0; idx < NumChunks; ++idx)
-                if (MeshChunks[idx]->IsDirty)
-                    DirtyChunks.Add(MeshChunks[idx]);
-
-            AsyncTask(ENamedThreads::GameThread, [WeakThis, DirtyChunks, CapturedGen]()
-                {
-                    AOceanSphereActor* Self = WeakThis.Get();
-                    if (!Self || Self->bIsDestroyed || Self->InitGeneration != CapturedGen) return;
-
-                    int32 NumInitThisFrame = 0;
-                    const int32 MaxInitPerFrame = 32;
-
-                    for (auto& Chunk : DirtyChunks)
-                    {
-                        if (!Chunk.IsValid()) continue;
-
-                        if (!Chunk->IsInitialized)
-                        {
-                            if (NumInitThisFrame >= MaxInitPerFrame) continue;
-                            AOceanSphereActor* OwnerPtr = Chunk->CachedOwner.Get();
-                            if (!OwnerPtr) continue;
-                            Chunk->InitializeComponent(OwnerPtr);
-                            NumInitThisFrame++;
-                        }
-
-                        URealtimeMeshSimple* MeshPtr = Chunk->ChunkRtMesh.Get();
-                        if (!MeshPtr || !Chunk->IsDirty) continue;
-
-                        auto* InnerTriStream = Chunk->InnerMeshData->MeshStream.Find(FRealtimeMeshStreams::Triangles);
-                        if (InnerTriStream && InnerTriStream->Num() > 0)
-                        {
-                            MeshPtr->UpdateBufferSet(Chunk->InnerMeshData->MeshGroupKey, Chunk->InnerMeshData->MeshStream);
-                            FRealtimeMeshSectionConfig Config(0);
-                            MeshPtr->UpdateSectionConfig(Chunk->InnerMeshData->MeshSectionKey, Config, false); // no collision: the ocean has none
-                        }
-                        else
-                            MeshPtr->UpdateBufferSet(Chunk->InnerMeshData->MeshGroupKey, FRealtimeMeshStreamSet());
-
-                        auto* EdgeTriStream = Chunk->EdgeMeshData->MeshStream.Find(FRealtimeMeshStreams::Triangles);
-                        if (EdgeTriStream && EdgeTriStream->Num() > 0)
-                        {
-                            MeshPtr->UpdateBufferSet(Chunk->EdgeMeshData->MeshGroupKey, Chunk->EdgeMeshData->MeshStream);
-                            FRealtimeMeshSectionConfig Config(0);
-                            Config.bCastsShadow = false;
-                            MeshPtr->UpdateSectionConfig(Chunk->EdgeMeshData->MeshSectionKey, Config, false); // no collision: the ocean has none
-                        }
-                        else
-                            MeshPtr->UpdateBufferSet(Chunk->EdgeMeshData->MeshGroupKey, FRealtimeMeshStreamSet());
-
-                        Chunk->IsDirty = false;
-                    }
-
-                    if (UWorld* W = Self->GetWorld())
-                        W->GetTimerManager().SetTimer(
-                            Self->LodTimerHandle, Self,
-                            &AOceanSphereActor::RunLodUpdateTask,
-                            (float)Self->MinLodInterval, false);
-                });
-
-        }, TStatId(), nullptr, ENamedThreads::AnyNormalThreadHiPriTask);
+    Surface->Tick(CameraPosition);
 }
