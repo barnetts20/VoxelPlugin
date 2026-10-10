@@ -6,7 +6,9 @@
 // Stage O2: the terrain depth under every vertex (the planet density with the terrain's
 // edits), the land cull and a test wave. Stage O3: the view from under water (a render-graph
 // pass per ocean from a view extension, FVoxelUnderwaterViewExtension), the water's optics,
-// and height queries. The wave and query interfaces come in stage O4.
+// and height queries. Stage O4: the wave model interface (VoxelOceanWaves.h, the GPU hook in
+// VoxelOceanWaves.ush), the surface query on any thread, the ocean clock, and the environment
+// inputs (wind, storm) the atmosphere will provide.
 
 #pragma once
 
@@ -14,6 +16,8 @@
 #include "RealtimeMeshActor.h"
 #include "FDensitySampleCompositor.h"
 #include "VoxelDensity.h"
+#include "VoxelOceanWaves.h"
+#include "HAL/CriticalSection.h"
 #include "OceanSphereActor.generated.h"
 
 class FVoxelOceanSurface;
@@ -144,16 +148,51 @@ public:
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Ocean|Optics")
     FLinearColor MeniscusColor = FLinearColor(0.02f, 0.06f, 0.08f);
 
-    // --- Queries ---
+    // --- Environment (constants until the atmosphere provides fields) ---
 
-    /** The height (cm) of a world point above the drawn surface (the sea sphere and the test
-     *  wave while it is on); negative under water. Game thread. */
+    /** Wind speed (m/s) everywhere on this ocean. The waves receive it per point; the test
+     *  model ignores it. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Ocean|Environment", meta = (ClampMin = "0.0", UIMax = "40.0"))
+    double WindSpeed = 8.0;
+
+    /** Wind heading (degrees from local north toward east; north is the planet's +Z). */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Ocean|Environment", meta = (UIMin = "0.0", UIMax = "360.0"))
+    double WindHeading = 0.0;
+
+    /** Storm intensity, 0-1. The waves receive it per point; the test model ignores it. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Ocean|Environment", meta = (ClampMin = "0.0", ClampMax = "1.0"))
+    double StormIntensity = 0.0;
+
+    /** The ocean clock's rate against the game's (server) time. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Ocean|Environment", meta = (ClampMin = "0.0", UIMax = "4.0"))
+    double OceanTimeScale = 1.0;
+
+    // --- Queries (any thread for the C++ ones; Blueprint on the game thread) ---
+
+    /** The water surface at world points: height above it, the surface point on each point's
+     *  radial, its normal, the water's velocity, and (with EVoxelOceanQuery::Depth) the terrain
+     *  depth there. Any thread, no GPU: it reads the snapshot of the last tick (the same waves
+     *  as drawn, unfaded). Time < 0: the snapshot's clock. False (and the plain sphere) before
+     *  the ocean is initialized. */
+    bool QuerySurface(TConstArrayView<FVector> WorldPoints, TArrayView<FVoxelOceanSample> Out,
+        EVoxelOceanQuery Flags = EVoxelOceanQuery::None, double Time = -1.0) const;
+
+    /** QuerySurface for one point. */
+    UFUNCTION(BlueprintCallable, BlueprintPure, Category = "Ocean|Query")
+    FVoxelOceanSample QuerySurfaceAt(const FVector& WorldLocation, bool bWithDepth = false) const;
+
+    /** The height (cm) of a world point above the drawn surface; negative under water. */
     UFUNCTION(BlueprintCallable, BlueprintPure, Category = "Ocean|Query")
     double GetHeightAboveSurface(const FVector& WorldLocation) const;
 
-    /** True when the world point is under the drawn surface. Game thread. */
+    /** True when the world point is under the drawn surface. */
     UFUNCTION(BlueprintCallable, BlueprintPure, Category = "Ocean|Query")
     bool IsSubmerged(const FVector& WorldLocation) const;
+
+    /** The ocean clock (s): the game state's server time (the same on every machine) times
+     *  OceanTimeScale; the world's time without a game state (the editor). Game thread. */
+    UFUNCTION(BlueprintCallable, BlueprintPure, Category = "Ocean|Query")
+    double GetOceanTime() const;
 
     // --- Accessors ---
 
@@ -211,6 +250,10 @@ private:
     /** The view from under water: one view extension per ocean, fed every tick. */
     TSharedPtr<FVoxelUnderwaterViewExtension, ESPMode::ThreadSafe> UnderwaterExtension;
 
+    /** The last tick's waves for the queries, swapped whole under QueryLock. */
+    TSharedPtr<const FVoxelOceanWaveFrame, ESPMode::ThreadSafe> QueryFrame;
+    mutable FRWLock QueryLock;
+
     /** The density (shared with the terrain when planet-owned); the terrain depth reads it from
      *  stage O2. */
     TSharedPtr<FDensitySampleCompositor> Compositor;
@@ -249,6 +292,12 @@ private:
     void ReleaseUnderwater();
     /** The optics properties on the surface material instance (Single Layer Water). */
     void ApplyOptics();
+    /** The environment constants from the properties. */
+    FVoxelOceanEnvironment GetEnvironment() const;
+    /** Publishes this tick's waves to the queries (and the underwater pass). */
+    void PublishWaveFrame();
+    /** voxel.Debug.OceanQuery: query points around the camera drawn on the surface. */
+    void DrawQueryDebug() const;
     FVector LastInitScale = FVector::ZeroVector;
 
     /** Cached scale set by the planet actor, used by the transform guard. */

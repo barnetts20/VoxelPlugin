@@ -11,10 +11,25 @@
 #include "Materials/MaterialInstanceDynamic.h"
 #include "MaterialDomain.h"
 #include "Misc/App.h"
+#include "Misc/ScopeRWLock.h"
 #include "RenderingThread.h"
 #include "SceneViewExtension.h"
+#include "DrawDebugHelpers.h"
+#include "Engine/World.h"
+#include "GameFramework/GameStateBase.h"
+#include "HAL/IConsoleManager.h"
 
 DECLARE_CYCLE_STAT(TEXT("Ocean: actor tick"), STAT_VoxelOceanActorTick, STATGROUP_VoxelTerrain);
+
+static TAutoConsoleVariable<int32> CVarVoxelDebugOceanQuery(
+    TEXT("voxel.Debug.OceanQuery"), 0,
+    TEXT("N > 0: a (2N + 1) x (2N + 1) grid of QuerySurface points around the camera, drawn where the query puts the surface (green; red where it folds or the search didn't settle), with their normals (blue) and velocities (yellow)."),
+    ECVF_Default);
+
+static TAutoConsoleVariable<float> CVarVoxelDebugOceanQuerySpacing(
+    TEXT("voxel.Debug.OceanQuerySpacing"), 150.0f,
+    TEXT("Spacing (cm) of the voxel.Debug.OceanQuery grid."),
+    ECVF_Default);
 
 namespace OceanSphereActorDetail
 {
@@ -60,6 +75,10 @@ void AOceanSphereActor::BeginPlay()
 void AOceanSphereActor::EndPlay(const EEndPlayReason::Type EndPlayReason)
 {
     ReleaseUnderwater();
+    {
+        FWriteScopeLock Lock(QueryLock);
+        QueryFrame.Reset();
+    }
     UnbindTerrain();
     if (Surface.IsValid())
         Surface->Reset();
@@ -70,6 +89,10 @@ void AOceanSphereActor::EndPlay(const EEndPlayReason::Type EndPlayReason)
 void AOceanSphereActor::Destroyed()
 {
     ReleaseUnderwater();
+    {
+        FWriteScopeLock Lock(QueryLock);
+        QueryFrame.Reset();
+    }
     UnbindTerrain();
     if (Surface.IsValid())
         Surface->Reset();
@@ -115,8 +138,16 @@ void AOceanSphereActor::PostEditChangeProperty(FPropertyChangedEvent& PropertyCh
     if (PropName == GET_MEMBER_NAME_CHECKED(AOceanSphereActor, bCullUnderLand))
         return;
 
-    // The underwater pass reads the switch and the optics every tick.
-    if (PropName == GET_MEMBER_NAME_CHECKED(AOceanSphereActor, bUnderwaterView))
+    // The underwater pass reads the switch and the optics every tick, the waves the environment
+    // and the clock.
+    static const TSet<FName> TickProps = {
+        GET_MEMBER_NAME_CHECKED(AOceanSphereActor, bUnderwaterView),
+        GET_MEMBER_NAME_CHECKED(AOceanSphereActor, WindSpeed),
+        GET_MEMBER_NAME_CHECKED(AOceanSphereActor, WindHeading),
+        GET_MEMBER_NAME_CHECKED(AOceanSphereActor, StormIntensity),
+        GET_MEMBER_NAME_CHECKED(AOceanSphereActor, OceanTimeScale),
+    };
+    if (TickProps.Contains(PropName))
         return;
     // Optics apply live (struct members report the struct as the member property).
     static const TSet<FName> OpticsProps = {
@@ -258,10 +289,18 @@ void AOceanSphereActor::UpdateUnderwater()
         bVisible = bVisible && !IsHiddenEd();
 #endif
     FVoxelUnderwaterParams Params;
-    const bool bOn = bUnderwaterView && bVisible && bInitialized && Surface.IsValid() && Surface->GetWaveFrame(Params.Waves);
+    TSharedPtr<const FVoxelOceanWaveFrame, ESPMode::ThreadSafe> Frame;
+    {
+        FReadScopeLock Lock(QueryLock);
+        Frame = QueryFrame;
+    }
+    const bool bOn = bUnderwaterView && bVisible && bInitialized && Frame.IsValid();
     UnderwaterExtension->SetEnabled(bOn);
     if (!bOn) return;
 
+    // The render thread needs the waves, not the density.
+    Params.Waves = *Frame;
+    Params.Waves.Density.Reset();
     Params.Absorption = FVector3f(Absorption.R, Absorption.G, Absorption.B);
     Params.Scattering = FVector3f(Scattering.R, Scattering.G, Scattering.B);
     Params.Light = FVector3f(UnderwaterLight.R, UnderwaterLight.G, UnderwaterLight.B);
@@ -282,16 +321,123 @@ void AOceanSphereActor::ReleaseUnderwater()
     UnderwaterExtension.Reset();
 }
 
+bool AOceanSphereActor::QuerySurface(TConstArrayView<FVector> WorldPoints, TArrayView<FVoxelOceanSample> Out,
+    EVoxelOceanQuery Flags, double Time) const
+{
+    const int32 Count = FMath::Min(WorldPoints.Num(), Out.Num());
+    TSharedPtr<const FVoxelOceanWaveFrame, ESPMode::ThreadSafe> Frame;
+    {
+        FReadScopeLock Lock(QueryLock);
+        Frame = QueryFrame;
+    }
+    if (!Frame.IsValid() || Frame->Radius() <= 0.0)
+    {
+        // Not initialized: the plain sphere around the actor on the game thread (the actor's
+        // state isn't safe to read elsewhere); elsewhere far above any water, so a caller that
+        // ignores the result applies no buoyancy.
+        const bool bGameThread = IsInGameThread();
+        for (int32 i = 0; i < Count; i++)
+        {
+            Out[i] = FVoxelOceanSample();
+            Out[i].Height = bGameThread ? (WorldPoints[i] - GetActorLocation()).Size() - OceanRadius : VoxelOceanWaves::Deep;
+        }
+        return false;
+    }
+
+    // World to the planet frame and back through the snapshot's transform.
+    TArray<FVector, TInlineAllocator<16>> Points;
+    Points.SetNumUninitialized(Count);
+    for (int32 i = 0; i < Count; i++)
+        Points[i] = Frame->PlanetToWorld.InverseTransformPositionNoScale(WorldPoints[i]);
+    VoxelOceanQuery::Run(*Frame, Points, Out.Slice(0, Count), Flags, Time);
+    for (int32 i = 0; i < Count; i++)
+    {
+        FVoxelOceanSample& S = Out[i];
+        S.SurfaceLocation = Frame->PlanetToWorld.TransformPositionNoScale(S.SurfaceLocation);
+        S.Normal = Frame->PlanetToWorld.TransformVectorNoScale(S.Normal);
+        S.Velocity = Frame->PlanetToWorld.TransformVectorNoScale(S.Velocity);
+    }
+    return true;
+}
+
+FVoxelOceanSample AOceanSphereActor::QuerySurfaceAt(const FVector& WorldLocation, bool bWithDepth) const
+{
+    FVoxelOceanSample Sample;
+    QuerySurface(MakeArrayView(&WorldLocation, 1), MakeArrayView(&Sample, 1),
+        bWithDepth ? EVoxelOceanQuery::Depth : EVoxelOceanQuery::None);
+    return Sample;
+}
+
 double AOceanSphereActor::GetHeightAboveSurface(const FVector& WorldLocation) const
 {
-    const FTransform NoScaleTransform(GetActorRotation(), GetActorLocation());
-    const FVector Point = NoScaleTransform.InverseTransformPosition(WorldLocation);
-    return Surface.IsValid() ? Surface->HeightAboveSurface(Point) : Point.Size() - OceanRadius;
+    return QuerySurfaceAt(WorldLocation, false).Height;
 }
 
 bool AOceanSphereActor::IsSubmerged(const FVector& WorldLocation) const
 {
     return GetHeightAboveSurface(WorldLocation) < 0.0;
+}
+
+double AOceanSphereActor::GetOceanTime() const
+{
+    // The server's clock where there is one, so every machine draws and queries the same waves.
+    const UWorld* World = GetWorld();
+    if (!World) return 0.0;
+    const AGameStateBase* GameState = World->GetGameState();
+    const double Seconds = GameState ? (double)GameState->GetServerWorldTimeSeconds() : (double)World->GetTimeSeconds();
+    return Seconds * FMath::Max(OceanTimeScale, 0.0);
+}
+
+FVoxelOceanEnvironment AOceanSphereActor::GetEnvironment() const
+{
+    FVoxelOceanEnvironment Environment;
+    Environment.WindSpeed = FMath::Max(WindSpeed, 0.0);
+    Environment.WindHeading = FMath::DegreesToRadians(WindHeading);
+    Environment.Storm = FMath::Clamp(StormIntensity, 0.0, 1.0);
+    return Environment;
+}
+
+void AOceanSphereActor::PublishWaveFrame()
+{
+    TSharedPtr<FVoxelOceanWaveFrame, ESPMode::ThreadSafe> Frame = MakeShared<FVoxelOceanWaveFrame, ESPMode::ThreadSafe>();
+    if (!Surface.IsValid() || !Surface->GetWaveFrame(*Frame)) return;
+    // Depth inputs and depth queries read the planet density (planet frame).
+    Frame->Density = Compositor;
+    FWriteScopeLock Lock(QueryLock);
+    QueryFrame = Frame;
+}
+
+void AOceanSphereActor::DrawQueryDebug() const
+{
+#if ENABLE_DRAW_DEBUG
+    const int32 N = FMath::Clamp(CVarVoxelDebugOceanQuery.GetValueOnGameThread(), 0, 32);
+    UWorld* World = GetWorld();
+    if (N <= 0 || !World || !bHasCamera) return;
+    // A grid on the sea sphere around the camera's foot, in the planet frame.
+    const double Spacing = FMath::Max(1.0, (double)CVarVoxelDebugOceanQuerySpacing.GetValueOnGameThread());
+    const FVector Up = CameraPosition.GetSafeNormal();
+    FVector E1, E2;
+    Up.FindBestAxisVectors(E1, E2);
+    const FTransform NoScaleTransform(GetActorRotation(), GetActorLocation());
+    TArray<FVector> Points;
+    for (int32 j = -N; j <= N; j++)
+    {
+        for (int32 i = -N; i <= N; i++)
+        {
+            const FVector Planet = (Up * OceanRadius + E1 * (i * Spacing) + E2 * (j * Spacing)).GetSafeNormal() * OceanRadius;
+            Points.Add(NoScaleTransform.TransformPosition(Planet));
+        }
+    }
+    TArray<FVoxelOceanSample> Samples;
+    Samples.SetNum(Points.Num());
+    if (!QuerySurface(Points, Samples)) return;
+    for (const FVoxelOceanSample& S : Samples)
+    {
+        DrawDebugPoint(World, S.SurfaceLocation, 8.0f, S.bAmbiguous ? FColor::Red : FColor::Green, false, -1.0f, SDPG_Foreground);
+        DrawDebugLine(World, S.SurfaceLocation, S.SurfaceLocation + S.Normal * 50.0, FColor::Blue, false, -1.0f, SDPG_Foreground);
+        DrawDebugLine(World, S.SurfaceLocation, S.SurfaceLocation + S.Velocity * 0.25, FColor::Yellow, false, -1.0f, SDPG_Foreground);
+    }
+#endif
 }
 
 void AOceanSphereActor::SetActorHiddenInGame(bool bNewHidden)
@@ -435,9 +581,11 @@ void AOceanSphereActor::Tick(float DeltaTime)
         BindTerrain(Terrain);
     Surface->SetInputs(GatherInputs(Terrain));
     Surface->Tick(CameraPosition);
+    PublishWaveFrame();
 
     // The view from under water: every view decides for itself on the render thread.
     UpdateUnderwater();
+    DrawQueryDebug();
 }
 
 AAdaptiveVoxelActor* AOceanSphereActor::FindTerrain() const
@@ -475,6 +623,8 @@ FVoxelOceanSurfaceInputs AOceanSphereActor::GatherInputs(const AAdaptiveVoxelAct
     FVoxelOceanSurfaceInputs Inputs;
     Inputs.Density.Density = GPUDensity;
     Inputs.LandCullMargin = bCullUnderLand ? AppliedLandCullMargin : -1.0;
+    Inputs.Time = GetOceanTime();
+    Inputs.Environment = GetEnvironment();
     if (Terrain && Terrain->ActualPrecision > 0.0)
     {
         // The terrain's lattice (its edit tree is addressed in it) and slope bound.

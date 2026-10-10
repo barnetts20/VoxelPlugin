@@ -19,6 +19,7 @@
 #include "CoreMinimal.h"
 #include "VoxelOceanTiles.h"
 #include "VoxelOceanPages.h"
+#include "VoxelOceanWaves.h"
 
 class AActor;
 class USceneComponent;
@@ -34,31 +35,9 @@ struct FVoxelOceanSurfaceInputs
     /** How far (cm) the land must stand above the sea, beyond what the slope bound allows for
      *  over a morphed triangle, before the triangle is culled. Negative: no cull. */
     double LandCullMargin = 500.0;
-};
-
-/** The waves of one frame, enough to evaluate them from any reference point: the selection
- *  camera for the surface material, each view's own camera for the underwater pass. Built by
- *  FVoxelOceanSurface::GetWaveFrame (game thread); a copy may go to the render thread. */
-struct VOXELPLUGIN_API FVoxelOceanWaveFrame
-{
-    /** The planet frame (the sea sphere's centre and rotation) in world space, without scale. */
-    FTransform PlanetToWorld = FTransform::Identity;
-    double Radius = 0.0;                  // sea sphere (cm)
-    double Amplitude = 0.0;               // per sine (cm); 0: no waves
-    FVector KPlanet[3] = { FVector::ZeroVector, FVector::ZeroVector, FVector::ZeroVector };   // rad/cm, planet frame
-    double Omega[3] = { 0.0, 0.0, 0.0 }; // rad/s
-    double Time = 0.0;                    // s
-
-    /** Sine Index as the shaders take it (VoxelOceanCommon.ush): k in world axes and the phase
-     *  at Reference (planet frame), formed and wrapped in double. Zero without waves. */
-    FVector4f ShaderWave(int32 Index, const FVector& Reference) const;
-
-    /** The height (cm) of a point (planet frame) above the surface, as the shaders compute
-     *  it: above the sphere, less the waves at its foot on the sphere, unfaded. */
-    double HeightAt(const FVector& Point) const;
-
-    /** The highest the waves reach above the sphere (cm). */
-    double MaxWaveHeight() const { return 3.0 * Amplitude; }
+    /** The ocean clock (s) and the environment constants, this frame (no rewrite on change). */
+    double Time = 0.0;
+    FVoxelOceanEnvironment Environment;
 };
 
 /** Inputs of the ocean surface, fixed until the next Initialize (LodDistanceFactor and the
@@ -90,18 +69,10 @@ public:
     /** Game thread. A new material instance for every page, without rebuilding. */
     void SetMaterial(UMaterialInstanceDynamic* InMaterial);
 
-    /** Game thread. The height (cm) of a point (planet frame) above the drawn surface: the sea
-     *  sphere and the waves (the test wave while voxel.Ocean.TestWaves is on), as the
-     *  shaders compute it. Negative under water. */
-    double HeightAboveSurface(const FVector& Point) const;
-
-    /** Game thread. This frame's waves (false before Initialize, or without an attach root). */
+    /** Game thread. This frame's waves: the planet frame, the clock, the environment and the
+     *  wave model (false before Initialize, or without an attach root). Density is left for
+     *  the caller. */
     bool GetWaveFrame(FVoxelOceanWaveFrame& Out) const;
-
-    /** The test wave's amplitude per sine (cm, 0 when off) and sine Index's planet-frame wave
-     *  vector and angular frequency (false when off). */
-    static double TestWaveAmplitude();
-    static bool TestWave(int32 Index, FVector& OutKPlanet, double& OutOmega);
 
     /** Game thread. A new LOD distance factor (clamped to MinLodDistanceFactor); the next
      *  selection follows it. */
@@ -133,8 +104,9 @@ private:
      *  the material instance. */
     void UpdateMaterial();
     void LogPerf(double Now);
-    /** The world's time (s), the waves' clock. */
-    double GetTime() const;
+    /** The wave model from the console's test settings (voxel.Ocean.TestWaves); a change of
+     *  its reach writes the tiles on screen again (the land cull allows for it). */
+    void UpdateWaveModel();
 
     TWeakObjectPtr<AActor> Owner;
     TWeakObjectPtr<USceneComponent> AttachRoot;
@@ -142,6 +114,9 @@ private:
     TUniquePtr<FVoxelOceanPages> Pages;
 
     FVoxelOceanSurfaceInputs Inputs;
+    /** Null: a flat sea. */
+    TSharedPtr<const IVoxelOceanWaveModel, ESPMode::ThreadSafe> WaveModel;
+    FVoxelOceanWavesTest::FSettings WaveSettings;
     bool bHasInputs = false;
     bool bRewriteAll = false;
     struct FPendingEdit
@@ -163,6 +138,7 @@ private:
     bool bFlipWinding = false;
     bool bAvailable = false;
     bool bReportedMaterial = false;
+    bool bReportedShape = false;
 
     struct FPerf
     {

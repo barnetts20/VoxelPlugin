@@ -29,21 +29,6 @@ static TAutoConsoleVariable<int32> CVarVoxelOceanFlipWinding(
     TEXT("Reverses the ocean's triangle winding. A diagnostic: with 0 the ocean must be visible from above (and culled from below with a one-sided material). Rebuilds the ocean."),
     ECVF_Default);
 
-static TAutoConsoleVariable<int32> CVarVoxelOceanTestWaves(
-    TEXT("voxel.Ocean.TestWaves"), 0,
-    TEXT("1: a test wave on the ocean (three sines, voxel.Ocean.TestWaveHeight and voxel.Ocean.TestWaveLength), to check the surface under displacement. Needs the O2 material wiring."),
-    ECVF_Default);
-
-static TAutoConsoleVariable<float> CVarVoxelOceanTestWaveHeight(
-    TEXT("voxel.Ocean.TestWaveHeight"), 100.0f,
-    TEXT("Amplitude of each of the test wave's three sines (cm)."),
-    ECVF_Default);
-
-static TAutoConsoleVariable<float> CVarVoxelOceanTestWaveLength(
-    TEXT("voxel.Ocean.TestWaveLength"), 3000.0f,
-    TEXT("Wavelength of the test wave's longest sine (cm); the others are 0.61 and 0.37 of it."),
-    ECVF_Default);
-
 static TAutoConsoleVariable<int32> CVarVoxelDebugOcean(
     TEXT("voxel.Debug.Ocean"), 0,
     TEXT("Once a second: the ocean's tiles, pages, commits and their waits."),
@@ -56,16 +41,13 @@ namespace VoxelOceanSurfaceDetail
     const FName ParamsName(TEXT("VoxelOceanParams"));
     const FName WaveNames[3] = { FName(TEXT("VoxelOceanWave0")), FName(TEXT("VoxelOceanWave1")), FName(TEXT("VoxelOceanWave2")) };
     const FName CenterName(TEXT("VoxelOceanCenter"));
+    const FName ShapeName(TEXT("VoxelOceanShape"));
     constexpr double Hysteresis = 1.1;
     constexpr int32 ParallelBuildTiles = 8;        // fewer tiles are built on the game thread
     /** How far a point of a drawn triangle can be from the vertices whose depth culls it, in
      *  tile spacings: the triangle itself, and its corners' morph to the grandparent grid. */
     constexpr double CullReachSpacings = 6.0;
     constexpr double NoCull = 3.0e38;
-    constexpr double Gravity = 980.665;            // cm/s^2, the test wave's dispersion
-    /** The test wave: fixed planet directions and wavelengths relative to the longest. */
-    const FVector TestWaveDirections[3] = { FVector(0.97, 0.29, -0.19), FVector(-0.36, 0.89, 0.27), FVector(0.18, -0.53, 0.83) };
-    constexpr double TestWaveScales[3] = { 1.0, 0.61, 0.37 };
 }
 
 namespace VOS = VoxelOceanSurfaceDetail;
@@ -88,6 +70,7 @@ void FVoxelOceanSurface::Initialize(AActor* InOwner, USceneComponent* InAttachRo
     Settings.TileQuads = 1 << FMath::Clamp(FMath::RoundToInt(FMath::Log2((double)FMath::Max(Settings.TileQuads, 1))), 3, 5);
     bFlipWinding = CVarVoxelOceanFlipWinding.GetValueOnGameThread() > 0;
     bReportedMaterial = false;
+    bReportedShape = false;
     // A server, or a commandlet, draws nothing.
     bAvailable = FApp::CanEverRender() && InOwner && InAttachRoot && Settings.Radius > 0.0;
     if (!bAvailable) return;
@@ -146,6 +129,7 @@ void FVoxelOceanSurface::SetMaterial(UMaterialInstanceDynamic* InMaterial)
 {
     Settings.Material = InMaterial;
     bReportedMaterial = false;
+    bReportedShape = false;
     if (Pages.IsValid())
         Pages->SetMaterial(InMaterial);
     UpdateMaterial();
@@ -185,7 +169,10 @@ void FVoxelOceanSurface::BuildWrites(TConstArrayView<FVoxelOceanTileKey> Tiles, 
     const double MinFootprint = Inputs.Density.Density.IsValid() ? Inputs.Density.Density->MinFootprint : 0.0;
     const double SlopeBound = FMath::Max(Inputs.SlopeBound, 0.0);
     const double Margin = Inputs.LandCullMargin;
-    ParallelFor(Tiles.Num(), [&Tiles, &Out, Quads, Radius, HalfFinest, MinFootprint, SlopeBound, Margin](int32 Index)
+    // The waves reach up and sideways over land the cull would otherwise leave dry.
+    const double WaveHeight = WaveModel.IsValid() ? WaveModel->MaxHeight() : 0.0;
+    const double WaveReach = WaveModel.IsValid() ? WaveModel->MaxHorizontal() : 0.0;
+    ParallelFor(Tiles.Num(), [&Tiles, &Out, Quads, Radius, HalfFinest, MinFootprint, SlopeBound, Margin, WaveHeight, WaveReach](int32 Index)
         {
             TArray<VoxelOceanTiles::FTileVertex> Vertices;
             VoxelOceanTiles::BuildTile(Tiles[Index], Quads, Radius, Vertices);
@@ -197,7 +184,7 @@ void FVoxelOceanSurface::BuildWrites(TConstArrayView<FVoxelOceanTileKey> Tiles, 
             const double Spacing = VoxelOceanTiles::MaxSpacing(Vertices, Quads);
             Write.Footprint = (float)FMath::Max(Spacing, MinFootprint);
             Write.CullHeight = Margin < 0.0 ? (float)VOS::NoCull
-                : (float)(Margin + SlopeBound * (VOS::CullReachSpacings * Spacing + 2.0 * HalfFinest));
+                : (float)(Margin + WaveHeight + SlopeBound * (VOS::CullReachSpacings * Spacing + 2.0 * HalfFinest + WaveReach));
             Write.Words.SetNumUninitialized(Vertices.Num() * FVoxelOceanPages::VertexWords);
             for (int32 v = 0; v < Vertices.Num(); v++)
             {
@@ -262,6 +249,9 @@ void FVoxelOceanSurface::ApplyRewrites()
 
 void FVoxelOceanSurface::Tick(const FVector& Camera)
 {
+    // The waves before anything drawn: a server has no pages but answers queries with the same
+    // waves as every client.
+    UpdateWaveModel();
     if (!bAvailable || !Pages.IsValid()) return;
     const double Now = FPlatformTime::Seconds();
     Perf.Frames++;
@@ -382,50 +372,21 @@ void FVoxelOceanSurface::Tick(const FVector& Camera)
     LogPerf(Now);
 }
 
-bool FVoxelOceanSurface::TestWave(int32 Index, FVector& OutKPlanet, double& OutOmega)
+void FVoxelOceanSurface::UpdateWaveModel()
 {
-    // Per sine: k along a fixed planet direction, deep water dispersion omega = sqrt(g k).
-    if (CVarVoxelOceanTestWaves.GetValueOnGameThread() <= 0 || Index < 0 || Index >= 3) return false;
-    const double Length = FMath::Max(10.0, (double)CVarVoxelOceanTestWaveLength.GetValueOnGameThread());
-    const double K = 2.0 * UE_DOUBLE_PI / (Length * VOS::TestWaveScales[Index]);
-    OutKPlanet = VOS::TestWaveDirections[Index].GetSafeNormal() * K;
-    OutOmega = FMath::Sqrt(VOS::Gravity * K);
-    return true;
-}
-
-double FVoxelOceanSurface::TestWaveAmplitude()
-{
-    return CVarVoxelOceanTestWaves.GetValueOnGameThread() > 0 ? FMath::Max(0.0, (double)CVarVoxelOceanTestWaveHeight.GetValueOnGameThread()) : 0.0;
-}
-
-double FVoxelOceanSurface::GetTime() const
-{
-    const AActor* OwnerActor = Owner.Get();
-    const UWorld* World = OwnerActor ? OwnerActor->GetWorld() : nullptr;
-    return World ? (double)World->GetTimeSeconds() : 0.0;
-}
-
-FVector4f FVoxelOceanWaveFrame::ShaderWave(int32 Index, const FVector& Reference) const
-{
-    // k . (point - reference) is small and exact near the reference; the phase there carries
-    // the rest, in double.
-    if (Amplitude <= 0.0 || Index < 0 || Index >= 3) return FVector4f(0.0f, 0.0f, 0.0f, 0.0f);
-    const double Phase = FMath::Fmod((KPlanet[Index] | Reference) + Omega[Index] * Time, 2.0 * UE_DOUBLE_PI);
-    const FVector KWorld = PlanetToWorld.TransformVectorNoScale(KPlanet[Index]);
-    return FVector4f((float)KWorld.X, (float)KWorld.Y, (float)KWorld.Z, (float)Phase);
-}
-
-double FVoxelOceanWaveFrame::HeightAt(const FVector& Point) const
-{
-    // As VoxelOceanCommon.ush: above the sea sphere, less the waves at the point's foot on the
-    // sphere (they displace along the radial), unfaded.
-    const double Distance = Point.Size();
-    double Height = Distance - Radius;
-    if (Amplitude <= 0.0 || Distance <= 0.0) return Height;
-    const FVector Foot = Point * (Radius / Distance);
-    for (int32 w = 0; w < 3; w++)
-        Height -= Amplitude * FMath::Sin((KPlanet[w] | Foot) + Omega[w] * Time);
-    return Height;
+    const FVoxelOceanWavesTest::FSettings Next = FVoxelOceanWavesTest::ReadConsole();
+    if (WaveModel.IsValid() == (Next.Amplitude > 0.0) && Next == WaveSettings) return;
+    const double OldHeight = WaveModel.IsValid() ? WaveModel->MaxHeight() : 0.0;
+    const double OldReach = WaveModel.IsValid() ? WaveModel->MaxHorizontal() : 0.0;
+    WaveSettings = Next;
+    WaveModel.Reset();
+    if (Next.Amplitude > 0.0)
+        WaveModel = MakeShared<FVoxelOceanWavesTest, ESPMode::ThreadSafe>(Next);
+    const double NewHeight = WaveModel.IsValid() ? WaveModel->MaxHeight() : 0.0;
+    const double NewReach = WaveModel.IsValid() ? WaveModel->MaxHorizontal() : 0.0;
+    // The land cull allows for the waves' reach (BuildWrites).
+    if (Inputs.LandCullMargin >= 0.0 && (OldHeight != NewHeight || OldReach != NewReach))
+        bRewriteAll |= Committed.Num() > 0;
 }
 
 bool FVoxelOceanSurface::GetWaveFrame(FVoxelOceanWaveFrame& Out) const
@@ -436,22 +397,11 @@ bool FVoxelOceanSurface::GetWaveFrame(FVoxelOceanWaveFrame& Out) const
     const FTransform& RootTransform = Root->GetComponentTransform();
     Out = FVoxelOceanWaveFrame();
     Out.PlanetToWorld = FTransform(RootTransform.GetRotation(), RootTransform.GetLocation());
-    Out.Radius = Settings.Radius;
-    Out.Time = GetTime();
-    const double Amplitude = TestWaveAmplitude();
-    for (int32 w = 0; w < 3 && Amplitude > 0.0; w++)
-    {
-        if (!TestWave(w, Out.KPlanet[w], Out.Omega[w])) return true;
-    }
-    Out.Amplitude = Amplitude;
+    Out.Context.Time = Inputs.Time;
+    Out.Context.Radius = Settings.Radius;
+    Out.Context.Environment = Inputs.Environment;
+    Out.Model = WaveModel;
     return true;
-}
-
-double FVoxelOceanSurface::HeightAboveSurface(const FVector& Point) const
-{
-    FVoxelOceanWaveFrame Frame;
-    if (GetWaveFrame(Frame)) return Frame.HeightAt(Point);
-    return Point.Size() - Settings.Radius;
 }
 
 void FVoxelOceanSurface::UpdateMaterial()
@@ -475,17 +425,17 @@ void FVoxelOceanSurface::UpdateMaterial()
 
     Material->SetVectorParameterValue(VOS::CameraHighName, FLinearColor(High.X, High.Y, High.Z, 0.0f));
     Material->SetVectorParameterValue(VOS::CameraLowName, FLinearColor((float)Low.X, (float)Low.Y, (float)Low.Z, 0.0f));
-    Material->SetVectorParameterValue(VOS::ParamsName, FLinearColor((float)Mode, (float)StartFraction, (float)Frame.Amplitude, (float)SpacingPerMorphEnd));
+    // The waves from the selection camera (the underwater pass forms the same from each view's
+    // camera).
+    FVoxelOceanWaveShaderParams Waves;
+    Frame.ShaderParams(SelectionCamera, Waves);
+    Material->SetVectorParameterValue(VOS::ParamsName, FLinearColor((float)Mode, (float)StartFraction, Waves.Amplitude, (float)SpacingPerMorphEnd));
     Material->SetVectorParameterValue(VOS::CenterName, FLinearColor((float)Center.X, (float)Center.Y, (float)Center.Z, 0.0f));
-    // The test wave from the selection camera (the underwater pass forms the same from each
-    // view's camera).
-    if (Frame.Amplitude > 0.0)
+    Material->SetVectorParameterValue(VOS::ShapeName, FLinearColor(Waves.Shape.X, Waves.Shape.Y, Waves.Shape.Z, Waves.Shape.W));
+    if (Waves.Amplitude > 0.0f)
     {
         for (int32 w = 0; w < 3; w++)
-        {
-            const FVector4f Wave = Frame.ShaderWave(w, SelectionCamera);
-            Material->SetVectorParameterValue(VOS::WaveNames[w], FLinearColor(Wave.X, Wave.Y, Wave.Z, Wave.W));
-        }
+            Material->SetVectorParameterValue(VOS::WaveNames[w], FLinearColor(Waves.Wave[w].X, Waves.Wave[w].Y, Waves.Wave[w].Z, Waves.Wave[w].W));
     }
 
     if (!bReportedMaterial)
@@ -510,6 +460,17 @@ void FVoxelOceanSurface::UpdateMaterial()
                 *GetNameSafe(Parent));
         }
         bReportedMaterial = true;
+    }
+    if (!bReportedShape && Waves.Amplitude > 0.0f)
+    {
+        FLinearColor Probe;
+        UMaterialInterface* Parent = Material->Parent;
+        if (Parent && !Parent->GetVectorParameterValue(FHashedMaterialParameterInfo(VOS::ShapeName), Probe))
+        {
+            UE_LOG(LogVoxelPlugin, Log, TEXT("[VoxelOcean] %s has no vector parameter VoxelOceanShape: the waves move only up and down (stage O4 notes, material setup)."),
+                *GetNameSafe(Parent));
+        }
+        bReportedShape = true;
     }
 }
 

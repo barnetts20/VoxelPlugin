@@ -19,30 +19,20 @@
 //    shows that scene colour, less the Fresnel reflection; outside, total internal reflection
 //    shows the water below. The normal there includes the waves.
 //
-// Positions are from the view's camera (the reference point): Center is the planet centre from
+// Positions are from the view's camera (the reference point): W.Center is the planet centre from
 // it, Sphere = (sea radius, the camera's height above the sphere), both formed in double on the
-// CPU. Heights come from the stable sphere formula (VoxelOceanSphereHeight), so the waterline is
-// exact to well under a millimetre at the near plane.
+// CPU. Heights come from the stable sphere formula (VoxelOceanSphereHeight) less the waves at
+// the surface point above (VoxelOceanHeightAt, the wave hook), so the waterline is exact to
+// well under a millimetre at the near plane, horizontal displacement included.
 
 #pragma once
 
-#include "/Plugin/VoxelPlugin/Private/VoxelOceanCommon.ush"
+#include "/Plugin/VoxelPlugin/Private/VoxelOceanWaves.ush"
 
 // An exit distance meaning the ray doesn't leave the water nearby.
 #define VOXEL_UNDERWATER_NO_EXIT 3.0e38f
 // The scene distance of a pixel showing nothing (the sky).
 #define VOXEL_UNDERWATER_FAR 1.0e30f
-
-// The height (cm) of D (from the reference point) above the displaced surface: above the
-// sphere, less the waves at its foot on the sphere (the waves displace along the radial, so
-// this is exact for them). Up is the reference point's radial.
-float VoxelUnderwaterHeightAt(float3 D, float2 Sphere, float3 Up, float3 Center, float4 Params, float4 Wave0, float4 Wave1, float4 Wave2)
-{
-    const float Height = VoxelOceanSphereHeight(D, Sphere.x, Sphere.y, Up);
-    if (Params.z <= 0.0f) return Height;
-    const float3 Foot = D - normalize(D - Center) * Height;
-    return Height - VoxelOceanTestHeight(Foot, Params, Wave0, Wave1, Wave2, 0.0f);
-}
 
 // Where along Dir a ray from a point at sphere height Height (cm, from the planet centre O,
 // B = O . Dir) leaves the sphere of radius R + Offset from inside it: the stable root of
@@ -55,30 +45,36 @@ float VoxelUnderwaterShellExit(float B, float Height, float Radius, float Offset
 }
 
 // How far from Start (below the surface) along Dir the ray leaves through the surface;
-// VOXEL_UNDERWATER_NO_EXIT when it doesn't nearby (it heads down into deep water). Up is the
-// reference point's radial (VoxelOceanSphereHeight's reference). Without waves it is the
-// sphere's stable root. With them the surface lies in a shell of +-MaxHeight around the
-// sphere: the ray is marched across that shell (16 steps, denser near the start; a ray heading
-// down stops where it dives below the shell) and the first crossing is bisected. Inside Snell's
-// window the exit is within a centimetre of the first crossing; a grazing ray may skip a crest
-// tip it only clips, where total internal reflection shows the water colour either way.
-float VoxelUnderwaterExit(float3 Start, float3 Dir, float2 Sphere, float3 Up, float3 Center,
-    float4 Params, float4 Wave0, float4 Wave1, float4 Wave2)
+// VOXEL_UNDERWATER_NO_EXIT when it doesn't nearby (it heads down into deep water). Without
+// waves it is the sphere's stable root. With them the surface lies in a shell of +-MaxHeight
+// around the sphere (VoxelOceanMaxHeight): the ray is marched across that shell (16 steps,
+// denser near the start; a ray heading down stops where it dives below the shell) and the first
+// crossing is bisected. Inside Snell's window the exit is within a centimetre of the first
+// crossing; a grazing ray may skip a crest tip it only clips, where total internal reflection
+// shows the water colour either way. OutSurface receives the waves where it leaves.
+float VoxelUnderwaterExit(float3 Start, float3 Dir, float2 Sphere, FVoxelOceanWaveParams W, out FVoxelOceanWaveOutput OutSurface)
 {
-    const float Height = VoxelOceanSphereHeight(Start, Sphere.x, Sphere.y, Up);
-    const float B = dot(Start - Center, Dir);
-    if (Params.z <= 0.0f) return VoxelUnderwaterShellExit(B, Height, Sphere.x, 0.0f);
+    const float Height = VoxelOceanSphereHeight(Start, Sphere.x, Sphere.y, normalize(-W.Center));
+    const float B = dot(Start - W.Center, Dir);
+    const float MaxHeight = VoxelOceanMaxHeight(W);
+    if (MaxHeight <= 0.0f)
+    {
+        const float T = VoxelUnderwaterShellExit(B, Height, Sphere.x, 0.0f);
+        VoxelOceanHeightAt(Start + Dir * T, Sphere, W, OutSurface);
+        return T;
+    }
 
-    const float MaxHeight = 3.0f * Params.z + 1.0f;
+    const float Shell = MaxHeight + 1.0f;
+    OutSurface = (FVoxelOceanWaveOutput)0;
     // Below the waves' shell and heading down: deep water all the way.
-    if (Height < -MaxHeight && B < 0.0f) return VOXEL_UNDERWATER_NO_EXIT;
-    const float Lower = Height < -MaxHeight ? VoxelUnderwaterShellExit(B, Height, Sphere.x, -MaxHeight) : 0.0f;
-    float Upper = max(VoxelUnderwaterShellExit(B, Height, Sphere.x, MaxHeight), Lower);
+    if (Height < -Shell && B < 0.0f) return VOXEL_UNDERWATER_NO_EXIT;
+    const float Lower = Height < -Shell ? VoxelUnderwaterShellExit(B, Height, Sphere.x, -Shell) : 0.0f;
+    float Upper = max(VoxelUnderwaterShellExit(B, Height, Sphere.x, Shell), Lower);
     // Heading down from inside the shell, the search ends where the ray dives below it (the
     // near root into the inner sphere, stable form); past that it is deep water.
-    if (Height >= -MaxHeight && B < 0.0f)
+    if (Height >= -Shell && B < 0.0f)
     {
-        const float Inner = (Height + MaxHeight) * (2.0f * Sphere.x + Height - MaxHeight);
+        const float Inner = (Height + Shell) * (2.0f * Sphere.x + Height - Shell);
         const float Disc = B * B - Inner;
         if (Disc >= 0.0f)
             Upper = min(Upper, Inner / max(sqrt(Disc) - B, 1.0e-6f));
@@ -86,12 +82,13 @@ float VoxelUnderwaterExit(float3 Start, float3 Dir, float2 Sphere, float3 Up, fl
     float Below = Lower;
     float Above = Upper;
     bool bFound = false;
+    FVoxelOceanWaveOutput Surface;
     [loop]
     for (int Step = 1; Step <= 16; Step++)
     {
         const float X = (float)Step / 16.0f;
         const float T = Lower + (Upper - Lower) * X * X;
-        if (VoxelUnderwaterHeightAt(Start + Dir * T, Sphere, Up, Center, Params, Wave0, Wave1, Wave2) > 0.0f)
+        if (VoxelOceanHeightAt(Start + Dir * T, Sphere, W, Surface) > 0.0f)
         {
             Above = T;
             bFound = true;
@@ -101,30 +98,31 @@ float VoxelUnderwaterExit(float3 Start, float3 Dir, float2 Sphere, float3 Up, fl
     }
     // No crossing before the ray dives below the shell: it stays in the water.
     if (!bFound) return VOXEL_UNDERWATER_NO_EXIT;
-    [unroll]
+    [loop]
     for (int Bisect = 0; Bisect < 6; Bisect++)
     {
         const float Mid = 0.5f * (Below + Above);
-        if (VoxelUnderwaterHeightAt(Start + Dir * Mid, Sphere, Up, Center, Params, Wave0, Wave1, Wave2) > 0.0f)
+        if (VoxelOceanHeightAt(Start + Dir * Mid, Sphere, W, Surface) > 0.0f)
             Above = Mid;
         else
             Below = Mid;
     }
-    return 0.5f * (Below + Above);
+    const float Exit = 0.5f * (Below + Above);
+    VoxelOceanHeightAt(Start + Dir * Exit, Sphere, W, OutSurface);
+    return Exit;
 }
 
 // The scene colour seen through the water along one pixel's ray from the reference point.
 // Dir: the ray (unit, world axes); NearDistance: to the near plane along it; SceneDistance: to
 // the scene point (VOXEL_UNDERWATER_FAR for the sky). Light and Meniscus.rgb are in the scene
-// colour's units (pre-exposed). Params.z is the test wave's amplitude (0: none).
+// colour's units (pre-exposed).
 float3 VoxelUnderwaterColor(float3 SceneColor, float3 Dir, float NearDistance, float SceneDistance, float2 Sphere,
-    float3 Center, float4 Params, float4 Wave0, float4 Wave1, float4 Wave2, float3 Absorption, float3 Scattering, float3 Light, float4 Meniscus)
+    FVoxelOceanWaveParams W, float3 Absorption, float3 Scattering, float3 Light, float4 Meniscus)
 {
-    const float3 Up = normalize(-Center);
-
     // The pixel's point on the near plane.
     const float3 Near = Dir * NearDistance;
-    const float NearHeight = VoxelUnderwaterHeightAt(Near, Sphere, Up, Center, Params, Wave0, Wave1, Wave2);
+    FVoxelOceanWaveOutput NearSurface;
+    const float NearHeight = VoxelOceanHeightAt(Near, Sphere, W, NearSurface);
     const float MeniscusMix = Meniscus.w > 0.0f ? 1.0f - saturate(abs(NearHeight) / Meniscus.w) : 0.0f;
     if (NearHeight > 0.0f)
         return lerp(SceneColor, Meniscus.rgb, MeniscusMix);
@@ -132,19 +130,17 @@ float3 VoxelUnderwaterColor(float3 SceneColor, float3 Dir, float NearDistance, f
     // Under water: the path through it, and what lies at its end.
     const float3 Extinction = max(Absorption + Scattering, 1.0e-6f);
     const float3 WaterColor = Light * Scattering / Extinction;
-    const float Exit = VoxelUnderwaterExit(Near, Dir, Sphere, Up, Center, Params, Wave0, Wave1, Wave2);
+    FVoxelOceanWaveOutput ExitSurface;
+    const float Exit = VoxelUnderwaterExit(Near, Dir, Sphere, W, ExitSurface);
     const bool bExits = NearDistance + Exit < SceneDistance;
     const float Path = max(bExits ? Exit : SceneDistance - NearDistance, 0.0f);
     float3 Behind = SceneColor;
     if (bExits)
     {
         // The underside: Snell's window (refraction into air, Fresnel from the water side), total
-        // internal reflection outside it.
-        const float3 P = Near + Dir * Exit;
-        const float3 U = normalize(P - Center);
-        float Variance;
-        const float3 Foot = P - U * VoxelOceanSphereHeight(P, Sphere.x, Sphere.y, Up);
-        const float3 N = VoxelOceanSurfaceNormal(U, VoxelOceanTestGradient(Foot, Params, Wave0, Wave1, Wave2, 0.0f, Variance));
+        // internal reflection outside it. The normal is the displaced surface's where the ray
+        // leaves.
+        const float3 N = ExitSurface.Normal;
         const float CosI = dot(Dir, N);
         const float SinT2 = 1.7769f * max(1.0f - CosI * CosI, 0.0f);   // (1.333 sin(i))^2
         float Fresnel = 1.0f;

@@ -12,6 +12,8 @@
 #include "ShaderCompilerCore.h"
 #include "ShaderParameterStruct.h"
 
+DECLARE_GPU_STAT(VoxelUnderwater);
+
 namespace VoxelUnderwaterDetail
 {
     constexpr int32 ThreadGroupSize = 8;
@@ -39,6 +41,7 @@ BEGIN_SHADER_PARAMETER_STRUCT(FVoxelUnderwaterParameters, )
     SHADER_PARAMETER(FVector4f, UnderwaterWave0)
     SHADER_PARAMETER(FVector4f, UnderwaterWave1)
     SHADER_PARAMETER(FVector4f, UnderwaterWave2)
+    SHADER_PARAMETER(FVector4f, UnderwaterShape)
 
     SHADER_PARAMETER(FVector3f, UnderwaterAbsorption)
     SHADER_PARAMETER(FVector3f, UnderwaterScattering)
@@ -141,7 +144,7 @@ FScreenPassTexture FVoxelUnderwaterViewExtension::Render_RenderThread(
     const FVoxelOceanWaveFrame& Waves = Params.Waves;
     const FVector ViewOrigin = View.ViewMatrices.GetViewOrigin();
     const FVector CameraPlanet = Waves.PlanetToWorld.InverseTransformPositionNoScale(ViewOrigin);
-    const double CameraHeight = CameraPlanet.Size() - Waves.Radius;
+    const double CameraHeight = CameraPlanet.Size() - Waves.Radius();
 
     // The pixel's ray: the jittered clip space (the depth buffer's) to the view, then the
     // view's rotation back to world axes; a point comes out relative to the camera.
@@ -157,7 +160,7 @@ FScreenPassTexture FVoxelUnderwaterViewExtension::Render_RenderThread(
         if (H.W > 0.0)
             NearReach = FMath::Max(NearReach, FVector(H.X, H.Y, H.Z).Size() / H.W);
     }
-    if (CameraHeight - Waves.MaxWaveHeight() - NearReach > FMath::Max(0.0f, Params.Meniscus.W) + VoxelUnderwaterDetail::ViewSlack)
+    if (CameraHeight - Waves.MaxHeight() - NearReach > FMath::Max(0.0f, Params.Meniscus.W) + VoxelUnderwaterDetail::ViewSlack)
     {
         return Inputs.ReturnUntouchedSceneColorForPostProcessing(GraphBuilder);
     }
@@ -171,7 +174,7 @@ FScreenPassTexture FVoxelUnderwaterViewExtension::Render_RenderThread(
         return Inputs.ReturnUntouchedSceneColorForPostProcessing(GraphBuilder);
     }
 
-    RDG_EVENT_SCOPE(GraphBuilder, "VoxelUnderwater");
+    RDG_EVENT_SCOPE_STAT(GraphBuilder, VoxelUnderwater, "VoxelUnderwater");
 
     // Into a new texture of the scene colour's size, written inside the view rect only: the
     // passes after this one read within it.
@@ -193,11 +196,14 @@ FScreenPassTexture FVoxelUnderwaterViewExtension::Render_RenderThread(
 
         // Formed here in double from this view's own camera.
         P->UnderwaterCenter = FVector3f(Waves.PlanetToWorld.GetLocation() - ViewOrigin);
-        P->UnderwaterSphere = FVector2f((float)Waves.Radius, (float)CameraHeight);
-        P->UnderwaterWaveAmplitude = (float)Waves.Amplitude;
-        P->UnderwaterWave0 = Waves.ShaderWave(0, CameraPlanet);
-        P->UnderwaterWave1 = Waves.ShaderWave(1, CameraPlanet);
-        P->UnderwaterWave2 = Waves.ShaderWave(2, CameraPlanet);
+        P->UnderwaterSphere = FVector2f((float)Waves.Radius(), (float)CameraHeight);
+        FVoxelOceanWaveShaderParams WaveParams;
+        Waves.ShaderParams(CameraPlanet, WaveParams);
+        P->UnderwaterWaveAmplitude = WaveParams.Amplitude;
+        P->UnderwaterWave0 = WaveParams.Wave[0];
+        P->UnderwaterWave1 = WaveParams.Wave[1];
+        P->UnderwaterWave2 = WaveParams.Wave[2];
+        P->UnderwaterShape = WaveParams.Shape;
 
         P->UnderwaterAbsorption = Params.Absorption;
         P->UnderwaterScattering = Params.Scattering;

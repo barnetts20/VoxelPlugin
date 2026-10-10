@@ -25,6 +25,7 @@ float UnderwaterWaveAmplitude;
 float4 UnderwaterWave0;
 float4 UnderwaterWave1;
 float4 UnderwaterWave2;
+float4 UnderwaterShape;
 
 float3 UnderwaterAbsorption;
 float3 UnderwaterScattering;
@@ -55,9 +56,10 @@ void UnderwaterCS(uint3 DispatchThreadId : SV_DispatchThreadID)
 
     // The water's light and the meniscus in the scene colour's (pre-exposed) units.
     const float PreExposure = View.PreExposure;
-    const float4 Params = float4(0.0f, 0.0f, UnderwaterWaveAmplitude, 0.0f);
-    const float3 Color = VoxelUnderwaterColor(Scene.rgb, Dir, NearDistance, SceneDistance, UnderwaterSphere, UnderwaterCenter,
-        Params, UnderwaterWave0, UnderwaterWave1, UnderwaterWave2, UnderwaterAbsorption, UnderwaterScattering,
-        UnderwaterLight * PreExposure, float4(UnderwaterMeniscus.rgb * PreExposure, UnderwaterMeniscus.w));
+    const FVoxelOceanWaveParams Waves = VoxelOceanMakeWaveParams(float4(0.0f, 0.0f, UnderwaterWaveAmplitude, 0.0f),
+        UnderwaterWave0, UnderwaterWave1, UnderwaterWave2, UnderwaterCenter, UnderwaterShape);
+    const float3 Color = VoxelUnderwaterColor(Scene.rgb, Dir, NearDistance, SceneDistance, UnderwaterSphere, Waves,
+        UnderwaterAbsorption, UnderwaterScattering, UnderwaterLight * PreExposure,
+        float4(UnderwaterMeniscus.rgb * PreExposure, UnderwaterMeniscus.w));
     UnderwaterOutput[Pixel] = float4(Color, Scene.a);
 }

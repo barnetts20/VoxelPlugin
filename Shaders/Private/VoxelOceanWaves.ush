@@ -1,0 +1,280 @@
+// VoxelOceanWaves.ush - The ocean's wave hook (Design/OceanMeshing.md section 4.2): the one place
+// the waves are defined on the GPU. The surface vertex shader (displacement), the surface pixel
+// shader (normal, unresolved slope) and the underwater pass (height above the surface, the
+// underside's normal) all call VoxelOceanWaves and VoxelOceanHeightAt; a wave model replaces
+// the bodies here and nothing else changes. Its C++ twin (IVoxelOceanWaveModel,
+// VoxelOceanWaves.h) evaluates the same function on the CPU for queries.
+//
+// Determinism: a wave is a function of the planet-frame position, the ocean clock (in the
+// phases) and the inputs below (depth, shore, environment), never of a camera or of history.
+//
+// Positions are from a reference point near the camera, in world axes and cm (the selection
+// camera for the surface, the view's camera for the underwater pass); the planet centre from it
+// is W.Center. Phases are formed at the reference point in double on the CPU, so k . P + phase
+// is small and exact near it.
+//
+// Inputs every model receives per point (FVoxelOceanWaveInput):
+// - Spacing: the mesh spacing there (the waves it may displace as geometry); Footprint: the
+//   pixel's (for the normal and the slope variance). 0: no limit.
+// - Depth: the terrain depth below the sea (cm, morphed with the vertex); VOXEL_OCEAN_DEEP where
+//   it isn't known (the pixel shader, the underwater pass).
+// - Shore: distance to the shore and the direction toward it (VoxelOceanShoreAt). Open water
+//   until a shore field is baked (a later stage); a model sampling it at the morphed point stays
+//   crack-free, as the depth does.
+// - Environment: wind (m/s along local east and north) and storm (0-1), from
+//   VoxelOceanEnvironmentAt: the ocean actor's constants now, the atmosphere's fields later.
+//   Whatever replaces it must be deterministic or replicated, so the CPU query agrees.
+//
+// Outputs (FVoxelOceanWaveOutput): the displacement (vertical along the radial plus horizontal,
+// world axes, cm), its vertical part, the normal of the displaced surface, the unresolved slope
+// variance (for the roughness), the surface's area ratio (Jacobian: 1 flat, below 1 compressed
+// toward a crest, 0 or below where it folds over: a breaking crest), and foam (reserved).
+//
+// The test model (voxel.Ocean.TestWaves): three Gerstner waves along fixed planet directions.
+// Wave i: height A sin(theta), horizontal C A cos(theta) along its tangent direction, theta =
+// k . P + phase; C (Shape.x) is clamped on the CPU so the sum of C A |k| stays below 0.95 (no
+// fold). Each wave is weighed by how well the spacing (displacement) or footprint (normal)
+// resolves it (VoxelOceanResolved).
+
+#pragma once
+
+#include "/Plugin/VoxelPlugin/Private/VoxelOceanCommon.ush"
+
+// A depth or shore distance meaning "none near" (cm).
+#define VOXEL_OCEAN_DEEP 1.0e30f
+// Newton steps of VoxelOceanHeightAt.
+#ifndef VOXEL_OCEAN_HEIGHT_STEPS
+#define VOXEL_OCEAN_HEIGHT_STEPS 3
+#endif
+
+// The frame's wave parameters, as the material and the pass receive them.
+struct FVoxelOceanWaveParams
+{
+    float4 Params;     // x: morph mode, y: morph start, z: test wave amplitude (cm, 0 off), w: spacing per morph end
+    float4 Wave0;      // per test wave: k (world axes, rad/cm), phase at the reference point
+    float4 Wave1;
+    float4 Wave2;
+    float3 Center;     // the planet centre from the reference point (world cm)
+    float4 Shape;      // x: horizontal displacement per amplitude (test choppiness), y: storm, z: wind speed (m/s), w: wind heading (rad from local north toward east)
+};
+
+FVoxelOceanWaveParams VoxelOceanMakeWaveParams(float4 Params, float4 Wave0, float4 Wave1, float4 Wave2, float3 Center, float4 Shape)
+{
+    FVoxelOceanWaveParams W;
+    W.Params = Params;
+    W.Wave0 = Wave0;
+    W.Wave1 = Wave1;
+    W.Wave2 = Wave2;
+    W.Center = Center;
+    W.Shape = Shape;
+    return W;
+}
+
+struct FVoxelOceanEnvironment
+{
+    float2 Wind;       // m/s along local (east, north)
+    float Storm;       // 0-1
+};
+
+struct FVoxelOceanShore
+{
+    float Distance;    // cm; VOXEL_OCEAN_DEEP: open water
+    float3 Direction;  // toward the shore (world axes, tangent); zero in open water
+};
+
+struct FVoxelOceanWaveInput
+{
+    float3 P;          // undisplaced point from the reference point
+    float3 Up;         // its radial
+    float Spacing;     // mesh spacing (cm), 0: no limit
+    float Footprint;   // pixel footprint (cm), 0: no limit
+    float Depth;       // terrain depth below the sea (cm), VOXEL_OCEAN_DEEP if unknown
+    FVoxelOceanShore Shore;
+    FVoxelOceanEnvironment Environment;
+};
+
+struct FVoxelOceanWaveOutput
+{
+    float3 Displacement;   // world axes, cm
+    float Height;          // its vertical part (cm, along Up)
+    float3 Normal;         // of the displaced surface (world)
+    float SlopeVariance;   // unresolved slope variance at the footprint
+    float Jacobian;        // area ratio of the displaced surface: <= 0 folds over (breaking)
+    float Foam;            // reserved, 0
+};
+
+// The environment at a point: the ocean actor's constants (Shape) until the atmosphere provides
+// fields. The wind is a tangent vector given by speed and heading in the local east-north frame.
+FVoxelOceanEnvironment VoxelOceanEnvironmentAt(float3 P, float3 Up, FVoxelOceanWaveParams W)
+{
+    FVoxelOceanEnvironment E;
+    E.Wind = W.Shape.z * float2(sin(W.Shape.w), cos(W.Shape.w));
+    E.Storm = W.Shape.y;
+    return E;
+}
+
+// The shore at a point: open water until a shore field exists.
+FVoxelOceanShore VoxelOceanShoreAt(float3 P, float3 Up, FVoxelOceanWaveParams W)
+{
+    FVoxelOceanShore S;
+    S.Distance = VOXEL_OCEAN_DEEP;
+    S.Direction = float3(0.0f, 0.0f, 0.0f);
+    return S;
+}
+
+FVoxelOceanWaveInput VoxelOceanWaveInput(float3 P, float Spacing, float Footprint, float Depth, FVoxelOceanWaveParams W)
+{
+    FVoxelOceanWaveInput In;
+    In.P = P;
+    In.Up = normalize(P - W.Center);
+    In.Spacing = Spacing;
+    In.Footprint = Footprint;
+    In.Depth = Depth;
+    In.Shore = VoxelOceanShoreAt(P, In.Up, W);
+    In.Environment = VoxelOceanEnvironmentAt(P, In.Up, W);
+    return In;
+}
+
+// The highest the waves reach above the sphere (cm).
+float VoxelOceanMaxHeight(FVoxelOceanWaveParams W)
+{
+    return 3.0f * max(W.Params.z, 0.0f);
+}
+
+// One test wave. Its tangent direction T and magnitude Kt; height weight Rv (spacing) and
+// normal weight Rp (footprint). Accumulates the displacement, the height gradient G, the
+// horizontal Jacobian's terms (S = sum of Ws T T^T), and the unresolved slope variance.
+struct FVoxelOceanWaveSum
+{
+    float3 Displacement;
+    float Height;
+    float3 G;
+    float3 T[3];
+    float Ws[3];
+    float SlopeVariance;
+};
+
+void VoxelOceanTestWaveAdd(FVoxelOceanWaveInput In, float4 Wave, float Amplitude, float Chop, int Index, inout FVoxelOceanWaveSum Sum)
+{
+    const float K = length(Wave.xyz);
+    const float3 Kt3 = Wave.xyz - In.Up * dot(In.Up, Wave.xyz);
+    const float Kt = length(Kt3);
+    const float3 T = Kt > 1.0e-12f ? Kt3 / Kt : float3(0.0f, 0.0f, 0.0f);
+    const float Wavelength = 6.2831853f / max(K, 1.0e-12f);
+    const float Rv = VoxelOceanResolved(Wavelength, In.Spacing);
+    const float Rp = VoxelOceanResolved(Wavelength, In.Footprint);
+    float S, C;
+    sincos(dot(Wave.xyz, In.P) + Wave.w, S, C);
+    // Geometry: the waves the spacing resolves.
+    Sum.Height += Rv * Amplitude * S;
+    Sum.Displacement += T * (Rv * Chop * Amplitude * C);
+    // Shading: the waves the footprint resolves.
+    Sum.G += Kt3 * (Rp * Amplitude * C);
+    Sum.T[Index] = T;
+    Sum.Ws[Index] = Rp * Chop * Amplitude * Kt * S;
+    Sum.SlopeVariance += (1.0f - Rp) * 0.5f * (Amplitude * K) * (Amplitude * K);
+}
+
+FVoxelOceanWaveOutput VoxelOceanWaves(FVoxelOceanWaveInput In, FVoxelOceanWaveParams W)
+{
+    FVoxelOceanWaveOutput Out;
+    Out.Displacement = float3(0.0f, 0.0f, 0.0f);
+    Out.Height = 0.0f;
+    Out.Normal = In.Up;
+    Out.SlopeVariance = 0.0f;
+    Out.Jacobian = 1.0f;
+    Out.Foam = 0.0f;
+    const float Amplitude = W.Params.z;
+    if (Amplitude <= 0.0f) return Out;
+
+    FVoxelOceanWaveSum Sum;
+    Sum.Displacement = float3(0.0f, 0.0f, 0.0f);
+    Sum.Height = 0.0f;
+    Sum.G = float3(0.0f, 0.0f, 0.0f);
+    Sum.SlopeVariance = 0.0f;
+    [unroll] for (int k = 0; k < 3; k++)
+    {
+        Sum.T[k] = float3(0.0f, 0.0f, 0.0f);
+        Sum.Ws[k] = 0.0f;
+    }
+    const float Chop = max(W.Shape.x, 0.0f);
+    VoxelOceanTestWaveAdd(In, W.Wave0, Amplitude, Chop, 0, Sum);
+    VoxelOceanTestWaveAdd(In, W.Wave1, Amplitude, Chop, 1, Sum);
+    VoxelOceanTestWaveAdd(In, W.Wave2, Amplitude, Chop, 2, Sum);
+
+    Out.Height = Sum.Height;
+    Out.Displacement = In.Up * Sum.Height + Sum.Displacement;
+    Out.SlopeVariance = Sum.SlopeVariance;
+
+    // The displaced surface's tangents are M e_a + g_a Up, M = I - S on the tangent plane, so
+    // its normal is Up det(M) - adj(M) g, with adj(M) = (1 - tr S) I + S (M symmetric):
+    // exact for a displaced plane (the sphere adds a relative error of displacement / radius).
+    const float Trace = Sum.Ws[0] + Sum.Ws[1] + Sum.Ws[2];
+    float TraceSq = 0.0f;
+    [unroll] for (int i = 0; i < 3; i++)
+    {
+        [unroll] for (int j = 0; j < 3; j++)
+        {
+            const float D = dot(Sum.T[i], Sum.T[j]);
+            TraceSq += Sum.Ws[i] * Sum.Ws[j] * D * D;
+        }
+    }
+    const float DetS = 0.5f * (Trace * Trace - TraceSq);
+    Out.Jacobian = 1.0f - Trace + DetS;
+    const float3 SG = Sum.T[0] * (Sum.Ws[0] * dot(Sum.T[0], Sum.G)) + Sum.T[1] * (Sum.Ws[1] * dot(Sum.T[1], Sum.G))
+        + Sum.T[2] * (Sum.Ws[2] * dot(Sum.T[2], Sum.G));
+    const float3 N = In.Up * Out.Jacobian - ((1.0f - Trace) * Sum.G + SG);
+    // A fold turns the normal through the surface; keep it on the water's side.
+    Out.Normal = normalize(Out.Jacobian > 0.0f ? N : N + In.Up * (2.0f * abs(Out.Jacobian) + 1.0e-3f));
+    return Out;
+}
+
+// The height (cm) of Q (from the reference point) above the displaced surface: above the
+// sphere (stable form, Sphere = (radius, the reference point's height above it)), less the
+// waves' vertical displacement at the surface point displaced onto Q's radial. That point is
+// found by Newton steps on X + D(X) = Foot in the tangent plane (D the horizontal displacement),
+// starting at Q's foot on the sphere. Unfaded (Spacing and Footprint 0), as the CPU query.
+// OutSurface receives the waves at that point (its normal for the underwater pass).
+float VoxelOceanHeightAt(float3 Q, float2 Sphere, FVoxelOceanWaveParams W, out FVoxelOceanWaveOutput OutSurface)
+{
+    const float Height = VoxelOceanSphereHeight(Q, Sphere.x, Sphere.y, normalize(-W.Center));
+    const float3 Up = normalize(Q - W.Center);
+    const float3 Foot = Q - Up * Height;
+    float3 X = Foot;
+    FVoxelOceanWaveInput In = VoxelOceanWaveInput(X, 0.0f, 0.0f, VOXEL_OCEAN_DEEP, W);
+    OutSurface = VoxelOceanWaves(In, W);
+    if (W.Params.z <= 0.0f || W.Shape.x <= 0.0f) return Height - OutSurface.Height;
+    [unroll]
+    for (int Step = 0; Step < VOXEL_OCEAN_HEIGHT_STEPS; Step++)
+    {
+        // Residual in the tangent plane, and the Newton step through the horizontal Jacobian's
+        // inverse, adj(M) / det(M), the determinant held above 0.05 where the surface nearly
+        // folds (as the CPU query).
+        const float3 Horizontal = OutSurface.Displacement - In.Up * OutSurface.Height;
+        float3 R = X + Horizontal - Foot;
+        R -= Up * dot(Up, R);
+        float Ws[3];
+        float3 T[3];
+        // The Jacobian's terms again at X (unfaded): Ws = C A Kt sin, along T.
+        const float Chop = W.Shape.x;
+        const float A = W.Params.z;
+        float Trace = 0.0f;
+        float3 SR = float3(0.0f, 0.0f, 0.0f);
+        [unroll] for (int i = 0; i < 3; i++)
+        {
+            const float4 Wave = i == 0 ? W.Wave0 : (i == 1 ? W.Wave1 : W.Wave2);
+            const float3 Kt3 = Wave.xyz - In.Up * dot(In.Up, Wave.xyz);
+            const float Kt = length(Kt3);
+            T[i] = Kt > 1.0e-12f ? Kt3 / Kt : float3(0.0f, 0.0f, 0.0f);
+            Ws[i] = Chop * A * Kt * sin(dot(Wave.xyz, X) + Wave.w);
+            Trace += Ws[i];
+            SR += T[i] * (Ws[i] * dot(T[i], R));
+        }
+        const float Det = max(OutSurface.Jacobian, 0.05f);
+        const float3 Delta = ((1.0f - Trace) * R + SR) / Det;
+        X -= Delta;
+        In = VoxelOceanWaveInput(X, 0.0f, 0.0f, VOXEL_OCEAN_DEEP, W);
+        OutSurface = VoxelOceanWaves(In, W);
+    }
+    return Height - OutSurface.Height;
+}

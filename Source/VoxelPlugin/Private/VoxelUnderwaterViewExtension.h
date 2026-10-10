@@ -19,7 +19,7 @@
 
 #include "CoreMinimal.h"
 #include "SceneViewExtension.h"
-#include "VoxelOceanSurface.h"
+#include "VoxelOceanWaves.h"
 #include <atomic>
 
 struct FPostProcessMaterialInputs;
@@ -28,7 +28,7 @@ struct FScreenPassTexture;
 /** The pass's inputs, flattened for the render thread. The ocean actor sets every member. */
 struct FVoxelUnderwaterParams
 {
-    /** The sea sphere, its frame and the waves (VoxelOceanSurface.h). */
+    /** The sea sphere, its frame, the clock and the wave model (VoxelOceanWaves.h). */
     FVoxelOceanWaveFrame Waves;
 
     /** Per metre, per channel. */
@@ -39,7 +39,7 @@ struct FVoxelUnderwaterParams
     /** rgb: the waterline's tint (scene units before exposure); w: its width (cm). */
     FVector4f Meniscus = FVector4f::Zero();
 
-    bool IsUsable() const { return Waves.Radius > 0.0; }
+    bool IsUsable() const { return Waves.Radius() > 0.0; }
 };
 
 class FVoxelUnderwaterViewExtension : public FWorldSceneViewExtension
