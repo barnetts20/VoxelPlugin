@@ -69,7 +69,9 @@ void AOceanSphereActor::BeginPlay()
 {
     Super::BeginPlay();
     if (GetOwner() && GetOwner()->IsA<APlanetActor>()) return;
-    Initialize();
+    // An ocean spawned at run time was built by its construction already.
+    if (!bInitialized || !GetActorScale3D().Equals(LastInitScale, 0.01))
+        Initialize();
 }
 
 void AOceanSphereActor::EndPlay(const EEndPlayReason::Type EndPlayReason)
@@ -121,60 +123,26 @@ void AOceanSphereActor::PostEditChangeProperty(FPropertyChangedEvent& PropertyCh
         return;
     }
 
-    if (PropName == GET_MEMBER_NAME_CHECKED(AOceanSphereActor, LodDistanceFactor))
-    {
-        if (PropertyChangedEvent.ChangeType != EPropertyChangeType::Interactive && Surface.IsValid())
-            Surface->SetLodDistanceFactor(LodDistanceFactor);
-        return;
-    }
-
-    // The tiles on screen are written again with the new cull (GatherInputs), once per release.
-    if (PropName == GET_MEMBER_NAME_CHECKED(AOceanSphereActor, LandCullMargin))
-    {
-        if (PropertyChangedEvent.ChangeType != EPropertyChangeType::Interactive)
-            AppliedLandCullMargin = LandCullMargin;
-        return;
-    }
-    if (PropName == GET_MEMBER_NAME_CHECKED(AOceanSphereActor, bCullUnderLand))
-        return;
-
-    // The underwater pass reads the switch and the optics every tick, the waves the environment
-    // and the clock.
-    static const TSet<FName> TickProps = {
-        GET_MEMBER_NAME_CHECKED(AOceanSphereActor, bUnderwaterView),
-        GET_MEMBER_NAME_CHECKED(AOceanSphereActor, WindSpeed),
-        GET_MEMBER_NAME_CHECKED(AOceanSphereActor, WindHeading),
-        GET_MEMBER_NAME_CHECKED(AOceanSphereActor, StormIntensity),
-        GET_MEMBER_NAME_CHECKED(AOceanSphereActor, OceanTimeScale),
-    };
-    if (TickProps.Contains(PropName))
-        return;
-    // Optics apply live (struct members report the struct as the member property).
-    static const TSet<FName> OpticsProps = {
-        GET_MEMBER_NAME_CHECKED(AOceanSphereActor, Absorption),
-        GET_MEMBER_NAME_CHECKED(AOceanSphereActor, Scattering),
-        GET_MEMBER_NAME_CHECKED(AOceanSphereActor, PhaseG),
-        GET_MEMBER_NAME_CHECKED(AOceanSphereActor, UnderwaterLight),
-        GET_MEMBER_NAME_CHECKED(AOceanSphereActor, MeniscusWidth),
-        GET_MEMBER_NAME_CHECKED(AOceanSphereActor, MeniscusColor),
-    };
+    // The settings: only what changed applies (SetOceanSettings). A change inside the struct
+    // reports the struct as the member property.
     const FName MemberName = PropertyChangedEvent.MemberProperty ? PropertyChangedEvent.MemberProperty->GetFName() : PropName;
-    if (OpticsProps.Contains(PropName) || OpticsProps.Contains(MemberName))
+    if (MemberName == GET_MEMBER_NAME_CHECKED(AOceanSphereActor, OceanSettings))
     {
-        ApplyOptics();
+        const FVoxelOceanSettings Edited = OceanSettings;
+        SetOceanSettings(Edited, PropertyChangedEvent.ChangeType == EPropertyChangeType::Interactive);
         return;
     }
-    // The mesh rebuilds; slider drags rebuild once, on release.
+
+    // Slider drags rebuild once, on release.
     if (PropertyChangedEvent.ChangeType == EPropertyChangeType::Interactive) return;
-    static const TSet<FName> MeshProps = {
-        GET_MEMBER_NAME_CHECKED(AOceanSphereActor, FinestSpacing),
-        GET_MEMBER_NAME_CHECKED(AOceanSphereActor, TileQuads),
-        GET_MEMBER_NAME_CHECKED(AOceanSphereActor, SpareBufferSets),
-    };
-    if (MeshProps.Contains(PropName))
+
+    // Anything else (an undo reports no property): the settings again, applying only what
+    // differs from what the surface was built with.
+    if (SurfaceMaterialInstance && OceanMaterial && SurfaceMaterialInstance->Parent != OceanMaterial)
+        SetOceanMaterial(OceanMaterial);
     {
-        InitializeInternal(Compositor);
-        return;
+        const FVoxelOceanSettings Current = OceanSettings;
+        SetOceanSettings(Current);
     }
 
     // A standalone ocean's density follows the terrain's settings.
@@ -265,9 +233,33 @@ void AOceanSphereActor::ApplyOptics()
 {
     using namespace OceanSphereActorDetail;
     if (!SurfaceMaterialInstance) return;
-    SurfaceMaterialInstance->SetVectorParameterValue(AbsorptionName, Absorption);
-    SurfaceMaterialInstance->SetVectorParameterValue(ScatteringName, Scattering);
-    SurfaceMaterialInstance->SetScalarParameterValue(PhaseGName, PhaseG);
+    SurfaceMaterialInstance->SetVectorParameterValue(AbsorptionName, OceanSettings.Absorption);
+    SurfaceMaterialInstance->SetVectorParameterValue(ScatteringName, OceanSettings.Scattering);
+    SurfaceMaterialInstance->SetScalarParameterValue(PhaseGName, OceanSettings.PhaseG);
+}
+
+void AOceanSphereActor::SetOceanSettings(const FVoxelOceanSettings& InSettings, bool bInteractive)
+{
+    OceanSettings = InSettings;
+    if (!bInteractive)
+        OceanSettings.Sanitize();
+    if (!bInitialized) return;   // the next initialization takes them
+
+    // Live, even while a slider moves: the optics on the surface material. The underwater
+    // view, its optics and the environment are read every tick.
+    ApplyOptics();
+    if (bInteractive) return;
+
+    // On release: the mesh rebuilds; the LOD factor refills the surface; the cull rewrites the
+    // tiles on screen (GatherInputs reads AppliedSettings).
+    if (!OceanSettings.SameMesh(AppliedSettings))
+    {
+        InitializeInternal(Compositor);
+        return;
+    }
+    if (OceanSettings.LodDistanceFactor != AppliedSettings.LodDistanceFactor && Surface.IsValid())
+        Surface->SetLodDistanceFactor(OceanSettings.LodDistanceFactor);
+    AppliedSettings = OceanSettings;
 }
 
 void AOceanSphereActor::CreateUnderwater()
@@ -294,17 +286,18 @@ void AOceanSphereActor::UpdateUnderwater()
         FReadScopeLock Lock(QueryLock);
         Frame = QueryFrame;
     }
-    const bool bOn = bUnderwaterView && bVisible && bInitialized && Frame.IsValid();
+    const bool bOn = OceanSettings.bUnderwaterView && bVisible && bInitialized && Frame.IsValid();
     UnderwaterExtension->SetEnabled(bOn);
     if (!bOn) return;
 
     // The render thread needs the waves, not the density.
     Params.Waves = *Frame;
     Params.Waves.Density.Reset();
-    Params.Absorption = FVector3f(Absorption.R, Absorption.G, Absorption.B);
-    Params.Scattering = FVector3f(Scattering.R, Scattering.G, Scattering.B);
-    Params.Light = FVector3f(UnderwaterLight.R, UnderwaterLight.G, UnderwaterLight.B);
-    Params.Meniscus = FVector4f(MeniscusColor.R, MeniscusColor.G, MeniscusColor.B, (float)FMath::Max(MeniscusWidth, 0.0));
+    const FVoxelOceanSettings& S = OceanSettings;
+    Params.Absorption = FVector3f(S.Absorption.R, S.Absorption.G, S.Absorption.B);
+    Params.Scattering = FVector3f(S.Scattering.R, S.Scattering.G, S.Scattering.B);
+    Params.Light = FVector3f(S.UnderwaterLight.R, S.UnderwaterLight.G, S.UnderwaterLight.B);
+    Params.Meniscus = FVector4f(S.MeniscusColor.R, S.MeniscusColor.G, S.MeniscusColor.B, (float)FMath::Max(S.MeniscusWidth, 0.0));
     UnderwaterExtension->SetFrame_GameThread(Params);
 }
 
@@ -385,15 +378,15 @@ double AOceanSphereActor::GetOceanTime() const
     if (!World) return 0.0;
     const AGameStateBase* GameState = World->GetGameState();
     const double Seconds = GameState ? (double)GameState->GetServerWorldTimeSeconds() : (double)World->GetTimeSeconds();
-    return Seconds * FMath::Max(OceanTimeScale, 0.0);
+    return Seconds * FMath::Max(OceanSettings.OceanTimeScale, 0.0);
 }
 
 FVoxelOceanEnvironment AOceanSphereActor::GetEnvironment() const
 {
     FVoxelOceanEnvironment Environment;
-    Environment.WindSpeed = FMath::Max(WindSpeed, 0.0);
-    Environment.WindHeading = FMath::DegreesToRadians(WindHeading);
-    Environment.Storm = FMath::Clamp(StormIntensity, 0.0, 1.0);
+    Environment.WindSpeed = FMath::Max(OceanSettings.WindSpeed, 0.0);
+    Environment.WindHeading = FMath::DegreesToRadians(OceanSettings.WindHeading);
+    Environment.Storm = FMath::Clamp(OceanSettings.StormIntensity, 0.0, 1.0);
     return Environment;
 }
 
@@ -521,11 +514,11 @@ void AOceanSphereActor::InitializeInternal(TSharedPtr<FDensitySampleCompositor> 
     Compositor = InCompositor;
 
     OceanRadius = GetActorScale3D().GetMax();
-    // 8, 16 or 32 quads per tile edge.
-    TileQuads = 1 << FMath::Clamp(FMath::RoundToInt(FMath::Log2((double)FMath::Max(TileQuads, 1))), 3, 5);
-    LodDistanceFactor = FMath::Max(LodDistanceFactor, VoxelOceanTiles::MinLodDistanceFactor);
-    MaxLevel = VoxelOceanTiles::LevelForSpacing(OceanRadius, TileQuads, FinestSpacing);
-    ActualSpacing = VoxelOceanTiles::NominalArc(MaxLevel) * OceanRadius / TileQuads;
+    // 8, 16 or 32 quads per tile edge, and the other settings within their limits.
+    OceanSettings.Sanitize();
+    OceanSettings.LodDistanceFactor = FMath::Max(OceanSettings.LodDistanceFactor, VoxelOceanTiles::MinLodDistanceFactor);
+    MaxLevel = VoxelOceanTiles::LevelForSpacing(OceanRadius, OceanSettings.TileQuads, OceanSettings.FinestSpacing);
+    ActualSpacing = VoxelOceanTiles::NominalArc(MaxLevel) * OceanRadius / OceanSettings.TileQuads;
 
     if (!OceanMaterial)
         OceanMaterial = DefaultOceanMaterial();
@@ -540,14 +533,14 @@ void AOceanSphereActor::InitializeInternal(TSharedPtr<FDensitySampleCompositor> 
         Compositor->GetBaseDensity()->BuildGPUData(*Data);
         GPUDensity = Data;
     }
-    AppliedLandCullMargin = LandCullMargin;
+    AppliedSettings = OceanSettings;
 
     FVoxelOceanSurfaceSettings Settings;
     Settings.Radius = OceanRadius;
-    Settings.TileQuads = TileQuads;
+    Settings.TileQuads = OceanSettings.TileQuads;
     Settings.MaxLevel = MaxLevel;
-    Settings.LodDistanceFactor = LodDistanceFactor;
-    Settings.SpareBufferSets = SpareBufferSets;
+    Settings.LodDistanceFactor = OceanSettings.LodDistanceFactor;
+    Settings.SpareBufferSets = OceanSettings.SpareBufferSets;
     Settings.Material = SurfaceMaterialInstance.Get();
     if (!Surface.IsValid())
         Surface = MakeShared<FVoxelOceanSurface>();
@@ -622,7 +615,8 @@ FVoxelOceanSurfaceInputs AOceanSphereActor::GatherInputs(const AAdaptiveVoxelAct
 {
     FVoxelOceanSurfaceInputs Inputs;
     Inputs.Density.Density = GPUDensity;
-    Inputs.LandCullMargin = bCullUnderLand ? AppliedLandCullMargin : -1.0;
+    // As last applied, so a slider drag doesn't write the tiles again every frame.
+    Inputs.LandCullMargin = AppliedSettings.bCullUnderLand ? AppliedSettings.LandCullMargin : -1.0;
     Inputs.Time = GetOceanTime();
     Inputs.Environment = GetEnvironment();
     if (Terrain && Terrain->ActualPrecision > 0.0)
@@ -632,6 +626,9 @@ FVoxelOceanSurfaceInputs AOceanSphereActor::GatherInputs(const AAdaptiveVoxelAct
         Inputs.SlopeBound = Terrain->CollisionSlopeBound;
         if (const TSharedPtr<FVoxelBrickTerrain> Bricks = Terrain->GetBrickTerrain())
         {
+            // The slope bound the terrain was built with: a slider still moving doesn't write
+            // the ocean's tiles again every frame.
+            Inputs.SlopeBound = Bricks->GetSettings().SlopeBound;
             // A sequence only with the data that holds it (a rebuilding terrain drops its data
             // before its sequence).
             Inputs.Density.Edits = Bricks->GetGPUEdits();

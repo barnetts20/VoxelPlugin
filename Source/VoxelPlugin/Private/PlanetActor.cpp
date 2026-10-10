@@ -12,17 +12,23 @@ APlanetActor::APlanetActor()
 
     // Default planet radius: 1000 km = 100,000,000 cm
     SetActorScale3D(FVector(100000000.0));
+
+#if WITH_EDITORONLY_DATA
+    // Dragging the planet with the gizmo reconstructs it once, on release (a scale drag
+    // would otherwise rebuild the terrain and ocean every frame).
+    bRunConstructionScriptOnDrag = false;
+#endif
 }
 
 void APlanetActor::BeginPlay()
 {
     Super::BeginPlay();
-    // bPendingInitialize defaults to true — first Tick calls Initialize.
+    // bPendingInitialize defaults to true - first Tick calls Initialize.
 }
 
 void APlanetActor::Destroyed()
 {
-    // Destroyed() fires when the actor is explicitly deleted — both in-editor
+    // Destroyed() fires when the actor is explicitly deleted - both in-editor
     // and at runtime. The world is still valid here, so Destroy() on children works.
     DestroyChildActors();
     Super::Destroyed();
@@ -36,7 +42,7 @@ void APlanetActor::EndPlay(const EEndPlayReason::Type EndPlayReason)
 
 void APlanetActor::BeginDestroy()
 {
-    // Fallback — catch anything EndPlay missed (shouldn't happen, but safe).
+    // Fallback - catch anything EndPlay missed (shouldn't happen, but safe).
     DestroyChildActors();
     Super::BeginDestroy();
 }
@@ -46,7 +52,14 @@ void APlanetActor::OnConstruction(const FTransform& Transform)
     Super::OnConstruction(Transform);
     if (!GetWorld() || GetWorld()->IsPreviewWorld()) return;
 
-    // Flag for deferred work in Tick — never spawn actors during OnConstruction.
+    // A slider or a gizmo drag still moving: the release flags the work once.
+    if (bInteractiveEdit) return;
+    FlagPendingWork();
+}
+
+void APlanetActor::FlagPendingWork()
+{
+    // Flag for deferred work in Tick - never spawn actors during OnConstruction.
     if (!bInitialized
         || !GetActorScale3D().Equals(LastInitScale, 0.01)
         || NoiseAmplitudeRatio != LastNoiseAmplitudeRatio
@@ -65,10 +78,18 @@ void APlanetActor::OnConstruction(const FTransform& Transform)
 #if WITH_EDITOR
 void APlanetActor::PostEditChangeProperty(FPropertyChangedEvent& PropertyChangedEvent)
 {
+    // The construction rerun inside Super sees whether a slider is still moving.
+    const bool bInteractive = PropertyChangedEvent.ChangeType == EPropertyChangeType::Interactive;
+    bInteractiveEdit = bInteractive;
     Super::PostEditChangeProperty(PropertyChangedEvent);
+    bInteractiveEdit = false;
     if (!bInitialized) return;
+    // A PIE world doesn't rerun construction after an edit; flagging twice is harmless.
+    if (!bInteractive)
+        FlagPendingWork();
 
-    FName PropName = PropertyChangedEvent.GetPropertyName();
+    const FName PropName = PropertyChangedEvent.GetPropertyName();
+    const FName MemberName = PropertyChangedEvent.MemberProperty ? PropertyChangedEvent.MemberProperty->GetFName() : PropName;
 
     // The terrain material changes in place (no rebuild).
     if (PropName == GET_MEMBER_NAME_CHECKED(APlanetActor, TerrainMaterial))
@@ -78,27 +99,68 @@ void APlanetActor::PostEditChangeProperty(FPropertyChangedEvent& PropertyChanged
         return;
     }
 
+    // So does the ocean's.
     if (PropName == GET_MEMBER_NAME_CHECKED(APlanetActor, OceanMaterial))
     {
-        if (OceanActor && OceanMaterial)
-        {
-            OceanActor->OceanMaterial = OceanMaterial;
-            OceanActor->InitializeFromPlanet(SharedCompositor, PlanetRoot);
-        }
+        if (OceanActor)
+            OceanActor->SetOceanMaterial(OceanMaterial);
+        return;
+    }
+
+    // The ocean's settings apply in place, as far as they can (a change inside the struct
+    // reports the struct as the member property); slider drags apply on release.
+    if (MemberName == GET_MEMBER_NAME_CHECKED(APlanetActor, OceanSettings))
+    {
+        // The planet shows what the ocean builds (TileQuads snapped, limits) once released.
+        if (!bInteractive)
+            OceanSettings.Sanitize();
+        if (OceanActor)
+            OceanActor->SetOceanSettings(OceanSettings, bInteractive);
         return;
     }
 
     // Scale, NoiseAmplitudeRatio, SurfaceSettings, SeaLevel, and toggle changes are handled
-    // by OnConstruction (which also fires on property edits) via the
-    // bPendingInitialize / bPendingOceanUpdate flags.
+    // by FlagPendingWork via the bPendingInitialize / bPendingOceanUpdate flags. Anything else
+    // (an undo reports no property) forwards the children's settings again.
+    if (!bInteractive)
+        ForwardChildSettings();
+}
+
+void APlanetActor::PostEditMove(bool bFinished)
+{
+    // A gizmo drag (also on a Blueprint planet, whose asset may rerun construction on drag)
+    // flags the work once, when it ends.
+    bInteractiveEdit = !bFinished;
+    Super::PostEditMove(bFinished);
+    bInteractiveEdit = false;
 }
 #endif
+
+void APlanetActor::ForwardChildSettings()
+{
+    if (TerrainActor && TerrainMaterial && TerrainActor->SurfaceMaterial != TerrainMaterial)
+        TerrainActor->SetSurfaceMaterial(TerrainMaterial);
+    if (OceanActor)
+    {
+        if (OceanMaterial && OceanActor->OceanMaterial != OceanMaterial)
+            OceanActor->SetOceanMaterial(OceanMaterial);
+        OceanActor->SetOceanSettings(OceanSettings);
+    }
+}
+
+void APlanetActor::SetOceanSettings(const FVoxelOceanSettings& InSettings)
+{
+    OceanSettings = InSettings;
+    OceanSettings.Sanitize();
+    if (OceanActor && bInitialized)
+        OceanActor->SetOceanSettings(OceanSettings);
+}
 
 void APlanetActor::Tick(float DeltaTime)
 {
     Super::Tick(DeltaTime);
 
-    // Deferred init — safe to spawn actors here.
+    // Deferred init - safe to spawn actors here.
     if (bPendingInitialize)
     {
         bPendingInitialize = false;
@@ -108,41 +170,16 @@ void APlanetActor::Tick(float DeltaTime)
     else if (bPendingOceanUpdate)
     {
         bPendingOceanUpdate = false;
-        double PlanetRadius = GetActorScale3D().GetMax();
-        double NoiseAmplitude = PlanetRadius * NoiseAmplitudeRatio;
-
-        if (bEnableOcean && OceanActor)
-        {
-            double NewOceanRadius = ComputeOceanRadius(PlanetRadius, NoiseAmplitude);
-            OceanActor->TerrainPlanetRadius = PlanetRadius;
-            OceanActor->NoiseAmplitudeRatio = NoiseAmplitudeRatio;
-            OceanActor->InitializeFromPlanet(SharedCompositor, PlanetRoot, FVector(NewOceanRadius));
-            OceanActor->SetActorHiddenInGame(false);
-            OceanActor->SetActorTickEnabled(true);
-        }
-        else if (OceanActor)
-        {
-            OceanActor->SetActorHiddenInGame(true);
-            OceanActor->SetActorTickEnabled(false);
-        }
-
-        // Toggle gravity zone visibility
-        if (bEnableGravity && GravityZone)
-        {
-            GravityZone->SetActorHiddenInGame(false);
-            GravityZone->SetActorTickEnabled(true);
-            GravityZone->SetActorEnableCollision(true);
-        }
-        else if (GravityZone)
-        {
-            GravityZone->SetActorHiddenInGame(true);
-            GravityZone->SetActorTickEnabled(false);
-            GravityZone->SetActorEnableCollision(false);
-        }
-
-        LastSeaLevel = SeaLevel;
-        bLastEnableOcean = bEnableOcean;
-        bLastEnableGravity = bEnableGravity;
+        const double PlanetRadius = GetActorScale3D().GetMax();
+        const double NoiseAmplitude = PlanetRadius * NoiseAmplitudeRatio;
+        const double OceanRadius = ComputeOceanRadius(PlanetRadius, NoiseAmplitude);
+        // The same configuration as the first initialization: the ocean keeps its material and
+        // settings, and the gravity zone follows the new sea level. A gravity toggle alone
+        // leaves the ocean as it is.
+        if (SeaLevel != LastSeaLevel || bEnableOcean != bLastEnableOcean)
+            ConfigureOcean(PlanetRadius, NoiseAmplitude, OceanRadius);
+        ConfigureGravity(PlanetRadius, OceanRadius);
+        RecordAppliedState();
     }
 }
 
@@ -152,12 +189,13 @@ void APlanetActor::Tick(float DeltaTime)
 
 void APlanetActor::Initialize()
 {
-    double PlanetRadius = GetActorScale3D().GetMax();
-    double NoiseAmplitude = PlanetRadius * NoiseAmplitudeRatio;
-    double RootExtent = VoxelDensity::RootExtentFor(PlanetRadius, NoiseAmplitude);
-    double OceanRadiusValue = ComputeOceanRadius(PlanetRadius, NoiseAmplitude);
+    const double PlanetRadius = GetActorScale3D().GetMax();
+    const double NoiseAmplitude = PlanetRadius * NoiseAmplitudeRatio;
+    const double RootExtent = VoxelDensity::RootExtentFor(PlanetRadius, NoiseAmplitude);
+    const double OceanRadius = ComputeOceanRadius(PlanetRadius, NoiseAmplitude);
 
     SpawnChildActors();
+    if (!TerrainActor) return;
 
     // The terrain lattice depth the terrain actor derives in Rebuild: the edit store and the
     // compositor's finest footprint must match it.
@@ -172,53 +210,72 @@ void APlanetActor::Initialize()
     TerrainActor->NoiseAmplitudeRatio = NoiseAmplitudeRatio;
     TerrainActor->SurfaceSettings = SurfaceSettings;
     TerrainActor->InitializeFromPlanet(SharedCompositor, PlanetRoot, FVector(PlanetRadius));
+    // Re-activate after a pool park: shown, ticking, and with collision (dormancy dropped it).
     TerrainActor->SetActorHiddenInGame(false);
-    TerrainActor->SetActorTickEnabled(true);   // re-activate after a pool park
+    TerrainActor->SetActorTickEnabled(true);
+    TerrainActor->SetActorEnableCollision(true);
 
-    // --- Ocean actor ---
-    if (bEnableOcean && OceanActor)
-    {
-        if (OceanMaterial)
-            OceanActor->OceanMaterial = OceanMaterial;
-        OceanActor->TerrainPlanetRadius = PlanetRadius;
-        OceanActor->NoiseAmplitudeRatio = NoiseAmplitudeRatio;
-        OceanActor->SurfaceSettings = SurfaceSettings;
-        OceanActor->InitializeFromPlanet(SharedCompositor, PlanetRoot, FVector(OceanRadiusValue));
-        OceanActor->SetActorHiddenInGame(false);
-        OceanActor->SetActorTickEnabled(true);
-    }
-    else if (OceanActor)
+    ConfigureOcean(PlanetRadius, NoiseAmplitude, OceanRadius);
+    ConfigureGravity(PlanetRadius, OceanRadius);
+
+    RecordAppliedState();
+    bInitialized = true;
+}
+
+void APlanetActor::ConfigureOcean(double PlanetRadius, double NoiseAmplitude, double OceanRadius)
+{
+    if (!OceanActor) return;
+    if (!bEnableOcean)
     {
         OceanActor->SetActorHiddenInGame(true);
         OceanActor->SetActorTickEnabled(false);
+#if WITH_EDITOR
+        // Hidden in game doesn't hide it in the editor's viewports.
+        OceanActor->SetIsTemporarilyHiddenInEditor(true);
+#endif
+        return;
     }
+    OceanActor->OceanMaterial = OceanMaterial;
+    OceanActor->TerrainPlanetRadius = PlanetRadius;
+    OceanActor->NoiseAmplitudeRatio = NoiseAmplitudeRatio;
+    OceanActor->SurfaceSettings = SurfaceSettings;
+    // Before the initialization, which builds the surface with them.
+    OceanActor->OceanSettings = OceanSettings;
+    OceanActor->InitializeFromPlanet(SharedCompositor, PlanetRoot, FVector(OceanRadius));
+    OceanActor->SetActorHiddenInGame(false);
+    OceanActor->SetActorTickEnabled(true);
+#if WITH_EDITOR
+    OceanActor->SetIsTemporarilyHiddenInEditor(false);
+#endif
+}
 
-    // --- Gravity zone ---
-    if (bEnableGravity && GravityZone)
-    {
-        // Inner radius = max of ocean/planet radius, so full gravity is reached at
-        // the visible surface.
-        double GravityInnerRadius = FMath::Max(OceanRadiusValue, PlanetRadius);
-        GravityZone->SetActorScale3D(FVector(GravityInnerRadius));
-        GravityZone->InitializeFromPlanet();
-        GravityZone->SetActorHiddenInGame(false);
-        GravityZone->SetActorTickEnabled(true);
-        GravityZone->SetActorEnableCollision(true);
-    }
-    else if (GravityZone)
+void APlanetActor::ConfigureGravity(double PlanetRadius, double OceanRadius)
+{
+    if (!GravityZone) return;
+    if (!bEnableGravity)
     {
         GravityZone->SetActorHiddenInGame(true);
         GravityZone->SetActorTickEnabled(false);
         GravityZone->SetActorEnableCollision(false);
+        return;
     }
+    // Inner radius = max of ocean/planet radius, so full gravity is reached at the visible
+    // surface; set on every update, so a sea level change or a late enable sizes it too.
+    GravityZone->SetActorScale3D(FVector(FMath::Max(OceanRadius, PlanetRadius)));
+    GravityZone->InitializeFromPlanet();
+    GravityZone->SetActorHiddenInGame(false);
+    GravityZone->SetActorTickEnabled(true);
+    GravityZone->SetActorEnableCollision(true);
+}
 
+void APlanetActor::RecordAppliedState()
+{
     LastInitScale = GetActorScale3D();
     LastSeaLevel = SeaLevel;
     LastNoiseAmplitudeRatio = NoiseAmplitudeRatio;
     LastSurfaceSettingsHash = SurfaceSettings.GetSettingsHash();
     bLastEnableOcean = bEnableOcean;
     bLastEnableGravity = bEnableGravity;
-    bInitialized = true;
 }
 
 // ---------------------------------------------------------------------------
@@ -295,7 +352,7 @@ void APlanetActor::SpawnChildActors()
         }
     }
 
-    // Load default materials if none set — paths reference plugin Content folder
+    // Load default materials if none set - paths reference plugin Content folder
     if (!TerrainMaterial)
     {
         TerrainMaterial = Cast<UMaterialInterface>(
@@ -326,7 +383,7 @@ void APlanetActor::DestroyChildActors()
 
 double APlanetActor::ComputeOceanRadius(double PlanetRadius, double NoiseAmplitude) const
 {
-    return PlanetRadius + SeaLevel * NoiseAmplitude;
+    return FMath::Max(1.0, PlanetRadius + SeaLevel * NoiseAmplitude);
 }
 
 // ---------------------------------------------------------------------------
@@ -348,6 +405,8 @@ void APlanetActor::SetDormant(bool bDormant)
     }
     if (OceanActor)
     {
+        // Hidden and not ticking: no selection, no commits, no underwater pass. Its pages stay
+        // allocated, so waking draws at once.
         const bool bOn = bActive && bEnableOcean;
         OceanActor->SetActorHiddenInGame(!bOn);
         OceanActor->SetActorTickEnabled(bOn);

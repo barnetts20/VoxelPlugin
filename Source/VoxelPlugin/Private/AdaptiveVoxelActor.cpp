@@ -76,6 +76,8 @@ void AAdaptiveVoxelActor::PostEditChangeProperty(FPropertyChangedEvent& Property
     if (!Initialized) return;
 
     FName PropName = PropertyChangedEvent.GetPropertyName();
+    // A slider still moving: everything below rebuilds, so it waits for the release.
+    const bool bInteractive = PropertyChangedEvent.ChangeType == EPropertyChangeType::Interactive;
 
     // Changes to the density or the lattice rebuild everything.
     static const TSet<FName> RebuildProps = {
@@ -86,11 +88,11 @@ void AAdaptiveVoxelActor::PostEditChangeProperty(FPropertyChangedEvent& Property
     // A change inside SurfaceSettings reports the inner field as the property; the member
     // property is the struct.
     // Slider drags rebuild once, on release.
-    const bool bSurfaceChanged = !bIsPlanetOwned && PropertyChangedEvent.ChangeType != EPropertyChangeType::Interactive
+    const bool bSurfaceChanged = !bIsPlanetOwned && !bInteractive
         && PropertyChangedEvent.MemberProperty
         && PropertyChangedEvent.MemberProperty->GetFName() == GET_MEMBER_NAME_CHECKED(AAdaptiveVoxelActor, SurfaceSettings);
 
-    if (RebuildProps.Contains(PropName) || bSurfaceChanged)
+    if ((RebuildProps.Contains(PropName) && !bInteractive) || bSurfaceChanged)
     {
         // A planet's terrain shares the planet's compositor, whose edit store depth follows
         // TargetPrecision: the planet rebuilds both.
@@ -114,21 +116,30 @@ void AAdaptiveVoxelActor::PostEditChangeProperty(FPropertyChangedEvent& Property
         return;
     }
 
+    if (bInteractive) return;
+    const double ActorPlanetRadius = GetActorScale3D().GetMax();
+    const double ActorRootExtent = VoxelDensity::RootExtentFor(ActorPlanetRadius, ActorPlanetRadius * NoiseAmplitudeRatio);
+
     if (PropName == GET_MEMBER_NAME_CHECKED(AAdaptiveVoxelActor, BrickLodDistanceFactor)
         || PropName == GET_MEMBER_NAME_CHECKED(AAdaptiveVoxelActor, BrickCellsPerBrick))
     {
-        const double ActorPlanetRadius = GetActorScale3D().GetMax();
-        InitializeBrickTerrain(VoxelDensity::RootExtentFor(ActorPlanetRadius, ActorPlanetRadius * NoiseAmplitudeRatio));
+        // InitializeBrickTerrain snaps BrickCellsPerBrick to the size it builds (8-64).
+        InitializeBrickTerrain(ActorRootExtent);
         return;
     }
 
-    // Collision lattice changes rebuild only the collision bricks.
-    if (PropName == GET_MEMBER_NAME_CHECKED(AAdaptiveVoxelActor, CollisionCellScale)
-        || PropName == GET_MEMBER_NAME_CHECKED(AAdaptiveVoxelActor, CollisionSlopeBound))
+    // The slope bound drives both the collision bricks and the rendered terrain's empty test
+    // (and the ocean's land cull, which follows it every tick): both restart.
+    if (PropName == GET_MEMBER_NAME_CHECKED(AAdaptiveVoxelActor, CollisionSlopeBound))
     {
-        const double ActorPlanetRadius = GetActorScale3D().GetMax();
-        InitializeCollision(VoxelDensity::RootExtentFor(ActorPlanetRadius, ActorPlanetRadius * NoiseAmplitudeRatio));
+        InitializeCollision(ActorRootExtent);
+        InitializeBrickTerrain(ActorRootExtent);
+        return;
     }
+
+    // The collision lattice rebuilds only the collision bricks.
+    if (PropName == GET_MEMBER_NAME_CHECKED(AAdaptiveVoxelActor, CollisionCellScale))
+        InitializeCollision(ActorRootExtent);
 }
 
 bool AAdaptiveVoxelActor::CanEditChange(const FProperty* InProperty) const
@@ -189,7 +200,9 @@ void AAdaptiveVoxelActor::BeginPlay()
 {
     Super::BeginPlay();
     if (GetOwner() && GetOwner()->IsA<APlanetActor>()) return;
-    Initialize();
+    // A terrain spawned at run time was built by its construction already.
+    if (!Initialized || !GetActorScale3D().Equals(LastInitScale, 0.01))
+        Initialize();
 }
 
 void AAdaptiveVoxelActor::CleanSceneRoot()
@@ -333,6 +346,8 @@ void AAdaptiveVoxelActor::InitializeBrickTerrain(double RootExtent)
 
     // Bricks of 2^k cells: level MaxDepth - k is a single brick covering the whole root.
     const int32 BrickLog2 = FMath::Clamp(FMath::RoundToInt(FMath::Log2((double)FMath::Max(BrickCellsPerBrick, 1))), 3, 6);
+    // The property shows the size built (8, 16, 32 or 64), not a value rounded away.
+    BrickCellsPerBrick = 1 << BrickLog2;
     FVoxelBrickTerrainSettings Settings;
     Settings.Origin = FVector(-RootExtent);
     Settings.FinestCell = ActualPrecision;

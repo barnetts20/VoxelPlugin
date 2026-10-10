@@ -17,6 +17,7 @@
 #include "FDensitySampleCompositor.h"
 #include "VoxelDensity.h"
 #include "VoxelOceanWaves.h"
+#include "VoxelOceanSettings.h"
 #include "HAL/CriticalSection.h"
 #include "OceanSphereActor.generated.h"
 
@@ -71,26 +72,13 @@ public:
         meta = (EditCondition = "!bIsPlanetOwned"))
     FVoxelSurfaceSettings SurfaceSettings;
 
-    // --- Mesh ---
+    // --- Settings ---
 
-    /** Spacing between vertices at the finest level near the camera (cm). The finest level is
-     *  the one at or just under it (ActualSpacing). */
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Ocean|Mesh", meta = (ClampMin = "1.0", UIMin = "10.0", UIMax = "1000.0"))
-    double FinestSpacing = 50.0;
-
-    /** Quads along a tile edge: 8, 16 or 32 (rounded to one of them). The number of tiles
-     *  doesn't depend on it, so the triangle count grows with its square. */
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Ocean|Mesh", meta = (ClampMin = "8", ClampMax = "32"))
-    int32 TileQuads = 16;
-
-    /** A tile splits while the camera is within this many tile sizes of it. Higher: more
-     *  detail and a wider morph band. At least 2.25 (the morph band closes below it). */
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Ocean|Mesh", meta = (ClampMin = "2.25", UIMax = "6.0"))
-    double LodDistanceFactor = 2.5;
-
-    /** Buffer sets kept ready, so a commit doesn't wait for one to be created. */
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Ocean|Mesh", meta = (ClampMin = "0", UIMax = "32"))
-    int32 SpareBufferSets = 8;
+    /** The ocean's settings: mesh, land cull, underwater view, optics and environment. A
+     *  planet sets them from its own OceanSettings (read-only here then: edit them on the
+     *  planet). Change them at run time with SetOceanSettings: only what changed is applied. */
+    UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Ocean", meta = (EditCondition = "!bIsPlanetOwned"))
+    FVoxelOceanSettings OceanSettings;
 
     /** The finest tile level (from FinestSpacing and the radius). */
     UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Ocean|Mesh")
@@ -99,73 +87,6 @@ public:
     /** The spacing (cm) between vertices at MaxLevel, through a face's centre. */
     UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Ocean|Mesh")
     double ActualSpacing = 0.0;
-
-    // --- Depth ---
-
-    /** Leave out the triangles the land stands well above (the terrain hides them anyway). */
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Ocean|Depth")
-    bool bCullUnderLand = true;
-
-    /** How far (cm) the land must stand above the sea at a triangle's corners, beyond what the
-     *  terrain's slope bound allows for across the triangle, before it is left out. Covers
-     *  the terrain mesh's error and the waves' run-up. */
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Ocean|Depth", meta = (ClampMin = "0.0", UIMax = "5000.0", EditCondition = "bCullUnderLand"))
-    double LandCullMargin = 500.0;
-
-    // --- Underwater and optics ---
-
-    /** The view from under water: a pass of the ocean's own after the atmosphere, ahead of
-     *  depth of field (STAGE_O3b_NOTES.md). It decides each pixel itself, so partly submerged
-     *  frames split exactly, and leaves a view whose camera can't reach the water untouched. */
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Ocean|Underwater")
-    bool bUnderwaterView = true;
-
-    /** Absorption of the water per metre, per channel (red goes first). Feeds the underwater
-     *  pass and the surface material (VoxelOceanAbsorption). */
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Ocean|Optics")
-    FLinearColor Absorption = FLinearColor(0.35f, 0.07f, 0.03f);
-
-    /** Scattering of the water per metre, per channel. Feeds the underwater pass and the
-     *  surface material (VoxelOceanScattering). */
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Ocean|Optics")
-    FLinearColor Scattering = FLinearColor(0.02f, 0.03f, 0.035f);
-
-    /** Forward scattering anisotropy, for a Single Layer Water surface (VoxelOceanPhaseG). */
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Ocean|Optics", meta = (ClampMin = "-1.0", ClampMax = "1.0"))
-    float PhaseG = 0.8f;
-
-    /** The light the water scatters toward the camera under water, in the scene's light units
-     *  (linear, before exposure, so it holds as the exposure adapts), until the atmosphere
-     *  provides the sun's. */
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Ocean|Optics")
-    FLinearColor UnderwaterLight = FLinearColor(0.4f, 0.8f, 1.0f);
-
-    /** The thin band (cm) where the near plane meets the surface. */
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Ocean|Optics", meta = (ClampMin = "0.0", UIMax = "10.0"))
-    double MeniscusWidth = 1.5;
-
-    /** The waterline's tint, in the scene's light units (as UnderwaterLight). */
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Ocean|Optics")
-    FLinearColor MeniscusColor = FLinearColor(0.02f, 0.06f, 0.08f);
-
-    // --- Environment (constants until the atmosphere provides fields) ---
-
-    /** Wind speed (m/s) everywhere on this ocean. The waves receive it per point; the test
-     *  model ignores it. */
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Ocean|Environment", meta = (ClampMin = "0.0", UIMax = "40.0"))
-    double WindSpeed = 8.0;
-
-    /** Wind heading (degrees from local north toward east; north is the planet's +Z). */
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Ocean|Environment", meta = (UIMin = "0.0", UIMax = "360.0"))
-    double WindHeading = 0.0;
-
-    /** Storm intensity, 0-1. The waves receive it per point; the test model ignores it. */
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Ocean|Environment", meta = (ClampMin = "0.0", ClampMax = "1.0"))
-    double StormIntensity = 0.0;
-
-    /** The ocean clock's rate against the game's (server) time. */
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Ocean|Environment", meta = (ClampMin = "0.0", UIMax = "4.0"))
-    double OceanTimeScale = 1.0;
 
     // --- Queries (any thread for the C++ ones; Blueprint on the game thread) ---
 
@@ -236,6 +157,12 @@ public:
     UFUNCTION(BlueprintCallable, Category = "Ocean|Material")
     void SetOceanMaterial(UMaterialInterface* InMaterial);
 
+    /** New settings, applying only what changed: a mesh change rebuilds the surface (unless
+     *  bInteractive: a slider still moving, applied on release), the LOD factor and the optics
+     *  apply in place, the rest is read every tick. */
+    UFUNCTION(BlueprintCallable, Category = "Ocean")
+    void SetOceanSettings(const FVoxelOceanSettings& InSettings, bool bInteractive = false);
+
 private:
     /** Page components attach to this one. It inherits the actor's position and rotation but
      *  uses absolute scale (1, 1, 1): the surface is built at world scale. */
@@ -272,8 +199,9 @@ private:
     TWeakObjectPtr<AAdaptiveVoxelActor> BoundTerrain;
     FDelegateHandle TerrainEditHandle;
 
-    /** LandCullMargin as last applied (slider drags apply on release). */
-    double AppliedLandCullMargin = 500.0;
+    /** The settings the surface was last built or updated with (SetOceanSettings compares
+     *  against them; slider drags apply on release). */
+    FVoxelOceanSettings AppliedSettings;
 
     /** The owner planet's terrain (null when standalone). */
     AAdaptiveVoxelActor* FindTerrain() const;

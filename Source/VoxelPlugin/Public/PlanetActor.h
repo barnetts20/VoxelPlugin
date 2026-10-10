@@ -1,4 +1,4 @@
-// PlanetActor.h — Top-level planet actor that orchestrates terrain, ocean, and
+// PlanetActor.h - Top-level planet actor that orchestrates terrain, ocean, and
 // gravity child actors. Owns the shared density compositor (noise + edit store)
 // that both terrain and ocean subsystems sample from.
 //
@@ -17,6 +17,7 @@
 #include "OceanSphereActor.h"
 #include "FDensitySampleCompositor.h"
 #include "VoxelDensity.h"
+#include "VoxelOceanSettings.h"
 #include "PooledActor.h"
 #include "PlanetActor.generated.h"
 
@@ -34,7 +35,9 @@ class APlanetGravityZone;
  *
  *  Property changes are handled via two deferred flags:
  *    - bPendingInitialize: full rebuild (scale, NAR, surface settings changes)
- *    - bPendingOceanUpdate: ocean/gravity toggle or sea level change only */
+ *    - bPendingOceanUpdate: ocean/gravity toggle or sea level change only
+ *  Both go through ConfigureOcean / ConfigureGravity, as the first initialization does.
+ *  The ocean's own settings (OceanSettings) and material apply in place, without either. */
 UCLASS()
 class VOXELPLUGIN_API APlanetActor : public AActor, public IPooledActor, public IStarLit
 {
@@ -58,7 +61,7 @@ public:
     FVoxelSurfaceSettings SurfaceSettings;
 
     /** Sea level as a fraction of the noise distribution [0, 1].
-     *  OceanRadius = PlanetRadius + SeaLevel * NoiseAmplitude. */
+     *  OceanRadius = PlanetRadius + SeaLevel * NoiseAmplitude (at least 1 cm). */
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Planet|Shape", meta = (ClampMin = "-1", ClampMax = "2.0"))
     double SeaLevel = 0.5;
 
@@ -67,8 +70,15 @@ public:
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Planet|Ocean")
     bool bEnableOcean = true;
 
+    /** The ocean's surface material (empty: the plugin's MT_Ocean). Applies without a rebuild. */
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Planet|Ocean")
     UMaterialInterface* OceanMaterial = nullptr;
+
+    /** The ocean's settings: mesh, land cull, underwater view, optics and environment. The
+     *  planet forwards them whole to its ocean (SetOceanSettings), so they survive a respawn;
+     *  only what changed is applied (the mesh rebuilds, the rest applies in place). */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, BlueprintSetter = SetOceanSettings, Category = "Planet|Ocean")
+    FVoxelOceanSettings OceanSettings;
 
     // --- Terrain ---
 
@@ -94,6 +104,11 @@ public:
     /** Rebuilds the compositor and every child on the next Tick (a child's structural
      *  setting changed, e.g. the terrain's TargetPrecision). */
     void RequestRebuild() { bPendingInitialize = true; }
+
+    /** New ocean settings at run time: stored on the planet and forwarded to its ocean, which
+     *  applies only what changed. */
+    UFUNCTION(BlueprintCallable, Category = "Planet|Ocean")
+    void SetOceanSettings(const FVoxelOceanSettings& InSettings);
 
     // --- Lifecycle ---
 
@@ -121,11 +136,13 @@ public:
 
     /** Master dormancy toggle: hides + tick-disables this actor and its child actors
      *  (terrain/ocean/gravity) and drops collision. A dormant planet does NO per-frame
-     *  CPU or GPU work. Waking respects the bEnableOcean/Gravity feature flags. */
+     *  CPU or GPU work; the ocean keeps its pages, so waking is instant. Waking respects the
+     *  bEnableOcean/Gravity feature flags. */
     void SetDormant(bool bDormant);
 
 #if WITH_EDITOR
     virtual void PostEditChangeProperty(FPropertyChangedEvent& PropertyChangedEvent) override;
+    virtual void PostEditMove(bool bFinished) override;
 #endif
 
 private:
@@ -160,6 +177,9 @@ private:
 
     bool bInitialized = false;
 
+    /** A slider is still moving (editor): construction doesn't flag rebuilds until release. */
+    bool bInteractiveEdit = false;
+
     FVector StarWorldPosition = FVector::ZeroVector;
     bool bHasStarWorldPosition = false;
 
@@ -175,6 +195,27 @@ private:
      *  configures and initializes terrain/ocean/gravity. */
     void Initialize();
 
+    /** The ocean from the planet's settings: radius, density, material and OceanSettings,
+     *  shown and ticking, or hidden and stopped when bEnableOcean is off. Used by the first
+     *  initialization and by every later update alike. */
+    void ConfigureOcean(double PlanetRadius, double NoiseAmplitude, double OceanRadius);
+
+    /** The gravity zone at the visible surface (the larger of the ocean and planet radii),
+     *  or hidden and without collision when bEnableGravity is off. */
+    void ConfigureGravity(double PlanetRadius, double OceanRadius);
+
+    /** Records the values FlagPendingWork compares against. */
+    void RecordAppliedState();
+
+    /** Compares the shape, sea level and toggles against what was applied and flags the
+     *  rebuild or the ocean update for the next Tick. From OnConstruction, and from
+     *  PostEditChangeProperty (a PIE world doesn't rerun construction after an edit). */
+    void FlagPendingWork();
+
+    /** Forwards the materials and OceanSettings to the children again; each applies only what
+     *  changed (after an undo, which reports no property). */
+    void ForwardChildSettings();
+
     /** Spawns terrain, ocean, and gravity child actors if not already present.
      *  Attaches them to PlanetRoot with absolute scale. Loads default materials. */
     void SpawnChildActors();
@@ -187,6 +228,7 @@ private:
     TSharedPtr<FDensitySampleCompositor> BuildCompositor(double PlanetRadius, double NoiseAmplitude, double RootExtent, int32 MaxDepth);
 
     /** Computes ocean radius from planet radius, noise amplitude, and SeaLevel.
-     *  OceanRadius = PlanetRadius + SeaLevel * NoiseAmplitude. */
+     *  OceanRadius = PlanetRadius + SeaLevel * NoiseAmplitude, at least 1 cm (a sea level
+     *  below the planet's centre gives a vanishing ocean, not a negative scale). */
     double ComputeOceanRadius(double PlanetRadius, double NoiseAmplitude) const;
 };
