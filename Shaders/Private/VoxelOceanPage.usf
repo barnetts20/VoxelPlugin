@@ -7,19 +7,34 @@
 // tangent and normal (snorm8 x4), and five texture coordinates as ten words: the morph offset
 // (to the parent vertex the vertex collapses into) x, y | z, terrain depth | the depth at that
 // target, shore distance | the target's own morph offset (toward the grandparent grid) x, y |
-// z, the depth at its target (depths and shore 0 until stage O2; VoxelOcean.ush reads them).
-// Colour is the page's (voxel.Debug.LevelColor).
+// z, the depth at its target (shore 0 until a later stage; VoxelOcean.ush reads them). Colour
+// is the page's (voxel.Debug.LevelColor).
+//
+// The terrain depth of a vertex (cm, positive under water) is the planet density with the
+// terrain's edits at the lattice point nearest it (the terrain's VoxelDensitySample.ush and
+// VoxelEditSample.ush, unchanged): the density is about the height above the terrain, and
+// the vertex lies on the sea sphere. Each tile samples its own vertices once, into group
+// memory; a vertex's morph target and the target's target are vertices of the same tile, so
+// their depths are read from there and the depth morphs with the vertex. A triangle the land
+// stands above at every corner by more than the job's cull height (a margin plus the slope
+// bound times how far a morphed triangle reaches) is written degenerate: no part of it can be
+// above the terrain.
 
 #include "/Engine/Public/Platform.ush"
+#include "/Plugin/VoxelPlugin/Private/VoxelDensityCore.ush"
+#include "/Plugin/VoxelPlugin/Private/VoxelDF64.ush"
 
-#define VOXEL_OCEAN_JOB_WORDS 4u       // VoxelOceanPagesDetail::JobWords
-#define VOXEL_OCEAN_VERTEX_WORDS 11u   // FVoxelOceanPages::VertexWords
+#define VOXEL_OCEAN_JOB_WORDS 6u          // VoxelOceanPagesDetail::JobWords
+#define VOXEL_OCEAN_VERTEX_WORDS 15u      // FVoxelOceanPages::VertexWords
+#define VOXEL_OCEAN_MAX_TILE_VERTICES 1089u   // (32 + 1)^2: TileQuads is at most 32
 
 static const uint TexCoordWords = 10u;
 
-// Per job: kind (0 write, 1 clear), slot, first word of the tile's vertices, unused.
+// Per job: kind (0 write, 1 clear), slot, first word of the tile's vertices, density footprint
+// (float, cm), cull height (float, cm), unused.
 StructuredBuffer<uint> Jobs;
-// Per vertex: position (3), morph offset (3), packed tangent, packed normal, target's morph offset (3).
+// Per vertex: position (3), morph offset (3), packed tangent, packed normal, target's morph
+// offset (3), lattice point (3 ints), tile indices of the target and of its target (16 bits each).
 StructuredBuffer<uint> VertexWords;
 RWBuffer<float> OutPositions;
 RWBuffer<uint> OutTangents;          // two packed normals per vertex: tangent, normal
@@ -36,13 +51,45 @@ uint Color;
 uint StreamMask;                     // 1 tangents, 2 texture coordinates, 4 colours: streams the page has
 uint FlipWinding;
 
+// The density (VoxelDensitySample.ush).
+StructuredBuffer<FVoxelOctave> Octaves;
+uint ContinentOctaves;
+uint MountainOctaves;
+uint DetailOctaves;
+float2 InvNormContinent;
+float2 InvNormMountain;
+float2 InvNormDetail;
+float2 PlanetRadius;
+float2 NoiseAmplitude;
+float2 HalfFinest;
+float2 ContinentWeight;
+float2 MountainWeight;
+float2 MountainStart;
+float2 MountainBlend;
+float2 DetailWeight;
+float RidgeGain;
+float SlopeDamping;
+
+// The edits (VoxelEditSample.ush).
+StructuredBuffer<float> EditCorners;
+StructuredBuffer<int> EditChildren;
+StructuredBuffer<uint> EditFlags;
+uint EditNodeCount;
+int EditRootExtent;
+
+#include "/Plugin/VoxelPlugin/Private/VoxelDensitySample.ush"
+#include "/Plugin/VoxelPlugin/Private/VoxelEditSample.ush"
+
+// The job's terrain depth per tile vertex.
+groupshared float TileDepth[VOXEL_OCEAN_MAX_TILE_VERTICES];
+
 // One group per job; group 0 also writes FRHIDrawIndexedIndirectParameters (index count,
 // instances, first index, base vertex, first instance).
 [numthreads(64, 1, 1)]
 void WriteCS(uint3 GroupId : SV_GroupID, uint GroupThread : SV_GroupIndex)
 {
     const uint N = TileQuads + 1u;
-    const uint TileVertices = N * N;
+    const uint TileVertices = min(N * N, VOXEL_OCEAN_MAX_TILE_VERTICES);
     const uint TileTriangles = 2u * TileQuads * TileQuads;
     const uint Job = GroupId.x;
     if (Job == 0u && GroupThread == 0u)
@@ -53,14 +100,40 @@ void WriteCS(uint3 GroupId : SV_GroupID, uint GroupThread : SV_GroupIndex)
         OutArgs[3] = 0u;
         OutArgs[4] = 0u;
     }
-    if (Job >= NumJobs) return;
-
-    const uint W = Job * VOXEL_OCEAN_JOB_WORDS;
-    const bool bWrite = Jobs[W] == 0u;
-    const uint Slot = Jobs[W + 1u];
-    const uint Source = Jobs[W + 2u];
+    // Groups past the jobs (group 0 when there are none) do nothing more; no early return, so
+    // the barrier below stays in uniform flow for every compiler.
+    const bool bActive = Job < NumJobs;
+    bool bWrite = false;
+    uint Slot = 0u;
+    uint Source = 0u;
+    float Footprint = 0.0f;
+    float CullHeight = 0.0f;
+    if (bActive)
+    {
+        const uint W = Job * VOXEL_OCEAN_JOB_WORDS;
+        bWrite = Jobs[W] == 0u;
+        Slot = Jobs[W + 1u];
+        Source = Jobs[W + 2u];
+        Footprint = asfloat(Jobs[W + 3u]);
+        CullHeight = asfloat(Jobs[W + 4u]);
+    }
     const uint BaseVertex = Slot * TileVertices;
     const uint BaseTriangle = Slot * TileTriangles;
+
+    // The terrain depth at every vertex of the tile.
+    if (bWrite)
+    {
+        [loop]
+        for (uint I = GroupThread; I < TileVertices; I += 64u)
+        {
+            const uint Src = Source + I * VOXEL_OCEAN_VERTEX_WORDS;
+            const int X = asint(VertexWords[Src + 11u]);
+            const int Y = asint(VertexWords[Src + 12u]);
+            const int Z = asint(VertexWords[Src + 13u]);
+            TileDepth[I] = VoxelSampleDensityDF(X, Y, Z, Footprint) + VoxelEditDelta(X, Y, Z);
+        }
+    }
+    GroupMemoryBarrierWithGroupSync();
 
     if (bWrite)
     {
@@ -79,17 +152,20 @@ void WriteCS(uint3 GroupId : SV_GroupID, uint GroupThread : SV_GroupIndex)
             }
             if ((StreamMask & 2u) != 0u)
             {
+                const uint Gather = VertexWords[Src + 14u];
+                const uint Target = min(Gather & 0xffffu, TileVertices - 1u);
+                const uint Grand = min(Gather >> 16u, TileVertices - 1u);
                 const uint T = Dst * TexCoordWords;
                 OutTexCoords[T] = VertexWords[Src + 3u];
                 OutTexCoords[T + 1u] = VertexWords[Src + 4u];
                 OutTexCoords[T + 2u] = VertexWords[Src + 5u];
-                OutTexCoords[T + 3u] = asuint(0.0f);    // terrain depth (stage O2)
-                OutTexCoords[T + 4u] = asuint(0.0f);    // the depth at the morph target
+                OutTexCoords[T + 3u] = asuint(TileDepth[I]);
+                OutTexCoords[T + 4u] = asuint(TileDepth[Target]);
                 OutTexCoords[T + 5u] = asuint(0.0f);    // shore distance (reserved)
                 OutTexCoords[T + 6u] = VertexWords[Src + 8u];
                 OutTexCoords[T + 7u] = VertexWords[Src + 9u];
                 OutTexCoords[T + 8u] = VertexWords[Src + 10u];
-                OutTexCoords[T + 9u] = asuint(0.0f);    // the depth at the target's target
+                OutTexCoords[T + 9u] = asuint(TileDepth[Grand]);
             }
             if ((StreamMask & 4u) != 0u)
                 OutColors[Dst] = Color;
@@ -97,7 +173,7 @@ void WriteCS(uint3 GroupId : SV_GroupID, uint GroupThread : SV_GroupIndex)
     }
 
     [loop]
-    for (uint T = GroupThread; T < TileTriangles && BaseTriangle + T < TriangleCapacity; T += 64u)
+    for (uint T = GroupThread; bActive && T < TileTriangles && BaseTriangle + T < TriangleCapacity; T += 64u)
     {
         const uint Dst = (BaseTriangle + T) * 3u;
         uint3 Tri = uint3(0u, 0u, 0u);
@@ -107,14 +183,18 @@ void WriteCS(uint3 GroupId : SV_GroupID, uint GroupThread : SV_GroupIndex)
             const uint Quad = T >> 1u;
             const uint A = Quad % TileQuads;
             const uint B = Quad / TileQuads;
-            const uint V00 = BaseVertex + B * N + A;
+            const uint V00 = B * N + A;
             const uint V10 = V00 + 1u;
             const uint V01 = V00 + N;
             const uint V11 = V01 + 1u;
+            uint3 Local;
             if ((T & 1u) == 0u)
-                Tri = FlipWinding != 0u ? uint3(V00, V10, V11) : uint3(V00, V11, V10);
+                Local = FlipWinding != 0u ? uint3(V00, V10, V11) : uint3(V00, V11, V10);
             else
-                Tri = FlipWinding != 0u ? uint3(V00, V11, V01) : uint3(V00, V01, V11);
+                Local = FlipWinding != 0u ? uint3(V00, V11, V01) : uint3(V00, V01, V11);
+            // Under land at every corner, by more than the cull height: degenerate.
+            const float Highest = max(TileDepth[Local.x], max(TileDepth[Local.y], TileDepth[Local.z]));
+            Tri = Highest < -CullHeight ? uint3(BaseVertex, BaseVertex, BaseVertex) : Local + BaseVertex;
         }
         OutIndices[Dst] = Tri.x;
         OutIndices[Dst + 1u] = Tri.y;

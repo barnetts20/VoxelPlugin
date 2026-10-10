@@ -2,9 +2,11 @@
 // pages of a cube-sphere quadtree (FVoxelOceanSurface, Design/OceanMeshing.md). Scale (max
 // component, cm) is the ocean radius; a planet sets it from its sea level and drives the actor.
 //
-// Stage O1: the plain sphere, its level-of-detail selection, the GPU pages and the morph. The
-// terrain depth under the sea, the underwater view and the wave and query interfaces come in
-// the next stages.
+// Stage O1: the plain sphere, its level-of-detail selection, the GPU pages and the morph.
+// Stage O2: the terrain depth under every vertex (the planet density with the terrain's
+// edits), the land cull and a test wave. Stage O3: the view from under water (a render-graph
+// pass per ocean from a view extension, FVoxelUnderwaterViewExtension), the water's optics,
+// and height queries. The wave and query interfaces come in stage O4.
 
 #pragma once
 
@@ -16,6 +18,10 @@
 
 class FVoxelOceanSurface;
 class UMaterialInstanceDynamic;
+class AAdaptiveVoxelActor;
+class FVoxelUnderwaterViewExtension;
+struct FVoxelDensityGPUData;
+struct FVoxelOceanSurfaceInputs;
 
 /** The ocean surface: every frame the tiles the camera selects are committed to GPU pages
  *  (one frame per change, the previous tiles kept until the new ones can be drawn), and the
@@ -90,6 +96,65 @@ public:
     UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Ocean|Mesh")
     double ActualSpacing = 0.0;
 
+    // --- Depth ---
+
+    /** Leave out the triangles the land stands well above (the terrain hides them anyway). */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Ocean|Depth")
+    bool bCullUnderLand = true;
+
+    /** How far (cm) the land must stand above the sea at a triangle's corners, beyond what the
+     *  terrain's slope bound allows for across the triangle, before it is left out. Covers
+     *  the terrain mesh's error and the waves' run-up. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Ocean|Depth", meta = (ClampMin = "0.0", UIMax = "5000.0", EditCondition = "bCullUnderLand"))
+    double LandCullMargin = 500.0;
+
+    // --- Underwater and optics ---
+
+    /** The view from under water: a pass of the ocean's own after the atmosphere, ahead of
+     *  depth of field (STAGE_O3b_NOTES.md). It decides each pixel itself, so partly submerged
+     *  frames split exactly, and leaves a view whose camera can't reach the water untouched. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Ocean|Underwater")
+    bool bUnderwaterView = true;
+
+    /** Absorption of the water per metre, per channel (red goes first). Feeds the underwater
+     *  pass and the surface material (VoxelOceanAbsorption). */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Ocean|Optics")
+    FLinearColor Absorption = FLinearColor(0.35f, 0.07f, 0.03f);
+
+    /** Scattering of the water per metre, per channel. Feeds the underwater pass and the
+     *  surface material (VoxelOceanScattering). */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Ocean|Optics")
+    FLinearColor Scattering = FLinearColor(0.02f, 0.03f, 0.035f);
+
+    /** Forward scattering anisotropy, for a Single Layer Water surface (VoxelOceanPhaseG). */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Ocean|Optics", meta = (ClampMin = "-1.0", ClampMax = "1.0"))
+    float PhaseG = 0.8f;
+
+    /** The light the water scatters toward the camera under water, in the scene's light units
+     *  (linear, before exposure, so it holds as the exposure adapts), until the atmosphere
+     *  provides the sun's. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Ocean|Optics")
+    FLinearColor UnderwaterLight = FLinearColor(0.4f, 0.8f, 1.0f);
+
+    /** The thin band (cm) where the near plane meets the surface. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Ocean|Optics", meta = (ClampMin = "0.0", UIMax = "10.0"))
+    double MeniscusWidth = 1.5;
+
+    /** The waterline's tint, in the scene's light units (as UnderwaterLight). */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Ocean|Optics")
+    FLinearColor MeniscusColor = FLinearColor(0.02f, 0.06f, 0.08f);
+
+    // --- Queries ---
+
+    /** The height (cm) of a world point above the drawn surface (the sea sphere and the test
+     *  wave while it is on); negative under water. Game thread. */
+    UFUNCTION(BlueprintCallable, BlueprintPure, Category = "Ocean|Query")
+    double GetHeightAboveSurface(const FVector& WorldLocation) const;
+
+    /** True when the world point is under the drawn surface. Game thread. */
+    UFUNCTION(BlueprintCallable, BlueprintPure, Category = "Ocean|Query")
+    bool IsSubmerged(const FVector& WorldLocation) const;
+
     // --- Accessors ---
 
     USceneComponent* GetMeshAttachmentRoot() const { return MeshAttachmentRoot; }
@@ -103,8 +168,10 @@ public:
     virtual void BeginPlay() override;
     virtual void EndPlay(const EEndPlayReason::Type EndPlayReason) override;
     virtual void Destroyed() override;
+    virtual void BeginDestroy() override;
     virtual bool ShouldTickIfViewportsOnly() const override;
     virtual void Tick(float DeltaTime) override;
+    virtual void SetActorHiddenInGame(bool bNewHidden) override;
 
     // --- Editor Property & Transform Locking ---
 
@@ -141,6 +208,9 @@ private:
     UPROPERTY(Transient)
     TObjectPtr<UMaterialInstanceDynamic> SurfaceMaterialInstance;
 
+    /** The view from under water: one view extension per ocean, fed every tick. */
+    TSharedPtr<FVoxelUnderwaterViewExtension, ESPMode::ThreadSafe> UnderwaterExtension;
+
     /** The density (shared with the terrain when planet-owned); the terrain depth reads it from
      *  stage O2. */
     TSharedPtr<FDensitySampleCompositor> Compositor;
@@ -149,7 +219,36 @@ private:
     TSharedPtr<FVoxelOceanSurface> Surface;
 
     FVector CameraPosition = FVector::ZeroVector;
+    bool bHasCamera = false;       // CameraPosition holds a rendered view's
     bool bInitialized = false;
+
+    /** The planet density on the GPU, built from Compositor (the terrain's is the same). */
+    TSharedPtr<const FVoxelDensityGPUData> GPUDensity;
+
+    /** The planet's terrain the depth follows: its lattice, slope bound and edits. */
+    TWeakObjectPtr<AAdaptiveVoxelActor> BoundTerrain;
+    FDelegateHandle TerrainEditHandle;
+
+    /** LandCullMargin as last applied (slider drags apply on release). */
+    double AppliedLandCullMargin = 500.0;
+
+    /** The owner planet's terrain (null when standalone). */
+    AAdaptiveVoxelActor* FindTerrain() const;
+    /** Listens to Terrain's edits (and no longer to the previous terrain's). */
+    void BindTerrain(AAdaptiveVoxelActor* Terrain);
+    void UnbindTerrain();
+    void HandleTerrainEdit(uint32 Sequence, const FVector& Center, double Radius);
+    /** The surface's terrain inputs this frame. */
+    FVoxelOceanSurfaceInputs GatherInputs(const AAdaptiveVoxelActor* Terrain) const;
+
+    /** The underwater extension, once per world (no renderer: none). */
+    void CreateUnderwater();
+    /** Enables the underwater extension while the ocean is drawn and hands it this frame. */
+    void UpdateUnderwater();
+    /** Disables the underwater extension and releases it on the render thread. */
+    void ReleaseUnderwater();
+    /** The optics properties on the surface material instance (Single Layer Water). */
+    void ApplyOptics();
     FVector LastInitScale = FVector::ZeroVector;
 
     /** Cached scale set by the planet actor, used by the transform guard. */

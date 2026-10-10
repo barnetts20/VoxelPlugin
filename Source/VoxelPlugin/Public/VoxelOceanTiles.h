@@ -285,11 +285,17 @@ namespace VoxelOceanTiles
 
     struct FTileVertex
     {
+        FVector Point;        // on the sea sphere, planet frame (cm)
         FVector3f Position;   // from the page origin, page units
         FVector3f Morph;      // to the morph target (the parent vertex it collapses into), page units
         FVector3f Grand;      // from the morph target to the target's own (the grandparent grid), page units
         FVector3f Normal;     // radial
         FVector3f Tangent;    // the face's U axis on the tangent plane
+        /** The morph target and the target's own target as vertices of this tile (BuildTile
+         *  order): both lie in the tile, so values sampled per vertex (the terrain depth) are
+         *  gathered for them from the tile itself. */
+        int32 TargetIndex = 0;
+        int32 GrandIndex = 0;
     };
 
     /** Which way an odd vertex on a face's edge collapses (-1 toward lower grid lines, +1
@@ -384,8 +390,11 @@ namespace VoxelOceanTiles
                 int32 DA = 0, DB = 0;
                 CollapseOffset(Tile, Quads, a, b, DA, DB);
                 const FVector& Target = At(a + DA, b + DB);
-                // The target as a vertex of the parent tile, and where it collapses in turn.
+                // The target as a vertex of the parent tile, and where it collapses in turn. A
+                // tile's edge lines are even in its parent's grid too (Quads / 2 is even), so the
+                // grand target stays in the tile.
                 FVector Grand = Target;
+                int32 GrandA = a + DA, GrandB = b + DB;
                 if (Tile.Level >= 2)
                 {
                     const FVoxelOceanTileKey Parent(Tile.Face, Tile.Level - 1, Tile.I >> 1, Tile.J >> 1);
@@ -397,10 +406,15 @@ namespace VoxelOceanTiles
                     {
                         Grand = Direction(Tile.Face, GridCoord((int64)Parent.I * Quads + PA + GA, Bits - 1),
                             GridCoord((int64)Parent.J * Quads + PB + GB, Bits - 1)) * Radius;
+                        GrandA = FMath::Clamp(2 * (PA + GA) - (Tile.I & 1) * Quads, 0, Quads);
+                        GrandB = FMath::Clamp(2 * (PB + GB) - (Tile.J & 1) * Quads, 0, Quads);
                     }
                 }
                 const FVector D = P / Radius;
                 FTileVertex Vertex;
+                Vertex.Point = P;
+                Vertex.TargetIndex = (b + DB) * N + (a + DA);
+                Vertex.GrandIndex = GrandB * N + GrandA;
                 Vertex.Position = FVector3f((P - Origin) * InvUnit);
                 Vertex.Morph = FVector3f((Target - P) * InvUnit);
                 Vertex.Grand = FVector3f((Grand - Target) * InvUnit);
@@ -409,6 +423,23 @@ namespace VoxelOceanTiles
                 Out.Add(Vertex);
             }
         }
+    }
+
+    /** The longest edge between neighbouring vertices of a tile BuildTile made (cm). */
+    inline double MaxSpacing(TConstArrayView<FTileVertex> Vertices, int32 Quads)
+    {
+        const int32 N = Quads + 1;
+        double Max = 0.0;
+        for (int32 b = 0; b < N; b++)
+        {
+            for (int32 a = 0; a < N; a++)
+            {
+                const FVector& P = Vertices[b * N + a].Point;
+                if (a + 1 < N) Max = FMath::Max(Max, FVector::DistSquared(P, Vertices[b * N + a + 1].Point));
+                if (b + 1 < N) Max = FMath::Max(Max, FVector::DistSquared(P, Vertices[(b + 1) * N + a].Point));
+            }
+        }
+        return FMath::Sqrt(Max);
     }
 
     /** The two triangles of quad (a, b) of a tile, as vertex indices of BuildTile's order, wound

@@ -17,6 +17,10 @@
 #include <atomic>
 #include "AdaptiveVoxelActor.generated.h"
 
+/** An edit written to the edit store, as the terrain forwards it to its bricks: its sequence,
+ *  centre (actor space without scale) and radius (cm). */
+DECLARE_MULTICAST_DELEGATE_ThreeParams(FOnVoxelTerrainEdited, uint32 /*Sequence*/, const FVector& /*Center*/, double /*Radius*/);
+
 /** The brick terrain and the collision bricks run their own tasks; edits are written to the
  *  edit store on a task and forwarded to both from Tick. */
 UCLASS()
@@ -42,7 +46,7 @@ private:
     /** Set in BeginDestroy to prevent async tasks from touching a dying actor. */
     std::atomic<bool> IsDestroyed = false;
 
-    /** Last scale at which Initialize ran — used to detect scale changes in OnConstruction. */
+    /** Last scale at which Initialize ran - used to detect scale changes in OnConstruction. */
     FVector LastInitScale = FVector::ZeroVector;
 
     /** Cached scale set by the planet actor, used by the transform guard to restore
@@ -58,7 +62,7 @@ public:
 
     /** True when this actor is spawned and driven by an APlanetActor.
      *  Planet-driven properties (NoiseAmplitudeRatio, SurfaceMaterial) become
-     *  read-only on this actor — edit them on the planet instead. */
+     *  read-only on this actor - edit them on the planet instead. */
     UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Terrain")
     bool bIsPlanetOwned = false;
 
@@ -189,6 +193,10 @@ public:
     /** The brick terrain (exists once initialized). */
     TSharedPtr<FVoxelBrickTerrain> GetBrickTerrain() const { return BrickTerrain; }
 
+    /** Game thread. Broadcast from Tick for every edit written to the edit store, as it is
+     *  forwarded to the collision and brick terrain (the ocean rewrites its depth there). */
+    FOnVoxelTerrainEdited& OnTerrainEdited() { return TerrainEdited; }
+
     /** Called by APlanetActor: uses its compositor (shared density and edits), sets the scale
      *  (planet radius) first, and re-parents BrickAttachmentRoot to InAttachParent if given. */
     void InitializeFromPlanet(TSharedPtr<FDensitySampleCompositor> InCompositor,
@@ -214,6 +222,9 @@ protected:
 
     /** The rendered terrain. */
     TSharedPtr<FVoxelBrickTerrain> BrickTerrain;
+
+    /** Listeners to the edits (OnTerrainEdited). */
+    FOnVoxelTerrainEdited TerrainEdited;
 
     /** An edit written to the edit store, for the collision bricks and the brick terrain. */
     struct FEditNotice

@@ -10,6 +10,12 @@
 // A commit writes and clears tiles; every page it touches runs in the same frame's graph, so
 // the surface switches from one selection to the next between two frames. A page that needs a
 // buffer set first waits until one is registered and placed (PreparePages).
+//
+// Writing a tile also samples the terrain under it (stage O2): the planet density, with the
+// terrain's edits, at the lattice point nearest each vertex, in the page's compute run (the
+// terrain's own VoxelDensitySample.ush and VoxelEditSample.ush). The depth goes to the
+// vertices' texture coordinates, morphed with them, and a triangle the land stands well
+// above at every corner is written degenerate (the land cull).
 
 #pragma once
 
@@ -23,6 +29,22 @@ class UMaterialInterface;
 class URealtimeMeshSimple;
 class URealtimeMeshComponent;
 class FVoxelOceanPageProvider;
+class FVoxelOceanInputCache;
+struct FVoxelDensityGPUData;
+struct FVoxelEditGPUData;
+
+/** What the page writes sample the terrain depth from. */
+struct FVoxelOceanDensityInputs
+{
+    /** The planet density without edits (FVoxelDensityCPU::BuildGPUData). Null: no terrain,
+     *  every vertex deep water. */
+    TSharedPtr<const FVoxelDensityGPUData> Density;
+    /** The edit tree as the terrain meshes with it. Null: no edits. */
+    TSharedPtr<const FVoxelEditGPUData> Edits;
+    /** The lattice step (cm): a vertex samples the point of the terrain lattice nearest it,
+     *  counted in these from the planet centre (the edit tree is addressed the same way). */
+    double HalfFinest = 50.0;
+};
 
 /** Game thread. The pages of one ocean surface. */
 class FVoxelOceanPages
@@ -34,11 +56,18 @@ public:
     {
         FVoxelOceanTileKey Tile;
         TArray<uint32> Words;
+        /** The density is sampled leaving out detail finer than this (cm): the tile's spacing. */
+        float Footprint = 0.0f;
+        /** A triangle is culled when the land stands above the sea by more than this (cm) at
+         *  each corner (FLT_MAX: never). */
+        float CullHeight = 0.0f;
     };
 
     /** Words per vertex in a tile write: position (3 floats), morph offset (3 floats), packed
-     *  tangent and packed normal (snorm8 x4), the target's own morph offset (3 floats). */
-    static constexpr int32 VertexWords = 11;
+     *  tangent and packed normal (snorm8 x4), the target's own morph offset (3 floats), the
+     *  lattice point sampled for the depth (3 ints), and the tile indices of the morph target
+     *  and of its own target (16 bits each). */
+    static constexpr int32 VertexWords = 15;
 
     FVoxelOceanPages();
     ~FVoxelOceanPages();
@@ -55,6 +84,10 @@ public:
 
     /** Changes where level 0's morph ends (world units) on every buffer set. */
     void SetMorphEnd0(double InMorphEnd0);
+
+    /** The density and edits the next writes sample. Writes already pushed keep theirs. */
+    void SetDensityInputs(const FVoxelOceanDensityInputs& InInputs);
+    const FVoxelOceanDensityInputs& GetDensityInputs() const { return DensityInputs; }
 
     /** True when every page in InPages has a buffer set ready to draw in this frame; otherwise
      *  gets more ready (within voxel.Ocean.PageCreates new ones per frame) and returns false. */
@@ -77,8 +110,9 @@ public:
     /** voxel.Debug.Ocean: work since the last call, and resets it. */
     FString TakePerf();
 
-    /** Vertex words of a tile write for one vertex. */
-    static void PackVertex(const VoxelOceanTiles::FTileVertex& Vertex, uint32* OutWords);
+    /** Vertex words of a tile write for one vertex; Lattice: the lattice point its depth is
+     *  sampled at. */
+    static void PackVertex(const VoxelOceanTiles::FTileVertex& Vertex, const FIntVector& Lattice, uint32* OutWords);
 
 private:
     struct FInstance
@@ -148,6 +182,13 @@ private:
     int32 TileQuads = 16;
     double MorphEnd0 = 0.0;
     bool bFlipWinding = false;
+    FVoxelOceanDensityInputs DensityInputs;
+    /** Stand-ins for missing inputs: a density with no terrain (every vertex deep water) and
+     *  no edits. */
+    TSharedPtr<const FVoxelDensityGPUData> NoDensity;
+    TSharedPtr<const FVoxelEditGPUData> NoEdits;
+    /** The inputs uploaded once for every page's runs (render thread). */
+    TSharedPtr<FVoxelOceanInputCache, ESPMode::ThreadSafe> InputCache;
     TMap<FVoxelOceanTileKey, FPage> Pages;
     TArray<FInstance> Pool;
     TArray<FReleasing> Releasing;

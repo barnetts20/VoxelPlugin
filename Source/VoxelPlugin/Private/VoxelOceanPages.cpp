@@ -2,6 +2,8 @@
 #include "VoxelPlugin.h"
 #include "VoxelGPUCommon.h"
 #include "VoxelBrickTerrain.h"
+#include "VoxelBrickMesherGPU.h"
+#include "VoxelDensityGPU.h"
 #include "VoxelTerrainStats.h"
 #include "HAL/IConsoleManager.h"
 #include "RealtimeMeshSimple.h"
@@ -44,6 +46,30 @@ BEGIN_SHADER_PARAMETER_STRUCT(FVoxelOceanWriteParameters, )
     SHADER_PARAMETER(uint32, Color)
     SHADER_PARAMETER(uint32, StreamMask)
     SHADER_PARAMETER(uint32, FlipWinding)
+    // The density (VoxelDensitySample.ush) and the edits (VoxelEditSample.ush), as the
+    // terrain's FVoxelDensityCS takes them.
+    SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<FVoxelOctave>, Octaves)
+    SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<float>, EditCorners)
+    SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<int>, EditChildren)
+    SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, EditFlags)
+    SHADER_PARAMETER(uint32, EditNodeCount)
+    SHADER_PARAMETER(int32, EditRootExtent)
+    SHADER_PARAMETER(FVector2f, HalfFinest)
+    SHADER_PARAMETER(uint32, ContinentOctaves)
+    SHADER_PARAMETER(uint32, MountainOctaves)
+    SHADER_PARAMETER(uint32, DetailOctaves)
+    SHADER_PARAMETER(FVector2f, InvNormContinent)
+    SHADER_PARAMETER(FVector2f, InvNormMountain)
+    SHADER_PARAMETER(FVector2f, InvNormDetail)
+    SHADER_PARAMETER(FVector2f, PlanetRadius)
+    SHADER_PARAMETER(FVector2f, NoiseAmplitude)
+    SHADER_PARAMETER(FVector2f, ContinentWeight)
+    SHADER_PARAMETER(FVector2f, MountainWeight)
+    SHADER_PARAMETER(FVector2f, MountainStart)
+    SHADER_PARAMETER(FVector2f, MountainBlend)
+    SHADER_PARAMETER(FVector2f, DetailWeight)
+    SHADER_PARAMETER(float, RidgeGain)
+    SHADER_PARAMETER(float, SlopeDamping)
 END_SHADER_PARAMETER_STRUCT()
 
 class FVoxelOceanWriteCS : public FGlobalShader
@@ -57,6 +83,13 @@ public:
     {
         return IsFeatureLevelSupported(Parameters.Platform, ERHIFeatureLevel::SM5);
     }
+
+    static void ModifyCompilationEnvironment(const FGlobalShaderPermutationParameters& Parameters, FShaderCompilerEnvironment& OutEnvironment)
+    {
+        FGlobalShader::ModifyCompilationEnvironment(Parameters, OutEnvironment);
+        // The density's double-float code needs exact float rounding (as FVoxelDensityCS).
+        OutEnvironment.CompilerFlags.Add(CFLAG_NoFastMath);
+    }
 };
 
 IMPLEMENT_GLOBAL_SHADER(FVoxelOceanWriteCS, "/Plugin/VoxelPlugin/Private/VoxelOceanPage.usf", "WriteCS", SF_Compute);
@@ -68,7 +101,7 @@ static TAutoConsoleVariable<int32> CVarVoxelOceanPageCreates(
 
 namespace VoxelOceanPagesDetail
 {
-    constexpr uint32 JobWords = 4;                 // VOXEL_OCEAN_JOB_WORDS (VoxelOceanPage.usf)
+    constexpr uint32 JobWords = 6;                 // VOXEL_OCEAN_JOB_WORDS (VoxelOceanPage.usf)
     constexpr int32 TexCoordChannels = 5;          // morph xy | morph z, depth | target depth, shore | grand xy | grand z, grand depth
     constexpr int32 MaxPooled = 48;                // emptied buffer sets kept for reuse
     constexpr uint64 KickFrames = 3;               // frames before a run that didn't happen is asked for again
@@ -142,6 +175,44 @@ namespace VoxelOceanPagesDetail
 
 namespace VOP = VoxelOceanPagesDetail;
 
+/** The density and edit inputs as graph buffers, uploaded once for every page's runs while
+ *  they stay the same (render thread; as the terrain pages' GetInputs). */
+class FVoxelOceanInputCache
+{
+public:
+    VoxelBrickMesherGPU::FInputs Get(FRDGBuilder& GraphBuilder, const TSharedPtr<const FVoxelDensityGPUData>& InDensity,
+        const TSharedPtr<const FVoxelEditGPUData>& InEdits)
+    {
+        VoxelBrickMesherGPU::FInputs Inputs;
+        if (InDensity != Density || InEdits != Edits || !Octaves.IsValid())
+        {
+            Inputs = VoxelBrickMesherGPU::UploadInputs(GraphBuilder, *InDensity, *InEdits);
+            Octaves = GraphBuilder.ConvertToExternalBuffer(Inputs.Octaves);
+            EditCorners = GraphBuilder.ConvertToExternalBuffer(Inputs.EditCorners);
+            EditChildren = GraphBuilder.ConvertToExternalBuffer(Inputs.EditChildren);
+            EditFlags = GraphBuilder.ConvertToExternalBuffer(Inputs.EditFlags);
+            Density = InDensity;
+            Edits = InEdits;
+            return Inputs;
+        }
+        Inputs.Octaves = GraphBuilder.RegisterExternalBuffer(Octaves);
+        Inputs.EditCorners = GraphBuilder.RegisterExternalBuffer(EditCorners);
+        Inputs.EditChildren = GraphBuilder.RegisterExternalBuffer(EditChildren);
+        Inputs.EditFlags = GraphBuilder.RegisterExternalBuffer(EditFlags);
+        Inputs.EditNodeCount = (uint32)Edits->Flags.Num();
+        Inputs.EditRootExtent = Edits->RootExtent;
+        return Inputs;
+    }
+
+private:
+    TSharedPtr<const FVoxelDensityGPUData> Density;
+    TSharedPtr<const FVoxelEditGPUData> Edits;
+    TRefCountPtr<FRDGPooledBuffer> Octaves;
+    TRefCountPtr<FRDGPooledBuffer> EditCorners;
+    TRefCountPtr<FRDGPooledBuffer> EditChildren;
+    TRefCountPtr<FRDGPooledBuffer> EditFlags;
+};
+
 /** Writes one buffer set's commits when the compute driver runs it (render thread). */
 class FVoxelOceanPageProvider final : public IRealtimeMeshComputeProvider
 {
@@ -156,7 +227,16 @@ public:
         uint32 Color = 0xffffffffu;
         uint32 FlipWinding = 0;
         uint64 Version = 0;
+        /** What the writes sample the depth from (never null). */
+        TSharedPtr<const FVoxelDensityGPUData> Density;
+        TSharedPtr<const FVoxelEditGPUData> Edits;
+        double HalfFinest = 50.0;
     };
+
+    explicit FVoxelOceanPageProvider(const TSharedPtr<FVoxelOceanInputCache, ESPMode::ThreadSafe>& InInputCache)
+        : InputCache(InInputCache)
+    {
+    }
 
     /** States not yet run accumulate: each is written in order, so none is lost. */
     void AddState_RenderThread(FState&& InState)
@@ -181,6 +261,7 @@ public:
 
 private:
     TArray<FState> States;
+    TSharedPtr<FVoxelOceanInputCache, ESPMode::ThreadSafe> InputCache;
 };
 
 void FVoxelOceanPageProvider::BuildComputePasses(FRDGBuilder& GraphBuilder, const FRealtimeMeshComputeContext& Context)
@@ -243,7 +324,31 @@ void FVoxelOceanPageProvider::BuildComputePasses(FRDGBuilder& GraphBuilder, cons
     for (const FState& State : States)
     {
         const uint32 NumJobs = (uint32)State.Jobs.Num() / VOP::JobWords;
+        const FVoxelDensityGPUData& Density = *State.Density;
+        const VoxelBrickMesherGPU::FInputs Inputs = InputCache->Get(GraphBuilder, State.Density, State.Edits);
         FVoxelOceanWriteParameters* Parameters = GraphBuilder.AllocParameters<FVoxelOceanWriteParameters>();
+        Parameters->Octaves = GraphBuilder.CreateSRV(Inputs.Octaves);
+        Parameters->EditCorners = GraphBuilder.CreateSRV(Inputs.EditCorners);
+        Parameters->EditChildren = GraphBuilder.CreateSRV(Inputs.EditChildren);
+        Parameters->EditFlags = GraphBuilder.CreateSRV(Inputs.EditFlags);
+        Parameters->EditNodeCount = Inputs.EditNodeCount;
+        Parameters->EditRootExtent = Inputs.EditRootExtent;
+        Parameters->HalfFinest = VoxelDoubleFloat(State.HalfFinest);
+        Parameters->ContinentOctaves = Density.ContinentOctaves;
+        Parameters->MountainOctaves = Density.MountainOctaves;
+        Parameters->DetailOctaves = Density.DetailOctaves;
+        Parameters->InvNormContinent = Density.InvNormContinent;
+        Parameters->InvNormMountain = Density.InvNormMountain;
+        Parameters->InvNormDetail = Density.InvNormDetail;
+        Parameters->PlanetRadius = Density.PlanetRadius;
+        Parameters->NoiseAmplitude = Density.NoiseAmplitude;
+        Parameters->ContinentWeight = Density.ContinentWeight;
+        Parameters->MountainWeight = Density.MountainWeight;
+        Parameters->MountainStart = Density.MountainStart;
+        Parameters->MountainBlend = Density.MountainBlend;
+        Parameters->DetailWeight = Density.DetailWeight;
+        Parameters->RidgeGain = Density.RidgeGain;
+        Parameters->SlopeDamping = Density.SlopeDamping;
         Parameters->Jobs = GraphBuilder.CreateSRV(VoxelGPUCommon::UploadStructuredBuffer<uint32>(GraphBuilder, TEXT("Voxel.OceanJobs"), State.Jobs));
         Parameters->VertexWords = GraphBuilder.CreateSRV(VoxelGPUCommon::UploadStructuredBuffer<uint32>(GraphBuilder, TEXT("Voxel.OceanVertexWords"), State.Words));
         Parameters->OutPositions = Positions;
@@ -267,11 +372,27 @@ void FVoxelOceanPageProvider::BuildComputePasses(FRDGBuilder& GraphBuilder, cons
     States.Reset();
 }
 
-FVoxelOceanPages::FVoxelOceanPages() = default;
+FVoxelOceanPages::FVoxelOceanPages()
+    : NoDensity(MakeShared<FVoxelDensityGPUData>())
+    , NoEdits(MakeShared<FVoxelEditGPUData>())
+    , InputCache(MakeShared<FVoxelOceanInputCache, ESPMode::ThreadSafe>())
+{
+}
 
 FVoxelOceanPages::~FVoxelOceanPages()
 {
     Reset();
+    // The cached graph buffers are let go on the render thread (the providers may still hold
+    // the cache there too).
+    ENQUEUE_RENDER_COMMAND(VoxelOceanReleaseInputs)([Cache = MoveTemp(InputCache)](FRHICommandListImmediate&) mutable
+        {
+            Cache.Reset();
+        });
+}
+
+void FVoxelOceanPages::SetDensityInputs(const FVoxelOceanDensityInputs& InInputs)
+{
+    DensityInputs = InInputs;
 }
 
 void FVoxelOceanPages::Initialize(AActor* InOwner, USceneComponent* InAttachRoot, UMaterialInterface* InMaterial, double InRadius, int32 InTileQuads,
@@ -332,7 +453,7 @@ void FVoxelOceanPages::SetMorphEnd0(double InMorphEnd0)
         Apply(Entry.Instance);
 }
 
-void FVoxelOceanPages::PackVertex(const VoxelOceanTiles::FTileVertex& Vertex, uint32* OutWords)
+void FVoxelOceanPages::PackVertex(const VoxelOceanTiles::FTileVertex& Vertex, const FIntVector& Lattice, uint32* OutWords)
 {
     OutWords[0] = VOP::FloatBits(Vertex.Position.X);
     OutWords[1] = VOP::FloatBits(Vertex.Position.Y);
@@ -345,6 +466,10 @@ void FVoxelOceanPages::PackVertex(const VoxelOceanTiles::FTileVertex& Vertex, ui
     OutWords[8] = VOP::FloatBits(Vertex.Grand.X);
     OutWords[9] = VOP::FloatBits(Vertex.Grand.Y);
     OutWords[10] = VOP::FloatBits(Vertex.Grand.Z);
+    OutWords[11] = (uint32)Lattice.X;
+    OutWords[12] = (uint32)Lattice.Y;
+    OutWords[13] = (uint32)Lattice.Z;
+    OutWords[14] = ((uint32)Vertex.TargetIndex & 0xffffu) | ((uint32)Vertex.GrandIndex << 16);
 }
 
 FVoxelOceanPages::FInstance FVoxelOceanPages::CreateInstance()
@@ -413,7 +538,7 @@ FVoxelOceanPages::FInstance FVoxelOceanPages::CreateInstance()
 
     Instance.Mesh = Mesh;
     Instance.Component = Component;
-    Instance.Provider = MakeShared<FVoxelOceanPageProvider, ESPMode::ThreadSafe>();
+    Instance.Provider = MakeShared<FVoxelOceanPageProvider, ESPMode::ThreadSafe>(InputCache);
     Instance.CreatedFrame = GFrameCounter;
     return Instance;
 }
@@ -581,7 +706,7 @@ void FVoxelOceanPages::Commit(TConstArrayView<FTileWrite> Writes, TConstArrayVie
         }
         FPageWork& PageWork = Work.FindOrAdd(PageKey);
         PageWork.Cleared &= ~(1u << Slot);
-        PageWork.Jobs.Append({ 0u, (uint32)Slot, (uint32)PageWork.Words.Num(), 0u });
+        PageWork.Jobs.Append({ 0u, (uint32)Slot, (uint32)PageWork.Words.Num(), VOP::FloatBits(Write.Footprint), VOP::FloatBits(Write.CullHeight), 0u });
         PageWork.Words.Append(Write.Words);
         Perf.TilesWritten++;
     }
@@ -594,7 +719,7 @@ void FVoxelOceanPages::Commit(TConstArrayView<FTileWrite> Writes, TConstArrayVie
         for (int32 s = 0; s < VoxelOceanTiles::PageSlots; s++)
         {
             if (PageWork.Cleared & (1u << s))
-                PageWork.Jobs.Append({ 1u, (uint32)s, 0u, 0u });
+                PageWork.Jobs.Append({ 1u, (uint32)s, 0u, 0u, 0u, 0u });
         }
         Push(Pair.Key, Page->Instance, MoveTemp(PageWork.Jobs), MoveTemp(PageWork.Words), DrawSlotsOf(*Page));
         Perf.PagesPushed++;
@@ -619,6 +744,9 @@ void FVoxelOceanPages::Push(const FVoxelOceanTileKey& PageKey, FInstance& Instan
     State.TileQuads = (uint32)TileQuads;
     State.Color = (CVarVoxelDebugLevelColor.GetValueOnGameThread() > 0 ? FVoxelBrickTerrain::LevelColor(PageKey.Level) : FColor::White).DWColor();
     State.FlipWinding = bFlipWinding ? 1u : 0u;
+    State.Density = DensityInputs.Density.IsValid() ? DensityInputs.Density : NoDensity;
+    State.Edits = DensityInputs.Edits.IsValid() ? DensityInputs.Edits : NoEdits;
+    State.HalfFinest = DensityInputs.HalfFinest;
     State.Version = NextVersion++;
     Instance.PushedVersion = State.Version;
     // The state reaches the provider before the dirty mark: both are render commands.

@@ -1,0 +1,80 @@
+// VoxelOceanCommon.ush - Ocean math shared by the surface material (VoxelOcean.ush) and the
+// underwater pass (VoxelUnderwater.ush): the test wave (stage O4 replaces it with the wave
+// hook) and the stable height of a point above the sea sphere. Every position is from a
+// reference point near the camera (the selection camera for the surface, the view's camera for
+// the underwater pass), in world axes and cm (small and exact near it); the planet centre from
+// it is Center.
+//
+// Test wave: three sines along fixed planet directions; each is Wave = (k, phase), k in world
+// axes (radians per cm), the phase at the selection camera. Params.z is the amplitude (cm, 0
+// off). A wave is weighed by how well a spacing (vertex spacing or pixel footprint) resolves
+// it: 1 from four spacings per wavelength, 0 at two (VoxelOctaveBandWeight's rule).
+
+#pragma once
+
+// How far a wave of this wavelength is resolved at this spacing (0: no limit).
+float VoxelOceanResolved(float Wavelength, float Spacing)
+{
+    return Spacing > 0.0f ? saturate(Wavelength / (2.0f * Spacing) - 1.0f) : 1.0f;
+}
+
+// One test wave's height at P per amplitude, faded by the spacing.
+float VoxelOceanTestWave(float3 P, float4 Wave, float Spacing)
+{
+    const float Wavelength = 6.2831853f / max(length(Wave.xyz), 1.0e-12f);
+    return VoxelOceanResolved(Wavelength, Spacing) * sin(dot(Wave.xyz, P) + Wave.w);
+}
+
+// The test wave's height at P (cm), faded by the spacing.
+float VoxelOceanTestHeight(float3 P, float4 Params, float4 Wave0, float4 Wave1, float4 Wave2, float Spacing)
+{
+    if (Params.z <= 0.0f) return 0.0f;
+    return Params.z * (VoxelOceanTestWave(P, Wave0, Spacing) + VoxelOceanTestWave(P, Wave1, Spacing) + VoxelOceanTestWave(P, Wave2, Spacing));
+}
+
+// One test wave's height gradient at P, faded by the footprint; its unresolved slope variance,
+// (A k)^2 / 2 over a period, is added to Variance.
+void VoxelOceanTestWaveSlope(float3 P, float4 Wave, float Footprint, inout float3 Gradient, inout float Variance, float Amplitude)
+{
+    const float K = length(Wave.xyz);
+    const float Wavelength = 6.2831853f / max(K, 1.0e-12f);
+    const float Resolved = VoxelOceanResolved(Wavelength, Footprint);
+    Gradient += Wave.xyz * (Amplitude * Resolved * cos(dot(Wave.xyz, P) + Wave.w));
+    Variance += (1.0f - Resolved) * 0.5f * (Amplitude * K) * (Amplitude * K);
+}
+
+// The test wave's height gradient at P (world axes, per cm of surface), faded by the
+// footprint, and the slope variance it leaves out.
+float3 VoxelOceanTestGradient(float3 P, float4 Params, float4 Wave0, float4 Wave1, float4 Wave2, float Footprint, out float Variance)
+{
+    Variance = 0.0f;
+    float3 Gradient = float3(0.0f, 0.0f, 0.0f);
+    if (Params.z <= 0.0f) return Gradient;
+    VoxelOceanTestWaveSlope(P, Wave0, Footprint, Gradient, Variance, Params.z);
+    VoxelOceanTestWaveSlope(P, Wave1, Footprint, Gradient, Variance, Params.z);
+    VoxelOceanTestWaveSlope(P, Wave2, Footprint, Gradient, Variance, Params.z);
+    return Gradient;
+}
+
+// The normal of the displaced surface at a point whose radial is Up: the radial tilted by the
+// height's tangential gradient (exact for a height field; the sphere's curvature adds a
+// relative error of height / radius).
+float3 VoxelOceanSurfaceNormal(float3 Up, float3 Gradient)
+{
+    return normalize(Up - (Gradient - Up * dot(Up, Gradient)));
+}
+
+// The height (cm) above the sea sphere of radius Radius of the point D (from the selection
+// camera, whose own height is CameraHeight and whose radial is Up), without float
+// cancellation: with a = R + h and mu = Up . D,
+//   |a Up + D| - R = (h (2R + h) + 2 a mu + |D|^2) / (|a Up + D| + R).
+// Every term is small or a product the division brings back down (Design/OceanMeshing.md
+// section 5.3: under 0.03 mm within 100 m of the camera).
+float VoxelOceanSphereHeight(float3 D, float Radius, float CameraHeight, float3 Up)
+{
+    const float A = Radius + CameraHeight;
+    const float Mu = dot(Up, D);
+    const float Numerator = CameraHeight * (2.0f * Radius + CameraHeight) + 2.0f * A * Mu + dot(D, D);
+    const float Denominator = length(A * Up + D) + Radius;
+    return Numerator / max(Denominator, 1.0f);
+}

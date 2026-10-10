@@ -113,6 +113,11 @@ public:
     /** Game thread. True if the brick may hold surface: a member of a page, as committed. */
     bool HoldsSurface(const FVoxelBrickKey& Key) const;
 
+    /** Game thread. The edit tree as the pages mesh with it (null before the first Tick) and
+     *  the newest edit it holds. The ocean samples its depth with the same data. */
+    TSharedPtr<const FVoxelEditGPUData> GetGPUEdits() const { return GPUEdits; }
+    uint32 GetGPUEditsSequence() const { return GPUEditsSequence; }
+
     /** Debug vertex colour of a level (voxel.Debug.LevelColor). */
     static FColor LevelColor(int32 Level);
 

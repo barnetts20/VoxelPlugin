@@ -1,0 +1,63 @@
+// VoxelUnderwaterPass.usf - The underwater pass (FVoxelUnderwaterViewExtension): for every pixel
+// of a view's rect, the scene colour seen through the water (VoxelUnderwater.ush), written to a
+// copy of the scene colour. Runs ahead of depth of field, after the atmosphere's composite.
+//
+// The pixel's ray comes from the view's jittered clip space (the depth buffer's), through
+// UnderwaterClipToCamera: clip to view, then the view's rotation back to world axes, so a point
+// comes out relative to the view's camera. That clip space is linear in device z along a pixel,
+// so the near plane (device z 1, reversed z) and the scene point (the depth buffer's device z)
+// are the same transform; device z 0 (the sky) has no finite point.
+//
+// Parameter names must match FVoxelUnderwaterParameters exactly.
+
+#include "/Engine/Private/Common.ush"
+#include "/Plugin/VoxelPlugin/Private/VoxelUnderwater.ush"
+
+Texture2D<float4> UnderwaterSceneColor;
+Texture2D<float> UnderwaterSceneDepth;
+uint2 UnderwaterViewMin;
+uint2 UnderwaterViewSize;
+float4x4 UnderwaterClipToCamera;
+
+float3 UnderwaterCenter;
+float2 UnderwaterSphere;
+float UnderwaterWaveAmplitude;
+float4 UnderwaterWave0;
+float4 UnderwaterWave1;
+float4 UnderwaterWave2;
+
+float3 UnderwaterAbsorption;
+float3 UnderwaterScattering;
+float3 UnderwaterLight;
+float4 UnderwaterMeniscus;
+
+RWTexture2D<float4> UnderwaterOutput;
+
+[numthreads(VOXEL_UNDERWATER_THREADS, VOXEL_UNDERWATER_THREADS, 1)]
+void UnderwaterCS(uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+    if (any(DispatchThreadId.xy >= UnderwaterViewSize)) return;
+    const uint2 Pixel = UnderwaterViewMin + DispatchThreadId.xy;
+    const float4 Scene = UnderwaterSceneColor[Pixel];
+    const float DeviceZ = UnderwaterSceneDepth[Pixel];
+
+    // The pixel centre in clip space (y up).
+    const float2 UV = (float2(DispatchThreadId.xy) + 0.5f) / float2(UnderwaterViewSize);
+    const float2 Clip = float2(2.0f * UV.x - 1.0f, 1.0f - 2.0f * UV.y);
+
+    // The near plane's point and the scene's, from the camera.
+    const float4 NearH = mul(float4(Clip, 1.0f, 1.0f), UnderwaterClipToCamera);
+    const float4 SceneH = mul(float4(Clip, DeviceZ, 1.0f), UnderwaterClipToCamera);
+    const float NearLength = max(length(NearH.xyz), 1.0e-20f);
+    const float3 Dir = NearH.xyz / NearLength;
+    const float NearDistance = NearLength / max(NearH.w, 1.0e-20f);
+    const float SceneDistance = SceneH.w > 0.0f ? length(SceneH.xyz) / SceneH.w : VOXEL_UNDERWATER_FAR;
+
+    // The water's light and the meniscus in the scene colour's (pre-exposed) units.
+    const float PreExposure = View.PreExposure;
+    const float4 Params = float4(0.0f, 0.0f, UnderwaterWaveAmplitude, 0.0f);
+    const float3 Color = VoxelUnderwaterColor(Scene.rgb, Dir, NearDistance, SceneDistance, UnderwaterSphere, UnderwaterCenter,
+        Params, UnderwaterWave0, UnderwaterWave1, UnderwaterWave2, UnderwaterAbsorption, UnderwaterScattering,
+        UnderwaterLight * PreExposure, float4(UnderwaterMeniscus.rgb * PreExposure, UnderwaterMeniscus.w));
+    UnderwaterOutput[Pixel] = float4(Color, Scene.a);
+}

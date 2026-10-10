@@ -1,6 +1,8 @@
 // VoxelOcean.ush - The ocean surface in its material (Design/OceanMeshing.md): the morph between
-// tile levels in the vertex shader, for a Custom node (wiring: STAGE_O1c_NOTES.md). Later
-// stages add the wave hook (VoxelOceanWaves) and the underwater pass here.
+// tile levels and a test wave in the vertex shader (VoxelOceanVertex), and the surface normal
+// and unresolved slope in the pixel shader (VoxelOceanPixel), for two Custom nodes (wiring:
+// STAGE_O2b_NOTES.md). Stage O4 replaces the test wave with the wave hook (VoxelOceanWaves);
+// both entry points stay.
 //
 // Every odd vertex of a level-L tile collapses onto a vertex of its parent tile (an even vertex
 // is one already); the targets are chained, as the terrain's (VoxelMorph.ush). The vertex
@@ -12,21 +14,54 @@
 // (VoxelOceanTiles::MorphWeight), from the camera the selection on screen was built for; with
 // StartFraction 0.5 the levels' bands touch, so the mesh morphs continuously with distance.
 // Where a tile meets a coarser one its vertices are fully collapsed onto the coarser tile's
-// vertices as that tile draws them, so the boundary stays closed. Waves (stage O4) are sampled
-// at the morphed point, which keeps it closed under any displacement. Level 0 doesn't morph.
+// vertices as that tile draws them, so the boundary stays closed. Level 0 doesn't morph.
+//
+// The terrain depth (cm, positive under water; TexCoord 1 y, and at the targets TexCoord 2 x
+// and TexCoord 4 y) morphs the same way.
+//
+// Test wave (voxel.Ocean.TestWaves): three sines along fixed planet directions, displacing the
+// vertex along the radial at the morphed point (from the planet centre, Center), sampled
+// there, so a boundary stays closed under them as it will under any wave model. Each wave is
+// (k, phase): k in world axes (radians per cm) and the phase at the selection camera, so the
+// phase is k . (vertex - camera) + phase, small and exact near the camera.
+//
+// Normal (VoxelOceanPixel): the waves are a height field over the sphere, sampled at the
+// undisplaced (morphed) point, which the vertex shader hands on (SamplePoint, through a vertex
+// interpolator). Per pixel, the normal of the displaced surface is the radial tilted by the
+// height's tangential gradient: N = normalize(U - (G - U (U . G))), G the gradient (exact for a
+// height field over a plane; the sphere's curvature adds a relative error of height / radius).
+// It is evaluated at the pixel, not interpolated from the vertices, so it keeps wave detail
+// finer than the mesh. The mesh itself only takes the waves it can hold: each wave's
+// displacement fades with the vertex's spacing (1 from four vertices per wavelength, 0 at two),
+// the spacing being the level's, doubled as the vertex morphs to its parent and again toward
+// the grandparent (s 2^(W0 (1 + W1))), which is the same on both sides of a level boundary. A wave shorter than about four pixel footprints fades out of the normal
+// (fully gone at two, as the terrain's octave band weight) and its slope goes to SlopeVariance
+// instead, for the roughness: the far ocean shades as rough water rather than aliasing.
 //
 // Inputs: ToVertex = the vertex's absolute world position (excluding material offsets) minus
 // VoxelOceanCameraHigh minus VoxelOceanCameraLow; UV0 to UV4 = TexCoord 0 to 4; Level and
 // MorphEnd0 = custom primitive data 0 and 1 (0 and 0 on components that aren't ocean pages,
-// which keep their position); Params = VoxelOceanParams masked to R G (x: mode 0 off, 1 by
-// distance, 2 fully morphed; y: StartFraction).
-// Outputs: the World Position Offset; Depth, the terrain depth under the sea at the vertex
-// (cm, positive under water; 0 until stage O2), morphed with the vertex.
+// which keep their position); Params = VoxelOceanParams, all four (x: morph mode 0 off, 1 by
+// distance, 2 fully morphed; y: StartFraction; z: test wave amplitude, cm, 0 off; w: a level's
+// vertex spacing per unit of its morph end, 1 / (0.98 * 2 * F * TileQuads)); Wave0
+// to Wave2 = VoxelOceanWave0 to VoxelOceanWave2 (RGBA); Center = VoxelOceanCenter masked to
+// R G B (the planet centre from the selection camera, world cm).
+// Outputs: the World Position Offset; Depth, the terrain depth at the vertex, morphed;
+// SamplePoint, the undisplaced morphed point from the selection camera (world cm), for the
+// pixel shader.
+//
+// VoxelOceanPixel inputs: SamplePoint through a vertex interpolator; Params (all four), Wave0
+// to Wave2 and Center as above. Outputs: the world-space normal (the material's Normal, with Tangent Space
+// Normal off); SlopeVariance, the variance of the slope the normal leaves out (0 when every
+// wave is resolved), for Roughness = sqrt(R^2 + SlopeVariance).
 //
 // Custom node code:
-//   return VoxelOceanVertex(Parameters, ToVertex, UV0, UV1, UV2, UV3, UV4, Level, MorphEnd0, Params, Depth);
+//   return VoxelOceanVertex(Parameters, ToVertex, UV0, UV1, UV2, UV3, UV4, Level, MorphEnd0, Params, Wave0, Wave1, Wave2, Center, Depth, SamplePoint);
+//   return VoxelOceanPixel(Parameters, SamplePoint, Params, Wave0, Wave1, Wave2, Center, SlopeVariance);
 
 #pragma once
+
+#include "/Plugin/VoxelPlugin/Private/VoxelOceanCommon.ush"
 
 // Morph weight of a level-L vertex D (world units) from the selection camera.
 float VoxelOceanMorphWeight(float D, float Level, float MorphEnd0, float2 Params)
@@ -43,24 +78,57 @@ float VoxelOceanMorphWeight(float D, float Level, float MorphEnd0, float2 Params
 // but the include is seen by every shader of the material).
 #define VOXEL_OCEAN_VERTEX_BODY \
     Depth = UV1.y; \
-    const float W0 = VoxelOceanMorphWeight(length(ToVertex), Level, MorphEnd0, Params); \
-    if (W0 <= 0.0f) return float3(0.0f, 0.0f, 0.0f); \
-    const float3 Parent = TransformLocalVectorToWorld(Parameters, float3(UV0.x, UV0.y, UV1.x)); \
-    const float3 Grand = TransformLocalVectorToWorld(Parameters, float3(UV3.x, UV3.y, UV4.x)); \
-    const float W1 = VoxelOceanMorphWeight(length(ToVertex + Parent), Level - 1.0f, MorphEnd0, Params); \
-    Depth = lerp(UV1.y, lerp(UV2.x, UV4.y, W1), W0); \
-    return (Parent + Grand * W1) * W0;
+    float3 Offset = float3(0.0f, 0.0f, 0.0f); \
+    const float W0 = VoxelOceanMorphWeight(length(ToVertex), Level, MorphEnd0, Params.xy); \
+    float W1 = 0.0f; \
+    if (W0 > 0.0f) \
+    { \
+        const float3 Parent = TransformLocalVectorToWorld(Parameters, float3(UV0.x, UV0.y, UV1.x)); \
+        const float3 Grand = TransformLocalVectorToWorld(Parameters, float3(UV3.x, UV3.y, UV4.x)); \
+        W1 = VoxelOceanMorphWeight(length(ToVertex + Parent), Level - 1.0f, MorphEnd0, Params.xy); \
+        Depth = lerp(UV1.y, lerp(UV2.x, UV4.y, W1), W0); \
+        Offset = (Parent + Grand * W1) * W0; \
+    } \
+    SamplePoint = ToVertex + Offset; \
+    if (Params.z > 0.0f && MorphEnd0 > 0.0f) \
+    { \
+        const float Spacing = MorphEnd0 * exp2(W0 * (1.0f + W1) - Level) * Params.w; \
+        const float3 Up = normalize(SamplePoint - Center); \
+        Offset += Up * VoxelOceanTestHeight(SamplePoint, Params, Wave0, Wave1, Wave2, Spacing); \
+    } \
+    return Offset;
 
 float3 VoxelOceanVertex(FMaterialVertexParameters Parameters, float3 ToVertex, float2 UV0, float2 UV1, float2 UV2,
-    float2 UV3, float2 UV4, float Level, float MorphEnd0, float2 Params, out float Depth)
+    float2 UV3, float2 UV4, float Level, float MorphEnd0, float4 Params, float4 Wave0, float4 Wave1, float4 Wave2, float3 Center,
+    out float Depth, out float3 SamplePoint)
 {
     VOXEL_OCEAN_VERTEX_BODY
 }
 
 float3 VoxelOceanVertex(FMaterialPixelParameters Parameters, float3 ToVertex, float2 UV0, float2 UV1, float2 UV2,
-    float2 UV3, float2 UV4, float Level, float MorphEnd0, float2 Params, out float Depth)
+    float2 UV3, float2 UV4, float Level, float MorphEnd0, float4 Params, float4 Wave0, float4 Wave1, float4 Wave2, float3 Center,
+    out float Depth, out float3 SamplePoint)
 {
     VOXEL_OCEAN_VERTEX_BODY
 }
 
 #undef VOXEL_OCEAN_VERTEX_BODY
+
+// The surface normal (world) at the pixel and the slope variance it leaves out. In the pixel
+// shader the footprint comes from screen-space derivatives.
+float3 VoxelOceanPixel(FMaterialPixelParameters Parameters, float3 SamplePoint, float4 Params, float4 Wave0, float4 Wave1, float4 Wave2, float3 Center,
+    out float SlopeVariance)
+{
+    SlopeVariance = 0.0f;
+    const float3 Up = normalize(SamplePoint - Center);
+    if (Params.z <= 0.0f) return Up;
+    // The pixel's footprint on the surface: how far the sample point moves to the next pixel.
+    // Stages without screen derivatives (ray tracing hit shaders) take every wave as resolved.
+#if defined(PIXELSHADER) && PIXELSHADER
+    const float Footprint = max(length(ddx(SamplePoint)), length(ddy(SamplePoint)));
+#else
+    const float Footprint = 0.0f;
+#endif
+    const float3 Gradient = VoxelOceanTestGradient(SamplePoint, Params, Wave0, Wave1, Wave2, Footprint, SlopeVariance);
+    return VoxelOceanSurfaceNormal(Up, Gradient);
+}

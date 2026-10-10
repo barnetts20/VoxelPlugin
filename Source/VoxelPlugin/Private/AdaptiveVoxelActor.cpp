@@ -57,7 +57,7 @@ void AAdaptiveVoxelActor::OnConstruction(const FTransform& Transform)
 {
     Super::OnConstruction(Transform);
 
-    // When owned by a PlanetActor, skip self-init — planet calls InitializeFromPlanet.
+    // When owned by a PlanetActor, skip self-init - planet calls InitializeFromPlanet.
     if (GetOwner() && GetOwner()->IsA<APlanetActor>()) return;
 
     if (GetWorld() && !GetWorld()->IsPreviewWorld() && bTickInEditor)
@@ -139,7 +139,7 @@ bool AAdaptiveVoxelActor::CanEditChange(const FProperty* InProperty) const
     if (bIsPlanetOwned && InProperty)
     {
         const FName PropName = InProperty->GetFName();
-        // Lock all transform components — position, rotation, scale are driven by the planet.
+        // Lock all transform components - position, rotation, scale are driven by the planet.
         static const FName TransformNames[] = {
             TEXT("RelativeLocation"), TEXT("RelativeRotation"), TEXT("RelativeScale3D"),
         };
@@ -174,7 +174,7 @@ void AAdaptiveVoxelActor::PostEditMove(bool bFinished)
 {
     if (bIsPlanetOwned)
     {
-        // Snap all transforms back — location and rotation follow parent, scale is planet-driven.
+        // Snap all transforms back - location and rotation follow parent, scale is planet-driven.
         if (USceneComponent* Root = GetRootComponent())
         {
             Root->SetRelativeLocation(FVector::ZeroVector);
@@ -288,7 +288,7 @@ void AAdaptiveVoxelActor::InitializeFromPlanet(TSharedPtr<FDensitySampleComposit
     Initialized = false;
     bIsPlanetOwned = true;
 
-    // Apply scale BEFORE binding the transform guard — prevents the old guard
+    // Apply scale BEFORE binding the transform guard - prevents the old guard
     // from reverting a scale change that the planet actor intends.
     if (USceneComponent* Root = GetRootComponent())
         Root->TransformUpdated.RemoveAll(this);
@@ -373,6 +373,7 @@ void AAdaptiveVoxelActor::TickCollision(UWorld* World)
         CollisionBricks->NotifyEdit(Notice.Sequence, Notice.Center, Notice.Radius);
         if (BrickTerrain.IsValid())
             BrickTerrain->NotifyEdit(Notice.Sequence, Notice.Center, Notice.Radius);
+        TerrainEdited.Broadcast(Notice.Sequence, Notice.Center, Notice.Radius);
     }
 
     TArray<FVoxelCollisionSource> Sources;
