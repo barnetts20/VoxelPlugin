@@ -208,9 +208,13 @@ VOXEL_FUNC float VoxelSolveNoise(uint Cell)
 
 // --- The solve's inputs --------------------------------------------------------------------
 
+/** The plate height (m) over which land on oceanic crust joins the solve. */
+#define VOXEL_SOLVE_LAND_RAMP 300.0f
+
 /** What the plate model gives a cell: its static height (the base and the profile without the
  *  solved uplift), how much of its uplift the solve raises (the range-front ramp times the
- *  continental fraction), the uplift rate, and whether it is solved. */
+ *  continental fraction, or the land ramp on oceanic crust), the uplift rate, and whether it
+ *  is solved. */
 struct FVoxelSolveSetup
 {
     float Static;
@@ -228,7 +232,13 @@ VOXEL_FUNC FVoxelSolveSetup VoxelSolveSetupOf(uint Cell)
     const float Half = 0.5f * max(SolveRampWidth, 1.0f);
     const float Lo = SolvePlainsUplift - Half;
     FVoxelSolveSetup S;
-    S.Mix = smoothstep(0.45f, 0.55f, Crust) * smoothstep(Lo, SolvePlainsUplift + Half, Up);
+    // Continental crust, and any crust the profile lifts above the sea (an arc's ocean-side
+    // flank, an island arc): left out, such land kept its full profile height beside the
+    // eroded range, a wall up to kilometres high along the coast.
+    const float CrustRamp = smoothstep(0.45f, 0.55f, Crust);
+    const float LandRamp = smoothstep(0.0f, VOXEL_SOLVE_LAND_RAMP, H);
+    const float Solid = 1.0f - (1.0f - CrustRamp) * (1.0f - LandRamp);   // a smooth union
+    S.Mix = Solid * smoothstep(Lo, SolvePlainsUplift + Half, Up);
     S.Static = H - Up * S.Mix;
     S.Target = Up * S.Mix;
     S.Uplift = S.Mix * max(Up - Lo, 0.0f) / max(SolveUpliftTime, 1.0f);

@@ -63,17 +63,18 @@ RWStructuredBuffer<uint> TargetHashValues;
 #include "/Plugin/VoxelPlugin/Private/VoxelCubeSphere.ush"
 #include "/Plugin/VoxelPlugin/Private/VoxelLandParameters.ush"
 #include "/Plugin/VoxelPlugin/Private/VoxelLandSample.ush"
+#include "/Plugin/VoxelPlugin/Private/VoxelLandGully.ush"
 #include "/Plugin/VoxelPlugin/Private/VoxelDensitySample.ush"
 #include "/Plugin/VoxelPlugin/Private/VoxelEditSample.ush"
 #include "/Plugin/VoxelPlugin/Private/VoxelBrickMesherPasses.ush"
 
 // The land debug views (VoxelLandDebug.ush; FVoxelLandDebugParameters): the view, the bake's
-// attributes, the sea radius, and the plate model's inputs (VoxelLandPlates.ush; the plates
-// view reads the plates and the seed).
+// attributes, the sea radius, the lake levels, and the plate model's inputs
+// (VoxelLandPlates.ush; the plates view reads the plates and the seed). The drainage is the
+// density's (VoxelLandParameters.ush).
 uint LandDebugMode;
 StructuredBuffer<uint> LandAttr;
 float2 LandDebugSeaRadius;
-StructuredBuffer<uint> LandFlow;
 StructuredBuffer<float> LandWater;
 uint LandDebugHasHydro;
 StructuredBuffer<float> LandPlates;

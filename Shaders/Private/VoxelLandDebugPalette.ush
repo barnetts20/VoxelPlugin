@@ -26,7 +26,8 @@
 #define VOXEL_LAND_VIEW_CELLS 8u       // the bake's cells: a checker in each cube face's colour
 #define VOXEL_LAND_VIEW_FLOW 9u        // drainage area: rivers (eroded bakes)
 #define VOXEL_LAND_VIEW_LAKES 10u      // kept lakes by depth (eroded bakes)
-#define VOXEL_LAND_VIEW_COUNT 11u
+#define VOXEL_LAND_VIEW_GULLY 11u      // the gullies, signed, over their local half-depth
+#define VOXEL_LAND_VIEW_COUNT 12u
 
 VOXEL_FUNC float3 VoxelLandViewRgb(float R, float G, float B)
 {

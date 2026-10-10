@@ -1,0 +1,417 @@
+// VoxelLandGully.ush - The hillside layer of the terrestrial generator (Design/LandGen.md
+// section 7.4; stage L4): a stateless erosion filter that cuts gullies down the bake's slopes
+// below the bake's resolution, from twice the bake cell down to GullyFinestWavelength.
+//
+// Each octave lays stripes along the downhill direction: from jittered lattice points with
+// compact bell weights (4 x 4 taps), the cosine of the distance across the slope. The stripes
+// are steered by the bake's gradient plus the derivative the coarser octaves have added, so
+// finer gullies run down the walls of coarser ones. Each octave's lattice is rotated and
+// offset, so no grid direction survives. Depth per octave is GullyStrength x lambda0 x 0.42^o
+// x the slope of the surface so far, softly capped at 0.8: bounded by the slope, and nothing
+// on flats (faded in until the bake's slope makes 150 m of relief over lambda0). Where the
+// downhill direction turns fast for an octave (valley floors, crests, tight bends) the octave
+// fades: stripes steered by a direction that turns within their wavelength fold into creases.
+// The fades and the cap are smooth, so they draw no crease along a contour or a valley.
+// The profile is zero-mean, so an octave a coarse level leaves out (the footprint band rule)
+// moves the surface by its own small relief, not by its depth.
+//
+// The lattice is face-local, in the face's equal-angle coordinates in metres (the angle from
+// the face centre times the radius, so the equal-angle spread of about 1.4 varies the gully
+// scale gently across a face). Its coordinates come exactly from the bake sampler's segment
+// split (VoxelLandAxisAt: an integer cell and a fraction to 1e-7), and lambda0 is two bake
+// cells, so every octave's lattice coordinate is an integer times a power of two plus a small
+// fraction: exact at any radius. Within 3 bake cells of a face edge each face's lattice is
+// evaluated and the results blend by smooth weights (a partition of unity), so only samples
+// near edges pay twice (three times at corners).
+//
+// The drainage raises the gullies from the ridges (a cell's own area) to the valley sides
+// (GullyFlowGain); river corridors (stage L3) will fade them out.
+//
+// Shared subset (VoxelShaderCompat.h): the CPU density includes it in the same struct as
+// VoxelLandSample.ush. Include after VoxelLandSample.ush, and after declaring:
+//
+//   float LandGullyStrength;     depth per unit lambda0 and slope (0: no gullies)
+//   uint LandGullyOctaves;       octaves from lambda0 = 2 cells down to the finest wavelength
+//   float LandGullyFlowGain;     0..1: how much shallower gullies are on ridges than in valleys
+//   float LandGullyDetail;       the detail layer's scale on land while there are gullies
+//   uint LandGullySeed;
+
+#ifndef VOXEL_LAND_GULLY_USH
+#define VOXEL_LAND_GULLY_USH
+
+#ifndef VOXEL_LOOP
+#define VOXEL_LOOP [loop]
+#endif
+
+#define VOXEL_LAND_GULLY_MAX_OCTAVES 12u
+#define VOXEL_LAND_GULLY_GAIN 0.42f
+#define VOXEL_LAND_GULLY_MAX_SLOPE 0.8f
+#define VOXEL_LAND_GULLY_FADE_RELIEF 150.0f
+// How far (rad) the downhill direction may turn over an octave's wavelength before the octave
+// fades: stripes steered by a direction that turns faster than they repeat fold into creases.
+#define VOXEL_LAND_GULLY_TURN 3.0f
+// A typical curvature of an octave, as a fraction of its largest (half-depth x (2 pi / lambda)^2):
+// only where the slope so far nearly vanishes (a coarser gully's floor or spur) does it fade the
+// finer octaves.
+#define VOXEL_LAND_GULLY_OCTAVE_CURVE 0.25f
+#define VOXEL_LAND_GULLY_BAND_CELLS 3.0f
+#define VOXEL_LAND_GULLY_JITTER 0.9f
+#define VOXEL_LAND_GULLY_RADIUS_SQ 2.25f
+#define VOXEL_LAND_GULLY_TWO_PI 6.28318530717958648f
+// The drainage over which gullies reach full strength above a cell's own area: 16 cells.
+#define VOXEL_LAND_GULLY_FLOW_OCTAVES 4.0f
+
+/** An octave's lattice rotation (cos, sin of 0.9 + 1.7 o), as literals so both backends use
+ *  the same floats: the rotated coordinate multiplies large integers, so it must match bit
+ *  for bit. */
+VOXEL_FUNC float2 VoxelLandGullyRotation(uint Octave)
+{
+    if (Octave == 0u) return float2(0.621609968f, 0.783326910f);
+    if (Octave == 1u) return float2(-0.856888753f, 0.515501372f);
+    if (Octave == 2u) return float2(-0.400799172f, -0.916165937f);
+    if (Octave == 3u) return float2(0.960170287f, -0.279415498f);
+    if (Octave == 4u) return float2(0.153373862f, 0.988168234f);
+    if (Octave == 5u) return float2(-0.999693042f, 0.024775425f);
+    if (Octave == 6u) return float2(0.104236027f, -0.994552588f);
+    if (Octave == 7u) return float2(0.972832566f, 0.231509825f);
+    if (Octave == 8u) return float2(-0.354924267f, 0.934895056f);
+    if (Octave == 9u) return float2(-0.881372490f, -0.472421986f);
+    if (Octave == 10u) return float2(0.582044252f, -0.813157112f);
+    return float2(0.731386096f, 0.681963620f);
+}
+
+/** A lattice coordinate along a face axis in an octave: the segment's cell J and fraction
+ *  (VoxelLandAxisAt) give the angle from the face centre in cells, (J + 0.5 - N / 2) + Frac;
+ *  over lambda = 2 cells / 2^o that is (2 J + 1 - N) 2^(o - 2) + Frac 2^(o - 1). Returned as
+ *  the exact integer part (a float holding an integer times a power of two) and the fraction
+ *  part. */
+struct FVoxelLandGullyCoord
+{
+    float Whole;
+    float Part;
+};
+
+/** 2^E exactly, as its bit pattern (E in -126..127): HLSL's ldexp may be x * exp2(e), which
+ *  need not be exact. */
+VOXEL_FUNC float VoxelLandGullyPow2(int E)
+{
+    return asfloat(uint(127 + E) << 23u);
+}
+
+VOXEL_FUNC FVoxelLandGullyCoord VoxelLandGullyCoordAt(FVoxelLandAxis Axis, uint Octave)
+{
+    FVoxelLandGullyCoord C;
+    C.Whole = float(2 * Axis.Cell + 1 - int(LandN)) * VoxelLandGullyPow2(int(Octave) - 2);
+    C.Part = Axis.Frac * VoxelLandGullyPow2(int(Octave) - 1);
+    return C;
+}
+
+/** The slope a gully octave's depth follows, from the slope S of the surface so far: capped
+ *  smoothly at 0.8 (S / (1 + (S / 0.8)^4)^(1/4): within 1.5% of S up to 0.4, 0.67 at 0.8). */
+VOXEL_FUNC float VoxelLandGullySlope(float S)
+{
+    const float X = S * (1.0f / VOXEL_LAND_GULLY_MAX_SLOPE);
+    return S / sqrt(sqrt(1.0f + X * X * X * X));
+}
+
+/** An octave's strength where the downhill direction turns by Turn (rad) over its wavelength:
+ *  1 on even slopes, fading where the slope curves fast for the octave (near valley floors and
+ *  crests, and for the coarsest octaves around tight bends). */
+VOXEL_FUNC float VoxelLandGullyCoherence(float Turn)
+{
+    const float X = Turn * (1.0f / VOXEL_LAND_GULLY_TURN);
+    return 1.0f / (1.0f + X * X);
+}
+
+/** The gullies' weight from the relief the bake's slope S makes over the coarsest wavelength
+ *  Lambda0 (m): 0 on flats, smoothly to 1 at 150 m (a slope of 0.05 on a 1,000 km planet's
+ *  3 km, 0.008 on Earth's 20 km: the bake's slopes are gentler the larger its cells). Of the
+ *  squared relief, so it has no corner where the slope passes through zero across a valley. */
+VOXEL_FUNC float VoxelLandGullyFade(float S, float Lambda0)
+{
+    const float R = S * Lambda0 * (1.0f / VOXEL_LAND_GULLY_FADE_RELIEF);
+    return smoothstep(0.0f, 1.0f, R * R);
+}
+
+/** cos and sin of 2 pi T, by polynomials (both backends compute the same; a few times cheaper
+ *  than the library's on the CPU, and no worse than the hardware's on the GPU): T to the
+ *  nearest half turn, then the half angle (|x| <= pi / 2) to degree 10 and 11, then the
+ *  double-angle formulas. Error below 1e-6. */
+VOXEL_FUNC float2 VoxelLandGullyCosSin(float T)
+{
+    const float R = T - floor(T + 0.5f);                 // -0.5 .. 0.5 turns
+    const float X = R * (0.5f * VOXEL_LAND_GULLY_TWO_PI);  // the half angle, -pi/2 .. pi/2
+    const float X2 = X * X;
+    const float S = X * (1.0f + X2 * (-1.0f / 6.0f + X2 * (1.0f / 120.0f + X2 * (-1.0f / 5040.0f + X2 * (1.0f / 362880.0f - X2 * (1.0f / 39916800.0f))))));
+    const float C = 1.0f + X2 * (-0.5f + X2 * (1.0f / 24.0f + X2 * (-1.0f / 720.0f + X2 * (1.0f / 40320.0f - X2 * (1.0f / 3628800.0f)))));
+    return float2(1.0f - 2.0f * S * S, 2.0f * S * C);
+}
+
+/** The bell weight of a lattice point at squared distance R2 (lattice units): (1 - R2 / 2.25)^3,
+ *  zero (with its first two derivatives) from 1.5. A point outside the 4 x 4 cells around the
+ *  sample is at least 1.55 away, so leaving it out changes nothing: the field is continuous. */
+VOXEL_FUNC float VoxelLandGullyKernel(float R2)
+{
+    const float X = max(1.0f - R2 * (1.0f / VOXEL_LAND_GULLY_RADIUS_SQ), 0.0f);
+    return X * X * X;
+}
+
+/** Its derivative in R2 (zero from 1.5): -3 (1 - R2 / 2.25)^2 / 2.25. */
+VOXEL_FUNC float VoxelLandGullyKernelSlope(float R2)
+{
+    const float X = max(1.0f - R2 * (1.0f / VOXEL_LAND_GULLY_RADIUS_SQ), 0.0f);
+    return -3.0f * X * X * (1.0f / VOXEL_LAND_GULLY_RADIUS_SQ);
+}
+
+/** One octave's stripes: the value in -1..1 and its derivative along the lattice axes, at the
+ *  rotated lattice point (cells and fractions), for stripes whose phase runs along D (unit,
+ *  rotated). The value is the weighted mean of the points' cosines; its derivative includes
+ *  the weights' (D taken as fixed). */
+struct FVoxelLandGullyOctave
+{
+    float Value;
+    float DU;
+    float DW;
+};
+
+VOXEL_FUNC FVoxelLandGullyOctave VoxelLandGullyStripes(int CellU, float FracU, int CellW, float FracW, float DX, float DY, uint Face, uint Seed)
+{
+    // The 4 x 4 cells around the sample: the cell whose centre precedes it and one either side.
+    int BaseU = CellU;
+    float FU = FracU - 0.5f;
+    if (FU < 0.0f)
+    {
+        BaseU -= 1;
+        FU += 1.0f;
+    }
+    int BaseW = CellW;
+    float FW = FracW - 0.5f;
+    if (FW < 0.0f)
+    {
+        BaseW -= 1;
+        FW += 1.0f;
+    }
+    float Sum = 0.0f;
+    float SumU = 0.0f;       // sum of w dcos/du + dw/du cos
+    float SumW = 0.0f;
+    float WSum = 0.0f;
+    float WSumU = 0.0f;      // sum of dw/du
+    float WSumW = 0.0f;
+    for (int j = -1; j <= 2; j++)
+    {
+        for (int i = -1; i <= 2; i++)
+        {
+            const uint H = VoxelHash(uint3(asuint(BaseU + i), asuint(BaseW + j), Face), Seed);
+            const float JU = VOXEL_LAND_GULLY_JITTER * (float(H & 0xffffu) * (1.0f / 65535.0f) - 0.5f);
+            const float JW = VOXEL_LAND_GULLY_JITTER * (float(H >> 16u) * (1.0f / 65535.0f) - 0.5f);
+            const float QU = FU - float(i) - JU;
+            const float QW = FW - float(j) - JW;
+            const float R2 = QU * QU + QW * QW;
+            const float W = VoxelLandGullyKernel(R2);
+            if (W <= 0.0f) continue;
+            // d R2 / du = 2 QU (the sample moves, the point stays).
+            const float DWDR = VoxelLandGullyKernelSlope(R2);
+            const float WU = 2.0f * QU * DWDR;
+            const float WW = 2.0f * QW * DWDR;
+            const float2 CS = VoxelLandGullyCosSin(QU * DX + QW * DY);
+            const float S = CS.y * W * VOXEL_LAND_GULLY_TWO_PI;
+            Sum += CS.x * W;
+            SumU += WU * CS.x - S * DX;
+            SumW += WW * CS.x - S * DY;
+            WSum += W;
+            WSumU += WU;
+            WSumW += WW;
+        }
+    }
+    FVoxelLandGullyOctave Out;
+    const float Inv = WSum > 0.0f ? 1.0f / WSum : 0.0f;
+    Out.Value = Sum * Inv;
+    // d (Sum / WSum) = (dSum - Value dWSum) / WSum.
+    Out.DU = (SumU - Out.Value * WSumU) * Inv;
+    Out.DW = (SumW - Out.Value * WSumW) * Inv;
+    return Out;
+}
+
+/** The gullies of one face's lattice (m): the octave chain at the point whose segments along
+ *  the face's axes are U and V, with tan coordinates A, B, under the surface gradient Gradient
+ *  (m/m, tangent vector) whose direction turns at Turn (rad/m). Footprint in cm. */
+VOXEL_FUNC float VoxelLandGullyFace(uint Face, FVoxelLandAxis U, FVoxelLandAxis V, float A, float B, float3 Gradient, float Turn, float Footprint)
+{
+    const FVoxelLandFaceFrame Frame = VoxelLandFaceFrameAt(Face, A, B);
+    // The gradient as a covector in the face's metres (dh / dX, dh / dY).
+    const float GU = dot(Gradient, Frame.TU);
+    const float GV = dot(Gradient, Frame.TV);
+    const float Lambda0 = 2.0f * LandCellM;
+    float AccU = 0.0f;   // the derivative the octaves so far have added (m/m, covector)
+    float AccV = 0.0f;
+    // How fast the surface so far curves (1/m): the bake's (its turn rate times its slope),
+    // plus a typical curvature of each octave added. Over the slope, how fast the steering
+    // turns.
+    float Curve = Turn * length(Gradient);
+    float Height = 0.0f;
+    float Gain = LandGullyStrength * Lambda0;
+    const uint NumOctaves = min(LandGullyOctaves, VOXEL_LAND_GULLY_MAX_OCTAVES);
+    VOXEL_LOOP
+    for (uint o = 0u; o < NumOctaves; o++)
+    {
+        const float Lambda = Lambda0 * VoxelLandGullyPow2(-int(o));
+        const float Band = VoxelOctaveBandWeight(Lambda * 100.0f, Footprint);
+        if (Band <= 0.0f) break;
+
+        // Downhill on the surface so far: the steering vector G^-1 t in the face's
+        // coordinates; the stripes run along it, so their phase runs across it.
+        const float TU = GU + AccU;
+        const float TV = GV + AccV;
+        const float SU = Frame.GUU * TU + Frame.GUV * TV;
+        const float SV = Frame.GUV * TU + Frame.GVV * TV;
+        const float Slope = sqrt(max(TU * SU + TV * SV, 0.0f));
+        const float Len = sqrt(SU * SU + SV * SV);
+        if (Len <= 1.0e-12f) break;
+        const float DX = -SV / Len;
+        const float DY = SU / Len;
+        const float Amp = Gain * VoxelLandGullySlope(Slope) * VoxelLandGullyCoherence(Lambda * Curve / max(Slope, 1.0e-6f)) * Band;
+
+        // The rotated lattice point, in double-float: the rotation of the exact integer parts
+        // is exact (two products), the fraction parts are small.
+        const float2 Rot = VoxelLandGullyRotation(o);
+        const FVoxelLandGullyCoord CU = VoxelLandGullyCoordAt(U, o);
+        const FVoxelLandGullyCoord CV = VoxelLandGullyCoordAt(V, o);
+        const float OffU = 17.3f * float(o) + 0.37f;
+        const float OffW = 5.1f * float(o) + 0.61f;
+        const float2 LU = VoxelDFAdd(VoxelDFAdd(VoxelDFTwoProd(Rot.x, CU.Whole), VoxelDFTwoProd(-Rot.y, CV.Whole)),
+            float2(Rot.x * CU.Part - Rot.y * CV.Part + OffU, 0.0f));
+        const float2 LW = VoxelDFAdd(VoxelDFAdd(VoxelDFTwoProd(Rot.y, CU.Whole), VoxelDFTwoProd(Rot.x, CV.Whole)),
+            float2(Rot.y * CU.Part + Rot.x * CV.Part + OffW, 0.0f));
+        const FVoxelLatticeSplit SU2 = VoxelDFLatticeSplit(LU);
+        const FVoxelLatticeSplit SW2 = VoxelDFLatticeSplit(LW);
+        const float RDX = Rot.x * DX - Rot.y * DY;
+        const float RDY = Rot.y * DX + Rot.x * DY;
+        const FVoxelLandGullyOctave G = VoxelLandGullyStripes(SU2.Cell, SU2.Frac, SW2.Cell, SW2.Frac, RDX, RDY, Face,
+            LandGullySeed + o * 0x9e3779b9u);
+
+        // Back to the face's axes; d / dX = (d / d lattice) / lambda.
+        const float VX = Rot.x * G.DU + Rot.y * G.DW;
+        const float VY = -Rot.y * G.DU + Rot.x * G.DW;
+        Height += 0.5f * Amp * G.Value;
+        AccU += 0.5f * Amp * VX / Lambda;
+        AccV += 0.5f * Amp * VY / Lambda;
+        Curve += VOXEL_LAND_GULLY_OCTAVE_CURVE * 0.5f * Amp * (VOXEL_LAND_GULLY_TWO_PI * VOXEL_LAND_GULLY_TWO_PI) / (Lambda * Lambda);
+        Gain *= VOXEL_LAND_GULLY_GAIN;
+    }
+    return Height;
+}
+
+/** The hillside layer at the sphere point P (double-float, cm): the gullies (m), the weight
+ *  they have there (0..1: the slope fade times the land fade), and the coarsest octave's
+ *  largest half-depth there (m; the gullies' local scale, for the debug view). Gradient is the surface's (m/m,
+ *  a tangent vector at P), Turn how fast its direction turns (rad/m), Flow the drainage there
+ *  (log2 m^2), Bake the height (m). */
+struct FVoxelLandGully
+{
+    float Height;
+    float Weight;
+    float Scale;
+};
+
+VOXEL_FUNC FVoxelLandGully VoxelLandGullyDF(float2 PX, float2 PY, float2 PZ, float3 Gradient, float Turn, float Flow, float Bake, float Footprint)
+{
+    FVoxelLandGully Out;
+    Out.Height = 0.0f;
+    Out.Weight = 0.0f;
+    Out.Scale = 0.0f;
+    if (LandGullyStrength <= 0.0f || LandGullyOctaves == 0u) return Out;
+    const float Slope = length(Gradient);
+    Out.Weight = VoxelLandGullyFade(Slope, 2.0f * LandCellM) * smoothstep(-50.0f, 50.0f, Bake);
+    // Nothing to add: flat, under the sea, or every octave finer than the footprint's band.
+    if (Out.Weight <= 0.0f || VoxelOctaveBandWeight(200.0f * LandCellM, Footprint) <= 0.0f) return Out;
+
+    // Each face on P's side of the three axes, weighted by how far inside it P is (as the bake
+    // blends, over a wider band).
+    const float Band = 2.0f * VOXEL_LAND_GULLY_BAND_CELLS / float(LandN);
+    float Sum = 0.0f;
+    float WSum = 0.0f;
+    // A loop, not unrolled: the face chain is the bulk of the code.
+    VOXEL_LOOP
+    for (uint Axis = 0u; Axis < 3u; Axis++)
+    {
+        const float2 PN = VoxelLandPick(PX, PY, PZ, Axis);
+        if (PN.x == 0.0f) continue;
+        const bool bNegative = PN.x < 0.0f;
+        const uint Face = Axis * 2u + (bNegative ? 1u : 0u);
+        const float2 Den = bNegative ? float2(-PN.x, -PN.y) : PN;
+        const float2 AU = VoxelDFDiv(VoxelLandPick(PX, PY, PZ, VoxelCubeUAxis(Face)), Den);
+        const float2 AV = VoxelDFDiv(VoxelLandPick(PX, PY, PZ, VoxelCubeVAxis(Face)), Den);
+        const float S = atan(AU.x) * VOXEL_LAND_INV_QUARTER_PI;
+        const float T = atan(AV.x) * VOXEL_LAND_INV_QUARTER_PI;
+        const float W = VoxelLandFaceRamp(S, Band) * VoxelLandFaceRamp(T, Band);
+        if (W <= 0.0f) continue;
+        Sum += W * VoxelLandGullyFace(Face, VoxelLandAxisAt(AU, S), VoxelLandAxisAt(AV, T), AU.x, AV.x, Gradient, Turn, Footprint);
+        WSum += W;
+    }
+    float FlowScale = 1.0f;
+    if (LandHasFlow != 0u)
+    {
+        const float OwnArea = 2.0f * log2(LandCellM);
+        FlowScale = lerp(1.0f - LandGullyFlowGain, 1.0f, saturate((Flow - OwnArea) * (1.0f / VOXEL_LAND_GULLY_FLOW_OCTAVES)));
+    }
+    Out.Height = WSum > 0.0f ? Out.Weight * FlowScale * Sum / WSum : 0.0f;
+    Out.Scale = 0.5f * LandGullyStrength * 2.0f * LandCellM * VoxelLandGullySlope(Slope) * Out.Weight * FlowScale;
+    return Out;
+}
+
+/** The surface gradient at the sampled point P from the bake's at the warped point Q = P + W(P):
+ *  the chain rule through the warp's Jacobian (I + dW/dP; DWX, DWY and DWZ are the gradients of
+ *  W's components, dimensionless), less the part along Normal (P's direction, unit). */
+VOXEL_FUNC float3 VoxelLandWarpedGradient(float3 GQ, float3 DWX, float3 DWY, float3 DWZ, float3 Normal)
+{
+    const float3 G = GQ + DWX * GQ.x + DWY * GQ.y + DWZ * GQ.z;
+    return G - Normal * dot(G, Normal);
+}
+
+/** The detail layer's scale (LandGullyDetail on land while there are gullies) at bake height
+ *  Bake (m). */
+VOXEL_FUNC float VoxelLandDetailScale(float Bake)
+{
+    if (LandGullyStrength <= 0.0f || LandGullyOctaves == 0u) return 1.0f;
+    return lerp(1.0f, LandGullyDetail, smoothstep(-50.0f, 50.0f, Bake));
+}
+
+/** The land surface's per-sample terms at the sphere point P (double-float, cm) and the warped
+ *  point Q where the bake is read: the bake height (m), the gullies (m), and the detail
+ *  layer's scale (LandGullyDetail on land while there are gullies: they replace much of the
+ *  isotropic detail. Uniform over the land, not by slope: a scale that follows the slope dips
+ *  across every valley floor and crest, and the detail draws a groove there). DWX, DWY, DWZ as
+ *  VoxelLandWarpedGradient (zero without a warp). Both density backends add the detail
+ *  themselves (VoxelDensitySample.ush, FVoxelDensityCPU::LandHeightAt). */
+struct FVoxelLandSurface
+{
+    float Bake;
+    float Gully;
+    float GullyScale;    // FVoxelLandGully::Scale
+    float DetailScale;
+};
+
+VOXEL_FUNC FVoxelLandSurface VoxelLandSurfaceDF(float2 PX, float2 PY, float2 PZ, float2 QX, float2 QY, float2 QZ,
+    float3 DWX, float3 DWY, float3 DWZ, float Footprint)
+{
+    FVoxelLandSurface Out;
+    Out.Gully = 0.0f;
+    Out.GullyScale = 0.0f;
+    Out.DetailScale = 1.0f;
+    if (LandGullyStrength <= 0.0f || LandGullyOctaves == 0u)
+    {
+        Out.Bake = VoxelLandBakeSampleDF(QX, QY, QZ, false).Height;
+        return Out;
+    }
+    const FVoxelLandBakeSample Bake = VoxelLandBakeSampleDF(QX, QY, QZ, true);
+    Out.Bake = Bake.Height;
+    const float3 Normal = normalize(float3(PX.x, PY.x, PZ.x));
+    const float3 Gradient = VoxelLandWarpedGradient(Bake.Gradient, DWX, DWY, DWZ, Normal);
+    const FVoxelLandGully G = VoxelLandGullyDF(PX, PY, PZ, Gradient, Bake.Turn, Bake.Flow, Bake.Height, Footprint);
+    Out.Gully = G.Height;
+    Out.GullyScale = G.Scale;
+    Out.DetailScale = VoxelLandDetailScale(Bake.Height);
+    return Out;
+}
+
+#endif // VOXEL_LAND_GULLY_USH

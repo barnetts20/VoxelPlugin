@@ -102,6 +102,19 @@ namespace VoxelShader
     inline uint max(uint a, uint b) { return a > b ? a : b; }
     inline int clamp(int v, int lo, int hi) { return v < lo ? lo : (v > hi ? hi : v); }
     inline float log2(float a) { return std::log2(a); }
+    inline float pow(float a, float b) { return std::pow(a, b); }
+    /** HLSL's f16tof32: the IEEE half in the low 16 bits as a float (exact). */
+    inline float f16tof32(uint h)
+    {
+        const uint Sign = (h >> 15) & 1u;
+        const uint Exponent = (h >> 10) & 0x1fu;
+        const uint Mantissa = h & 0x3ffu;
+        float Value;
+        if (Exponent == 0u) Value = std::ldexp((float)Mantissa, -24);
+        else if (Exponent == 31u) Value = Mantissa != 0u ? NAN : INFINITY;
+        else Value = std::ldexp((float)(Mantissa | 0x400u), (int)Exponent - 25);
+        return Sign != 0u ? -Value : Value;
+    }
 
 #if defined(__cpp_lib_atomic_ref)
     // Atomics on buffer elements (uint lvalues), with HLSL's signatures (C++ tests of the

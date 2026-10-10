@@ -11,16 +11,25 @@ namespace VoxelShader
 #include "VoxelDF64.ush"
 #include "VoxelCubeSphere.ush"
 
-    /** The land bake's sampler on the CPU: VoxelLandSample.ush with the shader's buffers and
-     *  constants as members (the GPU runs the same code). */
+    /** The land bake's sampler on the CPU: VoxelLandSample.ush and VoxelLandGully.ush with the
+     *  shader's buffers and constants as members (the GPU runs the same code). */
     struct FVoxelLandSamplerCPU
     {
         const float* LandHeight = nullptr;
         const float2* LandTanTable = nullptr;
+        const uint* LandFlow = nullptr;
         uint LandN = 1;
         uint LandPad = 0;
+        uint LandHasFlow = 0;
+        float LandCellM = 1.0f;
+        float LandGullyStrength = 0.0f;
+        uint LandGullyOctaves = 0;
+        float LandGullyFlowGain = 0.0f;
+        float LandGullyDetail = 1.0f;
+        uint LandGullySeed = 0;
 
 #include "VoxelLandSample.ush"
+#include "VoxelLandGully.ush"
     };
 }
 
@@ -30,6 +39,7 @@ namespace
     constexpr uint32 SaltMountain = 2u;
     constexpr uint32 SaltDetail = 3u;
     constexpr uint32 SaltLandWarp = 0x11u;   // + component
+    constexpr uint32 SaltLandGully = 0x21u;
 
     /** The sampling warp of the land bake: three octaves of fBm per component, its longest
      *  wavelength six bake cells. */
@@ -104,6 +114,11 @@ FVoxelDensityCPU::FVoxelDensityCPU(const FVoxelTerrestrialSettings& InLand, TSha
 {
     check(LandBake.IsValid());
     const uint32 Seed = (uint32)InLand.Seed;
+    // The per-sample layers (warp, detail) are sampled on the sea-level sphere, not on
+    // PlanetRadius: that is the bottom of the height range, which moves with the layers'
+    // amplitudes, and would move every pattern with it.
+    LandSampleRadius = FMath::Max(LandBake->SeaRadius, 1.0);
+    const double SampleRadius = LandSampleRadius;
 
     // The detail layer through the noise surface's machinery (no continents or mountains):
     // octaves from DetailWavelength down to the finest cell, slope-damped, gain 0.5.
@@ -113,22 +128,38 @@ FVoxelDensityCPU::FVoxelDensityCPU(const FVoxelTerrestrialSettings& InLand, TSha
     Settings.ContinentOctaves = 0;
     Settings.MountainOctaves = 0;
     const double DetailWavelength = FMath::Max(InLand.DetailWavelength, 1.0) * 100.0;
-    Settings.DetailWavelength = DetailWavelength / PlanetRadius;
+    Settings.DetailWavelength = DetailWavelength / SampleRadius;
     Settings.DetailGain = 0.5;
     Settings.DetailSlopeDamping = FMath::Max(InLand.DetailSlopeDamping, 0.0);
     const double Finest = FMath::Max(MinFootprint, 1.0);
     Settings.DetailOctaves = FMath::Clamp(FMath::CeilToInt(FMath::Log2(DetailWavelength / Finest)) + 1, 1, 24);
-    Continent = MakeLayer(VoxelShader::VoxelLayerPlain, 1.0, PlanetRadius, 2.0, 0.5, 0, VoxelShader::VoxelHashSeed(Seed, SaltContinent));
-    Mountain = MakeLayer(VoxelShader::VoxelLayerRidged, 1.0, PlanetRadius, 2.0, 0.5, 0, VoxelShader::VoxelHashSeed(Seed, SaltMountain));
-    Detail = MakeLayer(VoxelShader::VoxelLayerDamped, Settings.DetailWavelength, PlanetRadius, 2.0, Settings.DetailGain, Settings.DetailOctaves, VoxelShader::VoxelHashSeed(Seed, SaltDetail));
+    Continent = MakeLayer(VoxelShader::VoxelLayerPlain, 1.0, SampleRadius, 2.0, 0.5, 0, VoxelShader::VoxelHashSeed(Seed, SaltContinent));
+    Mountain = MakeLayer(VoxelShader::VoxelLayerRidged, 1.0, SampleRadius, 2.0, 0.5, 0, VoxelShader::VoxelHashSeed(Seed, SaltMountain));
+    Detail = MakeLayer(VoxelShader::VoxelLayerDamped, Settings.DetailWavelength, SampleRadius, 2.0, Settings.DetailGain, Settings.DetailOctaves, VoxelShader::VoxelHashSeed(Seed, SaltDetail));
 
     const double Cell = VoxelLand::CellArc(LandBake->SeaRadius, LandBake->N);
-    const double WarpFraction = LandWarpWavelengthCells * Cell / PlanetRadius;
+    const double WarpFraction = LandWarpWavelengthCells * Cell / SampleRadius;
     for (int32 Axis = 0; Axis < 3; Axis++)
-        LandWarp[Axis] = MakeLayer(VoxelShader::VoxelLayerPlain, WarpFraction, PlanetRadius, 2.0, 0.5, LandWarpOctaves, VoxelShader::VoxelHashSeed(Seed, SaltLandWarp + (uint32)Axis));
+        LandWarp[Axis] = MakeLayer(VoxelShader::VoxelLayerPlain, WarpFraction, SampleRadius, 2.0, 0.5, LandWarpOctaves, VoxelShader::VoxelHashSeed(Seed, SaltLandWarp + (uint32)Axis));
     LandWarpAmplitude = FMath::Max(InLand.BakeWarp, 0.0) * Cell;
     LandDetailAmplitude = FMath::Max(InLand.DetailAmplitude, 0.0) * 100.0;
     LandHeightOffset = LandBake->SeaRadius - PlanetRadius;
+
+    // The gullies (VoxelLandGully.ush): octaves from two bake cells down to the finest wavelength.
+    LandCellM = (float)(Cell * 0.01);
+    LandGullyStrength = (float)FMath::Max(InLand.GullyStrength, 0.0);
+    LandGullyOctaves = (uint32)VoxelLand::GullyOctavesFor(InLand, *LandBake);
+    LandGullyFlowGain = (float)FMath::Clamp(InLand.GullyFlowGain, 0.0, 1.0);
+    LandGullyDetail = (float)FMath::Clamp(InLand.GullyDetailScale, 0.0, 1.0);
+    LandGullySeed = VoxelShader::VoxelHashSeed(Seed, SaltLandGully);
+    if (LandBake->Flow.Num() == LandBake->NumCells() && LandBake->NumCells() % 2 == 0)
+    {
+        // Two cells per word, the lower index in the low half: the GPU's packing (and the
+        // little-endian layout of the f16 array).
+        LandFlowPacked.SetNumUninitialized(LandBake->NumCells() / 2);
+        for (int32 i = 0; i < LandFlowPacked.Num(); i++)
+            LandFlowPacked[i] = (uint32)LandBake->Flow[2 * i].Encoded | ((uint32)LandBake->Flow[2 * i + 1].Encoded << 16);
+    }
 }
 
 FVoxelDensityCPU::FLayer FVoxelDensityCPU::MakeLayer(uint32 Kind, double WavelengthFraction, double InPlanetRadius, double InLacunarity, double InGain, int32 InOctaves, uint32 InSeed)
@@ -187,12 +218,19 @@ FVoxelDensityCPU::FLayer FVoxelDensityCPU::MakeLayer(uint32 Kind, double Wavelen
 
 double FVoxelDensityCPU::EvaluateLayer(const FLayer& Layer, const FVector& SurfacePoint, double Footprint) const
 {
+    return EvaluateLayerGradient(Layer, SurfacePoint, Footprint, nullptr);
+}
+
+double FVoxelDensityCPU::EvaluateLayerGradient(const FLayer& Layer, const FVector& SurfacePoint, double Footprint, FVector* OutGradient) const
+{
     using namespace VoxelShader;
 
     // The core keeps its running sum in float; each octave's contribution is taken from a
     // zeroed sum and added here in double, so the total keeps double precision.
     FVoxelFbmState State = VoxelFbmBegin();
     double Sum = 0.0;
+    FVector Gradient = FVector::ZeroVector;
+    if (OutGradient) *OutGradient = FVector::ZeroVector;
     if (Layer.Octaves.Num() == 0) return 0.0;
 
     // Lacunarity 2: the finest octave's coordinate once, in fixed point, as the GPU takes it.
@@ -228,7 +266,10 @@ double FVoxelDensityCPU::EvaluateLayer(const FLayer& Layer, const FVector& Surfa
         State.Sum = 0.0f;
         State = VoxelLayerOctave(State, Layer.Kind, N, Octave.Amplitude * Band, (float)Settings.RidgeGain, (float)Settings.DetailSlopeDamping);
         Sum += State.Sum;
+        if (OutGradient)
+            Gradient += FVector(N.Gradient.x, N.Gradient.y, N.Gradient.z) * ((double)(Octave.Amplitude * Band) * Octave.Frequency);
     }
+    if (OutGradient) *OutGradient = Gradient * Layer.InvNorm;
     return Sum * Layer.InvNorm;
 }
 
@@ -236,12 +277,13 @@ double FVoxelDensityCPU::HeightAt(const FVector& Dir, double Footprint) const
 {
     const double Len = Dir.Size();
     if (Len <= 1e-12 || NoiseAmplitude <= 0.0) return 0.0;
-    const FVector SurfacePoint = Dir * (PlanetRadius / Len);
 
     // Footprints below the finest cell are raised to it, as Sample does (and the GPU).
     const double Band = FMath::Max(Footprint, MinFootprint);
+    // The terrestrial layers on the sea-level sphere (see the constructor).
     if (LandBake.IsValid())
-        return LandHeightAt(SurfacePoint, Band);
+        return LandHeightAt(Dir * (LandSampleRadius / Len), Band);
+    const FVector SurfacePoint = Dir * (PlanetRadius / Len);
     const double C = EvaluateLayer(Continent, SurfacePoint, Band);
     const double R = EvaluateLayer(Mountain, SurfacePoint, Band);
     const double D = EvaluateLayer(Detail, SurfacePoint, Band);
@@ -257,25 +299,47 @@ double FVoxelDensityCPU::HeightAt(const FVector& Dir, double Footprint) const
 
 double FVoxelDensityCPU::LandHeightAt(const FVector& SurfacePoint, double Footprint) const
 {
+    using namespace VoxelShader;
+
     // The bake through the sampling warp (every octave: the warp doesn't change with the
-    // footprint, so the bake looks the same at every level).
+    // footprint, so the bake looks the same at every level), and the warp's Jacobian for the
+    // gullies' steering.
     FVector Q = SurfacePoint;
+    FVector DW[3] = { FVector::ZeroVector, FVector::ZeroVector, FVector::ZeroVector };
     if (LandWarpAmplitude > 0.0)
     {
-        Q += FVector(EvaluateLayer(LandWarp[0], SurfacePoint, 0.0), EvaluateLayer(LandWarp[1], SurfacePoint, 0.0),
-            EvaluateLayer(LandWarp[2], SurfacePoint, 0.0)) * LandWarpAmplitude;
+        FVector W;
+        for (int32 Axis = 0; Axis < 3; Axis++)
+        {
+            W[Axis] = EvaluateLayerGradient(LandWarp[Axis], SurfacePoint, 0.0, &DW[Axis]) * LandWarpAmplitude;
+            DW[Axis] *= LandWarpAmplitude;
+        }
+        Q += W;
     }
-    VoxelShader::FVoxelLandSamplerCPU Sampler;
+    FVoxelLandSamplerCPU Sampler;
     Sampler.LandHeight = LandBake->Height.GetData();
-    Sampler.LandTanTable = reinterpret_cast<const VoxelShader::float2*>(LandBake->TanTable.GetData());
+    Sampler.LandTanTable = reinterpret_cast<const float2*>(LandBake->TanTable.GetData());
+    Sampler.LandFlow = LandFlowPacked.GetData();
     Sampler.LandN = (uint32)LandBake->N;
     Sampler.LandPad = (uint32)FVoxelLandBake::Pad;
-    const float Bake = Sampler.VoxelLandBakeHeightDF(ToDoubleFloat(Q.X), ToDoubleFloat(Q.Y), ToDoubleFloat(Q.Z));
+    Sampler.LandHasFlow = LandFlowPacked.Num() > 0 ? 1u : 0u;
+    Sampler.LandCellM = LandCellM;
+    Sampler.LandGullyStrength = LandGullyStrength;
+    Sampler.LandGullyOctaves = LandGullyOctaves;
+    Sampler.LandGullyFlowGain = LandGullyFlowGain;
+    Sampler.LandGullyDetail = LandGullyDetail;
+    Sampler.LandGullySeed = LandGullySeed;
+    auto ToFloat3 = [](const FVector& V) { return float3((float)V.X, (float)V.Y, (float)V.Z); };
+    const FVoxelLandSamplerCPU::FVoxelLandSurface Land = Sampler.VoxelLandSurfaceDF(
+        ToDoubleFloat(SurfacePoint.X), ToDoubleFloat(SurfacePoint.Y), ToDoubleFloat(SurfacePoint.Z),
+        ToDoubleFloat(Q.X), ToDoubleFloat(Q.Y), ToDoubleFloat(Q.Z), ToFloat3(DW[0]), ToFloat3(DW[1]), ToFloat3(DW[2]), (float)Footprint);
 
-    // Detail, a quarter as strong under the sea (VoxelDensitySample.ush in float the same way).
-    const float DetailWeight = VoxelShader::lerp(0.25f, 1.0f, VoxelShader::smoothstep(-50.0f, 50.0f, Bake));
+    // Detail, a quarter as strong under the sea and scaled by GullyDetailScale on land while
+    // there are gullies (VoxelDensitySample.ush in float the same way).
+    const float DetailWeight = lerp(0.25f, 1.0f, smoothstep(-50.0f, 50.0f, Land.Bake));
     const double D = EvaluateLayer(Detail, SurfacePoint, Footprint);
-    const double Height = (double)Bake * 100.0 + LandHeightOffset + D * (double)((float)LandDetailAmplitude * DetailWeight);
+    const double Height = (double)Land.Bake * 100.0 + LandHeightOffset + D * (double)((float)LandDetailAmplitude * DetailWeight * Land.DetailScale)
+        + (double)Land.Gully * 100.0;
     return FMath::Clamp(Height, 0.0, NoiseAmplitude);
 }
 
@@ -359,6 +423,12 @@ void FVoxelDensityCPU::BuildGPUData(FVoxelDensityGPUData& Out) const
         Out.LandWarpAmplitude = (float)LandWarpAmplitude;
         Out.LandDetailAmplitude = (float)LandDetailAmplitude;
         Out.LandHeightOffset = VoxelDoubleFloat(LandHeightOffset);
+        Out.LandCellM = LandCellM;
+        Out.LandGullyStrength = LandGullyStrength;
+        Out.LandGullyOctaves = LandGullyOctaves;
+        Out.LandGullyFlowGain = LandGullyFlowGain;
+        Out.LandGullyDetail = LandGullyDetail;
+        Out.LandGullySeed = LandGullySeed;
     }
 
     // The GPU converts lattice coordinates to int32 before wrapping; the CPU wraps through
@@ -370,10 +440,11 @@ void FVoxelDensityCPU::BuildGPUData(FVoxelDensityGPUData& Out) const
         if (Layer->Octaves.Num() > 0)
             MaxFrequency = FMath::Max(MaxFrequency, Layer->Octaves.Last().Frequency);
     }
-    if (PlanetRadius * MaxFrequency + 750.0 >= 2147483648.0)
+    const double SampleRadius = LandBake.IsValid() ? FMath::Max(PlanetRadius, LandSampleRadius) : PlanetRadius;
+    if (SampleRadius * MaxFrequency + 750.0 >= 2147483648.0)
     {
         UE_LOG(LogVoxelPlugin, Warning, TEXT("[VoxelDensity] The finest octave reaches lattice coordinate %.3g (limit 2^31): GPU and CPU densities will differ. Use fewer octaves or a longer wavelength."),
-            PlanetRadius * MaxFrequency + 750.0);
+            SampleRadius * MaxFrequency + 750.0);
     }
 }
 

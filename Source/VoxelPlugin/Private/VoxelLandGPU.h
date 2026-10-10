@@ -12,7 +12,8 @@
 
 struct FVoxelDensityGPUData;
 
-/** The GPU copy of an FVoxelLandBake (render thread only). The attributes and the plates are
+/** The GPU copy of an FVoxelLandBake (render thread only). The heights, the tan table and
+ *  the drainage are the density's; the attributes, the plates and the lake levels are
  *  uploaded only for the land debug views. */
 struct FVoxelLandBakeGPU
 {
@@ -31,23 +32,31 @@ BEGIN_SHADER_PARAMETER_STRUCT(FVoxelLandShaderParameters, )
     SHADER_PARAMETER(uint32, LandMode)
     SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<float>, LandHeight)
     SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<float2>, LandTanTable)
+    SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, LandFlow)
     SHADER_PARAMETER(uint32, LandN)
     SHADER_PARAMETER(uint32, LandPad)
+    SHADER_PARAMETER(uint32, LandHasFlow)
+    SHADER_PARAMETER(float, LandCellM)
     SHADER_PARAMETER(uint32, LandWarpOctaves)
     SHADER_PARAMETER(float, LandWarpInvNorm)
     SHADER_PARAMETER(float, LandWarpAmplitude)
     SHADER_PARAMETER(float, LandDetailAmplitude)
     SHADER_PARAMETER(FVector2f, LandHeightOffset)
+    SHADER_PARAMETER(float, LandGullyStrength)
+    SHADER_PARAMETER(uint32, LandGullyOctaves)
+    SHADER_PARAMETER(float, LandGullyFlowGain)
+    SHADER_PARAMETER(float, LandGullyDetail)
+    SHADER_PARAMETER(uint32, LandGullySeed)
 END_SHADER_PARAMETER_STRUCT()
 
 /** The land debug views' inputs (VoxelLandDebug.ush, declared in VoxelBrickMesherGPU.usf):
- *  the view, the bake's attributes, the sea radius, and the plate model's inputs
- *  (VoxelLandPlates.ush). Included in the brick mesher's parameters. */
+ *  the view, the bake's attributes, the sea radius, the lake levels, and the plate model's
+ *  inputs (VoxelLandPlates.ush). Included in the brick mesher's parameters, with the
+ *  density's (FVoxelLandShaderParameters: the drainage is there). */
 BEGIN_SHADER_PARAMETER_STRUCT(FVoxelLandDebugParameters, )
     SHADER_PARAMETER(uint32, LandDebugMode)
     SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, LandAttr)
     SHADER_PARAMETER(FVector2f, LandDebugSeaRadius)
-    SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, LandFlow)
     SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<float>, LandWater)
     SHADER_PARAMETER(uint32, LandDebugHasHydro)
     SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<float>, LandPlates)

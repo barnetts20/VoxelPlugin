@@ -159,7 +159,7 @@ private:
 namespace VoxelLand
 {
     /** Bump when the generator's output changes for the same settings (invalidates caches). */
-    constexpr uint32 GeneratorVersion = 2;
+    constexpr uint32 GeneratorVersion = 3;
 
     /** voxel.Land.Erosion: whether bakes run the erosion solve (part of the key). */
     VOXELPLUGIN_API bool IsErosionEnabled();
@@ -179,6 +179,19 @@ namespace VoxelLand
      *  per-sample layers' reach. */
     VOXELPLUGIN_API void ShapeFor(const FVoxelTerrestrialSettings& Settings, const FVoxelLandBake& Bake,
         double& OutPlanetRadius, double& OutNoiseAmplitude);
+
+    /** The gully filter's constants (VOXEL_LAND_GULLY_MAX_OCTAVES, _GAIN, _MAX_SLOPE in
+     *  VoxelLandGully.ush; keep them equal). */
+    constexpr int32 GullyMaxOctaves = 12;
+    constexpr double GullyGain = 0.42;
+    constexpr double GullyMaxSlope = 0.8;
+
+    /** The gully octaves a bake gets (VoxelLandGully.ush): from two bake cells down to
+     *  Settings.GullyFinestWavelength, at most 12; 0 without gullies. */
+    VOXELPLUGIN_API int32 GullyOctavesFor(const FVoxelTerrestrialSettings& Settings, const FVoxelLandBake& Bake);
+
+    /** How far the gullies can move the surface either way (cm). */
+    VOXELPLUGIN_API double GullyReach(const FVoxelTerrestrialSettings& Settings, const FVoxelLandBake& Bake);
 
     /** The arc of one bake cell at the face centre (cm). */
     inline double CellArc(double SeaRadius, int32 N) { return UE_DOUBLE_PI * 0.5 * SeaRadius / FMath::Max(N, 1); }

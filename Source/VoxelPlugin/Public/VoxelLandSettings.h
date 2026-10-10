@@ -108,7 +108,7 @@ struct VOXELPLUGIN_API FVoxelTerrestrialSettings
 
     /** Slope-damped fBm detail on top of the bake: amplitude (m), its longest wavelength (m),
      *  and how strongly accumulated slope suppresses finer octaves. A quarter as strong under
-     *  the sea. Placeholder for the hillside layers of stage L4. */
+     *  the sea, and scaled by GullyDetailScale on land while there are gullies. */
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrestrial|Sample", meta = (ClampMin = "0.0", UIMax = "1000"))
     double DetailAmplitude = 250.0;
 
@@ -117,6 +117,28 @@ struct VOXELPLUGIN_API FVoxelTerrestrialSettings
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrestrial|Sample", meta = (ClampMin = "0.0", UIMax = "4.0"))
     double DetailSlopeDamping = 1.0;
+
+    /** Gullies cut down the slopes below the bake's resolution (a stateless erosion filter,
+     *  from two bake cells down to GullyFinestWavelength): depth per unit of wavelength and
+     *  slope. 0 turns them off. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrestrial|Sample", meta = (ClampMin = "0.0", ClampMax = "1.0", UIMax = "0.5"))
+    double GullyStrength = 0.22;
+
+    /** The finest gully wavelength (m); finer octaves are left out (and coarse levels leave out
+     *  the ones they can't show). */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrestrial|Sample", meta = (ClampMin = "5.0", UIMin = "10", UIMax = "500"))
+    double GullyFinestWavelength = 30.0;
+
+    /** How much shallower gullies are on ridges (a bake cell's own drainage) than on valley
+     *  sides (16 cells' drainage and more): 0 the same everywhere, 1 none on ridges. Eroded
+     *  bakes only. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrestrial|Sample", meta = (ClampMin = "0.0", ClampMax = "1.0"))
+    double GullyFlowGain = 0.5;
+
+    /** The detail layer's scale on land while there are gullies (GullyStrength above 0): they
+     *  replace much of the isotropic detail. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrestrial|Sample", meta = (ClampMin = "0.0", ClampMax = "1.0"))
+    double GullyDetailScale = 0.5;
 
     /** Hash of the settings that change the bake (with the radius and the generator version,
      *  the cache key). */

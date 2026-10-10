@@ -4,6 +4,10 @@
 // grid and inputs.
 //
 // g++ -O2 -std=c++20 -ffp-contract=off -pthread -I<Public> -I<Shaders/Private> solve_harness.cpp
+//
+// solve_harness N Tag: the checks and the full runs at 6 x N^2 (1,000 km planet), images Tag_*.ppm.
+// solve_harness N Tag dump [RadiusM]: one GPU-sequence run, its fields written to Tag_*.f32 (the
+// gully harness's input, Tools/LandGullyHarness).
 #include "VoxelShaderCompat.h"
 #include <cstdio>
 #include <cstdlib>
@@ -433,16 +437,34 @@ int main(int argc, char** argv)
     FPlateBake B;
     B.N = N;
     double T = Now();
-    BakePlates(B, 7, 10, 0.30f, 1.0e6f);
+    const float RadiusM = argc > 4 ? (float)atof(argv[4]) : 1.0e6f;
+    BakePlates(B, 7, 10, 0.30f, RadiusM);
     printf("plates 6x%d^2 in %.1f s\n", N, Now() - T);
 
     FSolve S;
-    S.SolveN = N; S.SolvePad = B.Pad; S.SolveRadiusM = 1.0e6f;
+    S.SolveN = N; S.SolvePad = B.Pad; S.SolveRadiusM = RadiusM;
     S.SolveTan = B.Tan.data(); S.BakeHeight = B.Height.data(); S.BakeUp = B.Up.data(); S.BakeCrust = B.Crust.data(); S.BakeAttr = B.Attr.data();
     FSolveBuffers Buf;
     Buf.Bind(S, B.Cells());
     const uint Cells = B.Cells();
 
+    if (argc > 3 && std::string(argv[3]) == "dump")
+    {
+        FRunOptions O;
+        O.bReference = false;
+        Buf.Bind(S, Cells);
+        const FRunResult R = Run(S, O, true);
+        printf("  %zu steps, final residual %.4f, %.1f s; factor %.3f; %d lakes\n", R.Residuals.size(), R.Residuals.back(), R.Seconds, R.Factor, R.Lakes);
+        auto Dump = [&](const std::string& Name, const void* Data, size_t Bytes) { FILE* F = fopen(Name.c_str(), "wb"); fwrite(Data, 1, Bytes, F); fclose(F); };
+        Dump(Tag + "_height.f32", Buf.OHeight.data(), Cells * 4);
+        Dump(Tag + "_flow.f32", Buf.OFlow.data(), Cells * 4);
+        Dump(Tag + "_water.f32", Buf.OWater.data(), Cells * 4);
+        Dump(Tag + "_tan.f32", B.Tan.data(), B.Tan.size() * 8);
+        Dump(Tag + "_plates.f32", B.Height.data(), Cells * 4);
+        Dump(Tag + "_up.f32", B.Up.data(), Cells * 4);
+        Dump(Tag + "_crust.f32", B.Crust.data(), Cells * 4);
+        return 0;
+    }
     // 1. Neighbour symmetry.
     {
         int Asym = 0, Missing = 0, Total = 0;

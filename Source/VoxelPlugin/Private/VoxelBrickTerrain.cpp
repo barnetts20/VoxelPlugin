@@ -44,7 +44,7 @@ TAutoConsoleVariable<int32> CVarVoxelDebugLandView(
     TEXT("Colours the terrain by a component of the generator, in the vertex colour with alpha 0 (the terrain material must show it: see STAGE_L1b_NOTES.md). A change meshes the terrain again; a legend is on screen while a view is on.\n")
     TEXT(" 0: off\n")
     TEXT(" 1: elevation about sea level (hypsometric; 500 m bands on land, 1 km at sea, close up)\n")
-    TEXT(" 2: the bake's height alone (no detail layer)\n")
+    TEXT(" 2: the bake's height alone (no gullies or detail)\n")
     TEXT(" 3: the detail layer (blue down, red up, over its amplitude)\n")
     TEXT(" 4: crust (oceanic blue to continental tan; the threshold yellow)\n")
     TEXT(" 5: boundary class (red collision, orange arc range, purple trench, yellow island arc, cyan rift, green ridge)\n")
@@ -53,7 +53,8 @@ TAutoConsoleVariable<int32> CVarVoxelDebugLandView(
     TEXT(" 8: the bake's cells (a checker in each cube face's colour)\n")
     TEXT(" 9: drainage (rivers: blue from 1,000 km^2)\n")
     TEXT(" 10: lakes by depth\n")
-    TEXT("2 to 6 and 8 to 10 need a terrestrial planet, 9 and 10 a GPU bake (magenta otherwise)."),
+    TEXT(" 11: the gullies (blue down, red up, over their local depth)\n")
+    TEXT("2 to 6 and 8 to 11 need a terrestrial planet, 9 and 10 a GPU bake (magenta otherwise)."),
     ECVF_Default);
 
 static TAutoConsoleVariable<int32> CVarVoxelBrickPerf(
@@ -497,7 +498,7 @@ namespace VoxelBrickTerrainDetail
     {
         using namespace VoxelShader;
         static const TCHAR* Names[VOXEL_LAND_VIEW_COUNT] = { TEXT("off"), TEXT("elevation"), TEXT("bake height"), TEXT("detail layer"),
-            TEXT("crust"), TEXT("boundary class"), TEXT("plates"), TEXT("slope"), TEXT("bake cells"), TEXT("drainage"), TEXT("lakes") };
+            TEXT("crust"), TEXT("boundary class"), TEXT("plates"), TEXT("slope"), TEXT("bake cells"), TEXT("drainage"), TEXT("lakes"), TEXT("gullies") };
         TArray<FLegendLine> Lines;
         Lines.Add({ FString::Printf(TEXT("voxel.Debug.LandView %d: %s (0 hides it; the terrain material must show vertex colour)"), View, Names[View]), FColor::White });
         const bool bBakeView = View != (int32)VOXEL_LAND_VIEW_ELEVATION && View != (int32)VOXEL_LAND_VIEW_SLOPE;
@@ -524,7 +525,15 @@ namespace VoxelBrickTerrainDetail
             Add(TEXT("-0.5"), VoxelLandViewSigned(-0.5f));
             Add(TEXT("0"), VoxelLandViewSigned(0.0f));
             Add(TEXT("+0.5"), VoxelLandViewSigned(0.5f));
-            Add(TEXT("+1 (up; a quarter as strong under the sea)"), VoxelLandViewSigned(1.0f));
+            Add(TEXT("+1 (up; a quarter as strong under the sea, scaled by GullyDetailScale on land)"), VoxelLandViewSigned(1.0f));
+            break;
+        case VOXEL_LAND_VIEW_GULLY:
+            Add(TEXT("-1 (a gully floor: down by the coarsest octave's local half-depth)"), VoxelLandViewSigned(-1.0f));
+            Add(TEXT("-0.5"), VoxelLandViewSigned(-0.5f));
+            Add(TEXT("0 (none: flats, the sea, valley floors, or too coarse a level)"), VoxelLandViewSigned(0.0f));
+            Add(TEXT("+0.5"), VoxelLandViewSigned(0.5f));
+            Add(TEXT("+1 (a spur between gullies)"), VoxelLandViewSigned(1.0f));
+            Add(TEXT("magenta: no gullies (GullyStrength 0, or GullyFinestWavelength above two bake cells)"), VoxelLandViewNone());
             break;
         case VOXEL_LAND_VIEW_CRUST:
             Add(TEXT("0 oceanic"), VoxelLandViewCrust(0.0f));

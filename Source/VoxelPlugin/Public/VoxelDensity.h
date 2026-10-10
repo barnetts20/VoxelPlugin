@@ -101,7 +101,7 @@ public:
     FVoxelDensityCPU(const FVoxelSurfaceSettings& InSettings, double InPlanetRadius, double InNoiseAmplitude, double InMinFootprint = 0.0);
 
     /** The terrestrial generator: Bake's heights (sampled through a warp, VoxelLandSample.ush)
-     *  plus slope-damped detail. InPlanetRadius is the base radius and InNoiseAmplitude the
+     *  plus the gullies (VoxelLandGully.ush) and slope-damped detail. InPlanetRadius is the base radius and InNoiseAmplitude the
      *  height range above it that hold every height (VoxelLand::ShapeFor), so the contract of
      *  HeightAt and the lattice sizing are the noise surface's. */
     FVoxelDensityCPU(const FVoxelTerrestrialSettings& InLand, TSharedPtr<const FVoxelLandBake, ESPMode::ThreadSafe> InBake,
@@ -150,9 +150,12 @@ private:
 
     static FLayer MakeLayer(uint32 Kind, double WavelengthFraction, double InPlanetRadius, double InLacunarity, double InGain, int32 InOctaves, uint32 InSeed);
     double EvaluateLayer(const FLayer& Layer, const FVector& SurfacePoint, double Footprint) const;
+    /** EvaluateLayer and, when OutGradient is set, its gradient (per cm; plain layers). */
+    double EvaluateLayerGradient(const FLayer& Layer, const FVector& SurfacePoint, double Footprint, FVector* OutGradient) const;
     float SampleOne(const FVector& Position, double Footprint) const;
 
-    /** HeightAt for the terrestrial generator, from the surface point at PlanetRadius. */
+    /** HeightAt for the terrestrial generator, from the surface point on the sea-level sphere
+     *  (the bake's SeaRadius; VoxelDensitySample.ush samples the same sphere). */
     double LandHeightAt(const FVector& SurfacePoint, double Footprint) const;
 
     FVoxelSurfaceSettings Settings;
@@ -169,6 +172,14 @@ private:
     double LandHeightOffset = 0.0;      // cm: the bake's sea-level heights to heights above PlanetRadius
     double LandDetailAmplitude = 0.0;   // cm
     double LandWarpAmplitude = 0.0;     // cm
+    double LandSampleRadius = 1.0;      // cm: the sea-level sphere the warp and detail are sampled on
+    float LandCellM = 1.0f;             // the bake cell's arc at the face centre (m)
+    float LandGullyStrength = 0.0f;     // VoxelLandGully.ush
+    uint32 LandGullyOctaves = 0;
+    float LandGullyFlowGain = 0.0f;
+    float LandGullyDetail = 1.0f;
+    uint32 LandGullySeed = 0;
+    TArray<uint32> LandFlowPacked;      // the bake's drainage, two f16 cells per word (empty: none)
 };
 
 namespace VoxelDensity

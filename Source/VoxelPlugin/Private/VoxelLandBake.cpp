@@ -332,7 +332,8 @@ uint32 FVoxelTerrestrialSettings::GetBakeHash() const
 uint32 FVoxelTerrestrialSettings::GetSettingsHash() const
 {
     uint32 H = GetBakeHash();
-    for (const double V : { BakeWarp, DetailAmplitude, DetailWavelength, DetailSlopeDamping })
+    for (const double V : { BakeWarp, DetailAmplitude, DetailWavelength, DetailSlopeDamping,
+        GullyStrength, GullyFinestWavelength, GullyFlowGain, GullyDetailScale })
         H = HashCombine(H, ::GetTypeHash(V));
     return H;
 }
@@ -420,15 +421,42 @@ uint32 VoxelLand::BakeCheck(const FVoxelTerrestrialSettings& Settings, double Se
     return FCrc::MemCrc32(Values.GetData(), Values.Num() * (int32)sizeof(double));
 }
 
+int32 VoxelLand::GullyOctavesFor(const FVoxelTerrestrialSettings& Settings, const FVoxelLandBake& Bake)
+{
+    if (Settings.GullyStrength <= 0.0) return 0;
+    // From lambda0 = two bake cells, halving, while the wavelength is at least the finest.
+    const double Lambda0 = 2.0 * CellArc(Bake.SeaRadius, Bake.N) * 0.01;
+    const double Finest = FMath::Max(Settings.GullyFinestWavelength, 1.0);
+    if (Lambda0 < Finest) return 0;
+    return FMath::Clamp(FMath::FloorToInt(FMath::Log2(Lambda0 / Finest)) + 1, 0, GullyMaxOctaves);
+}
+
+double VoxelLand::GullyReach(const FVoxelTerrestrialSettings& Settings, const FVoxelLandBake& Bake)
+{
+    // Each octave is half its depth times a value in -1..1, its depth at most strength x
+    // lambda0 x 0.42^o x 0.8 (VoxelLandGully.ush); the face blend and the weights are convex.
+    const int32 Octaves = GullyOctavesFor(Settings, Bake);
+    const double Lambda0 = 2.0 * CellArc(Bake.SeaRadius, Bake.N);
+    double Sum = 0.0;
+    double Gain = 1.0;
+    for (int32 o = 0; o < Octaves; o++)
+    {
+        Sum += Gain;
+        Gain *= GullyGain;
+    }
+    return 0.5 * FMath::Max(Settings.GullyStrength, 0.0) * Lambda0 * GullyMaxSlope * Sum;
+}
+
 void VoxelLand::ShapeFor(const FVoxelTerrestrialSettings& Settings, const FVoxelLandBake& Bake,
     double& OutPlanetRadius, double& OutNoiseAmplitude)
 {
     // The B-spline and the face blend are convex combinations of the cells, so the bake's
     // range holds; the detail reaches at most about 2.4 times its amplitude (MakeLayer's
-    // normalisation), and a metre of margin either side.
+    // normalisation), the gullies GullyReach either way, and a metre of margin either side.
     const double DetailReach = 2.5 * FMath::Max(Settings.DetailAmplitude, 0.0) * 100.0;
-    const double Low = (double)Bake.MinHeight * 100.0 - DetailReach - 100.0;
-    const double High = (double)Bake.MaxHeight * 100.0 + DetailReach + 100.0;
+    const double Reach = DetailReach + GullyReach(Settings, Bake) + 100.0;
+    const double Low = (double)Bake.MinHeight * 100.0 - Reach;
+    const double High = (double)Bake.MaxHeight * 100.0 + Reach;
     OutPlanetRadius = FMath::Max(Bake.SeaRadius + Low, 1.0);
     OutNoiseAmplitude = FMath::Max(High - Low, 1.0);
 }
@@ -1253,17 +1281,43 @@ void FVoxelLandBaker::Finish(TSharedPtr<FVoxelLandBake, ESPMode::ThreadSafe> Bak
 // Sampling parameters
 // ---------------------------------------------------------------------------------------------
 
+namespace VoxelLandBakeDetail
+{
+    /** Two 16-bit cells per word, the lower index in the low half (VoxelLandFlowAt,
+     *  VoxelLandDebugAttr). An odd count pads the last word with 0. */
+    template <typename FGetBits>
+    TArray<uint32> PackHalves(int32 NumCells, FGetBits GetBits)
+    {
+        TArray<uint32> Packed;
+        Packed.SetNumUninitialized((NumCells + 1) / 2);
+        for (int32 i = 0; i < Packed.Num(); i++)
+        {
+            const uint32 Low = GetBits(2 * i);
+            const uint32 High = 2 * i + 1 < NumCells ? GetBits(2 * i + 1) : 0u;
+            Packed[i] = Low | (High << 16);
+        }
+        return Packed;
+    }
+}
+
 FVoxelLandShaderParameters VoxelLandGPU::GetParameters(FRDGBuilder& GraphBuilder, const FVoxelDensityGPUData& Density)
 {
     FVoxelLandShaderParameters Parameters;
     Parameters.LandMode = 0;
     Parameters.LandN = 1;
     Parameters.LandPad = 0;
+    Parameters.LandHasFlow = 0;
+    Parameters.LandCellM = 1.0f;
     Parameters.LandWarpOctaves = 0;
     Parameters.LandWarpInvNorm = 0.0f;
     Parameters.LandWarpAmplitude = 0.0f;
     Parameters.LandDetailAmplitude = 0.0f;
     Parameters.LandHeightOffset = FVector2f::ZeroVector;
+    Parameters.LandGullyStrength = 0.0f;
+    Parameters.LandGullyOctaves = 0;
+    Parameters.LandGullyFlowGain = 0.0f;
+    Parameters.LandGullyDetail = 1.0f;
+    Parameters.LandGullySeed = 0;
 
     const FVoxelLandBake* Bake = Density.LandMode != 0 ? Density.Land.Get() : nullptr;
     if (Bake && Bake->GPU.IsValid() && Bake->Height.Num() == Bake->NumCells() && Bake->TanTable.Num() == Bake->Side())
@@ -1276,22 +1330,40 @@ FVoxelLandShaderParameters VoxelLandGPU::GetParameters(FRDGBuilder& GraphBuilder
             Resource.TanTable = GraphBuilder.ConvertToExternalBuffer(
                 VoxelGPUCommon::UploadStructuredBuffer(GraphBuilder, TEXT("Voxel.LandTanTable"), MakeArrayView(Bake->TanTable)));
         }
+        // The drainage steers the gullies' strength (and shows in the drainage view).
+        const bool bHasFlow = Bake->Flow.Num() == Bake->NumCells();
+        if (bHasFlow && !Resource.Flow.IsValid())
+        {
+            const TArray<uint32> Packed = VoxelLandBakeDetail::PackHalves(Bake->Flow.Num(), [Bake](int32 i) { return (uint32)Bake->Flow[i].Encoded; });
+            Resource.Flow = GraphBuilder.ConvertToExternalBuffer(
+                VoxelGPUCommon::UploadStructuredBuffer(GraphBuilder, TEXT("Voxel.LandFlow"), MakeConstArrayView(Packed)));
+        }
         Parameters.LandHeight = GraphBuilder.CreateSRV(GraphBuilder.RegisterExternalBuffer(Resource.Height));
         Parameters.LandTanTable = GraphBuilder.CreateSRV(GraphBuilder.RegisterExternalBuffer(Resource.TanTable));
+        Parameters.LandFlow = bHasFlow ? GraphBuilder.CreateSRV(GraphBuilder.RegisterExternalBuffer(Resource.Flow))
+            : GraphBuilder.CreateSRV(VoxelGPUCommon::UploadStructuredBuffer<uint32>(GraphBuilder, TEXT("Voxel.LandFlowNone"), TConstArrayView<uint32>()));
         Parameters.LandMode = 1;
         Parameters.LandN = (uint32)Bake->N;
         Parameters.LandPad = (uint32)FVoxelLandBake::Pad;
+        Parameters.LandHasFlow = bHasFlow ? 1u : 0u;
+        Parameters.LandCellM = Density.LandCellM;
         Parameters.LandWarpOctaves = Density.LandWarpOctaves;
         Parameters.LandWarpInvNorm = Density.LandWarpInvNorm;
         Parameters.LandWarpAmplitude = Density.LandWarpAmplitude;
         Parameters.LandDetailAmplitude = Density.LandDetailAmplitude;
         Parameters.LandHeightOffset = Density.LandHeightOffset;
+        Parameters.LandGullyStrength = Density.LandGullyStrength;
+        Parameters.LandGullyOctaves = Density.LandGullyOctaves;
+        Parameters.LandGullyFlowGain = Density.LandGullyFlowGain;
+        Parameters.LandGullyDetail = Density.LandGullyDetail;
+        Parameters.LandGullySeed = Density.LandGullySeed;
         return Parameters;
     }
 
     // The noise surface: one-element stand-ins (the shader's land branch never runs).
     Parameters.LandHeight = GraphBuilder.CreateSRV(VoxelGPUCommon::UploadStructuredBuffer<float>(GraphBuilder, TEXT("Voxel.LandHeightNone"), TConstArrayView<float>()));
     Parameters.LandTanTable = GraphBuilder.CreateSRV(VoxelGPUCommon::UploadStructuredBuffer<FVector2f>(GraphBuilder, TEXT("Voxel.LandTanTableNone"), TConstArrayView<FVector2f>()));
+    Parameters.LandFlow = GraphBuilder.CreateSRV(VoxelGPUCommon::UploadStructuredBuffer<uint32>(GraphBuilder, TEXT("Voxel.LandFlowNone"), TConstArrayView<uint32>()));
     return Parameters;
 }
 
@@ -1318,16 +1390,7 @@ FVoxelLandDebugParameters VoxelLandGPU::GetDebugParameters(FRDGBuilder& GraphBui
         FVoxelLandBakeGPU& Resource = *Bake->GPU;
         if (!Resource.Attr.IsValid())
         {
-            // Two 16-bit cells per word, the lower index in the low half (VoxelLandDebugAttr).
-            const int32 NumCells = Bake->Attr.Num();
-            TArray<uint32> Packed;
-            Packed.SetNumUninitialized((NumCells + 1) / 2);
-            for (int32 i = 0; i < Packed.Num(); i++)
-            {
-                const uint32 Low = Bake->Attr[2 * i];
-                const uint32 High = 2 * i + 1 < NumCells ? (uint32)Bake->Attr[2 * i + 1] : 0u;
-                Packed[i] = Low | (High << 16);
-            }
+            const TArray<uint32> Packed = VoxelLandBakeDetail::PackHalves(Bake->Attr.Num(), [Bake](int32 i) { return (uint32)Bake->Attr[i]; });
             Resource.Attr = GraphBuilder.ConvertToExternalBuffer(
                 VoxelGPUCommon::UploadStructuredBuffer(GraphBuilder, TEXT("Voxel.LandAttr"), MakeConstArrayView(Packed)));
         }
@@ -1340,33 +1403,21 @@ FVoxelLandDebugParameters VoxelLandGPU::GetDebugParameters(FRDGBuilder& GraphBui
         Parameters.LandPlates = GraphBuilder.CreateSRV(GraphBuilder.RegisterExternalBuffer(Resource.Plates));
         Parameters.LandPlateCount = (uint32)(Bake->Plates.Num() / 8);
         Parameters.LandSeed = Bake->PlateSeed;
-        // The drainage and the lake levels, for the views that show them, when the bake has them.
+        // The lake levels, for the views that show the hydrology, when the bake has them (the
+        // drainage is the density's, VoxelLandGPU::GetParameters).
         const bool bHydro = (Mode == 9 || Mode == 10) /* VOXEL_LAND_VIEW_FLOW, _LAKES */ && Bake->Flow.Num() == Bake->NumCells() && Bake->Water.Num() == Bake->NumCells();
-        if (bHydro && !Resource.Flow.IsValid())
+        if (bHydro && !Resource.Water.IsValid())
         {
-            const int32 NumCells = Bake->Flow.Num();
-            TArray<uint32> Packed;
-            Packed.SetNumUninitialized((NumCells + 1) / 2);
-            for (int32 i = 0; i < Packed.Num(); i++)
-            {
-                const uint32 Low = Bake->Flow[2 * i].Encoded;
-                const uint32 High = 2 * i + 1 < NumCells ? (uint32)Bake->Flow[2 * i + 1].Encoded : 0u;
-                Packed[i] = Low | (High << 16);
-            }
-            Resource.Flow = GraphBuilder.ConvertToExternalBuffer(
-                VoxelGPUCommon::UploadStructuredBuffer(GraphBuilder, TEXT("Voxel.LandFlow"), MakeConstArrayView(Packed)));
             Resource.Water = GraphBuilder.ConvertToExternalBuffer(
                 VoxelGPUCommon::UploadStructuredBuffer(GraphBuilder, TEXT("Voxel.LandWater"), MakeArrayView(Bake->Water)));
         }
         if (bHydro)
         {
-            Parameters.LandFlow = GraphBuilder.CreateSRV(GraphBuilder.RegisterExternalBuffer(Resource.Flow));
             Parameters.LandWater = GraphBuilder.CreateSRV(GraphBuilder.RegisterExternalBuffer(Resource.Water));
             Parameters.LandDebugHasHydro = 1;
         }
         else
         {
-            Parameters.LandFlow = GraphBuilder.CreateSRV(VoxelGPUCommon::UploadStructuredBuffer<uint32>(GraphBuilder, TEXT("Voxel.LandFlowNone"), TConstArrayView<uint32>()));
             Parameters.LandWater = GraphBuilder.CreateSRV(VoxelGPUCommon::UploadStructuredBuffer<float>(GraphBuilder, TEXT("Voxel.LandWaterNone"), TConstArrayView<float>()));
         }
         return Parameters;
@@ -1375,7 +1426,6 @@ FVoxelLandDebugParameters VoxelLandGPU::GetDebugParameters(FRDGBuilder& GraphBui
     // No view, or the noise surface: one-element stand-ins (the bake views show "none").
     Parameters.LandAttr = GraphBuilder.CreateSRV(VoxelGPUCommon::UploadStructuredBuffer<uint32>(GraphBuilder, TEXT("Voxel.LandAttrNone"), TConstArrayView<uint32>()));
     Parameters.LandPlates = GraphBuilder.CreateSRV(VoxelGPUCommon::UploadStructuredBuffer<float>(GraphBuilder, TEXT("Voxel.LandPlatesNone"), TConstArrayView<float>()));
-    Parameters.LandFlow = GraphBuilder.CreateSRV(VoxelGPUCommon::UploadStructuredBuffer<uint32>(GraphBuilder, TEXT("Voxel.LandFlowNone"), TConstArrayView<uint32>()));
     Parameters.LandWater = GraphBuilder.CreateSRV(VoxelGPUCommon::UploadStructuredBuffer<float>(GraphBuilder, TEXT("Voxel.LandWaterNone"), TConstArrayView<float>()));
     return Parameters;
 }

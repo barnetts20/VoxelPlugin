@@ -19,8 +19,15 @@
 //   StructuredBuffer<float> LandHeight;      6 * (N + 2 Pad)^2 heights (m), face-major, rows of U
 //   StructuredBuffer<float2> LandTanTable;   N + 2 Pad double-float tan(pi s_i / 4), s_i the
 //                                            face coordinate of cell centre i - Pad
+//   StructuredBuffer<uint> LandFlow;         the drainage (f16 log2 m^2), two cells per word,
+//                                            lower index in the low half (read when LandHasFlow)
 //   uint LandN;
 //   uint LandPad;                            at least 4
+//   uint LandHasFlow;                        1 when the bake has the drainage (eroded)
+//   float LandCellM;                         a cell's arc at the face centre (m)
+//
+// With the height, VoxelLandBakeSampleDF gives the surface gradient (m/m, a tangent vector)
+// and the drainage, both from the same B-spline, for the hillside layers (VoxelLandGully.ush).
 
 #ifndef VOXEL_LAND_SAMPLE_USH
 #define VOXEL_LAND_SAMPLE_USH
@@ -82,13 +89,56 @@ VOXEL_FUNC FVoxelLandWeights VoxelLandBSpline(float T)
     return W;
 }
 
+/** Their derivatives in T. */
+VOXEL_FUNC FVoxelLandWeights VoxelLandBSplineSlope(float T)
+{
+    const float U = 1.0f - T;
+    FVoxelLandWeights W;
+    W.W0 = -0.5f * U * U;
+    W.W1 = (1.5f * T - 2.0f) * T;
+    W.W2 = (-1.5f * T + 1.0f) * T + 0.5f;
+    W.W3 = 0.5f * T * T;
+    return W;
+}
+
+/** Their second derivatives in T. */
+VOXEL_FUNC FVoxelLandWeights VoxelLandBSplineCurve(float T)
+{
+    FVoxelLandWeights W;
+    W.W0 = 1.0f - T;
+    W.W1 = 3.0f * T - 2.0f;
+    W.W2 = 1.0f - 3.0f * T;
+    W.W3 = T;
+    return W;
+}
+
 VOXEL_FUNC float VoxelLandWeightAt(FVoxelLandWeights W, uint K)
 {
     return K == 0u ? W.W0 : (K == 1u ? W.W1 : (K == 2u ? W.W2 : W.W3));
 }
 
-/** One face's spline at the point's segments along U and V. */
-VOXEL_FUNC float VoxelLandFaceHeight(uint Face, FVoxelLandAxis U, FVoxelLandAxis V)
+/** A bake cell's drainage (log2 m^2). */
+VOXEL_FUNC float VoxelLandFlowAt(uint Index)
+{
+    return f16tof32((LandFlow[Index >> 1u] >> ((Index & 1u) * 16u)) & 0xffffu);
+}
+
+/** One face's spline at the point: the height (m), its first and second derivatives along the
+ *  face's U and V (m per cell, m per cell^2) and the drainage (log2 m^2; 0 without it). */
+struct FVoxelLandFaceSample
+{
+    float Height;
+    float DU;
+    float DV;
+    float DUU;
+    float DUV;
+    float DVV;
+    float Flow;
+};
+
+/** One face's spline at the point's segments along U and V. bSlopes adds the derivatives and
+ *  the drainage (a constant argument: the compiler drops them when false). */
+VOXEL_FUNC FVoxelLandFaceSample VoxelLandFaceSampleAt(uint Face, FVoxelLandAxis U, FVoxelLandAxis V, bool bSlopes)
 {
     const uint Side = LandN + 2u * LandPad;
     const uint Base = Face * Side * Side;
@@ -99,15 +149,91 @@ VOXEL_FUNC float VoxelLandFaceHeight(uint Face, FVoxelLandAxis U, FVoxelLandAxis
     // Summed relative to the segment's first centre: the weights add to 1, and small
     // differences round far less than heights of kilometres.
     const float Ref = LandHeight[Base + (J0 + 1u) * Side + I0 + 1u];
-    float Sum = 0.0f;
+    FVoxelLandFaceSample Out;
+    Out.Height = 0.0f;
+    Out.DU = 0.0f;
+    Out.DV = 0.0f;
+    Out.DUU = 0.0f;
+    Out.DUV = 0.0f;
+    Out.DVV = 0.0f;
+    Out.Flow = 0.0f;
+    if (!bSlopes)
+    {
+        for (uint b = 0u; b < 4u; b++)
+        {
+            const uint Row = Base + (J0 + b) * Side + I0;
+            const float Line = WU.W0 * (LandHeight[Row] - Ref) + WU.W1 * (LandHeight[Row + 1u] - Ref)
+                + WU.W2 * (LandHeight[Row + 2u] - Ref) + WU.W3 * (LandHeight[Row + 3u] - Ref);
+            Out.Height += VoxelLandWeightAt(WV, b) * Line;
+        }
+        Out.Height += Ref;
+        return Out;
+    }
+    const FVoxelLandWeights DWU = VoxelLandBSplineSlope(U.Frac);
+    const FVoxelLandWeights DWV = VoxelLandBSplineSlope(V.Frac);
+    const FVoxelLandWeights CWU = VoxelLandBSplineCurve(U.Frac);
+    const FVoxelLandWeights CWV = VoxelLandBSplineCurve(V.Frac);
     for (uint b = 0u; b < 4u; b++)
     {
         const uint Row = Base + (J0 + b) * Side + I0;
-        const float Line = WU.W0 * (LandHeight[Row] - Ref) + WU.W1 * (LandHeight[Row + 1u] - Ref)
-            + WU.W2 * (LandHeight[Row + 2u] - Ref) + WU.W3 * (LandHeight[Row + 3u] - Ref);
-        Sum += VoxelLandWeightAt(WV, b) * Line;
+        const float H0 = LandHeight[Row] - Ref;
+        const float H1 = LandHeight[Row + 1u] - Ref;
+        const float H2 = LandHeight[Row + 2u] - Ref;
+        const float H3 = LandHeight[Row + 3u] - Ref;
+        const float Line = WU.W0 * H0 + WU.W1 * H1 + WU.W2 * H2 + WU.W3 * H3;
+        const float LineSlope = DWU.W0 * H0 + DWU.W1 * H1 + DWU.W2 * H2 + DWU.W3 * H3;
+        const float LineCurve = CWU.W0 * H0 + CWU.W1 * H1 + CWU.W2 * H2 + CWU.W3 * H3;
+        Out.Height += VoxelLandWeightAt(WV, b) * Line;
+        Out.DU += VoxelLandWeightAt(WV, b) * LineSlope;
+        Out.DV += VoxelLandWeightAt(DWV, b) * Line;
+        Out.DUU += VoxelLandWeightAt(WV, b) * LineCurve;
+        Out.DUV += VoxelLandWeightAt(DWV, b) * LineSlope;
+        Out.DVV += VoxelLandWeightAt(CWV, b) * Line;
+        if (LandHasFlow != 0u)
+        {
+            Out.Flow += VoxelLandWeightAt(WV, b) * (WU.W0 * VoxelLandFlowAt(Row) + WU.W1 * VoxelLandFlowAt(Row + 1u)
+                + WU.W2 * VoxelLandFlowAt(Row + 2u) + WU.W3 * VoxelLandFlowAt(Row + 3u));
+        }
     }
-    return Ref + Sum;
+    Out.Height += Ref;
+    return Out;
+}
+
+/** One face's spline at the point's segments along U and V. */
+VOXEL_FUNC float VoxelLandFaceHeight(uint Face, FVoxelLandAxis U, FVoxelLandAxis V)
+{
+    return VoxelLandFaceSampleAt(Face, U, V, false).Height;
+}
+
+/** A face's frame at a point with tan coordinates A, B (u / n, v / n): the unit sphere's
+ *  tangents along the face's two angles, d dir / d theta_U and d dir / d theta_V, and the
+ *  inverse of their metric (G^-1: UU, UV, VV). A gradient covector (dh / dX, dh / dY, X and Y
+ *  the face's angles times the radius) maps to the tangent vector G^-1 h through them. */
+struct FVoxelLandFaceFrame
+{
+    float3 TU;
+    float3 TV;
+    float GUU;
+    float GUV;
+    float GVV;
+};
+
+VOXEL_FUNC FVoxelLandFaceFrame VoxelLandFaceFrameAt(uint Face, float A, float B)
+{
+    const float3 N = VoxelCubeAxisVector(VoxelCubeNormalAxis(Face)) * VoxelCubeNormalSign(Face);
+    const float3 U = VoxelCubeAxisVector(VoxelCubeUAxis(Face));
+    const float3 V = VoxelCubeAxisVector(VoxelCubeVAxis(Face));
+    const float A2 = 1.0f + A * A;
+    const float B2 = 1.0f + B * B;
+    const float L2 = A2 + B * B;
+    const float InvL3 = 1.0f / (L2 * sqrt(L2));
+    FVoxelLandFaceFrame Frame;
+    Frame.TU = (U * B2 - V * (A * B) - N * A) * (A2 * InvL3);
+    Frame.TV = (V * A2 - U * (A * B) - N * B) * (B2 * InvL3);
+    Frame.GUU = L2 / A2;
+    Frame.GUV = L2 * A * B / (A2 * B2);
+    Frame.GVV = L2 / B2;
+    return Frame;
 }
 
 VOXEL_FUNC float2 VoxelLandPick(float2 X, float2 Y, float2 Z, uint Axis)
@@ -115,16 +241,33 @@ VOXEL_FUNC float2 VoxelLandPick(float2 X, float2 Y, float2 Z, uint Axis)
     return Axis == 0u ? X : (Axis == 1u ? Y : Z);
 }
 
-/** The bake's height (m) in the direction of the double-float point P (any length): each face
- *  on P's side of the three axes, weighted by how far inside it P is. Interior points read one
- *  face; within a cell of an edge two, of a corner three. */
-VOXEL_FUNC float VoxelLandBakeHeightDF(float2 PX, float2 PY, float2 PZ)
+/** The bake at a point: the height (m about sea level), its gradient on the sphere (m/m, a
+ *  tangent vector; zero unless asked for), how fast the gradient's direction turns along the
+ *  surface (rad/m: |Hessian x the gradient turned a right angle| / |gradient|^2, in the face's
+ *  metres; large at valley floors and crests), and the drainage (log2 m^2; 0 without it). */
+struct FVoxelLandBakeSample
+{
+    float Height;
+    float3 Gradient;
+    float Turn;
+    float Flow;
+};
+
+/** The bake in the direction of the double-float point P (any length): each face on P's side
+ *  of the three axes, weighted by how far inside it P is. Interior points read one face;
+ *  within a cell of an edge two, of a corner three. bSlopes adds the gradient and the drainage
+ *  (constant: dropped when false); the gradient blends the faces' gradients by the same
+ *  weights (the faces agree in the band, so the weights' own slope is left out). */
+VOXEL_FUNC FVoxelLandBakeSample VoxelLandBakeSampleDF(float2 PX, float2 PY, float2 PZ, bool bSlopes)
 {
     const float Band = 2.0f / float(LandN);
     float Sum = 0.0f;
     float WSum = 0.0f;
     float First = 0.0f;   // the first face's height: the others are summed relative to it
     bool bFirst = true;
+    float3 Gradient = float3(0.0f, 0.0f, 0.0f);
+    float Turn = 0.0f;
+    float Flow = 0.0f;
     for (uint Axis = 0u; Axis < 3u; Axis++)
     {
         const float2 PN = VoxelLandPick(PX, PY, PZ, Axis);
@@ -138,16 +281,42 @@ VOXEL_FUNC float VoxelLandBakeHeightDF(float2 PX, float2 PY, float2 PZ)
         const float T = atan(AV.x) * VOXEL_LAND_INV_QUARTER_PI;
         const float W = VoxelLandFaceRamp(S, Band) * VoxelLandFaceRamp(T, Band);
         if (W <= 0.0f) continue;
-        const float H = VoxelLandFaceHeight(Face, VoxelLandAxisAt(AU, S), VoxelLandAxisAt(AV, T));
+        const FVoxelLandFaceSample F = VoxelLandFaceSampleAt(Face, VoxelLandAxisAt(AU, S), VoxelLandAxisAt(AV, T), bSlopes);
         if (bFirst)
         {
-            First = H;
+            First = F.Height;
             bFirst = false;
         }
-        Sum += W * (H - First);
+        Sum += W * (F.Height - First);
         WSum += W;
+        if (bSlopes)
+        {
+            // dh / dX = (dh / dcell) / (cell arc), then the tangent vector G^-1 h.
+            const FVoxelLandFaceFrame Frame = VoxelLandFaceFrameAt(Face, AU.x, AV.x);
+            const float HU = F.DU / LandCellM;
+            const float HV = F.DV / LandCellM;
+            Gradient = Gradient + (Frame.TU * (Frame.GUU * HU + Frame.GUV * HV) + Frame.TV * (Frame.GUV * HU + Frame.GVV * HV)) * W;
+            // The direction's turn rate, from the Hessian in the face's metres (the metric's own
+            // variation left out: an estimate for fading, not a measure).
+            const float InvCell2 = 1.0f / (LandCellM * LandCellM);
+            const float TurnU = (F.DUU * -HV + F.DUV * HU) * InvCell2;
+            const float TurnV = (F.DUV * -HV + F.DVV * HU) * InvCell2;
+            Turn += W * sqrt(TurnU * TurnU + TurnV * TurnV) / max(HU * HU + HV * HV, 1.0e-12f);
+            Flow += W * F.Flow;
+        }
     }
-    return WSum > 0.0f ? First + Sum / WSum : 0.0f;
+    FVoxelLandBakeSample Out;
+    Out.Height = WSum > 0.0f ? First + Sum / WSum : 0.0f;
+    Out.Gradient = WSum > 0.0f ? Gradient / WSum : float3(0.0f, 0.0f, 0.0f);
+    Out.Turn = WSum > 0.0f ? Turn / WSum : 0.0f;
+    Out.Flow = WSum > 0.0f ? Flow / WSum : 0.0f;
+    return Out;
+}
+
+/** The bake's height (m) in the direction of the double-float point P (any length). */
+VOXEL_FUNC float VoxelLandBakeHeightDF(float2 PX, float2 PY, float2 PZ)
+{
+    return VoxelLandBakeSampleDF(PX, PY, PZ, false).Height;
 }
 
 #endif // VOXEL_LAND_SAMPLE_USH

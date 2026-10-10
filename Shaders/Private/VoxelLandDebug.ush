@@ -4,10 +4,10 @@
 // integer, 0xRRGGBB, linear). The pages copy it into the vertex colour stream
 // (VoxelBrickPageGPU.usf). GPU only; the palette is VoxelLandDebugPalette.ush.
 //
-// The bake views repeat the density's land branch (VoxelDensitySample.ush) in their own copy:
-// the warp, the bake height, the detail layer. They show those terms; the elevation view shows
-// the mesh itself (the vertex's height about sea level), so the two agree up to the clamp to
-// the lattice range and the edits.
+// The bake views evaluate the density's land branch (VoxelDensitySample.ush) term by term: the
+// warp (VoxelLandWarpDF), the bake height and the gullies (VoxelLandSurfaceDF), the detail
+// layer. They show those terms; the elevation view shows the mesh itself (the vertex's height
+// about sea level), so the two agree up to the clamp to the lattice range and the edits.
 //
 // Include after VoxelBrickMesherPasses.ush, VoxelLandPlates.ush and
 // VoxelLandDebugPalette.ush, and after declaring (FVoxelLandDebugParameters, VoxelLandGPU.h):
@@ -15,7 +15,6 @@
 //   StructuredBuffer<uint> LandAttr;     the bake's attributes, two cells per word (low half
 //                                        first), in the bake's cell order
 //   float2 LandDebugSeaRadius;           cm, double-float; 0: the density's sea level
-//   StructuredBuffer<uint> LandFlow;     the bake's drainage (f16 log2 m^2), two cells per word
 //   StructuredBuffer<float> LandWater;   the bake's lake levels (m)
 //   uint LandDebugHasHydro;              1 when the bake has them (eroded)
 
@@ -108,45 +107,57 @@ void VoxelLandDebugPass(uint Id)
     }
     else if (LandMode != 0u && Radius.x > 1.0e-6f)
     {
-        // The density's land branch, term by term: the point on the planet sphere, warped.
-        const float2 Scale = VoxelDFDiv(PlanetRadius, Radius);
+        // The density's land branch, term by term: the point on the sea-level sphere, warped.
+        const float2 Scale = VoxelDFDiv(VoxelDFAdd(PlanetRadius, LandHeightOffset), Radius);
         const float2 SPX = VoxelDFMul(PX, Scale);
         const float2 SPY = VoxelDFMul(PY, Scale);
         const float2 SPZ = VoxelDFMul(PZ, Scale);
-        float2 QX = SPX;
-        float2 QY = SPY;
-        float2 QZ = SPZ;
-        if (LandWarpAmplitude > 0.0f)
-        {
-            const uint WarpFirst = ContinentOctaves + MountainOctaves + DetailOctaves;
-            const float2 WX = VoxelLayerSumDF(WarpFirst, LandWarpOctaves, VoxelLayerPlain, SPX, SPY, SPZ, 0.0f);
-            const float2 WY = VoxelLayerSumDF(WarpFirst + LandWarpOctaves, LandWarpOctaves, VoxelLayerPlain, SPX, SPY, SPZ, 0.0f);
-            const float2 WZ = VoxelLayerSumDF(WarpFirst + 2u * LandWarpOctaves, LandWarpOctaves, VoxelLayerPlain, SPX, SPY, SPZ, 0.0f);
-            const float WarpScale = LandWarpAmplitude * LandWarpInvNorm;
-            QX = VoxelDFAdd(SPX, float2(WarpScale * (WX.x + WX.y), 0.0f));
-            QY = VoxelDFAdd(SPY, float2(WarpScale * (WY.x + WY.y), 0.0f));
-            QZ = VoxelDFAdd(SPZ, float2(WarpScale * (WZ.x + WZ.y), 0.0f));
-        }
+        const FVoxelLandWarp Warp = VoxelLandWarpDF(SPX, SPY, SPZ);
+        const float2 QX = Warp.QX;
+        const float2 QY = Warp.QY;
+        const float2 QZ = Warp.QZ;
         const float3 QDir = normalize(float3(QX.x, QY.x, QZ.x));
         const FVoxelLandDebugCell Cell = VoxelLandDebugCellOf(QDir);
         const uint Attr = VoxelLandDebugAttr(Cell);
         const float Crust = float(Attr & 0xffu) / 255.0f;
         const uint Class = (Attr >> 8u) & 7u;
-        const bool bHeights = LandDebugMode == VOXEL_LAND_VIEW_BAKE || LandDebugMode == VOXEL_LAND_VIEW_DETAIL;
-        float Bake = 0.0f;
-        if (bHeights)
-            Bake = VoxelLandBakeHeightDF(QX, QY, QZ);
+        // The gully view runs the whole hillside chain; the bake and detail views need only the
+        // bake's height.
+        FVoxelLandSurface Land;
+        Land.Bake = 0.0f;
+        Land.Gully = 0.0f;
+        Land.GullyScale = 0.0f;
+        Land.DetailScale = 1.0f;
+        if (LandDebugMode == VOXEL_LAND_VIEW_GULLY)
+        {
+            Land = VoxelLandSurfaceDF(SPX, SPY, SPZ, QX, QY, QZ, Warp.DWX, Warp.DWY, Warp.DWZ, Footprint);
+        }
+        else if (LandDebugMode == VOXEL_LAND_VIEW_BAKE || LandDebugMode == VOXEL_LAND_VIEW_DETAIL)
+        {
+            Land.Bake = VoxelLandBakeHeightDF(QX, QY, QZ);
+            Land.DetailScale = VoxelLandDetailScale(Land.Bake);
+        }
 
         if (LandDebugMode == VOXEL_LAND_VIEW_BAKE)
         {
-            Color = VoxelLandViewHeight(Bake, CellM);
+            Color = VoxelLandViewHeight(Land.Bake, CellM);
         }
         else if (LandDebugMode == VOXEL_LAND_VIEW_DETAIL)
         {
-            const float SeaWeight = lerp(0.25f, 1.0f, smoothstep(-50.0f, 50.0f, Bake));
+            const float SeaWeight = lerp(0.25f, 1.0f, smoothstep(-50.0f, 50.0f, Land.Bake));
             const float2 Detail = VoxelDFMul(VoxelLayerSumDF(ContinentOctaves + MountainOctaves, DetailOctaves, VoxelLayerDamped, SPX, SPY, SPZ, Footprint), InvNormDetail);
-            // Over the full amplitude, so the weaker detail under the sea shows paler.
-            Color = VoxelLandViewSigned(LandDetailAmplitude > 0.0f ? (Detail.x + Detail.y) * SeaWeight : 0.0f);
+            // Over the full amplitude, so the weaker detail under the sea (and on land while
+            // there are gullies) shows paler.
+            Color = VoxelLandViewSigned(LandDetailAmplitude > 0.0f ? (Detail.x + Detail.y) * SeaWeight * Land.DetailScale : 0.0f);
+        }
+        else if (LandDebugMode == VOXEL_LAND_VIEW_GULLY)
+        {
+            // Over the coarsest octave's largest half-depth there (VoxelLandGully.ush), so the
+            // pattern shows on gentle slopes too; white where there are none.
+            if (LandGullyStrength <= 0.0f || LandGullyOctaves == 0u)
+                Color = VoxelLandViewNone();
+            else
+                Color = VoxelLandViewSigned(Land.GullyScale > 1.0e-3f ? Land.Gully / Land.GullyScale : 0.0f);
         }
         else if (LandDebugMode == VOXEL_LAND_VIEW_CRUST)
         {
@@ -162,8 +173,7 @@ void VoxelLandDebugPass(uint Id)
         }
         else if (LandDebugMode == VOXEL_LAND_VIEW_FLOW && LandDebugHasHydro != 0u)
         {
-            const uint Index = VoxelLandDebugIndex(Cell);
-            const float Log2 = f16tof32((LandFlow[Index >> 1u] >> ((Index & 1u) * 16u)) & 0xffffu);
+            const float Log2 = VoxelLandFlowAt(VoxelLandDebugIndex(Cell));
             Color = VoxelLandViewFlow(Log2 * 0.30103f - 6.0f, Elevation <= 0.0f);
         }
         else if (LandDebugMode == VOXEL_LAND_VIEW_LAKES && LandDebugHasHydro != 0u)
