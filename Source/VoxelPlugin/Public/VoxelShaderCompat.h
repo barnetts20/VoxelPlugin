@@ -99,6 +99,9 @@ namespace VoxelShader
     inline int min(int a, int b) { return a < b ? a : b; }
     inline int max(int a, int b) { return a > b ? a : b; }
     inline uint min(uint a, uint b) { return a < b ? a : b; }
+    inline uint max(uint a, uint b) { return a > b ? a : b; }
+    inline int clamp(int v, int lo, int hi) { return v < lo ? lo : (v > hi ? hi : v); }
+    inline float log2(float a) { return std::log2(a); }
 
 #if defined(__cpp_lib_atomic_ref)
     // Atomics on buffer elements (uint lvalues), with HLSL's signatures (C++ tests of the
@@ -116,6 +119,22 @@ namespace VoxelShader
     inline void InterlockedOr(uint& Dest, uint Value)
     {
         std::atomic_ref<uint>(Dest).fetch_or(Value);
+    }
+    inline void InterlockedAdd(uint& Dest, uint Value)
+    {
+        std::atomic_ref<uint>(Dest).fetch_add(Value);
+    }
+    inline void InterlockedMin(uint& Dest, uint Value)
+    {
+        std::atomic_ref<uint> Ref(Dest);
+        uint Old = Ref.load();
+        while (Value < Old && !Ref.compare_exchange_weak(Old, Value)) {}
+    }
+    inline void InterlockedMax(uint& Dest, uint Value)
+    {
+        std::atomic_ref<uint> Ref(Dest);
+        uint Old = Ref.load();
+        while (Value > Old && !Ref.compare_exchange_weak(Old, Value)) {}
     }
 #endif
 

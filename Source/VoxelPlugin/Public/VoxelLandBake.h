@@ -3,18 +3,31 @@
 // and the driver that makes it (time-sliced compute passes, read back once; on the CPU when
 // there is no GPU). The density samples it on both backends (VoxelLandSample.ush).
 //
-// Stage L1: the plate model only (VoxelLandPlates.ush): the height is the crust hypsometry
-// plus the boundary profiles, without erosion.
+// The plate model (VoxelLandPlates.ush) gives the crust hypsometry and the boundary profiles;
+// on the GPU the continental ranges then rise into a stream-power erosion solve, and a final
+// routing gives the drainage and the lakes (VoxelLandSolve.ush, stage L2). Without a GPU the
+// bake is the plate model alone (not cached).
 
 #pragma once
 
 #include "CoreMinimal.h"
 #include "Async/Future.h"
+#include "Math/Float16.h"
 #include "VoxelLandSettings.h"
 
 struct FVoxelLandBakeGPU;
 struct FVoxelLandBakeJob;
 struct FVoxelLandCpuProgress;
+
+/** A lake the final routing kept: a depression at least MinLakeDepth deep and MinLakeArea
+ *  large, filled to its spill level. */
+struct FVoxelLandLake
+{
+    uint32 Cell = 0;         // its lowest-index cell (padded cell index): its id
+    float Level = 0.0f;      // water level (m about sea level)
+    uint32 Outlet = 0;       // the lake cell it drains from (lowest index), or ~0 for none
+    float AreaKm2 = 0.0f;
+};
 
 /** One planet's bake. Immutable once made; shared by the density on any thread. */
 struct VOXELPLUGIN_API FVoxelLandBake
@@ -23,7 +36,7 @@ struct VOXELPLUGIN_API FVoxelLandBake
     static constexpr int32 Pad = 4;
     /** Changes whenever the bake's content or file layout changes (old cache files are then
      *  ignored). */
-    static constexpr uint32 Version = 2;
+    static constexpr uint32 Version = 3;
 
     FVoxelLandBake();
     ~FVoxelLandBake();
@@ -39,14 +52,33 @@ struct VOXELPLUGIN_API FVoxelLandBake
     float MaxHeight = 0.0f;
     double BakeSeconds = 0.0;     // how long making it took (0 when loaded)
     bool bFromCache = false;
+    /** Made by the erosion solve (else the plate model alone: the CPU fallback, or
+     *  voxel.Land.Erosion 0); only eroded bakes are cached. */
+    bool bEroded = false;
+    int32 SolveSteps = 0;         // steps the solve ran
+    float SolveResidual = 0.0f;   // its last residual (mean height change over mean uplift)
+    float ReliefFactor = 1.0f;    // the relief normalisation's scale
 
     /** Heights (m about sea level), 6 faces of Side() x Side() cells, rows along the face's U
      *  axis; cell (i, j) of face f, i and j from -Pad, at f * Side^2 + (j + Pad) * Side + i + Pad. */
     TArray<float> Height;
 
     /** Per cell: crust fraction (bits 0-7, 0..255), boundary class (bits 8-10: 0 none,
-     *  1 collision, 2 arc range, 3 trench, 4 island arc, 5 rift, 6 ridge). */
+     *  1 collision, 2 arc range, 3 trench, 4 island arc, 5 rift, 6 ridge), sea-connected
+     *  (bit 11, stage L5), under a kept lake (bit 12). */
     TArray<uint16> Attr;
+    static constexpr uint16 LakeBit = 1u << 12;
+
+    /** Per cell: log2 of the drainage area (m^2), a cell's own area off the land; empty when
+     *  not eroded. */
+    TArray<FFloat16> Flow;
+
+    /** Per cell: the kept lake's water level (m), or -3e38 where there is none; empty when not
+     *  eroded. */
+    TArray<float> Water;
+
+    /** The kept lakes, by Cell. */
+    TArray<FVoxelLandLake> Lakes;
 
     /** tan(pi s_i / 4) for the cell centres along a face axis (i from -Pad), as double-float
      *  pairs: the sampler's exact fractions. */
@@ -99,7 +131,8 @@ private:
         Start,
         LoadingCache,
         Gpu,
-        GpuReading,
+        GpuSolving,
+        GpuAssembling,
         Cpu,
         Done
     };
@@ -126,7 +159,10 @@ private:
 namespace VoxelLand
 {
     /** Bump when the generator's output changes for the same settings (invalidates caches). */
-    constexpr uint32 GeneratorVersion = 1;
+    constexpr uint32 GeneratorVersion = 2;
+
+    /** voxel.Land.Erosion: whether bakes run the erosion solve (part of the key). */
+    VOXELPLUGIN_API bool IsErosionEnabled();
 
     /** The cache key of a bake: the bake settings, the radius (to the cm), N, the versions. */
     VOXELPLUGIN_API uint32 BakeKey(const FVoxelTerrestrialSettings& Settings, double SeaRadius);

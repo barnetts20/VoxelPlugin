@@ -20,6 +20,8 @@ struct FVoxelLandBakeGPU
     TRefCountPtr<FRDGPooledBuffer> TanTable;
     TRefCountPtr<FRDGPooledBuffer> Attr;     // two cells per word
     TRefCountPtr<FRDGPooledBuffer> Plates;
+    TRefCountPtr<FRDGPooledBuffer> Flow;     // two cells per word (f16)
+    TRefCountPtr<FRDGPooledBuffer> Water;
 };
 
 /** Declared in the shader by VoxelLandParameters.ush, read by VoxelLandSample.ush and the land
@@ -45,6 +47,9 @@ BEGIN_SHADER_PARAMETER_STRUCT(FVoxelLandDebugParameters, )
     SHADER_PARAMETER(uint32, LandDebugMode)
     SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, LandAttr)
     SHADER_PARAMETER(FVector2f, LandDebugSeaRadius)
+    SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, LandFlow)
+    SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<float>, LandWater)
+    SHADER_PARAMETER(uint32, LandDebugHasHydro)
     SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<float>, LandPlates)
     SHADER_PARAMETER(uint32, LandPlateCount)
     SHADER_PARAMETER(uint32, LandSeed)

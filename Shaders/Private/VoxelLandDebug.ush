@@ -15,6 +15,9 @@
 //   StructuredBuffer<uint> LandAttr;     the bake's attributes, two cells per word (low half
 //                                        first), in the bake's cell order
 //   float2 LandDebugSeaRadius;           cm, double-float; 0: the density's sea level
+//   StructuredBuffer<uint> LandFlow;     the bake's drainage (f16 log2 m^2), two cells per word
+//   StructuredBuffer<float> LandWater;   the bake's lake levels (m)
+//   uint LandDebugHasHydro;              1 when the bake has them (eroded)
 
 #ifndef VOXEL_LAND_DEBUG_USH
 #define VOXEL_LAND_DEBUG_USH
@@ -51,6 +54,13 @@ uint VoxelLandDebugAttr(FVoxelLandDebugCell Cell)
     return (LandAttr[Index >> 1u] >> ((Index & 1u) * 16u)) & 0xffffu;
 }
 
+/** A bake cell's index in the padded grid. */
+uint VoxelLandDebugIndex(FVoxelLandDebugCell Cell)
+{
+    const uint Side = LandN + 2u * LandPad;
+    return Cell.Face * Side * Side + uint(Cell.J + int(LandPad)) * Side + uint(Cell.I + int(LandPad));
+}
+
 /** A display colour as the vertex colour stores it: linear (the material reads vertex colours
  *  as stored, without the sRGB curve), 8 bits a channel, 0xRRGGBB. */
 uint VoxelLandDebugPack(float3 Color)
@@ -80,14 +90,15 @@ void VoxelLandDebugPass(uint Id)
     const float3 Normal = float3(Vertices[Base + 3u], Vertices[Base + 4u], Vertices[Base + 5u]);
     const float Footprint = max(ldexp(FinestCell, Brick.Level), MinFootprint);
     const float CellM = Footprint * 0.01f;
+    const float2 Sea = LandDebugSeaRadius.x > 0.0f ? LandDebugSeaRadius
+        : (LandMode != 0u ? VoxelDFAdd(PlanetRadius, LandHeightOffset) : PlanetRadius);
+    const float2 HeightDF = VoxelDFSub(Radius, Sea);
+    const float Elevation = (HeightDF.x + HeightDF.y) * 0.01f;
 
     float3 Color = VoxelLandViewNone();
     if (LandDebugMode == VOXEL_LAND_VIEW_ELEVATION)
     {
-        const float2 Sea = LandDebugSeaRadius.x > 0.0f ? LandDebugSeaRadius
-            : (LandMode != 0u ? VoxelDFAdd(PlanetRadius, LandHeightOffset) : PlanetRadius);
-        const float2 Height = VoxelDFSub(Radius, Sea);
-        Color = VoxelLandViewHeight((Height.x + Height.y) * 0.01f, CellM);
+        Color = VoxelLandViewHeight(Elevation, CellM);
     }
     else if (LandDebugMode == VOXEL_LAND_VIEW_SLOPE)
     {
@@ -148,6 +159,18 @@ void VoxelLandDebugPass(uint Id)
         else if (LandDebugMode == VOXEL_LAND_VIEW_PLATES)
         {
             Color = LandPlateCount > 0u ? VoxelLandViewPlate(VoxelLandNearestPlate(VoxelLandWarp(QDir)), Crust) : VoxelLandViewNone();
+        }
+        else if (LandDebugMode == VOXEL_LAND_VIEW_FLOW && LandDebugHasHydro != 0u)
+        {
+            const uint Index = VoxelLandDebugIndex(Cell);
+            const float Log2 = f16tof32((LandFlow[Index >> 1u] >> ((Index & 1u) * 16u)) & 0xffffu);
+            Color = VoxelLandViewFlow(Log2 * 0.30103f - 6.0f, Elevation <= 0.0f);
+        }
+        else if (LandDebugMode == VOXEL_LAND_VIEW_LAKES && LandDebugHasHydro != 0u)
+        {
+            const float Level = LandWater[VoxelLandDebugIndex(Cell)];
+            const bool bLake = Level > -1.0e30f && Elevation < Level;
+            Color = VoxelLandViewLake(Level - Elevation, bLake, Elevation <= 0.0f);
         }
         else if (LandDebugMode == VOXEL_LAND_VIEW_CELLS)
         {

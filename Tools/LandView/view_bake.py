@@ -1,5 +1,6 @@
 """Renders a terrestrial bake exported with voxel.Land.ExportBake (Saved/VoxelLand/Export_*):
-an equirectangular, hill-shaded height map, and the boundary classes.
+an equirectangular, hill-shaded height map, the boundary classes, and for an eroded bake the
+rivers (drainage above 1,000 km^2) and kept lakes over the map.
 
     python view_bake.py <Saved/VoxelLand/Export_<planet>_<key>.json> [width]
 
@@ -24,7 +25,11 @@ def load(path):
     side = n + 2 * pad
     h = np.fromfile(base + "_height.f32", np.float32).reshape(6, side, side)
     a = np.fromfile(base + "_attr.u16", np.uint16).reshape(6, side, side)
-    return meta, h, a
+    flow = water = None
+    if os.path.exists(base + "_flow.f32"):
+        flow = np.fromfile(base + "_flow.f32", np.float32).reshape(6, side, side)
+        water = np.fromfile(base + "_water.f32", np.float32).reshape(6, side, side)
+    return meta, h, a, flow, water
 
 
 def sample(field, n, pad, d):
@@ -49,7 +54,7 @@ def sample(field, n, pad, d):
 def main():
     path = sys.argv[1]
     width = int(sys.argv[2]) if len(sys.argv) > 2 else 2048
-    meta, h, a = load(path)
+    meta, h, a, flow, water = load(path)
     n, pad = meta["n"], meta["pad"]
     W, H = width, width // 2
     lat = np.pi / 2 - (np.arange(H) + 0.5) / H * np.pi
@@ -72,7 +77,16 @@ def main():
     plt.imsave(out + "_map.png", np.clip(colour * (0.35 + 0.75 * shade[..., None]), 0, 1))
     pal = np.array([[.5, .5, .5], [.85, .2, .2], [.95, .55, .1], [.2, .2, .6], [.6, .3, .8], [.9, .9, .2], [.2, .7, .9], [0, 0, 0]])
     plt.imsave(out + "_classes.png", np.where((img > 0)[..., None], pal[cls] * 0.75 + 0.25, pal[cls] * 0.5))
-    print("wrote", out + "_map.png", out + "_classes.png", "heights", img.min(), img.max(), "land", (img > 0).mean())
+    wrote = [out + "_map.png", out + "_classes.png"]
+    if flow is not None:
+        rivers = np.clip(colour * (0.35 + 0.75 * shade[..., None]), 0, 1)
+        f = sample(flow, n, pad, d)
+        w = sample(water, n, pad, d)
+        rivers[(img > 0) & (f > np.log2(1.0e9))] = [0.1, 0.35, 0.9]
+        rivers[w > -1e30] = [0.0, 0.8, 0.9]
+        plt.imsave(out + "_rivers.png", rivers)
+        wrote.append(out + "_rivers.png")
+    print("wrote", *wrote, "heights", img.min(), img.max(), "land", (img > 0).mean(), "lakes", len(meta.get("lakes", [])))
 
 
 if __name__ == "__main__":

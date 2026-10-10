@@ -51,7 +51,9 @@ TAutoConsoleVariable<int32> CVarVoxelDebugLandView(
     TEXT(" 6: plates (a hue each, brighter on continental crust)\n")
     TEXT(" 7: slope (green flat, yellow 20 deg, red 45 deg, purple 60+)\n")
     TEXT(" 8: the bake's cells (a checker in each cube face's colour)\n")
-    TEXT("2 to 6 and 8 need a terrestrial planet (magenta on the noise surface)."),
+    TEXT(" 9: drainage (rivers: blue from 1,000 km^2)\n")
+    TEXT(" 10: lakes by depth\n")
+    TEXT("2 to 6 and 8 to 10 need a terrestrial planet, 9 and 10 a GPU bake (magenta otherwise)."),
     ECVF_Default);
 
 static TAutoConsoleVariable<int32> CVarVoxelBrickPerf(
@@ -495,7 +497,7 @@ namespace VoxelBrickTerrainDetail
     {
         using namespace VoxelShader;
         static const TCHAR* Names[VOXEL_LAND_VIEW_COUNT] = { TEXT("off"), TEXT("elevation"), TEXT("bake height"), TEXT("detail layer"),
-            TEXT("crust"), TEXT("boundary class"), TEXT("plates"), TEXT("slope"), TEXT("bake cells") };
+            TEXT("crust"), TEXT("boundary class"), TEXT("plates"), TEXT("slope"), TEXT("bake cells"), TEXT("drainage"), TEXT("lakes") };
         TArray<FLegendLine> Lines;
         Lines.Add({ FString::Printf(TEXT("voxel.Debug.LandView %d: %s (0 hides it; the terrain material must show vertex colour)"), View, Names[View]), FColor::White });
         const bool bBakeView = View != (int32)VOXEL_LAND_VIEW_ELEVATION && View != (int32)VOXEL_LAND_VIEW_SLOPE;
@@ -562,6 +564,23 @@ namespace VoxelBrickTerrainDetail
             Add(TEXT("alternate cells darker (close up)"), VoxelLandViewCell(0u, 1, 0, 1.0f));
             break;
         }
+        case VOXEL_LAND_VIEW_FLOW:
+            Add(TEXT("hillslope"), VoxelLandViewFlow(0.0f, false));
+            Add(TEXT("10 km^2"), VoxelLandViewFlow(1.0f, false));
+            Add(TEXT("100 km^2"), VoxelLandViewFlow(2.0f, false));
+            Add(TEXT("1,000 km^2 (river)"), VoxelLandViewFlow(3.0f, false));
+            Add(TEXT("100,000 km^2"), VoxelLandViewFlow(5.0f, false));
+            Add(TEXT("sea"), VoxelLandViewFlow(0.0f, true));
+            Add(TEXT("magenta: the bake has no drainage (a CPU bake)"), VoxelLandViewNone());
+            break;
+        case VOXEL_LAND_VIEW_LAKES:
+            Add(TEXT("lake, shallow"), VoxelLandViewLake(0.0f, true, false));
+            Add(TEXT("lake, 50 m"), VoxelLandViewLake(50.0f, true, false));
+            Add(TEXT("lake, 100 m and deeper"), VoxelLandViewLake(100.0f, true, false));
+            Add(TEXT("dry land"), VoxelLandViewLake(0.0f, false, false));
+            Add(TEXT("sea"), VoxelLandViewLake(0.0f, false, true));
+            Add(TEXT("magenta: the bake has no drainage (a CPU bake)"), VoxelLandViewNone());
+            break;
         default:
             break;
         }

@@ -1,5 +1,6 @@
 #include "VoxelLandBake.h"
 #include "VoxelLandGPU.h"
+#include "VoxelLandSolve.h"
 #include "VoxelDensityGPU.h"
 #include "VoxelGPUCommon.h"
 #include "VoxelPlugin.h"
@@ -57,6 +58,21 @@ static TAutoConsoleVariable<int32> CVarVoxelLandForceCpu(
 static TAutoConsoleVariable<int32> CVarVoxelLandBakeCellsPerFrame(
     TEXT("voxel.Land.BakeCellsPerFrame"), 1 << 20,
     TEXT("Bake cells the GPU evaluates per frame (the plate model costs a few microseconds per cell on the CPU, far less on the GPU)."),
+    ECVF_Default);
+
+static TAutoConsoleVariable<int32> CVarVoxelLandErosion(
+    TEXT("voxel.Land.Erosion"), 1,
+    TEXT("1: terrestrial bakes run the erosion solve on the GPU (stage L2). 0: the plate model alone (for comparison; part of the cache key, so switching rebakes once)."),
+    ECVF_Default);
+
+static TAutoConsoleVariable<int32> CVarVoxelLandSolveStepCells(
+    TEXT("voxel.Land.SolveStepCells"), 1 << 22,
+    TEXT("The erosion solve's budget per frame: solved cells x steps (about 70 passes over the mountain cells per step)."),
+    ECVF_Default);
+
+static TAutoConsoleVariable<int32> CVarVoxelLandSolveIterationCells(
+    TEXT("voxel.Land.SolveIterationCells"), 1 << 26,
+    TEXT("The fills', drainage's and lake labels' budget per frame: cells x iterations (one cheap pass each), until they converge."),
     ECVF_Default);
 
 static TAutoConsoleVariable<int32> CVarVoxelDebugLand(
@@ -306,8 +322,10 @@ uint32 FVoxelTerrestrialSettings::GetBakeHash() const
     uint32 H = ::GetTypeHash(Seed);
     H = HashCombine(H, ::GetTypeHash(PlateCount));
     H = HashCombine(H, ::GetTypeHash(BakeResolution));
-    for (const double V : { ContinentalFraction, LandformWidthScale, RangeRelief, CoastHeight, InteriorHeight, ShelfDepth, AbyssDepth })
+    for (const double V : { ContinentalFraction, LandformWidthScale, RangeRelief, CoastHeight, InteriorHeight, ShelfDepth, AbyssDepth,
+        PlainsUpliftThreshold, MountainRampWidth, SolveResidual, MinLakeDepth, MinLakeArea })
         H = HashCombine(H, ::GetTypeHash(V));
+    H = HashCombine(H, ::GetTypeHash(SolveMaxSteps));
     return H;
 }
 
@@ -375,6 +393,11 @@ int32 VoxelLand::BakeResolutionFor(const FVoxelTerrestrialSettings& Settings)
     return FMath::Clamp(Settings.BakeResolution, 64, 2048);
 }
 
+bool VoxelLand::IsErosionEnabled()
+{
+    return CVarVoxelLandErosion.GetValueOnAnyThread() != 0;
+}
+
 uint32 VoxelLand::BakeKey(const FVoxelTerrestrialSettings& Settings, double SeaRadius)
 {
     uint32 H = Settings.GetBakeHash();
@@ -382,6 +405,7 @@ uint32 VoxelLand::BakeKey(const FVoxelTerrestrialSettings& Settings, double SeaR
     H = HashCombine(H, ::GetTypeHash(BakeResolutionFor(Settings)));
     H = HashCombine(H, ::GetTypeHash(FVoxelLandBake::Version));
     H = HashCombine(H, ::GetTypeHash(GeneratorVersion));
+    H = HashCombine(H, ::GetTypeHash(IsErosionEnabled() ? 1 : 0));
     return H;
 }
 
@@ -391,7 +415,8 @@ uint32 VoxelLand::BakeCheck(const FVoxelTerrestrialSettings& Settings, double Se
     TArray<double> Values = { (double)Settings.Seed, (double)Settings.PlateCount, (double)BakeResolutionFor(Settings),
         Settings.ContinentalFraction, Settings.LandformWidthScale, Settings.RangeRelief, Settings.CoastHeight,
         Settings.InteriorHeight, Settings.ShelfDepth, Settings.AbyssDepth, FMath::RoundToDouble(SeaRadius),
-        (double)FVoxelLandBake::Version, (double)GeneratorVersion };
+        (double)FVoxelLandBake::Version, (double)GeneratorVersion, Settings.PlainsUpliftThreshold, Settings.MountainRampWidth,
+        Settings.SolveResidual, (double)Settings.SolveMaxSteps, Settings.MinLakeDepth, Settings.MinLakeArea, IsErosionEnabled() ? 1.0 : 0.0 };
     return FCrc::MemCrc32(Values.GetData(), Values.Num() * (int32)sizeof(double));
 }
 
@@ -410,6 +435,8 @@ void VoxelLand::ShapeFor(const FVoxelTerrestrialSettings& Settings, const FVoxel
 
 namespace VoxelLandCache
 {
+    static_assert(sizeof(FVoxelLandLake) == 16 && sizeof(FFloat16) == sizeof(uint16), "The cache stores these as they are in memory");
+
     struct FHeader
     {
         uint32 Magic = VLB::CacheMagic;
@@ -423,8 +450,21 @@ namespace VoxelLandCache
         double SeaRadius = 0.0;
         double BakeSeconds = 0.0;
         uint32 SettingsCheck = 0;   // VoxelLand::BakeCheck: a second hash, against key collisions
-        uint32 Reserved = 0;
+        uint32 Flags = 0;           // 1: eroded (Flow and Water follow Attr)
+        int32 LakeCount = 0;        // FVoxelLandLake records after the fields
+        int32 SolveSteps = 0;
+        float SolveResidual = 0.0f;
+        float ReliefFactor = 1.0f;
     };
+
+    /** The raw (uncompressed) size of a bake's data: heights, attributes, then for an eroded
+     *  bake the drainage and the lake levels, then the lakes. */
+    int64 RawBytes(int64 NumCells, bool bEroded, int64 NumLakes)
+    {
+        return NumCells * (int64)(sizeof(float) + sizeof(uint16))
+            + (bEroded ? NumCells * (int64)(sizeof(uint16) + sizeof(float)) : 0)
+            + NumLakes * (int64)sizeof(FVoxelLandLake);
+    }
 
     /** Bakes kept in Saved/VoxelLand; the least recently written beyond this are deleted. */
     constexpr int32 MaxFiles = 16;
@@ -433,6 +473,7 @@ namespace VoxelLandCache
     bool IsUsable(const FVoxelLandBake& Bake)
     {
         if (Bake.Height.Num() != Bake.NumCells() || Bake.Attr.Num() != Bake.NumCells()) return false;
+        if (Bake.bEroded && (Bake.Flow.Num() != Bake.NumCells() || Bake.Water.Num() != Bake.NumCells())) return false;
         if (!(Bake.MinHeight <= Bake.MaxHeight)) return false;
         for (const float H : Bake.Height)
         {
@@ -465,13 +506,25 @@ namespace VoxelLandCache
 
     bool Save(const FVoxelLandBake& Bake)
     {
-        const int64 HeightBytes = (int64)Bake.Height.Num() * sizeof(float);
-        const int64 AttrBytes = (int64)Bake.Attr.Num() * sizeof(uint16);
-        if (HeightBytes + AttrBytes >= MAX_int32) return false;
+        const int64 NumCells = Bake.Height.Num();
+        const int64 Total = RawBytes(NumCells, Bake.bEroded, Bake.Lakes.Num());
+        if (Total >= MAX_int32) return false;
         TArray<uint8> Raw;
-        Raw.SetNumUninitialized((int32)(HeightBytes + AttrBytes));
-        FMemory::Memcpy(Raw.GetData(), Bake.Height.GetData(), HeightBytes);
-        FMemory::Memcpy(Raw.GetData() + HeightBytes, Bake.Attr.GetData(), AttrBytes);
+        Raw.SetNumUninitialized((int32)Total);
+        int64 Offset = 0;
+        auto Append = [&Raw, &Offset](const void* Data, int64 Bytes)
+            {
+                FMemory::Memcpy(Raw.GetData() + Offset, Data, Bytes);
+                Offset += Bytes;
+            };
+        Append(Bake.Height.GetData(), NumCells * sizeof(float));
+        Append(Bake.Attr.GetData(), NumCells * sizeof(uint16));
+        if (Bake.bEroded)
+        {
+            Append(Bake.Flow.GetData(), NumCells * sizeof(uint16));
+            Append(Bake.Water.GetData(), NumCells * sizeof(float));
+        }
+        Append(Bake.Lakes.GetData(), (int64)Bake.Lakes.Num() * sizeof(FVoxelLandLake));
 
         int32 CompressedSize = FCompression::CompressMemoryBound(NAME_Zlib, Raw.Num());
         TArray<uint8> File;
@@ -489,6 +542,11 @@ namespace VoxelLandCache
         Header.SeaRadius = Bake.SeaRadius;
         Header.BakeSeconds = Bake.BakeSeconds;
         Header.SettingsCheck = Bake.SettingsCheck;
+        Header.Flags = Bake.bEroded ? 1u : 0u;
+        Header.LakeCount = Bake.Lakes.Num();
+        Header.SolveSteps = Bake.SolveSteps;
+        Header.SolveResidual = Bake.SolveResidual;
+        Header.ReliefFactor = Bake.ReliefFactor;
         FMemory::Memcpy(File.GetData(), &Header, sizeof(FHeader));
 
         const FString Path = PathFor(Bake.Key, Bake.N);
@@ -522,7 +580,7 @@ namespace VoxelLandCache
         if (Header.Magic != VLB::CacheMagic || Header.Version != FVoxelLandBake::Version || Header.Key != Key
             || Header.SettingsCheck != SettingsCheck || Header.N != N
             || Header.Pad != FVoxelLandBake::Pad || FMath::Abs(Header.SeaRadius - SeaRadius) > 0.5
-            || (int64)Header.RawSize != NumCells * (int64)(sizeof(float) + sizeof(uint16))
+            || Header.LakeCount < 0 || (int64)Header.RawSize != RawBytes(NumCells, (Header.Flags & 1u) != 0, Header.LakeCount)
             || Header.CompressedSize <= 0 || (int64)sizeof(FHeader) + Header.CompressedSize > File.Num())
         {
             UE_LOG(LogVoxelPlugin, Warning, TEXT("[VoxelLand] Ignoring cache file %s (doesn't match this bake)."), *Path);
@@ -542,10 +600,29 @@ namespace VoxelLandCache
         Bake->SettingsCheck = SettingsCheck;
         Bake->CrustThreshold = Header.Threshold;
         Bake->bFromCache = true;
+        Bake->bEroded = (Header.Flags & 1u) != 0;
+        Bake->SolveSteps = Header.SolveSteps;
+        Bake->SolveResidual = Header.SolveResidual;
+        Bake->ReliefFactor = Header.ReliefFactor;
+        int64 Offset = 0;
+        auto Take = [&Raw, &Offset](void* Data, int64 Bytes)
+            {
+                FMemory::Memcpy(Data, Raw.GetData() + Offset, Bytes);
+                Offset += Bytes;
+            };
         Bake->Height.SetNumUninitialized((int32)NumCells);
         Bake->Attr.SetNumUninitialized((int32)NumCells);
-        FMemory::Memcpy(Bake->Height.GetData(), Raw.GetData(), NumCells * sizeof(float));
-        FMemory::Memcpy(Bake->Attr.GetData(), Raw.GetData() + NumCells * sizeof(float), NumCells * sizeof(uint16));
+        Take(Bake->Height.GetData(), NumCells * sizeof(float));
+        Take(Bake->Attr.GetData(), NumCells * sizeof(uint16));
+        if (Bake->bEroded)
+        {
+            Bake->Flow.SetNumUninitialized((int32)NumCells);
+            Bake->Water.SetNumUninitialized((int32)NumCells);
+            Take(Bake->Flow.GetData(), NumCells * sizeof(uint16));
+            Take(Bake->Water.GetData(), NumCells * sizeof(float));
+        }
+        Bake->Lakes.SetNumUninitialized(Header.LakeCount);
+        Take(Bake->Lakes.GetData(), (int64)Header.LakeCount * sizeof(FVoxelLandLake));
         Bake->BuildTanTable();
         Bake->UpdateRange();
         if (!IsUsable(*Bake))
@@ -584,6 +661,8 @@ BEGIN_SHADER_PARAMETER_STRUCT(FVoxelLandBakeParameters, )
     SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<float>, ThresholdBuffer)
     SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<float>, OutHeight)
     SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint>, OutAttr)
+    SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<float>, OutUp)
+    SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<float>, OutCrust)
 END_SHADER_PARAMETER_STRUCT()
 
 #define VOXEL_LAND_BAKE_SHADER(ShaderName) \
@@ -608,8 +687,8 @@ IMPLEMENT_GLOBAL_SHADER(FVoxelLandCrustCS, "/Plugin/VoxelPlugin/Private/VoxelLan
 IMPLEMENT_GLOBAL_SHADER(FVoxelLandThresholdCS, "/Plugin/VoxelPlugin/Private/VoxelLandBake.usf", "ThresholdCS", SF_Compute);
 IMPLEMENT_GLOBAL_SHADER(FVoxelLandFieldsCS, "/Plugin/VoxelPlugin/Private/VoxelLandBake.usf", "FieldsCS", SF_Compute);
 
-/** A GPU bake in flight: its inputs, the buffers kept between frames (render thread), and the
- *  results the readback leaves for the game thread. */
+/** A GPU bake in flight: its inputs, the buffers kept between frames (render thread), the
+ *  erosion solve that follows the plate pass, and the threshold read back on the way. */
 struct FVoxelLandBakeJob
 {
     VLB::FInputs Inputs;
@@ -620,18 +699,21 @@ struct FVoxelLandBakeJob
     TRefCountPtr<FRDGPooledBuffer> Threshold;
     TRefCountPtr<FRDGPooledBuffer> Height;
     TRefCountPtr<FRDGPooledBuffer> Attr;
-    TUniquePtr<FRHIGPUBufferReadback> HeightReadback;
-    TUniquePtr<FRHIGPUBufferReadback> AttrReadback;
+    TRefCountPtr<FRDGPooledBuffer> Up;
+    TRefCountPtr<FRDGPooledBuffer> Crust;
     TUniquePtr<FRHIGPUBufferReadback> ThresholdReadback;
 
-    // Written on the render thread before Status is set.
-    TArray<float> OutHeight;
-    TArray<uint16> OutAttr;
-    float OutThreshold = 0.0f;
-    float OutMin = 0.0f;
-    float OutMax = 0.0f;
+    /** The solve (VoxelLandSolve.h), run once the plate pass is done; bErode: with the
+     *  erosion (else it only routes the plate model's heights). */
+    TUniquePtr<VoxelLandSolve::FJob> Solve;
+    bool bErode = true;
 
-    /** 0 running, 1 the results are in, -1 failed (the game thread bakes on the CPU). */
+    // Written on the render thread before Status is set.
+    float OutThreshold = 0.0f;
+    bool bThresholdRead = false;
+
+    /** 0 running, 1 the results are in (Solve->Result), -1 failed (the game thread bakes on
+     *  the CPU). */
     std::atomic<int32> Status{ 0 };
 
     int32 NumCells() const
@@ -644,10 +726,23 @@ struct FVoxelLandBakeJob
     int32 Chunk() const { return FMath::Max(CellsPerStep, 4096); }
 
     /** Crust steps (the last also finds the threshold), then field steps (the last also copies
-     *  the results for readback). */
+     *  the threshold for readback); the solve follows (TickSolve). */
     int32 CrustSteps() const { return FMath::DivideAndRoundUp(NumInterior(), Chunk()); }
     int32 FieldSteps() const { return FMath::DivideAndRoundUp(NumCells(), Chunk()); }
     int32 NumSteps() const { return CrustSteps() + FieldSteps(); }
+
+    /** Render thread: drops every GPU buffer. */
+    void ReleaseBuffers()
+    {
+        Plates.SafeRelease();
+        Histogram.SafeRelease();
+        Threshold.SafeRelease();
+        Height.SafeRelease();
+        Attr.SafeRelease();
+        Up.SafeRelease();
+        Crust.SafeRelease();
+        ThresholdReadback.Reset();
+    }
 };
 
 namespace VoxelLandBakeDetail
@@ -664,7 +759,8 @@ namespace VoxelLandBakeDetail
         return ShaderMap
             && ShaderMap->GetShader(&FVoxelLandCrustCS::GetStaticType(), 0).IsValid()
             && ShaderMap->GetShader(&FVoxelLandThresholdCS::GetStaticType(), 0).IsValid()
-            && ShaderMap->GetShader(&FVoxelLandFieldsCS::GetStaticType(), 0).IsValid();
+            && ShaderMap->GetShader(&FVoxelLandFieldsCS::GetStaticType(), 0).IsValid()
+            && VoxelLandSolve::AreShadersReady();
     }
 
     FIntVector GroupsFor(uint32 Threads, uint32& OutGroupsX)
@@ -674,9 +770,30 @@ namespace VoxelLandBakeDetail
         return FIntVector((int32)OutGroupsX, (int32)FMath::DivideAndRoundUp(NumGroups, OutGroupsX), 1);
     }
 
-    /** Render thread. One step of the bake (FVoxelLandBakeJob::NumSteps): a chunk of the crust
-     *  histogram (the first creates the buffers, the last finds the threshold), or a chunk of
-     *  the fields (the last copies the results for readback). */
+    /** The solve's settings for a bake (game thread: reads the console variables). */
+    VoxelLandSolve::FSettings MakeSolveSettings(const FVoxelTerrestrialSettings& Settings, const FInputs& In, const TArray<FVector2f>& TanTable)
+    {
+        VoxelLandSolve::FSettings S;
+        S.N = In.N;
+        S.Pad = FVoxelLandBake::Pad;
+        S.RadiusM = In.RadiusM;
+        S.Seed = In.Seed;
+        S.PlainsUplift = (float)FMath::Max(Settings.PlainsUpliftThreshold, 0.0);
+        S.RampWidth = (float)FMath::Max(Settings.MountainRampWidth, 1.0);
+        S.MaxSteps = FMath::Clamp(Settings.SolveMaxSteps, 10, 1000);
+        S.Tolerance = (float)FMath::Clamp(Settings.SolveResidual, 0.001, 0.5);
+        S.MinLakeDepth = (float)FMath::Max(Settings.MinLakeDepth, 0.0);
+        S.MinLakeArea = (float)(FMath::Max(Settings.MinLakeArea, 0.0) * 1.0e6);
+        S.bErode = VoxelLand::IsErosionEnabled();
+        S.StepCellsPerFrame = FMath::Max(CVarVoxelLandSolveStepCells.GetValueOnGameThread(), 1 << 16);
+        S.IterationCellsPerFrame = FMath::Max(CVarVoxelLandSolveIterationCells.GetValueOnGameThread(), 1 << 18);
+        S.TanTable = TanTable;
+        return S;
+    }
+
+    /** Render thread. One step of the plate pass (FVoxelLandBakeJob::NumSteps): a chunk of the
+     *  crust histogram (the first creates the buffers, the last finds the threshold), or a
+     *  chunk of the fields (the last copies the threshold for readback). */
     void RunStep(FRHICommandListImmediate& RHICmdList, FVoxelLandBakeJob& Job, int32 Step)
     {
         if (Job.Status.load(std::memory_order_acquire) != 0) return;
@@ -697,13 +814,23 @@ namespace VoxelLandBakeDetail
         FRDGBufferRef Threshold;
         FRDGBufferRef Height;
         FRDGBufferRef Attr;
+        FRDGBufferRef Up;
+        FRDGBufferRef Crust;
         if (Step == 0)
         {
+            auto Create = [&GraphBuilder](uint32 Stride, uint32 Count, const TCHAR* Name)
+                {
+                    FRDGBufferDesc Desc = FRDGBufferDesc::CreateStructuredDesc(Stride, Count);
+                    Desc.Usage |= EBufferUsageFlags::SourceCopy;
+                    return GraphBuilder.CreateBuffer(Desc, Name);
+                };
             Plates = VoxelGPUCommon::UploadStructuredBuffer(GraphBuilder, TEXT("Voxel.LandPlates"), MakeArrayView(In.Plates));
-            Histogram = GraphBuilder.CreateBuffer(FRDGBufferDesc::CreateStructuredDesc(sizeof(uint32), HistogramBins), TEXT("Voxel.LandHistogram"));
-            Threshold = GraphBuilder.CreateBuffer(FRDGBufferDesc::CreateStructuredDesc(sizeof(float), 1), TEXT("Voxel.LandThreshold"));
-            Height = GraphBuilder.CreateBuffer(FRDGBufferDesc::CreateStructuredDesc(sizeof(float), NumCells), TEXT("Voxel.LandBakeHeight"));
-            Attr = GraphBuilder.CreateBuffer(FRDGBufferDesc::CreateStructuredDesc(sizeof(uint32), NumCells), TEXT("Voxel.LandBakeAttr"));
+            Histogram = Create(sizeof(uint32), HistogramBins, TEXT("Voxel.LandHistogram"));
+            Threshold = Create(sizeof(float), 1, TEXT("Voxel.LandThreshold"));
+            Height = Create(sizeof(float), NumCells, TEXT("Voxel.LandBakeHeight"));
+            Attr = Create(sizeof(uint32), NumCells, TEXT("Voxel.LandBakeAttr"));
+            Up = Create(sizeof(float), NumCells, TEXT("Voxel.LandBakeUp"));
+            Crust = Create(sizeof(float), NumCells, TEXT("Voxel.LandBakeCrust"));
         }
         else
         {
@@ -712,6 +839,8 @@ namespace VoxelLandBakeDetail
             Threshold = GraphBuilder.RegisterExternalBuffer(Job.Threshold);
             Height = GraphBuilder.RegisterExternalBuffer(Job.Height);
             Attr = GraphBuilder.RegisterExternalBuffer(Job.Attr);
+            Up = GraphBuilder.RegisterExternalBuffer(Job.Up);
+            Crust = GraphBuilder.RegisterExternalBuffer(Job.Crust);
         }
 
         FVoxelLandBakeParameters Template;
@@ -735,6 +864,8 @@ namespace VoxelLandBakeDetail
         Template.ThresholdBuffer = GraphBuilder.CreateUAV(Threshold);
         Template.OutHeight = GraphBuilder.CreateUAV(Height);
         Template.OutAttr = GraphBuilder.CreateUAV(Attr);
+        Template.OutUp = GraphBuilder.CreateUAV(Up);
+        Template.OutCrust = GraphBuilder.CreateUAV(Crust);
         FGlobalShaderMap* ShaderMap = GetGlobalShaderMap(GMaxRHIFeatureLevel);
 
         const int32 CrustSteps = Job.CrustSteps();
@@ -773,11 +904,7 @@ namespace VoxelLandBakeDetail
             }
             if (FieldStep == Job.FieldSteps() - 1)
             {
-                Job.HeightReadback = MakeUnique<FRHIGPUBufferReadback>(TEXT("Voxel.LandHeightReadback"));
-                Job.AttrReadback = MakeUnique<FRHIGPUBufferReadback>(TEXT("Voxel.LandAttrReadback"));
                 Job.ThresholdReadback = MakeUnique<FRHIGPUBufferReadback>(TEXT("Voxel.LandThresholdReadback"));
-                AddEnqueueCopyPass(GraphBuilder, Job.HeightReadback.Get(), Height, NumCells * (uint32)sizeof(float));
-                AddEnqueueCopyPass(GraphBuilder, Job.AttrReadback.Get(), Attr, NumCells * (uint32)sizeof(uint32));
                 AddEnqueueCopyPass(GraphBuilder, Job.ThresholdReadback.Get(), Threshold, (uint32)sizeof(float));
             }
         }
@@ -788,68 +915,53 @@ namespace VoxelLandBakeDetail
             Job.Threshold = GraphBuilder.ConvertToExternalBuffer(Threshold);
             Job.Height = GraphBuilder.ConvertToExternalBuffer(Height);
             Job.Attr = GraphBuilder.ConvertToExternalBuffer(Attr);
+            Job.Up = GraphBuilder.ConvertToExternalBuffer(Up);
+            Job.Crust = GraphBuilder.ConvertToExternalBuffer(Crust);
         }
         GraphBuilder.Execute();
     }
 
-    /** Render thread, once per frame after the last step: true once the results are copied
-     *  (or the job failed). Narrows the attributes and finds the height range here, off the
-     *  game thread; a non-finite height fails the job (the CPU bakes instead). */
-    bool PollReadback(FVoxelLandBakeJob& Job)
+    /** Render thread, once a frame after the plate pass: reads the threshold back, runs the
+     *  solve's next passes, and sets the job's status when the solve is done or failed. The
+     *  buffers are released either way. */
+    void TickSolve(FRHICommandListImmediate& RHICmdList, FVoxelLandBakeJob& Job)
     {
-        if (Job.Status.load(std::memory_order_acquire) != 0) return true;
-        if (!Job.HeightReadback.IsValid() || !Job.AttrReadback.IsValid() || !Job.ThresholdReadback.IsValid()) return false;
-        if (!Job.HeightReadback->IsReady() || !Job.AttrReadback->IsReady() || !Job.ThresholdReadback->IsReady()) return false;
-        const int32 NumCells = Job.NumCells();
-        bool bOk = true;
-        if (const float* Source = (const float*)Job.HeightReadback->Lock((uint32)NumCells * (uint32)sizeof(float)))
+        if (Job.Status.load(std::memory_order_acquire) != 0 || !Job.Solve.IsValid()) return;
+        if (!Job.bThresholdRead && Job.ThresholdReadback.IsValid() && Job.ThresholdReadback->IsReady())
         {
-            Job.OutHeight.SetNumUninitialized(NumCells);
-            FMemory::Memcpy(Job.OutHeight.GetData(), Source, (SIZE_T)NumCells * sizeof(float));
-            Job.HeightReadback->Unlock();
-        }
-        else bOk = false;
-        if (const uint32* Source = (const uint32*)Job.AttrReadback->Lock((uint32)NumCells * (uint32)sizeof(uint32)))
-        {
-            Job.OutAttr.SetNumUninitialized(NumCells);
-            for (int32 i = 0; i < NumCells; i++)
-                Job.OutAttr[i] = (uint16)Source[i];
-            Job.AttrReadback->Unlock();
-        }
-        else bOk = false;
-        if (const void* Source = Job.ThresholdReadback->Lock((uint32)sizeof(float)))
-        {
+            const void* Source = Job.ThresholdReadback->Lock((uint32)sizeof(float));
+            if (!Source)
+            {
+                Job.ReleaseBuffers();
+                Job.Status.store(-1, std::memory_order_release);
+                return;
+            }
             FMemory::Memcpy(&Job.OutThreshold, Source, sizeof(float));
             Job.ThresholdReadback->Unlock();
+            Job.bThresholdRead = true;
+            Job.ThresholdReadback.Reset();
         }
-        else bOk = false;
-        if (bOk)
+        VoxelLandSolve::FPlateFields Fields;
+        Fields.Height = Job.Height;
+        Fields.Up = Job.Up;
+        Fields.Crust = Job.Crust;
+        Fields.Attr = Job.Attr;
+        Job.Solve->Tick(RHICmdList, Fields);
+        const int32 SolveStatus = Job.Solve->Status.load(std::memory_order_acquire);
+        if (SolveStatus < 0 || (SolveStatus > 0 && !Job.bThresholdRead && !Job.ThresholdReadback.IsValid()))
         {
-            float Min = TNumericLimits<float>::Max();
-            float Max = TNumericLimits<float>::Lowest();
-            for (const float H : Job.OutHeight)
-            {
-                if (!FMath::IsFinite(H))
-                {
-                    bOk = false;
-                    break;
-                }
-                Min = FMath::Min(Min, H);
-                Max = FMath::Max(Max, H);
-            }
-            Job.OutMin = Min;
-            Job.OutMax = Max;
+            Job.ReleaseBuffers();
+            Job.Status.store(-1, std::memory_order_release);
+            return;
         }
-        Job.HeightReadback.Reset();
-        Job.AttrReadback.Reset();
-        Job.ThresholdReadback.Reset();
-        Job.Plates.SafeRelease();
-        Job.Histogram.SafeRelease();
-        Job.Threshold.SafeRelease();
-        Job.Height.SafeRelease();
-        Job.Attr.SafeRelease();
-        Job.Status.store(bOk ? 1 : -1, std::memory_order_release);
-        return true;
+        if (SolveStatus > 0 && Job.bThresholdRead)
+        {
+            const VoxelLandSolve::FResult& R = Job.Solve->Result;
+            const int32 NumCells = Job.NumCells();
+            const bool bOk = R.Height.Num() == NumCells && R.Attr.Num() == NumCells && R.Flow.Num() == NumCells && R.Water.Num() == NumCells;
+            Job.ReleaseBuffers();
+            Job.Status.store(bOk ? 1 : -1, std::memory_order_release);
+        }
     }
 }
 
@@ -902,8 +1014,9 @@ float FVoxelLandBaker::GetProgress() const
     switch (State)
     {
     case EState::Done: return Result.IsValid() ? 1.0f : 0.0f;
-    case EState::Gpu: return GpuSteps > 0 ? 0.95f * (float)GpuStep / (float)GpuSteps : 0.0f;
-    case EState::GpuReading: return 0.97f;
+    case EState::Gpu: return GpuSteps > 0 ? 0.1f * (float)GpuStep / (float)GpuSteps : 0.0f;
+    case EState::GpuSolving: return 0.1f + 0.89f * (Job.IsValid() && Job->Solve.IsValid() ? Job->Solve->Progress.load(std::memory_order_relaxed) : 0.0f);
+    case EState::GpuAssembling: return 0.99f;
     case EState::Cpu:
         if (CpuProgress.IsValid())
             return FMath::Clamp(0.99f * (float)CpuProgress->Cells.load(std::memory_order_relaxed) / (float)CpuProgress->Total, 0.0f, 0.99f);
@@ -978,32 +1091,74 @@ void FVoxelLandBaker::Tick()
                 RunStep(RHICmdList, *InJob, Step);
             });
         if (GpuStep >= GpuSteps)
-        {
-            VoxelGPUCommon::PollRenderThread([InJob]() -> bool
-                {
-                    return PollReadback(*InJob);
-                });
-            State = EState::GpuReading;
-        }
+            State = EState::GpuSolving;
         break;
     }
-    case EState::GpuReading:
+    case EState::GpuSolving:
     {
+        // The erosion solve and the routing: a few passes a frame (VoxelLandSolve.h).
         const int32 Status = Job->Status.load(std::memory_order_acquire);
-        if (Status == 0) break;
+        if (Status == 0)
+        {
+            TSharedPtr<FVoxelLandBakeJob, ESPMode::ThreadSafe> InJob = Job;
+            ENQUEUE_RENDER_COMMAND(VoxelLandSolveTick)([InJob](FRHICommandListImmediate& RHICmdList)
+                {
+                    TickSolve(RHICmdList, *InJob);
+                });
+            break;
+        }
         if (Status < 0)
         {
-            UE_LOG(LogVoxelPlugin, Warning, TEXT("[VoxelLand] The GPU bake failed; baking on the CPU."));
+            UE_LOG(LogVoxelPlugin, Warning, TEXT("[VoxelLand] The GPU bake failed; baking the plate model on the CPU (no erosion)."));
             StartCpu();
             break;
         }
+        // The render thread is done with the result; the fields are narrowed and checked on a
+        // worker (a few passes over every cell).
+        const TSharedPtr<VoxelLandSolve::FResult, ESPMode::ThreadSafe> R = MakeShared<VoxelLandSolve::FResult, ESPMode::ThreadSafe>(MoveTemp(Job->Solve->Result));
+        UE_LOG(LogVoxelPlugin, Log, TEXT("[VoxelLand] Solve %08x: %d mountain cells, %d steps (residual %.4f), relief x %.3f (eased above %.0f m toward %.0f m); routing over %d land cells, %d lakes kept%s."),
+            Key, R->SolvedCells, R->Steps, R->Residual, R->Factor, R->ReliefKnee, R->ReliefTop, R->LandCells, R->Lakes.Num(),
+            R->Errors != 0 ? *FString::Printf(TEXT("; error bits 0x%x"), R->Errors) : TEXT(""));
+        if (CVarVoxelDebugLand.GetValueOnGameThread() != 0)
+            UE_LOG(LogVoxelPlugin, Log, TEXT("[VoxelLand] Solve phases: %s."), *FString::Join(R->PhaseLog, TEXT(", ")));
         const TSharedPtr<FVoxelLandBake, ESPMode::ThreadSafe> Bake = MakeBake(Job->Inputs);
         Bake->CrustThreshold = Job->OutThreshold;
-        Bake->Height = MoveTemp(Job->OutHeight);
-        Bake->Attr = MoveTemp(Job->OutAttr);
-        Bake->MinHeight = Job->OutMin;
-        Bake->MaxHeight = Job->OutMax;
+        Bake->bEroded = Job->bErode;
+        Bake->SolveSteps = R->Steps;
+        Bake->SolveResidual = R->Residual;
+        Bake->ReliefFactor = R->Factor;
         ReleaseJob(Job);
+        Pending = Async(EAsyncExecution::ThreadPool, [Bake, R]() -> TSharedPtr<FVoxelLandBake, ESPMode::ThreadSafe>
+            {
+                const int32 Num = R->Height.Num();
+                Bake->Height = MoveTemp(R->Height);
+                Bake->Water = MoveTemp(R->Water);
+                Bake->Lakes = MoveTemp(R->Lakes);
+                Bake->Attr.SetNumUninitialized(Num);
+                Bake->Flow.SetNumUninitialized(Num);
+                for (int32 i = 0; i < Num; i++)
+                {
+                    Bake->Attr[i] = (uint16)R->Attr[i];
+                    if (!FMath::IsFinite(R->Flow[i])) return nullptr;
+                    Bake->Flow[i] = FFloat16(R->Flow[i]);
+                }
+                Bake->UpdateRange();
+                return VoxelLandCache::IsUsable(*Bake) ? Bake : nullptr;
+            });
+        State = EState::GpuAssembling;
+        break;
+    }
+    case EState::GpuAssembling:
+    {
+        if (!Pending.IsReady()) break;
+        TSharedPtr<FVoxelLandBake, ESPMode::ThreadSafe> Bake = Pending.Get();
+        Pending = TFuture<TSharedPtr<FVoxelLandBake, ESPMode::ThreadSafe>>();
+        if (!Bake.IsValid())
+        {
+            UE_LOG(LogVoxelPlugin, Warning, TEXT("[VoxelLand] The GPU bake of %08x has non-finite values; baking the plate model on the CPU (no erosion)."), Key);
+            StartCpu();
+            break;
+        }
         Finish(Bake);
         break;
     }
@@ -1032,6 +1187,13 @@ void FVoxelLandBaker::StartGpu()
     Job = MakeShared<FVoxelLandBakeJob, ESPMode::ThreadSafe>();
     Job->Inputs = VoxelLandBakeDetail::MakeInputs(Settings, SeaRadius, Key);
     Job->CellsPerStep = FMath::Max(CVarVoxelLandBakeCellsPerFrame.GetValueOnGameThread(), 4096);
+    {
+        // The tan table the sampler uses, for the solve's cell directions.
+        const TSharedPtr<FVoxelLandBake, ESPMode::ThreadSafe> Grid = VoxelLandBakeDetail::MakeBake(Job->Inputs);
+        VoxelLandSolve::FSettings SolveSettings = VoxelLandBakeDetail::MakeSolveSettings(Settings, Job->Inputs, Grid->TanTable);
+        Job->bErode = SolveSettings.bErode;
+        Job->Solve = MakeUnique<VoxelLandSolve::FJob>(MoveTemp(SolveSettings));
+    }
     GpuStep = 0;
     GpuSteps = Job->NumSteps();
     GpuWaitFrames = 0;
@@ -1056,6 +1218,8 @@ void FVoxelLandBaker::StartCpu()
     State = EState::Cpu;
     if (CVarVoxelDebugLand.GetValueOnGameThread() != 0)
         UE_LOG(LogVoxelPlugin, Log, TEXT("[VoxelLand] Baking %08x on the CPU: 6 x %d^2 cells."), Key, N);
+    if (VoxelLand::IsErosionEnabled())
+        UE_LOG(LogVoxelPlugin, Warning, TEXT("[VoxelLand] Bake %08x runs on the CPU: the plate model alone, without the erosion solve (it needs the GPU); not cached."), Key);
 }
 
 void FVoxelLandBaker::Finish(TSharedPtr<FVoxelLandBake, ESPMode::ThreadSafe> Bake)
@@ -1073,7 +1237,8 @@ void FVoxelLandBaker::Finish(TSharedPtr<FVoxelLandBake, ESPMode::ThreadSafe> Bak
         Bake->Key, Bake->bFromCache ? TEXT("from the cache") : TEXT("baked"), FPlatformTime::Seconds() - StartSeconds,
         Bake->N, Bake->MinHeight, Bake->MaxHeight, Bake->CrustThreshold);
 
-    if (!Bake->bFromCache && CVarVoxelLandCache.GetValueOnGameThread() != 0)
+    // Only eroded bakes are cached: a CPU or erosion-off bake would stand in for the real one.
+    if (!Bake->bFromCache && Bake->bEroded && CVarVoxelLandCache.GetValueOnGameThread() != 0)
     {
         TSharedPtr<const FVoxelLandBake, ESPMode::ThreadSafe> ToSave = Bake;
         Async(EAsyncExecution::ThreadPool, [ToSave]()
@@ -1137,6 +1302,7 @@ FVoxelLandDebugParameters VoxelLandGPU::GetDebugParameters(FRDGBuilder& GraphBui
     Parameters.LandDebugSeaRadius = VoxelDoubleFloat(FMath::Max(SeaRadius, 0.0));
     Parameters.LandPlateCount = 0;
     Parameters.LandSeed = 0;
+    Parameters.LandDebugHasHydro = 0;
     // The plate model's other inputs: the debug views read only the plates and the seed.
     Parameters.LandRadiusM = 1.0f;
     Parameters.LandWidthScale = 1.0f;
@@ -1174,11 +1340,42 @@ FVoxelLandDebugParameters VoxelLandGPU::GetDebugParameters(FRDGBuilder& GraphBui
         Parameters.LandPlates = GraphBuilder.CreateSRV(GraphBuilder.RegisterExternalBuffer(Resource.Plates));
         Parameters.LandPlateCount = (uint32)(Bake->Plates.Num() / 8);
         Parameters.LandSeed = Bake->PlateSeed;
+        // The drainage and the lake levels, for the views that show them, when the bake has them.
+        const bool bHydro = (Mode == 9 || Mode == 10) /* VOXEL_LAND_VIEW_FLOW, _LAKES */ && Bake->Flow.Num() == Bake->NumCells() && Bake->Water.Num() == Bake->NumCells();
+        if (bHydro && !Resource.Flow.IsValid())
+        {
+            const int32 NumCells = Bake->Flow.Num();
+            TArray<uint32> Packed;
+            Packed.SetNumUninitialized((NumCells + 1) / 2);
+            for (int32 i = 0; i < Packed.Num(); i++)
+            {
+                const uint32 Low = Bake->Flow[2 * i].Encoded;
+                const uint32 High = 2 * i + 1 < NumCells ? (uint32)Bake->Flow[2 * i + 1].Encoded : 0u;
+                Packed[i] = Low | (High << 16);
+            }
+            Resource.Flow = GraphBuilder.ConvertToExternalBuffer(
+                VoxelGPUCommon::UploadStructuredBuffer(GraphBuilder, TEXT("Voxel.LandFlow"), MakeConstArrayView(Packed)));
+            Resource.Water = GraphBuilder.ConvertToExternalBuffer(
+                VoxelGPUCommon::UploadStructuredBuffer(GraphBuilder, TEXT("Voxel.LandWater"), MakeArrayView(Bake->Water)));
+        }
+        if (bHydro)
+        {
+            Parameters.LandFlow = GraphBuilder.CreateSRV(GraphBuilder.RegisterExternalBuffer(Resource.Flow));
+            Parameters.LandWater = GraphBuilder.CreateSRV(GraphBuilder.RegisterExternalBuffer(Resource.Water));
+            Parameters.LandDebugHasHydro = 1;
+        }
+        else
+        {
+            Parameters.LandFlow = GraphBuilder.CreateSRV(VoxelGPUCommon::UploadStructuredBuffer<uint32>(GraphBuilder, TEXT("Voxel.LandFlowNone"), TConstArrayView<uint32>()));
+            Parameters.LandWater = GraphBuilder.CreateSRV(VoxelGPUCommon::UploadStructuredBuffer<float>(GraphBuilder, TEXT("Voxel.LandWaterNone"), TConstArrayView<float>()));
+        }
         return Parameters;
     }
 
     // No view, or the noise surface: one-element stand-ins (the bake views show "none").
     Parameters.LandAttr = GraphBuilder.CreateSRV(VoxelGPUCommon::UploadStructuredBuffer<uint32>(GraphBuilder, TEXT("Voxel.LandAttrNone"), TConstArrayView<uint32>()));
     Parameters.LandPlates = GraphBuilder.CreateSRV(VoxelGPUCommon::UploadStructuredBuffer<float>(GraphBuilder, TEXT("Voxel.LandPlatesNone"), TConstArrayView<float>()));
+    Parameters.LandFlow = GraphBuilder.CreateSRV(VoxelGPUCommon::UploadStructuredBuffer<uint32>(GraphBuilder, TEXT("Voxel.LandFlowNone"), TConstArrayView<uint32>()));
+    Parameters.LandWater = GraphBuilder.CreateSRV(VoxelGPUCommon::UploadStructuredBuffer<float>(GraphBuilder, TEXT("Voxel.LandWaterNone"), TConstArrayView<float>()));
     return Parameters;
 }

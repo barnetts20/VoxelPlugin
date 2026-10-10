@@ -64,10 +64,39 @@ struct VOXELPLUGIN_API FVoxelTerrestrialSettings
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrestrial|Landforms", meta = (UIMin = "-8000", UIMax = "-1000"))
     double AbyssDepth = -4200.0;
 
+    /** Boundary uplift above which continental crust rises into the erosion solve (m); below
+     *  it the land keeps its profile as plains. The solve fades in over MountainRampWidth
+     *  around it, so ranges rise from the plains without a scarp. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrestrial|Landforms", meta = (ClampMin = "0.0", UIMax = "2000"))
+    double PlainsUpliftThreshold = 400.0;
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrestrial|Landforms", meta = (ClampMin = "1.0", UIMax = "2000"))
+    double MountainRampWidth = 300.0;
+
+    // --- Bake: erosion solve and lakes ---
+
+    /** The stream-power solve stops once the mean height change per step is below this
+     *  fraction of the mean uplift (after at least 10 steps), or after SolveMaxSteps. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrestrial|Solve", meta = (ClampMin = "0.001", ClampMax = "0.5"))
+    double SolveResidual = 0.02;
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrestrial|Solve", meta = (ClampMin = "10", ClampMax = "1000"))
+    int32 SolveMaxSteps = 150;
+
+    /** Depressions the final routing keeps as lakes: at least this deep (m) and this large
+     *  (km^2). Smaller ones are filled. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrestrial|Solve", meta = (ClampMin = "0.0", UIMax = "200"))
+    double MinLakeDepth = 10.0;
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrestrial|Solve", meta = (ClampMin = "0.0", UIMax = "1000"))
+    double MinLakeArea = 20.0;
+
     // --- Bake: grid ---
 
     /** Cells per cube face edge: 1024 (1.5 km on a 1,000 km planet, 9.8 km on Earth), or 512 or
-     *  2048 for development (memory and bake time scale with its square). */
+     *  2048 for development (memory and bake time scale with its square: the GPU solve needs
+     *  up to about 95 bytes a cell of GPU memory while it runs, 600 MB at 1024, 2.4 GB at
+     *  2048). */
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrestrial|Bake", meta = (ClampMin = "64", ClampMax = "2048"))
     int32 BakeResolution = 1024;
 

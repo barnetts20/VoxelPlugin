@@ -24,7 +24,9 @@
 #define VOXEL_LAND_VIEW_PLATES 6u      // nearest plate, brighter on continental crust
 #define VOXEL_LAND_VIEW_SLOPE 7u       // degrees from the horizontal
 #define VOXEL_LAND_VIEW_CELLS 8u       // the bake's cells: a checker in each cube face's colour
-#define VOXEL_LAND_VIEW_COUNT 9u
+#define VOXEL_LAND_VIEW_FLOW 9u        // drainage area: rivers (eroded bakes)
+#define VOXEL_LAND_VIEW_LAKES 10u      // kept lakes by depth (eroded bakes)
+#define VOXEL_LAND_VIEW_COUNT 11u
 
 VOXEL_FUNC float3 VoxelLandViewRgb(float R, float G, float B)
 {
@@ -139,6 +141,25 @@ VOXEL_FUNC float3 VoxelLandViewSlope(float Degrees)
     if (D < 30.0f) return VoxelLandViewMix(VoxelLandViewRgb(245.0f, 210.0f, 50.0f), VoxelLandViewRgb(240.0f, 130.0f, 30.0f), (D - 20.0f) / 10.0f);
     if (D < 45.0f) return VoxelLandViewMix(VoxelLandViewRgb(240.0f, 130.0f, 30.0f), VoxelLandViewRgb(210.0f, 40.0f, 40.0f), (D - 30.0f) / 15.0f);
     return VoxelLandViewMix(VoxelLandViewRgb(210.0f, 40.0f, 40.0f), VoxelLandViewRgb(110.0f, 20.0f, 90.0f), (D - 45.0f) / 15.0f);
+}
+
+/** Drainage area, as log10 of km^2: hillslopes pale, streams light blue from 10 km^2, rivers
+ *  blue from 1,000 km^2, the largest dark from 100,000 km^2. Under the sea, grey. */
+VOXEL_FUNC float3 VoxelLandViewFlow(float Log10Km2, bool bSea)
+{
+    if (bSea) return VoxelLandViewRgb(70.0f, 75.0f, 90.0f);
+    const float X = Log10Km2;
+    if (X < 1.0f) return VoxelLandViewMix(VoxelLandViewRgb(205.0f, 200.0f, 185.0f), VoxelLandViewRgb(180.0f, 200.0f, 215.0f), X);
+    if (X < 3.0f) return VoxelLandViewMix(VoxelLandViewRgb(150.0f, 190.0f, 235.0f), VoxelLandViewRgb(40.0f, 100.0f, 225.0f), (X - 1.0f) / 2.0f);
+    return VoxelLandViewMix(VoxelLandViewRgb(40.0f, 100.0f, 225.0f), VoxelLandViewRgb(10.0f, 25.0f, 120.0f), (X - 3.0f) / 2.0f);
+}
+
+/** Lakes by water depth (m): light cyan at the shore, deep blue from 100 m. Dry land is a
+ *  neutral green-grey, the sea dark grey. */
+VOXEL_FUNC float3 VoxelLandViewLake(float Depth, bool bLake, bool bSea)
+{
+    if (bLake) return VoxelLandViewMix(VoxelLandViewRgb(120.0f, 225.0f, 240.0f), VoxelLandViewRgb(20.0f, 60.0f, 165.0f), Depth / 100.0f);
+    return bSea ? VoxelLandViewRgb(70.0f, 75.0f, 90.0f) : VoxelLandViewRgb(150.0f, 155.0f, 140.0f);
 }
 
 /** A cube face (VoxelCubeSphere.ush order: +X, -X, +Y, -Y, +Z, -Z). */

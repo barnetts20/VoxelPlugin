@@ -1,0 +1,110 @@
+// VoxelLandSolve.h - The land bake's erosion solve and final routing on the GPU (Design/LandGen.md
+// section 5; stage L2). After the plate pass (VoxelLandBake.cpp), a render-thread job runs, a
+// few compute passes a frame:
+//   1. the mountain cells (continental crust whose uplift is past the range-front ramp) are
+//      compacted into slots, start at their static height, and are filled until they drain;
+//   2. steps of the implicit stream-power solve, each: the fill along the previous receivers
+//      and a few Planchon-Darboux refinements, the receivers (steepest descent; depressions
+//      filled), drainage accumulation (warm-started Jacobi), the implicit update (pointer
+//      jumping over affine maps), the residual; until it is below the setting or the step
+//      limit (the GPU decides, so the step count is reproducible);
+//   3. the relief above each cell's outlet is scaled so its 90th percentile matches the
+//      profile's, and eased above it toward the profile's top;
+//   4. the land is routed on the final heights: lake levels (a fill without descent), the
+//      routing fill, receivers, exact drainage, lake labels; lakes past the size settings are
+//      kept, smaller depressions filled;
+//   5. the fields (aprons from the neighbouring faces) and the lake list are read back once.
+// The work is VoxelLandSolve.ush / .usf. Every pass is order-independent, so the same GPU
+// reproduces a bake bit for bit. Private: it pulls in the render graph.
+
+#pragma once
+
+#include "CoreMinimal.h"
+#include "RenderGraphResources.h"
+#include "VoxelLandBake.h"
+#include <atomic>
+
+class FRHICommandListImmediate;
+class FRHIGPUBufferReadback;
+
+namespace VoxelLandSolve
+{
+    /** The solve's inputs (fixed for a bake). */
+    struct FSettings
+    {
+        int32 N = 0;
+        int32 Pad = 4;
+        float RadiusM = 1.0f;
+        uint32 Seed = 0;
+        float PlainsUplift = 400.0f;     // m
+        float RampWidth = 300.0f;        // m
+        float UpliftTime = 5.0e6f;       // years for the full uplift
+        float Kdt = 0.4f;                // erodibility x step (the look test's)
+        float Dt = 0.4f / 4.3e-7f;       // years per step
+        float Eps = 0.01f;               // the fill's descent per cell (m)
+        int32 MaxSteps = 150;
+        int32 MinSteps = 10;
+        float Tolerance = 0.02f;
+        float MinLakeDepth = 10.0f;      // m
+        float MinLakeArea = 20.0e6f;     // m^2
+        bool bErode = true;
+        int64 StepCellsPerFrame = 1 << 22;        // slot-steps a frame
+        int64 IterationCellsPerFrame = 1 << 26;   // slot-iterations a frame (the fills, drainage, labels)
+        TArray<FVector2f> TanTable;      // the bake's (FVoxelLandBake::TanTable)
+    };
+
+    /** The plate pass's per-cell fields, on the GPU (the bake job's buffers). */
+    struct FPlateFields
+    {
+        TRefCountPtr<FRDGPooledBuffer> Height;
+        TRefCountPtr<FRDGPooledBuffer> Up;
+        TRefCountPtr<FRDGPooledBuffer> Crust;
+        TRefCountPtr<FRDGPooledBuffer> Attr;
+    };
+
+    /** The bake's fields after the solve, on the padded grid, as read back (the baker narrows
+     *  them on a worker), with what the log reports. */
+    struct FResult
+    {
+        TArray<float> Height;
+        TArray<uint32> Attr;             // FVoxelLandBake::Attr in the low 16 bits
+        TArray<float> Flow;              // log2 m^2
+        TArray<float> Water;
+        TArray<FVoxelLandLake> Lakes;
+        int32 SolvedCells = 0;
+        int32 LandCells = 0;
+        int32 Steps = 0;
+        float Residual = 0.0f;
+        float Factor = 1.0f;
+        float ReliefKnee = 0.0f;
+        float ReliefTop = 0.0f;
+        uint32 Errors = 0;               // VOXEL_SOLVE_ERROR_* bits
+        int32 LakesFound = 0;            // kept lakes, before the list's cap
+        TArray<FString> PhaseLog;        // per phase: frames and seconds (voxel.Debug.Land)
+    };
+
+    /** Render thread. One bake's solve. */
+    class FJob
+    {
+    public:
+        explicit FJob(FSettings InSettings);
+        ~FJob();
+
+        /** Once a frame: polls the readbacks and records the next passes. Sets Status. */
+        void Tick(FRHICommandListImmediate& RHICmdList, const FPlateFields& Fields);
+
+        /** 0 running, 1 the result is ready, -1 failed. */
+        std::atomic<int32> Status{ 0 };
+        /** 0..1, for the planet's progress. */
+        std::atomic<float> Progress{ 0.0f };
+        /** Written on the render thread before Status becomes 1. */
+        FResult Result;
+
+    private:
+        struct FImpl;
+        TUniquePtr<FImpl> Impl;
+    };
+
+    /** Render thread or game thread. Every solve shader is compiled for this platform. */
+    bool AreShadersReady();
+}

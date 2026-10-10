@@ -572,8 +572,29 @@ namespace PlanetActorLandExport
             Bytes.SetNumUninitialized(Bake->Attr.Num() * sizeof(uint16));
             FMemory::Memcpy(Bytes.GetData(), Bake->Attr.GetData(), Bytes.Num());
             FFileHelper::SaveArrayToFile(Bytes, *(Base + TEXT("_attr.u16")));
-            const FString Json = FString::Printf(TEXT("{\"n\": %d, \"pad\": %d, \"sea_radius_cm\": %.17g, \"key\": \"%08x\", \"min_m\": %.3f, \"max_m\": %.3f, \"crust_threshold\": %.6f}\n"),
-                Bake->N, FVoxelLandBake::Pad, Bake->SeaRadius, Bake->Key, Bake->MinHeight, Bake->MaxHeight, Bake->CrustThreshold);
+            // The drainage (log2 m^2) and the lake levels, as f32, when the bake is eroded.
+            if (Bake->Flow.Num() == Bake->Height.Num() && Bake->Water.Num() == Bake->Height.Num())
+            {
+                TArray<float> Flow;
+                Flow.SetNumUninitialized(Bake->Flow.Num());
+                for (int32 i = 0; i < Flow.Num(); i++)
+                    Flow[i] = Bake->Flow[i].GetFloat();
+                Bytes.SetNumUninitialized(Flow.Num() * sizeof(float));
+                FMemory::Memcpy(Bytes.GetData(), Flow.GetData(), Bytes.Num());
+                FFileHelper::SaveArrayToFile(Bytes, *(Base + TEXT("_flow.f32")));
+                Bytes.SetNumUninitialized(Bake->Water.Num() * sizeof(float));
+                FMemory::Memcpy(Bytes.GetData(), Bake->Water.GetData(), Bytes.Num());
+                FFileHelper::SaveArrayToFile(Bytes, *(Base + TEXT("_water.f32")));
+            }
+            FString LakesJson;
+            for (const FVoxelLandLake& Lake : Bake->Lakes)
+            {
+                LakesJson += FString::Printf(TEXT("%s{\"cell\": %u, \"level_m\": %.3f, \"outlet\": %u, \"area_km2\": %.3f}"),
+                    LakesJson.IsEmpty() ? TEXT("") : TEXT(", "), Lake.Cell, Lake.Level, Lake.Outlet, Lake.AreaKm2);
+            }
+            const FString Json = FString::Printf(TEXT("{\"n\": %d, \"pad\": %d, \"sea_radius_cm\": %.17g, \"key\": \"%08x\", \"min_m\": %.3f, \"max_m\": %.3f, \"crust_threshold\": %.6f, \"eroded\": %s, \"solve_steps\": %d, \"solve_residual\": %.5f, \"relief_factor\": %.4f, \"lakes\": [%s]}\n"),
+                Bake->N, FVoxelLandBake::Pad, Bake->SeaRadius, Bake->Key, Bake->MinHeight, Bake->MaxHeight, Bake->CrustThreshold,
+                Bake->bEroded ? TEXT("true") : TEXT("false"), Bake->SolveSteps, Bake->SolveResidual, Bake->ReliefFactor, *LakesJson);
             FFileHelper::SaveStringToFile(Json, *(Base + TEXT(".json")));
             UE_LOG(LogVoxelPlugin, Log, TEXT("[VoxelLand] Exported %s's bake to %s_*."), *It->GetName(), *Base);
             Count++;
@@ -584,6 +605,6 @@ namespace PlanetActorLandExport
 
     FAutoConsoleCommandWithWorldAndArgs Command(
         TEXT("voxel.Land.ExportBake"),
-        TEXT("Writes every terrestrial planet's bake (heights f32, attributes u16, a json header) to Saved/VoxelLand/Export_* (Tools/LandView/view_bake.py renders them)."),
+        TEXT("Writes every terrestrial planet's bake (heights f32, attributes u16, drainage and lake levels f32 when eroded, a json header with the lakes) to Saved/VoxelLand/Export_* (Tools/LandView/view_bake.py renders them)."),
         FConsoleCommandWithWorldAndArgsDelegate::CreateStatic(&Run));
 }
