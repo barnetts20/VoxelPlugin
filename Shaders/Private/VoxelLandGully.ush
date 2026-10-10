@@ -39,6 +39,8 @@
 #ifndef VOXEL_LAND_GULLY_USH
 #define VOXEL_LAND_GULLY_USH
 
+#include "VoxelLandAccess.ush"
+
 #ifndef VOXEL_LOOP
 #define VOXEL_LOOP [loop]
 #endif
@@ -98,7 +100,7 @@ VOXEL_FUNC float VoxelLandGullyPow2(int E)
     return asfloat(uint(127 + E) << 23u);
 }
 
-VOXEL_FUNC FVoxelLandGullyCoord VoxelLandGullyCoordAt(FVoxelLandAxis Axis, uint Octave)
+VOXEL_FUNC FVoxelLandGullyCoord VoxelLandGullyCoordAt(VOXEL_LAND_ARGS_DECL FVoxelLandAxis Axis, uint Octave)
 {
     FVoxelLandGullyCoord C;
     C.Whole = float(2 * Axis.Cell + 1 - int(LandN)) * VoxelLandGullyPow2(int(Octave) - 2);
@@ -235,7 +237,7 @@ VOXEL_FUNC FVoxelLandGullyOctave VoxelLandGullyStripes(int CellU, float FracU, i
 /** The gullies of one face's lattice (m): the octave chain at the point whose segments along
  *  the face's axes are U and V, with tan coordinates A, B, under the surface gradient Gradient
  *  (m/m, tangent vector) whose direction turns at Turn (rad/m). Footprint in cm. */
-VOXEL_FUNC float VoxelLandGullyFace(uint Face, FVoxelLandAxis U, FVoxelLandAxis V, float A, float B, float3 Gradient, float Turn, float Footprint)
+VOXEL_FUNC float VoxelLandGullyFace(VOXEL_LAND_ARGS_DECL uint Face, FVoxelLandAxis U, FVoxelLandAxis V, float A, float B, float3 Gradient, float Turn, float Footprint)
 {
     const FVoxelLandFaceFrame Frame = VoxelLandFaceFrameAt(Face, A, B);
     // The gradient as a covector in the face's metres (dh / dX, dh / dY).
@@ -274,8 +276,8 @@ VOXEL_FUNC float VoxelLandGullyFace(uint Face, FVoxelLandAxis U, FVoxelLandAxis 
         // The rotated lattice point, in double-float: the rotation of the exact integer parts
         // is exact (two products), the fraction parts are small.
         const float2 Rot = VoxelLandGullyRotation(o);
-        const FVoxelLandGullyCoord CU = VoxelLandGullyCoordAt(U, o);
-        const FVoxelLandGullyCoord CV = VoxelLandGullyCoordAt(V, o);
+        const FVoxelLandGullyCoord CU = VoxelLandGullyCoordAt(VOXEL_LAND_ARGS U, o);
+        const FVoxelLandGullyCoord CV = VoxelLandGullyCoordAt(VOXEL_LAND_ARGS V, o);
         const float OffU = 17.3f * float(o) + 0.37f;
         const float OffW = 5.1f * float(o) + 0.61f;
         const float2 LU = VoxelDFAdd(VoxelDFAdd(VoxelDFTwoProd(Rot.x, CU.Whole), VoxelDFTwoProd(-Rot.y, CV.Whole)),
@@ -313,7 +315,7 @@ struct FVoxelLandGully
     float Scale;
 };
 
-VOXEL_FUNC FVoxelLandGully VoxelLandGullyDF(float2 PX, float2 PY, float2 PZ, float3 Gradient, float Turn, float Flow, float Bake, float Footprint)
+VOXEL_FUNC FVoxelLandGully VoxelLandGullyDF(VOXEL_LAND_ARGS_DECL float2 PX, float2 PY, float2 PZ, float3 Gradient, float Turn, float Flow, float Bake, float Footprint)
 {
     FVoxelLandGully Out;
     Out.Height = 0.0f;
@@ -345,7 +347,7 @@ VOXEL_FUNC FVoxelLandGully VoxelLandGullyDF(float2 PX, float2 PY, float2 PZ, flo
         const float T = atan(AV.x) * VOXEL_LAND_INV_QUARTER_PI;
         const float W = VoxelLandFaceRamp(S, Band) * VoxelLandFaceRamp(T, Band);
         if (W <= 0.0f) continue;
-        Sum += W * VoxelLandGullyFace(Face, VoxelLandAxisAt(AU, S), VoxelLandAxisAt(AV, T), AU.x, AV.x, Gradient, Turn, Footprint);
+        Sum += W * VoxelLandGullyFace(VOXEL_LAND_ARGS Face, VoxelLandAxisAt(VOXEL_LAND_ARGS AU, S), VoxelLandAxisAt(VOXEL_LAND_ARGS AV, T), AU.x, AV.x, Gradient, Turn, Footprint);
         WSum += W;
     }
     float FlowScale = 1.0f;
@@ -370,7 +372,7 @@ VOXEL_FUNC float3 VoxelLandWarpedGradient(float3 GQ, float3 DWX, float3 DWY, flo
 
 /** The detail layer's scale (LandGullyDetail on land while there are gullies) at bake height
  *  Bake (m). */
-VOXEL_FUNC float VoxelLandDetailScale(float Bake)
+VOXEL_FUNC float VoxelLandDetailScale(VOXEL_LAND_ARGS_DECL float Bake)
 {
     if (LandGullyStrength <= 0.0f || LandGullyOctaves == 0u) return 1.0f;
     return lerp(1.0f, LandGullyDetail, smoothstep(-50.0f, 50.0f, Bake));
@@ -387,30 +389,39 @@ struct FVoxelLandSurface
 {
     float Bake;
     float Gully;
-    float GullyScale;    // FVoxelLandGully::Scale
+    float GullyScale;        // FVoxelLandGully::Scale
     float DetailScale;
+    float Flow;              // the bake's drainage (log2 m^2; 0 without it or unless asked)
+    float3 BakeGradient;     // m/m, tangent at P, through the warp (zero unless asked or gullies)
 };
 
-VOXEL_FUNC FVoxelLandSurface VoxelLandSurfaceDF(float2 PX, float2 PY, float2 PZ, float2 QX, float2 QY, float2 QZ,
-    float3 DWX, float3 DWY, float3 DWZ, float Footprint)
+/** bGradients (a constant: dropped when false) asks for the bake's gradient and the drainage
+ *  even without gullies (the material's normal). */
+VOXEL_FUNC FVoxelLandSurface VoxelLandSurfaceDF(VOXEL_LAND_ARGS_DECL float2 PX, float2 PY, float2 PZ, float2 QX, float2 QY, float2 QZ,
+    float3 DWX, float3 DWY, float3 DWZ, float Footprint, bool bGradients)
 {
     FVoxelLandSurface Out;
     Out.Gully = 0.0f;
     Out.GullyScale = 0.0f;
     Out.DetailScale = 1.0f;
-    if (LandGullyStrength <= 0.0f || LandGullyOctaves == 0u)
+    Out.Flow = 0.0f;
+    Out.BakeGradient = float3(0.0f, 0.0f, 0.0f);
+    const bool bGullies = LandGullyStrength > 0.0f && LandGullyOctaves != 0u;
+    if (!bGullies && !bGradients)
     {
-        Out.Bake = VoxelLandBakeSampleDF(QX, QY, QZ, false).Height;
+        Out.Bake = VoxelLandBakeSampleDF(VOXEL_LAND_ARGS QX, QY, QZ, false).Height;
         return Out;
     }
-    const FVoxelLandBakeSample Bake = VoxelLandBakeSampleDF(QX, QY, QZ, true);
+    const FVoxelLandBakeSample Bake = VoxelLandBakeSampleDF(VOXEL_LAND_ARGS QX, QY, QZ, true);
     Out.Bake = Bake.Height;
+    Out.Flow = Bake.Flow;
     const float3 Normal = normalize(float3(PX.x, PY.x, PZ.x));
-    const float3 Gradient = VoxelLandWarpedGradient(Bake.Gradient, DWX, DWY, DWZ, Normal);
-    const FVoxelLandGully G = VoxelLandGullyDF(PX, PY, PZ, Gradient, Bake.Turn, Bake.Flow, Bake.Height, Footprint);
+    Out.BakeGradient = VoxelLandWarpedGradient(Bake.Gradient, DWX, DWY, DWZ, Normal);
+    if (!bGullies) return Out;
+    const FVoxelLandGully G = VoxelLandGullyDF(VOXEL_LAND_ARGS PX, PY, PZ, Out.BakeGradient, Bake.Turn, Bake.Flow, Bake.Height, Footprint);
     Out.Gully = G.Height;
     Out.GullyScale = G.Scale;
-    Out.DetailScale = VoxelLandDetailScale(Bake.Height);
+    Out.DetailScale = VoxelLandDetailScale(VOXEL_LAND_ARGS Bake.Height);
     return Out;
 }
 

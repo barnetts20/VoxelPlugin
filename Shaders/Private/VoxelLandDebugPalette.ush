@@ -39,6 +39,13 @@ VOXEL_FUNC float3 VoxelLandViewMix(float3 A, float3 B, float T)
     return A + (B - A) * saturate(T);
 }
 
+/** A display (sRGB) colour as linear (the material's base colour; the vertex colours store it
+ *  the same way): the 2.2 curve. */
+VOXEL_FUNC float3 VoxelLandViewSrgbToLinear(float3 C)
+{
+    return float3(pow(saturate(C.x), 2.2f), pow(saturate(C.y), 2.2f), pow(saturate(C.z), 2.2f));
+}
+
 /** A view that has nothing to show here (a bake view on the noise surface). */
 VOXEL_FUNC float3 VoxelLandViewNone()
 {

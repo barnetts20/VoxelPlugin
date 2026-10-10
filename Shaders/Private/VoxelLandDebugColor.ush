@@ -1,0 +1,113 @@
+// VoxelLandDebugColor.ush - The colour of a land debug view (voxel.Debug.LandView) at a surface
+// point, from the land's terms there. Shared by the mesher's per-vertex pass (VoxelLandDebug.ush)
+// and the terrain material's per-pixel evaluation (VoxelLandMaterial.ush), so both show the
+// same thing; the palette is VoxelLandDebugPalette.ush.
+//
+// Shared subset (VoxelShaderCompat.h; land inputs through VoxelLandAccess.ush). Include after
+// VoxelLandSample.ush, VoxelLandGully.ush, VoxelLandPlates.ush and VoxelLandDebugPalette.ush.
+// Reads the bake's attributes (VOXEL_LAND_ATTR) and lake levels (VOXEL_LAND_WATER) only for the
+// views that show them.
+
+#ifndef VOXEL_LAND_DEBUG_COLOR_USH
+#define VOXEL_LAND_DEBUG_COLOR_USH
+
+#include "VoxelLandAccess.ush"
+
+/** The bake cell holding direction Dir (unit, float): its face and cell indices. */
+struct FVoxelLandDebugCell
+{
+    uint Face;
+    int I;
+    int J;
+};
+
+VOXEL_FUNC FVoxelLandDebugCell VoxelLandDebugCellOf(VOXEL_LAND_ARGS_DECL float3 Dir)
+{
+    const float AX = abs(Dir.x);
+    const float AY = abs(Dir.y);
+    const float AZ = abs(Dir.z);
+    uint Axis = 2u;
+    if (AX >= AY && AX >= AZ) Axis = 0u;
+    else if (AY >= AZ) Axis = 1u;
+    const float PN = VoxelCubeComponent(Dir, Axis);
+    FVoxelLandDebugCell Cell;
+    Cell.Face = Axis * 2u + (PN < 0.0f ? 1u : 0u);
+    const float Den = max(abs(PN), 1.0e-20f);
+    const float S = atan(VoxelCubeComponent(Dir, VoxelCubeUAxis(Cell.Face)) / Den) * VOXEL_LAND_INV_QUARTER_PI;
+    const float T = atan(VoxelCubeComponent(Dir, VoxelCubeVAxis(Cell.Face)) / Den) * VOXEL_LAND_INV_QUARTER_PI;
+    const int N = int(LandN);
+    Cell.I = clamp(int(floor((S + 1.0f) * 0.5f * float(N))), 0, N - 1);
+    Cell.J = clamp(int(floor((T + 1.0f) * 0.5f * float(N))), 0, N - 1);
+    return Cell;
+}
+
+/** A bake cell's index in the padded grid. */
+VOXEL_FUNC uint VoxelLandDebugIndex(VOXEL_LAND_ARGS_DECL FVoxelLandDebugCell Cell)
+{
+    const uint Side = LandN + 2u * LandPad;
+    return Cell.Face * Side * Side + uint(Cell.J + int(LandPad)) * Side + uint(Cell.I + int(LandPad));
+}
+
+/** What a view needs at the point. */
+struct FVoxelLandDebugInput
+{
+    uint Mode;            // VOXEL_LAND_VIEW_*
+    float Elevation;      // m about sea level: the shown surface
+    float SlopeDegrees;   // the shown surface's slope
+    float CellM;          // the sample's footprint (m): fades the fine bands and the cell checker
+    float3 Warped;        // the bake's direction after the sampling warp (unit)
+    float Bake;           // m (FVoxelLandHeight)
+    float Gully;          // m
+    float GullyScale;     // m
+    float DetailNorm;     // the detail as added, over its full amplitude (about -1..1)
+    bool bTerrestrial;    // the land inputs are bound (else the bake views show "none")
+    bool bHydro;          // the bake has drainage and lakes (eroded)
+};
+
+VOXEL_FUNC float3 VoxelLandDebugColor(VOXEL_LAND_ARGS_DECL FVoxelLandDebugInput In)
+{
+    if (In.Mode == VOXEL_LAND_VIEW_ELEVATION) return VoxelLandViewHeight(In.Elevation, In.CellM);
+    if (In.Mode == VOXEL_LAND_VIEW_SLOPE) return VoxelLandViewSlope(In.SlopeDegrees);
+    if (!In.bTerrestrial) return VoxelLandViewNone();
+    if (In.Mode == VOXEL_LAND_VIEW_BAKE) return VoxelLandViewHeight(In.Bake, In.CellM);
+    if (In.Mode == VOXEL_LAND_VIEW_DETAIL) return VoxelLandViewSigned(In.DetailNorm);
+    if (In.Mode == VOXEL_LAND_VIEW_GULLY)
+    {
+        // Over the coarsest octave's largest half-depth there (VoxelLandGully.ush), so the
+        // pattern shows on gentle slopes too; white where there are none.
+        if (LandGullyStrength <= 0.0f || LandGullyOctaves == 0u) return VoxelLandViewNone();
+        return VoxelLandViewSigned(In.GullyScale > 1.0e-3f ? In.Gully / In.GullyScale : 0.0f);
+    }
+
+    const FVoxelLandDebugCell Cell = VoxelLandDebugCellOf(VOXEL_LAND_ARGS In.Warped);
+    const uint Index = VoxelLandDebugIndex(VOXEL_LAND_ARGS Cell);
+    if (In.Mode == VOXEL_LAND_VIEW_CELLS)
+    {
+        // The checker shows from two samples a cell.
+        return VoxelLandViewCell(Cell.Face, Cell.I, Cell.J, saturate(2.0f - 4.0f * In.CellM / max(LandCellM, 1.0e-3f)));
+    }
+    if (In.Mode == VOXEL_LAND_VIEW_FLOW)
+    {
+        if (!In.bHydro) return VoxelLandViewNone();
+        return VoxelLandViewFlow(VoxelLandFlowAt(VOXEL_LAND_ARGS Index) * 0.30103f - 6.0f, In.Elevation <= 0.0f);
+    }
+    if (In.Mode == VOXEL_LAND_VIEW_LAKES)
+    {
+        if (!In.bHydro) return VoxelLandViewNone();
+        const float Level = VOXEL_LAND_WATER(Index);
+        const bool bLake = Level > -1.0e30f && In.Elevation < Level;
+        return VoxelLandViewLake(Level - In.Elevation, bLake, In.Elevation <= 0.0f);
+    }
+    const uint Attr = VOXEL_LAND_ATTR(Index);
+    const float Crust = float(Attr & 0xffu) / 255.0f;
+    if (In.Mode == VOXEL_LAND_VIEW_CRUST) return VoxelLandViewCrust(Crust);
+    if (In.Mode == VOXEL_LAND_VIEW_CLASS) return VoxelLandViewClass((Attr >> 8u) & 7u, Crust);
+    if (In.Mode == VOXEL_LAND_VIEW_PLATES)
+    {
+        if (LandPlateCount == 0u) return VoxelLandViewNone();
+        return VoxelLandViewPlate(VoxelLandNearestPlate(VOXEL_LAND_ARGS VoxelLandWarp(VOXEL_LAND_ARGS In.Warped)), Crust);
+    }
+    return VoxelLandViewNone();
+}
+
+#endif // VOXEL_LAND_DEBUG_COLOR_USH

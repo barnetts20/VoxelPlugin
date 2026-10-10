@@ -95,6 +95,10 @@ public:
      *  from now on (cm; 0: the density's sea level). */
     void SetDebugSeaRadius(double InSeaRadius) { Settings.DebugSeaRadius = InSeaRadius; }
 
+    /** Whether the material shows the land views (FVoxelBrickTerrainSettings::
+     *  bMaterialLandViews), for bricks sent to the mesher from now on. */
+    void SetMaterialLandViews(bool bInMaterialLandViews) { Settings.bMaterialLandViews = bInMaterialLandViews; }
+
 private:
     struct FInstance
     {

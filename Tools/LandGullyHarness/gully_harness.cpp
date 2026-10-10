@@ -256,7 +256,7 @@ static FTerms Terms(const FPlanet& P, const double D[3], double Footprint, bool 
     if (!bGullies) S.LandGullyStrength = 0;
     const auto L = S.VoxelLandSurfaceDF(DF(SP[0]), DF(SP[1]), DF(SP[2]), DF(Q[0]), DF(Q[1]), DF(Q[2]),
         float3((float)DW[0][0], (float)DW[0][1], (float)DW[0][2]), float3((float)DW[1][0], (float)DW[1][1], (float)DW[1][2]),
-        float3((float)DW[2][0], (float)DW[2][1], (float)DW[2][2]), (float)std::max(Footprint, P.Finest));
+        float3((float)DW[2][0], (float)DW[2][1], (float)DW[2][2]), (float)std::max(Footprint, P.Finest), false);
     const float Wd = lerp(0.25f, 1.0f, smoothstep(-50.0f, 50.0f, L.Bake));
     const double Dd = Evaluate(P.Det, SP, std::max(Footprint, P.Finest));
     FTerms T;
@@ -371,6 +371,22 @@ static void Sheet(const std::string& Name, const std::vector<std::vector<float3>
     WritePPM(Name, W, Px, Out);
 }
 
+
+/** The GPU path's globals (VoxelDensitySample.ush, VoxelLandParameters.ush) for planet P. */
+static void SetGpuGlobals(const FPlanet& P, std::vector<FVoxelOctave>& Gpu)
+{
+    for (auto& O : P.Det.O) Gpu.push_back(ToGPU(O));
+    for (int a = 0; a < 3; a++) for (auto& O : P.W[a].O) Gpu.push_back(ToGPU(O));
+    VoxelShader::Octaves = Gpu.data();
+    ContinentOctaves = 0; MountainOctaves = 0; DetailOctaves = (uint)P.Det.O.size();
+    InvNormDetail = DF(P.Det.InvNorm); PlanetRadius = DF(P.R); NoiseAmplitude = DF(P.NA); HalfFinest = DF(P.Half);
+    VoxelShader::LandHeight = P.Height.data(); VoxelShader::LandTanTable = P.Tan.data(); VoxelShader::LandFlow = P.FlowPacked.data();
+    VoxelShader::LandN = P.N; VoxelShader::LandPad = P.Pad; VoxelShader::LandHasFlow = 1; VoxelShader::LandCellM = P.S.LandCellM;
+    LandWarpOctaves = 3; LandWarpInvNorm = (float)P.W[0].InvNorm; LandWarpAmplitude = (float)P.WarpAmp;
+    LandDetailAmplitude = (float)P.DetailAmp; LandHeightOffset = DF(P.Offset);
+    VoxelShader::LandGullyStrength = P.S.LandGullyStrength; VoxelShader::LandGullyOctaves = P.S.LandGullyOctaves;
+    VoxelShader::LandGullyFlowGain = P.S.LandGullyFlowGain; VoxelShader::LandGullyDetail = P.S.LandGullyDetail; VoxelShader::LandGullySeed = P.S.LandGullySeed;
+}
 // ---------------------------------------------------------------------------------------------
 
 int main(int argc, char** argv)
@@ -649,23 +665,90 @@ int main(int argc, char** argv)
                 Q(0.1), Q(0.25), Q(0.5), Q(0.75), Q(0.9), Q(0.99));
         }
     }
+    else if (Mode == "ref")
+    {
+        // A checksum of the CPU path's terms and the GPU path's densities at fixed points, for
+        // refactors that must not change a bit.
+        std::vector<FVoxelOctave> Gpu;
+        SetGpuGlobals(P, Gpu);
+        std::mt19937 Rng(21);
+        std::normal_distribution<double> G;
+        uint64_t Hash = 1469598103934665603ull;
+        auto Mix = [&](const void* D, size_t N) { const unsigned char* B = (const unsigned char*)D; for (size_t i = 0; i < N; i++) { Hash ^= B[i]; Hash *= 1099511628211ull; } };
+        for (int i = 0; i < 20000; i++)
+        {
+            double D[3] = { G(Rng), G(Rng), G(Rng) }; Normalize(D);
+            const double F = P.Finest * (1 << (i % 8));
+            const FTerms T = Terms(P, D, F);
+            Mix(&T.Bake, 8); Mix(&T.Gully, 8); Mix(&T.Detail, 8);
+            int Idx[3]; for (int a = 0; a < 3; a++) Idx[a] = (int)std::llround(D[a] * (P.R + (T.Height * 100.0 + P.SeaRadius - P.R)) / P.Half);
+            const float Gp = VoxelSampleDensityDF(Idx[0], Idx[1], Idx[2], (float)std::max(F, P.Finest));
+            Mix(&Gp, 4);
+        }
+        printf("reference checksum %016llx\n", (unsigned long long)Hash);
+    }
+    else if (Mode == "grad")
+    {
+        // VoxelLandHeightDF's bake gradient against central differences of the bake term, and
+        // the material's normal scheme: the bake's analytic gradient plus Gully + Detail
+        // differenced over a pixel (as ddx/ddy do), against central differences of the full
+        // height. At footprints (the pixel size) of 1 m, 10 m and 100 m.
+        std::vector<FVoxelOctave> Gpu;
+        SetGpuGlobals(P, Gpu);
+        std::mt19937 Rng(23);
+        std::normal_distribution<double> G;
+        for (double F : { 100.0 * 100, 10.0 * 100, 1.0 * 100 })
+        {
+            std::vector<double> EB, EN, Slope;
+            int Tries = 0;
+            const double PixM = F * 0.01;
+            while (EB.size() < 3000 && Tries < 400000)
+            {
+                Tries++;
+                double D[3] = { G(Rng), G(Rng), G(Rng) }; Normalize(D);
+                auto At = [&](const double* Dir, bool bGrad) {
+                    return VoxelLandHeightDF(DF(Dir[0] * P.SeaRadius), DF(Dir[1] * P.SeaRadius), DF(Dir[2] * P.SeaRadius), (float)F, bGrad);
+                };
+                const FVoxelLandHeight H0 = At(D, true);
+                if (H0.Bake < 100) continue;
+                double E1[3], E2[3]; Frame(D, E1, E2);
+                auto Offset = [&](const double* E, double M, double* Out) { for (int a = 0; a < 3; a++) Out[a] = D[a] + M * 100.0 / P.SeaRadius * E[a]; Normalize(Out); };
+                // Reference: central differences of the full height at a small step.
+                const double StepM = 0.02;
+                double Ref[2], Bfd[2], Pix[2];
+                for (int k = 0; k < 2; k++)
+                {
+                    const double* E = k == 0 ? E1 : E2;
+                    double A[3], B[3], C[3];
+                    Offset(E, StepM, A); Offset(E, -StepM, B); Offset(E, PixM, C);
+                    const FVoxelLandHeight HA = At(A, false), HB = At(B, false), HC = At(C, false);
+                    Ref[k] = ((HA.Height.x - HB.Height.x) + ((double)HA.Height.y - HB.Height.y)) * 0.01 / (2 * StepM);
+                    Bfd[k] = (HA.Bake - HB.Bake) / (2 * StepM);
+                    // A pixel's forward difference of Gully + Detail (ddx_fine).
+                    Pix[k] = ((HC.Gully + HC.Detail) - (H0.Gully + H0.Detail)) / PixM;
+                }
+                const double Bx = H0.BakeGradient.x * E1[0] + H0.BakeGradient.y * E1[1] + H0.BakeGradient.z * E1[2];
+                const double By = H0.BakeGradient.x * E2[0] + H0.BakeGradient.y * E2[1] + H0.BakeGradient.z * E2[2];
+                EB.push_back(std::hypot(Bx - Bfd[0], By - Bfd[1]));
+                // The normals' angle between the scheme and the reference.
+                const double Nx = Bx + Pix[0], Ny = By + Pix[1];
+                const double Dot = (1 + Nx * Ref[0] + Ny * Ref[1]) / (std::sqrt(1 + Nx * Nx + Ny * Ny) * std::sqrt(1 + Ref[0] * Ref[0] + Ref[1] * Ref[1]));
+                EN.push_back(std::acos(std::min(1.0, Dot)) * 57.2957795);
+                Slope.push_back(std::atan(std::hypot(Ref[0], Ref[1])) * 57.2957795);
+            }
+            std::sort(EB.begin(), EB.end()); std::sort(EN.begin(), EN.end()); std::sort(Slope.begin(), Slope.end());
+            auto Q = [](const std::vector<double>& V, double q) { return V[std::min((size_t)(q * V.size()), V.size() - 1)]; };
+            printf("pixel %5.1f m: bake gradient |analytic - FD| median %.5f p99 %.5f; normal angle error (deg) median %.2f p90 %.2f p99 %.2f, slope (deg) median %.1f p90 %.1f; n %zu\n",
+                PixM, Q(EB, 0.5), Q(EB, 0.99), Q(EN, 0.5), Q(EN, 0.9), Q(EN, 0.99), Q(Slope, 0.5), Q(Slope, 0.9), EB.size());
+        }
+    }
     else if (Mode == "agree")
     {
         // The GPU code path (VoxelSampleDensityDF on lattice indices, double-float throughout)
         // against the CPU path (double positions), at lattice points within metres of the
         // surface, at several footprints.
         std::vector<FVoxelOctave> Gpu;
-        for (auto& O : P.Det.O) Gpu.push_back(ToGPU(O));
-        for (int a = 0; a < 3; a++) for (auto& O : P.W[a].O) Gpu.push_back(ToGPU(O));
-        VoxelShader::Octaves = Gpu.data();
-        ContinentOctaves = 0; MountainOctaves = 0; DetailOctaves = (uint)P.Det.O.size();
-        InvNormDetail = DF(P.Det.InvNorm); PlanetRadius = DF(P.R); NoiseAmplitude = DF(P.NA); HalfFinest = DF(P.Half);
-        VoxelShader::LandHeight = P.Height.data(); VoxelShader::LandTanTable = P.Tan.data(); VoxelShader::LandFlow = P.FlowPacked.data();
-        VoxelShader::LandN = P.N; VoxelShader::LandPad = P.Pad; VoxelShader::LandHasFlow = 1; VoxelShader::LandCellM = P.S.LandCellM;
-        LandWarpOctaves = 3; LandWarpInvNorm = (float)P.W[0].InvNorm; LandWarpAmplitude = (float)P.WarpAmp;
-        LandDetailAmplitude = (float)P.DetailAmp; LandHeightOffset = DF(P.Offset);
-        VoxelShader::LandGullyStrength = P.S.LandGullyStrength; VoxelShader::LandGullyOctaves = P.S.LandGullyOctaves;
-        VoxelShader::LandGullyFlowGain = P.S.LandGullyFlowGain; VoxelShader::LandGullyDetail = P.S.LandGullyDetail; VoxelShader::LandGullySeed = P.S.LandGullySeed;
+        SetGpuGlobals(P, Gpu);
         std::mt19937 Rng(9);
         std::normal_distribution<double> G;
         const int Count = 40000;

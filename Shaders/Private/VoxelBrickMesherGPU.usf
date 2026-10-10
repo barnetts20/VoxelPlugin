@@ -90,6 +90,7 @@ float LandInteriorHeight;
 
 #include "/Plugin/VoxelPlugin/Private/VoxelLandPlates.ush"
 #include "/Plugin/VoxelPlugin/Private/VoxelLandDebugPalette.ush"
+#include "/Plugin/VoxelPlugin/Private/VoxelLandDebugColor.ush"
 #include "/Plugin/VoxelPlugin/Private/VoxelLandDebug.ush"
 
 // Thread index over a 2D grid of 64-thread groups (GroupsX wide), so a pass can exceed 65535

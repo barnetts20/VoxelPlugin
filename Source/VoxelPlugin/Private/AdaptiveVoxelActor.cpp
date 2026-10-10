@@ -12,6 +12,11 @@
 #include "FSparseEditStore.h"
 #include "RealtimeMeshComponent.h"
 #include "VoxelTerrainStats.h"
+#include "VoxelLandMaterial.h"
+#include "Engine/Texture2DDynamic.h"
+#include "Materials/MaterialInstanceDynamic.h"
+#include "Engine/World.h"
+#include "Misc/App.h"
 
 DECLARE_CYCLE_STAT(TEXT("Actor tick"), STAT_VoxelActorTick, STATGROUP_VoxelTerrain);
 DECLARE_CYCLE_STAT(TEXT("Collision tick"), STAT_VoxelCollisionTick, STATGROUP_VoxelTerrain);
@@ -44,6 +49,11 @@ int32 AAdaptiveVoxelActor::MaxDepthFor(double RootExtent, double InTargetPrecisi
 void AAdaptiveVoxelActor::BeginDestroy()
 {
     IsDestroyed = true;
+    if (LandMaterialTickHandle.IsValid())
+    {
+        FWorldDelegates::OnWorldPostActorTick.Remove(LandMaterialTickHandle);
+        LandMaterialTickHandle.Reset();
+    }
     if (UWorld* World = GetWorld())
         World->GetTimerManager().ClearAllTimersForObject(this);
     {
@@ -230,7 +240,111 @@ void AAdaptiveVoxelActor::SetSurfaceMaterial(UMaterialInterface* InMaterial)
 {
     SurfaceMaterial = InMaterial ? InMaterial : DefaultSurfaceMaterial();
     if (BrickTerrain.IsValid())
-        BrickTerrain->SetMaterial(SurfaceMaterial);
+    {
+        BrickTerrain->SetMaterial(ResolveBrickMaterial());
+        BrickTerrain->SetMaterialLandViews(bLandMaterialBound);
+    }
+}
+
+void AAdaptiveVoxelActor::ReleaseLandTextures()
+{
+    LandHeightTexture = nullptr;
+    LandFieldTexture = nullptr;
+    LandConstantTexture = nullptr;
+    LandTexturesBake.Reset();
+    LandTexturesDensity.Reset();
+    // The instance lets go of them too (the frame parameters are set again every frame).
+    if (LandMaterialInstance)
+        LandMaterialInstance->ClearParameterValues();
+}
+
+UMaterialInterface* AAdaptiveVoxelActor::ResolveBrickMaterial()
+{
+    bLandMaterialBound = false;
+    if (!SurfaceMaterial)
+    {
+        ReleaseLandTextures();
+        LandMaterialInstance = nullptr;
+        LandMaterialParent = nullptr;
+        return SurfaceMaterial;
+    }
+    // The bricks always draw an instance: with the land node off (VoxelLandParams.z 0) unless the
+    // textures are bound, whatever the material's own default.
+    if (!LandMaterialInstance || LandMaterialParent != SurfaceMaterial)
+    {
+        LandMaterialInstance = UMaterialInstanceDynamic::Create(SurfaceMaterial, this);
+        LandMaterialInstance->SetFlags(RF_Transient | RF_DuplicateTransient);
+        LandMaterialParent = SurfaceMaterial;
+    }
+
+    // The textures, on a terrestrial planet whose material has the land node: the bake's (kept
+    // while the bake is, across densities rebuilt with other sample settings) and the density's
+    // constants. A failure is remembered, so a later call doesn't build them again.
+    const TSharedPtr<const FVoxelDensityCPU> Density = DensityCompositor.IsValid() ? DensityCompositor->GetBaseDensity() : nullptr;
+    const TSharedPtr<const FVoxelLandBake, ESPMode::ThreadSafe> Bake = Density.IsValid() ? Density->GetLandBake() : nullptr;
+    if (!FApp::CanEverRender() || !Bake.IsValid() || !VoxelLandMaterial::HasLandNode(SurfaceMaterial) || LandTexturesFailed.Pin() == Density)
+    {
+        ReleaseLandTextures();
+    }
+    else
+    {
+        bool bFailed = false;
+        if (LandTexturesBake.Pin() != Bake || !LandHeightTexture || !LandFieldTexture)
+        {
+            UTexture2DDynamic* Height = nullptr;
+            UTexture2DDynamic* Fields = nullptr;
+            bFailed = !VoxelLandMaterial::MakeBakeTextures(Bake, Height, Fields);
+            LandHeightTexture = Height;
+            LandFieldTexture = Fields;
+            LandTexturesBake = Bake;
+            LandTexturesDensity.Reset();
+        }
+        if (!bFailed && (LandTexturesDensity.Pin() != Density || !LandConstantTexture))
+        {
+            LandConstantTexture = VoxelLandMaterial::MakeConstantTexture(*Density);
+            LandTexturesDensity = Density;
+            bFailed = !LandConstantTexture;
+        }
+        if (bFailed)
+        {
+            ReleaseLandTextures();
+            LandTexturesFailed = Density;
+        }
+        else
+        {
+            VoxelLandMaterial::SetTextureParameters(LandMaterialInstance, LandHeightTexture, LandFieldTexture, LandConstantTexture);
+            bLandMaterialBound = true;
+        }
+    }
+
+    // The frame every frame, once all actors (the planet among them) have moved.
+    if (!LandMaterialTickHandle.IsValid())
+        LandMaterialTickHandle = FWorldDelegates::OnWorldPostActorTick.AddUObject(this, &AAdaptiveVoxelActor::OnWorldPostActorTick);
+    UpdateLandMaterial();
+    return LandMaterialInstance;
+}
+
+void AAdaptiveVoxelActor::OnWorldPostActorTick(UWorld* World, ELevelTick TickType, float DeltaSeconds)
+{
+    if (World == GetWorld() && !IsDestroyed)
+        UpdateLandMaterial();
+}
+
+void AAdaptiveVoxelActor::UpdateLandMaterial()
+{
+    if (!LandMaterialInstance) return;
+    // The reference point: the camera the last frame rendered from (any point near the pixels
+    // keeps their offsets small; the editor's viewports count, ticking or not).
+    const UWorld* World = GetWorld();
+    if (World && World->ViewLocationsRenderedLastFrame.Num() > 0)
+    {
+        LandReferenceWorld = World->ViewLocationsRenderedLastFrame[0];
+        bHasLandReference = true;
+    }
+    // Until a view exists the node stays off: from the planet's centre the pixels' offsets
+    // would be too large for floats.
+    VoxelLandMaterial::SetFrameParameters(LandMaterialInstance, FTransform(GetActorRotation(), GetActorLocation()), LandReferenceWorld,
+        FVoxelBrickTerrain::GetMaterialLandView(), LandSurfaceTolerance, bLandMaterialBound && bHasLandReference);
 }
 
 void AAdaptiveVoxelActor::SetDebugSeaRadius(double InSeaRadius)
@@ -363,7 +477,8 @@ void AAdaptiveVoxelActor::InitializeBrickTerrain(double RootExtent)
     Settings.LodDistanceFactor = BrickLodDistanceFactor;
     Settings.SlopeBound = CollisionSlopeBound;
     Settings.TriplanarUVScale = 0.0001 * (80000000.0 / FMath::Max(GetActorScale3D().GetMax(), 1.0));
-    Settings.Material = SurfaceMaterial;
+    Settings.Material = ResolveBrickMaterial();
+    Settings.bMaterialLandViews = bLandMaterialBound;
     Settings.DebugSeaRadius = DebugSeaRadius;
     // The plugin's collection when none is assigned (the planet spawns this actor).
     if (!BrickMorphParameters)

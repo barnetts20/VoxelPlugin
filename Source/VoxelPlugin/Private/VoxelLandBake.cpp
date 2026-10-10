@@ -1283,8 +1283,8 @@ void FVoxelLandBaker::Finish(TSharedPtr<FVoxelLandBake, ESPMode::ThreadSafe> Bak
 
 namespace VoxelLandBakeDetail
 {
-    /** Two 16-bit cells per word, the lower index in the low half (VoxelLandFlowAt,
-     *  VoxelLandDebugAttr). An odd count pads the last word with 0. */
+    /** Two 16-bit cells per word, the lower index in the low half (VoxelLandAccess.ush's
+     *  VOXEL_LAND_FLOW and VOXEL_LAND_ATTR). An odd count pads the last word with 0. */
     template <typename FGetBits>
     TArray<uint32> PackHalves(int32 NumCells, FGetBits GetBits)
     {

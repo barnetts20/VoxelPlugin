@@ -1,0 +1,45 @@
+// VoxelLandMaterialAccessEnd.ush - Ends VoxelLandMaterialAccess.ush's scalar macros (the names of
+// the global shaders' land inputs: LandN, PlanetRadius, ...) once the land code's functions are
+// defined, so the rest of the material (or the harness's other hosts) keeps its own meaning of
+// those names. The accessors and VOXEL_LAND_ARGS stay: they name only the land code's arguments.
+
+#undef LandN
+#undef LandPad
+#undef LandHasFlow
+#undef LandCellM
+#undef LandGullyStrength
+#undef LandGullyOctaves
+#undef LandGullyFlowGain
+#undef LandGullyDetail
+#undef LandGullySeed
+#undef LandMode
+#undef LandWarpOctaves
+#undef LandWarpInvNorm
+#undef LandWarpAmplitude
+#undef LandDetailAmplitude
+#undef LandHeightOffset
+#undef ContinentOctaves
+#undef MountainOctaves
+#undef DetailOctaves
+#undef InvNormDetail
+#undef PlanetRadius
+#undef NoiseAmplitude
+#undef RidgeGain
+#undef SlopeDamping
+#undef InvNormContinent
+#undef InvNormMountain
+#undef HalfFinest
+#undef ContinentWeight
+#undef MountainWeight
+#undef MountainStart
+#undef MountainBlend
+#undef DetailWeight
+#undef LandPlateCount
+#undef LandSeed
+#undef LandRadiusM
+#undef LandWidthScale
+#undef LandReliefScale
+#undef LandShelfDepth
+#undef LandAbyssDepth
+#undef LandCoastHeight
+#undef LandInteriorHeight

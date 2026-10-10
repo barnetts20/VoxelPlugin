@@ -17,6 +17,9 @@
 #include <atomic>
 #include "AdaptiveVoxelActor.generated.h"
 
+class UMaterialInstanceDynamic;
+class UTexture2DDynamic;
+
 /** An edit written to the edit store, as the terrain forwards it to its bricks: its sequence,
  *  centre (actor space without scale) and radius (cm). */
 DECLARE_MULTICAST_DELEGATE_ThreeParams(FOnVoxelTerrainEdited, uint32 /*Sequence*/, const FVector& /*Center*/, double /*Radius*/);
@@ -72,6 +75,13 @@ public:
     UPROPERTY(EditAnywhere, BlueprintReadWrite, BlueprintSetter = SetSurfaceMaterial, Category = "Terrain|Materials",
         meta = (EditCondition = "!bIsPlanetOwned"))
     UMaterialInterface* SurfaceMaterial = nullptr;
+
+    /** Terrestrial planets, materials with the land node (VoxelLandMaterial.ush): how far the
+     *  rendered surface may lie off the analytic one (m) before the node's normal fades to the
+     *  mesh's (edits, overhangs). It also grows by 16 pixel footprints, for the coarse mesh far
+     *  off. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrain|Materials", meta = (ClampMin = "0.0", UIMax = "50"))
+    double LandSurfaceTolerance = 2.0;
 
     // --- Terrain Geometry ---
 
@@ -282,6 +292,46 @@ protected:
     /** The plugin's triplanar material, or the engine default when the plugin content is
      *  missing. */
     static UMaterialInterface* DefaultSurfaceMaterial();
+
+    /** Game thread. The material the bricks use: a dynamic instance of SurfaceMaterial, its
+     *  land node (VoxelLandMaterial.ush) bound to the land textures on a terrestrial planet
+     *  (bLandMaterialBound) and off otherwise. */
+    UMaterialInterface* ResolveBrickMaterial();
+
+    /** Drops the land textures (and the instance's references to them). */
+    void ReleaseLandTextures();
+
+    /** Game thread, per frame after every actor's tick: the land node's reference point (the
+     *  camera) and the planet's frame. */
+    void UpdateLandMaterial();
+    void OnWorldPostActorTick(UWorld* World, ELevelTick TickType, float DeltaSeconds);
+
+    /** The land material (VoxelLandMaterial.h): the instance, the textures, and what they were
+     *  made from. */
+    UPROPERTY(Transient)
+    TObjectPtr<UMaterialInstanceDynamic> LandMaterialInstance;
+
+    UPROPERTY(Transient)
+    TObjectPtr<UTexture2DDynamic> LandHeightTexture;
+
+    UPROPERTY(Transient)
+    TObjectPtr<UTexture2DDynamic> LandFieldTexture;
+
+    UPROPERTY(Transient)
+    TObjectPtr<UTexture2DDynamic> LandConstantTexture;
+
+    UPROPERTY(Transient)
+    TObjectPtr<UMaterialInterface> LandMaterialParent;
+
+    TWeakPtr<const FVoxelLandBake, ESPMode::ThreadSafe> LandTexturesBake;   // the height and field textures'
+    TWeakPtr<const FVoxelDensityCPU> LandTexturesDensity;                   // the constants'
+    TWeakPtr<const FVoxelDensityCPU> LandTexturesFailed;                    // the textures couldn't be made for it
+    /** The instance's land node is bound to the textures. */
+    bool bLandMaterialBound = false;
+    /** The reference point (world cm), once a view has rendered. */
+    FVector LandReferenceWorld = FVector::ZeroVector;
+    bool bHasLandReference = false;
+    FDelegateHandle LandMaterialTickHandle;
 
     /** Example edit flow (E adds, Q removes), not in shipping builds: traces from the camera
      *  along the control rotation and edits this terrain where the trace hits one of its

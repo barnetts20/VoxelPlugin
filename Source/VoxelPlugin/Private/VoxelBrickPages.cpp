@@ -1143,7 +1143,7 @@ void FVoxelBrickPages::DispatchBatches()
     const VoxelBrickMesherGPU::FCaps Caps = VoxelBrickMesherGPU::CapsFor(MesherSettings);
     // The land debug view the bricks sent now are coloured with (their copies say so).
     FVoxelBrickMesherGPUDebugView DebugView;
-    DebugView.Mode = FVoxelBrickTerrain::GetLandView();
+    DebugView.Mode = FVoxelBrickTerrain::GetVertexLandView(Settings.bMaterialLandViews);
     DebugView.SeaRadius = Settings.DebugSeaRadius;
     for (int32 Sent = 0; Sent < Budget && QueueHead < MeshQueue.Num() && Batches.Num() < VBP::MaxBatchesInFlight; Sent++)
     {

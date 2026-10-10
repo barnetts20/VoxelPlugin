@@ -44,6 +44,9 @@ struct FVoxelBrickTerrainSettings
      *  density's own (the terrestrial sea radius, or the noise surface's base radius). */
     double DebugSeaRadius = 0.0;
     TWeakObjectPtr<UMaterialInterface> Material;
+    /** The material shows the land debug views per pixel: its land node is bound to the land
+     *  textures (a terrestrial planet; VoxelLandMaterial.h). Else the vertex colours do. */
+    bool bMaterialLandViews = false;
     /** Receives the camera and morph slack every frame (VoxelMorph.ush). */
     TWeakObjectPtr<UMaterialParameterCollection> MorphParameters;
 
@@ -131,6 +134,17 @@ public:
 
     /** Game thread. voxel.Debug.LandView, 0 when out of range. */
     static int32 GetLandView();
+    /** The view the mesher colours vertices with: the selected one where the vertex colours
+     *  show it (voxel.Debug.LandViewSource 1, or a material without a bound land node:
+     *  bMaterialLandViews false), else 0. */
+    static int32 GetVertexLandView(bool bMaterialLandViews);
+    /** The view the terrain material's land node shows (voxel.Debug.LandViewSource 0), when it
+     *  is bound. */
+    static int32 GetMaterialLandView();
+
+    /** Game thread. Whether the material shows the land views (Settings.bMaterialLandViews);
+     *  a change of the vertex view meshes the terrain again. */
+    void SetMaterialLandViews(bool bInMaterialLandViews);
 
     /** Game thread. The sea radius the elevation debug view measures from (Settings.
      *  DebugSeaRadius); with that view on, the terrain is meshed again. */

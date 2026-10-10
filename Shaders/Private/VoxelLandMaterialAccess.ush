@@ -1,0 +1,177 @@
+// VoxelLandMaterialAccess.ush - The land code's inputs as the terrain material has them
+// (VoxelLandAccess.ush explains the scheme): three textures passed down as function arguments
+// (VoxelLandMaterialLayout.ush gives their layout), every buffer read a texture load, every
+// scalar input a macro that reads the constants texture. Include before the land code; the
+// macros named like the global shaders' inputs (LandN, Octaves' accessor, PlanetRadius, ...)
+// are #undef'd again by VoxelLandMaterial.ush once its functions are defined, so they don't
+// reach the rest of the material.
+//
+// HLSL, and C++ in the material harness (with Texture2D, float4 and int3 stand-ins).
+
+#ifndef VOXEL_LAND_MATERIAL_ACCESS_USH
+#define VOXEL_LAND_MATERIAL_ACCESS_USH
+
+#include "VoxelLandMaterialLayout.ush"
+
+#define VOXEL_LAND_ARGS_DECL Texture2D LandHeightTex, Texture2D LandFieldTex, Texture2D LandConstTex,
+#define VOXEL_LAND_ARGS LandHeightTex, LandFieldTex, LandConstTex,
+
+/** Texel T (in order, VOXEL_LAND_MATERIAL_CONST_WIDTH a row) of the constants texture. */
+VOXEL_FUNC float4 VoxelLandConstTexel(Texture2D ConstTex, uint T)
+{
+    return ConstTex.Load(int3(int(T % uint(VOXEL_LAND_MATERIAL_CONST_WIDTH)), int(T / uint(VOXEL_LAND_MATERIAL_CONST_WIDTH)), 0));
+}
+
+VOXEL_FUNC float VoxelLandPick4(float4 V, uint K)
+{
+    if (K == 0u) return V.x;
+    if (K == 1u) return V.y;
+    if (K == 2u) return V.z;
+    return V.w;
+}
+
+/** Scalar I (VOXEL_LAND_MC_*). */
+VOXEL_FUNC float VoxelLandConstF(Texture2D ConstTex, uint I)
+{
+    return VoxelLandPick4(VoxelLandConstTexel(ConstTex, I >> 2u), I & 3u);
+}
+
+VOXEL_FUNC uint VoxelLandConstU(Texture2D ConstTex, uint I)
+{
+    return uint(VoxelLandConstF(ConstTex, I));
+}
+
+/** A 32-bit integer stored as two 16-bit halves at I and I + 1. */
+VOXEL_FUNC uint VoxelLandConstU32(Texture2D ConstTex, uint I)
+{
+    return uint(VoxelLandConstF(ConstTex, I)) | (uint(VoxelLandConstF(ConstTex, I + 1u)) << 16u);
+}
+
+VOXEL_FUNC float2 VoxelLandConstF2(Texture2D ConstTex, uint I)
+{
+    return float2(VoxelLandConstF(ConstTex, I), VoxelLandConstF(ConstTex, I + 1u));
+}
+
+VOXEL_FUNC uint VoxelLandHalves(float Low, float High)
+{
+    return uint(Low) | (uint(High) << 16u);
+}
+
+/** Bake cell I's texel in the height and field textures (Side x 6 Side). */
+VOXEL_FUNC int3 VoxelLandCellTexel(Texture2D ConstTex, uint I)
+{
+    const uint Side = VoxelLandConstU(ConstTex, VOXEL_LAND_MC_SIDE);
+    return int3(int(I % Side), int(I / Side), 0);
+}
+
+VOXEL_FUNC float2 VoxelLandMaterialTan(Texture2D ConstTex, uint I)
+{
+    const float4 V = VoxelLandConstTexel(ConstTex, VoxelLandConstU(ConstTex, VOXEL_LAND_MC_TAN_BASE) + (I >> 1u));
+    return (I & 1u) != 0u ? float2(V.z, V.w) : float2(V.x, V.y);
+}
+
+VOXEL_FUNC FVoxelOctave VoxelLandMaterialOctave(Texture2D ConstTex, uint I)
+{
+    const uint T = VoxelLandConstU(ConstTex, VOXEL_LAND_MC_OCTAVE_BASE) + I * uint(VOXEL_LAND_MATERIAL_OCTAVE_TEXELS);
+    const float4 V0 = VoxelLandConstTexel(ConstTex, T);
+    const float4 V1 = VoxelLandConstTexel(ConstTex, T + 1u);
+    const float4 V2 = VoxelLandConstTexel(ConstTex, T + 2u);
+    const float4 V3 = VoxelLandConstTexel(ConstTex, T + 3u);
+    const float4 V4 = VoxelLandConstTexel(ConstTex, T + 4u);
+    const float4 V5 = VoxelLandConstTexel(ConstTex, T + 5u);
+    const float4 V6 = VoxelLandConstTexel(ConstTex, T + 6u);
+    FVoxelOctave O;
+    O.Frequency = float2(V0.x, V0.y);
+    O.OffsetX = float2(V0.z, V0.w);
+    O.OffsetY = float2(V1.x, V1.y);
+    O.OffsetZ = float2(V1.z, V1.w);
+    O.Wavelength = V2.x;
+    O.Amplitude = V2.y;
+    O.Seed = VoxelLandHalves(V2.z, V2.w);
+    O.Shift = VoxelLandHalves(V3.x, V3.y);
+    O.OffsetCellX = VoxelLandHalves(V3.z, V3.w);
+    O.OffsetCellY = VoxelLandHalves(V4.x, V4.y);
+    O.OffsetCellZ = VoxelLandHalves(V4.z, V4.w);
+    O.OffsetFracX = VoxelLandHalves(V5.x, V5.y);
+    O.OffsetFracY = VoxelLandHalves(V5.z, V5.w);
+    O.OffsetFracZ = VoxelLandHalves(V6.x, V6.y);
+    O.Pad0 = 0u;
+    O.Pad1 = 0u;
+    return O;
+}
+
+VOXEL_FUNC float VoxelLandMaterialPlate(Texture2D ConstTex, uint I)
+{
+    const float4 V = VoxelLandConstTexel(ConstTex, VoxelLandConstU(ConstTex, VOXEL_LAND_MC_PLATE_BASE) + (I >> 2u));
+    return VoxelLandPick4(V, I & 3u);
+}
+
+VOXEL_FUNC uint VoxelLandMaterialAttr(Texture2D FieldTex, Texture2D ConstTex, uint I)
+{
+    const float4 V = FieldTex.Load(VoxelLandCellTexel(ConstTex, I));
+    return uint(V.z) | (uint(V.w) << 8u);
+}
+
+/** The kept lake's level (m) at cell I: the field texture keeps it above the cell's height. */
+VOXEL_FUNC float VoxelLandMaterialWater(Texture2D HeightTex, Texture2D FieldTex, Texture2D ConstTex, uint I)
+{
+    const int3 Texel = VoxelLandCellTexel(ConstTex, I);
+    const float Above = FieldTex.Load(Texel).y;
+    return Above <= VOXEL_LAND_MATERIAL_NO_LAKE ? -3.0e38f : HeightTex.Load(Texel).x + Above;
+}
+
+// The accessors (VoxelLandAccess.ush).
+#define VOXEL_LAND_HEIGHT(I) LandHeightTex.Load(VoxelLandCellTexel(LandConstTex, (I))).x
+#define VOXEL_LAND_TAN(I) VoxelLandMaterialTan(LandConstTex, (I))
+#define VOXEL_LAND_FLOW(I) LandFieldTex.Load(VoxelLandCellTexel(LandConstTex, (I))).x
+#define VOXEL_LAND_ATTR(I) VoxelLandMaterialAttr(LandFieldTex, LandConstTex, (I))
+#define VOXEL_LAND_WATER(I) VoxelLandMaterialWater(LandHeightTex, LandFieldTex, LandConstTex, (I))
+#define VOXEL_LAND_PLATE(I) VoxelLandMaterialPlate(LandConstTex, (I))
+#define VOXEL_OCTAVE(I) VoxelLandMaterialOctave(LandConstTex, (I))
+
+// The scalar inputs: the land sampler and gullies (VoxelLandParameters.ush) ...
+#define LandN VoxelLandConstU(LandConstTex, VOXEL_LAND_MC_N)
+#define LandPad VoxelLandConstU(LandConstTex, VOXEL_LAND_MC_PAD)
+#define LandHasFlow VoxelLandConstU(LandConstTex, VOXEL_LAND_MC_HAS_FLOW)
+#define LandCellM VoxelLandConstF(LandConstTex, VOXEL_LAND_MC_CELL_M)
+#define LandGullyStrength VoxelLandConstF(LandConstTex, VOXEL_LAND_MC_GULLY_STRENGTH)
+#define LandGullyOctaves VoxelLandConstU(LandConstTex, VOXEL_LAND_MC_GULLY_OCTAVES)
+#define LandGullyFlowGain VoxelLandConstF(LandConstTex, VOXEL_LAND_MC_GULLY_FLOW_GAIN)
+#define LandGullyDetail VoxelLandConstF(LandConstTex, VOXEL_LAND_MC_GULLY_DETAIL)
+#define LandGullySeed VoxelLandConstU32(LandConstTex, VOXEL_LAND_MC_GULLY_SEED)
+#define LandMode VoxelLandConstU(LandConstTex, VOXEL_LAND_MC_LAND_MODE)
+#define LandWarpOctaves VoxelLandConstU(LandConstTex, VOXEL_LAND_MC_WARP_OCTAVES)
+#define LandWarpInvNorm VoxelLandConstF(LandConstTex, VOXEL_LAND_MC_WARP_INV_NORM)
+#define LandWarpAmplitude VoxelLandConstF(LandConstTex, VOXEL_LAND_MC_WARP_AMPLITUDE)
+#define LandDetailAmplitude VoxelLandConstF(LandConstTex, VOXEL_LAND_MC_DETAIL_AMPLITUDE)
+#define LandHeightOffset VoxelLandConstF2(LandConstTex, VOXEL_LAND_MC_HEIGHT_OFFSET)
+// ... the density's (VoxelDensitySample.ush; the noise surface's are unused and zero) ...
+#define ContinentOctaves VoxelLandConstU(LandConstTex, VOXEL_LAND_MC_CONTINENT_OCTAVES)
+#define MountainOctaves VoxelLandConstU(LandConstTex, VOXEL_LAND_MC_MOUNTAIN_OCTAVES)
+#define DetailOctaves VoxelLandConstU(LandConstTex, VOXEL_LAND_MC_DETAIL_OCTAVES)
+#define InvNormDetail VoxelLandConstF2(LandConstTex, VOXEL_LAND_MC_INV_NORM_DETAIL)
+#define PlanetRadius VoxelLandConstF2(LandConstTex, VOXEL_LAND_MC_PLANET_RADIUS)
+#define NoiseAmplitude VoxelLandConstF2(LandConstTex, VOXEL_LAND_MC_NOISE_AMPLITUDE)
+#define RidgeGain VoxelLandConstF(LandConstTex, VOXEL_LAND_MC_RIDGE_GAIN)
+#define SlopeDamping VoxelLandConstF(LandConstTex, VOXEL_LAND_MC_SLOPE_DAMPING)
+#define InvNormContinent float2(0.0f, 0.0f)
+#define InvNormMountain float2(0.0f, 0.0f)
+#define HalfFinest float2(0.0f, 0.0f)
+#define ContinentWeight float2(0.0f, 0.0f)
+#define MountainWeight float2(0.0f, 0.0f)
+#define MountainStart float2(0.0f, 0.0f)
+#define MountainBlend float2(1.0f, 0.0f)
+#define DetailWeight float2(0.0f, 0.0f)
+// ... and the plate model's (VoxelLandPlates.ush; the debug views read only the plates and the
+// seed, the profile inputs are unused).
+#define LandPlateCount VoxelLandConstU(LandConstTex, VOXEL_LAND_MC_PLATE_COUNT)
+#define LandSeed VoxelLandConstU32(LandConstTex, VOXEL_LAND_MC_PLATE_SEED)
+#define LandRadiusM 1.0f
+#define LandWidthScale 1.0f
+#define LandReliefScale 1.0f
+#define LandShelfDepth 0.0f
+#define LandAbyssDepth 0.0f
+#define LandCoastHeight 0.0f
+#define LandInteriorHeight 0.0f
+
+#endif // VOXEL_LAND_MATERIAL_ACCESS_USH

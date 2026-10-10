@@ -1,0 +1,59 @@
+// VoxelLandMaterialLayout.ush - The layout of the land textures the terrain material reads
+// (VoxelLandMaterialAccess.ush), shared with the C++ that fills them (VoxelLandMaterial.h).
+// Macros only, so both sides include it.
+//
+// Height texture (R32F): the bake's heights (m), Side x 6 Side texels, cell I at (I % Side,
+// I / Side) (the bake's padded index: face-major, rows of U).
+// Field texture (RGBA16F), the same texels: R the drainage (log2 m^2, 0 without it), G the kept
+// lake's level above the cell's own height (m: small, so the half keeps it to a few cm in lakes
+// tens of metres deep, 0.25 m at 500 m;
+// VOXEL_LAND_MATERIAL_NO_LAKE where there is none), B the attributes' low byte (the crust,
+// 0..255), A their high bits (class, sea-connected, lake: attr >> 8).
+// Constants texture (RGBA32F, VOXEL_LAND_MATERIAL_CONST_WIDTH texels a row): scalars first (four
+// a texel, at the VOXEL_LAND_MC_* indices), then the tan table (two entries a texel), the noise
+// octaves (VOXEL_LAND_MATERIAL_OCTAVE_TEXELS texels each) and the plates (two texels each), at
+// the texel offsets the scalars give. Integers below 2^24 are stored as floats; 32-bit ones as
+// two floats of 16 bits (low, high), so every value reads back exactly.
+
+#ifndef VOXEL_LAND_MATERIAL_LAYOUT_USH
+#define VOXEL_LAND_MATERIAL_LAYOUT_USH
+
+#define VOXEL_LAND_MATERIAL_CONST_WIDTH 256
+#define VOXEL_LAND_MATERIAL_OCTAVE_TEXELS 7
+#define VOXEL_LAND_MATERIAL_NO_LAKE -60000.0f
+
+// Scalar indices (float units; texel = index / 4).
+#define VOXEL_LAND_MC_N 0
+#define VOXEL_LAND_MC_PAD 1
+#define VOXEL_LAND_MC_HAS_FLOW 2
+#define VOXEL_LAND_MC_CELL_M 3
+#define VOXEL_LAND_MC_GULLY_STRENGTH 4
+#define VOXEL_LAND_MC_GULLY_OCTAVES 5
+#define VOXEL_LAND_MC_GULLY_FLOW_GAIN 6
+#define VOXEL_LAND_MC_GULLY_DETAIL 7
+#define VOXEL_LAND_MC_GULLY_SEED 8          // two (low, high 16 bits)
+#define VOXEL_LAND_MC_WARP_OCTAVES 10
+#define VOXEL_LAND_MC_WARP_INV_NORM 11
+#define VOXEL_LAND_MC_WARP_AMPLITUDE 12
+#define VOXEL_LAND_MC_DETAIL_AMPLITUDE 13
+#define VOXEL_LAND_MC_HEIGHT_OFFSET 14      // double-float: two
+#define VOXEL_LAND_MC_PLANET_RADIUS 16      // two
+#define VOXEL_LAND_MC_NOISE_AMPLITUDE 18    // two
+#define VOXEL_LAND_MC_INV_NORM_DETAIL 20    // two
+#define VOXEL_LAND_MC_RIDGE_GAIN 22
+#define VOXEL_LAND_MC_SLOPE_DAMPING 23
+#define VOXEL_LAND_MC_CONTINENT_OCTAVES 24
+#define VOXEL_LAND_MC_MOUNTAIN_OCTAVES 25
+#define VOXEL_LAND_MC_DETAIL_OCTAVES 26
+#define VOXEL_LAND_MC_LAND_MODE 27
+#define VOXEL_LAND_MC_PLATE_COUNT 28
+#define VOXEL_LAND_MC_PLATE_SEED 29         // two
+#define VOXEL_LAND_MC_HAS_HYDRO 31
+#define VOXEL_LAND_MC_TAN_BASE 32           // texel offsets
+#define VOXEL_LAND_MC_OCTAVE_BASE 33
+#define VOXEL_LAND_MC_PLATE_BASE 34
+#define VOXEL_LAND_MC_SIDE 35
+#define VOXEL_LAND_MC_COUNT 36              // scalars in use (9 texels)
+#define VOXEL_LAND_MC_TEXELS 9
+
+#endif // VOXEL_LAND_MATERIAL_LAYOUT_USH

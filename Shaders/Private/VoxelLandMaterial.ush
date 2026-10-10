@@ -1,0 +1,220 @@
+// VoxelLandMaterial.ush - The terrestrial surface in the terrain material, per pixel: the
+// density's own land chain (VoxelLandHeightDF: the sampling warp, the B-spline bake, the gullies,
+// the detail layer) evaluated at the pixel's direction, band-limited by the pixel's footprint, so
+// the material sees the height the mesh is built from at a resolution the mesh doesn't have.
+// Design: Design/TerrainMaterial.md. Wiring: STAGE_M1_NOTES.md.
+//
+// Outputs (Custom node; Include File Paths: /Plugin/VoxelPlugin/Private/VoxelLandMaterial.ush):
+//   return value  the debug view's colour (linear), for the views of voxel.Debug.LandView;
+//   Height        the analytic surface's height about sea level (m);
+//   NormalWS      the analytic surface's normal (world): the bake's exact gradient through the
+//                 warp, plus the screen-space change of the gullies and the detail (their analytic
+//                 gradients leave out terms as large as they keep). Where the pixel lies off the
+//                 analytic surface by more than the tolerance (edits, overhangs, a coarse mesh far
+//                 off), it fades to the mesh's normal;
+//   NormalTS      the same in tangent space (for materials with Tangent Space Normal on);
+//   Fields        x the drainage (log2 m^2), y the crust (0 oceanic..1 continental), z the boundary
+//                 class (0..6; +8 under a kept lake), w the kept lake's depth above the analytic
+//                 surface (m, 0 where there is none);
+//   Terms         x the bake (m), y the gullies (m), z the detail (m), w the pixel's height above
+//                 the analytic surface (m: the mesh's error, or an edit);
+//   DebugMask     1 where the node shows a debug view (lerp the base colour to the return value),
+//                 else 0 (no view, or the node off: the vertex colours then carry the views).
+//
+// Inputs: HeightTex, FieldTex, ConstTex = the VoxelLandHeight, VoxelLandFields and
+// VoxelLandConstants texture parameters (Texture Objects; the terrain's dynamic material instance
+// sets them); ToPixel = Absolute World Position (including material shader offsets) minus
+// VoxelLandRefWorldHigh minus VoxelLandRefWorldLow (cm; a float vector, precise near the camera);
+// RefLocalHigh, RefLocalLow = VoxelLandRefLocalHigh and VoxelLandRefLocalLow (the same reference
+// point in the planet's frame, double-float cm); AxisX, AxisY, AxisZ = VoxelLandAxisX/Y/Z (the
+// planet frame's axes in world); Params = VoxelLandParams (x the debug view, voxel.Debug.LandView;
+// y the surface tolerance, m, and w its growth per metre of pixel footprint: the normal fades to
+// the mesh's beyond y + w x footprint off the analytic surface; z 1 when the land textures are
+// bound and the frame is known, else 0: the node then reads nothing. The parameter's default in
+// the material must be (0, 2, 0, 16), so an instance the terrain didn't set stays off).
+//
+// Custom node code:
+//   return VoxelLandMaterial(Parameters, HeightTex, FieldTex, ConstTex, ToPixel, RefLocalHigh, RefLocalLow, AxisX, AxisY, AxisZ, Params, Height, NormalWS, NormalTS, Fields, Terms, DebugMask);
+//
+// The gullies' and the detail's share of the normal needs screen-space derivatives: other stages
+// that compile the material's pixel inputs (ray-tracing hit shaders) get the bake's gradient
+// alone.
+
+#pragma once
+
+#include "/Plugin/VoxelPlugin/Private/VoxelDensityCore.ush"
+#include "/Plugin/VoxelPlugin/Private/VoxelDF64.ush"
+#include "/Plugin/VoxelPlugin/Private/VoxelCubeSphere.ush"
+#include "/Plugin/VoxelPlugin/Private/VoxelLandMaterialAccess.ush"
+#include "/Plugin/VoxelPlugin/Private/VoxelLandSample.ush"
+#include "/Plugin/VoxelPlugin/Private/VoxelLandGully.ush"
+#include "/Plugin/VoxelPlugin/Private/VoxelLandPlates.ush"
+#include "/Plugin/VoxelPlugin/Private/VoxelDensitySample.ush"
+#include "/Plugin/VoxelPlugin/Private/VoxelLandDebugPalette.ush"
+#include "/Plugin/VoxelPlugin/Private/VoxelLandDebugColor.ush"
+
+// Screen-space derivatives exist in pixel shaders only; the material's pixel inputs are also
+// compiled into other stages (ray-tracing hit shaders, for one), which get the bake's gradient
+// alone and a footprint from the distance to the camera.
+#if defined(PIXELSHADER) && PIXELSHADER
+#define VOXEL_LAND_HAS_DERIVATIVES 1
+#if defined(FEATURE_LEVEL) && defined(FEATURE_LEVEL_SM5) && FEATURE_LEVEL < FEATURE_LEVEL_SM5
+#define VOXEL_LAND_DDX(V) ddx(V)
+#define VOXEL_LAND_DDY(V) ddy(V)
+#else
+#define VOXEL_LAND_DDX(V) ddx_fine(V)
+#define VOXEL_LAND_DDY(V) ddy_fine(V)
+#endif
+#else
+#define VOXEL_LAND_HAS_DERIVATIVES 0
+#define VOXEL_LAND_DDX(V) ((V) * 0.0f)
+#define VOXEL_LAND_DDY(V) ((V) * 0.0f)
+#endif
+
+/** The surface at the planet-frame point P (double-float cm), sampled at Footprint (cm), with the
+ *  screen-space changes of the position (Ddx/DdyLocal, cm, planet frame) for the normal. */
+struct FVoxelLandPixel
+{
+    float Height;          // m about sea level
+    float3 Normal;         // planet frame
+    float3 Up;             // planet frame: the radial direction
+    float Offset;          // m: the point's height above the analytic surface
+    float4 Fields;
+    float4 Terms;
+    FVoxelLandHeight Land; // the terms behind them (the debug views)
+};
+
+FVoxelLandPixel VoxelLandPixel(VOXEL_LAND_ARGS_DECL float2 PX, float2 PY, float2 PZ, float3 DdxLocal, float3 DdyLocal, float Footprint)
+{
+    FVoxelLandPixel Out;
+    const float2 Radius = VoxelDFSqrt(VoxelDFAdd(VoxelDFAdd(VoxelDFMul(PX, PX), VoxelDFMul(PY, PY)), VoxelDFMul(PZ, PZ)));
+    const float2 SeaRadius = VoxelDFAdd(PlanetRadius, LandHeightOffset);
+    const float2 Scale = VoxelDFDiv(SeaRadius, Radius);
+    const float2 LPX = VoxelDFMul(PX, Scale);
+    const float2 LPY = VoxelDFMul(PY, Scale);
+    const float2 LPZ = VoxelDFMul(PZ, Scale);
+    const FVoxelLandHeight H = VoxelLandHeightDF(VOXEL_LAND_ARGS LPX, LPY, LPZ, Footprint, true);
+    Out.Land = H;
+
+    // Heights about sea level (m): the analytic surface's, and the point's above it.
+    const float2 AboveBase = VoxelDFSub(H.Height, LandHeightOffset);
+    Out.Height = (AboveBase.x + AboveBase.y) * 0.01f;
+    const float2 PointAbove = VoxelDFSub(Radius, VoxelDFAdd(SeaRadius, AboveBase));
+    Out.Offset = (PointAbove.x + PointAbove.y) * 0.01f;
+
+    // The gradient: the bake's, plus the gullies' and the detail's change across the pixel. The
+    // derivative calls stay in uniform control flow (nothing above returns or branches on the
+    // pixel).
+    const float3 Up = normalize(float3(PX.x, PY.x, PZ.x));
+    Out.Up = Up;
+    const float Rest = H.Gully + H.Detail;
+    const float DRx = VOXEL_LAND_DDX(Rest);
+    const float DRy = VOXEL_LAND_DDY(Rest);
+    const float3 Tx = (DdxLocal - Up * dot(DdxLocal, Up)) * 0.01f;
+    const float3 Ty = (DdyLocal - Up * dot(DdyLocal, Up)) * 0.01f;
+    const float XX = dot(Tx, Tx);
+    const float XY = dot(Tx, Ty);
+    const float YY = dot(Ty, Ty);
+    const float Det = XX * YY - XY * XY;
+    float3 Gradient = H.BakeGradient;
+    if (Det > 1.0e-6f * max(XX * YY, 1.0e-30f))
+    {
+        const float A = (DRx * YY - DRy * XY) / Det;
+        const float B = (DRy * XX - DRx * XY) / Det;
+        Gradient = Gradient + Tx * A + Ty * B;
+    }
+    Out.Normal = normalize(Up - Gradient);
+
+    // The bake's fields at the nearest cell of the warped direction.
+    const FVoxelLandDebugCell Cell = VoxelLandDebugCellOf(VOXEL_LAND_ARGS H.Warped);
+    const uint Index = VoxelLandDebugIndex(VOXEL_LAND_ARGS Cell);
+    const uint Attr = VOXEL_LAND_ATTR(Index);
+    const float Level = VOXEL_LAND_WATER(Index);
+    const float LakeDepth = Level > -1.0e30f ? max(Level - Out.Height, 0.0f) : 0.0f;
+    Out.Fields = float4(H.Flow, float(Attr & 0xffu) / 255.0f, float((Attr >> 8u) & 7u) + ((Attr & 0x1000u) != 0u ? 8.0f : 0.0f), LakeDepth);
+    Out.Terms = float4(H.Bake, H.Gully, H.Detail, Out.Offset);
+    return Out;
+}
+
+/** View Mode's display (sRGB) colour at the pixel, of the surface the pixel shows: where the
+ *  normal faded to the mesh's (ToMesh 1: an edit, a coarse mesh far off), the mesh's height and
+ *  normal (Normal, planet frame), else the analytic surface's. */
+float3 VoxelLandPixelColor(VOXEL_LAND_ARGS_DECL FVoxelLandPixel Pixel, float3 Normal, float ToMesh, float Footprint, uint Mode)
+{
+    FVoxelLandDebugInput In;
+    In.Mode = Mode;
+    In.Elevation = Pixel.Height + Pixel.Offset * ToMesh;
+    In.SlopeDegrees = acos(clamp(dot(Normal, Pixel.Up), -1.0f, 1.0f)) * 57.2957795f;
+    In.CellM = Footprint * 0.01f;
+    In.Warped = Pixel.Land.Warped;
+    In.Bake = Pixel.Land.Bake;
+    In.Gully = Pixel.Land.Gully;
+    In.GullyScale = Pixel.Land.GullyScale;
+    In.DetailNorm = LandDetailAmplitude > 0.0f ? Pixel.Land.Detail * 100.0f / LandDetailAmplitude : 0.0f;
+    In.bTerrestrial = true;
+    In.bHydro = VoxelLandConstU(LandConstTex, VOXEL_LAND_MC_HAS_HYDRO) != 0u;
+    return VoxelLandDebugColor(VOXEL_LAND_ARGS In);
+}
+
+/** The pixel's footprint (cm): the larger screen-space step of its position; outside pixel
+ *  shaders a thousandth of its distance to the reference point (about a pixel at 1080p). */
+float VoxelLandPixelFootprint(float3 Local, float3 DdxLocal, float3 DdyLocal)
+{
+#if VOXEL_LAND_HAS_DERIVATIVES
+    return max(length(DdxLocal), length(DdyLocal));
+#else
+    return max(length(Local) * 1.0e-3f, 1.0f);
+#endif
+}
+
+#define VOXEL_LAND_MATERIAL_BODY \
+    Height = 0.0f; \
+    NormalWS = Parameters.TangentToWorld[2]; \
+    NormalTS = float3(0.0f, 0.0f, 1.0f); \
+    Fields = float4(0.0f, 0.0f, 0.0f, 0.0f); \
+    Terms = float4(0.0f, 0.0f, 0.0f, 0.0f); \
+    DebugMask = 0.0f; \
+    /* Off (no land textures bound, the noise surface; or no view rendered yet): the mesh keeps */ \
+    /* its normal, and the vertex colours carry the debug views where the node isn't bound. */ \
+    if (Params.z < 0.5f) return float3(0.0f, 0.0f, 0.0f); \
+    /* The pixel in the planet's frame: the reference point (double-float) plus the pixel's */ \
+    /* offset from it, rotated from world. */ \
+    const float3 Local = float3(dot(ToPixel, AxisX), dot(ToPixel, AxisY), dot(ToPixel, AxisZ)); \
+    const float2 PX = VoxelDFAdd(float2(RefLocalHigh.x, RefLocalLow.x), float2(Local.x, 0.0f)); \
+    const float2 PY = VoxelDFAdd(float2(RefLocalHigh.y, RefLocalLow.y), float2(Local.y, 0.0f)); \
+    const float2 PZ = VoxelDFAdd(float2(RefLocalHigh.z, RefLocalLow.z), float2(Local.z, 0.0f)); \
+    const float3 DdxLocal = VOXEL_LAND_DDX(Local); \
+    const float3 DdyLocal = VOXEL_LAND_DDY(Local); \
+    const float Footprint = VoxelLandPixelFootprint(Local, DdxLocal, DdyLocal); \
+    const FVoxelLandPixel Pixel = VoxelLandPixel(HeightTex, FieldTex, ConstTex, PX, PY, PZ, DdxLocal, DdyLocal, Footprint); \
+    Height = Pixel.Height; \
+    Fields = Pixel.Fields; \
+    Terms = Pixel.Terms; \
+    /* Off the analytic surface (an edit, an overhang, a coarse mesh far off): the mesh's normal. */ \
+    const float3 MeshWS = normalize(Parameters.TangentToWorld[2]); \
+    const float3 MeshLocal = float3(dot(MeshWS, AxisX), dot(MeshWS, AxisY), dot(MeshWS, AxisZ)); \
+    const float Tolerance = max(Params.y + Params.w * Footprint * 0.01f, 0.01f); \
+    const float ToMesh = saturate(abs(Pixel.Offset) / Tolerance - 1.0f); \
+    const float3 Shown = normalize(lerp(Pixel.Normal, MeshLocal, ToMesh)); \
+    NormalWS = normalize(AxisX * Shown.x + AxisY * Shown.y + AxisZ * Shown.z); \
+    NormalTS = normalize(mul(Parameters.TangentToWorld, NormalWS)); \
+    const uint Mode = uint(Params.x + 0.5f); \
+    if (Mode == 0u) return float3(0.0f, 0.0f, 0.0f); \
+    DebugMask = 1.0f; \
+    return VoxelLandViewSrgbToLinear(VoxelLandPixelColor(HeightTex, FieldTex, ConstTex, Pixel, Shown, ToMesh, Footprint, Mode));
+
+float3 VoxelLandMaterial(FMaterialPixelParameters Parameters, Texture2D HeightTex, Texture2D FieldTex, Texture2D ConstTex,
+    float3 ToPixel, float3 RefLocalHigh, float3 RefLocalLow, float3 AxisX, float3 AxisY, float3 AxisZ, float4 Params,
+    out float Height, out float3 NormalWS, out float3 NormalTS, out float4 Fields, out float4 Terms, out float DebugMask)
+{
+    VOXEL_LAND_MATERIAL_BODY
+}
+
+#undef VOXEL_LAND_MATERIAL_BODY
+#undef VOXEL_LAND_HAS_DERIVATIVES
+#undef VOXEL_LAND_DDX
+#undef VOXEL_LAND_DDY
+
+// The inputs' macros (VoxelLandMaterialAccess.ush) end here: the rest of the material keeps its
+// own meaning of these names.
+#include "/Plugin/VoxelPlugin/Private/VoxelLandMaterialAccessEnd.ush"

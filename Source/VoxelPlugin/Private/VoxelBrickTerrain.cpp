@@ -39,9 +39,14 @@ TAutoConsoleVariable<int32> CVarVoxelDebugLevelColor(
     TEXT("1: vertex colour of the terrain bricks by level (the material must show vertex colour; a change meshes the terrain again). 0: white."),
     ECVF_Default);
 
+TAutoConsoleVariable<int32> CVarVoxelDebugLandViewSource(
+    TEXT("voxel.Debug.LandViewSource"), 0,
+    TEXT("Where voxel.Debug.LandView colours terrestrial terrain. 0: per pixel, in the terrain material's land node (VoxelLandMaterial.ush; STAGE_M1_NOTES.md): a view change is instant (where the material has no land node, or it isn't bound, the vertex colours show it). 1: per vertex, in the vertex colour with alpha 0 (STAGE_L1b_NOTES.md): a view change meshes the terrain again. The noise surface always uses the vertex colour."),
+    ECVF_Default);
+
 TAutoConsoleVariable<int32> CVarVoxelDebugLandView(
     TEXT("voxel.Debug.LandView"), 0,
-    TEXT("Colours the terrain by a component of the generator, in the vertex colour with alpha 0 (the terrain material must show it: see STAGE_L1b_NOTES.md). A change meshes the terrain again; a legend is on screen while a view is on.\n")
+    TEXT("Colours the terrain by a component of the generator: per pixel in the terrain material's land node, or per vertex in the vertex colour (voxel.Debug.LandViewSource). A legend is on screen while a view is on.\n")
     TEXT(" 0: off\n")
     TEXT(" 1: elevation about sea level (hypsometric; 500 m bands on land, 1 km at sea, close up)\n")
     TEXT(" 2: the bake's height alone (no gullies or detail)\n")
@@ -435,12 +440,29 @@ int32 FVoxelBrickTerrain::GetLandView()
     return View > 0 && View < (int32)VOXEL_LAND_VIEW_COUNT ? View : 0;
 }
 
+int32 FVoxelBrickTerrain::GetVertexLandView(bool bMaterialLandViews)
+{
+    return !bMaterialLandViews || CVarVoxelDebugLandViewSource.GetValueOnGameThread() != 0 ? GetLandView() : 0;
+}
+
+int32 FVoxelBrickTerrain::GetMaterialLandView()
+{
+    return CVarVoxelDebugLandViewSource.GetValueOnGameThread() == 0 ? GetLandView() : 0;
+}
+
+void FVoxelBrickTerrain::SetMaterialLandViews(bool bInMaterialLandViews)
+{
+    // TickDebugViews meshes the terrain again if the vertex view changes with it.
+    Settings.bMaterialLandViews = bInMaterialLandViews;
+    Pages->SetMaterialLandViews(bInMaterialLandViews);
+}
+
 void FVoxelBrickTerrain::SetDebugSeaRadius(double InSeaRadius)
 {
     if (Settings.DebugSeaRadius == InSeaRadius) return;
     Settings.DebugSeaRadius = InSeaRadius;
     Pages->SetDebugSeaRadius(InSeaRadius);
-    if (GetLandView() == (int32)VOXEL_LAND_VIEW_ELEVATION)
+    if (GetVertexLandView(Settings.bMaterialLandViews) == (int32)VOXEL_LAND_VIEW_ELEVATION)
         RemeshAll();
 }
 
@@ -494,13 +516,18 @@ namespace VoxelBrickTerrainDetail
             (uint8)FMath::RoundToInt(FMath::Clamp(C.z, 0.0f, 1.0f) * 255.0f));
     }
 
-    TArray<FLegendLine> LandViewLegend(int32 View, bool bTerrestrial)
+    TArray<FLegendLine> LandViewLegend(int32 View, bool bTerrestrial, bool bPerPixel)
     {
         using namespace VoxelShader;
         static const TCHAR* Names[VOXEL_LAND_VIEW_COUNT] = { TEXT("off"), TEXT("elevation"), TEXT("bake height"), TEXT("detail layer"),
             TEXT("crust"), TEXT("boundary class"), TEXT("plates"), TEXT("slope"), TEXT("bake cells"), TEXT("drainage"), TEXT("lakes"), TEXT("gullies") };
         TArray<FLegendLine> Lines;
-        Lines.Add({ FString::Printf(TEXT("voxel.Debug.LandView %d: %s (0 hides it; the terrain material must show vertex colour)"), View, Names[View]), FColor::White });
+        Lines.Add({ FString::Printf(TEXT("voxel.Debug.LandView %d: %s (0 hides it; %s)"), View, Names[View],
+            bPerPixel
+                ? TEXT("per pixel, in the terrain material's land node")
+                : bTerrestrial && CVarVoxelDebugLandViewSource.GetValueOnGameThread() == 0
+                ? TEXT("per vertex: the terrain material has no land node bound (STAGE_M1_NOTES.md), so it must show vertex colour")
+                : TEXT("per vertex: the terrain material must show vertex colour")), FColor::White });
         const bool bBakeView = View != (int32)VOXEL_LAND_VIEW_ELEVATION && View != (int32)VOXEL_LAND_VIEW_SLOPE;
         if (bBakeView && !bTerrestrial)
         {
@@ -599,11 +626,14 @@ namespace VoxelBrickTerrainDetail
 
 void FVoxelBrickTerrain::TickDebugViews()
 {
+    // Only the vertex colours need the terrain meshed again; the material's views are a
+    // parameter.
     const int32 View = GetLandView();
+    const int32 VertexView = GetVertexLandView(Settings.bMaterialLandViews);
     const int32 Level = CVarVoxelDebugLevelColor.GetValueOnGameThread() > 0 ? 1 : 0;
-    if (View != LastLandView || Level != LastLevelColor)
+    if (VertexView != LastLandView || Level != LastLevelColor)
     {
-        LastLandView = View;
+        LastLandView = VertexView;
         LastLevelColor = Level;
         RemeshAll();
     }
@@ -611,7 +641,7 @@ void FVoxelBrickTerrain::TickDebugViews()
     if (View == 0 || !GEngine || !GPUDensity.IsValid()) return;
     // One key per line, shared by every terrain (they show the same legend).
     const bool bTerrestrial = GPUDensity->LandMode != 0;
-    const TArray<VBT::FLegendLine> Lines = VBT::LandViewLegend(View, bTerrestrial);
+    const TArray<VBT::FLegendLine> Lines = VBT::LandViewLegend(View, bTerrestrial, Settings.bMaterialLandViews && GetMaterialLandView() != 0);
     constexpr uint64 KeyBase = 0x564f584c56000000ull;   // "VOXLV"
     for (int32 i = 0; i < Lines.Num(); i++)
         GEngine->AddOnScreenDebugMessage(KeyBase + (uint64)i, 0.25f, Lines[i].Color, Lines[i].Text, false);
@@ -647,6 +677,8 @@ void FVoxelBrickTerrain::Initialize(AActor* InOwner, USceneComponent* InAttachRo
     Settings.MaxLevel = FMath::Max(0, Settings.MaxLevel);
     Settings.SlopeBound = FMath::Max(Settings.SlopeBound, 1.0);
     Pages->Initialize(InOwner, InAttachRoot, Settings);
+    // The first fill is meshed with the vertex view of the new settings (Reset ran with the old).
+    LastLandView = GetVertexLandView(Settings.bMaterialLandViews);
     GPUDensity.Reset();
     GPUEdits.Reset();
     EditBuild.Reset();
@@ -694,7 +726,7 @@ void FVoxelBrickTerrain::Reset()
     // The terrain is meshed from scratch with the current debug colours.
     RemeshQueue.Reset();
     RemeshHead = 0;
-    LastLandView = GetLandView();
+    LastLandView = GetVertexLandView(Settings.bMaterialLandViews);
     LastLevelColor = CVarVoxelDebugLevelColor.GetValueOnGameThread() > 0 ? 1 : 0;
     FScopeLock Lock(&ResultCS);
     Results.Reset();
