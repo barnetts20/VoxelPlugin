@@ -18,13 +18,14 @@
 const FName VoxelLandMaterial::HeightTextureName(TEXT("VoxelLandHeight"));
 const FName VoxelLandMaterial::FieldTextureName(TEXT("VoxelLandFields"));
 const FName VoxelLandMaterial::ConstantTextureName(TEXT("VoxelLandConstants"));
-const FName VoxelLandMaterial::RefWorldHighName(TEXT("VoxelLandRefWorldHigh"));
-const FName VoxelLandMaterial::RefWorldLowName(TEXT("VoxelLandRefWorldLow"));
-const FName VoxelLandMaterial::RefLocalHighName(TEXT("VoxelLandRefLocalHigh"));
-const FName VoxelLandMaterial::RefLocalLowName(TEXT("VoxelLandRefLocalLow"));
+const FName VoxelLandMaterial::OriginHighName(TEXT("VoxelLandOriginHigh"));
+const FName VoxelLandMaterial::OriginLowName(TEXT("VoxelLandOriginLow"));
 const FName VoxelLandMaterial::AxisXName(TEXT("VoxelLandAxisX"));
 const FName VoxelLandMaterial::AxisYName(TEXT("VoxelLandAxisY"));
 const FName VoxelLandMaterial::AxisZName(TEXT("VoxelLandAxisZ"));
+const FName VoxelLandMaterial::AxisXLowName(TEXT("VoxelLandAxisXLow"));
+const FName VoxelLandMaterial::AxisYLowName(TEXT("VoxelLandAxisYLow"));
+const FName VoxelLandMaterial::AxisZLowName(TEXT("VoxelLandAxisZLow"));
 const FName VoxelLandMaterial::ParamsName(TEXT("VoxelLandParams"));
 
 namespace VoxelLandMaterialDetail
@@ -36,7 +37,7 @@ namespace VoxelLandMaterialDetail
         S[Index + 1] = (float)(V >> 16);
     }
 
-    /** The planet-frame and world reference points as double-float pairs. */
+    /** A world position or direction as a double-float pair. */
     void Split(const FVector& V, FVector3f& OutHigh, FVector3f& OutLow)
     {
         OutHigh = FVector3f((float)V.X, (float)V.Y, (float)V.Z);
@@ -246,22 +247,26 @@ void VoxelLandMaterial::SetTextureParameters(UMaterialInstanceDynamic* Material,
     Material->SetTextureParameterValue(ConstantTextureName, Constants);
 }
 
-void VoxelLandMaterial::SetFrameParameters(UMaterialInstanceDynamic* Material, const FTransform& PlanetFrame, const FVector& ReferenceWorld,
+void VoxelLandMaterial::SetFrameParameters(UMaterialInstanceDynamic* Material, const FTransform& PlanetFrame,
     int32 View, double Tolerance, bool bEnabled)
 {
     using namespace VoxelLandMaterialDetail;
     if (!Material) return;
-    FVector3f WorldHigh, WorldLow, LocalHigh, LocalLow;
-    Split(ReferenceWorld, WorldHigh, WorldLow);
-    Split(PlanetFrame.InverseTransformPositionNoScale(ReferenceWorld), LocalHigh, LocalLow);
+    FVector3f OriginHigh, OriginLow;
+    Split(PlanetFrame.GetLocation(), OriginHigh, OriginLow);
     auto Set = [Material](const FName& Name, const FVector3f& V) { Material->SetVectorParameterValue(Name, FLinearColor(V.X, V.Y, V.Z, 0.0f)); };
-    Set(RefWorldHighName, WorldHigh);
-    Set(RefWorldLowName, WorldLow);
-    Set(RefLocalHighName, LocalHigh);
-    Set(RefLocalLowName, LocalLow);
-    Set(AxisXName, FVector3f(PlanetFrame.GetUnitAxis(EAxis::X)));
-    Set(AxisYName, FVector3f(PlanetFrame.GetUnitAxis(EAxis::Y)));
-    Set(AxisZName, FVector3f(PlanetFrame.GetUnitAxis(EAxis::Z)));
+    Set(OriginHighName, OriginHigh);
+    Set(OriginLowName, OriginLow);
+    const FName HighNames[3] = { AxisXName, AxisYName, AxisZName };
+    const FName LowNames[3] = { AxisXLowName, AxisYLowName, AxisZLowName };
+    const EAxis::Type Axes[3] = { EAxis::X, EAxis::Y, EAxis::Z };
+    for (int32 a = 0; a < 3; a++)
+    {
+        FVector3f High, Low;
+        Split(PlanetFrame.GetUnitAxis(Axes[a]), High, Low);
+        Set(HighNames[a], High);
+        Set(LowNames[a], Low);
+    }
     Material->SetVectorParameterValue(ParamsName, FLinearColor(bEnabled ? (float)FMath::Max(View, 0) : 0.0f, (float)FMath::Max(Tolerance, 0.0),
         bEnabled ? 1.0f : 0.0f, 16.0f));
 }

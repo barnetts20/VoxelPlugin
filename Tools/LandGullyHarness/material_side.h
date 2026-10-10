@@ -25,5 +25,9 @@ uint32_t MaterialAttr(const FMaterialTextures& T, uint32_t Cell);
 float MaterialWater(const FMaterialTextures& T, uint32_t Cell);
 /** Octave I as the material decodes it: FVoxelOctave's 80 bytes. */
 void MaterialOctave(const FMaterialTextures& T, uint32_t I, void* Out);
+/** VoxelLandFramePoint: the pixel in the planet's frame (as doubles: the double-float sums). */
+void MaterialFramePoint(const float TranslatedWorld[3], const float PreViewHigh[3], const float PreViewLow[3], const float OriginHigh[3],
+    const float OriginLow[3], const float AxisX[3], const float AxisY[3], const float AxisZ[3], const float AxisXLow[3],
+    const float AxisYLow[3], const float AxisZLow[3], double Out[3]);
 /** View Mode's colour (sRGB) at the surface H (the debug input as VoxelLandMaterial.ush builds it). */
 void MaterialDebugColor(const FMaterialTextures& T, uint32_t Mode, const FMaterialHeight& H, float CellM, float Out[3]);

@@ -120,6 +120,33 @@ VOXEL_FUNC float VoxelLandMaterialWater(Texture2D HeightTex, Texture2D FieldTex,
     return Above <= VOXEL_LAND_MATERIAL_NO_LAKE ? -3.0e38f : HeightTex.Load(Texel).x + Above;
 }
 
+/** A pixel in the planet's frame (cm, double-float), from what the material has exactly: its
+ *  translated world position (world plus the view's pre-view translation: small, a float), the
+ *  view's pre-view translation, and the planet's origin and its frame's axes in world (all
+ *  double-float: at a planet's radius a float axis would misplace the surface by decimetres,
+ *  and jitter it as the planet turns). Per view, so every view (split screen, captures) is exact, and
+ *  a fixed function of the pixel's world position (nothing moves with the camera). */
+struct FVoxelLandFramePoint
+{
+    float2 X;
+    float2 Y;
+    float2 Z;
+};
+
+VOXEL_FUNC FVoxelLandFramePoint VoxelLandFramePoint(float3 TranslatedWorld, float3 PreViewHigh, float3 PreViewLow,
+    float3 OriginHigh, float3 OriginLow, float3 AxisX, float3 AxisY, float3 AxisZ, float3 AxisXLow, float3 AxisYLow, float3 AxisZLow)
+{
+    // The planet's origin in translated world, then the pixel's offset from it (world axes).
+    const float2 DX = VoxelDFSub(float2(TranslatedWorld.x, 0.0f), VoxelDFAdd(float2(OriginHigh.x, OriginLow.x), float2(PreViewHigh.x, PreViewLow.x)));
+    const float2 DY = VoxelDFSub(float2(TranslatedWorld.y, 0.0f), VoxelDFAdd(float2(OriginHigh.y, OriginLow.y), float2(PreViewHigh.y, PreViewLow.y)));
+    const float2 DZ = VoxelDFSub(float2(TranslatedWorld.z, 0.0f), VoxelDFAdd(float2(OriginHigh.z, OriginLow.z), float2(PreViewHigh.z, PreViewLow.z)));
+    FVoxelLandFramePoint P;
+    P.X = VoxelDFAdd(VoxelDFAdd(VoxelDFMul(DX, float2(AxisX.x, AxisXLow.x)), VoxelDFMul(DY, float2(AxisX.y, AxisXLow.y))), VoxelDFMul(DZ, float2(AxisX.z, AxisXLow.z)));
+    P.Y = VoxelDFAdd(VoxelDFAdd(VoxelDFMul(DX, float2(AxisY.x, AxisYLow.x)), VoxelDFMul(DY, float2(AxisY.y, AxisYLow.y))), VoxelDFMul(DZ, float2(AxisY.z, AxisYLow.z)));
+    P.Z = VoxelDFAdd(VoxelDFAdd(VoxelDFMul(DX, float2(AxisZ.x, AxisZLow.x)), VoxelDFMul(DY, float2(AxisZ.y, AxisZLow.y))), VoxelDFMul(DZ, float2(AxisZ.z, AxisZLow.z)));
+    return P;
+}
+
 // The accessors (VoxelLandAccess.ush).
 #define VOXEL_LAND_HEIGHT(I) LandHeightTex.Load(VoxelLandCellTexel(LandConstTex, (I))).x
 #define VOXEL_LAND_TAN(I) VoxelLandMaterialTan(LandConstTex, (I))

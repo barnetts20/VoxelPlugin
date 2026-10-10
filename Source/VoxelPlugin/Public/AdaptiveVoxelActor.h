@@ -301,8 +301,7 @@ protected:
     /** Drops the land textures (and the instance's references to them). */
     void ReleaseLandTextures();
 
-    /** Game thread, per frame after every actor's tick: the land node's reference point (the
-     *  camera) and the planet's frame. */
+    /** Game thread, per frame after every actor's tick: the planet's frame for the land node. */
     void UpdateLandMaterial();
     void OnWorldPostActorTick(UWorld* World, ELevelTick TickType, float DeltaSeconds);
 
@@ -328,9 +327,6 @@ protected:
     TWeakPtr<const FVoxelDensityCPU> LandTexturesFailed;                    // the textures couldn't be made for it
     /** The instance's land node is bound to the textures. */
     bool bLandMaterialBound = false;
-    /** The reference point (world cm), once a view has rendered. */
-    FVector LandReferenceWorld = FVector::ZeroVector;
-    bool bHasLandReference = false;
     FDelegateHandle LandMaterialTickHandle;
 
     /** Example edit flow (E adds, Q removes), not in shipping builds: traces from the camera

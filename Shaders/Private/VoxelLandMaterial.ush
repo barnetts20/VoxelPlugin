@@ -23,18 +23,21 @@
 //
 // Inputs: HeightTex, FieldTex, ConstTex = the VoxelLandHeight, VoxelLandFields and
 // VoxelLandConstants texture parameters (Texture Objects; the terrain's dynamic material instance
-// sets them); ToPixel = Absolute World Position (including material shader offsets) minus
-// VoxelLandRefWorldHigh minus VoxelLandRefWorldLow (cm; a float vector, precise near the camera);
-// RefLocalHigh, RefLocalLow = VoxelLandRefLocalHigh and VoxelLandRefLocalLow (the same reference
-// point in the planet's frame, double-float cm); AxisX, AxisY, AxisZ = VoxelLandAxisX/Y/Z (the
-// planet frame's axes in world); Params = VoxelLandParams (x the debug view, voxel.Debug.LandView;
-// y the surface tolerance, m, and w its growth per metre of pixel footprint: the normal fades to
-// the mesh's beyond y + w x footprint off the analytic surface; z 1 when the land textures are
-// bound and the frame is known, else 0: the node then reads nothing. The parameter's default in
-// the material must be (0, 2, 0, 16), so an instance the terrain didn't set stays off).
+// sets them); OriginHigh, OriginLow = VoxelLandOriginHigh and VoxelLandOriginLow (the planet's
+// origin in world, double-float cm); AxisX, AxisY, AxisZ = VoxelLandAxisX/Y/Z (the planet frame's
+// axes in world) and AxisXLow, AxisYLow, AxisZLow = VoxelLandAxisXLow/YLow/ZLow (their
+// double-float remainders); Params = VoxelLandParams (x the debug view, voxel.Debug.LandView; y the surface
+// tolerance, m, and w its growth per metre of pixel footprint: the normal fades to the mesh's
+// beyond y + w x footprint off the analytic surface; z 1 when the land textures are bound, else
+// 0: the node then reads nothing. The parameter's default in the material must be (0, 2, 0, 16),
+// so an instance the terrain didn't set stays off).
+//
+// The pixel's position comes from the view itself (VOXEL_LAND_TRANSLATED_WORLD_POSITION and
+// VOXEL_LAND_PRE_VIEW_TRANSLATION_*, below: the engine's translated world position and the
+// view's pre-view translation), exact for every view at any distance from the world origin.
 //
 // Custom node code:
-//   return VoxelLandMaterial(Parameters, HeightTex, FieldTex, ConstTex, ToPixel, RefLocalHigh, RefLocalLow, AxisX, AxisY, AxisZ, Params, Height, NormalWS, NormalTS, Fields, Terms, DebugMask);
+//   return VoxelLandMaterial(Parameters, HeightTex, FieldTex, ConstTex, OriginHigh, OriginLow, AxisX, AxisY, AxisZ, AxisXLow, AxisYLow, AxisZLow, Params, Height, NormalWS, NormalTS, Fields, Terms, DebugMask);
 //
 // The gullies' and the detail's share of the normal needs screen-space derivatives: other stages
 // that compile the material's pixel inputs (ray-tracing hit shaders) get the bake's gradient
@@ -52,6 +55,17 @@
 #include "/Plugin/VoxelPlugin/Private/VoxelDensitySample.ush"
 #include "/Plugin/VoxelPlugin/Private/VoxelLandDebugPalette.ush"
 #include "/Plugin/VoxelPlugin/Private/VoxelLandDebugColor.ush"
+
+// The engine's view of the pixel (UE 5.4 and later: double-float pre-view translation). The
+// translated world position is world plus the pre-view translation (the camera's negative):
+// small near the camera, so a float holds it exactly enough.
+#ifndef VOXEL_LAND_TRANSLATED_WORLD_POSITION
+#define VOXEL_LAND_TRANSLATED_WORLD_POSITION(Parameters) ((Parameters).WorldPosition_CamRelative)
+#endif
+#ifndef VOXEL_LAND_PRE_VIEW_TRANSLATION_HIGH
+#define VOXEL_LAND_PRE_VIEW_TRANSLATION_HIGH (ResolvedView.PreViewTranslation.High)
+#define VOXEL_LAND_PRE_VIEW_TRANSLATION_LOW (ResolvedView.PreViewTranslation.Low)
+#endif
 
 // Screen-space derivatives exist in pixel shaders only; the material's pixel inputs are also
 // compiled into other stages (ray-tracing hit shaders, for one), which get the bake's gradient
@@ -157,13 +171,13 @@ float3 VoxelLandPixelColor(VOXEL_LAND_ARGS_DECL FVoxelLandPixel Pixel, float3 No
 }
 
 /** The pixel's footprint (cm): the larger screen-space step of its position; outside pixel
- *  shaders a thousandth of its distance to the reference point (about a pixel at 1080p). */
-float VoxelLandPixelFootprint(float3 Local, float3 DdxLocal, float3 DdyLocal)
+ *  shaders a thousandth of its distance to the camera (about a pixel at 1080p). */
+float VoxelLandPixelFootprint(float3 TranslatedWorld, float3 DdxLocal, float3 DdyLocal)
 {
 #if VOXEL_LAND_HAS_DERIVATIVES
     return max(length(DdxLocal), length(DdyLocal));
 #else
-    return max(length(Local) * 1.0e-3f, 1.0f);
+    return max(length(TranslatedWorld) * 1.0e-3f, 1.0f);
 #endif
 }
 
@@ -174,19 +188,19 @@ float VoxelLandPixelFootprint(float3 Local, float3 DdxLocal, float3 DdyLocal)
     Fields = float4(0.0f, 0.0f, 0.0f, 0.0f); \
     Terms = float4(0.0f, 0.0f, 0.0f, 0.0f); \
     DebugMask = 0.0f; \
-    /* Off (no land textures bound, the noise surface; or no view rendered yet): the mesh keeps */ \
-    /* its normal, and the vertex colours carry the debug views where the node isn't bound. */ \
+    /* Off (no land textures bound: the noise surface, or a material instance the terrain */ \
+    /* didn't set): the mesh keeps its normal, and the vertex colours carry the debug views. */ \
     if (Params.z < 0.5f) return float3(0.0f, 0.0f, 0.0f); \
-    /* The pixel in the planet's frame: the reference point (double-float) plus the pixel's */ \
-    /* offset from it, rotated from world. */ \
-    const float3 Local = float3(dot(ToPixel, AxisX), dot(ToPixel, AxisY), dot(ToPixel, AxisZ)); \
-    const float2 PX = VoxelDFAdd(float2(RefLocalHigh.x, RefLocalLow.x), float2(Local.x, 0.0f)); \
-    const float2 PY = VoxelDFAdd(float2(RefLocalHigh.y, RefLocalLow.y), float2(Local.y, 0.0f)); \
-    const float2 PZ = VoxelDFAdd(float2(RefLocalHigh.z, RefLocalLow.z), float2(Local.z, 0.0f)); \
-    const float3 DdxLocal = VOXEL_LAND_DDX(Local); \
-    const float3 DdyLocal = VOXEL_LAND_DDY(Local); \
-    const float Footprint = VoxelLandPixelFootprint(Local, DdxLocal, DdyLocal); \
-    const FVoxelLandPixel Pixel = VoxelLandPixel(HeightTex, FieldTex, ConstTex, PX, PY, PZ, DdxLocal, DdyLocal, Footprint); \
+    /* The pixel in the planet's frame (double-float), and its screen-space steps there. */ \
+    const float3 TranslatedWorld = VOXEL_LAND_TRANSLATED_WORLD_POSITION(Parameters); \
+    const FVoxelLandFramePoint Point = VoxelLandFramePoint(TranslatedWorld, VOXEL_LAND_PRE_VIEW_TRANSLATION_HIGH, \
+        VOXEL_LAND_PRE_VIEW_TRANSLATION_LOW, OriginHigh, OriginLow, AxisX, AxisY, AxisZ, AxisXLow, AxisYLow, AxisZLow); \
+    const float3 DdxWorld = VOXEL_LAND_DDX(TranslatedWorld); \
+    const float3 DdyWorld = VOXEL_LAND_DDY(TranslatedWorld); \
+    const float3 DdxLocal = float3(dot(DdxWorld, AxisX), dot(DdxWorld, AxisY), dot(DdxWorld, AxisZ)); \
+    const float3 DdyLocal = float3(dot(DdyWorld, AxisX), dot(DdyWorld, AxisY), dot(DdyWorld, AxisZ)); \
+    const float Footprint = VoxelLandPixelFootprint(TranslatedWorld, DdxLocal, DdyLocal); \
+    const FVoxelLandPixel Pixel = VoxelLandPixel(HeightTex, FieldTex, ConstTex, Point.X, Point.Y, Point.Z, DdxLocal, DdyLocal, Footprint); \
     Height = Pixel.Height; \
     Fields = Pixel.Fields; \
     Terms = Pixel.Terms; \
@@ -204,7 +218,7 @@ float VoxelLandPixelFootprint(float3 Local, float3 DdxLocal, float3 DdyLocal)
     return VoxelLandViewSrgbToLinear(VoxelLandPixelColor(HeightTex, FieldTex, ConstTex, Pixel, Shown, ToMesh, Footprint, Mode));
 
 float3 VoxelLandMaterial(FMaterialPixelParameters Parameters, Texture2D HeightTex, Texture2D FieldTex, Texture2D ConstTex,
-    float3 ToPixel, float3 RefLocalHigh, float3 RefLocalLow, float3 AxisX, float3 AxisY, float3 AxisZ, float4 Params,
+    float3 OriginHigh, float3 OriginLow, float3 AxisX, float3 AxisY, float3 AxisZ, float3 AxisXLow, float3 AxisYLow, float3 AxisZLow, float4 Params,
     out float Height, out float3 NormalWS, out float3 NormalTS, out float4 Fields, out float4 Terms, out float DebugMask)
 {
     VOXEL_LAND_MATERIAL_BODY

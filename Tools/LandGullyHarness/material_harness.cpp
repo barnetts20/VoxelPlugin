@@ -137,5 +137,79 @@ int main(int argc, char** argv)
         }
     }
     printf("land chain through the material's accessors against the global shaders': %d of %d points differ in any bit; %d debug colours out of range\n", Mismatch, Count, ColorBad);
+
+    // The pixel's planet-frame position from the view (VoxelLandFramePoint), against doubles:
+    // planets anywhere within 10^9 cm of the world origin, rotated, cameras near their surface.
+    {
+        std::mt19937 R2(41);
+        std::uniform_real_distribution<double> U(-1.0, 1.0);
+        double WorstFloatAxes = 0, WorstTrue = 0;
+        for (int i = 0; i < 20000; i++)
+        {
+            const double Origin[3] = { U(R2) * 1e9, U(R2) * 1e9, U(R2) * 1e9 };
+            // A random rotation: axes from a random unit quaternion.
+            double Qt[4] = { U(R2), U(R2), U(R2), U(R2) }; const double Ql = std::sqrt(Qt[0]*Qt[0]+Qt[1]*Qt[1]+Qt[2]*Qt[2]+Qt[3]*Qt[3]);
+            for (double& q : Qt) q /= Ql;
+            const double w = Qt[0], x = Qt[1], y = Qt[2], z = Qt[3];
+            const double Ax[3][3] = { { 1 - 2*(y*y+z*z), 2*(x*y+w*z), 2*(x*z-w*y) }, { 2*(x*y-w*z), 1 - 2*(x*x+z*z), 2*(y*z+w*x) }, { 2*(x*z+w*y), 2*(y*z-w*x), 1 - 2*(x*x+y*y) } };
+            double Dir[3] = { U(R2), U(R2), U(R2) }; Normalize(Dir);
+            double Cam[3], Pix[3];
+            for (int a = 0; a < 3; a++) { Cam[a] = Origin[a] + Dir[a] * (P.SeaRadius + 3e5); }
+            const double Off[3] = { U(R2) * 1e5, U(R2) * 1e5, U(R2) * 1e5 };
+            for (int a = 0; a < 3; a++) Pix[a] = Cam[a] + Off[a];
+            float TW[3], PH[3], PL[3], OH[3], OL[3], AF[3][3], AL[3][3];
+            for (int a = 0; a < 3; a++)
+            {
+                const double Pv = -Cam[a];
+                PH[a] = (float)Pv; PL[a] = (float)(Pv - (double)PH[a]);
+                OH[a] = (float)Origin[a]; OL[a] = (float)(Origin[a] - (double)OH[a]);
+                TW[a] = (float)(Pix[a] + Pv);
+                for (int b = 0; b < 3; b++) { AF[a][b] = (float)Ax[a][b]; AL[a][b] = (float)(Ax[a][b] - (double)AF[a][b]); }
+            }
+            double Out[3];
+            MaterialFramePoint(TW, PH, PL, OH, OL, AF[0], AF[1], AF[2], AL[0], AL[1], AL[2], Out);
+            for (int a = 0; a < 3; a++)
+            {
+                // The world position the GPU has: the translated float, back in world.
+                double ExactF = 0, ExactT = 0;
+                for (int b = 0; b < 3; b++)
+                {
+                    const double Dw = ((double)TW[b] - ((double)PH[b] + PL[b])) - Origin[b];
+                    ExactF += Dw * ((double)AF[a][b] + AL[a][b]);
+                    ExactT += Dw * Ax[a][b];
+                }
+                WorstFloatAxes = std::max(WorstFloatAxes, std::fabs(Out[a] - ExactF));
+                WorstTrue = std::max(WorstTrue, std::fabs(Out[a] - ExactT));
+            }
+        }
+        printf("pixel in the planet frame from the view: worst %.2g cm against its double-float axes in doubles, %.2g cm against the exact rotation\n",
+            WorstFloatAxes, WorstTrue);
+    }
+
+    // Close up: Gully + Detail along tangent lines in 1 cm steps at a 1 cm footprint, the
+    // material's path against the global one (a staircase there is what screen-space
+    // derivatives turn into speckle).
+    for (int Line = 0; Line < 4; Line++)
+    {
+        double D[3] = { 0.013 + 0.31 * Line, 0.021 - 0.17 * Line, 1.0 - 0.2 * Line }; Normalize(D);
+        double E1[3], E2[3]; Frame(D, E1, E2);
+        float Worst = 0; int Flat = 0, Steps = 0; double SumD2A = 0, SumD2B = 0;
+        float PrevA = 0, PrevB = 0, PrevA2 = 0, PrevB2 = 0;
+        for (int k = 0; k < 2000; k++)
+        {
+            double Q[3]; for (int a = 0; a < 3; a++) Q[a] = D[a] * P.SeaRadius + E1[a] * (k * 1.0);
+            const float2 X = DF(Q[0]), Y = DF(Q[1]), Z = DF(Q[2]);
+            const VoxelShader::FVoxelLandHeight A = VoxelShader::VoxelLandHeightDF(X, Y, Z, 1.0f, true);
+            const float XA[2] = { X.x, X.y }, YA[2] = { Y.x, Y.y }, ZA[2] = { Z.x, Z.y };
+            const FMaterialHeight B = MaterialLandHeight(Tex, XA, YA, ZA, 1.0f, true);
+            const float RA = A.Gully + A.Detail, RB = B.Gully + B.Detail;
+            Worst = std::max(Worst, std::fabs(RA - RB));
+            if (k > 0) { Steps++; Flat += RB == PrevB; }
+            if (k > 1) { const double a2 = RA - 2 * PrevA + PrevA2, b2 = RB - 2 * PrevB + PrevB2; SumD2A += a2 * a2; SumD2B += b2 * b2; }
+            PrevA2 = PrevA; PrevB2 = PrevB; PrevA = RA; PrevB = RB;
+        }
+        printf("close-up line %d (up %.2f %.2f %.2f): gully+detail worst difference %.4f m, %d of %d 1 cm steps unchanged, rms 2nd difference %.3g mm (global %.3g mm)\n",
+            Line, D[0], D[1], D[2], Worst, Flat, Steps, 1000 * std::sqrt(SumD2B / (Steps - 1)), 1000 * std::sqrt(SumD2A / (Steps - 1)));
+    }
     return Mismatch || AttrBad || WaterBad || OctBad || ColorBad ? 1 : 0;
 }

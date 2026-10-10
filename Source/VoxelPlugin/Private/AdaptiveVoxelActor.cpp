@@ -333,18 +333,10 @@ void AAdaptiveVoxelActor::OnWorldPostActorTick(UWorld* World, ELevelTick TickTyp
 void AAdaptiveVoxelActor::UpdateLandMaterial()
 {
     if (!LandMaterialInstance) return;
-    // The reference point: the camera the last frame rendered from (any point near the pixels
-    // keeps their offsets small; the editor's viewports count, ticking or not).
-    const UWorld* World = GetWorld();
-    if (World && World->ViewLocationsRenderedLastFrame.Num() > 0)
-    {
-        LandReferenceWorld = World->ViewLocationsRenderedLastFrame[0];
-        bHasLandReference = true;
-    }
-    // Until a view exists the node stays off: from the planet's centre the pixels' offsets
-    // would be too large for floats.
-    VoxelLandMaterial::SetFrameParameters(LandMaterialInstance, FTransform(GetActorRotation(), GetActorLocation()), LandReferenceWorld,
-        FVoxelBrickTerrain::GetMaterialLandView(), LandSurfaceTolerance, bLandMaterialBound && bHasLandReference);
+    // The planet's frame as it renders this frame (every actor has moved); the material places
+    // each pixel from its own view.
+    VoxelLandMaterial::SetFrameParameters(LandMaterialInstance, FTransform(GetActorRotation(), GetActorLocation()),
+        FVoxelBrickTerrain::GetMaterialLandView(), LandSurfaceTolerance, bLandMaterialBound);
 }
 
 void AAdaptiveVoxelActor::SetDebugSeaRadius(double InSeaRadius)

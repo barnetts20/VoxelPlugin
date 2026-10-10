@@ -22,13 +22,14 @@ namespace VoxelLandMaterial
     VOXELPLUGIN_API extern const FName HeightTextureName;      // VoxelLandHeight (texture)
     VOXELPLUGIN_API extern const FName FieldTextureName;       // VoxelLandFields (texture)
     VOXELPLUGIN_API extern const FName ConstantTextureName;    // VoxelLandConstants (texture)
-    VOXELPLUGIN_API extern const FName RefWorldHighName;       // VoxelLandRefWorldHigh (vector, world cm)
-    VOXELPLUGIN_API extern const FName RefWorldLowName;        // VoxelLandRefWorldLow
-    VOXELPLUGIN_API extern const FName RefLocalHighName;       // VoxelLandRefLocalHigh (vector, planet frame cm)
-    VOXELPLUGIN_API extern const FName RefLocalLowName;        // VoxelLandRefLocalLow
+    VOXELPLUGIN_API extern const FName OriginHighName;         // VoxelLandOriginHigh (vector: the planet's origin in world, cm)
+    VOXELPLUGIN_API extern const FName OriginLowName;          // VoxelLandOriginLow (its double-float remainder)
     VOXELPLUGIN_API extern const FName AxisXName;              // VoxelLandAxisX (vector: the planet frame's X in world)
     VOXELPLUGIN_API extern const FName AxisYName;              // VoxelLandAxisY
     VOXELPLUGIN_API extern const FName AxisZName;              // VoxelLandAxisZ
+    VOXELPLUGIN_API extern const FName AxisXLowName;           // VoxelLandAxisXLow (the axes' double-float remainders)
+    VOXELPLUGIN_API extern const FName AxisYLowName;           // VoxelLandAxisYLow
+    VOXELPLUGIN_API extern const FName AxisZLowName;           // VoxelLandAxisZLow
     VOXELPLUGIN_API extern const FName ParamsName;             // VoxelLandParams (x view, y tolerance m, z enabled, w tolerance growth)
 
     /** The field texels of a bake (Side x 6 Side, the bake's cell order). Any thread. */
@@ -55,10 +56,11 @@ namespace VoxelLandMaterial
     VOXELPLUGIN_API void SetTextureParameters(UMaterialInstanceDynamic* Material, UTexture2DDynamic* Height, UTexture2DDynamic* Fields,
         UTexture2DDynamic* Constants);
 
-    /** Game thread, every frame: the reference point (a world position near the camera) in
-     *  world and in the planet's frame (PlanetFrame: the planet's location and rotation, no
-     *  scale), the frame's axes, the debug view and the surface tolerance (m). bEnabled false
-     *  turns the node off (it then reads no texture and leaves the mesh's normal). */
-    VOXELPLUGIN_API void SetFrameParameters(UMaterialInstanceDynamic* Material, const FTransform& PlanetFrame, const FVector& ReferenceWorld,
+    /** Game thread, every frame: the planet's frame (PlanetFrame: its location and rotation, no
+     *  scale) as its origin and axes (double-float), the debug view and the surface tolerance
+     *  (m). The material places each pixel from its own view, so no camera is needed here.
+     *  bEnabled false turns the node off (it then reads no texture and leaves the mesh's
+     *  normal). */
+    VOXELPLUGIN_API void SetFrameParameters(UMaterialInstanceDynamic* Material, const FTransform& PlanetFrame,
         int32 View, double Tolerance, bool bEnabled);
 }

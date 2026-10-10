@@ -10,7 +10,17 @@
 namespace VoxelShader
 {
 #include "VoxelDensityCore.ush"
+#ifdef VOXEL_FASTMATH_TEST
+    // HLSL's precise under fast math (the material's compile): the double-float steps exact,
+    // everything else as a fast-math compiler may rearrange it.
+#undef VOXEL_FUNC
+#define VOXEL_FUNC __attribute__((optimize("no-fast-math"), noinline))
+#endif
 #include "VoxelDF64.ush"
+#ifdef VOXEL_FASTMATH_TEST
+#undef VOXEL_FUNC
+#define VOXEL_FUNC inline
+#endif
 #include "VoxelCubeSphere.ush"
 
     struct float4
@@ -90,4 +100,12 @@ void MaterialDebugColor(const FMaterialTextures& T, uint32_t Mode, const FMateri
     const float3 Color = VoxelLandDebugColor(H, F, C, In);
     Out[0] = Color.x; Out[1] = Color.y; Out[2] = Color.z;
     (void)CellMOf;
+}
+
+void MaterialFramePoint(const float TW[3], const float PH[3], const float PL[3], const float OH[3], const float OL[3],
+    const float AX[3], const float AY[3], const float AZ[3], const float AXL[3], const float AYL[3], const float AZL[3], double Out[3])
+{
+    auto V = [](const float* A) { return float3(A[0], A[1], A[2]); };
+    const FVoxelLandFramePoint P = VoxelLandFramePoint(V(TW), V(PH), V(PL), V(OH), V(OL), V(AX), V(AY), V(AZ), V(AXL), V(AYL), V(AZL));
+    Out[0] = (double)P.X.x + P.X.y; Out[1] = (double)P.Y.x + P.Y.y; Out[2] = (double)P.Z.x + P.Z.y;
 }
