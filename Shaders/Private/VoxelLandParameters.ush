@@ -1,0 +1,19 @@
+// VoxelLandParameters.ush - The land bake's shader inputs (FVoxelLandShaderParameters in
+// VoxelLandGPU.h), for passes that evaluate the density. Include before VoxelLandSample.ush
+// and VoxelDensitySample.ush.
+
+#ifndef VOXEL_LAND_PARAMETERS_USH
+#define VOXEL_LAND_PARAMETERS_USH
+
+uint LandMode;                          // 0 the noise surface, 1 the terrestrial generator
+StructuredBuffer<float> LandHeight;     // VoxelLandSample.ush
+StructuredBuffer<float2> LandTanTable;
+uint LandN;
+uint LandPad;
+uint LandWarpOctaves;                   // per warp component, after the detail octaves
+float LandWarpInvNorm;
+float LandWarpAmplitude;                // cm
+float LandDetailAmplitude;              // cm
+float2 LandHeightOffset;                // cm (double-float): sea-level heights to heights above PlanetRadius
+
+#endif // VOXEL_LAND_PARAMETERS_USH

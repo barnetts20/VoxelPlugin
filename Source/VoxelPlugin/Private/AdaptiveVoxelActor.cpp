@@ -233,6 +233,13 @@ void AAdaptiveVoxelActor::SetSurfaceMaterial(UMaterialInterface* InMaterial)
         BrickTerrain->SetMaterial(SurfaceMaterial);
 }
 
+void AAdaptiveVoxelActor::SetDebugSeaRadius(double InSeaRadius)
+{
+    DebugSeaRadius = FMath::Max(InSeaRadius, 0.0);
+    if (BrickTerrain.IsValid())
+        BrickTerrain->SetDebugSeaRadius(DebugSeaRadius);
+}
+
 void AAdaptiveVoxelActor::Initialize()
 {
     Initialized = false;
@@ -357,6 +364,7 @@ void AAdaptiveVoxelActor::InitializeBrickTerrain(double RootExtent)
     Settings.SlopeBound = CollisionSlopeBound;
     Settings.TriplanarUVScale = 0.0001 * (80000000.0 / FMath::Max(GetActorScale3D().GetMax(), 1.0));
     Settings.Material = SurfaceMaterial;
+    Settings.DebugSeaRadius = DebugSeaRadius;
     // The plugin's collection when none is assigned (the planet spawns this actor).
     if (!BrickMorphParameters)
         BrickMorphParameters = Cast<UMaterialParameterCollection>(StaticLoadObject(UMaterialParameterCollection::StaticClass(), nullptr,

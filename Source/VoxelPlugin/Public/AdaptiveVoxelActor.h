@@ -213,7 +213,14 @@ public:
     UFUNCTION(BlueprintCallable, Category = "Terrain|Materials")
     void SetSurfaceMaterial(UMaterialInterface* InMaterial);
 
+    /** The sea radius the elevation debug view (voxel.Debug.LandView 1) measures heights from
+     *  (cm, actor space; 0: the density's own). The planet sets its ocean radius. */
+    void SetDebugSeaRadius(double InSeaRadius);
+
 protected:
+    /** SetDebugSeaRadius's value, for the brick terrain's settings. */
+    double DebugSeaRadius = 0.0;
+
     /** The density every terrain consumer samples (set by Initialize / InitializeFromPlanet). */
     TSharedPtr<FDensitySampleCompositor> DensityCompositor;
 

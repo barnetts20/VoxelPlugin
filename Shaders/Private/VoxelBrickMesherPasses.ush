@@ -62,9 +62,10 @@
 //                                           target position and normal, grandparent target
 //                                           position and normal, unstitched position and
 //                                           normal, level of the cell relative to the brick
-//                                           (0 or 1), pad, the next level's normal field at
-//                                           the unstitched position and the level after's
-//                                           at the parent target
+//                                           (0 or 1), the debug colour (0xRRGGBB as an exact
+//                                           float, VoxelLandDebug.ush), the next level's
+//                                           normal field at the unstitched position and the
+//                                           level after's at the parent target
 //   RWStructuredBuffer<uint> Indices;       NumBricks * TriangleCap * 3
 //   uint TargetHashSize (power of two);
 //   RWStructuredBuffer<uint> TargetState;   NumBricks * targets: 1 needed, 2 solved, 3 no
@@ -816,8 +817,10 @@ VOXEL_FUNC void VoxelMesherSolvePass(uint Id)
     Vertices[Base + 4u] = VertexNormal.y;
     Vertices[Base + 5u] = VertexNormal.z;
     // Floats 6 to 23 and 26 to 31 are written by VoxelMesherVertexTargetsPass for every vertex
-    // stored here; 25 is unused.
+    // stored here. 25 is the debug colour (0xRRGGBB as an exact float): white here, the land
+    // view's when one runs (VoxelLandDebug.ush).
     Vertices[Base + 24u] = float(Cell.Level);
+    Vertices[Base + 25u] = 16777215.0f;
     SlotVertex[Id] = V;
     const uint Targets = B * VoxelMesherNumTargets();
     const uint ParentSlot = VoxelMesherTargetOf(Cell);

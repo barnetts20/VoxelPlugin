@@ -39,6 +39,9 @@ StructuredBuffer<uint> EditFlags;
 uint EditNodeCount;
 int EditRootExtent;
 
+#include "/Plugin/VoxelPlugin/Private/VoxelCubeSphere.ush"
+#include "/Plugin/VoxelPlugin/Private/VoxelLandParameters.ush"
+#include "/Plugin/VoxelPlugin/Private/VoxelLandSample.ush"
 #include "/Plugin/VoxelPlugin/Private/VoxelDensitySample.ush"
 #include "/Plugin/VoxelPlugin/Private/VoxelEditSample.ush"
 

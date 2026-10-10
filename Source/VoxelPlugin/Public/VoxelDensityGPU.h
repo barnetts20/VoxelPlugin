@@ -7,6 +7,7 @@
 #include "CoreMinimal.h"
 
 class FSparseEditStore;
+struct FVoxelLandBake;
 
 /** A double as the shaders take it (VoxelDF64.ush): the nearest float and the remainder. */
 inline FVector2f VoxelDoubleFloat(double V)
@@ -53,6 +54,17 @@ struct FVoxelDensityGPUData
     float RidgeGain = 0.0f;
     float SlopeDamping = 0.0f;
     double MinFootprint = 0.0;   // footprints below it are raised to it, as on the CPU
+
+    // The terrestrial generator (VoxelLandSample.ush; LandMode 0 for the noise surface). The
+    // height is the bake's (m) plus the detail layer, offset to the height above PlanetRadius;
+    // the warp's three layers follow the detail octaves in Octaves.
+    uint32 LandMode = 0;
+    TSharedPtr<const FVoxelLandBake, ESPMode::ThreadSafe> Land;
+    uint32 LandWarpOctaves = 0;          // per warp component
+    float LandWarpInvNorm = 0.0f;
+    float LandWarpAmplitude = 0.0f;      // cm
+    float LandDetailAmplitude = 0.0f;    // cm
+    FVector2f LandHeightOffset = FVector2f::ZeroVector;   // cm, double-float
 };
 
 /** The sparse edit tree flattened for the GPU (VoxelEditSample.ush). */

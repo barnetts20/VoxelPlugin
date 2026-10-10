@@ -1,5 +1,6 @@
 #include "VoxelDensityGPU.h"
 #include "VoxelGPUCommon.h"
+#include "VoxelLandGPU.h"
 #include "VoxelPlugin.h"
 #include "FSparseEditStore.h"
 #include "GlobalShader.h"
@@ -50,6 +51,7 @@ public:
         SHADER_PARAMETER(FVector2f, DetailWeight)
         SHADER_PARAMETER(float, RidgeGain)
         SHADER_PARAMETER(float, SlopeDamping)
+        SHADER_PARAMETER_STRUCT_INCLUDE(FVoxelLandShaderParameters, Land)
     END_SHADER_PARAMETER_STRUCT()
 
     static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
@@ -120,6 +122,7 @@ void VoxelDensityGPU::SampleBlocksAsync(TSharedRef<const FVoxelDensityGPUData> D
             // Blocks write disjoint ranges, so their passes need no barrier between them.
             FRDGBufferUAVRef OutUAV = GraphBuilder.CreateUAV(OutBuffer, ERDGUnorderedAccessViewFlags::SkipBarrier);
             TShaderMapRef<FVoxelDensityCS> Shader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
+            const FVoxelLandShaderParameters Land = VoxelLandGPU::GetParameters(GraphBuilder, *Data);
 
             uint32 Offset = 0;
             for (const FVoxelDensityGPUBlock& Block : Blocks)
@@ -155,6 +158,7 @@ void VoxelDensityGPU::SampleBlocksAsync(TSharedRef<const FVoxelDensityGPUData> D
                 Parameters->DetailWeight = Data->DetailWeight;
                 Parameters->RidgeGain = Data->RidgeGain;
                 Parameters->SlopeDamping = Data->SlopeDamping;
+                Parameters->Land = Land;
                 FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("VoxelDensity %dx%dx%d", Block.Dim.X, Block.Dim.Y, Block.Dim.Z),
                     Shader, Parameters, FComputeShaderUtils::GetGroupCount(Block.Dim, FVoxelDensityCS::GroupSize));
                 Offset += (uint32)Block.NumPoints();

@@ -1,5 +1,6 @@
 // VoxelBrickMesherGPU.usf - The stitched brick mesher on the GPU (VoxelBrickMesherGPU.cpp).
-// The passes are VoxelBrickMesherPasses.ush; this file declares their inputs and entry points.
+// The passes are VoxelBrickMesherPasses.ush, and the land debug views' VoxelLandDebug.ush;
+// this file declares their inputs and entry points.
 
 #include "/Engine/Public/Platform.ush"
 #include "/Plugin/VoxelPlugin/Private/VoxelDensityCore.ush"
@@ -59,9 +60,33 @@ RWStructuredBuffer<float> TargetData;
 RWStructuredBuffer<uint> TargetHashKeys;
 RWStructuredBuffer<uint> TargetHashValues;
 
+#include "/Plugin/VoxelPlugin/Private/VoxelCubeSphere.ush"
+#include "/Plugin/VoxelPlugin/Private/VoxelLandParameters.ush"
+#include "/Plugin/VoxelPlugin/Private/VoxelLandSample.ush"
 #include "/Plugin/VoxelPlugin/Private/VoxelDensitySample.ush"
 #include "/Plugin/VoxelPlugin/Private/VoxelEditSample.ush"
 #include "/Plugin/VoxelPlugin/Private/VoxelBrickMesherPasses.ush"
+
+// The land debug views (VoxelLandDebug.ush; FVoxelLandDebugParameters): the view, the bake's
+// attributes, the sea radius, and the plate model's inputs (VoxelLandPlates.ush; the plates
+// view reads the plates and the seed).
+uint LandDebugMode;
+StructuredBuffer<uint> LandAttr;
+float2 LandDebugSeaRadius;
+StructuredBuffer<float> LandPlates;
+uint LandPlateCount;
+uint LandSeed;
+float LandRadiusM;
+float LandWidthScale;
+float LandReliefScale;
+float LandShelfDepth;
+float LandAbyssDepth;
+float LandCoastHeight;
+float LandInteriorHeight;
+
+#include "/Plugin/VoxelPlugin/Private/VoxelLandPlates.ush"
+#include "/Plugin/VoxelPlugin/Private/VoxelLandDebugPalette.ush"
+#include "/Plugin/VoxelPlugin/Private/VoxelLandDebug.ush"
 
 // Thread index over a 2D grid of 64-thread groups (GroupsX wide), so a pass can exceed 65535
 // groups.
@@ -116,4 +141,10 @@ void TargetSolveCS(uint3 GroupId : SV_GroupID, uint GroupThread : SV_GroupIndex)
 void VertexTargetsCS(uint3 GroupId : SV_GroupID, uint GroupThread : SV_GroupIndex)
 {
     VoxelMesherVertexTargetsPass(ThreadIndex(GroupId, GroupThread));
+}
+
+[numthreads(64, 1, 1)]
+void LandDebugCS(uint3 GroupId : SV_GroupID, uint GroupThread : SV_GroupIndex)
+{
+    VoxelLandDebugPass(ThreadIndex(GroupId, GroupThread));
 }

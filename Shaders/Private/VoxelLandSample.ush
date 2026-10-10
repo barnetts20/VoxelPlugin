@@ -1,0 +1,153 @@
+// VoxelLandSample.ush - Samples the land bake at a lattice point (Design/LandGen.md section
+// 7.1): the bake is a 6 x N^2 equal-angle cube-sphere grid of heights (m), each face padded by
+// LandPad cells on every side (the apron continues the face past its edges). The height is a
+// uniform cubic B-spline over the cells' centres (C2, a convex combination of the cells), and
+// across face edges and corners the faces' splines blend by smooth weights that form a
+// partition of unity, so the field is C2 everywhere and the same whichever face a sample
+// starts from.
+//
+// Precision: a point's position along a face axis is its angle from the face centre. Only the
+// fraction inside the B-spline segment needs to be exact, so the segment comes from a float
+// estimate and the fraction from the small angle between the point and the segment's start,
+// atan((a - a_j) / (1 + a a_j)), with a = u / n in double-float and a_j = tan of the centre's
+// angle from a double-float table: about 1e-7 cells, at any radius.
+//
+// Shared subset (VoxelShaderCompat.h). The C++ side includes it inside a struct whose members
+// have the names of the inputs below (VoxelDensity.cpp). Include after VoxelDensityCore.ush,
+// VoxelDF64.ush and VoxelCubeSphere.ush, and after declaring:
+//
+//   StructuredBuffer<float> LandHeight;      6 * (N + 2 Pad)^2 heights (m), face-major, rows of U
+//   StructuredBuffer<float2> LandTanTable;   N + 2 Pad double-float tan(pi s_i / 4), s_i the
+//                                            face coordinate of cell centre i - Pad
+//   uint LandN;
+//   uint LandPad;                            at least 4
+
+#ifndef VOXEL_LAND_SAMPLE_USH
+#define VOXEL_LAND_SAMPLE_USH
+
+#define VOXEL_LAND_HALF_PI 1.57079632679489662f
+#define VOXEL_LAND_INV_QUARTER_PI 1.27323954473516269f
+
+/** A face's weight along one axis: 1 inside, 0.5 on the edge, 0 one band beyond it (quintic,
+ *  so the blend is C2). */
+VOXEL_FUNC float VoxelLandFaceRamp(float S, float Band)
+{
+    const float X = saturate((1.0f + Band - abs(S)) / (2.0f * Band));
+    return X * X * X * (X * (X * 6.0f - 15.0f) + 10.0f);
+}
+
+/** A point's B-spline segment along one face axis: the cell whose centre starts it, and the
+ *  fraction from that centre to the next. */
+struct FVoxelLandAxis
+{
+    int Cell;
+    float Frac;
+};
+
+/** A is the axis's double-float tan of the point's angle (u / n), S its face coordinate as a
+ *  float estimate. */
+VOXEL_FUNC FVoxelLandAxis VoxelLandAxisAt(float2 A, float S)
+{
+    const float N = float(LandN);
+    int J = int(floor((S + 1.0f) * 0.5f * N - 0.5f));
+    J = max(min(J, int(LandN) + int(LandPad) - 3), 1 - int(LandPad));
+    const float2 AJ = LandTanTable[uint(J + int(LandPad))];
+    const float2 D = VoxelDFSub(A, AJ);
+    FVoxelLandAxis Out;
+    Out.Cell = J;
+    // Angle from centre J over the angle between centres (pi / 2N).
+    Out.Frac = atan((D.x + D.y) / (1.0f + A.x * AJ.x)) * (N / VOXEL_LAND_HALF_PI);
+    return Out;
+}
+
+struct FVoxelLandWeights
+{
+    float W0;
+    float W1;
+    float W2;
+    float W3;
+};
+
+/** Uniform cubic B-spline weights of the centres J - 1 .. J + 2 at fraction T past J. */
+VOXEL_FUNC FVoxelLandWeights VoxelLandBSpline(float T)
+{
+    const float T2 = T * T;
+    const float T3 = T2 * T;
+    const float U = 1.0f - T;
+    FVoxelLandWeights W;
+    W.W0 = U * U * U * (1.0f / 6.0f);
+    W.W1 = (3.0f * T3 - 6.0f * T2 + 4.0f) * (1.0f / 6.0f);
+    W.W2 = (-3.0f * T3 + 3.0f * T2 + 3.0f * T + 1.0f) * (1.0f / 6.0f);
+    W.W3 = T3 * (1.0f / 6.0f);
+    return W;
+}
+
+VOXEL_FUNC float VoxelLandWeightAt(FVoxelLandWeights W, uint K)
+{
+    return K == 0u ? W.W0 : (K == 1u ? W.W1 : (K == 2u ? W.W2 : W.W3));
+}
+
+/** One face's spline at the point's segments along U and V. */
+VOXEL_FUNC float VoxelLandFaceHeight(uint Face, FVoxelLandAxis U, FVoxelLandAxis V)
+{
+    const uint Side = LandN + 2u * LandPad;
+    const uint Base = Face * Side * Side;
+    const FVoxelLandWeights WU = VoxelLandBSpline(U.Frac);
+    const FVoxelLandWeights WV = VoxelLandBSpline(V.Frac);
+    const uint I0 = uint(U.Cell - 1 + int(LandPad));
+    const uint J0 = uint(V.Cell - 1 + int(LandPad));
+    // Summed relative to the segment's first centre: the weights add to 1, and small
+    // differences round far less than heights of kilometres.
+    const float Ref = LandHeight[Base + (J0 + 1u) * Side + I0 + 1u];
+    float Sum = 0.0f;
+    for (uint b = 0u; b < 4u; b++)
+    {
+        const uint Row = Base + (J0 + b) * Side + I0;
+        const float Line = WU.W0 * (LandHeight[Row] - Ref) + WU.W1 * (LandHeight[Row + 1u] - Ref)
+            + WU.W2 * (LandHeight[Row + 2u] - Ref) + WU.W3 * (LandHeight[Row + 3u] - Ref);
+        Sum += VoxelLandWeightAt(WV, b) * Line;
+    }
+    return Ref + Sum;
+}
+
+VOXEL_FUNC float2 VoxelLandPick(float2 X, float2 Y, float2 Z, uint Axis)
+{
+    return Axis == 0u ? X : (Axis == 1u ? Y : Z);
+}
+
+/** The bake's height (m) in the direction of the double-float point P (any length): each face
+ *  on P's side of the three axes, weighted by how far inside it P is. Interior points read one
+ *  face; within a cell of an edge two, of a corner three. */
+VOXEL_FUNC float VoxelLandBakeHeightDF(float2 PX, float2 PY, float2 PZ)
+{
+    const float Band = 2.0f / float(LandN);
+    float Sum = 0.0f;
+    float WSum = 0.0f;
+    float First = 0.0f;   // the first face's height: the others are summed relative to it
+    bool bFirst = true;
+    for (uint Axis = 0u; Axis < 3u; Axis++)
+    {
+        const float2 PN = VoxelLandPick(PX, PY, PZ, Axis);
+        if (PN.x == 0.0f) continue;
+        const bool bNegative = PN.x < 0.0f;
+        const uint Face = Axis * 2u + (bNegative ? 1u : 0u);
+        const float2 Den = bNegative ? float2(-PN.x, -PN.y) : PN;
+        const float2 AU = VoxelDFDiv(VoxelLandPick(PX, PY, PZ, VoxelCubeUAxis(Face)), Den);
+        const float2 AV = VoxelDFDiv(VoxelLandPick(PX, PY, PZ, VoxelCubeVAxis(Face)), Den);
+        const float S = atan(AU.x) * VOXEL_LAND_INV_QUARTER_PI;
+        const float T = atan(AV.x) * VOXEL_LAND_INV_QUARTER_PI;
+        const float W = VoxelLandFaceRamp(S, Band) * VoxelLandFaceRamp(T, Band);
+        if (W <= 0.0f) continue;
+        const float H = VoxelLandFaceHeight(Face, VoxelLandAxisAt(AU, S), VoxelLandAxisAt(AV, T));
+        if (bFirst)
+        {
+            First = H;
+            bFirst = false;
+        }
+        Sum += W * (H - First);
+        WSum += W;
+    }
+    return WSum > 0.0f ? First + Sum / WSum : 0.0f;
+}
+
+#endif // VOXEL_LAND_SAMPLE_USH

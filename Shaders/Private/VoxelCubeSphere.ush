@@ -1,0 +1,68 @@
+// VoxelCubeSphere.ush - The equal-angle cube-sphere mapping of VoxelCubeSphere.h, for shared
+// shader code (the land bake and its sampling). Shared subset (see VoxelShaderCompat.h): the
+// C++ side compiles this file too.
+//
+// Face f has an outward normal N along axis (f >> 1), negative for odd f, and axes U, V with
+// U x V = N:
+//   0: +X, U = +Y, V = +Z      1: -X, U = +Z, V = +Y
+//   2: +Y, U = +Z, V = +X      3: -Y, U = +X, V = +Z
+//   4: +Z, U = +X, V = +Y      5: -Z, U = +Y, V = +X
+// Face coordinates s, t in [-1, 1] map to normalize(N + tan(pi s / 4) U + tan(pi t / 4) V);
+// beyond [-1, 1] the same formula continues the face past its edges (used for aprons).
+
+#ifndef VOXEL_CUBE_SPHERE_USH
+#define VOXEL_CUBE_SPHERE_USH
+
+#ifndef VOXEL_FUNC
+#define VOXEL_FUNC
+#endif
+
+#define VOXEL_CUBE_QUARTER_PI 0.78539816339744831f
+
+VOXEL_FUNC uint VoxelCubeNormalAxis(uint Face)
+{
+    return Face >> 1u;
+}
+
+VOXEL_FUNC float VoxelCubeNormalSign(uint Face)
+{
+    return (Face & 1u) != 0u ? -1.0f : 1.0f;
+}
+
+VOXEL_FUNC uint VoxelCubeUAxis(uint Face)
+{
+    return Face == 0u ? 1u : (Face == 1u ? 2u : (Face == 2u ? 2u : (Face == 3u ? 0u : (Face == 4u ? 0u : 1u))));
+}
+
+VOXEL_FUNC uint VoxelCubeVAxis(uint Face)
+{
+    return Face == 0u ? 2u : (Face == 1u ? 1u : (Face == 2u ? 0u : (Face == 3u ? 2u : (Face == 4u ? 1u : 0u))));
+}
+
+VOXEL_FUNC float3 VoxelCubeAxisVector(uint Axis)
+{
+    return Axis == 0u ? float3(1.0f, 0.0f, 0.0f) : (Axis == 1u ? float3(0.0f, 1.0f, 0.0f) : float3(0.0f, 0.0f, 1.0f));
+}
+
+VOXEL_FUNC float VoxelCubeComponent(float3 P, uint Axis)
+{
+    return Axis == 0u ? P.x : (Axis == 1u ? P.y : P.z);
+}
+
+/** Unit direction of face coordinates (S, T), in float (bake cells; not for lattice points). */
+VOXEL_FUNC float3 VoxelCubeDirection(uint Face, float S, float T)
+{
+    const float3 N = VoxelCubeAxisVector(VoxelCubeNormalAxis(Face)) * VoxelCubeNormalSign(Face);
+    const float3 U = VoxelCubeAxisVector(VoxelCubeUAxis(Face));
+    const float3 V = VoxelCubeAxisVector(VoxelCubeVAxis(Face));
+    return normalize(N + U * tan(S * VOXEL_CUBE_QUARTER_PI) + V * tan(T * VOXEL_CUBE_QUARTER_PI));
+}
+
+/** Face coordinate of the centre of cell I (0 .. N - 1 inside the face, negative or N and up
+ *  in the apron) of a face with N cells per edge. */
+VOXEL_FUNC float VoxelCubeCellCentre(int I, uint N)
+{
+    return -1.0f + (2.0f * float(I) + 1.0f) / float(N);
+}
+
+#endif // VOXEL_CUBE_SPHERE_USH

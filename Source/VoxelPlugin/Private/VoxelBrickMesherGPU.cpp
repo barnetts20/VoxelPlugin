@@ -1,6 +1,7 @@
 #include "VoxelBrickMesherGPU.h"
 #include "VoxelDensityGPU.h"
 #include "VoxelGPUCommon.h"
+#include "VoxelLandGPU.h"
 #include "GlobalShader.h"
 #include "DataDrivenShaderPlatformInfo.h"
 #include "ShaderParameterStruct.h"
@@ -28,6 +29,7 @@ BEGIN_SHADER_PARAMETER_STRUCT(FVoxelMesherParameters, )
     SHADER_PARAMETER(FVector2f, DetailWeight)
     SHADER_PARAMETER(float, RidgeGain)
     SHADER_PARAMETER(float, SlopeDamping)
+    SHADER_PARAMETER_STRUCT_INCLUDE(FVoxelLandShaderParameters, Land)
     // Edits (VoxelEditSample.ush)
     SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<float>, EditCorners)
     SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<int>, EditChildren)
@@ -60,6 +62,8 @@ BEGIN_SHADER_PARAMETER_STRUCT(FVoxelMesherParameters, )
     SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<float>, TargetData)
     SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint>, TargetHashKeys)
     SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint>, TargetHashValues)
+    // Land debug views (VoxelLandDebug.ush)
+    SHADER_PARAMETER_STRUCT_INCLUDE(FVoxelLandDebugParameters, LandDebug)
 END_SHADER_PARAMETER_STRUCT()
 
 // One global shader per pass of VoxelBrickMesherPasses.ush, all on FVoxelMesherParameters.
@@ -89,6 +93,7 @@ VOXEL_MESHER_SHADER(FVoxelMesherTrianglesCS)
 VOXEL_MESHER_SHADER(FVoxelMesherTargetRequestCS)
 VOXEL_MESHER_SHADER(FVoxelMesherTargetSolveCS)
 VOXEL_MESHER_SHADER(FVoxelMesherVertexTargetsCS)
+VOXEL_MESHER_SHADER(FVoxelMesherLandDebugCS)
 #undef VOXEL_MESHER_SHADER
 
 IMPLEMENT_GLOBAL_SHADER(FVoxelMesherSampleCS, "/Plugin/VoxelPlugin/Private/VoxelBrickMesherGPU.usf", "SampleCS", SF_Compute);
@@ -99,6 +104,7 @@ IMPLEMENT_GLOBAL_SHADER(FVoxelMesherTrianglesCS, "/Plugin/VoxelPlugin/Private/Vo
 IMPLEMENT_GLOBAL_SHADER(FVoxelMesherTargetRequestCS, "/Plugin/VoxelPlugin/Private/VoxelBrickMesherGPU.usf", "TargetRequestCS", SF_Compute);
 IMPLEMENT_GLOBAL_SHADER(FVoxelMesherTargetSolveCS, "/Plugin/VoxelPlugin/Private/VoxelBrickMesherGPU.usf", "TargetSolveCS", SF_Compute);
 IMPLEMENT_GLOBAL_SHADER(FVoxelMesherVertexTargetsCS, "/Plugin/VoxelPlugin/Private/VoxelBrickMesherGPU.usf", "VertexTargetsCS", SF_Compute);
+IMPLEMENT_GLOBAL_SHADER(FVoxelMesherLandDebugCS, "/Plugin/VoxelPlugin/Private/VoxelBrickMesherGPU.usf", "LandDebugCS", SF_Compute);
 
 namespace VoxelBrickMesherGPUDetail
 {
@@ -229,7 +235,8 @@ VoxelBrickMesherGPU::FInputs VoxelBrickMesherGPU::UploadInputs(FRDGBuilder& Grap
 }
 
 VoxelBrickMesherGPU::FOutputs VoxelBrickMesherGPU::AddMesherPasses(FRDGBuilder& GraphBuilder, const FVoxelDensityGPUData& Density,
-    const FInputs& Inputs, const FVoxelBrickMesherGPUSettings& Settings, TConstArrayView<FVoxelMesherBrickGPU> Bricks, ERDGPassFlags PassFlags)
+    const FInputs& Inputs, const FVoxelBrickMesherGPUSettings& Settings, TConstArrayView<FVoxelMesherBrickGPU> Bricks, ERDGPassFlags PassFlags,
+    const FVoxelBrickMesherGPUDebugView& DebugView)
 {
     using namespace VoxelBrickMesherGPUDetail;
     check(Bricks.Num() > 0);
@@ -276,6 +283,7 @@ VoxelBrickMesherGPU::FOutputs VoxelBrickMesherGPU::AddMesherPasses(FRDGBuilder& 
     Template.DetailWeight = Density.DetailWeight;
     Template.RidgeGain = Density.RidgeGain;
     Template.SlopeDamping = Density.SlopeDamping;
+    Template.Land = VoxelLandGPU::GetParameters(GraphBuilder, Density);
     Template.EditCorners = GraphBuilder.CreateSRV(Inputs.EditCorners);
     Template.EditChildren = GraphBuilder.CreateSRV(Inputs.EditChildren);
     Template.EditFlags = GraphBuilder.CreateSRV(Inputs.EditFlags);
@@ -304,6 +312,11 @@ VoxelBrickMesherGPU::FOutputs VoxelBrickMesherGPU::AddMesherPasses(FRDGBuilder& 
     Template.TargetData = GraphBuilder.CreateUAV(MakeBuffer(4, NB * NumTargets * 6u, TEXT("Voxel.MesherTargetData")));
     Template.TargetHashKeys = GraphBuilder.CreateUAV(MakeBuffer(4, NB * Caps.TargetHashSize, TEXT("Voxel.MesherTargetHashKeys")));
     Template.TargetHashValues = GraphBuilder.CreateUAV(MakeBuffer(4, NB * Caps.TargetHashSize, TEXT("Voxel.MesherTargetHashValues")));
+    // The debug view's pass, when its shader is ready (it isn't part of AreShadersReady, so the
+    // terrain never waits for it).
+    FGlobalShaderMap* ShaderMap = GetGlobalShaderMap(GMaxRHIFeatureLevel);
+    const bool bDebugView = DebugView.Mode > 0 && ShaderMap && ShaderMap->GetShader(&FVoxelMesherLandDebugCS::GetStaticType(), 0).IsValid();
+    Template.LandDebug = VoxelLandGPU::GetDebugParameters(GraphBuilder, Density, bDebugView ? DebugView.Mode : 0, DebugView.SeaRadius);
 
     // Only the buffers whose zero means "empty" are cleared. HashValues and TargetHashValues
     // are set to unsampled by the thread that takes a slot (VoxelMesherRequest), and SlotVertex
@@ -331,6 +344,8 @@ VoxelBrickMesherGPU::FOutputs VoxelBrickMesherGPU::AddMesherPasses(FRDGBuilder& 
     AddMesherPass<FVoxelMesherSampleCS>(GraphBuilder, PassFlags, Template, 2u, NB * Caps.TargetHashSize, TEXT("Sample target gradients"));
     AddMesherPass<FVoxelMesherTargetSolveCS>(GraphBuilder, PassFlags, Template, 0u, NB * NumTargets, TEXT("Solve targets"));
     AddMesherPass<FVoxelMesherVertexTargetsCS>(GraphBuilder, PassFlags, Template, 0u, NB * NumSlots, TEXT("Vertex targets"));
+    if (bDebugView)
+        AddMesherPass<FVoxelMesherLandDebugCS>(GraphBuilder, PassFlags, Template, 0u, NB * Caps.VertexCap, TEXT("Land debug colours"));
     return Outputs;
 }
 

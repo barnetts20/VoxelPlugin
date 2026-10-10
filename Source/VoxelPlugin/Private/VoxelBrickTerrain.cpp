@@ -15,7 +15,14 @@
 #include "Engine/World.h"
 #include "Materials/MaterialParameterCollection.h"
 #include "Materials/MaterialParameterCollectionInstance.h"
+#include "Engine/Engine.h"
 #include "VoxelTerrainStats.h"
+#include "VoxelShaderCompat.h"
+
+namespace VoxelShader
+{
+#include "VoxelLandDebugPalette.ush"
+}
 
 DECLARE_CYCLE_STAT(TEXT("Bricks: tick"), STAT_VoxelBricksTick, STATGROUP_VoxelTerrain);
 DECLARE_CYCLE_STAT(TEXT("Bricks: drain task results"), STAT_VoxelBricksDrain, STATGROUP_VoxelTerrain);
@@ -29,7 +36,22 @@ DECLARE_DWORD_ACCUMULATOR_STAT(TEXT("Bricks wanted"), STAT_VoxelBricksWanted, ST
 
 TAutoConsoleVariable<int32> CVarVoxelDebugLevelColor(
     TEXT("voxel.Debug.LevelColor"), 0,
-    TEXT("1: vertex colour of newly meshed terrain bricks by level (the material must show vertex colour). 0: white."),
+    TEXT("1: vertex colour of the terrain bricks by level (the material must show vertex colour; a change meshes the terrain again). 0: white."),
+    ECVF_Default);
+
+TAutoConsoleVariable<int32> CVarVoxelDebugLandView(
+    TEXT("voxel.Debug.LandView"), 0,
+    TEXT("Colours the terrain by a component of the generator, in the vertex colour with alpha 0 (the terrain material must show it: see STAGE_L1b_NOTES.md). A change meshes the terrain again; a legend is on screen while a view is on.\n")
+    TEXT(" 0: off\n")
+    TEXT(" 1: elevation about sea level (hypsometric; 500 m bands on land, 1 km at sea, close up)\n")
+    TEXT(" 2: the bake's height alone (no detail layer)\n")
+    TEXT(" 3: the detail layer (blue down, red up, over its amplitude)\n")
+    TEXT(" 4: crust (oceanic blue to continental tan; the threshold yellow)\n")
+    TEXT(" 5: boundary class (red collision, orange arc range, purple trench, yellow island arc, cyan rift, green ridge)\n")
+    TEXT(" 6: plates (a hue each, brighter on continental crust)\n")
+    TEXT(" 7: slope (green flat, yellow 20 deg, red 45 deg, purple 60+)\n")
+    TEXT(" 8: the bake's cells (a checker in each cube face's colour)\n")
+    TEXT("2 to 6 and 8 need a terrestrial planet (magenta on the noise surface)."),
     ECVF_Default);
 
 static TAutoConsoleVariable<int32> CVarVoxelBrickPerf(
@@ -72,6 +94,9 @@ namespace VoxelBrickTerrainDetail
     constexpr int32 DescentChunk = 64;              // bricks per parallel batch of the descent (one density batch)
     constexpr double CommitWaitBlend = 0.5;          // filter of the commit wait
     constexpr double LatencyBlend = 0.5;             // filter of the measured tree latency
+    /** Bricks a debug-colour change meshes again per commit: the whole terrain in one commit
+     *  would need all of it in the mesh cache at once. */
+    constexpr int32 RemeshChunkBricks = 512;
 
     // Vectors of the morph collection (VoxelMorph.ush).
     const FName MorphCameraHighName(TEXT("VoxelMorphCameraHigh"));
@@ -401,6 +426,169 @@ FColor FVoxelBrickTerrain::LevelColor(int32 Level)
     return VBT::LevelColor(Level);
 }
 
+int32 FVoxelBrickTerrain::GetLandView()
+{
+    const int32 View = CVarVoxelDebugLandView.GetValueOnGameThread();
+    return View > 0 && View < (int32)VOXEL_LAND_VIEW_COUNT ? View : 0;
+}
+
+void FVoxelBrickTerrain::SetDebugSeaRadius(double InSeaRadius)
+{
+    if (Settings.DebugSeaRadius == InSeaRadius) return;
+    Settings.DebugSeaRadius = InSeaRadius;
+    Pages->SetDebugSeaRadius(InSeaRadius);
+    if (GetLandView() == (int32)VOXEL_LAND_VIEW_ELEVATION)
+        RemeshAll();
+}
+
+void FVoxelBrickTerrain::RemeshAll()
+{
+    RemeshQueue.Reset();
+    RemeshHead = 0;
+    for (const TPair<FVoxelBrickKey, FBrick>& Pair : Bricks)
+    {
+        if (Pair.Value.bInPage && Wanted.Contains(Pair.Key))
+            RemeshQueue.Add(Pair.Key);
+    }
+    // A pending commit's bricks may be meshed with the old colours already: staged again.
+    if (bCommitPending && PendingChanges.Num() > 0)
+        StagePending();
+}
+
+void FVoxelBrickTerrain::FeedRemesh()
+{
+    if (RemeshHead >= RemeshQueue.Num())
+    {
+        RemeshQueue.Reset();
+        RemeshHead = 0;
+        return;
+    }
+    // The next chunk once the previous one (or an edit, or a result) is committed.
+    if (bCommitPending || EditBacklog.Num() > 0) return;
+    int32 Added = 0;
+    while (RemeshHead < RemeshQueue.Num() && Added < VBT::RemeshChunkBricks)
+    {
+        const FVoxelBrickKey Key = RemeshQueue[RemeshHead++];
+        const FBrick* Brick = Bricks.Find(Key);
+        if (!Brick || !Brick->bInPage || !Wanted.Contains(Key)) continue;
+        EditBacklog.Add(Key);
+        Added++;
+    }
+}
+
+namespace VoxelBrickTerrainDetail
+{
+    /** The legend of a land view: a title, then one line per colour, each in its colour. */
+    struct FLegendLine
+    {
+        FString Text;
+        FColor Color;
+    };
+
+    FColor ToColor(const VoxelShader::float3& C)
+    {
+        return FColor((uint8)FMath::RoundToInt(FMath::Clamp(C.x, 0.0f, 1.0f) * 255.0f), (uint8)FMath::RoundToInt(FMath::Clamp(C.y, 0.0f, 1.0f) * 255.0f),
+            (uint8)FMath::RoundToInt(FMath::Clamp(C.z, 0.0f, 1.0f) * 255.0f));
+    }
+
+    TArray<FLegendLine> LandViewLegend(int32 View, bool bTerrestrial)
+    {
+        using namespace VoxelShader;
+        static const TCHAR* Names[VOXEL_LAND_VIEW_COUNT] = { TEXT("off"), TEXT("elevation"), TEXT("bake height"), TEXT("detail layer"),
+            TEXT("crust"), TEXT("boundary class"), TEXT("plates"), TEXT("slope"), TEXT("bake cells") };
+        TArray<FLegendLine> Lines;
+        Lines.Add({ FString::Printf(TEXT("voxel.Debug.LandView %d: %s (0 hides it; the terrain material must show vertex colour)"), View, Names[View]), FColor::White });
+        const bool bBakeView = View != (int32)VOXEL_LAND_VIEW_ELEVATION && View != (int32)VOXEL_LAND_VIEW_SLOPE;
+        if (bBakeView && !bTerrestrial)
+        {
+            Lines.Add({ TEXT("  needs a terrestrial planet (Shape > Generator): magenta here"), ToColor(VoxelLandViewNone()) });
+            return Lines;
+        }
+        auto Add = [&Lines](const TCHAR* Text, const float3& C) { Lines.Add({ FString(TEXT("  ")) + Text, ToColor(C) }); };
+        switch ((uint32)View)
+        {
+        case VOXEL_LAND_VIEW_ELEVATION:
+        case VOXEL_LAND_VIEW_BAKE:
+        {
+            static const float Heights[] = { -7000.0f, -3000.0f, -800.0f, -100.0f, 0.0f, 300.0f, 800.0f, 1500.0f, 2500.0f, 4000.0f, 6000.0f };
+            static const TCHAR* Labels[] = { TEXT("-7 km"), TEXT("-3 km"), TEXT("-800 m"), TEXT("-100 m (shelf)"), TEXT("0 m"), TEXT("300 m"),
+                TEXT("800 m"), TEXT("1.5 km"), TEXT("2.5 km"), TEXT("4 km"), TEXT("6 km and up") };
+            for (int32 i = 0; i < (int32)UE_ARRAY_COUNT(Heights); i++)
+                Add(Labels[i], VoxelLandViewHeight(Heights[i], 1.0e9f));
+            break;
+        }
+        case VOXEL_LAND_VIEW_DETAIL:
+            Add(TEXT("-1 (down by the full amplitude)"), VoxelLandViewSigned(-1.0f));
+            Add(TEXT("-0.5"), VoxelLandViewSigned(-0.5f));
+            Add(TEXT("0"), VoxelLandViewSigned(0.0f));
+            Add(TEXT("+0.5"), VoxelLandViewSigned(0.5f));
+            Add(TEXT("+1 (up; a quarter as strong under the sea)"), VoxelLandViewSigned(1.0f));
+            break;
+        case VOXEL_LAND_VIEW_CRUST:
+            Add(TEXT("0 oceanic"), VoxelLandViewCrust(0.0f));
+            Add(TEXT("0.25"), VoxelLandViewCrust(0.25f));
+            Add(TEXT("0.5 the threshold (coasts lie near it)"), VoxelLandViewCrust(0.5f));
+            Add(TEXT("0.75"), VoxelLandViewCrust(0.75f));
+            Add(TEXT("1 continental"), VoxelLandViewCrust(1.0f));
+            break;
+        case VOXEL_LAND_VIEW_CLASS:
+            Add(TEXT("no boundary (oceanic crust)"), VoxelLandViewClass(0u, 0.0f));
+            Add(TEXT("no boundary (continental crust)"), VoxelLandViewClass(0u, 1.0f));
+            Add(TEXT("collision range"), VoxelLandViewClass(1u, 0.0f));
+            Add(TEXT("arc range (ocean under a continent)"), VoxelLandViewClass(2u, 0.0f));
+            Add(TEXT("trench"), VoxelLandViewClass(3u, 0.0f));
+            Add(TEXT("island arc"), VoxelLandViewClass(4u, 0.0f));
+            Add(TEXT("rift"), VoxelLandViewClass(5u, 0.0f));
+            Add(TEXT("mid-ocean ridge"), VoxelLandViewClass(6u, 0.0f));
+            break;
+        case VOXEL_LAND_VIEW_PLATES:
+            for (uint32 p = 0; p < 4u; p++)
+                Add(*FString::Printf(TEXT("plate %u (continental crust)"), p), VoxelLandViewPlate(p, 1.0f));
+            Add(TEXT("plate 0 (oceanic crust): darker"), VoxelLandViewPlate(0u, 0.0f));
+            break;
+        case VOXEL_LAND_VIEW_SLOPE:
+            Add(TEXT("0 deg"), VoxelLandViewSlope(0.0f));
+            Add(TEXT("10 deg"), VoxelLandViewSlope(10.0f));
+            Add(TEXT("20 deg"), VoxelLandViewSlope(20.0f));
+            Add(TEXT("30 deg"), VoxelLandViewSlope(30.0f));
+            Add(TEXT("45 deg"), VoxelLandViewSlope(45.0f));
+            Add(TEXT("60 deg and up"), VoxelLandViewSlope(60.0f));
+            break;
+        case VOXEL_LAND_VIEW_CELLS:
+        {
+            static const TCHAR* Faces[] = { TEXT("face +X"), TEXT("face -X"), TEXT("face +Y"), TEXT("face -Y"), TEXT("face +Z"), TEXT("face -Z") };
+            for (uint32 f = 0; f < 6u; f++)
+                Add(Faces[f], VoxelLandViewFace(f));
+            Add(TEXT("alternate cells darker (close up)"), VoxelLandViewCell(0u, 1, 0, 1.0f));
+            break;
+        }
+        default:
+            break;
+        }
+        return Lines;
+    }
+}
+
+void FVoxelBrickTerrain::TickDebugViews()
+{
+    const int32 View = GetLandView();
+    const int32 Level = CVarVoxelDebugLevelColor.GetValueOnGameThread() > 0 ? 1 : 0;
+    if (View != LastLandView || Level != LastLevelColor)
+    {
+        LastLandView = View;
+        LastLevelColor = Level;
+        RemeshAll();
+    }
+    FeedRemesh();
+    if (View == 0 || !GEngine || !GPUDensity.IsValid()) return;
+    // One key per line, shared by every terrain (they show the same legend).
+    const bool bTerrestrial = GPUDensity->LandMode != 0;
+    const TArray<VBT::FLegendLine> Lines = VBT::LandViewLegend(View, bTerrestrial);
+    constexpr uint64 KeyBase = 0x564f584c56000000ull;   // "VOXLV"
+    for (int32 i = 0; i < Lines.Num(); i++)
+        GEngine->AddOnScreenDebugMessage(KeyBase + (uint64)i, 0.25f, Lines[i].Color, Lines[i].Text, false);
+}
+
 void FVoxelBrickTerrain::DecodeSignature(uint64 Signature, int8 (&OutLevels)[27], uint32& OutMeshed)
 {
     OutLevels[13] = 0;
@@ -475,6 +663,11 @@ void FVoxelBrickTerrain::Reset()
     EditBacklog.Reset();
     TargetBacklog.Reset();
     EditBacklogSequence = 0;
+    // The terrain is meshed from scratch with the current debug colours.
+    RemeshQueue.Reset();
+    RemeshHead = 0;
+    LastLandView = GetLandView();
+    LastLevelColor = CVarVoxelDebugLevelColor.GetValueOnGameThread() > 0 ? 1 : 0;
     FScopeLock Lock(&ResultCS);
     Results.Reset();
 }
@@ -706,6 +899,7 @@ void FVoxelBrickTerrain::Tick(const FVector& Camera)
     LastTickTime = Now;
     LastCamera = Camera;
     if (!bAvailable) return;
+    TickDebugViews();
 
     // Each section timed for voxel.Debug.BrickPerf.
     double Mark = FPlatformTime::Seconds();

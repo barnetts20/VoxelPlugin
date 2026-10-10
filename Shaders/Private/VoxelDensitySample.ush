@@ -2,10 +2,16 @@
 // what FVoxelDensityCPU::Sample computes in double, for the GPU. Shared subset (see
 // VoxelShaderCompat.h), so the C++ tests run it against the CPU backend.
 //
-// Include after VoxelDensityCore.ush and VoxelDF64.ush, and after declaring the inputs
-// below (shader parameters on the GPU, globals in the C++ tests). Octave tables and every
-// constant come from FVoxelDensityCPU::BuildGPUData, so both backends evaluate the same
-// octaves with the same seeds, offsets, amplitudes and band limits.
+// Include after VoxelDensityCore.ush, VoxelDF64.ush, VoxelCubeSphere.ush,
+// VoxelLandParameters.ush and VoxelLandSample.ush, and after declaring the inputs below
+// (shader parameters on the GPU, globals in the C++ tests). Octave tables and every constant
+// come from FVoxelDensityCPU::BuildGPUData, so both backends evaluate the same octaves with
+// the same seeds, offsets, amplitudes and band limits.
+//
+// With LandMode 1 (the terrestrial generator) the height is the land bake's
+// (VoxelLandSample.ush) through the sampling warp, plus the detail layer, offset to the height
+// above PlanetRadius (FVoxelDensityCPU::LandHeightAt); the continent and mountain layers are
+// empty and the warp's octaves follow the detail's.
 //
 //   StructuredBuffer<FVoxelOctave> Octaves;      continent, mountain, then detail octaves
 //   uint ContinentOctaves, MountainOctaves, DetailOctaves;
@@ -91,17 +97,49 @@ VOXEL_FUNC float VoxelSampleDensityDF(int IndexX, int IndexY, int IndexZ, float 
         const float2 SPY = VoxelDFMul(PY, Scale);
         const float2 SPZ = VoxelDFMul(PZ, Scale);
 
-        const float2 C = VoxelDFMul(VoxelLayerSumDF(0u, ContinentOctaves, VoxelLayerPlain, SPX, SPY, SPZ, Footprint), InvNormContinent);
-        const float2 R = VoxelDFMul(VoxelLayerSumDF(ContinentOctaves, MountainOctaves, VoxelLayerRidged, SPX, SPY, SPZ, Footprint), InvNormMountain);
-        const float2 D = VoxelDFMul(VoxelLayerSumDF(ContinentOctaves + MountainOctaves, DetailOctaves, VoxelLayerDamped, SPX, SPY, SPZ, Footprint), InvNormDetail);
+        if (LandMode != 0u)
+        {
+            // The bake through the sampling warp (every octave: Footprint 0).
+            float2 QX = SPX;
+            float2 QY = SPY;
+            float2 QZ = SPZ;
+            if (LandWarpAmplitude > 0.0f)
+            {
+                const uint WarpFirst = ContinentOctaves + MountainOctaves + DetailOctaves;
+                const float2 WX = VoxelLayerSumDF(WarpFirst, LandWarpOctaves, VoxelLayerPlain, SPX, SPY, SPZ, 0.0f);
+                const float2 WY = VoxelLayerSumDF(WarpFirst + LandWarpOctaves, LandWarpOctaves, VoxelLayerPlain, SPX, SPY, SPZ, 0.0f);
+                const float2 WZ = VoxelLayerSumDF(WarpFirst + 2u * LandWarpOctaves, LandWarpOctaves, VoxelLayerPlain, SPX, SPY, SPZ, 0.0f);
+                const float WarpScale = LandWarpAmplitude * LandWarpInvNorm;
+                QX = VoxelDFAdd(SPX, float2(WarpScale * (WX.x + WX.y), 0.0f));
+                QY = VoxelDFAdd(SPY, float2(WarpScale * (WY.x + WY.y), 0.0f));
+                QZ = VoxelDFAdd(SPZ, float2(WarpScale * (WZ.x + WZ.y), 0.0f));
+            }
+            const float Bake = VoxelLandBakeHeightDF(QX, QY, QZ);
 
-        // FVoxelDensityCPU::HeightAt.
-        const float2 Base = VoxelDFAdd(float2(0.5f, 0.0f), VoxelDFMulFloat(VoxelDFMul(ContinentWeight, C), 0.5f));
-        const float2 T = VoxelDFClamp01(VoxelDFDiv(VoxelDFSub(C, MountainStart), MountainBlend));
-        const float2 Mask = VoxelDFMul(VoxelDFMul(T, T), VoxelDFSub(float2(3.0f, 0.0f), VoxelDFMulFloat(T, 2.0f)));
-        const float2 Mountains = VoxelDFMul(VoxelDFMul(MountainWeight, Mask), R);
-        const float2 Details = VoxelDFMul(DetailWeight, D);
-        Height = VoxelDFMul(NoiseAmplitude, VoxelDFClamp01(VoxelDFAdd(VoxelDFAdd(Base, Mountains), Details)));
+            // Detail, a quarter as strong under the sea.
+            const float SeaWeight = lerp(0.25f, 1.0f, smoothstep(-50.0f, 50.0f, Bake));
+            const float2 Detail = VoxelDFMul(VoxelLayerSumDF(ContinentOctaves + MountainOctaves, DetailOctaves, VoxelLayerDamped, SPX, SPY, SPZ, Footprint), InvNormDetail);
+            float2 Total = VoxelDFAdd(VoxelDFAdd(VoxelDFMulFloat(float2(Bake, 0.0f), 100.0f), LandHeightOffset),
+                VoxelDFMulFloat(Detail, LandDetailAmplitude * SeaWeight));
+            // Within [0, NoiseAmplitude], as FVoxelDensityCPU::LandHeightAt clamps.
+            if (Total.x < 0.0f || (Total.x == 0.0f && Total.y < 0.0f)) Total = float2(0.0f, 0.0f);
+            if (Total.x > NoiseAmplitude.x || (Total.x == NoiseAmplitude.x && Total.y > NoiseAmplitude.y)) Total = NoiseAmplitude;
+            Height = Total;
+        }
+        else
+        {
+            const float2 C = VoxelDFMul(VoxelLayerSumDF(0u, ContinentOctaves, VoxelLayerPlain, SPX, SPY, SPZ, Footprint), InvNormContinent);
+            const float2 R = VoxelDFMul(VoxelLayerSumDF(ContinentOctaves, MountainOctaves, VoxelLayerRidged, SPX, SPY, SPZ, Footprint), InvNormMountain);
+            const float2 D = VoxelDFMul(VoxelLayerSumDF(ContinentOctaves + MountainOctaves, DetailOctaves, VoxelLayerDamped, SPX, SPY, SPZ, Footprint), InvNormDetail);
+
+            // FVoxelDensityCPU::HeightAt.
+            const float2 Base = VoxelDFAdd(float2(0.5f, 0.0f), VoxelDFMulFloat(VoxelDFMul(ContinentWeight, C), 0.5f));
+            const float2 T = VoxelDFClamp01(VoxelDFDiv(VoxelDFSub(C, MountainStart), MountainBlend));
+            const float2 Mask = VoxelDFMul(VoxelDFMul(T, T), VoxelDFSub(float2(3.0f, 0.0f), VoxelDFMulFloat(T, 2.0f)));
+            const float2 Mountains = VoxelDFMul(VoxelDFMul(MountainWeight, Mask), R);
+            const float2 Details = VoxelDFMul(DetailWeight, D);
+            Height = VoxelDFMul(NoiseAmplitude, VoxelDFClamp01(VoxelDFAdd(VoxelDFAdd(Base, Mountains), Details)));
+        }
     }
 
     const float2 Surface = VoxelDFSub(Radius, VoxelDFAdd(PlanetRadius, Height));

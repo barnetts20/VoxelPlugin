@@ -1,0 +1,118 @@
+// VoxelLandBake.usf - The land bake's compute passes (VoxelLandBake.cpp), time-sliced by the
+// baker:
+//   CrustCS      a chunk of interior cells: each one's crust value before the threshold, into
+//                a histogram weighted by the cell's solid angle;
+//   ThresholdCS  one thread: the crust threshold that leaves LandFraction of the sphere above
+//                it (linear inside the histogram bin);
+//   FieldsCS     a chunk of cells (aprons included): height and attributes from the plate
+//                model (VoxelLandPlates.ush).
+// Cells are numbered face-major, f * Side^2 + (j + Pad) * Side + (i + Pad), i and j from -Pad.
+
+#include "/Engine/Public/Platform.ush"
+#include "/Plugin/VoxelPlugin/Private/VoxelDensityCore.ush"
+#include "/Plugin/VoxelPlugin/Private/VoxelCubeSphere.ush"
+
+#define VOXEL_LAND_HISTOGRAM_BINS 4096u      // VoxelLandBakeDetail::HistogramBins
+#define VOXEL_LAND_HISTOGRAM_MIN -2.0f       // the crust values the histogram spans
+#define VOXEL_LAND_HISTOGRAM_SPAN 4.0f
+#define VOXEL_LAND_SOLID_WEIGHT 64.0f        // solid-angle weight units per cell at a face centre
+
+// The plate model (VoxelLandPlates.ush).
+StructuredBuffer<float> LandPlates;
+uint LandPlateCount;
+uint LandSeed;
+float LandRadiusM;
+float LandWidthScale;
+float LandReliefScale;
+float LandShelfDepth;
+float LandAbyssDepth;
+float LandCoastHeight;
+float LandInteriorHeight;
+
+// The bake.
+uint BakeN;
+uint BakePad;
+uint FirstCell;
+uint NumCells;
+uint GroupsX;
+float LandFraction;
+RWStructuredBuffer<uint> Histogram;
+RWStructuredBuffer<float> ThresholdBuffer;
+RWStructuredBuffer<float> OutHeight;
+RWStructuredBuffer<uint> OutAttr;
+
+#include "/Plugin/VoxelPlugin/Private/VoxelLandPlates.ush"
+
+uint ThreadIndex(uint3 GroupId, uint GroupThread)
+{
+    return (GroupId.y * GroupsX + GroupId.x) * 64u + GroupThread;
+}
+
+[numthreads(64, 1, 1)]
+void CrustCS(uint3 GroupId : SV_GroupID, uint GroupThread : SV_GroupIndex)
+{
+    const uint Local = ThreadIndex(GroupId, GroupThread);
+    if (Local >= NumCells) return;
+    const uint Index = FirstCell + Local;
+    const uint PerFace = BakeN * BakeN;
+    if (Index >= 6u * PerFace) return;
+    const uint Face = Index / PerFace;
+    const uint Rest = Index - Face * PerFace;
+    const int J = int(Rest / BakeN);
+    const int I = int(Rest - uint(J) * BakeN);
+    const float S = VoxelCubeCellCentre(I, BakeN);
+    const float T = VoxelCubeCellCentre(J, BakeN);
+    const float3 P = VoxelCubeDirection(Face, S, T);
+    const float Raw = VoxelLandRawCrust(P, VoxelLandNearestPlate(VoxelLandWarp(P)));
+
+    // The equal-angle cell's solid angle, relative to the face centre's.
+    const float A = tan(S * VOXEL_CUBE_QUARTER_PI);
+    const float B = tan(T * VOXEL_CUBE_QUARTER_PI);
+    const float Q = 1.0f + A * A + B * B;
+    const float Solid = (1.0f + A * A) * (1.0f + B * B) / (Q * sqrt(Q));
+    const int Bin = clamp(int(floor((Raw - VOXEL_LAND_HISTOGRAM_MIN) / VOXEL_LAND_HISTOGRAM_SPAN * float(VOXEL_LAND_HISTOGRAM_BINS))), 0, int(VOXEL_LAND_HISTOGRAM_BINS) - 1);
+    InterlockedAdd(Histogram[uint(Bin)], uint(Solid * VOXEL_LAND_SOLID_WEIGHT + 0.5f));
+}
+
+[numthreads(1, 1, 1)]
+void ThresholdCS()
+{
+    uint Total = 0u;
+    [loop]
+    for (uint b = 0u; b < VOXEL_LAND_HISTOGRAM_BINS; b++)
+        Total += Histogram[b];
+    const float Target = (1.0f - LandFraction) * float(Total);
+    float Result = VOXEL_LAND_HISTOGRAM_MIN + VOXEL_LAND_HISTOGRAM_SPAN;
+    uint Cumulative = 0u;
+    [loop]
+    for (uint c = 0u; c < VOXEL_LAND_HISTOGRAM_BINS; c++)
+    {
+        const uint H = Histogram[c];
+        if (H > 0u && float(Cumulative + H) >= Target)
+        {
+            const float Inside = saturate((Target - float(Cumulative)) / float(H));
+            Result = VOXEL_LAND_HISTOGRAM_MIN + VOXEL_LAND_HISTOGRAM_SPAN * (float(c) + Inside) / float(VOXEL_LAND_HISTOGRAM_BINS);
+            break;
+        }
+        Cumulative += H;
+    }
+    ThresholdBuffer[0] = Result;
+}
+
+[numthreads(64, 1, 1)]
+void FieldsCS(uint3 GroupId : SV_GroupID, uint GroupThread : SV_GroupIndex)
+{
+    const uint Local = ThreadIndex(GroupId, GroupThread);
+    if (Local >= NumCells) return;
+    const uint Index = FirstCell + Local;
+    const uint Side = BakeN + 2u * BakePad;
+    const uint PerFace = Side * Side;
+    const uint Face = Index / PerFace;
+    const uint Rest = Index - Face * PerFace;
+    const int J = int(Rest / Side) - int(BakePad);
+    const int I = int(Rest % Side) - int(BakePad);
+    const float3 P = VoxelCubeDirection(Face, VoxelCubeCellCentre(I, BakeN), VoxelCubeCellCentre(J, BakeN));
+    const FVoxelLandElevation E = VoxelLandElevationAt(P, ThresholdBuffer[0]);
+    OutHeight[Index] = E.Base + E.Up - E.Down;
+    OutAttr[Index] = VoxelLandPackAttr(E.Crust, E.Class);
+}

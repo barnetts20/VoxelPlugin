@@ -38,6 +38,14 @@ struct FVoxelBrickMesherGPUSettings
     int32 CellsPerBrick = 32;
 };
 
+/** The land debug view a batch is meshed with (voxel.Debug.LandView): a pass after the
+ *  mesher's writes each vertex's colour (VoxelLandDebug.ush). */
+struct FVoxelBrickMesherGPUDebugView
+{
+    int32 Mode = 0;              // VOXEL_LAND_VIEW_* (VoxelLandDebugPalette.ush); 0 none
+    double SeaRadius = 0.0;      // cm, heights are about it; 0: the density's sea level
+};
+
 /** Per brick: the counts the GPU produced and its error bits (VoxelMesherError* in
  *  VoxelBrickMesherPasses.ush: 1 faces, 2 hash, 4 missing sample, 8 vertices, 16 triangles). */
 struct FVoxelBrickMesherGPUStats
@@ -57,8 +65,9 @@ namespace VoxelBrickMesherGPU
      *  brick min, normal, the parent target's position and normal, the grandparent target's
      *  position and normal, the unstitched position and normal (the cell solved as if the
      *  finer leaves around it were of its level), the cell's level relative to the brick (0 or
-     *  1), pad, the parent level's normal field at the unstitched position and the
-     *  grandparent level's at the parent target. */
+     *  1), the debug colour (0xRRGGBB as an exact float: white, or the land view's), the
+     *  parent level's normal field at the unstitched position and the grandparent level's at
+     *  the parent target. */
     constexpr uint32 VertexStride = 32;
 
     /** How far past a brick's box the mesher reads the density, in cells of the brick's
@@ -127,9 +136,11 @@ namespace VoxelBrickMesherGPU
 
     /** Render thread. Records the mesher passes for a batch of bricks (any number; the brick
      *  pages batch BatchBricksFor of them), on PassFlags' pipe: AsyncCompute lets a batch whose
-     *  results are read in a later frame overlap the frame's rendering. */
+     *  results are read in a later frame overlap the frame's rendering. With a debug view, one
+     *  more pass colours the vertices (skipped while its shader isn't compiled). */
     VOXELPLUGIN_API FOutputs AddMesherPasses(FRDGBuilder& GraphBuilder, const FVoxelDensityGPUData& Density, const FInputs& Inputs,
-        const FVoxelBrickMesherGPUSettings& Settings, TConstArrayView<FVoxelMesherBrickGPU> Bricks, ERDGPassFlags PassFlags = ERDGPassFlags::Compute);
+        const FVoxelBrickMesherGPUSettings& Settings, TConstArrayView<FVoxelMesherBrickGPU> Bricks, ERDGPassFlags PassFlags = ERDGPassFlags::Compute,
+        const FVoxelBrickMesherGPUDebugView& DebugView = FVoxelBrickMesherGPUDebugView());
 
     /** Meshes up to MaxBricks bricks on the GPU and calls OnDone on the game thread with one
      *  mesh and one stats entry per request (positions relative to the brick min, as

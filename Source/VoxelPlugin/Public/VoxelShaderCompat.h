@@ -4,6 +4,10 @@
 // Include this, then the .ush, inside namespace VoxelShader (see VoxelDensity.cpp): the
 // names below (float3, dot, lerp, ...) stay out of the global namespace.
 //
+// The land code (VoxelLandSample.ush, VoxelLandPlates.ush) is included inside a C++ struct
+// whose members carry the names of the shader's buffers and constants (VoxelLandBake.cpp,
+// VoxelDensity.cpp), so it must not declare static const data of its own (use #define).
+//
 // Subset rules for shared code: scalar/float2/float3/int3/uint3 only; members .x/.y/.z or
 // [axis] (no swizzles); no out/inout parameters in shared functions (return structs; the
 // Interlocked* intrinsics are the exception); 32-bit int/uint arithmetic (wraps on both
@@ -86,6 +90,10 @@ namespace VoxelShader
     inline float asfloat(uint a) { float f; std::memcpy(&f, &a, 4); return f; }
     inline float ldexp(float a, int e) { return std::ldexp(a, e); }
     inline float atan2(float y, float x) { return std::atan2(y, x); }
+    inline float atan(float a) { return std::atan(a); }
+    inline float acos(float a) { return std::acos(a); }
+    inline float tan(float a) { return std::tan(a); }
+    inline float exp(float a) { return std::exp(a); }
     inline float cos(float a) { return std::cos(a); }
     inline float sin(float a) { return std::sin(a); }
     inline int min(int a, int b) { return a < b ? a : b; }
@@ -113,6 +121,7 @@ namespace VoxelShader
 
     inline float dot(float3 a, float3 b) { return a.x * b.x + a.y * b.y + a.z * b.z; }
     inline float length(float3 a) { return std::sqrt(dot(a, a)); }
+    inline float3 normalize(float3 a) { return a * (1.f / std::sqrt(dot(a, a))); }
     inline float3 cross(float3 a, float3 b) { return float3(a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x); }
     inline float abs(float a) { return std::fabs(a); }
     inline float sqrt(float a) { return std::sqrt(a); }

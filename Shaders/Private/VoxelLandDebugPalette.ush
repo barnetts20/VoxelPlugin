@@ -1,0 +1,162 @@
+// VoxelLandDebugPalette.ush - The colours of the land debug views (voxel.Debug.LandView;
+// VoxelLandDebug.ush writes them into the terrain's vertex colours). One function per view,
+// from the value shown to a display (sRGB) colour in 0..1.
+//
+// Shared subset (VoxelShaderCompat.h): the terrain's on-screen legend (VoxelBrickTerrain.cpp)
+// calls the same functions, so it shows exactly the colours the mesher writes. No static data
+// (constants are #defines).
+
+#ifndef VOXEL_LAND_DEBUG_PALETTE_USH
+#define VOXEL_LAND_DEBUG_PALETTE_USH
+
+#ifndef VOXEL_FUNC
+#define VOXEL_FUNC
+#endif
+
+// The views (voxel.Debug.LandView). Elevation and slope work on either generator; the others
+// read the land bake and show VoxelLandViewNone on the noise surface.
+#define VOXEL_LAND_VIEW_OFF 0u
+#define VOXEL_LAND_VIEW_ELEVATION 1u   // the surface's height about sea level
+#define VOXEL_LAND_VIEW_BAKE 2u        // the bake's height at the warped point, without detail
+#define VOXEL_LAND_VIEW_DETAIL 3u      // the detail layer, signed, over its amplitude
+#define VOXEL_LAND_VIEW_CRUST 4u       // continental fraction of the nearest bake cell
+#define VOXEL_LAND_VIEW_CLASS 5u       // boundary class of the nearest bake cell
+#define VOXEL_LAND_VIEW_PLATES 6u      // nearest plate, brighter on continental crust
+#define VOXEL_LAND_VIEW_SLOPE 7u       // degrees from the horizontal
+#define VOXEL_LAND_VIEW_CELLS 8u       // the bake's cells: a checker in each cube face's colour
+#define VOXEL_LAND_VIEW_COUNT 9u
+
+VOXEL_FUNC float3 VoxelLandViewRgb(float R, float G, float B)
+{
+    return float3(R / 255.0f, G / 255.0f, B / 255.0f);
+}
+
+VOXEL_FUNC float3 VoxelLandViewMix(float3 A, float3 B, float T)
+{
+    return A + (B - A) * saturate(T);
+}
+
+/** A view that has nothing to show here (a bake view on the noise surface). */
+VOXEL_FUNC float3 VoxelLandViewNone()
+{
+    return VoxelLandViewRgb(180.0f, 80.0f, 180.0f);
+}
+
+/** Hypsometric tint of a height (m about sea level). Bands of 500 m on land and 1,000 m under
+ *  the sea alternate in brightness where the mesh is fine enough to draw them (CellM, the
+ *  cell size in m: full below an eighth of a band, gone from a quarter, so coarse levels don't
+ *  alias). */
+VOXEL_FUNC float3 VoxelLandViewHeight(float H, float CellM)
+{
+    float3 C;
+    if (H < 0.0f)
+    {
+        if (H < -4000.0f)
+            C = VoxelLandViewMix(VoxelLandViewRgb(5.0f, 15.0f, 60.0f), VoxelLandViewRgb(15.0f, 50.0f, 130.0f), (H + 8000.0f) / 4000.0f);
+        else if (H < -1000.0f)
+            C = VoxelLandViewMix(VoxelLandViewRgb(15.0f, 50.0f, 130.0f), VoxelLandViewRgb(40.0f, 100.0f, 175.0f), (H + 4000.0f) / 3000.0f);
+        else if (H < -150.0f)
+            C = VoxelLandViewMix(VoxelLandViewRgb(40.0f, 100.0f, 175.0f), VoxelLandViewRgb(80.0f, 155.0f, 210.0f), (H + 1000.0f) / 850.0f);
+        else
+            C = VoxelLandViewMix(VoxelLandViewRgb(80.0f, 155.0f, 210.0f), VoxelLandViewRgb(165.0f, 215.0f, 235.0f), (H + 150.0f) / 150.0f);
+    }
+    else
+    {
+        if (H < 300.0f)
+            C = VoxelLandViewMix(VoxelLandViewRgb(60.0f, 130.0f, 70.0f), VoxelLandViewRgb(120.0f, 170.0f, 85.0f), H / 300.0f);
+        else if (H < 800.0f)
+            C = VoxelLandViewMix(VoxelLandViewRgb(120.0f, 170.0f, 85.0f), VoxelLandViewRgb(200.0f, 195.0f, 115.0f), (H - 300.0f) / 500.0f);
+        else if (H < 1500.0f)
+            C = VoxelLandViewMix(VoxelLandViewRgb(200.0f, 195.0f, 115.0f), VoxelLandViewRgb(190.0f, 145.0f, 90.0f), (H - 800.0f) / 700.0f);
+        else if (H < 2500.0f)
+            C = VoxelLandViewMix(VoxelLandViewRgb(190.0f, 145.0f, 90.0f), VoxelLandViewRgb(145.0f, 100.0f, 75.0f), (H - 1500.0f) / 1000.0f);
+        else if (H < 4000.0f)
+            C = VoxelLandViewMix(VoxelLandViewRgb(145.0f, 100.0f, 75.0f), VoxelLandViewRgb(150.0f, 140.0f, 140.0f), (H - 2500.0f) / 1500.0f);
+        else
+            C = VoxelLandViewMix(VoxelLandViewRgb(150.0f, 140.0f, 140.0f), VoxelLandViewRgb(250.0f, 250.0f, 250.0f), (H - 4000.0f) / 2000.0f);
+    }
+    const float Band = H < 0.0f ? 1000.0f : 500.0f;
+    const float K = floor(H / Band);
+    const float Odd = K - 2.0f * floor(K * 0.5f);
+    const float Show = saturate(2.0f - 8.0f * CellM / Band);
+    return C * (1.0f - 0.12f * Odd * Show);
+}
+
+/** A signed value in -1..1: blue below zero, near-white at zero, red above. */
+VOXEL_FUNC float3 VoxelLandViewSigned(float T)
+{
+    const float3 Mid = VoxelLandViewRgb(235.0f, 235.0f, 235.0f);
+    if (T < 0.0f)
+        return VoxelLandViewMix(Mid, VoxelLandViewRgb(40.0f, 80.0f, 200.0f), -T);
+    return VoxelLandViewMix(Mid, VoxelLandViewRgb(200.0f, 50.0f, 40.0f), T);
+}
+
+/** Continental fraction 0..1: oceanic blue to continental tan, with the crust threshold
+ *  (0.5) as a yellow line. */
+VOXEL_FUNC float3 VoxelLandViewCrust(float Crust)
+{
+    const float3 Base = VoxelLandViewMix(VoxelLandViewRgb(35.0f, 70.0f, 150.0f), VoxelLandViewRgb(205.0f, 160.0f, 100.0f), Crust);
+    return VoxelLandViewMix(Base, VoxelLandViewRgb(250.0f, 220.0f, 60.0f), 1.0f - saturate(abs(Crust - 0.5f) / 0.03f));
+}
+
+/** Boundary class (FVoxelLandBake::Attr): a colour each; no boundary is grey, lighter on
+ *  continental crust. */
+VOXEL_FUNC float3 VoxelLandViewClass(uint Class, float Crust)
+{
+    if (Class == 1u) return VoxelLandViewRgb(220.0f, 40.0f, 40.0f);    // collision range
+    if (Class == 2u) return VoxelLandViewRgb(245.0f, 140.0f, 30.0f);   // arc range (ocean under continent)
+    if (Class == 3u) return VoxelLandViewRgb(130.0f, 40.0f, 170.0f);   // trench
+    if (Class == 4u) return VoxelLandViewRgb(240.0f, 220.0f, 40.0f);   // island arc
+    if (Class == 5u) return VoxelLandViewRgb(40.0f, 200.0f, 220.0f);   // rift
+    if (Class == 6u) return VoxelLandViewRgb(60.0f, 190.0f, 70.0f);    // mid-ocean ridge
+    if (Class == 7u) return VoxelLandViewRgb(255.0f, 0.0f, 255.0f);    // not used
+    return VoxelLandViewMix(VoxelLandViewRgb(60.0f, 62.0f, 72.0f), VoxelLandViewRgb(150.0f, 150.0f, 140.0f), Crust);
+}
+
+/** A colour of hue H (turns), saturation S and value V. */
+VOXEL_FUNC float3 VoxelLandViewHsv(float H, float S, float V)
+{
+    const float H6 = (H - floor(H)) * 6.0f;
+    const float R = saturate(abs(H6 - 3.0f) - 1.0f);
+    const float G = saturate(2.0f - abs(H6 - 2.0f));
+    const float B = saturate(2.0f - abs(H6 - 4.0f));
+    return float3(((R - 1.0f) * S + 1.0f) * V, ((G - 1.0f) * S + 1.0f) * V, ((B - 1.0f) * S + 1.0f) * V);
+}
+
+/** A plate: hues a golden ratio apart (neighbouring indices differ most), brighter where the
+ *  crust is continental. */
+VOXEL_FUNC float3 VoxelLandViewPlate(uint Plate, float Crust)
+{
+    return VoxelLandViewHsv(float(Plate) * 0.618034f + 0.05f, 0.65f, 0.55f + 0.4f * saturate(Crust));
+}
+
+/** Slope in degrees from the horizontal: green flats, yellow at 20, red at 45, purple cliffs. */
+VOXEL_FUNC float3 VoxelLandViewSlope(float Degrees)
+{
+    const float D = Degrees;
+    if (D < 10.0f) return VoxelLandViewMix(VoxelLandViewRgb(40.0f, 150.0f, 60.0f), VoxelLandViewRgb(160.0f, 205.0f, 60.0f), D / 10.0f);
+    if (D < 20.0f) return VoxelLandViewMix(VoxelLandViewRgb(160.0f, 205.0f, 60.0f), VoxelLandViewRgb(245.0f, 210.0f, 50.0f), (D - 10.0f) / 10.0f);
+    if (D < 30.0f) return VoxelLandViewMix(VoxelLandViewRgb(245.0f, 210.0f, 50.0f), VoxelLandViewRgb(240.0f, 130.0f, 30.0f), (D - 20.0f) / 10.0f);
+    if (D < 45.0f) return VoxelLandViewMix(VoxelLandViewRgb(240.0f, 130.0f, 30.0f), VoxelLandViewRgb(210.0f, 40.0f, 40.0f), (D - 30.0f) / 15.0f);
+    return VoxelLandViewMix(VoxelLandViewRgb(210.0f, 40.0f, 40.0f), VoxelLandViewRgb(110.0f, 20.0f, 90.0f), (D - 45.0f) / 15.0f);
+}
+
+/** A cube face (VoxelCubeSphere.ush order: +X, -X, +Y, -Y, +Z, -Z). */
+VOXEL_FUNC float3 VoxelLandViewFace(uint Face)
+{
+    if (Face == 0u) return VoxelLandViewRgb(225.0f, 75.0f, 75.0f);
+    if (Face == 1u) return VoxelLandViewRgb(70.0f, 205.0f, 205.0f);
+    if (Face == 2u) return VoxelLandViewRgb(80.0f, 190.0f, 80.0f);
+    if (Face == 3u) return VoxelLandViewRgb(200.0f, 80.0f, 200.0f);
+    if (Face == 4u) return VoxelLandViewRgb(80.0f, 120.0f, 230.0f);
+    return VoxelLandViewRgb(235.0f, 210.0f, 70.0f);
+}
+
+/** Bake cell (I, J) of a face: the face's colour, darker on alternate cells by Contrast (0..1;
+ *  the debug pass fades the checker out where the mesh is too coarse to draw it). */
+VOXEL_FUNC float3 VoxelLandViewCell(uint Face, int I, int J, float Contrast)
+{
+    return VoxelLandViewFace(Face) * (((I + J) & 1) != 0 ? 1.0f - 0.28f * saturate(Contrast) : 1.0f);
+}
+
+#endif // VOXEL_LAND_DEBUG_PALETTE_USH

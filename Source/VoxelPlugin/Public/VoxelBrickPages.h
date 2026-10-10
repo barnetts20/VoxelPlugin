@@ -91,6 +91,10 @@ public:
     /** The page holding a brick: same level, 8x8x8 bricks. */
     static FVoxelBrickKey PageOf(const FVoxelBrickKey& Key);
 
+    /** The sea radius the elevation debug view measures from, for bricks sent to the mesher
+     *  from now on (cm; 0: the density's sea level). */
+    void SetDebugSeaRadius(double InSeaRadius) { Settings.DebugSeaRadius = InSeaRadius; }
+
 private:
     struct FInstance
     {
@@ -154,6 +158,7 @@ private:
         int32 CacheTriangle = 0;
         int32 Triangles = 0;
         uint32 Errors = 0;
+        bool bDebugColor = false;      // meshed with a land debug view: its copy writes its own colours
     };
 
     struct FQueued

@@ -1,6 +1,13 @@
 #include "PlanetActor.h"
 #include "PlanetGravityZone.h"
+#include "VoxelLandBake.h"
+#include "VoxelPlugin.h"
+#include "EngineUtils.h"
+#include "HAL/FileManager.h"
+#include "HAL/IConsoleManager.h"
 #include "Kismet/GameplayStatics.h"
+#include "Misc/FileHelper.h"
+#include "Misc/Paths.h"
 
 APlanetActor::APlanetActor()
 {
@@ -60,14 +67,17 @@ void APlanetActor::OnConstruction(const FTransform& Transform)
 void APlanetActor::FlagPendingWork()
 {
     // Flag for deferred work in Tick - never spawn actors during OnConstruction.
+    const bool bTerrestrial = Generator == EVoxelSurfaceGenerator::Terrestrial;
     if (!bInitialized
         || !GetActorScale3D().Equals(LastInitScale, 0.01)
         || NoiseAmplitudeRatio != LastNoiseAmplitudeRatio
-        || SurfaceSettings.GetSettingsHash() != LastSurfaceSettingsHash)
+        || Generator != LastGenerator
+        || (!bTerrestrial && SurfaceSettings.GetSettingsHash() != LastSurfaceSettingsHash)
+        || (bTerrestrial && TerrestrialSettings.GetSettingsHash() != LastTerrestrialHash))
     {
         bPendingInitialize = true;
     }
-    else if (SeaLevel != LastSeaLevel
+    else if ((!bTerrestrial && SeaLevel != LastSeaLevel)
         || bEnableOcean != bLastEnableOcean
         || bEnableGravity != bLastEnableGravity)
     {
@@ -163,21 +173,36 @@ void APlanetActor::Tick(float DeltaTime)
     // Deferred init - safe to spawn actors here.
     if (bPendingInitialize)
     {
+        // A terrestrial planet is built once its bake is ready; until then it shows what it
+        // showed (nothing on the first build).
+        if (Generator == EVoxelSurfaceGenerator::Terrestrial && !TickLandBake())
+            return;
         bPendingInitialize = false;
         bPendingOceanUpdate = false;
         Initialize();
     }
     else if (bPendingOceanUpdate)
     {
+        // A terrestrial planet not built yet has nothing to update: its build applies the toggles.
+        if (Generator == EVoxelSurfaceGenerator::Terrestrial && !LandBake.IsValid())
+        {
+            bPendingOceanUpdate = false;
+            return;
+        }
         bPendingOceanUpdate = false;
-        const double PlanetRadius = GetActorScale3D().GetMax();
-        const double NoiseAmplitude = PlanetRadius * NoiseAmplitudeRatio;
-        const double OceanRadius = ComputeOceanRadius(PlanetRadius, NoiseAmplitude);
+        double PlanetRadius = 0.0;
+        double NoiseAmplitude = 0.0;
+        double OceanRadius = 0.0;
+        ComputeShape(PlanetRadius, NoiseAmplitude, OceanRadius);
         // The same configuration as the first initialization: the ocean keeps its material and
         // settings, and the gravity zone follows the new sea level. A gravity toggle alone
         // leaves the ocean as it is.
-        if (SeaLevel != LastSeaLevel || bEnableOcean != bLastEnableOcean)
+        const bool bSeaLevelChanged = Generator != EVoxelSurfaceGenerator::Terrestrial && SeaLevel != LastSeaLevel;
+        if (bSeaLevelChanged || bEnableOcean != bLastEnableOcean)
             ConfigureOcean(PlanetRadius, NoiseAmplitude, OceanRadius);
+        // The elevation debug view measures from the new sea level.
+        if (bSeaLevelChanged && TerrainActor)
+            TerrainActor->SetDebugSeaRadius(OceanRadius);
         ConfigureGravity(PlanetRadius, OceanRadius);
         RecordAppliedState();
     }
@@ -187,12 +212,76 @@ void APlanetActor::Tick(float DeltaTime)
 // Initialize
 // ---------------------------------------------------------------------------
 
+bool APlanetActor::TickLandBake()
+{
+    const double SeaRadius = GetActorScale3D().GetMax();
+    const uint32 Key = VoxelLand::BakeKey(TerrestrialSettings, SeaRadius);
+    if (LandBake.IsValid() && LandBake->Key == Key && LandBake->N == VoxelLand::BakeResolutionFor(TerrestrialSettings))
+    {
+        // Only the per-sample settings changed: the bake is reused.
+        LandBaker.Reset();
+        return true;
+    }
+    if (!LandBaker.IsValid() || LandBaker->GetKey() != Key)
+        LandBaker = MakeShared<FVoxelLandBaker>(TerrestrialSettings, SeaRadius);
+    LandBaker->Tick();
+    if (!LandBaker->IsDone())
+        return false;
+    LandBake = LandBaker->GetResult();
+    LandBaker.Reset();
+    return LandBake.IsValid();
+}
+
+float APlanetActor::GetBakeProgress() const
+{
+    if (Generator != EVoxelSurfaceGenerator::Terrestrial) return 1.0f;
+    if (LandBaker.IsValid()) return LandBaker->GetProgress();
+    return LandBake.IsValid() && LandBake->Key == VoxelLand::BakeKey(TerrestrialSettings, GetActorScale3D().GetMax()) ? 1.0f : 0.0f;
+}
+
+void APlanetActor::ComputeShape(double& OutPlanetRadius, double& OutNoiseAmplitude, double& OutOceanRadius) const
+{
+    const double Radius = GetActorScale3D().GetMax();
+    if (Generator == EVoxelSurfaceGenerator::Terrestrial && LandBake.IsValid())
+    {
+        // Heights about sea level, the actor's radius; the lattice spans the bake's range,
+        // within the NoiseAmplitudeRatio ceiling.
+        VoxelLand::ShapeFor(TerrestrialSettings, *LandBake, OutPlanetRadius, OutNoiseAmplitude);
+        const double Ceiling = Radius * NoiseAmplitudeRatio;
+        if (OutNoiseAmplitude > Ceiling)
+        {
+            UE_LOG(LogVoxelPlugin, Warning, TEXT("[Planet] %s: the terrestrial heights span %.0f m, more than NoiseAmplitudeRatio allows (%.0f m); they are clamped."),
+                *GetName(), OutNoiseAmplitude * 0.01, Ceiling * 0.01);
+            OutNoiseAmplitude = Ceiling;
+        }
+        OutOceanRadius = FMath::Max(1.0, Radius);
+        return;
+    }
+    OutPlanetRadius = Radius;
+    OutNoiseAmplitude = Radius * NoiseAmplitudeRatio;
+    OutOceanRadius = ComputeOceanRadius(OutPlanetRadius, OutNoiseAmplitude);
+}
+
+double APlanetActor::ChildNoiseAmplitudeRatio(double PlanetRadius, double NoiseAmplitude) const
+{
+    if (Generator == EVoxelSurfaceGenerator::Terrestrial && LandBake.IsValid())
+        return NoiseAmplitude / FMath::Max(PlanetRadius, 1.0);
+    return NoiseAmplitudeRatio;
+}
+
 void APlanetActor::Initialize()
 {
-    const double PlanetRadius = GetActorScale3D().GetMax();
-    const double NoiseAmplitude = PlanetRadius * NoiseAmplitudeRatio;
+    if (Generator != EVoxelSurfaceGenerator::Terrestrial)
+    {
+        // The noise surface needs no bake: release one a terrestrial build left.
+        LandBake.Reset();
+        LandBaker.Reset();
+    }
+    double PlanetRadius = 0.0;
+    double NoiseAmplitude = 0.0;
+    double OceanRadius = 0.0;
+    ComputeShape(PlanetRadius, NoiseAmplitude, OceanRadius);
     const double RootExtent = VoxelDensity::RootExtentFor(PlanetRadius, NoiseAmplitude);
-    const double OceanRadius = ComputeOceanRadius(PlanetRadius, NoiseAmplitude);
 
     SpawnChildActors();
     if (!TerrainActor) return;
@@ -207,8 +296,9 @@ void APlanetActor::Initialize()
 
     // --- Terrain actor ---
     TerrainActor->SetSurfaceMaterial(TerrainMaterial);
-    TerrainActor->NoiseAmplitudeRatio = NoiseAmplitudeRatio;
+    TerrainActor->NoiseAmplitudeRatio = ChildNoiseAmplitudeRatio(PlanetRadius, NoiseAmplitude);
     TerrainActor->SurfaceSettings = SurfaceSettings;
+    TerrainActor->SetDebugSeaRadius(OceanRadius);
     TerrainActor->InitializeFromPlanet(SharedCompositor, PlanetRoot, FVector(PlanetRadius));
     // Re-activate after a pool park: shown, ticking, and with collision (dormancy dropped it).
     TerrainActor->SetActorHiddenInGame(false);
@@ -237,7 +327,7 @@ void APlanetActor::ConfigureOcean(double PlanetRadius, double NoiseAmplitude, do
     }
     OceanActor->OceanMaterial = OceanMaterial;
     OceanActor->TerrainPlanetRadius = PlanetRadius;
-    OceanActor->NoiseAmplitudeRatio = NoiseAmplitudeRatio;
+    OceanActor->NoiseAmplitudeRatio = ChildNoiseAmplitudeRatio(PlanetRadius, NoiseAmplitude);
     OceanActor->SurfaceSettings = SurfaceSettings;
     // Before the initialization, which builds the surface with them.
     OceanActor->OceanSettings = OceanSettings;
@@ -274,6 +364,8 @@ void APlanetActor::RecordAppliedState()
     LastSeaLevel = SeaLevel;
     LastNoiseAmplitudeRatio = NoiseAmplitudeRatio;
     LastSurfaceSettingsHash = SurfaceSettings.GetSettingsHash();
+    LastGenerator = Generator;
+    LastTerrestrialHash = TerrestrialSettings.GetSettingsHash();
     bLastEnableOcean = bEnableOcean;
     bLastEnableGravity = bEnableGravity;
 }
@@ -288,8 +380,10 @@ TSharedPtr<FDensitySampleCompositor> APlanetActor::BuildCompositor(
     TSharedPtr<FSparseEditStore> EditStore = MakeShared<FSparseEditStore>(
         FVector::ZeroVector, RootExtent, MaxDepth);
 
-    return VoxelDensity::MakeCompositor(SurfaceSettings, PlanetRadius, NoiseAmplitude, EditStore,
-        VoxelDensity::TerrainFinestCell(PlanetRadius, NoiseAmplitude, MaxDepth));
+    const double Finest = VoxelDensity::TerrainFinestCell(PlanetRadius, NoiseAmplitude, MaxDepth);
+    if (Generator == EVoxelSurfaceGenerator::Terrestrial && LandBake.IsValid())
+        return VoxelDensity::MakeTerrestrialCompositor(TerrestrialSettings, LandBake, PlanetRadius, NoiseAmplitude, EditStore, Finest);
+    return VoxelDensity::MakeCompositor(SurfaceSettings, PlanetRadius, NoiseAmplitude, EditStore, Finest);
 }
 
 // ---------------------------------------------------------------------------
@@ -454,4 +548,42 @@ void APlanetActor::OnAcquired(double WorldRadius)
     {
         SetDormant(false);   // warm revisit: geometry matches, just un-park
     }
+}
+
+// ---------------------------------------------------------------------------
+// voxel.Land.ExportBake
+// ---------------------------------------------------------------------------
+
+namespace PlanetActorLandExport
+{
+    void Run(const TArray<FString>& Args, UWorld* World)
+    {
+        int32 Count = 0;
+        for (TActorIterator<APlanetActor> It(World); It; ++It)
+        {
+            const TSharedPtr<const FVoxelLandBake, ESPMode::ThreadSafe> Bake = It->GetLandBake();
+            if (!Bake.IsValid()) continue;
+            const FString Base = FPaths::Combine(FPaths::ProjectSavedDir(), TEXT("VoxelLand"), FString::Printf(TEXT("Export_%s_%08x"), *It->GetName(), Bake->Key));
+            IFileManager::Get().MakeDirectory(*FPaths::GetPath(Base), true);
+            TArray<uint8> Bytes;
+            Bytes.SetNumUninitialized(Bake->Height.Num() * sizeof(float));
+            FMemory::Memcpy(Bytes.GetData(), Bake->Height.GetData(), Bytes.Num());
+            FFileHelper::SaveArrayToFile(Bytes, *(Base + TEXT("_height.f32")));
+            Bytes.SetNumUninitialized(Bake->Attr.Num() * sizeof(uint16));
+            FMemory::Memcpy(Bytes.GetData(), Bake->Attr.GetData(), Bytes.Num());
+            FFileHelper::SaveArrayToFile(Bytes, *(Base + TEXT("_attr.u16")));
+            const FString Json = FString::Printf(TEXT("{\"n\": %d, \"pad\": %d, \"sea_radius_cm\": %.17g, \"key\": \"%08x\", \"min_m\": %.3f, \"max_m\": %.3f, \"crust_threshold\": %.6f}\n"),
+                Bake->N, FVoxelLandBake::Pad, Bake->SeaRadius, Bake->Key, Bake->MinHeight, Bake->MaxHeight, Bake->CrustThreshold);
+            FFileHelper::SaveStringToFile(Json, *(Base + TEXT(".json")));
+            UE_LOG(LogVoxelPlugin, Log, TEXT("[VoxelLand] Exported %s's bake to %s_*."), *It->GetName(), *Base);
+            Count++;
+        }
+        if (Count == 0)
+            UE_LOG(LogVoxelPlugin, Warning, TEXT("[VoxelLand] No terrestrial planet with a bake in this world."));
+    }
+
+    FAutoConsoleCommandWithWorldAndArgs Command(
+        TEXT("voxel.Land.ExportBake"),
+        TEXT("Writes every terrestrial planet's bake (heights f32, attributes u16, a json header) to Saved/VoxelLand/Export_* (Tools/LandView/view_bake.py renders them)."),
+        FConsoleCommandWithWorldAndArgsDelegate::CreateStatic(&Run));
 }

@@ -158,7 +158,7 @@ namespace VoxelBrickPagesDetail
     constexpr int32 MaxCacheTriangles = 1 << 24;
     constexpr uint64 CachePeakFrames = 300;          // window of the cache's peak use
     constexpr double CacheShrinkMargin = 1.5;        // an idle cache shrinks to a power of two above this times its peak
-    constexpr uint32 CacheWords = 21;                // VOXEL_CACHE_WORDS (VoxelBrickPageGPU.usf)
+    constexpr uint32 CacheWords = 22;                // VOXEL_CACHE_WORDS (VoxelBrickPageGPU.usf)
     constexpr uint32 EntryWords = 8;                 // VOXEL_ENTRY_WORDS
     constexpr uint32 JobWords = 8;                   // VOXEL_JOB_WORDS
     constexpr int32 TexCoordChannels = 8;
@@ -264,6 +264,7 @@ struct FVoxelBrickPageGPU
         TSharedPtr<const FVoxelDensityGPUData> Density;
         TSharedPtr<const FVoxelEditGPUData> Edits;
         FVoxelBrickMesherGPUSettings Settings;
+        FVoxelBrickMesherGPUDebugView DebugView;
         TRefCountPtr<FRDGPooledBuffer> Entries;
         TSharedPtr<FRHIGPUBufferReadback> Readback;
     };
@@ -403,7 +404,7 @@ void FVoxelBrickPageGPU::Run_RenderThread(FRDGBuilder& GraphBuilder, uint32 Fram
         const int32 NumBricks = Work.Bricks.Num();
         const VoxelBrickMesherGPU::FInputs Inputs = GetInputs(GraphBuilder, Work.Density, Work.Edits);
         const VoxelBrickMesherGPU::FOutputs Outputs = VoxelBrickMesherGPU::AddMesherPasses(GraphBuilder, *Work.Density, Inputs, Work.Settings,
-            Work.Bricks, ERDGPassFlags::AsyncCompute);
+            Work.Bricks, ERDGPassFlags::AsyncCompute, Work.DebugView);
 
         FRDGBufferDesc EntriesDesc = FRDGBufferDesc::CreateStructuredDesc(sizeof(uint32), (uint32)NumBricks * VBP::EntryWords);
         EntriesDesc.Usage |= EBufferUsageFlags::SourceCopy;
@@ -1140,6 +1141,10 @@ void FVoxelBrickPages::DispatchBatches()
         : (bBusy ? FMath::Max(Base, CVarVoxelBrickMeshBatchesBusy.GetValueOnGameThread()) : Base);
     const int32 BatchBricks = VBP::BatchBricksFor(MesherSettings);
     const VoxelBrickMesherGPU::FCaps Caps = VoxelBrickMesherGPU::CapsFor(MesherSettings);
+    // The land debug view the bricks sent now are coloured with (their copies say so).
+    FVoxelBrickMesherGPUDebugView DebugView;
+    DebugView.Mode = FVoxelBrickTerrain::GetLandView();
+    DebugView.SeaRadius = Settings.DebugSeaRadius;
     for (int32 Sent = 0; Sent < Budget && QueueHead < MeshQueue.Num() && Batches.Num() < VBP::MaxBatchesInFlight; Sent++)
     {
         FBatch Batch;
@@ -1151,6 +1156,7 @@ void FVoxelBrickPages::DispatchBatches()
             FStaged* Brick = Staged.Find(Item.Key);
             if (!Brick || Brick->Stamp != Item.Stamp || Brick->State != EStage::Queued) continue;
             Brick->State = EStage::Meshing;
+            Brick->bDebugColor = DebugView.Mode != 0;
             Batch.Keys.Add(Item.Key);
             Batch.Stamps.Add(Item.Stamp);
             Need += FIntPoint(FMath::Min(Brick->Expected.X, (int32)Caps.VertexCap), FMath::Min(Brick->Expected.Y, (int32)Caps.TriangleCap));
@@ -1205,6 +1211,7 @@ void FVoxelBrickPages::DispatchBatches()
         Work.Density = Density;
         Work.Edits = Edits;
         Work.Settings = MesherSettings;
+        Work.DebugView = DebugView;
         Batches.Add(Work.Id, MoveTemp(Batch));
         ENQUEUE_RENDER_COMMAND(VoxelBrickStage)([GPURef = GPU, Work = MoveTemp(Work), WantV = CacheVertices.GetCapacity(), WantT = CacheTriangles.GetCapacity()](FRHICommandListImmediate&) mutable
             {
@@ -1378,7 +1385,7 @@ FIntPoint FVoxelBrickPages::PlanPage(const FVoxelBrickKey& PageKey, FPage& Page,
             if (bApply)
             {
                 Slot.Jobs.Append({ 0u, (uint32)Brick->CacheVertex, (uint32)V, (uint32)Brick->Vertices,
-                    (uint32)Brick->CacheTriangle, (uint32)T, (uint32)Brick->Triangles, 0u });
+                    (uint32)Brick->CacheTriangle, (uint32)T, (uint32)Brick->Triangles, Brick->bDebugColor ? 1u : 0u });
             }
             PlacedSlot[c] = s;
             PlacedStart[c] = FIntPoint(V, T);

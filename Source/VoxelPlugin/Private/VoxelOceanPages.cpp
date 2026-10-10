@@ -1,6 +1,7 @@
 #include "VoxelOceanPages.h"
 #include "VoxelPlugin.h"
 #include "VoxelGPUCommon.h"
+#include "VoxelLandGPU.h"
 #include "VoxelBrickTerrain.h"
 #include "VoxelBrickMesherGPU.h"
 #include "VoxelDensityGPU.h"
@@ -70,6 +71,7 @@ BEGIN_SHADER_PARAMETER_STRUCT(FVoxelOceanWriteParameters, )
     SHADER_PARAMETER(FVector2f, DetailWeight)
     SHADER_PARAMETER(float, RidgeGain)
     SHADER_PARAMETER(float, SlopeDamping)
+    SHADER_PARAMETER_STRUCT_INCLUDE(FVoxelLandShaderParameters, Land)
 END_SHADER_PARAMETER_STRUCT()
 
 class FVoxelOceanWriteCS : public FGlobalShader
@@ -349,6 +351,7 @@ void FVoxelOceanPageProvider::BuildComputePasses(FRDGBuilder& GraphBuilder, cons
         Parameters->DetailWeight = Density.DetailWeight;
         Parameters->RidgeGain = Density.RidgeGain;
         Parameters->SlopeDamping = Density.SlopeDamping;
+        Parameters->Land = VoxelLandGPU::GetParameters(GraphBuilder, Density);
         Parameters->Jobs = GraphBuilder.CreateSRV(VoxelGPUCommon::UploadStructuredBuffer<uint32>(GraphBuilder, TEXT("Voxel.OceanJobs"), State.Jobs));
         Parameters->VertexWords = GraphBuilder.CreateSRV(VoxelGPUCommon::UploadStructuredBuffer<uint32>(GraphBuilder, TEXT("Voxel.OceanVertexWords"), State.Words));
         Parameters->OutPositions = Positions;

@@ -9,6 +9,8 @@
 #include "VoxelDensity.generated.h"
 
 struct FVoxelDensityGPUData;
+struct FVoxelLandBake;
+struct FVoxelTerrestrialSettings;
 
 /** Shape of the planet's surface heightfield. Wavelengths are fractions of the planet radius,
  *  so a setting keeps its look at any planet size; weights are fractions of the noise
@@ -98,6 +100,13 @@ public:
      *  than it are always left out, whatever footprint a caller passes (0 keeps all). */
     FVoxelDensityCPU(const FVoxelSurfaceSettings& InSettings, double InPlanetRadius, double InNoiseAmplitude, double InMinFootprint = 0.0);
 
+    /** The terrestrial generator: Bake's heights (sampled through a warp, VoxelLandSample.ush)
+     *  plus slope-damped detail. InPlanetRadius is the base radius and InNoiseAmplitude the
+     *  height range above it that hold every height (VoxelLand::ShapeFor), so the contract of
+     *  HeightAt and the lattice sizing are the noise surface's. */
+    FVoxelDensityCPU(const FVoxelTerrestrialSettings& InLand, TSharedPtr<const FVoxelLandBake, ESPMode::ThreadSafe> InBake,
+        double InPlanetRadius, double InNoiseAmplitude, double InMinFootprint = 0.0);
+
     /** Height above the planet radius (cm, 0..NoiseAmplitude) in direction Dir (any length),
      *  with octaves finer than Footprint (cm) left out. */
     double HeightAt(const FVector& Dir, double Footprint) const;
@@ -111,6 +120,9 @@ public:
 
     double GetPlanetRadius() const { return PlanetRadius; }
     double GetNoiseAmplitude() const { return NoiseAmplitude; }
+
+    /** The terrestrial generator's bake (null for the noise surface). */
+    const TSharedPtr<const FVoxelLandBake, ESPMode::ThreadSafe>& GetLandBake() const { return LandBake; }
 
 private:
     /** One octave, fixed at construction; both backends read these. With a lacunarity of 2,
@@ -140,6 +152,9 @@ private:
     double EvaluateLayer(const FLayer& Layer, const FVector& SurfacePoint, double Footprint) const;
     float SampleOne(const FVector& Position, double Footprint) const;
 
+    /** HeightAt for the terrestrial generator, from the surface point at PlanetRadius. */
+    double LandHeightAt(const FVector& SurfacePoint, double Footprint) const;
+
     FVoxelSurfaceSettings Settings;
     double PlanetRadius = 1.0;
     double NoiseAmplitude = 0.0;
@@ -147,6 +162,13 @@ private:
     FLayer Continent;
     FLayer Mountain;
     FLayer Detail;
+
+    // The terrestrial generator (all unused when LandBake is null).
+    TSharedPtr<const FVoxelLandBake, ESPMode::ThreadSafe> LandBake;
+    FLayer LandWarp[3];                 // the sampling warp's components (no band limit)
+    double LandHeightOffset = 0.0;      // cm: the bake's sea-level heights to heights above PlanetRadius
+    double LandDetailAmplitude = 0.0;   // cm
+    double LandWarpAmplitude = 0.0;     // cm
 };
 
 namespace VoxelDensity
@@ -157,6 +179,12 @@ namespace VoxelDensity
      *  field; 0 keeps every octave. */
     VOXELPLUGIN_API TSharedPtr<FDensitySampleCompositor> MakeCompositor(const FVoxelSurfaceSettings& Settings,
         double PlanetRadius, double NoiseAmplitude, TSharedPtr<FSparseEditStore> EditStore, double MinFootprint = 0.0);
+
+    /** The same for the terrestrial generator: PlanetRadius and NoiseAmplitude from
+     *  VoxelLand::ShapeFor(Land, *Bake). */
+    VOXELPLUGIN_API TSharedPtr<FDensitySampleCompositor> MakeTerrestrialCompositor(const FVoxelTerrestrialSettings& Land,
+        TSharedPtr<const FVoxelLandBake, ESPMode::ThreadSafe> Bake, double PlanetRadius, double NoiseAmplitude,
+        TSharedPtr<FSparseEditStore> EditStore, double MinFootprint = 0.0);
 
     /** Root half-extent of a planet's terrain lattice: holds every possible surface point. */
     inline double RootExtentFor(double PlanetRadius, double NoiseAmplitude) { return (PlanetRadius + NoiseAmplitude) * 1.05; }

@@ -1,0 +1,365 @@
+// VoxelLandPlates.ush - The plate model of the land bake (Design/LandGen.md section 4): warped
+// spherical Voronoi plates with Euler-pole motion, boundary profiles at Earth widths and
+// heights, and a crust field with abyss, slope, shelf and plains. A pure function of the
+// direction, evaluated once per bake cell (VoxelLandBake.usf on the GPU, VoxelLandBake.cpp on
+// the CPU when there is no GPU). Ported from the look-test prototype (landproto/plates.py),
+// with the changes of the design: smooth fades where the prototype cut off.
+//
+// Shared subset (VoxelShaderCompat.h). The C++ side includes it inside a struct whose members
+// have the names of the inputs below, so it declares no static data (constants are #defines).
+// Include after VoxelDensityCore.ush and VoxelCubeSphere.ush, and after declaring:
+//
+//   StructuredBuffer<float> LandPlates;   8 floats per plate: seed direction (3), continental
+//                                          bias, angular velocity (pole times rate, 3), density
+//   uint LandPlateCount;
+//   uint LandSeed;
+//   float LandRadiusM;                     sea-level radius (m)
+//   float LandWidthScale;                  landform widths, times Earth's
+//   float LandReliefScale;                 landform heights, times Earth's
+//   float LandShelfDepth, LandAbyssDepth;  (m, negative)
+//   float LandCoastHeight, LandInteriorHeight;   plains at the coast and deep inland (m)
+
+#ifndef VOXEL_LAND_PLATES_USH
+#define VOXEL_LAND_PLATES_USH
+
+// The prototype's noise (12 edge gradients) has 1.43 times the standard deviation of
+// VoxelGradientNoise; its thresholds and weights were tuned on it.
+#define VOXEL_LAND_NOISE_SCALE 1.43f
+// Soft plate assignment: weights fall off over this distance past a bisector (m, Earth).
+#define VOXEL_LAND_BLEND_M 60000.0f
+// Boundaries farther than this (m, Earth) contribute nothing; their contribution fades out
+// over the last tenth.
+#define VOXEL_LAND_REACH_M 1200000.0f
+// Seed salts.
+#define VOXEL_LAND_SALT_WARP 0x3a1u
+#define VOXEL_LAND_SALT_CRUST 0x5c3u
+#define VOXEL_LAND_SALT_TEXTURE 0x7e5u
+
+// --- Noise -------------------------------------------------------------------------------
+
+/** fBm of VoxelGradientNoise on a float position (a unit direction times a frequency):
+ *  gain 0.5, lacunarity 2, normalised by the amplitude sum and scaled to the prototype's. */
+VOXEL_FUNC float VoxelLandFbm(float3 P, float Frequency, uint NumOctaves, uint Seed)
+{
+    float Sum = 0.0f;
+    float Norm = 0.0f;
+    float Amplitude = 1.0f;
+    float F = Frequency;
+    for (uint o = 0u; o < NumOctaves; o++)
+    {
+        const float3 X = P * F;
+        const float3 Floor = float3(floor(X.x), floor(X.y), floor(X.z));
+        const uint3 Cell = uint3(asuint(int(Floor.x)), asuint(int(Floor.y)), asuint(int(Floor.z)));
+        const FVoxelNoiseSample N = VoxelGradientNoise(Cell, X - Floor, Seed + o * 0x9e3779b9u);
+        Sum += Amplitude * N.Value;
+        Norm += Amplitude;
+        Amplitude *= 0.5f;
+        F *= 2.0f;
+    }
+    return Norm > 0.0f ? Sum / Norm * VOXEL_LAND_NOISE_SCALE : 0.0f;
+}
+
+/** The plates' domain warp: a vector fBm offset of the direction (hides the Voronoi
+ *  polygons), back on the unit sphere. */
+VOXEL_FUNC float3 VoxelLandWarp(float3 P)
+{
+    const float WX = VoxelLandFbm(P + float3(3.1f, 0.0f, 0.0f), 2.5f, 4u, LandSeed + VOXEL_LAND_SALT_WARP + 1u);
+    const float WY = VoxelLandFbm(P + float3(0.0f, 7.7f, 0.0f), 2.5f, 4u, LandSeed + VOXEL_LAND_SALT_WARP + 2u);
+    const float WZ = VoxelLandFbm(P + float3(0.0f, 0.0f, 1.9f), 2.5f, 4u, LandSeed + VOXEL_LAND_SALT_WARP + 3u);
+    return normalize(P + float3(WX, WY, WZ) * 0.12f);
+}
+
+// --- Plates ------------------------------------------------------------------------------
+
+VOXEL_FUNC float3 VoxelLandPlateSeed(uint Plate)
+{
+    return float3(LandPlates[Plate * 8u], LandPlates[Plate * 8u + 1u], LandPlates[Plate * 8u + 2u]);
+}
+
+VOXEL_FUNC float VoxelLandPlateBias(uint Plate)
+{
+    return LandPlates[Plate * 8u + 3u];
+}
+
+VOXEL_FUNC float3 VoxelLandPlateOmega(uint Plate)
+{
+    return float3(LandPlates[Plate * 8u + 4u], LandPlates[Plate * 8u + 5u], LandPlates[Plate * 8u + 6u]);
+}
+
+VOXEL_FUNC float VoxelLandPlateDensity(uint Plate)
+{
+    return LandPlates[Plate * 8u + 7u];
+}
+
+/** The plate whose seed is nearest the warped direction W. */
+VOXEL_FUNC uint VoxelLandNearestPlate(float3 W)
+{
+    uint Best = 0u;
+    float BestDot = -2.0f;
+    for (uint q = 0u; q < LandPlateCount; q++)
+    {
+        const float D = dot(W, VoxelLandPlateSeed(q));
+        if (D > BestDot)
+        {
+            BestDot = D;
+            Best = q;
+        }
+    }
+    return Best;
+}
+
+/** Crust value before the threshold: the plate's continental tendency plus low-frequency
+ *  noise, so coasts don't follow plate edges. The bake's threshold is the quantile of this
+ *  over the sphere that leaves the continental fraction above it. */
+VOXEL_FUNC float VoxelLandRawCrust(float3 P, uint Plate)
+{
+    return 0.45f * VoxelLandPlateBias(Plate) + VoxelLandFbm(P, 1.6f, 5u, LandSeed + VOXEL_LAND_SALT_CRUST);
+}
+
+/** Continental fraction 0..1 of direction P as plate Plate's crust. */
+VOXEL_FUNC float VoxelLandCrust(float3 P, uint Plate, float Threshold)
+{
+    return saturate((VoxelLandRawCrust(P, Plate) - Threshold) / 0.08f + 0.5f);
+}
+
+/** Hypsometry from the continental fraction: abyss, slope, shelf, plains rising inland
+ *  (bimodal, like Earth's). Continuous in C. */
+VOXEL_FUNC float VoxelLandBaseElevation(float C)
+{
+    if (C >= 0.5f)
+        return LandCoastHeight + (LandInteriorHeight - LandCoastHeight) * (C - 0.5f) * 2.0f;
+    if (C >= 0.42f)
+        return LandShelfDepth + (LandCoastHeight - LandShelfDepth) * (C - 0.42f) / 0.08f;
+    if (C >= 0.25f)
+    {
+        const float T = smoothstep(0.25f, 0.42f, C);
+        return LandAbyssDepth + (LandShelfDepth - LandAbyssDepth) * T;
+    }
+    return LandAbyssDepth - 600.0f * LandReliefScale * (0.25f - C) / 0.25f;
+}
+
+VOXEL_FUNC float VoxelLandGauss(float X, float Mu, float W)
+{
+    const float T = (X - Mu) / W;
+    return exp(-T * T);
+}
+
+struct FVoxelLandProfile
+{
+    float Up;      // uplift (m, >= 0)
+    float Down;    // depression (m, >= 0)
+    uint Class;    // 0 none, 1 collision, 2 arc range, 3 trench, 4 island arc, 5 rift, 6 ridge
+};
+
+/** Elevation change at Dist (m, on the point's own side) from a boundary with convergence
+ *  Conv (positive toward each other), own crust C1 and the other side's C2. The four crust
+ *  pairings blend by smooth crust weights, and the strength ramps in smoothly from zero
+ *  convergence, so nothing switches or creases. Earth widths (km) times LandWidthScale, heights (m) times
+ *  LandReliefScale. */
+VOXEL_FUNC FVoxelLandProfile VoxelLandBoundaryProfile(float Dist, float Conv, float C1, float C2, float OwnDensity, float OtherDensity)
+{
+    const float Km = Dist / (1000.0f * LandWidthScale);
+    // Strength from the convergence rate; quadratic near zero, so a profile fades in and out
+    // with zero slope where the convergence changes sign (no crease along that line).
+    const float S = smoothstep(0.0f, 1.2f, abs(Conv));
+    const float W1 = smoothstep(0.35f, 0.65f, C1);
+    const float W2 = smoothstep(0.35f, 0.65f, C2);
+    const float WCC = W1 * W2;
+    const float WCO = W1 * (1.0f - W2);
+    const float WOC = (1.0f - W1) * W2;
+    const float WOO = (1.0f - W1) * (1.0f - W2);
+
+    FVoxelLandProfile Out;
+    Out.Up = 0.0f;
+    Out.Down = 0.0f;
+    Out.Class = 0u;
+    if (Conv > 0.0f)
+    {
+        // Convergent: collision belt and plateau, an Andes-like range over a trench, the
+        // trench, and an island arc (ocean-ocean: the denser plate subducts).
+        const float Collision = 5500.0f * VoxelLandGauss(Km, 60.0f, 110.0f) + 1800.0f * VoxelLandGauss(Km, 250.0f, 200.0f);
+        const float Arc = 4500.0f * VoxelLandGauss(Km, 180.0f, 90.0f) + 1200.0f * VoxelLandGauss(Km, 320.0f, 160.0f);
+        const float Trench = 3500.0f * VoxelLandGauss(Km, 45.0f, 35.0f);
+        const float Island = 3800.0f * VoxelLandGauss(Km, 150.0f, 45.0f);
+        const float Sub = OwnDensity > OtherDensity ? 1.0f : 0.0f;
+        Out.Up = S * (WCC * Collision + WCO * Arc + WOO * (1.0f - Sub) * Island);
+        Out.Down = S * (WOC * Trench + WOO * Sub * Trench);
+        // The dominant pairing (first of equals, as the prototype's argmax).
+        uint K = 0u;
+        float Best = WCC;
+        if (WCO > Best) { Best = WCO; K = 1u; }
+        if (WOC > Best) { Best = WOC; K = 2u; }
+        if (WOO > Best) { Best = WOO; K = 3u; }
+        Out.Class = K == 3u && Sub > 0.5f ? 3u : K + 1u;
+    }
+    else
+    {
+        // Divergent: a continental rift (graben with shoulders), or a mid-ocean ridge.
+        const float RiftDown = 1200.0f * VoxelLandGauss(Km, 0.0f, 35.0f);
+        const float RiftUp = 900.0f * VoxelLandGauss(Km, 70.0f, 45.0f);
+        const float RidgeUp = 2200.0f * VoxelLandGauss(Km, 0.0f, 300.0f);
+        const float RidgeDown = 400.0f * VoxelLandGauss(Km, 0.0f, 12.0f);
+        Out.Up = S * (WCC * RiftUp + (1.0f - W1) * RidgeUp);
+        Out.Down = S * (WCC * RiftDown + (1.0f - W1) * RidgeDown);
+        Out.Class = WCC > (1.0f - W1) ? 5u : 6u;
+        if (S < 0.04f)
+            Out.Class = 0u;
+    }
+    Out.Up *= LandReliefScale;
+    Out.Down *= LandReliefScale;
+    return Out;
+}
+
+struct FVoxelLandOwnParts
+{
+    float Crust;
+    float Up;
+    float Down;
+    uint Class;
+};
+
+/** As plate Own's point (unwarped P, warped W): its crust, and every neighbouring boundary's
+ *  profile, uplifts and depressions combined by a soft maximum (p = 4). */
+VOXEL_FUNC FVoxelLandOwnParts VoxelLandPartsForOwn(float3 P, float3 W, uint Own, float Threshold)
+{
+    const float3 SeedOwn = VoxelLandPlateSeed(Own);
+    const float T1 = acos(clamp(dot(W, SeedOwn), -1.0f, 1.0f));
+    const float C1 = VoxelLandCrust(P, Own, Threshold);
+    const float3 V1 = cross(VoxelLandPlateOmega(Own), P);
+    const float Reach = VOXEL_LAND_REACH_M * max(LandWidthScale, 1.0f);
+
+    float Up4 = 0.0f;
+    float Down4 = 0.0f;
+    float Best = 50.0f;   // a boundary class only where its profile is at least this tall (m)
+    uint Class = 0u;
+    for (uint q = 0u; q < LandPlateCount; q++)
+    {
+        if (q == Own) continue;
+        const float3 SeedQ = VoxelLandPlateSeed(q);
+        const float TQ = acos(clamp(dot(W, SeedQ), -1.0f, 1.0f));
+        const float Dist = 0.5f * (TQ - T1) * LandRadiusM;   // positive on Own's side
+        if (abs(Dist) >= Reach) continue;
+        const float Fade = 1.0f - smoothstep(0.9f * Reach, Reach, abs(Dist));
+
+        // The bisector's normal in the tangent plane at P, toward q.
+        float3 N = SeedQ - SeedOwn;
+        N = N - P * dot(N, P);
+        const float NL = length(N);
+        if (NL < 1.0e-12f) continue;
+        N = N * (1.0f / NL);
+        const float Conv = dot(V1 - cross(VoxelLandPlateOmega(q), P), N);
+
+        // The other side's crust, at the point mirrored across the bisector.
+        const float3 M = normalize(P + N * (2.0f * Dist / LandRadiusM));
+        const float C2 = VoxelLandCrust(M, q, Threshold);
+
+        const FVoxelLandProfile Profile = VoxelLandBoundaryProfile(max(Dist, 0.0f), Conv, C1, C2, VoxelLandPlateDensity(Own), VoxelLandPlateDensity(q));
+        const float Up = Profile.Up * Fade;
+        const float Down = Profile.Down * Fade;
+        Up4 += Up * Up * Up * Up;
+        Down4 += Down * Down * Down * Down;
+        if (Up + Down > Best)
+        {
+            Best = Up + Down;
+            Class = Profile.Class;
+        }
+    }
+
+    FVoxelLandOwnParts Out;
+    Out.Crust = C1;
+    Out.Up = sqrt(sqrt(Up4));
+    Out.Down = sqrt(sqrt(Down4));
+    Out.Class = Class;
+    return Out;
+}
+
+struct FVoxelLandElevation
+{
+    float Base;    // hypsometry of the crust plus low-relief texture (m)
+    float Up;      // boundary uplift (m)
+    float Down;    // boundary depression (m)
+    float Crust;   // continental fraction 0..1
+    uint Class;    // dominant boundary class of the nearest plate
+    uint Plate;    // nearest plate
+};
+
+/** The plate fields of direction P (unit). The point's plate is a soft assignment over the
+ *  three nearest plates, each weighted by how far past its bisector the point lies, less the
+ *  fourth's weight, so nothing jumps where the nearest plates change order. */
+VOXEL_FUNC FVoxelLandElevation VoxelLandElevationAt(float3 P, float Threshold)
+{
+    const float3 W = VoxelLandWarp(P);
+
+    // The four nearest plates (largest dot); only the fourth's distance is needed.
+    uint K0 = 0u, K1 = 0u, K2 = 0u;
+    float D0 = -3.0f, D1 = -3.0f, D2 = -3.0f, D3 = -3.0f;
+    for (uint q = 0u; q < LandPlateCount; q++)
+    {
+        const float D = dot(W, VoxelLandPlateSeed(q));
+        if (D > D0) { D3 = D2; D2 = D1; K2 = K1; D1 = D0; K1 = K0; D0 = D; K0 = q; }
+        else if (D > D1) { D3 = D2; D2 = D1; K2 = K1; D1 = D; K1 = q; }
+        else if (D > D2) { D3 = D2; D2 = D; K2 = q; }
+        else if (D > D3) { D3 = D; }
+    }
+    const float T0 = acos(clamp(D0, -1.0f, 1.0f));
+    const float Scale = 0.5f * LandRadiusM / (VOXEL_LAND_BLEND_M * LandWidthScale);
+    // The floor every kept weight is measured from: the fourth plate's weight (zero when there
+    // are fewer than four), and at least 1e-3 so far plates are skipped without a jump.
+    float Floor = 1.0e-3f;
+    if (LandPlateCount >= 4u)
+    {
+        const float X3 = (acos(clamp(D3, -1.0f, 1.0f)) - T0) * Scale;
+        Floor = max(Floor, exp(-X3 * X3));
+    }
+
+    float WSum = 0.0f;
+    float Crust = 0.0f;
+    float Up = 0.0f;
+    float Down = 0.0f;
+    uint Class = 0u;
+    for (uint r = 0u; r < 3u && r < LandPlateCount; r++)
+    {
+        const uint K = r == 0u ? K0 : (r == 1u ? K1 : K2);
+        const float DK = r == 0u ? D0 : (r == 1u ? D1 : D2);
+        const float X = (acos(clamp(DK, -1.0f, 1.0f)) - T0) * Scale;
+        const float Weight = exp(-X * X) - Floor;
+        if (Weight <= 0.0f) continue;
+        const FVoxelLandOwnParts Parts = VoxelLandPartsForOwn(P, W, K, Threshold);
+        Crust += Weight * Parts.Crust;
+        Up += Weight * Parts.Up;
+        Down += Weight * Parts.Down;
+        if (r == 0u)
+            Class = Parts.Class;
+        WSum += Weight;
+    }
+
+    FVoxelLandElevation Out;
+    if (WSum <= 1.0e-6f)
+    {
+        // Four plates equidistant at one point (a measure-zero case): the nearest alone.
+        const FVoxelLandOwnParts Parts = VoxelLandPartsForOwn(P, W, K0, Threshold);
+        Crust = Parts.Crust;
+        Up = Parts.Up;
+        Down = Parts.Down;
+        Class = Parts.Class;
+        WSum = 1.0f;
+    }
+    Out.Crust = Crust / WSum;
+    Out.Up = Up / WSum;
+    Out.Down = Down / WSum;
+    Out.Class = Class;
+    Out.Plate = K0;
+    // Low-relief continental texture, and abyssal hills (weaker), blended across the coast.
+    const float TextureWeight = lerp(0.4f, 1.0f, smoothstep(0.45f, 0.55f, Out.Crust));
+    Out.Base = VoxelLandBaseElevation(Out.Crust)
+        + 250.0f * LandReliefScale * TextureWeight * VoxelLandFbm(P, 6.0f, 5u, LandSeed + VOXEL_LAND_SALT_TEXTURE);
+    return Out;
+}
+
+/** Packs a cell's attributes: crust fraction (8 bits), boundary class (3 bits at bit 8). */
+VOXEL_FUNC uint VoxelLandPackAttr(float Crust, uint Class)
+{
+    return uint(saturate(Crust) * 255.0f + 0.5f) | ((Class & 7u) << 8u);
+}
+
+#endif // VOXEL_LAND_PLATES_USH

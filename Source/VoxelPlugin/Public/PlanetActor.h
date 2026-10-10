@@ -17,11 +17,14 @@
 #include "OceanSphereActor.h"
 #include "FDensitySampleCompositor.h"
 #include "VoxelDensity.h"
+#include "VoxelLandSettings.h"
 #include "VoxelOceanSettings.h"
 #include "PooledActor.h"
 #include "PlanetActor.generated.h"
 
 class APlanetGravityZone;
+class FVoxelLandBaker;
+struct FVoxelLandBake;
 
 /** Top-level planet actor that spawns and coordinates terrain, ocean, and
  *  gravity child actors. The atmosphere is not attached while mesh generation is
@@ -33,8 +36,13 @@ class APlanetGravityZone;
  *  are scaled independently (terrain = PlanetRadius, ocean = OceanRadius,
  *  gravity = max of the two).
  *
+ *  The surface comes from one of two generators (Generator): the noise surface
+ *  (SurfaceSettings), or the terrestrial generator (TerrestrialSettings), whose bake is made
+ *  before the planet is built (time-sliced, cached on disk): until it is ready the planet
+ *  keeps what it showed. A terrestrial planet's radius is its sea level.
+ *
  *  Property changes are handled via two deferred flags:
- *    - bPendingInitialize: full rebuild (scale, NAR, surface settings changes)
+ *    - bPendingInitialize: full rebuild (scale, NAR, generator or surface settings changes)
  *    - bPendingOceanUpdate: ocean/gravity toggle or sea level change only
  *  Both go through ConfigureOcean / ConfigureGravity, as the first initialization does.
  *  The ocean's own settings (OceanSettings) and material apply in place, without either. */
@@ -52,17 +60,31 @@ public:
 
     // --- Shape ---
 
-    /** Ratio of noise amplitude to planet radius, shared with child actors. */
+    /** Which generator shapes the surface (a change rebuilds the planet). */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Planet|Shape")
+    EVoxelSurfaceGenerator Generator = EVoxelSurfaceGenerator::Noise;
+
+    /** Noise surface: ratio of noise amplitude to planet radius, shared with child actors.
+     *  Terrestrial: the ceiling on the height range (the bake sets the range itself). */
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Planet|Shape", meta = (ClampMin = "0.01", ClampMax = "1.0"))
     double NoiseAmplitudeRatio = 0.15;
 
-    /** Shape of the surface heightfield, shared by terrain and ocean. */
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Planet|Shape")
+    /** Shape of the noise surface's heightfield, shared by terrain and ocean. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Planet|Shape",
+        meta = (EditCondition = "Generator == EVoxelSurfaceGenerator::Noise", EditConditionHides))
     FVoxelSurfaceSettings SurfaceSettings;
 
-    /** Sea level as a fraction of the noise distribution [0, 1].
-     *  OceanRadius = PlanetRadius + SeaLevel * NoiseAmplitude (at least 1 cm). */
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Planet|Shape", meta = (ClampMin = "-1", ClampMax = "2.0"))
+    /** The terrestrial generator: plates, landforms and the bake. Heights are metres about sea
+     *  level, which is the planet's radius (the actor scale). */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Planet|Shape",
+        meta = (EditCondition = "Generator == EVoxelSurfaceGenerator::Terrestrial", EditConditionHides))
+    FVoxelTerrestrialSettings TerrestrialSettings;
+
+    /** Noise surface: sea level as a fraction of the noise distribution [0, 1].
+     *  OceanRadius = PlanetRadius + SeaLevel * NoiseAmplitude (at least 1 cm). A terrestrial
+     *  planet's sea level is its radius. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Planet|Shape",
+        meta = (ClampMin = "-1", ClampMax = "2.0", EditCondition = "Generator == EVoxelSurfaceGenerator::Noise"))
     double SeaLevel = 0.5;
 
     // --- Ocean ---
@@ -100,6 +122,14 @@ public:
 
     UFUNCTION(BlueprintCallable, Category = "Planet")
     APlanetGravityZone* GetGravityZone() const { return GravityZone; }
+
+    /** 1 when the planet's surface is ready to build: always for the noise surface; for the
+     *  terrestrial generator once the bake for the current settings is made or loaded. */
+    UFUNCTION(BlueprintCallable, Category = "Planet")
+    float GetBakeProgress() const;
+
+    /** The terrestrial bake the planet is built with (null for the noise surface). */
+    TSharedPtr<const FVoxelLandBake, ESPMode::ThreadSafe> GetLandBake() const { return LandBake; }
 
     /** Rebuilds the compositor and every child on the next Tick (a child's structural
      *  setting changed, e.g. the terrain's TargetPrecision). */
@@ -172,6 +202,8 @@ private:
     double LastSeaLevel = -1.0;
     double LastNoiseAmplitudeRatio = -1.0;
     uint32 LastSurfaceSettingsHash = 0;
+    EVoxelSurfaceGenerator LastGenerator = EVoxelSurfaceGenerator::Noise;
+    uint32 LastTerrestrialHash = 0;
     bool bLastEnableOcean = true;
     bool bLastEnableGravity = true;
 
@@ -190,6 +222,25 @@ private:
     /** When true, ocean/gravity toggles and sea level changes are applied on the
      *  next Tick without a full terrain rebuild. */
     bool bPendingOceanUpdate = false;
+
+    /** The terrestrial bake being made for the current settings (null when none is needed). */
+    TSharedPtr<FVoxelLandBaker> LandBaker;
+
+    /** The terrestrial bake the planet is built with: kept while a new one is made, so the
+     *  planet shows the old surface until then. */
+    TSharedPtr<const FVoxelLandBake, ESPMode::ThreadSafe> LandBake;
+
+    /** Terrestrial: advances the bake for the current settings and radius; true once LandBake
+     *  is it. */
+    bool TickLandBake();
+
+    /** The density's shape for the current generator: the radius the heights are above, their
+     *  range, and the sea radius. Terrestrial needs LandBake. */
+    void ComputeShape(double& OutPlanetRadius, double& OutNoiseAmplitude, double& OutOceanRadius) const;
+
+    /** NoiseAmplitude / PlanetRadius for the children (NoiseAmplitudeRatio itself for the noise
+     *  surface, so its lattice is unchanged). */
+    double ChildNoiseAmplitudeRatio(double PlanetRadius, double NoiseAmplitude) const;
 
     /** Full planet initialization: spawns child actors, builds the shared compositor,
      *  configures and initializes terrain/ocean/gravity. */

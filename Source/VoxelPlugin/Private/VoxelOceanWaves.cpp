@@ -3,8 +3,8 @@
 #include "HAL/IConsoleManager.h"
 
 static TAutoConsoleVariable<int32> CVarVoxelOceanTestWaves(
-    TEXT("voxel.Ocean.TestWaves"), 0,
-    TEXT("1: the test wave model on the ocean (three Gerstner waves: voxel.Ocean.TestWaveHeight, TestWaveLength, TestWaveChop), to check the surface, the underwater view and the queries under displacement."),
+    TEXT("voxel.Ocean.TestWaves"), 1,
+    TEXT("1 (default): the test wave model on the ocean (three Gerstner waves: voxel.Ocean.TestWaveHeight, TestWaveLength, TestWaveChop), to check the surface, the underwater view and the queries under displacement."),
     ECVF_Default);
 
 static TAutoConsoleVariable<float> CVarVoxelOceanTestWaveHeight(

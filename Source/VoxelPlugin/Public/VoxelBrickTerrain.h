@@ -12,8 +12,13 @@
 #include "VoxelBrickMesher.h"
 #include <atomic>
 
-/** voxel.Debug.LevelColor: vertex colour of newly meshed bricks by level (0 off). */
+/** voxel.Debug.LevelColor: vertex colour of the bricks by level (0 off). */
 extern TAutoConsoleVariable<int32> CVarVoxelDebugLevelColor;
+
+/** voxel.Debug.LandView: vertex colour of the bricks by a component of the generator (0 off;
+ *  VOXEL_LAND_VIEW_* in VoxelLandDebugPalette.ush). Read it through
+ *  FVoxelBrickTerrain::GetLandView. */
+extern TAutoConsoleVariable<int32> CVarVoxelDebugLandView;
 
 class AActor;
 class USceneComponent;
@@ -35,6 +40,9 @@ struct FVoxelBrickTerrainSettings
     double LodDistanceFactor = 2.5;         // a brick splits when the camera is closer than this many brick sizes
     double SlopeBound = 3.5;                // the largest |grad density| assumed by the empty test
     double TriplanarUVScale = 0.0001;
+    /** The sea level the elevation debug view measures from (cm from the centre); 0: the
+     *  density's own (the terrestrial sea radius, or the noise surface's base radius). */
+    double DebugSeaRadius = 0.0;
     TWeakObjectPtr<UMaterialInterface> Material;
     /** Receives the camera and morph slack every frame (VoxelMorph.ush). */
     TWeakObjectPtr<UMaterialParameterCollection> MorphParameters;
@@ -120,6 +128,13 @@ public:
 
     /** Debug vertex colour of a level (voxel.Debug.LevelColor). */
     static FColor LevelColor(int32 Level);
+
+    /** Game thread. voxel.Debug.LandView, 0 when out of range. */
+    static int32 GetLandView();
+
+    /** Game thread. The sea radius the elevation debug view measures from (Settings.
+     *  DebugSeaRadius); with that view on, the terrain is meshed again. */
+    void SetDebugSeaRadius(double InSeaRadius);
 
     /** Neighbour levels and the meshed mask a signature packs (see RunTask), as
      *  VoxelBrickMesher::MeshBrickStitched takes them. */
@@ -208,6 +223,15 @@ private:
     void MergeEdits(TArray<FVoxelBrickPageChange>& Changes, bool bWithTargets);
     /** Commits the edited bricks on their own when no commit is pending. */
     void StartEditCommit();
+    /** Meshes every brick on screen again, as the tree has it, for new debug colours: queued
+     *  for FeedRemesh, and a pending commit staged again. */
+    void RemeshAll();
+    /** Moves the next VBT::RemeshChunkBricks queued bricks into the edit backlog once nothing
+     *  is pending, so each chunk is its own commit (the old mesh drawn until it is ready). */
+    void FeedRemesh();
+    /** Watches the debug colour variables: a change meshes the terrain again. While a land
+     *  view is on, its legend is on screen. */
+    void TickDebugViews();
     /** Stages PendingChanges with the edits the GPU data holds. */
     void StagePending();
     /** Whether the GPU path can run for this terrain (renderer, GPU density, centred lattice);
@@ -291,6 +315,12 @@ private:
     TSharedPtr<FEditBuild, ESPMode::ThreadSafe> EditBuild;
     bool bWarnedUnavailable = false;
     bool bReportedMorph = false;
+    /** The debug colours the terrain was last meshed with (voxel.Debug.LandView, LevelColor). */
+    int32 LastLandView = 0;
+    int32 LastLevelColor = 0;
+    /** Bricks to mesh again for new debug colours, from RemeshHead (RemeshAll). */
+    TArray<FVoxelBrickKey> RemeshQueue;
+    int32 RemeshHead = 0;
 
     /** Time spent since the last voxel.Debug.BrickPerf line. Sections: drain, commit, flush
      *  pages, launch. */

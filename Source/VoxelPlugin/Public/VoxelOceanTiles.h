@@ -1,6 +1,7 @@
 // VoxelOceanTiles.h - The ocean's cube-sphere quadtree (Design/OceanMeshing.md section 2): tile
-// keys, the equal-angle face mapping, the CDLOD selection, and a tile's vertices with their
-// morph targets. Pure functions of their inputs, in double; any thread.
+// keys, the equal-angle face mapping (from VoxelCubeSphere.h), the CDLOD selection, and a
+// tile's vertices with their morph targets. Pure functions of their inputs, in double; any
+// thread.
 //
 // A face has an outward normal N and axes U, V with U x V = N. Face coordinates s (along U) and
 // t (along V) run over [-1, 1] and map to normalize(N + tan(pi s / 4) U + tan(pi t / 4) V): the
@@ -37,6 +38,7 @@
 #pragma once
 
 #include "CoreMinimal.h"
+#include "VoxelCubeSphere.h"
 
 /** A tile of the ocean quadtree; also a page of tiles (VoxelOceanTiles::PageOf). */
 struct FVoxelOceanTileKey
@@ -95,62 +97,14 @@ namespace VoxelOceanTiles
      *  below 1. */
     constexpr double DefaultMorphStartFraction = 0.5;
 
-    struct FFace
-    {
-        FVector N;
-        FVector U;
-        FVector V;
-    };
-
-    inline const FFace& GetFace(int32 Face)
-    {
-        static const FFace Faces[6] = {
-            { FVector(1.0, 0.0, 0.0), FVector(0.0, 1.0, 0.0), FVector(0.0, 0.0, 1.0) },
-            { FVector(-1.0, 0.0, 0.0), FVector(0.0, 0.0, 1.0), FVector(0.0, 1.0, 0.0) },
-            { FVector(0.0, 1.0, 0.0), FVector(0.0, 0.0, 1.0), FVector(1.0, 0.0, 0.0) },
-            { FVector(0.0, -1.0, 0.0), FVector(1.0, 0.0, 0.0), FVector(0.0, 0.0, 1.0) },
-            { FVector(0.0, 0.0, 1.0), FVector(1.0, 0.0, 0.0), FVector(0.0, 1.0, 0.0) },
-            { FVector(0.0, 0.0, -1.0), FVector(0.0, 1.0, 0.0), FVector(1.0, 0.0, 0.0) },
-        };
-        return Faces[Face];
-    }
-
-    /** Equal-angle warp of a face coordinate onto the cube face, and its inverse. */
-    inline double Warp(double S) { return FMath::Tan(S * (UE_DOUBLE_PI * 0.25)); }
-    inline double Unwarp(double X) { return FMath::Atan(X) * (4.0 / UE_DOUBLE_PI); }
-
-    /** Face coordinate of grid line K of a grid with 2^Bits cells per face edge (exact). */
-    inline double GridCoord(int64 K, int32 Bits)
-    {
-        return -1.0 + 2.0 * (double)K / (double)(1LL << Bits);
-    }
-
-    /** Unit direction of face coordinates (s, t). */
-    inline FVector Direction(int32 Face, double S, double T)
-    {
-        const FFace& F = GetFace(Face);
-        return (F.N + F.U * Warp(S) + F.V * Warp(T)).GetSafeNormal();
-    }
-
-    /** Face and face coordinates of a direction (the inverse of Direction). */
-    inline void Locate(const FVector& Dir, int32& OutFace, double& OutS, double& OutT)
-    {
-        int32 Best = 0;
-        double BestDot = -2.0;
-        for (int32 Face = 0; Face < 6; Face++)
-        {
-            const double Dot = GetFace(Face).N | Dir;
-            if (Dot > BestDot)
-            {
-                BestDot = Dot;
-                Best = Face;
-            }
-        }
-        const FFace& F = GetFace(Best);
-        OutFace = Best;
-        OutS = Unwarp((F.U | Dir) / BestDot);
-        OutT = Unwarp((F.V | Dir) / BestDot);
-    }
+    // The mapping lives in VoxelCubeSphere.h, shared with the land bake.
+    using VoxelCubeSphere::FFace;
+    using VoxelCubeSphere::GetFace;
+    using VoxelCubeSphere::Warp;
+    using VoxelCubeSphere::Unwarp;
+    using VoxelCubeSphere::GridCoord;
+    using VoxelCubeSphere::Direction;
+    using VoxelCubeSphere::Locate;
 
     /** Angle between two vectors (radians), accurate for small angles. */
     inline double AngleBetween(const FVector& A, const FVector& B)
