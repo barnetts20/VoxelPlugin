@@ -74,6 +74,8 @@ FMaterialHeight MaterialLandHeight(const FMaterialTextures& T, const float X[2],
     O.Bake = L.Bake; O.Gully = L.Gully; O.Detail = L.Detail; O.GullyScale = L.GullyScale; O.Flow = L.Flow; O.DetailScale = L.DetailScale;
     O.BakeGradient[0] = L.BakeGradient.x; O.BakeGradient[1] = L.BakeGradient.y; O.BakeGradient[2] = L.BakeGradient.z;
     O.Warped[0] = L.Warped.x; O.Warped[1] = L.Warped.y; O.Warped[2] = L.Warped.z;
+    O.DetailGradient[0] = L.DetailGradient.x; O.DetailGradient[1] = L.DetailGradient.y; O.DetailGradient[2] = L.DetailGradient.z;
+    O.DetailUnit = L.DetailUnit; O.DetailAmplitudeM = L.DetailAmplitudeM;
     return O;
 }
 

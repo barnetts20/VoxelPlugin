@@ -110,7 +110,7 @@ int main(int argc, char** argv)
     // The full land chain through both accessors.
     std::mt19937 Rng(31);
     std::normal_distribution<double> G;
-    int Mismatch = 0, Count = 0, ColorBad = 0;
+    int Mismatch = 0, Count = 0, ColorBad = 0, HeightChanged = 0;
     for (int i = 0; i < 20000; i++)
     {
         double D[3] = { G(Rng), G(Rng), G(Rng) }; Normalize(D);
@@ -122,7 +122,12 @@ int main(int argc, char** argv)
         const bool bSame = A.Height.x == B.Height[0] && A.Height.y == B.Height[1] && A.Bake == B.Bake && A.Gully == B.Gully && A.Detail == B.Detail
             && A.Flow == B.Flow && A.GullyScale == B.GullyScale && A.DetailScale == B.DetailScale
             && A.BakeGradient.x == B.BakeGradient[0] && A.BakeGradient.y == B.BakeGradient[1] && A.BakeGradient.z == B.BakeGradient[2]
-            && A.Warped.x == B.Warped[0] && A.Warped.y == B.Warped[1] && A.Warped.z == B.Warped[2];
+            && A.Warped.x == B.Warped[0] && A.Warped.y == B.Warped[1] && A.Warped.z == B.Warped[2]
+            && A.DetailGradient.x == B.DetailGradient[0] && A.DetailGradient.y == B.DetailGradient[1] && A.DetailGradient.z == B.DetailGradient[2]
+            && A.DetailUnit == B.DetailUnit && A.DetailAmplitudeM == B.DetailAmplitudeM;
+        // The exact detail path (bGradient) leaves the height as the density's own path has it.
+        const VoxelShader::FVoxelLandHeight A0 = VoxelShader::VoxelLandHeightDF(X, Y, Z, F, false);
+        HeightChanged += A0.Height.x != A.Height.x || A0.Height.y != A.Height.y || A0.Detail != A.Detail;
         if (!bSame && Mismatch < 5)
             printf("  differs at %d: height %.9g/%.9g vs %.9g/%.9g, bake %.9g vs %.9g, gully %.9g vs %.9g, detail %.9g vs %.9g\n", i,
                 A.Height.x, A.Height.y, B.Height[0], B.Height[1], A.Bake, B.Bake, A.Gully, B.Gully, A.Detail, B.Detail);
@@ -136,7 +141,7 @@ int main(int argc, char** argv)
             for (float V : C) ColorBad += !(std::isfinite(V) && V >= 0.0f && V <= 1.001f);
         }
     }
-    printf("land chain through the material's accessors against the global shaders': %d of %d points differ in any bit; %d debug colours out of range\n", Mismatch, Count, ColorBad);
+    printf("land chain through the material's accessors against the global shaders': %d of %d points differ in any bit; %d debug colours out of range; height with the exact detail gradient against without: %d differ\n", Mismatch, Count, ColorBad, HeightChanged);
 
     // The pixel's planet-frame position from the view (VoxelLandFramePoint), against doubles:
     // planets anywhere within 10^9 cm of the world origin, rotated, cameras near their surface.
@@ -211,5 +216,5 @@ int main(int argc, char** argv)
         printf("close-up line %d (up %.2f %.2f %.2f): gully+detail worst difference %.4f m, %d of %d 1 cm steps unchanged, rms 2nd difference %.3g mm (global %.3g mm)\n",
             Line, D[0], D[1], D[2], Worst, Flat, Steps, 1000 * std::sqrt(SumD2B / (Steps - 1)), 1000 * std::sqrt(SumD2A / (Steps - 1)));
     }
-    return Mismatch || AttrBad || WaterBad || OctBad || ColorBad ? 1 : 0;
+    return Mismatch || AttrBad || WaterBad || OctBad || ColorBad || HeightChanged ? 1 : 0;
 }

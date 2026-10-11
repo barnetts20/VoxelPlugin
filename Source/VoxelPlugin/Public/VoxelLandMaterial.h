@@ -30,7 +30,7 @@ namespace VoxelLandMaterial
     VOXELPLUGIN_API extern const FName AxisXLowName;           // VoxelLandAxisXLow (the axes' double-float remainders)
     VOXELPLUGIN_API extern const FName AxisYLowName;           // VoxelLandAxisYLow
     VOXELPLUGIN_API extern const FName AxisZLowName;           // VoxelLandAxisZLow
-    VOXELPLUGIN_API extern const FName ParamsName;             // VoxelLandParams (x view, y tolerance m, z enabled, w tolerance growth)
+    VOXELPLUGIN_API extern const FName ParamsName;             // VoxelLandParams (x view, y tolerance m, z enabled, w near footprint cm)
 
     /** The field texels of a bake (Side x 6 Side, the bake's cell order). Any thread. */
     VOXELPLUGIN_API void BuildFieldTexels(const FVoxelLandBake& Bake, TArray<FFloat16Color>& Out);
@@ -57,10 +57,10 @@ namespace VoxelLandMaterial
         UTexture2DDynamic* Constants);
 
     /** Game thread, every frame: the planet's frame (PlanetFrame: its location and rotation, no
-     *  scale) as its origin and axes (double-float), the debug view and the surface tolerance
-     *  (m). The material places each pixel from its own view, so no camera is needed here.
+     *  scale) as its origin and axes (double-float), the debug view, the surface tolerance
+     *  (m) and the footprint (cm) below which the mesh's normal is used (NearFootprint). The material places each pixel from its own view, so no camera is needed here.
      *  bEnabled false turns the node off (it then reads no texture and leaves the mesh's
      *  normal). */
     VOXELPLUGIN_API void SetFrameParameters(UMaterialInstanceDynamic* Material, const FTransform& PlanetFrame,
-        int32 View, double Tolerance, bool bEnabled);
+        int32 View, double Tolerance, double NearFootprint, bool bEnabled);
 }

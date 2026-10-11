@@ -43,3 +43,4 @@
 #undef LandAbyssDepth
 #undef LandCoastHeight
 #undef LandInteriorHeight
+#undef VOXEL_LAND_DETAIL_COUNT

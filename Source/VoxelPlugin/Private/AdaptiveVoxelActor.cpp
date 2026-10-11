@@ -336,7 +336,7 @@ void AAdaptiveVoxelActor::UpdateLandMaterial()
     // The planet's frame as it renders this frame (every actor has moved); the material places
     // each pixel from its own view.
     VoxelLandMaterial::SetFrameParameters(LandMaterialInstance, FTransform(GetActorRotation(), GetActorLocation()),
-        FVoxelBrickTerrain::GetMaterialLandView(), LandSurfaceTolerance, bLandMaterialBound);
+        FVoxelBrickTerrain::GetMaterialLandView(), LandSurfaceTolerance, LandNearMeshNormal * ActualPrecision, bLandMaterialBound);
 }
 
 void AAdaptiveVoxelActor::SetDebugSeaRadius(double InSeaRadius)

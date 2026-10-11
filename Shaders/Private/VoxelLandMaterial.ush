@@ -26,10 +26,13 @@
 // sets them); OriginHigh, OriginLow = VoxelLandOriginHigh and VoxelLandOriginLow (the planet's
 // origin in world, double-float cm); AxisX, AxisY, AxisZ = VoxelLandAxisX/Y/Z (the planet frame's
 // axes in world) and AxisXLow, AxisYLow, AxisZLow = VoxelLandAxisXLow/YLow/ZLow (their
-// double-float remainders); Params = VoxelLandParams (x the debug view, voxel.Debug.LandView; y the surface
-// tolerance, m, and w its growth per metre of pixel footprint: the normal fades to the mesh's
-// beyond y + w x footprint off the analytic surface; z 1 when the land textures are bound, else
-// 0: the node then reads nothing. The parameter's default in the material must be (0, 2, 0, 16),
+// double-float remainders); Params = VoxelLandParams (x the debug view, voxel.Debug.LandView, plus
+// 16 x the normal's sources, voxel.Debug.LandNormalMode (VoxelLandPixel), plus 64 x the cost
+// switch, voxel.Land.MaterialCost; y the
+// surface tolerance, m: the normal fades to the mesh's beyond y + 16 pixel footprints off the
+// analytic surface; z 1 when the land textures are bound, else 0: the node then reads nothing;
+// w the footprint, cm, below which the mesh's normal is used (close to the camera, where the
+// finest mesh cells carry all the land's detail), the node's above 2.5 w. The parameter's default in the material must be (0, 2, 0, 16),
 // so an instance the terrain didn't set stays off).
 //
 // The pixel's position comes from the view itself (VOXEL_LAND_TRANSLATED_WORLD_POSITION and
@@ -67,6 +70,11 @@
 #define VOXEL_LAND_PRE_VIEW_TRANSLATION_LOW (ResolvedView.PreViewTranslation.Low)
 #endif
 
+// The step (cm) mode 0 differences the gullies over close up (VoxelLandPixel).
+#ifndef VOXEL_LAND_FIXED_STEP
+#define VOXEL_LAND_FIXED_STEP 25.0f
+#endif
+
 // Screen-space derivatives exist in pixel shaders only; the material's pixel inputs are also
 // compiled into other stages (ray-tracing hit shaders, for one), which get the bake's gradient
 // alone and a footprint from the distance to the camera.
@@ -98,7 +106,12 @@ struct FVoxelLandPixel
     FVoxelLandHeight Land; // the terms behind them (the debug views)
 };
 
-FVoxelLandPixel VoxelLandPixel(VOXEL_LAND_ARGS_DECL float2 PX, float2 PY, float2 PZ, float3 DdxLocal, float3 DdyLocal, float Footprint)
+/** The normal's sources (voxel.Debug.LandNormalMode, VoxelLandParams.x / 16): 0 the bake's and
+ *  the detail's exact gradients plus the gullies' (and the detail amplitude's) screen-space
+ *  change; 1 the screen-space change of gullies and detail together (M1); 2 the bake and the
+ *  detail exact, no gullies; 3 the bake alone. */
+FVoxelLandPixel VoxelLandPixel(VOXEL_LAND_ARGS_DECL float2 PX, float2 PY, float2 PZ, float3 DdxLocal, float3 DdyLocal, float Footprint,
+    uint NormalMode, float FixedScale)
 {
     FVoxelLandPixel Out;
     const float2 Radius = VoxelDFSqrt(VoxelDFAdd(VoxelDFAdd(VoxelDFMul(PX, PX), VoxelDFMul(PY, PY)), VoxelDFMul(PZ, PZ)));
@@ -116,27 +129,79 @@ FVoxelLandPixel VoxelLandPixel(VOXEL_LAND_ARGS_DECL float2 PX, float2 PY, float2
     const float2 PointAbove = VoxelDFSub(Radius, VoxelDFAdd(SeaRadius, AboveBase));
     Out.Offset = (PointAbove.x + PointAbove.y) * 0.01f;
 
-    // The gradient: the bake's, plus the gullies' and the detail's change across the pixel. The
-    // derivative calls stay in uniform control flow (nothing above returns or branches on the
-    // pixel).
+    // The gradient: the bake's exact one, the detail's exact one, and the gullies' change across
+    // the pixel (NormalMode). The derivative calls stay in uniform control flow (nothing above
+    // returns or branches on the pixel).
     const float3 Up = normalize(float3(PX.x, PY.x, PZ.x));
     Out.Up = Up;
+    // Every derivative is taken (uniform control flow); the mode picks.
     const float Rest = H.Gully + H.Detail;
-    const float DRx = VOXEL_LAND_DDX(Rest);
-    const float DRy = VOXEL_LAND_DDY(Rest);
+    const float RestX = VOXEL_LAND_DDX(Rest);
+    const float RestY = VOXEL_LAND_DDY(Rest);
+    const float GullyX = VOXEL_LAND_DDX(H.Gully);
+    const float GullyY = VOXEL_LAND_DDY(H.Gully);
+    const float AmplitudeX = VOXEL_LAND_DDX(H.DetailAmplitudeM);
+    const float AmplitudeY = VOXEL_LAND_DDY(H.DetailAmplitudeM);
+    float DRx = 0.0f;
+    float DRy = 0.0f;
+    float3 Exact = H.BakeGradient;
+    if (NormalMode == 1u)
+    {
+        DRx = RestX;
+        DRy = RestY;
+    }
+    else if (NormalMode != 3u)
+    {
+        Exact = Exact + (H.DetailGradient - Up * dot(H.DetailGradient, Up));
+        if (NormalMode == 0u)
+        {
+            DRx = GullyX + H.DetailUnit * AmplitudeX;
+            DRy = GullyY + H.DetailUnit * AmplitudeY;
+        }
+    }
     const float3 Tx = (DdxLocal - Up * dot(DdxLocal, Up)) * 0.01f;
     const float3 Ty = (DdyLocal - Up * dot(DdyLocal, Up)) * 0.01f;
     const float XX = dot(Tx, Tx);
     const float XY = dot(Tx, Ty);
     const float YY = dot(Ty, Ty);
     const float Det = XX * YY - XY * XY;
-    float3 Gradient = H.BakeGradient;
+    float3 Gradient = Exact;
+    float3 ScreenPart = float3(0.0f, 0.0f, 0.0f);
     if (Det > 1.0e-6f * max(XX * YY, 1.0e-30f))
     {
         const float A = (DRx * YY - DRy * XY) / Det;
         const float B = (DRy * XX - DRx * XY) / Det;
-        Gradient = Gradient + Tx * A + Ty * B;
+        ScreenPart = Tx * A + Ty * B;
     }
+    // Close up (pixels under VOXEL_LAND_FIXED_STEP), mode 0 differences the gullies and the
+    // detail's amplitude over that step instead of a pixel: the float sums' round-off is a few
+    // millimetres, a visible slope over a centimetre and nothing over a quarter metre, while the
+    // finest gullies (30 m) are still resolved. Two more evaluations of the surface (no detail
+    // layer).
+    // FixedScale: 0 where the mesh's normal is shown anyway (close to the camera, Params.w) or
+    // the cost switch leaves it out.
+    const float FixedBlend = NormalMode == 0u ? FixedScale * (1.0f - smoothstep(0.5f * VOXEL_LAND_FIXED_STEP, VOXEL_LAND_FIXED_STEP, Footprint)) : 0.0f;
+    if (FixedBlend > 0.0f)
+    {
+        const float3 T1 = normalize(abs(Up.z) < 0.9f ? cross(float3(0.0f, 0.0f, 1.0f), Up) : cross(float3(1.0f, 0.0f, 0.0f), Up));
+        const float3 T2 = cross(Up, T1);
+        // The centre's terms are VoxelLandHeightDF's own.
+        FVoxelLandDifferenced C0;
+        C0.Gully = H.Gully;
+        C0.DetailAmplitudeM = H.DetailAmplitudeM;
+        const FVoxelLandDifferenced C1 = VoxelLandDifferencedDF(VOXEL_LAND_ARGS
+            VoxelDFAdd(LPX, float2(T1.x * VOXEL_LAND_FIXED_STEP, 0.0f)), VoxelDFAdd(LPY, float2(T1.y * VOXEL_LAND_FIXED_STEP, 0.0f)),
+            VoxelDFAdd(LPZ, float2(T1.z * VOXEL_LAND_FIXED_STEP, 0.0f)), Footprint);
+        const FVoxelLandDifferenced C2 = VoxelLandDifferencedDF(VOXEL_LAND_ARGS
+            VoxelDFAdd(LPX, float2(T2.x * VOXEL_LAND_FIXED_STEP, 0.0f)), VoxelDFAdd(LPY, float2(T2.y * VOXEL_LAND_FIXED_STEP, 0.0f)),
+            VoxelDFAdd(LPZ, float2(T2.z * VOXEL_LAND_FIXED_STEP, 0.0f)), Footprint);
+        // m per m: the step is in cm.
+        const float Inv = 100.0f / VOXEL_LAND_FIXED_STEP;
+        const float D1 = ((C1.Gully - C0.Gully) + H.DetailUnit * (C1.DetailAmplitudeM - C0.DetailAmplitudeM)) * Inv;
+        const float D2 = ((C2.Gully - C0.Gully) + H.DetailUnit * (C2.DetailAmplitudeM - C0.DetailAmplitudeM)) * Inv;
+        ScreenPart = lerp(ScreenPart, T1 * D1 + T2 * D2, FixedBlend);
+    }
+    Gradient = Gradient + ScreenPart;
     Out.Normal = normalize(Up - Gradient);
 
     // The bake's fields at the nearest cell of the warped direction.
@@ -200,19 +265,29 @@ float VoxelLandPixelFootprint(float3 TranslatedWorld, float3 DdxLocal, float3 Dd
     const float3 DdxLocal = float3(dot(DdxWorld, AxisX), dot(DdxWorld, AxisY), dot(DdxWorld, AxisZ)); \
     const float3 DdyLocal = float3(dot(DdyWorld, AxisX), dot(DdyWorld, AxisY), dot(DdyWorld, AxisZ)); \
     const float Footprint = VoxelLandPixelFootprint(TranslatedWorld, DdxLocal, DdyLocal); \
-    const FVoxelLandPixel Pixel = VoxelLandPixel(HeightTex, FieldTex, ConstTex, Point.X, Point.Y, Point.Z, DdxLocal, DdyLocal, Footprint); \
+    /* x: the view (4 bits), the normal's sources (2 bits), the cost switch (3 bits). */ \
+    const uint Packed = uint(Params.x + 0.5f); \
+    const uint Cost = (Packed >> 6u) & 7u; \
+    GVoxelLandSkipGullies = Cost >= 2u; \
+    GVoxelLandSkipDetail = Cost >= 3u; \
+    /* Close to the camera (pixels far finer than the finest mesh cell, Params.w cm and below) */ \
+    /* the mesh carries all the land's detail, and its normal is cleaner than a screen-space */ \
+    /* difference over a centimetre: the mesh's normal there, the node's from 2.5 Params.w. */ \
+    const float Near = 1.0f - smoothstep(Params.w, 2.5f * Params.w, Footprint); \
+    const FVoxelLandPixel Pixel = VoxelLandPixel(HeightTex, FieldTex, ConstTex, Point.X, Point.Y, Point.Z, DdxLocal, DdyLocal, Footprint, \
+        (Packed >> 4u) & 3u, Cost == 0u ? 1.0f - Near : 0.0f); \
     Height = Pixel.Height; \
     Fields = Pixel.Fields; \
     Terms = Pixel.Terms; \
     /* Off the analytic surface (an edit, an overhang, a coarse mesh far off): the mesh's normal. */ \
     const float3 MeshWS = normalize(Parameters.TangentToWorld[2]); \
     const float3 MeshLocal = float3(dot(MeshWS, AxisX), dot(MeshWS, AxisY), dot(MeshWS, AxisZ)); \
-    const float Tolerance = max(Params.y + Params.w * Footprint * 0.01f, 0.01f); \
-    const float ToMesh = saturate(abs(Pixel.Offset) / Tolerance - 1.0f); \
+    const float Tolerance = max(Params.y + 16.0f * Footprint * 0.01f, 0.01f); \
+    const float ToMesh = max(saturate(abs(Pixel.Offset) / Tolerance - 1.0f), Near); \
     const float3 Shown = normalize(lerp(Pixel.Normal, MeshLocal, ToMesh)); \
     NormalWS = normalize(AxisX * Shown.x + AxisY * Shown.y + AxisZ * Shown.z); \
     NormalTS = normalize(mul(Parameters.TangentToWorld, NormalWS)); \
-    const uint Mode = uint(Params.x + 0.5f); \
+    const uint Mode = Packed & 15u; \
     if (Mode == 0u) return float3(0.0f, 0.0f, 0.0f); \
     DebugMask = 1.0f; \
     return VoxelLandViewSrgbToLinear(VoxelLandPixelColor(HeightTex, FieldTex, ConstTex, Pixel, Shown, ToMesh, Footprint, Mode));
@@ -228,6 +303,7 @@ float3 VoxelLandMaterial(FMaterialPixelParameters Parameters, Texture2D HeightTe
 #undef VOXEL_LAND_HAS_DERIVATIVES
 #undef VOXEL_LAND_DDX
 #undef VOXEL_LAND_DDY
+#undef VOXEL_LAND_FIXED_STEP
 
 // The inputs' macros (VoxelLandMaterialAccess.ush) end here: the rest of the material keeps its
 // own meaning of these names.

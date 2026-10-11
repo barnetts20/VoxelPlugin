@@ -83,6 +83,15 @@ public:
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrain|Materials", meta = (ClampMin = "0.0", UIMax = "50"))
     double LandSurfaceTolerance = 2.0;
 
+    /** Terrestrial planets, the land node: close to the camera, where the finest mesh cells
+     *  (ActualPrecision) carry all the land's detail, the node uses the mesh's normal. Below a
+     *  pixel footprint of this fraction of the finest cell it is the mesh's, above 2.5 times it
+     *  the node's (0 never). At the default 0.05 and 1 m cells, looking down at 1080p and 90
+     *  degrees: the mesh's within about 50 m, the node's beyond about 120 m (nearer at grazing
+     *  angles, where pixels stretch). */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrain|Materials", meta = (ClampMin = "0.0", UIMax = "0.5"))
+    double LandNearMeshNormal = 0.05;
+
     // --- Terrain Geometry ---
 
     /** Ratio of noise amplitude to planet radius. Surface elevation ranges from

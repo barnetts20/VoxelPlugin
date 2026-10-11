@@ -147,6 +147,11 @@ VOXEL_FUNC FVoxelLandFramePoint VoxelLandFramePoint(float3 TranslatedWorld, floa
     return P;
 }
 
+/** The material's cost switch (voxel.Land.MaterialCost, set per pixel by VoxelLandMaterial):
+ *  leave the gullies or the detail layer out, to measure what each costs. */
+static bool GVoxelLandSkipGullies = false;
+static bool GVoxelLandSkipDetail = false;
+
 // The accessors (VoxelLandAccess.ush).
 #define VOXEL_LAND_HEIGHT(I) LandHeightTex.Load(VoxelLandCellTexel(LandConstTex, (I))).x
 #define VOXEL_LAND_TAN(I) VoxelLandMaterialTan(LandConstTex, (I))
@@ -161,7 +166,7 @@ VOXEL_FUNC FVoxelLandFramePoint VoxelLandFramePoint(float3 TranslatedWorld, floa
 #define LandPad VoxelLandConstU(LandConstTex, VOXEL_LAND_MC_PAD)
 #define LandHasFlow VoxelLandConstU(LandConstTex, VOXEL_LAND_MC_HAS_FLOW)
 #define LandCellM VoxelLandConstF(LandConstTex, VOXEL_LAND_MC_CELL_M)
-#define LandGullyStrength VoxelLandConstF(LandConstTex, VOXEL_LAND_MC_GULLY_STRENGTH)
+#define LandGullyStrength (GVoxelLandSkipGullies ? 0.0f : VoxelLandConstF(LandConstTex, VOXEL_LAND_MC_GULLY_STRENGTH))
 #define LandGullyOctaves VoxelLandConstU(LandConstTex, VOXEL_LAND_MC_GULLY_OCTAVES)
 #define LandGullyFlowGain VoxelLandConstF(LandConstTex, VOXEL_LAND_MC_GULLY_FLOW_GAIN)
 #define LandGullyDetail VoxelLandConstF(LandConstTex, VOXEL_LAND_MC_GULLY_DETAIL)
@@ -176,6 +181,7 @@ VOXEL_FUNC FVoxelLandFramePoint VoxelLandFramePoint(float3 TranslatedWorld, floa
 #define ContinentOctaves VoxelLandConstU(LandConstTex, VOXEL_LAND_MC_CONTINENT_OCTAVES)
 #define MountainOctaves VoxelLandConstU(LandConstTex, VOXEL_LAND_MC_MOUNTAIN_OCTAVES)
 #define DetailOctaves VoxelLandConstU(LandConstTex, VOXEL_LAND_MC_DETAIL_OCTAVES)
+#define VOXEL_LAND_DETAIL_COUNT (GVoxelLandSkipDetail ? 0u : DetailOctaves)
 #define InvNormDetail VoxelLandConstF2(LandConstTex, VOXEL_LAND_MC_INV_NORM_DETAIL)
 #define PlanetRadius VoxelLandConstF2(LandConstTex, VOXEL_LAND_MC_PLANET_RADIUS)
 #define NoiseAmplitude VoxelLandConstF2(LandConstTex, VOXEL_LAND_MC_NOISE_AMPLITUDE)

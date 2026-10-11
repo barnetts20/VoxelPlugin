@@ -160,6 +160,93 @@ VOXEL_FUNC FVoxelNoiseSample VoxelGradientNoise(uint3 Cell, float3 F, uint Seed)
     return Result;
 }
 
+// VoxelGradientNoise with its Hessian too (lattice units; symmetric, as rows HX, HY, HZ), for
+// exact gradients of slope-damped layers (the terrain material's detail normal). Value and
+// Gradient are computed as VoxelGradientNoise computes them.
+struct FVoxelNoiseSample2
+{
+    float Value;
+    float3 Gradient;
+    float3 HX;
+    float3 HY;
+    float3 HZ;
+};
+
+VOXEL_FUNC FVoxelNoiseSample2 VoxelGradientNoiseHessian(uint3 Cell, float3 F, uint Seed)
+{
+    const float3 U = F * F * F * (F * (F * 6.0f - 15.0f) + 10.0f);
+    const float3 DU = 30.0f * F * F * (F * (F - 2.0f) + 1.0f);
+    const float3 DDU = 60.0f * F * (F * (2.0f * F - 3.0f) + 1.0f);
+
+    const float3 GA = VoxelGradient(VoxelHash(Cell + uint3(0u, 0u, 0u), Seed));
+    const float3 GB = VoxelGradient(VoxelHash(Cell + uint3(1u, 0u, 0u), Seed));
+    const float3 GC = VoxelGradient(VoxelHash(Cell + uint3(0u, 1u, 0u), Seed));
+    const float3 GD = VoxelGradient(VoxelHash(Cell + uint3(1u, 1u, 0u), Seed));
+    const float3 GE = VoxelGradient(VoxelHash(Cell + uint3(0u, 0u, 1u), Seed));
+    const float3 GF = VoxelGradient(VoxelHash(Cell + uint3(1u, 0u, 1u), Seed));
+    const float3 GG = VoxelGradient(VoxelHash(Cell + uint3(0u, 1u, 1u), Seed));
+    const float3 GH = VoxelGradient(VoxelHash(Cell + uint3(1u, 1u, 1u), Seed));
+
+    const float VA = dot(GA, F);
+    const float VB = dot(GB, F - float3(1.0f, 0.0f, 0.0f));
+    const float VC = dot(GC, F - float3(0.0f, 1.0f, 0.0f));
+    const float VD = dot(GD, F - float3(1.0f, 1.0f, 0.0f));
+    const float VE = dot(GE, F - float3(0.0f, 0.0f, 1.0f));
+    const float VF = dot(GF, F - float3(1.0f, 0.0f, 1.0f));
+    const float VG = dot(GG, F - float3(0.0f, 1.0f, 1.0f));
+    const float VH = dot(GH, F - float3(1.0f, 1.0f, 1.0f));
+
+    const float K1 = VB - VA;
+    const float K2 = VC - VA;
+    const float K3 = VE - VA;
+    const float K4 = VA - VB - VC + VD;
+    const float K5 = VA - VC - VE + VG;
+    const float K6 = VA - VB - VE + VF;
+    const float K7 = -VA + VB + VC - VD + VE - VF - VG + VH;
+
+    FVoxelNoiseSample2 Result;
+    Result.Value = VA + K1 * U.x + K2 * U.y + K3 * U.z
+        + K4 * U.x * U.y + K5 * U.y * U.z + K6 * U.z * U.x + K7 * U.x * U.y * U.z;
+
+    const float3 G1 = GB - GA;
+    const float3 G2 = GC - GA;
+    const float3 G3 = GE - GA;
+    const float3 G4 = GA - GB - GC + GD;
+    const float3 G5 = GA - GC - GE + GG;
+    const float3 G6 = GA - GB - GE + GF;
+    const float3 G7 = GH - GA + GB + GC - GD + GE - GF - GG;
+    const float3 Interp = GA + G1 * U.x + G2 * U.y + G3 * U.z
+        + G4 * (U.x * U.y) + G5 * (U.y * U.z) + G6 * (U.z * U.x) + G7 * (U.x * U.y * U.z);
+    const float3 Slope = float3(
+        K1 + K4 * U.y + K6 * U.z + K7 * U.y * U.z,
+        K2 + K5 * U.z + K4 * U.x + K7 * U.z * U.x,
+        K3 + K6 * U.x + K5 * U.y + K7 * U.x * U.y);
+    Result.Gradient = Interp + DU * Slope;
+
+    // Gradient_i = Interp_i + DU_i Slope_i. With A_j = dInterp/dU_j (whose component i is also
+    // dSlope_j/dF_i through the K's), dGradient_i/dF_j = A_j[i] DU_j + DU_i (A_i[j] + the
+    // cross term of Slope_i in U_j) DU_j, plus DDU_i Slope_i on the diagonal.
+    const float3 AX = G1 + G4 * U.y + G6 * U.z + G7 * (U.y * U.z);
+    const float3 AY = G2 + G5 * U.z + G4 * U.x + G7 * (U.z * U.x);
+    const float3 AZ = G3 + G6 * U.x + G5 * U.y + G7 * (U.x * U.y);
+    const float CXY = K4 + K7 * U.z;     // d2 Value / dUx dUy, and so on
+    const float CYZ = K5 + K7 * U.x;
+    const float CZX = K6 + K7 * U.y;
+    Result.HX = float3(
+        2.0f * AX.x * DU.x + DDU.x * Slope.x,
+        AY.x * DU.y + DU.x * (AX.y + CXY * DU.y),
+        AZ.x * DU.z + DU.x * (AX.z + CZX * DU.z));
+    Result.HY = float3(
+        AX.y * DU.x + DU.y * (AY.x + CXY * DU.x),
+        2.0f * AY.y * DU.y + DDU.y * Slope.y,
+        AZ.y * DU.z + DU.y * (AY.z + CYZ * DU.z));
+    Result.HZ = float3(
+        AX.z * DU.x + DU.z * (AZ.x + CZX * DU.x),
+        AY.z * DU.y + DU.z * (AZ.y + CYZ * DU.y),
+        2.0f * AZ.z * DU.z + DDU.z * Slope.z);
+    return Result;
+}
+
 // Weight of an octave of the given wavelength for samples meshed at Footprint (both in the
 // same units): 1 when the wavelength spans at least four footprints, fading to 0 at two.
 // Footprint <= 0 keeps every octave.

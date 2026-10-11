@@ -689,17 +689,18 @@ int main(int argc, char** argv)
     }
     else if (Mode == "grad")
     {
-        // VoxelLandHeightDF's bake gradient against central differences of the bake term, and
-        // the material's normal scheme: the bake's analytic gradient plus Gully + Detail
-        // differenced over a pixel (as ddx/ddy do), against central differences of the full
-        // height. At footprints (the pixel size) of 1 m, 10 m and 100 m.
+        // VoxelLandHeightDF's bake and detail gradients against central differences, and the
+        // material's normal schemes against central differences of the full height, at pixel
+        // footprints from 100 m down to 1 cm. Mode 0 (the default): the bake and the detail
+        // exact, the gullies and the detail's amplitude differenced over a pixel (as ddx/ddy
+        // do); mode 1 (M1): Gully + Detail differenced over a pixel.
         std::vector<FVoxelOctave> Gpu;
         SetGpuGlobals(P, Gpu);
         std::mt19937 Rng(23);
         std::normal_distribution<double> G;
-        for (double F : { 100.0 * 100, 10.0 * 100, 1.0 * 100 })
+        for (double F : { 100.0 * 100, 10.0 * 100, 1.0 * 100, 0.1 * 100, 0.01 * 100 })
         {
-            std::vector<double> EB, EN, Slope;
+            std::vector<double> EB, ED, EN0, EN0F, EN1, Slope;
             int Tries = 0;
             const double PixM = F * 0.01;
             while (EB.size() < 3000 && Tries < 400000)
@@ -713,34 +714,82 @@ int main(int argc, char** argv)
                 if (H0.Bake < 100) continue;
                 double E1[3], E2[3]; Frame(D, E1, E2);
                 auto Offset = [&](const double* E, double M, double* Out) { for (int a = 0; a < 3; a++) Out[a] = D[a] + M * 100.0 / P.SeaRadius * E[a]; Normalize(Out); };
-                // Reference: central differences of the full height at a small step.
-                const double StepM = 0.02;
-                double Ref[2], Bfd[2], Pix[2];
+                // Reference: central differences of the full height at 10 and 20 cm, Richardson-
+                // extrapolated (finer steps would measure the float sums' round-off: a few
+                // percent of the detail's slope at 2 cm). Every feature is a metre and up.
+                const double StepM = 0.1;
+                double Ref[2], Bfd[2], Dfd[2], Pix1[2], Pix0[2], Fix0[2], Bx[2], Dx[2];
                 for (int k = 0; k < 2; k++)
                 {
                     const double* E = k == 0 ? E1 : E2;
-                    double A[3], B[3], C[3];
-                    Offset(E, StepM, A); Offset(E, -StepM, B); Offset(E, PixM, C);
-                    const FVoxelLandHeight HA = At(A, false), HB = At(B, false), HC = At(C, false);
-                    Ref[k] = ((HA.Height.x - HB.Height.x) + ((double)HA.Height.y - HB.Height.y)) * 0.01 / (2 * StepM);
-                    Bfd[k] = (HA.Bake - HB.Bake) / (2 * StepM);
-                    // A pixel's forward difference of Gully + Detail (ddx_fine).
-                    Pix[k] = ((HC.Gully + HC.Detail) - (H0.Gully + H0.Detail)) / PixM;
+                    double A[3], B[3], A2[3], B2[3], C[3];
+                    Offset(E, StepM, A); Offset(E, -StepM, B); Offset(E, 2 * StepM, A2); Offset(E, -2 * StepM, B2); Offset(E, PixM, C);
+                    const FVoxelLandHeight HA = At(A, true), HB = At(B, true), HA2 = At(A2, true), HB2 = At(B2, true), HC = At(C, true);
+                    auto Rich = [&](double V1, double V2) { return (4 * V1 - V2) / 3; };
+                    Ref[k] = Rich(((HA.Height.x - HB.Height.x) + ((double)HA.Height.y - HB.Height.y)) * 0.01 / (2 * StepM),
+                        ((HA2.Height.x - HB2.Height.x) + ((double)HA2.Height.y - HB2.Height.y)) * 0.01 / (4 * StepM));
+                    Bfd[k] = Rich((HA.Bake - HB.Bake) / (2 * StepM), (HA2.Bake - HB2.Bake) / (4 * StepM));
+                    // The detail at fixed amplitude (its unit times the centre's amplitude).
+                    Dfd[k] = Rich((HA.DetailUnit - HB.DetailUnit) / (2 * StepM), (HA2.DetailUnit - HB2.DetailUnit) / (4 * StepM)) * H0.DetailAmplitudeM;
+                    // A pixel's forward differences (ddx_fine).
+                    Pix1[k] = ((HC.Gully + HC.Detail) - (H0.Gully + H0.Detail)) / PixM;
+                    Pix0[k] = ((HC.Gully - H0.Gully) + H0.DetailUnit * (HC.DetailAmplitudeM - H0.DetailAmplitudeM)) / PixM;
+                    // Close up, mode 0 differences them over a fixed 25 cm step (VoxelLandDifferencedDF).
+                    {
+                        double S[3]; Offset(E, 0.25, S);
+                        const FVoxelLandDifferenced C1 = VoxelLandDifferencedDF(DF(S[0] * P.SeaRadius), DF(S[1] * P.SeaRadius), DF(S[2] * P.SeaRadius), (float)F);
+                        Fix0[k] = ((C1.Gully - H0.Gully) + H0.DetailUnit * (C1.DetailAmplitudeM - H0.DetailAmplitudeM)) / 0.25;
+                    }
+                    Bx[k] = H0.BakeGradient.x * E[0] + H0.BakeGradient.y * E[1] + H0.BakeGradient.z * E[2];
+                    Dx[k] = H0.DetailGradient.x * E[0] + H0.DetailGradient.y * E[1] + H0.DetailGradient.z * E[2];
                 }
-                const double Bx = H0.BakeGradient.x * E1[0] + H0.BakeGradient.y * E1[1] + H0.BakeGradient.z * E1[2];
-                const double By = H0.BakeGradient.x * E2[0] + H0.BakeGradient.y * E2[1] + H0.BakeGradient.z * E2[2];
-                EB.push_back(std::hypot(Bx - Bfd[0], By - Bfd[1]));
-                // The normals' angle between the scheme and the reference.
-                const double Nx = Bx + Pix[0], Ny = By + Pix[1];
-                const double Dot = (1 + Nx * Ref[0] + Ny * Ref[1]) / (std::sqrt(1 + Nx * Nx + Ny * Ny) * std::sqrt(1 + Ref[0] * Ref[0] + Ref[1] * Ref[1]));
-                EN.push_back(std::acos(std::min(1.0, Dot)) * 57.2957795);
+                EB.push_back(std::hypot(Bx[0] - Bfd[0], Bx[1] - Bfd[1]));
+                ED.push_back(std::hypot(Dx[0] - Dfd[0], Dx[1] - Dfd[1]) / std::max(std::hypot(Dfd[0], Dfd[1]), 1e-3));
+                auto Angle = [&](double Nx, double Ny) {
+                    const double Dot = (1 + Nx * Ref[0] + Ny * Ref[1]) / (std::sqrt(1 + Nx * Nx + Ny * Ny) * std::sqrt(1 + Ref[0] * Ref[0] + Ref[1] * Ref[1]));
+                    return std::acos(std::min(1.0, Dot)) * 57.2957795;
+                };
+                EN0.push_back(Angle(Bx[0] + Dx[0] + Pix0[0], Bx[1] + Dx[1] + Pix0[1]));
+                EN1.push_back(Angle(Bx[0] + Pix1[0], Bx[1] + Pix1[1]));
+                EN0F.push_back(Angle(Bx[0] + Dx[0] + Fix0[0], Bx[1] + Dx[1] + Fix0[1]));
                 Slope.push_back(std::atan(std::hypot(Ref[0], Ref[1])) * 57.2957795);
             }
-            std::sort(EB.begin(), EB.end()); std::sort(EN.begin(), EN.end()); std::sort(Slope.begin(), Slope.end());
+            for (auto* V : { &EB, &ED, &EN0, &EN0F, &EN1, &Slope }) std::sort(V->begin(), V->end());
             auto Q = [](const std::vector<double>& V, double q) { return V[std::min((size_t)(q * V.size()), V.size() - 1)]; };
-            printf("pixel %5.1f m: bake gradient |analytic - FD| median %.5f p99 %.5f; normal angle error (deg) median %.2f p90 %.2f p99 %.2f, slope (deg) median %.1f p90 %.1f; n %zu\n",
-                PixM, Q(EB, 0.5), Q(EB, 0.99), Q(EN, 0.5), Q(EN, 0.9), Q(EN, 0.99), Q(Slope, 0.5), Q(Slope, 0.9), EB.size());
+            printf("pixel %6.2f m: bake |analytic-FD| median %.5f; detail relative error median %.4f p99 %.4f; normal error (deg) mode 0 median %.2f p90 %.2f p99 %.2f, mode 1 median %.2f p90 %.2f p99 %.2f, mode 0 with the 25 cm step median %.2f p90 %.2f p99 %.2f; slope median %.1f; n %zu\n",
+                PixM, Q(EB, 0.5), Q(ED, 0.5), Q(ED, 0.99), Q(EN0, 0.5), Q(EN0, 0.9), Q(EN0, 0.99), Q(EN1, 0.5), Q(EN1, 0.9), Q(EN1, 0.99),
+                Q(EN0F, 0.5), Q(EN0F, 0.9), Q(EN0F, 0.99), Q(Slope, 0.5), EB.size());
         }
+    }
+    else if (Mode == "dgrad")
+    {
+        // The detail layer's exact gradient (VoxelLayerSumDampedExactDF) against central
+        // differences of its sum, at steps of 20 and 10 cm (Richardson-extrapolated).
+        std::vector<FVoxelOctave> Gpu;
+        SetGpuGlobals(P, Gpu);
+        std::mt19937 Rng(29);
+        std::normal_distribution<double> G;
+        std::vector<double> Rel;
+        const uint First = ContinentOctaves + MountainOctaves;
+        for (int i = 0; i < 3000; i++)
+        {
+            double D[3] = { G(Rng), G(Rng), G(Rng) }; Normalize(D);
+            double E1[3], E2[3]; Frame(D, E1, E2);
+            auto Sum = [&](double M) {
+                double Q[3]; for (int a = 0; a < 3; a++) Q[a] = D[a] * P.SeaRadius + E1[a] * M;
+                const FVoxelLayerSum L = VoxelLayerSumDampedExactDF(First, DetailOctaves, DF(Q[0]), DF(Q[1]), DF(Q[2]), (float)P.Finest);
+                return (double)L.Sum.x + L.Sum.y;
+            };
+            const FVoxelLayerSum L0 = VoxelLayerSumDampedExactDF(First, DetailOctaves, DF(D[0] * P.SeaRadius), DF(D[1] * P.SeaRadius), DF(D[2] * P.SeaRadius), (float)P.Finest);
+            const double F4 = (Sum(20) - Sum(-20)) / 40, F2 = (Sum(10) - Sum(-10)) / 20;
+            const double Fd = (4 * F2 - F4) / 3;
+            const double An = L0.Gradient.x * E1[0] + L0.Gradient.y * E1[1] + L0.Gradient.z * E1[2];
+            const double Ref = VoxelLayerSumDF(First, DetailOctaves, VoxelLayerDamped, DF(D[0] * P.SeaRadius), DF(D[1] * P.SeaRadius), DF(D[2] * P.SeaRadius), (float)P.Finest).x;
+            if (i < 3) printf("  sum %.9g (plain path %.9g), gradient analytic %.6g FD %.6g (20 cm %.6g)\n", (double)L0.Sum.x, Ref, An, Fd, F4);
+            Rel.push_back(std::fabs(An - Fd) / std::max(std::fabs(Fd), 1e-9));
+        }
+        std::sort(Rel.begin(), Rel.end());
+        printf("detail layer gradient relative error: median %.2g p90 %.2g p99 %.2g\n", Rel[Rel.size() / 2], Rel[Rel.size() * 9 / 10], Rel[Rel.size() * 99 / 100]);
     }
     else if (Mode == "agree")
     {

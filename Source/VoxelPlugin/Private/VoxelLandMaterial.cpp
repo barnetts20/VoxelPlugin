@@ -4,6 +4,7 @@
 #include "VoxelLandBake.h"
 #include "VoxelPlugin.h"
 #include "Async/ParallelFor.h"
+#include "HAL/IConsoleManager.h"
 #include "Engine/Texture2DDynamic.h"
 #include "Materials/MaterialInstanceDynamic.h"
 #include "Materials/MaterialInterface.h"
@@ -27,6 +28,25 @@ const FName VoxelLandMaterial::AxisXLowName(TEXT("VoxelLandAxisXLow"));
 const FName VoxelLandMaterial::AxisYLowName(TEXT("VoxelLandAxisYLow"));
 const FName VoxelLandMaterial::AxisZLowName(TEXT("VoxelLandAxisZLow"));
 const FName VoxelLandMaterial::ParamsName(TEXT("VoxelLandParams"));
+
+static TAutoConsoleVariable<int32> CVarVoxelLandNormalMode(
+    TEXT("voxel.Debug.LandNormalMode"), 0,
+    TEXT("The terrain material's land node normal, for comparison (STAGE_M1d_NOTES.md):\n")
+    TEXT(" 0: the bake's and the detail's exact gradients, the gullies' screen-space change (default)\n")
+    TEXT(" 1: the screen-space change of gullies and detail together (M1)\n")
+    TEXT(" 2: the bake and the detail exact, no gullies\n")
+    TEXT(" 3: the bake alone"),
+    ECVF_Default);
+
+static TAutoConsoleVariable<int32> CVarVoxelLandMaterialCost(
+    TEXT("voxel.Land.MaterialCost"), 0,
+    TEXT("Profiling: what the terrain material's land node evaluates (STAGE_M1f_NOTES.md):\n")
+    TEXT(" 0: everything (default)\n")
+    TEXT(" 1: no fixed-step gully difference close up (screen-space instead)\n")
+    TEXT(" 2: no gullies\n")
+    TEXT(" 3: no gullies and no detail layer (the bake alone)\n")
+    TEXT(" 4: the node off (the mesh's normal; the vertex colours carry the views)"),
+    ECVF_Default);
 
 namespace VoxelLandMaterialDetail
 {
@@ -248,7 +268,7 @@ void VoxelLandMaterial::SetTextureParameters(UMaterialInstanceDynamic* Material,
 }
 
 void VoxelLandMaterial::SetFrameParameters(UMaterialInstanceDynamic* Material, const FTransform& PlanetFrame,
-    int32 View, double Tolerance, bool bEnabled)
+    int32 View, double Tolerance, double NearFootprint, bool bEnabled)
 {
     using namespace VoxelLandMaterialDetail;
     if (!Material) return;
@@ -267,6 +287,11 @@ void VoxelLandMaterial::SetFrameParameters(UMaterialInstanceDynamic* Material, c
         Set(HighNames[a], High);
         Set(LowNames[a], Low);
     }
-    Material->SetVectorParameterValue(ParamsName, FLinearColor(bEnabled ? (float)FMath::Max(View, 0) : 0.0f, (float)FMath::Max(Tolerance, 0.0),
-        bEnabled ? 1.0f : 0.0f, 16.0f));
+    // x: the view, plus 16 x the normal's sources and 64 x the cost switch (VoxelLandMaterial.ush).
+    const int32 NormalMode = FMath::Clamp(CVarVoxelLandNormalMode.GetValueOnGameThread(), 0, 3);
+    const int32 Cost = FMath::Clamp(CVarVoxelLandMaterialCost.GetValueOnGameThread(), 0, 4);
+    if (Cost == 4) bEnabled = false;
+    const float Packed = (float)(FMath::Clamp(View, 0, 15) + 16 * NormalMode + 64 * Cost);
+    Material->SetVectorParameterValue(ParamsName, FLinearColor(bEnabled ? Packed : 0.0f, (float)FMath::Max(Tolerance, 0.0),
+        bEnabled ? 1.0f : 0.0f, (float)FMath::Max(NearFootprint, 0.0)));
 }
