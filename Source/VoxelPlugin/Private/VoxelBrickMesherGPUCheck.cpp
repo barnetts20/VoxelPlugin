@@ -236,8 +236,8 @@ namespace VoxelBrickMesherGPUCheck
             if (Levels & (1 << L))
                 LevelList += FString::Printf(TEXT("%s%d"), LevelList.IsEmpty() ? TEXT("") : TEXT(","), L);
         }
-        UE_LOG(LogVoxelPlugin, Log, TEXT("[VoxelMesherGPU] %d bricks (%d showing surface, %d at level transitions, levels %s), %d edit nodes; CPU %.1f ms. Waiting for the GPU..."),
-            Requests.Num(), WithSurface, Transitions, *LevelList, EditData->Flags.Num(), CpuMs);
+        UE_LOG(LogVoxelPlugin, Log, TEXT("[VoxelMesherGPU] %d bricks (%d showing surface, %d at level transitions, levels %s), %d edits; CPU %.1f ms. Waiting for the GPU..."),
+            Requests.Num(), WithSurface, Transitions, *LevelList, (int32)EditData->OpCount, CpuMs);
 
         const double GpuStart = FPlatformTime::Seconds();
         TArray<FVoxelBrickKey> Keys;

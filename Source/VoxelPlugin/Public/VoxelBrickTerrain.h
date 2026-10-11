@@ -104,10 +104,11 @@ public:
     /** Game thread. Changes the material of every page component, without rebuilding. */
     void SetMaterial(UMaterialInterface* InMaterial);
 
-    /** Game thread. See FVoxelCollisionBricks::NotifyEdit. The held bricks whose mesh the
-     *  edit reaches are meshed again at once (in their own commit when none is pending);
-     *  those only whose morph targets it reaches, with the next task result. */
-    void NotifyEdit(uint32 Sequence, const FVector& Center, double Radius);
+    /** Game thread. An edit with this sequence number may have moved the surface within
+     *  Bounds (actor space; FVoxelEditResult). The held bricks whose mesh it reaches are meshed
+     *  again at once (in their own commit when none is pending); those only whose morph
+     *  targets it reaches, with the next task result. */
+    void NotifyEdit(uint32 Sequence, const FBox& Bounds);
 
     /** Game thread, every frame. Camera in actor-local space. */
     void Tick(const FVector& Camera);

@@ -110,15 +110,16 @@ namespace VoxelBrickMesherGPU
     /** Render thread. True when every mesher pass is compiled for this platform. */
     VOXELPLUGIN_API bool AreShadersReady();
 
-    /** The density octaves and the flattened edit tree as graph buffers. */
+    /** The density octaves and the edits (FVoxelEditGPUData) as graph buffers. */
     struct FInputs
     {
         FRDGBufferRef Octaves = nullptr;
-        FRDGBufferRef EditCorners = nullptr;
-        FRDGBufferRef EditChildren = nullptr;
-        FRDGBufferRef EditFlags = nullptr;
-        uint32 EditNodeCount = 0;
-        int32 EditRootExtent = 0;
+        FRDGBufferRef EditCells = nullptr;
+        FRDGBufferRef EditOpList = nullptr;
+        FRDGBufferRef EditOps = nullptr;
+        uint32 EditTableMask = 0;
+        uint32 EditCellShift = 0;
+        uint32 EditOpCount = 0;
     };
 
     /** Per brick b of a batch: Counters[4b..4b+3] = faces, vertices, triangles, error bits;

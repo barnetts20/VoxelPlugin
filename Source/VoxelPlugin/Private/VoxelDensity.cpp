@@ -454,6 +454,7 @@ TSharedPtr<FDensitySampleCompositor> VoxelDensity::MakeCompositor(const FVoxelSu
     const TSharedRef<const FVoxelDensityCPU> Density = MakeShared<FVoxelDensityCPU>(Settings, PlanetRadius, NoiseAmplitude, MinFootprint);
     TSharedPtr<FDensitySampleCompositor> Compositor = MakeShared<FDensitySampleCompositor>(EditStore);
     Compositor->SetBaseDensity(Density);
+    Compositor->SetEditFootprintFloor(MinFootprint);
     Compositor->AddSampleLayer([Density](const FSampleInput& Input, float* DensityOut) {
         Density->Sample(Input, DensityOut);
         });
@@ -467,6 +468,7 @@ TSharedPtr<FDensitySampleCompositor> VoxelDensity::MakeTerrestrialCompositor(con
     const TSharedRef<const FVoxelDensityCPU> Density = MakeShared<FVoxelDensityCPU>(Land, MoveTemp(Bake), PlanetRadius, NoiseAmplitude, MinFootprint);
     TSharedPtr<FDensitySampleCompositor> Compositor = MakeShared<FDensitySampleCompositor>(EditStore);
     Compositor->SetBaseDensity(Density);
+    Compositor->SetEditFootprintFloor(MinFootprint);
     Compositor->AddSampleLayer([Density](const FSampleInput& Input, float* DensityOut) {
         Density->Sample(Input, DensityOut);
         });

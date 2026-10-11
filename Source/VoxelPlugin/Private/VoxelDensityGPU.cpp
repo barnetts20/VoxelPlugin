@@ -3,6 +3,7 @@
 #include "VoxelLandGPU.h"
 #include "VoxelPlugin.h"
 #include "FSparseEditStore.h"
+#include "VoxelEditCore.h"
 #include "GlobalShader.h"
 #include "DataDrivenShaderPlatformInfo.h"
 #include "ShaderParameterStruct.h"
@@ -30,11 +31,12 @@ public:
         SHADER_PARAMETER(uint32, OutOffset)
         SHADER_PARAMETER(float, SampleFootprint)
         SHADER_PARAMETER(uint32, OutputMode)
-        SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<float>, EditCorners)
-        SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<int>, EditChildren)
-        SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, EditFlags)
-        SHADER_PARAMETER(uint32, EditNodeCount)
-        SHADER_PARAMETER(int32, EditRootExtent)
+        SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, EditCells)
+        SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, EditOpList)
+        SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, EditOps)
+        SHADER_PARAMETER(uint32, EditTableMask)
+        SHADER_PARAMETER(uint32, EditCellShift)
+        SHADER_PARAMETER(uint32, EditOpCount)
         SHADER_PARAMETER(FVector2f, HalfFinest)
         SHADER_PARAMETER(uint32, ContinentOctaves)
         SHADER_PARAMETER(uint32, MountainOctaves)
@@ -116,9 +118,9 @@ void VoxelDensityGPU::SampleBlocksAsync(TSharedRef<const FVoxelDensityGPUData> D
             FRDGBufferSRVRef OctaveSRV = GraphBuilder.CreateSRV(VoxelGPUCommon::UploadStructuredBuffer(GraphBuilder, TEXT("Voxel.DensityOctaves"), MakeArrayView(Data->Octaves)));
             const FVoxelEditGPUData NoEdits;
             const FVoxelEditGPUData& EditData = Edits.IsValid() ? *Edits : NoEdits;
-            FRDGBufferSRVRef EditCornersSRV = GraphBuilder.CreateSRV(VoxelGPUCommon::UploadStructuredBuffer(GraphBuilder, TEXT("Voxel.DensityEditCorners"), MakeArrayView(EditData.Corners)));
-            FRDGBufferSRVRef EditChildrenSRV = GraphBuilder.CreateSRV(VoxelGPUCommon::UploadStructuredBuffer(GraphBuilder, TEXT("Voxel.DensityEditChildren"), MakeArrayView(EditData.Children)));
-            FRDGBufferSRVRef EditFlagsSRV = GraphBuilder.CreateSRV(VoxelGPUCommon::UploadStructuredBuffer(GraphBuilder, TEXT("Voxel.DensityEditFlags"), MakeArrayView(EditData.Flags)));
+            FRDGBufferSRVRef EditCellsSRV = GraphBuilder.CreateSRV(VoxelGPUCommon::UploadStructuredBuffer(GraphBuilder, TEXT("Voxel.DensityEditCells"), MakeArrayView(EditData.Cells)));
+            FRDGBufferSRVRef EditOpListSRV = GraphBuilder.CreateSRV(VoxelGPUCommon::UploadStructuredBuffer(GraphBuilder, TEXT("Voxel.DensityEditOpList"), MakeArrayView(EditData.OpList)));
+            FRDGBufferSRVRef EditOpsSRV = GraphBuilder.CreateSRV(VoxelGPUCommon::UploadStructuredBuffer(GraphBuilder, TEXT("Voxel.DensityEditOps"), MakeArrayView(EditData.Ops)));
             // Blocks write disjoint ranges, so their passes need no barrier between them.
             FRDGBufferUAVRef OutUAV = GraphBuilder.CreateUAV(OutBuffer, ERDGUnorderedAccessViewFlags::SkipBarrier);
             TShaderMapRef<FVoxelDensityCS> Shader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
@@ -137,11 +139,12 @@ void VoxelDensityGPU::SampleBlocksAsync(TSharedRef<const FVoxelDensityGPUData> D
                 Parameters->OutOffset = Offset;
                 Parameters->SampleFootprint = (float)FMath::Max(Block.Footprint, Data->MinFootprint);
                 Parameters->OutputMode = (uint32)Output;
-                Parameters->EditCorners = EditCornersSRV;
-                Parameters->EditChildren = EditChildrenSRV;
-                Parameters->EditFlags = EditFlagsSRV;
-                Parameters->EditNodeCount = (uint32)EditData.Flags.Num();
-                Parameters->EditRootExtent = EditData.RootExtent;
+                Parameters->EditCells = EditCellsSRV;
+                Parameters->EditOpList = EditOpListSRV;
+                Parameters->EditOps = EditOpsSRV;
+                Parameters->EditTableMask = EditData.TableMask;
+                Parameters->EditCellShift = EditData.CellShift;
+                Parameters->EditOpCount = EditData.OpCount;
                 Parameters->HalfFinest = VoxelDoubleFloat(HalfFinest);
                 Parameters->ContinentOctaves = Data->ContinentOctaves;
                 Parameters->MountainOctaves = Data->MountainOctaves;
@@ -192,35 +195,30 @@ void VoxelDensityGPU::SampleBlocksAsync(TSharedRef<const FVoxelDensityGPUData> D
 TSharedRef<FVoxelEditGPUData> FVoxelEditGPUData::Build(const FSparseEditStore* Store, double HalfFinest, int32 MaxDepth)
 {
     const TSharedRef<FVoxelEditGPUData> Data = MakeShared<FVoxelEditGPUData>();
-    Data->RootExtent = 1 << FMath::Clamp(MaxDepth, 0, 29);
     if (!Store) return Data;
-    const TSharedPtr<const FSparseEditNode> Root = Store->GetRootSnapshot();
-    if (!Root.IsValid()) return Data;
+    const TSharedPtr<const VoxelEditCore::FState, ESPMode::ThreadSafe> State = Store->GetSnapshot();
+    if (!State.IsValid() || State->Ops.empty()) return Data;
 
-    // The GPU walks the tree in integer lattice coordinates, which needs the tree to be the
-    // terrain root: centred on the actor, half-extent HalfFinest * 2^MaxDepth.
-    const double Expected = HalfFinest * (double)Data->RootExtent;
-    if (!Store->GetCenter().IsNearlyZero() || FMath::Abs(Store->GetExtent() / Expected - 1.0) > 1e-9)
+    // The GPU reads the edits on the terrain's integer lattice, which needs the store to be
+    // the terrain root's: centred on the actor, with the same half cell.
+    if (!Store->GetCenter().IsNearlyZero() || FMath::Abs(Store->GetHalfFinest() / HalfFinest - 1.0) > 1e-9)
     {
-        UE_LOG(LogVoxelPlugin, Warning, TEXT("[VoxelMesherGPU] Edit tree (extent %.6g) is not the terrain root (%.6g); edits are left out on the GPU."), Store->GetExtent(), Expected);
+        UE_LOG(LogVoxelPlugin, Warning, TEXT("[VoxelMesherGPU] The edit store's lattice (half cell %.6g) is not the terrain's (%.6g); edits are left out on the GPU."),
+            Store->GetHalfFinest(), HalfFinest);
         return Data;
     }
 
-    TArray<const FSparseEditNode*> Order;
-    Order.Add(Root.Get());
-    for (int32 i = 0; i < Order.Num(); i++)
+    VoxelEditCore::FGPUArrays Arrays;
+    VoxelEditCore::Flatten(*State, Arrays);
+    if (Arrays.Truncated > 0)
     {
-        const FSparseEditNode* Node = Order[i];
-        for (int32 c = 0; c < 8; c++)
-            Data->Corners.Add((float)Node->CornerDensities[c]);
-        Data->Flags.Add(Node->HasEdits ? 1u : 0u);
-        for (int32 c = 0; c < 8; c++)
-        {
-            const FSparseEditNode* Child = Node->Children[c].Get();
-            Data->Children.Add(Child ? Order.Num() : -1);
-            if (Child)
-                Order.Add(Child);
-        }
+        UE_LOG(LogVoxelPlugin, Warning, TEXT("[VoxelMesherGPU] %d edit index cells hold more than 4095 edits; the GPU drops the rest there."), Arrays.Truncated);
     }
+    Data->Cells.Append(Arrays.Cells.data(), (int32)Arrays.Cells.size());
+    Data->OpList.Append(Arrays.OpList.data(), (int32)Arrays.OpList.size());
+    Data->Ops.Append(Arrays.Ops.data(), (int32)Arrays.Ops.size());
+    Data->TableMask = Arrays.TableMask;
+    Data->CellShift = Arrays.CellShift;
+    Data->OpCount = Arrays.OpCount;
     return Data;
 }

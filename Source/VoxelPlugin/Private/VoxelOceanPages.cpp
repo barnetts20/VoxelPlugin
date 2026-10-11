@@ -50,11 +50,12 @@ BEGIN_SHADER_PARAMETER_STRUCT(FVoxelOceanWriteParameters, )
     // The density (VoxelDensitySample.ush) and the edits (VoxelEditSample.ush), as the
     // terrain's FVoxelDensityCS takes them.
     SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<FVoxelOctave>, Octaves)
-    SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<float>, EditCorners)
-    SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<int>, EditChildren)
-    SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, EditFlags)
-    SHADER_PARAMETER(uint32, EditNodeCount)
-    SHADER_PARAMETER(int32, EditRootExtent)
+    SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, EditCells)
+    SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, EditOpList)
+    SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, EditOps)
+    SHADER_PARAMETER(uint32, EditTableMask)
+    SHADER_PARAMETER(uint32, EditCellShift)
+    SHADER_PARAMETER(uint32, EditOpCount)
     SHADER_PARAMETER(FVector2f, HalfFinest)
     SHADER_PARAMETER(uint32, ContinentOctaves)
     SHADER_PARAMETER(uint32, MountainOctaves)
@@ -190,19 +191,20 @@ public:
         {
             Inputs = VoxelBrickMesherGPU::UploadInputs(GraphBuilder, *InDensity, *InEdits);
             Octaves = GraphBuilder.ConvertToExternalBuffer(Inputs.Octaves);
-            EditCorners = GraphBuilder.ConvertToExternalBuffer(Inputs.EditCorners);
-            EditChildren = GraphBuilder.ConvertToExternalBuffer(Inputs.EditChildren);
-            EditFlags = GraphBuilder.ConvertToExternalBuffer(Inputs.EditFlags);
+            EditCells = GraphBuilder.ConvertToExternalBuffer(Inputs.EditCells);
+            EditOpList = GraphBuilder.ConvertToExternalBuffer(Inputs.EditOpList);
+            EditOps = GraphBuilder.ConvertToExternalBuffer(Inputs.EditOps);
             Density = InDensity;
             Edits = InEdits;
             return Inputs;
         }
         Inputs.Octaves = GraphBuilder.RegisterExternalBuffer(Octaves);
-        Inputs.EditCorners = GraphBuilder.RegisterExternalBuffer(EditCorners);
-        Inputs.EditChildren = GraphBuilder.RegisterExternalBuffer(EditChildren);
-        Inputs.EditFlags = GraphBuilder.RegisterExternalBuffer(EditFlags);
-        Inputs.EditNodeCount = (uint32)Edits->Flags.Num();
-        Inputs.EditRootExtent = Edits->RootExtent;
+        Inputs.EditCells = GraphBuilder.RegisterExternalBuffer(EditCells);
+        Inputs.EditOpList = GraphBuilder.RegisterExternalBuffer(EditOpList);
+        Inputs.EditOps = GraphBuilder.RegisterExternalBuffer(EditOps);
+        Inputs.EditTableMask = Edits->TableMask;
+        Inputs.EditCellShift = Edits->CellShift;
+        Inputs.EditOpCount = Edits->OpCount;
         return Inputs;
     }
 
@@ -210,9 +212,9 @@ private:
     TSharedPtr<const FVoxelDensityGPUData> Density;
     TSharedPtr<const FVoxelEditGPUData> Edits;
     TRefCountPtr<FRDGPooledBuffer> Octaves;
-    TRefCountPtr<FRDGPooledBuffer> EditCorners;
-    TRefCountPtr<FRDGPooledBuffer> EditChildren;
-    TRefCountPtr<FRDGPooledBuffer> EditFlags;
+    TRefCountPtr<FRDGPooledBuffer> EditCells;
+    TRefCountPtr<FRDGPooledBuffer> EditOpList;
+    TRefCountPtr<FRDGPooledBuffer> EditOps;
 };
 
 /** Writes one buffer set's commits when the compute driver runs it (render thread). */
@@ -330,11 +332,12 @@ void FVoxelOceanPageProvider::BuildComputePasses(FRDGBuilder& GraphBuilder, cons
         const VoxelBrickMesherGPU::FInputs Inputs = InputCache->Get(GraphBuilder, State.Density, State.Edits);
         FVoxelOceanWriteParameters* Parameters = GraphBuilder.AllocParameters<FVoxelOceanWriteParameters>();
         Parameters->Octaves = GraphBuilder.CreateSRV(Inputs.Octaves);
-        Parameters->EditCorners = GraphBuilder.CreateSRV(Inputs.EditCorners);
-        Parameters->EditChildren = GraphBuilder.CreateSRV(Inputs.EditChildren);
-        Parameters->EditFlags = GraphBuilder.CreateSRV(Inputs.EditFlags);
-        Parameters->EditNodeCount = Inputs.EditNodeCount;
-        Parameters->EditRootExtent = Inputs.EditRootExtent;
+        Parameters->EditCells = GraphBuilder.CreateSRV(Inputs.EditCells);
+        Parameters->EditOpList = GraphBuilder.CreateSRV(Inputs.EditOpList);
+        Parameters->EditOps = GraphBuilder.CreateSRV(Inputs.EditOps);
+        Parameters->EditTableMask = Inputs.EditTableMask;
+        Parameters->EditCellShift = Inputs.EditCellShift;
+        Parameters->EditOpCount = Inputs.EditOpCount;
         Parameters->HalfFinest = VoxelDoubleFloat(State.HalfFinest);
         Parameters->ContinentOctaves = Density.ContinentOctaves;
         Parameters->MountainOctaves = Density.MountainOctaves;

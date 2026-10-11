@@ -71,11 +71,12 @@ float RidgeGain;
 float SlopeDamping;
 
 // The edits (VoxelEditSample.ush).
-StructuredBuffer<float> EditCorners;
-StructuredBuffer<int> EditChildren;
-StructuredBuffer<uint> EditFlags;
-uint EditNodeCount;
-int EditRootExtent;
+StructuredBuffer<uint> EditCells;
+StructuredBuffer<uint> EditOpList;
+StructuredBuffer<uint> EditOps;
+uint EditTableMask;
+uint EditCellShift;
+uint EditOpCount;
 
 #include "/Plugin/VoxelPlugin/Private/VoxelCubeSphere.ush"
 #include "/Plugin/VoxelPlugin/Private/VoxelLandParameters.ush"
@@ -134,7 +135,7 @@ void WriteCS(uint3 GroupId : SV_GroupID, uint GroupThread : SV_GroupIndex)
             const int X = asint(VertexWords[Src + 11u]);
             const int Y = asint(VertexWords[Src + 12u]);
             const int Z = asint(VertexWords[Src + 13u]);
-            TileDepth[I] = VoxelSampleDensityDF(X, Y, Z, Footprint) + VoxelEditDelta(X, Y, Z);
+            TileDepth[I] = VoxelEditApply(X, Y, Z, Footprint, VoxelSampleDensityDF(X, Y, Z, Footprint));
         }
     }
     GroupMemoryBarrierWithGroupSync();

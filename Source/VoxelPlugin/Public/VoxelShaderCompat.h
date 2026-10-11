@@ -96,6 +96,7 @@ namespace VoxelShader
     inline uint asuint(int a) { return (uint)a; }
     inline uint asuint(float a) { uint u; std::memcpy(&u, &a, 4); return u; }
     inline float asfloat(uint a) { float f; std::memcpy(&f, &a, 4); return f; }
+    inline int asint(float a) { int i; std::memcpy(&i, &a, 4); return i; }
     inline float ldexp(float a, int e) { return std::ldexp(a, e); }
     inline float atan2(float y, float x) { return std::atan2(y, x); }
     inline float atan(float a) { return std::atan(a); }

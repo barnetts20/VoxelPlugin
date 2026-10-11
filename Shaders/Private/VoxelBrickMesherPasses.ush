@@ -595,7 +595,7 @@ VOXEL_FUNC float VoxelMesherDensity(uint B, int3 P, int Level)
 {
     const float Footprint = max(ldexp(FinestCell, Level), MinFootprint);
     const int3 Index = VoxelMesherLatticeIndex(B, P);
-    return VoxelSampleDensityDF(Index.x, Index.y, Index.z, Footprint) + VoxelEditDelta(Index.x, Index.y, Index.z);
+    return VoxelEditApply(Index.x, Index.y, Index.z, Footprint, VoxelSampleDensityDF(Index.x, Index.y, Index.z, Footprint));
 }
 
 // Mode 0: the own lattice of every brick. Mode 1: requested points not sampled yet. Points

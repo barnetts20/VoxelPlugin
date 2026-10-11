@@ -109,8 +109,9 @@ namespace VoxelDensityGPUCheck
             }
             else if (Output == EVoxelDensityGPUOutput::Edits)
             {
-                for (int32 i = 0; i < X.Num(); i++)
-                    Cpu[First + i] = EditStore.IsValid() ? (float)EditStore->Sample(FVector(X[i], Y[i], Z[i])) : 0.0f;
+                Density->Sample(FSampleInput(X.GetData(), Y.GetData(), Z.GetData(), X.Num(), Block.Footprint), Cpu.GetData() + First);
+                if (EditStore.IsValid())
+                    EditStore->Apply(X.GetData(), Y.GetData(), Z.GetData(), X.Num(), Cpu.GetData() + First, FMath::Max(Block.Footprint, (double)Data->MinFootprint));
             }
             else
             {
@@ -119,9 +120,9 @@ namespace VoxelDensityGPUCheck
         }
         const double CpuMs = (FPlatformTime::Seconds() - CpuStart) * 1000.0;
 
-        UE_LOG(LogVoxelPlugin, Log, TEXT("[VoxelDensityGPU] %s: %d blocks, %d samples, %d edit nodes; CPU %.1f ms. Waiting for the GPU..."),
-            Output == EVoxelDensityGPUOutput::Radial ? TEXT("|p| - R only") : (Output == EVoxelDensityGPUOutput::Edits ? TEXT("edit deltas only") : TEXT("density")),
-            Blocks.Num(), Cpu.Num(), EditData->Flags.Num(), CpuMs);
+        UE_LOG(LogVoxelPlugin, Log, TEXT("[VoxelDensityGPU] %s: %d blocks, %d samples, %d edits; CPU %.1f ms. Waiting for the GPU..."),
+            Output == EVoxelDensityGPUOutput::Radial ? TEXT("|p| - R only") : (Output == EVoxelDensityGPUOutput::Edits ? TEXT("density with edits") : TEXT("density")),
+            Blocks.Num(), Cpu.Num(), (int32)EditData->OpCount, CpuMs);
         const double GpuStart = FPlatformTime::Seconds();
         VoxelDensityGPU::SampleBlocksAsync(Data, HalfFinest, Blocks,
             [Blocks, Infos, Cpu = MoveTemp(Cpu), GpuStart](TArray<float>&& Gpu)

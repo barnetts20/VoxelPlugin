@@ -618,10 +618,18 @@ void AAdaptiveVoxelActor::TickCollision(UWorld* World)
     }
     for (const FEditNotice& Notice : Notices)
     {
-        CollisionBricks->NotifyEdit(Notice.Sequence, Notice.Center, Notice.Radius);
+        // The collision bricks and the listeners (the ocean) take a sphere and add their own
+        // reach of twice its radius: half the box's half diagonal covers the box, and half the
+        // edit index cell's diagonal the values around it that the cells listing the edit
+        // change (deep inside solid or air; FSparseEditStore::Apply).
+        const TSharedPtr<FSparseEditStore> Store = DensityCompositor.IsValid() ? DensityCompositor->GetEditStore() : nullptr;
+        const double IndexDiagonal = Store.IsValid() ? Store->GetIndexCellSize() * FMath::Sqrt(3.0) : 0.0;
+        const FVector Center = Notice.Bounds.GetCenter();
+        const double Radius = 0.5 * (Notice.Bounds.GetExtent().Size() + IndexDiagonal);
+        CollisionBricks->NotifyEdit(Notice.Sequence, Center, Radius);
         if (BrickTerrain.IsValid())
-            BrickTerrain->NotifyEdit(Notice.Sequence, Notice.Center, Notice.Radius);
-        TerrainEdited.Broadcast(Notice.Sequence, Notice.Center, Notice.Radius);
+            BrickTerrain->NotifyEdit(Notice.Sequence, Notice.Bounds);
+        TerrainEdited.Broadcast(Notice.Sequence, Center, Radius);
     }
 
     TArray<FVoxelCollisionSource> Sources;
@@ -653,22 +661,28 @@ void AAdaptiveVoxelActor::TickCollision(UWorld* World)
         CollisionBricks->DrawDebug(World, BrickAttachmentRoot->GetComponentTransform());
 }
 
-void AAdaptiveVoxelActor::RunEditUpdateTask(FVector InEditCenter, double InEditRadius, double InEditStrength, int InEditResolution)
+void AAdaptiveVoxelActor::RunEditUpdateTask(EVoxelEditMode Mode, FVector InEditCenter, double InEditRadius, double InEditBlend, bool bContinueStroke)
 {
     if (EditQueue->bRunning || IsDestroyed || !DensityCompositor.IsValid()) return;
     const TSharedPtr<FSparseEditStore> Store = DensityCompositor->GetEditStore();
     if (!Store.IsValid()) return;
 
     EditQueue->bRunning = true;
-    FFunctionGraphTask::CreateAndDispatchWhenReady([Queue = EditQueue, Store, InEditCenter, InEditRadius, InEditStrength, InEditResolution]()
+    FFunctionGraphTask::CreateAndDispatchWhenReady([Queue = EditQueue, Store, Mode, InEditCenter, InEditRadius, InEditBlend, bContinueStroke]()
         {
             const double StartTime = FPlatformTime::Seconds();
-            Store->ApplySphericalEdit(InEditCenter, InEditRadius, InEditStrength, Store->GetDepthForBrushRadius(InEditRadius, InEditResolution));
+            const FVoxelEditResult Result = Store->ApplyEdit(Mode, InEditCenter, InEditRadius, InEditBlend, bContinueStroke);
 
-            // The collision bricks and the brick terrain rebuild what this edit reaches.
+            // The collision bricks and the brick terrain rebuild what this edit reaches (nothing
+            // when it changed nothing: repeated, or the brush stayed put).
+            if (Result.bChanged)
             {
                 FScopeLock Lock(&Queue->CS);
-                Queue->Notices.Add({ Store->GetLastSequence(), InEditCenter, InEditRadius });
+                Queue->Notices.Add({ Result.Sequence, Result.Bounds });
+            }
+            if (Result.Dropped > 0)
+            {
+                UE_LOG(LogVoxelPlugin, Log, TEXT("[VoxelEdit] Edit %u made %d earlier edits irrelevant; the store holds %d."), Result.Sequence, Result.Dropped, Store->Num());
             }
 
             const double ElapsedMs = (FPlatformTime::Seconds() - StartTime) * 1000.0;
@@ -735,25 +749,39 @@ void AAdaptiveVoxelActor::TickDebugEdits(UWorld* World)
     // Example of the edit flow; a real tool would run this off the tick. Only this terrain's
     // collision bricks count as a hit, so with several planets each edits its own surface.
     APlayerController* PC = UGameplayStatics::GetPlayerController(World, 0);
-    if (!PC || EditQueue->bRunning) return;
-    const bool bAdd = PC->IsInputKeyDown(EKeys::E);
-    const bool bRemove = PC->IsInputKeyDown(EKeys::Q);
-    if (!bAdd && !bRemove) return;
+    if (!PC) return;
+    const bool bCarve = PC->IsInputKeyDown(EKeys::E);
+    const bool bFill = PC->IsInputKeyDown(EKeys::Q);
+    if (!bCarve && !bFill)
+    {
+        // Released: the next press starts a new stroke.
+        DebugStrokeMode = -1;
+        return;
+    }
+    // The previous edit is still being written: the stroke goes on with the next one.
+    if (EditQueue->bRunning) return;
 
+    const EVoxelEditMode Mode = bCarve ? EVoxelEditMode::Carve : EVoxelEditMode::Fill;
     const double EditRadius = 300.0;
-    const double EditStrength = 600.0;
-    const int32 EditResolution = 3;
+    const double EditBlend = 0.25 * EditRadius;
     const float DebugDrawTime = 0.1f;
 
     const FTransform NoScaleTransform(GetActorRotation(), GetActorLocation());
     const FVector Start = NoScaleTransform.TransformPosition(CameraPosition);
     const FVector End = Start + PC->GetControlRotation().Vector() * (GetActorScale3D().GetMax() * 3.0);
     FHitResult Hit;
-    if (!World->LineTraceSingleByChannel(Hit, Start, End, ECC_Visibility) || Hit.GetActor() != this) return;
+    if (!World->LineTraceSingleByChannel(Hit, Start, End, ECC_Visibility) || Hit.GetActor() != this)
+    {
+        // Off the terrain: the stroke breaks (it would otherwise bridge the gap).
+        DebugStrokeMode = -1;
+        return;
+    }
 
     const FVector LocalHit = NoScaleTransform.InverseTransformPosition(Hit.ImpactPoint);
     LogEditHit(Hit, LocalHit);
-    RunEditUpdateTask(LocalHit, EditRadius, bAdd ? EditStrength : -EditStrength, EditResolution);
-    DrawDebugSphere(World, Hit.ImpactPoint, (float)EditRadius, 32, bAdd ? FColor::Red : FColor::Green, false, DebugDrawTime);
+    const bool bContinueStroke = DebugStrokeMode == (int32)Mode;
+    RunEditUpdateTask(Mode, LocalHit, EditRadius, EditBlend, bContinueStroke);
+    DebugStrokeMode = (int32)Mode;
+    DrawDebugSphere(World, Hit.ImpactPoint, (float)EditRadius, 32, bCarve ? FColor::Red : FColor::Green, false, DebugDrawTime);
 }
 #endif

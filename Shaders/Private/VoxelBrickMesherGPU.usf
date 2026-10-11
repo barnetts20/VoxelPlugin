@@ -27,11 +27,12 @@ float RidgeGain;
 float SlopeDamping;
 
 // Edits (VoxelEditSample.ush).
-StructuredBuffer<float> EditCorners;
-StructuredBuffer<int> EditChildren;
-StructuredBuffer<uint> EditFlags;
-uint EditNodeCount;
-int EditRootExtent;
+StructuredBuffer<uint> EditCells;
+StructuredBuffer<uint> EditOpList;
+StructuredBuffer<uint> EditOps;
+uint EditTableMask;
+uint EditCellShift;
+uint EditOpCount;
 
 // Mesher (VoxelBrickMesherPasses.ush).
 StructuredBuffer<FVoxelMesherBrick> Bricks;

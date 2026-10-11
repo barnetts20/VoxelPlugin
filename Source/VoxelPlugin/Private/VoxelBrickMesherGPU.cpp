@@ -31,11 +31,12 @@ BEGIN_SHADER_PARAMETER_STRUCT(FVoxelMesherParameters, )
     SHADER_PARAMETER(float, SlopeDamping)
     SHADER_PARAMETER_STRUCT_INCLUDE(FVoxelLandShaderParameters, Land)
     // Edits (VoxelEditSample.ush)
-    SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<float>, EditCorners)
-    SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<int>, EditChildren)
-    SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, EditFlags)
-    SHADER_PARAMETER(uint32, EditNodeCount)
-    SHADER_PARAMETER(int32, EditRootExtent)
+    SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, EditCells)
+    SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, EditOpList)
+    SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, EditOps)
+    SHADER_PARAMETER(uint32, EditTableMask)
+    SHADER_PARAMETER(uint32, EditCellShift)
+    SHADER_PARAMETER(uint32, EditOpCount)
     // Mesher (VoxelBrickMesherPasses.ush)
     SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<FVoxelMesherBrick>, Bricks)
     SHADER_PARAMETER(int32, CellsPerBrick)
@@ -226,11 +227,12 @@ VoxelBrickMesherGPU::FInputs VoxelBrickMesherGPU::UploadInputs(FRDGBuilder& Grap
     using VoxelGPUCommon::UploadStructuredBuffer;
     FInputs Inputs;
     Inputs.Octaves = UploadStructuredBuffer(GraphBuilder, TEXT("Voxel.MesherOctaves"), MakeArrayView(Density.Octaves));
-    Inputs.EditCorners = UploadStructuredBuffer(GraphBuilder, TEXT("Voxel.EditCorners"), MakeArrayView(Edits.Corners));
-    Inputs.EditChildren = UploadStructuredBuffer(GraphBuilder, TEXT("Voxel.EditChildren"), MakeArrayView(Edits.Children));
-    Inputs.EditFlags = UploadStructuredBuffer(GraphBuilder, TEXT("Voxel.EditFlags"), MakeArrayView(Edits.Flags));
-    Inputs.EditNodeCount = (uint32)Edits.Flags.Num();
-    Inputs.EditRootExtent = Edits.RootExtent;
+    Inputs.EditCells = UploadStructuredBuffer(GraphBuilder, TEXT("Voxel.EditCells"), MakeArrayView(Edits.Cells));
+    Inputs.EditOpList = UploadStructuredBuffer(GraphBuilder, TEXT("Voxel.EditOpList"), MakeArrayView(Edits.OpList));
+    Inputs.EditOps = UploadStructuredBuffer(GraphBuilder, TEXT("Voxel.EditOps"), MakeArrayView(Edits.Ops));
+    Inputs.EditTableMask = Edits.TableMask;
+    Inputs.EditCellShift = Edits.CellShift;
+    Inputs.EditOpCount = Edits.OpCount;
     return Inputs;
 }
 
@@ -284,11 +286,12 @@ VoxelBrickMesherGPU::FOutputs VoxelBrickMesherGPU::AddMesherPasses(FRDGBuilder& 
     Template.RidgeGain = Density.RidgeGain;
     Template.SlopeDamping = Density.SlopeDamping;
     Template.Land = VoxelLandGPU::GetParameters(GraphBuilder, Density);
-    Template.EditCorners = GraphBuilder.CreateSRV(Inputs.EditCorners);
-    Template.EditChildren = GraphBuilder.CreateSRV(Inputs.EditChildren);
-    Template.EditFlags = GraphBuilder.CreateSRV(Inputs.EditFlags);
-    Template.EditNodeCount = Inputs.EditNodeCount;
-    Template.EditRootExtent = Inputs.EditRootExtent;
+    Template.EditCells = GraphBuilder.CreateSRV(Inputs.EditCells);
+    Template.EditOpList = GraphBuilder.CreateSRV(Inputs.EditOpList);
+    Template.EditOps = GraphBuilder.CreateSRV(Inputs.EditOps);
+    Template.EditTableMask = Inputs.EditTableMask;
+    Template.EditCellShift = Inputs.EditCellShift;
+    Template.EditOpCount = Inputs.EditOpCount;
     Template.Bricks = GraphBuilder.CreateSRV(VoxelGPUCommon::UploadStructuredBuffer(GraphBuilder, TEXT("Voxel.MesherBricks"), Bricks));
     Template.CellsPerBrick = (int32)UN;
     Template.NumBricks = NB;

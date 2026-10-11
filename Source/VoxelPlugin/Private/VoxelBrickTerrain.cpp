@@ -5,6 +5,7 @@
 #include "VoxelPlugin.h"
 #include "FDensitySampleCompositor.h"
 #include "FSparseEditStore.h"
+#include "VoxelEditCore.h"
 #include "Misc/ScopeLock.h"
 #include "Async/ParallelFor.h"
 #include "Async/TaskGraphInterfaces.h"
@@ -131,7 +132,8 @@ namespace VoxelBrickTerrainDetail
 
     struct FWantedInfo
     {
-        bool bEdited;   // an edit reaches the brick: never culled, never proven empty
+        bool bEdited;   // an edit reaches the brick: the lattice empty test is skipped (its samples
+                        // read their own cells' edits; IsBrickProvablyEmpty)
     };
 
     /** What the descent does with a brick. */
@@ -150,14 +152,20 @@ namespace VoxelBrickTerrainDetail
             const TSet<FVoxelBrickKey>* InSplitBefore)
             : Density(InDensity), Edits(InEdits), Settings(InSettings), Camera(InCamera), SplitBefore(InSplitBefore)
         {
-            // The whole walk sees one version of the edits.
+            // The edit-reach test (IsEdited) reads one version of the edits without a lock per
+            // brick; the density samples pin the store's latest each batch (the task read its
+            // sequence first, so they are at least as new).
             if (Edits)
-                EditRoot = Edits->GetRootSnapshot();
+            {
+                EditState = Edits->GetSnapshot();
+                EditCenter = Edits->GetCenter();
+            }
         }
 
         const FDensitySampleCompositor& Density;
         const FSparseEditStore* Edits;
-        TSharedPtr<const FSparseEditNode> EditRoot;
+        TSharedPtr<const VoxelEditCore::FState, ESPMode::ThreadSafe> EditState;
+        FVector EditCenter = FVector::ZeroVector;
         const FVoxelBrickTerrainSettings& Settings;
         FVector Camera;
         const TSet<FVoxelBrickKey>* SplitBefore;   // internal nodes of the previous tree
@@ -191,24 +199,33 @@ namespace VoxelBrickTerrainDetail
 
         bool IsEdited(const FBox& Region) const
         {
-            return Edits && Edits->HasEditsInBox(EditRoot.Get(), Region);
+            if (!EditState.IsValid() || EditState->Ops.empty()) return false;
+            VoxelEditCore::FAabb Box;
+            for (int32 a = 0; a < 3; a++)
+            {
+                Box.Min[a] = Region.Min[a] - EditCenter[a];
+                Box.Max[a] = Region.Max[a] - EditCenter[a];
+            }
+            Box.bValid = true;
+            return EditState->AnyInBox(Box);
         }
 
-        /** False when the brick's centre sample proves it free of surface (never where edits
-         *  reach it). */
+        /** False when the brick's centre sample proves it free of surface. The edits are as
+         *  slope-bounded as the land, so edited bricks are tested too: the sample applies every
+         *  edit reaching the region (SampleWithin), not only its own index cell's. */
         bool MayHoldSurface(const FVoxelBrickKey& Key, bool& bOutEdited)
         {
             const FVoxelBrickGrid Grid = Settings.GridFor(Key.Level);
             const FBox Region = TestRegion(Grid, Key);
             bOutEdited = IsEdited(Region);
-            if (bOutEdited) return true;
 
             const FVector Centre = Region.GetCenter();
+            const double Radius = Region.GetExtent().Size();
             double CX = Centre.X, CY = Centre.Y, CZ = Centre.Z;
             float D = 0.0f;
-            Density.Sample(FSampleInput(&CX, &CY, &CZ, 1, Grid.CellSize), &D);
+            Density.SampleWithin(FSampleInput(&CX, &CY, &CZ, 1, Grid.CellSize), Radius, &D);
             Samples++;
-            return FMath::Abs((double)D) <= Settings.SlopeBound * Region.GetExtent().Size();
+            return FMath::Abs((double)D) <= Settings.SlopeBound * Radius;
         }
 
         /** Thread safe. The descent's verdict on bricks of one level: culled when the centre
@@ -218,7 +235,8 @@ namespace VoxelBrickTerrainDetail
         {
             const FVoxelBrickGrid Grid = Settings.GridFor(Keys[0].Level);
             const double SplitDistance = Settings.LodDistanceFactor * Grid.BrickSize();
-            const double Bound = Settings.SlopeBound * TestRegion(Grid, Keys[0]).GetExtent().Size();
+            const double Radius = TestRegion(Grid, Keys[0]).GetExtent().Size();
+            const double Bound = Settings.SlopeBound * Radius;
             TArray<double, TInlineAllocator<DescentChunk>> X, Y, Z;
             TArray<int32, TInlineAllocator<DescentChunk>> Sampled;
             for (int32 i = 0; i < Keys.Num(); i++)
@@ -226,7 +244,6 @@ namespace VoxelBrickTerrainDetail
                 const FBox Region = TestRegion(Grid, Keys[i]);
                 OutVisits[i] = EVisit::Want;
                 OutInfos[i].bEdited = IsEdited(Region);
-                if (OutInfos[i].bEdited) continue;
                 const FVector Centre = Region.GetCenter();
                 X.Add(Centre.X);
                 Y.Add(Centre.Y);
@@ -237,7 +254,7 @@ namespace VoxelBrickTerrainDetail
             {
                 TArray<float, TInlineAllocator<DescentChunk>> D;
                 D.SetNumUninitialized(Sampled.Num());
-                Density.Sample(FSampleInput(X.GetData(), Y.GetData(), Z.GetData(), Sampled.Num(), Grid.CellSize), D.GetData());
+                Density.SampleWithin(FSampleInput(X.GetData(), Y.GetData(), Z.GetData(), Sampled.Num(), Grid.CellSize), Radius, D.GetData());
                 for (int32 s = 0; s < Sampled.Num(); s++)
                 {
                     if (FMath::Abs((double)D[s]) > Bound)
@@ -749,15 +766,25 @@ FBox FVoxelBrickTerrain::TargetBoundsOf(const FVoxelBrickKey& Key) const
     return FBox(Min - FVector(Reach), Min + FVector(Grid.BrickSize() + Reach));
 }
 
-void FVoxelBrickTerrain::NotifyEdit(uint32 Sequence, const FVector& Center, double Radius)
+void FVoxelBrickTerrain::NotifyEdit(uint32 Sequence, const FBox& Changed)
 {
-    const double Reach = 2.0 * Radius + 2.0 * Settings.FinestCell;
-    const FBox Bounds(Center - FVector(Reach), Center + FVector(Reach));
-    RecentEdits.Add({ Sequence, Bounds });
+    // Where an edit can change what a brick of a level reads: its shape's reach (Changed), and
+    // around it, deep inside solid or air, the values of the edit store's index cells that list
+    // it (a carve raises the solid near it; FSparseEditStore::Apply). A level's surface crossings
+    // read values up to about the slope bound times its cell from the surface, so the margin
+    // grows with the level, up to the index cell's diagonal.
+    const TSharedPtr<FSparseEditStore> Store = Density.IsValid() ? Density->GetEditStore() : nullptr;
+    const double IndexDiagonal = Store.IsValid() ? Store->GetIndexCellSize() * FMath::Sqrt(3.0) : 0.0;
+    auto BoundsAt = [this, &Changed, IndexDiagonal](int32 Level)
+        {
+            const double Margin = FMath::Min(Settings.SlopeBound * Settings.GridFor(Level).CellSize, IndexDiagonal);
+            return Changed.ExpandBy(2.0 * Settings.FinestCell + Margin);
+        };
+    RecentEdits.Add({ Sequence, Changed.ExpandBy(2.0 * Settings.FinestCell + IndexDiagonal) });
     // An empty test from before the edit proves nothing (an edit can add surface).
     for (TPair<FVoxelBrickKey, FBrick>& Pair : Bricks)
     {
-        if (!BoundsOf(Pair.Key).Intersect(Bounds)) continue;
+        if (!BoundsOf(Pair.Key).Intersect(BoundsAt(Pair.Key.Level))) continue;
         Pair.Value.bDirty = true;
         Pair.Value.bProvenEmpty = false;
     }
@@ -767,6 +794,7 @@ void FVoxelBrickTerrain::NotifyEdit(uint32 Sequence, const FVector& Center, doub
     // away) go with the next result's commit, which follows the edit anyway.
     for (const TPair<FVoxelBrickKey, uint64>& Pair : Wanted)
     {
+        const FBox Bounds = BoundsAt(Pair.Key.Level);
         if (BoundsOf(Pair.Key).Intersect(Bounds))
             EditBacklog.Add(Pair.Key);
         else if (TargetBoundsOf(Pair.Key).Intersect(Bounds))

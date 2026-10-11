@@ -241,9 +241,9 @@ struct FVoxelBrickPageGPU
     TSharedPtr<const FVoxelDensityGPUData> Density;
     TSharedPtr<const FVoxelEditGPUData> Edits;
     TRefCountPtr<FRDGPooledBuffer> Octaves;
-    TRefCountPtr<FRDGPooledBuffer> EditCorners;
-    TRefCountPtr<FRDGPooledBuffer> EditChildren;
-    TRefCountPtr<FRDGPooledBuffer> EditFlags;
+    TRefCountPtr<FRDGPooledBuffer> EditCells;
+    TRefCountPtr<FRDGPooledBuffer> EditOpList;
+    TRefCountPtr<FRDGPooledBuffer> EditOps;
 
     /** The cache: VBP::CacheWords words per vertex, 3 per triangle. The game thread places
      *  everything in it and asks for its size. */
@@ -292,19 +292,20 @@ struct FVoxelBrickPageGPU
         {
             Inputs = VoxelBrickMesherGPU::UploadInputs(GraphBuilder, *InDensity, *InEdits);
             Octaves = GraphBuilder.ConvertToExternalBuffer(Inputs.Octaves);
-            EditCorners = GraphBuilder.ConvertToExternalBuffer(Inputs.EditCorners);
-            EditChildren = GraphBuilder.ConvertToExternalBuffer(Inputs.EditChildren);
-            EditFlags = GraphBuilder.ConvertToExternalBuffer(Inputs.EditFlags);
+            EditCells = GraphBuilder.ConvertToExternalBuffer(Inputs.EditCells);
+            EditOpList = GraphBuilder.ConvertToExternalBuffer(Inputs.EditOpList);
+            EditOps = GraphBuilder.ConvertToExternalBuffer(Inputs.EditOps);
             Density = InDensity;
             Edits = InEdits;
             return Inputs;
         }
         Inputs.Octaves = GraphBuilder.RegisterExternalBuffer(Octaves);
-        Inputs.EditCorners = GraphBuilder.RegisterExternalBuffer(EditCorners);
-        Inputs.EditChildren = GraphBuilder.RegisterExternalBuffer(EditChildren);
-        Inputs.EditFlags = GraphBuilder.RegisterExternalBuffer(EditFlags);
-        Inputs.EditNodeCount = (uint32)Edits->Flags.Num();
-        Inputs.EditRootExtent = Edits->RootExtent;
+        Inputs.EditCells = GraphBuilder.RegisterExternalBuffer(EditCells);
+        Inputs.EditOpList = GraphBuilder.RegisterExternalBuffer(EditOpList);
+        Inputs.EditOps = GraphBuilder.RegisterExternalBuffer(EditOps);
+        Inputs.EditTableMask = Edits->TableMask;
+        Inputs.EditCellShift = Edits->CellShift;
+        Inputs.EditOpCount = Edits->OpCount;
         return Inputs;
     }
 

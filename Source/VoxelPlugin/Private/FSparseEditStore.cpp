@@ -1,258 +1,189 @@
 #include "FSparseEditStore.h"
+#include "VoxelEditCore.h"
 #include "Async/ParallelFor.h"
 #include "Misc/ScopeLock.h"
 
 namespace
 {
-    /** Child (or corner) c's direction from a node's centre: bit 0 +X, bit 1 +Y, bit 2 +Z. */
-    const FVector EditChildOffsets[8] = {
-        FVector(-1, -1, -1), FVector(1, -1, -1), FVector(-1, 1, -1), FVector(1, 1, -1),
-        FVector(-1, -1, 1), FVector(1, -1, 1), FVector(-1, 1, 1), FVector(1, 1, 1) };
+    using FStatePtr = TSharedPtr<const VoxelEditCore::FState, ESPMode::ThreadSafe>;
+
+    FBox ToBox(const VoxelEditCore::FAabb& Box, const FVector& Center)
+    {
+        if (!Box.bValid) return FBox(ForceInit);
+        return FBox(FVector(Box.Min[0], Box.Min[1], Box.Min[2]) + Center, FVector(Box.Max[0], Box.Max[1], Box.Max[2]) + Center);
+    }
+
+    /** Index cells: the power of two of half cells nearest 8 m. */
+    int32 CellShiftFor(double HalfFinest)
+    {
+        const double Cells = 800.0 / FMath::Max(HalfFinest, 1e-6);
+        return FMath::Clamp((int32)FMath::RoundToDouble(FMath::Log2(FMath::Max(Cells, 1.0))), 0, 20);
+    }
 }
 
 FSparseEditStore::FSparseEditStore(FVector InCenter, double InExtent, int InMaxDepth)
-    : Center(InCenter), Extent(InExtent), MaxDepth(InMaxDepth) {}
-
-TSharedPtr<FSparseEditNode> FSparseEditStore::PinRoot() const
+    : Center(InCenter), Extent(InExtent), HalfFinest(InExtent / FMath::Pow(2.0, (double)FMath::Max(InMaxDepth, 0)))
 {
-    FScopeLock Lock(&RootCS);
-    return Root;
+    TSharedRef<VoxelEditCore::FState, ESPMode::ThreadSafe> Empty = MakeShared<VoxelEditCore::FState, ESPMode::ThreadSafe>();
+    Empty->HalfFinest = HalfFinest;
+    Empty->CellShift = CellShiftFor(HalfFinest);
+    IndexCellSize = Empty->CellSize();
+    State = Empty;
 }
 
-double FSparseEditStore::Sample(FVector Position) const
+FSparseEditStore::~FSparseEditStore() = default;
+
+FStatePtr FSparseEditStore::PinState() const
 {
-    const TSharedPtr<FSparseEditNode> Tree = PinRoot();
-    return SampleTree(Tree.Get(), Position);
+    FScopeLock Lock(&StateCS);
+    return State;
 }
 
-void FSparseEditStore::SampleAdd(const double* X, const double* Y, const double* Z, int32 Count, float* DensityInOut) const
+FStatePtr FSparseEditStore::GetSnapshot() const
+{
+    return PinState();
+}
+
+void FSparseEditStore::Publish(FStatePtr NewState)
+{
+    const uint32 Sequence = NewState->LastSequence;
+    {
+        FScopeLock Lock(&StateCS);
+        State = MoveTemp(NewState);
+    }
+    LastSequence.store(Sequence, std::memory_order_release);
+}
+
+int32 FSparseEditStore::Num() const
+{
+    const FStatePtr Pinned = PinState();
+    return (int32)Pinned->Ops.size();
+}
+
+void FSparseEditStore::Apply(const double* X, const double* Y, const double* Z, int32 Count, float* DensityInOut, double Footprint) const
 {
     if (Count <= 0) return;
-
-    const TSharedPtr<FSparseEditNode> Tree = PinRoot();
-    const FSparseEditNode* TreeRoot = Tree.Get();
-    if (!TreeRoot) return;
-
+    const FStatePtr Pinned = PinState();
+    const VoxelEditCore::FState& S = *Pinned;
+    if (S.Ops.empty()) return;
+    auto One = [&](int32 i)
+        {
+            const double P[3] = { X[i] - Center.X, Y[i] - Center.Y, Z[i] - Center.Z };
+            DensityInOut[i] = (float)S.Apply(P, Footprint, (double)DensityInOut[i]);
+        };
     if (Count > 128)
-    {
-        ParallelFor(Count, [&](int32 i) {
-            DensityInOut[i] += (float)SampleTree(TreeRoot, FVector(X[i], Y[i], Z[i]));
-            });
-    }
+        ParallelFor(Count, One);
     else
-    {
-        for (int32 i = 0; i < Count; i++)
-            DensityInOut[i] += (float)SampleTree(TreeRoot, FVector(X[i], Y[i], Z[i]));
-    }
+        for (int32 i = 0; i < Count; i++) One(i);
 }
 
-double FSparseEditStore::SampleTree(const FSparseEditNode* TreeRoot, const FVector& Position) const
+void FSparseEditStore::ApplyWithin(const double* X, const double* Y, const double* Z, int32 Count, float* DensityInOut, double Footprint, double Radius) const
 {
-    // Raw pointers: the caller pins the tree, and published trees never change. Copying
-    // shared pointers here would contend on the root's reference count across workers.
-    const FSparseEditNode* Current = TreeRoot;
-    FVector NodeCenter = Center;
-    double NodeExtent = Extent;
-    double Sum = 0.0;
-
-    while (Current)
-    {
-        if (Current->HasEdits)
-            Sum += InterpolateCorners(*Current, NodeCenter, NodeExtent, Position);
-
-        int ChildIndex = GetChildIndex(Position, NodeCenter);
-        const FSparseEditNode* Child = Current->Children[ChildIndex].Get();
-        if (!Child) break;
-
-        NodeExtent *= 0.5;
-        NodeCenter = NodeCenter + EditChildOffsets[ChildIndex] * NodeExtent;
-        Current = Child;
-    }
-
-    return Sum;
+    if (Count <= 0) return;
+    const FStatePtr Pinned = PinState();
+    const VoxelEditCore::FState& S = *Pinned;
+    if (S.Ops.empty()) return;
+    auto One = [&](int32 i)
+        {
+            const double P[3] = { X[i] - Center.X, Y[i] - Center.Y, Z[i] - Center.Z };
+            DensityInOut[i] = (float)S.ApplyWithin(P, Radius, Footprint, (double)DensityInOut[i]);
+        };
+    if (Count > 128)
+        ParallelFor(Count, One);
+    else
+        for (int32 i = 0; i < Count; i++) One(i);
 }
 
 bool FSparseEditStore::HasEditsInBox(const FBox& Box) const
 {
-    const TSharedPtr<FSparseEditNode> Tree = PinRoot();
-    return HasEditsInBoxRecursive(Tree.Get(), Center, Extent, Box);
-}
-
-bool FSparseEditStore::HasEditsInBoxRecursive(const FSparseEditNode* Node, const FVector& NodeCenter, double NodeExtent, const FBox& Box)
-{
-    if (!Node) return false;
-    if (Box.Min.X > NodeCenter.X + NodeExtent || Box.Max.X < NodeCenter.X - NodeExtent
-        || Box.Min.Y > NodeCenter.Y + NodeExtent || Box.Max.Y < NodeCenter.Y - NodeExtent
-        || Box.Min.Z > NodeCenter.Z + NodeExtent || Box.Max.Z < NodeCenter.Z - NodeExtent)
-        return false;
-    if (Node->HasEdits) return true;
-
-    const double ChildExtent = NodeExtent * 0.5;
-    for (int i = 0; i < 8; i++)
+    if (!Box.IsValid) return false;
+    const FStatePtr Pinned = PinState();
+    VoxelEditCore::FAabb Local;
+    for (int32 a = 0; a < 3; a++)
     {
-        if (HasEditsInBoxRecursive(Node->Children[i].Get(), NodeCenter + EditChildOffsets[i] * ChildExtent, ChildExtent, Box))
-            return true;
+        Local.Min[a] = Box.Min[a] - Center[a];
+        Local.Max[a] = Box.Max[a] - Center[a];
     }
-    return false;
+    Local.bValid = true;
+    return Pinned->AnyInBox(Local);
 }
 
-void FSparseEditStore::ApplySphericalEdit(FVector BrushCenter, double Radius, double Strength, int Depth)
+FVoxelEditResult FSparseEditStore::ApplyEdit(EVoxelEditMode Mode, const FVector& InCenter, double Radius, double Blend, bool bContinueStroke)
 {
-    FVoxelEditOp Op;
-    Op.Center = BrushCenter;
-    Op.Radius = Radius;
-    Op.Strength = Strength;
-    Op.Depth = FMath::Clamp(Depth, 0, MaxDepth);
-
     FScopeLock WriteLock(&WriteCS);
-    Op.Sequence = NextSequence++;
-    EditLog.Add(Op);
-    ApplyOpLocked(Op);
-    LastSequence.store(Op.Sequence, std::memory_order_release);
-}
+    const FStatePtr Old = PinState();
+    const double P[3] = { InCenter.X - Center.X, InCenter.Y - Center.Y, InCenter.Z - Center.Z };
+    VoxelEditCore::FInsertResult Inserted;
+    TSharedRef<VoxelEditCore::FState, ESPMode::ThreadSafe> New = MakeShared<VoxelEditCore::FState, ESPMode::ThreadSafe>(
+        VoxelEditCore::Insert(*Old, Mode == EVoxelEditMode::Fill ? VoxelEditCore::EMode::Fill : VoxelEditCore::EMode::Carve, P, Radius, Blend,
+            bContinueStroke, VoxelEditCore::FInsertOptions(), Inserted));
 
-void FSparseEditStore::ApplyOpLocked(const FVoxelEditOp& Op)
-{
-    const TSharedPtr<FSparseEditNode> OldRoot = PinRoot();
-    TSharedPtr<FSparseEditNode> NewRoot = OldRoot.IsValid()
-        ? MakeShared<FSparseEditNode>(*OldRoot)
-        : MakeShared<FSparseEditNode>();
-
-    ApplyEditRecursive(*NewRoot, Center, Extent, Op.Center, Op.Radius, Op.Strength, 0, FMath::Clamp(Op.Depth, 0, MaxDepth));
-
-    FScopeLock Lock(&RootCS);
-    Root = NewRoot;
+    FVoxelEditResult Result;
+    Result.bChanged = Inserted.bChanged;
+    Result.Dropped = Inserted.Dropped;
+    Result.Bounds = ToBox(Inserted.Dirty, Center);
+    // Unchanged edits still move the stroke on (the next continued call starts there); a
+    // brush held still changes nothing at all, and publishes nothing.
+    const bool bStrokeMoved = New->StrokeOp != Old->StrokeOp || New->StrokeEnd[0] != Old->StrokeEnd[0]
+        || New->StrokeEnd[1] != Old->StrokeEnd[1] || New->StrokeEnd[2] != Old->StrokeEnd[2];
+    if (Inserted.bChanged || bStrokeMoved)
+        Publish(New);
+    Result.Sequence = GetLastSequence();
+    return Result;
 }
 
 TArray<FVoxelEditOp> FSparseEditStore::GetEditLog() const
 {
-    FScopeLock WriteLock(&WriteCS);
-    return EditLog;
+    const FStatePtr Pinned = PinState();
+    TArray<FVoxelEditOp> Out;
+    Out.Reserve((int32)Pinned->Ops.size());
+    for (const VoxelEditCore::FOp& Op : Pinned->Ops)
+    {
+        FVoxelEditOp& E = Out.AddDefaulted_GetRef();
+        E.Sequence = Op.Sequence;
+        E.Mode = Op.Mode == VoxelEditCore::EMode::Fill ? EVoxelEditMode::Fill : EVoxelEditMode::Carve;
+        E.A = FVector(Op.A[0], Op.A[1], Op.A[2]) + Center;
+        E.B = FVector(Op.B[0], Op.B[1], Op.B[2]) + Center;
+        E.Radius = Op.Radius;
+        E.Blend = Op.Blend;
+    }
+    return Out;
 }
 
 void FSparseEditStore::ReplayEditLog(const TArray<FVoxelEditOp>& Ops)
 {
     FScopeLock WriteLock(&WriteCS);
+    TSharedRef<VoxelEditCore::FState, ESPMode::ThreadSafe> New = MakeShared<VoxelEditCore::FState, ESPMode::ThreadSafe>();
+    New->HalfFinest = HalfFinest;
+    New->CellShift = CellShiftFor(HalfFinest);
+    uint32 Last = GetLastSequence();
+    for (const FVoxelEditOp& E : Ops)
     {
-        FScopeLock Lock(&RootCS);
-        Root.Reset();
-    }
-    EditLog.Reset();
-    NextSequence = 1;
-    for (const FVoxelEditOp& Op : Ops)
-    {
-        EditLog.Add(Op);
-        NextSequence = FMath::Max(NextSequence, Op.Sequence + 1);
-        ApplyOpLocked(Op);
-    }
-    LastSequence.store(NextSequence - 1, std::memory_order_release);
-}
-
-void FSparseEditStore::ApplyEditRecursive(FSparseEditNode& Node, FVector NodeCenter, double NodeExtent,
-    FVector BrushCenter, double BrushRadius, double Strength,
-    int CurrentDepth, int TargetDepth)
-{
-    // AABB-sphere overlap check
-    FVector ClosestPoint;
-    ClosestPoint.X = FMath::Clamp(BrushCenter.X, NodeCenter.X - NodeExtent, NodeCenter.X + NodeExtent);
-    ClosestPoint.Y = FMath::Clamp(BrushCenter.Y, NodeCenter.Y - NodeExtent, NodeCenter.Y + NodeExtent);
-    ClosestPoint.Z = FMath::Clamp(BrushCenter.Z, NodeCenter.Z - NodeExtent, NodeCenter.Z + NodeExtent);
-
-    if (FVector::DistSquared(ClosestPoint, BrushCenter) > BrushRadius * BrushRadius)
-        return;
-
-    // Write edit at target depth
-    if (CurrentDepth == TargetDepth)
-    {
-        Node.HasEdits = true;
-        for (int i = 0; i < 8; i++)
+        VoxelEditCore::FOp Op;
+        Op.Sequence = E.Sequence;
+        Op.Mode = E.Mode == EVoxelEditMode::Fill ? VoxelEditCore::EMode::Fill : VoxelEditCore::EMode::Carve;
+        for (int32 a = 0; a < 3; a++)
         {
-            FVector CornerPos = GetCornerPosition(NodeCenter, NodeExtent, i);
-            double Dist = FVector::Dist(CornerPos, BrushCenter);
-            double Falloff = FMath::Clamp(1.0 - (Dist / BrushRadius), 0.0, 1.0);
-            Falloff = Falloff * Falloff * (3.0 - 2.0 * Falloff); // Smoothstep
-            Node.CornerDensities[i] += Strength * Falloff;
+            Op.A[a] = E.A[a] - Center[a];
+            Op.B[a] = E.B[a] - Center[a];
         }
-        return;
+        Op.Radius = FMath::Max(E.Radius, 0.0);
+        Op.Blend = FMath::Clamp(E.Blend, 0.0, Op.Radius);
+        New->Ops.push_back(Op);
+        Last = FMath::Max(Last, E.Sequence);
     }
-
-    // Recurse into children
-    double ChildExtent = NodeExtent * 0.5;
-    for (int i = 0; i < 8; i++)
-    {
-        FVector ChildCenter = NodeCenter + EditChildOffsets[i] * ChildExtent;
-
-        FVector ChildClosest;
-        ChildClosest.X = FMath::Clamp(BrushCenter.X, ChildCenter.X - ChildExtent, ChildCenter.X + ChildExtent);
-        ChildClosest.Y = FMath::Clamp(BrushCenter.Y, ChildCenter.Y - ChildExtent, ChildCenter.Y + ChildExtent);
-        ChildClosest.Z = FMath::Clamp(BrushCenter.Z, ChildCenter.Z - ChildExtent, ChildCenter.Z + ChildExtent);
-
-        if (FVector::DistSquared(ChildClosest, BrushCenter) > BrushRadius * BrushRadius)
-            continue;
-
-        // The child may belong to a published tree: write to a copy.
-        Node.Children[i] = Node.Children[i].IsValid()
-            ? MakeShared<FSparseEditNode>(*Node.Children[i])
-            : MakeShared<FSparseEditNode>();
-
-        ApplyEditRecursive(*Node.Children[i], ChildCenter, ChildExtent,
-            BrushCenter, BrushRadius, Strength, CurrentDepth + 1, TargetDepth);
-    }
-}
-
-int FSparseEditStore::GetDepthForBrushRadius(double BrushRadius, int SubdivisionLevels) const
-{
-    int Depth = 0;
-    double NodeExtent = Extent;
-    while (Depth < MaxDepth - SubdivisionLevels && NodeExtent > BrushRadius)
-    {
-        NodeExtent *= 0.5;
-        Depth++;
-    }
-    return Depth + SubdivisionLevels;
-}
-
-int FSparseEditStore::GetChildIndex(FVector Position, FVector NodeCenter) const
-{
-    int Index = 0;
-    if (Position.X >= NodeCenter.X) Index |= 1;
-    if (Position.Y >= NodeCenter.Y) Index |= 2;
-    if (Position.Z >= NodeCenter.Z) Index |= 4;
-    return Index;
-}
-
-FVector FSparseEditStore::GetCornerPosition(FVector NodeCenter, double NodeExtent, int CornerIndex) const
-{
-    return NodeCenter + EditChildOffsets[CornerIndex] * NodeExtent;
-}
-
-double FSparseEditStore::InterpolateCorners(const FSparseEditNode& Node, FVector NodeCenter, double NodeExtent, FVector Position) const
-{
-    double tx = (Position.X - (NodeCenter.X - NodeExtent)) / (2.0 * NodeExtent);
-    double ty = (Position.Y - (NodeCenter.Y - NodeExtent)) / (2.0 * NodeExtent);
-    double tz = (Position.Z - (NodeCenter.Z - NodeExtent)) / (2.0 * NodeExtent);
-
-    tx = FMath::Clamp(tx, 0.0, 1.0);
-    ty = FMath::Clamp(ty, 0.0, 1.0);
-    tz = FMath::Clamp(tz, 0.0, 1.0);
-
-    double c00 = FMath::Lerp(Node.CornerDensities[0], Node.CornerDensities[1], tx);
-    double c01 = FMath::Lerp(Node.CornerDensities[2], Node.CornerDensities[3], tx);
-    double c10 = FMath::Lerp(Node.CornerDensities[4], Node.CornerDensities[5], tx);
-    double c11 = FMath::Lerp(Node.CornerDensities[6], Node.CornerDensities[7], tx);
-
-    double c0 = FMath::Lerp(c00, c01, ty);
-    double c1 = FMath::Lerp(c10, c11, ty);
-
-    return FMath::Lerp(c0, c1, tz);
+    // A replay is a change even when the sequences are old ones: consumers rebuild.
+    New->LastSequence = Last + 1;
+    New->Reindex();
+    Publish(New);
 }
 
 void FSparseEditStore::Clear()
 {
     FScopeLock WriteLock(&WriteCS);
-    EditLog.Reset();
-    NextSequence = 1;
-    LastSequence.store(0, std::memory_order_release);
-    FScopeLock Lock(&RootCS);
-    Root.Reset();
+    TSharedRef<VoxelEditCore::FState, ESPMode::ThreadSafe> New = MakeShared<VoxelEditCore::FState, ESPMode::ThreadSafe>();
+    New->HalfFinest = HalfFinest;
+    New->CellShift = CellShiftFor(HalfFinest);
+    New->LastSequence = GetLastSequence() + 1;
+    Publish(New);
 }

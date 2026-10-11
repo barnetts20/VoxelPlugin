@@ -1,55 +1,102 @@
-// VoxelEditSample.ush - The edit delta at a lattice point, from the sparse edit tree
-// (FSparseEditStore::SampleTree) flattened for the GPU. Shared subset (VoxelShaderCompat.h).
+// VoxelEditSample.ush - The terrain edits applied to the density at a lattice point
+// (Design/EditsAndCaves.md, E1): each edit carves or fills a capsule into the density as it
+// stands, in order, with a blend radius. The CPU twin and the data layout are in
+// Source/VoxelPlugin/Private/VoxelEditCore.h (Flatten). Shared subset (VoxelShaderCompat.h).
 //
 // Inputs, declared by the includer:
-//   StructuredBuffer<float> EditCorners;    8 corner deltas per node
-//   StructuredBuffer<int> EditChildren;     8 child node indices per node, -1 for none
-//   StructuredBuffer<uint> EditFlags;       1 when the node holds edits
-//   uint EditNodeCount;                     0: no edits
-//   int EditRootExtent;                     root half-extent in half finest cells (2^MaxDepth)
+//   StructuredBuffer<uint> EditCells;    4 per slot of an open-addressing table over the 8 m
+//                                        index cells: cell x, y, z (int bits), and
+//                                        (offset << 12) | count into EditOpList (0: empty slot)
+//   StructuredBuffer<uint> EditOpList;   op indices per cell, in order
+//   StructuredBuffer<uint> EditOps;      16 per op (VOXEL_EDIT_OP_STRIDE): the anchor lattice
+//                                        point (3 ints), the mode (0 carve, 1 fill), then as float
+//                                        bits: the capsule's A from the anchor (cm, 3), its
+//                                        radius, B from the anchor (3), the blend radius; 4
+//                                        reserved. (uint, so no load can flush or canonicalise
+//                                        the integers' bits.)
+//   uint EditTableMask;                  table slots - 1
+//   uint EditCellShift;                  index cells are 2^EditCellShift lattice points
+//   uint EditOpCount;                    0: no edits
+// and HalfFinest (the lattice's half cell, cm; VoxelDensitySample.ush's inputs).
 //
-// The tree is centred on the actor and its nodes are dyadic, so the walk runs in integer
-// lattice coordinates (half finest cells from the root centre).
+// Lattice indices count half finest cells from the root centre, so point I is at I * HalfFinest
+// in the store's frame. A point's offset from an edit's anchor is an integer difference times
+// the half cell: exact near the edit at any planet size.
 
 #ifndef VOXEL_EDIT_SAMPLE_USH
 #define VOXEL_EDIT_SAMPLE_USH
 
-VOXEL_FUNC float VoxelEditDelta(int X, int Y, int Z)
+#define VOXEL_EDIT_OP_STRIDE 16u
+#define VOXEL_EDIT_COUNT_BITS 12u
+
+#ifndef VOXEL_LOOP
+#define VOXEL_LOOP [loop]
+#endif
+
+/** The quadratic polynomial smooth min (K 0: min); VoxelEditCore::SmoothMin. */
+VOXEL_FUNC float VoxelEditSmoothMin(float X, float Y, float K)
 {
-    if (EditNodeCount == 0u) return 0.0f;
+    if (!(K > 0.0f)) return min(X, Y);
+    const float H = max(K - abs(X - Y), 0.0f) / K;
+    return min(X, Y) - H * H * K * 0.25f;
+}
 
-    int Node = 0;
-    int CX = 0;
-    int CY = 0;
-    int CZ = 0;
-    int E = EditRootExtent;
-    float Sum = 0.0f;
-    for (int Depth = 0; Depth < 40; Depth++)
+/** The table slot an index cell hashes to (VoxelEditCore::CellHash). */
+VOXEL_FUNC uint VoxelEditCellHash(int CX, int CY, int CZ)
+{
+    return (uint(CX) * 73856093u) ^ (uint(CY) * 19349663u) ^ (uint(CZ) * 83492791u);
+}
+
+/** Density D at lattice point (X, Y, Z) with the edits applied, for a footprint (cm): an edit
+ *  narrower than the footprint shrinks by the difference (VoxelEditCore::ApplyOp). */
+VOXEL_FUNC float VoxelEditApply(int X, int Y, int Z, float Footprint, float D)
+{
+    if (EditOpCount == 0u) return D;
+
+    // Arithmetic shifts: floor division for negative indices too.
+    const int CX = X >> int(EditCellShift);
+    const int CY = Y >> int(EditCellShift);
+    const int CZ = Z >> int(EditCellShift);
+    uint Slot = VoxelEditCellHash(CX, CY, CZ) & EditTableMask;
+    uint Range = 0u;
+    VOXEL_LOOP
+    for (uint Probe = 0u; Probe <= EditTableMask; Probe++)
     {
-        if (EditFlags[uint(Node)] != 0u)
+        const uint Base = Slot * 4u;
+        const uint Packed = EditCells[Base + 3u];
+        if (Packed == 0u) break;
+        if (int(EditCells[Base]) == CX && int(EditCells[Base + 1u]) == CY && int(EditCells[Base + 2u]) == CZ)
         {
-            const float Size = float(2 * E);
-            const float TX = saturate(float(X - (CX - E)) / Size);
-            const float TY = saturate(float(Y - (CY - E)) / Size);
-            const float TZ = saturate(float(Z - (CZ - E)) / Size);
-            const uint Base = uint(Node) * 8u;
-            const float C00 = lerp(EditCorners[Base + 0u], EditCorners[Base + 1u], TX);
-            const float C01 = lerp(EditCorners[Base + 2u], EditCorners[Base + 3u], TX);
-            const float C10 = lerp(EditCorners[Base + 4u], EditCorners[Base + 5u], TX);
-            const float C11 = lerp(EditCorners[Base + 6u], EditCorners[Base + 7u], TX);
-            Sum += lerp(lerp(C00, C01, TY), lerp(C10, C11, TY), TZ);
+            Range = Packed;
+            break;
         }
-
-        const int Child = (X >= CX ? 1 : 0) | (Y >= CY ? 2 : 0) | (Z >= CZ ? 4 : 0);
-        const int Next = EditChildren[uint(Node) * 8u + uint(Child)];
-        if (Next < 0 || E < 2) break;
-        E = E / 2;
-        CX += (Child & 1) != 0 ? E : -E;
-        CY += (Child & 2) != 0 ? E : -E;
-        CZ += (Child & 4) != 0 ? E : -E;
-        Node = Next;
+        Slot = (Slot + 1u) & EditTableMask;
     }
-    return Sum;
+    if (Range == 0u) return D;
+
+    const uint First = Range >> VOXEL_EDIT_COUNT_BITS;
+    const uint Count = Range & ((1u << VOXEL_EDIT_COUNT_BITS) - 1u);
+    const float H = HalfFinest.x;
+    VOXEL_LOOP
+    for (uint i = 0u; i < Count; i++)
+    {
+        const uint O = EditOpList[First + i] * VOXEL_EDIT_OP_STRIDE;
+        // The point from the edit's anchor (cm).
+        const float PX = float(X - int(EditOps[O + 0u])) * H;
+        const float PY = float(Y - int(EditOps[O + 1u])) * H;
+        const float PZ = float(Z - int(EditOps[O + 2u])) * H;
+        const float AX = asfloat(EditOps[O + 4u]), AY = asfloat(EditOps[O + 5u]), AZ = asfloat(EditOps[O + 6u]);
+        const float BAX = asfloat(EditOps[O + 8u]) - AX, BAY = asfloat(EditOps[O + 9u]) - AY, BAZ = asfloat(EditOps[O + 10u]) - AZ;
+        const float Radius = asfloat(EditOps[O + 7u]);
+        const float Blend = asfloat(EditOps[O + 11u]);
+        const float PAX = PX - AX, PAY = PY - AY, PAZ = PZ - AZ;
+        const float Len2 = BAX * BAX + BAY * BAY + BAZ * BAZ;
+        const float T = Len2 > 0.0f ? clamp((PAX * BAX + PAY * BAY + PAZ * BAZ) / Len2, 0.0f, 1.0f) : 0.0f;
+        const float QX = PAX - BAX * T, QY = PAY - BAY * T, QZ = PAZ - BAZ * T;
+        const float S = sqrt(QX * QX + QY * QY + QZ * QZ) - Radius + max(0.0f, Footprint - Radius);
+        D = EditOps[O + 3u] != 0u ? VoxelEditSmoothMin(D, S, Blend) : -VoxelEditSmoothMin(-D, S, Blend);
+    }
+    return D;
 }
 
 #endif // VOXEL_EDIT_SAMPLE_USH

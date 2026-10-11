@@ -1,7 +1,7 @@
-// FDensitySampleCompositor.h — Composites multiple density sample layers and
-// edit-store deltas into a final SDF density value. Layers are evaluated in
-// parallel when multiple are present, then summed. The edit store is applied
-// additively on top.
+// FDensitySampleCompositor.h — Composites multiple density sample layers and the edit store's
+// edits into a final SDF density value. Layers are evaluated in parallel when multiple are
+// present, then summed. The edits (FSparseEditStore: carves and fills of shapes) apply last, in
+// order, to the summed density.
 
 #pragma once
 
@@ -34,12 +34,12 @@ struct VOXELPLUGIN_API FSampleInput
         : X(InX), Y(InY), Z(InZ), Count(InCount), Footprint(InFootprint) {}
 };
 
-/** Composites one or more density sample layers with an optional sparse edit store into final
- *  SDF density values (negative = solid).
+/** Composites one or more density sample layers with an optional edit store into final SDF
+ *  density values (negative = solid).
  *
  *  Layers are TFunctions that write density values for a batch of positions.
  *  When multiple layers exist they are evaluated in parallel and summed.
- *  The edit store is always applied last as an additive delta.
+ *  The edits always apply last, to the sum.
  *
  *  Built by VoxelDensity::MakeCompositor and shared between the planet's terrain and ocean,
  *  so both sample the same density field (including user edits). Sampling is safe from any
@@ -51,11 +51,17 @@ public:
     FDensitySampleCompositor(TSharedPtr<FSparseEditStore> InEditStore) : EditStore(InEditStore) {}
 
     TSharedPtr<FSparseEditStore> GetEditStore() { return EditStore; }
+    TSharedPtr<const FSparseEditStore> GetEditStore() const { return EditStore; }
 
     /** The CPU density this compositor was built on (VoxelDensity::MakeCompositor), for
      *  consumers that evaluate the same field elsewhere (the GPU path); null otherwise. */
     TSharedPtr<const FVoxelDensityCPU> GetBaseDensity() const { return BaseDensity; }
     void SetBaseDensity(TSharedPtr<const FVoxelDensityCPU> InDensity) { BaseDensity = MoveTemp(InDensity); }
+
+    /** The smallest footprint the edits are applied at (the base density's MinFootprint), as
+     *  the GPU raises every footprint to it: collision and render agree on edits narrower
+     *  than it. */
+    void SetEditFootprintFloor(double InFootprint) { EditFootprintFloor = FMath::Max(InFootprint, 0.0); }
 
     /** Registers a density sample layer. Layers are evaluated in registration order
      *  and their outputs are summed. */
@@ -64,57 +70,66 @@ public:
         SampleLayers.Add(MoveTemp(Layer));
     }
 
-    /** Evaluates all layers and the edit store, writing final density values to DensityOut.
+    /** Evaluates all layers and the edits, writing final density values to DensityOut.
      *  Single-layer fast path avoids temp allocation and ParallelFor overhead. */
     void Sample(const FSampleInput& Input, float* DensityOut) const
     {
-        int32 Count = Input.Num();
-        if (Count <= 0 || SampleLayers.Num() <= 0) return;
-
-        // Fast path: single layer - no temp allocation, no ParallelFor overhead
-        if (SampleLayers.Num() == 1)
-        {
-            SampleLayers[0](Input, DensityOut);
-        }
-        else
-        {
-            // Multi-layer path
-            TArray<TArray<float>> LayerOutputs;
-            LayerOutputs.SetNum(SampleLayers.Num());
-            for (auto& L : LayerOutputs) L.SetNumUninitialized(Count);
-
-            ParallelFor(SampleLayers.Num(), [&](int32 LayerIdx) {
-                SampleLayers[LayerIdx](Input, LayerOutputs[LayerIdx].GetData());
-                });
-
-            FMemory::Memcpy(DensityOut, LayerOutputs[0].GetData(), Count * sizeof(float));
-            for (int32 LayerIdx = 1; LayerIdx < SampleLayers.Num(); LayerIdx++)
-                for (int32 i = 0; i < Count; i++)
-                    DensityOut[i] += LayerOutputs[LayerIdx][i];
-        }
-
-        ApplyEditDeltas(Input, DensityOut, Count);
+        if (!SampleLayersInto(Input, DensityOut)) return;
+        if (EditStore.IsValid())
+            EditStore->Apply(Input.X, Input.Y, Input.Z, Input.Count, DensityOut, FMath::Max(Input.Footprint, EditFootprintFloor));
     }
 
-    /** Applies only edit-store deltas to existing density values (DensityInOut). */
+    /** Sample for a test that proves a ball of Radius about each position free of surface from
+     *  that one value (|d| > slope bound x Radius): every edit reaching the ball applies, not
+     *  just those of the position's index cell (FSparseEditStore::ApplyWithin), and at its full
+     *  size (no shrinking for the footprint: a brick tree culls a brick's finer levels with it,
+     *  where a narrow edit does show). */
+    void SampleWithin(const FSampleInput& Input, double Radius, float* DensityOut) const
+    {
+        if (!SampleLayersInto(Input, DensityOut)) return;
+        if (EditStore.IsValid())
+            EditStore->ApplyWithin(Input.X, Input.Y, Input.Z, Input.Count, DensityOut, 0.0, Radius);
+    }
+
+    /** Applies only the edits to existing density values (DensityInOut). */
     void SampleEditsOnly(const FSampleInput& Input, float* DensityInOut) const
     {
-        int32 Count = Input.Num();
-        if (Count <= 0) return;
-
-        ApplyEditDeltas(Input, DensityInOut, Count);
+        if (Input.Num() <= 0 || !EditStore.IsValid()) return;
+        EditStore->Apply(Input.X, Input.Y, Input.Z, Input.Count, DensityInOut, FMath::Max(Input.Footprint, EditFootprintFloor));
     }
 
 private:
     TArray<TFunction<void(const FSampleInput&, float*)>> SampleLayers;
     TSharedPtr<FSparseEditStore> EditStore;
     TSharedPtr<const FVoxelDensityCPU> BaseDensity;
+    double EditFootprintFloor = 0.0;
 
-    /** Shared helper: additively applies edit-store deltas to an existing density buffer
-     *  (one tree snapshot per batch; the store parallelizes large batches). */
-    void ApplyEditDeltas(const FSampleInput& Input, float* DensityInOut, int32 Count) const
+    /** The layers' sum; false when there is nothing to write. */
+    bool SampleLayersInto(const FSampleInput& Input, float* DensityOut) const
     {
-        if (!EditStore.IsValid()) return;
-        EditStore->SampleAdd(Input.X, Input.Y, Input.Z, Count, DensityInOut);
+        const int32 Count = Input.Num();
+        if (Count <= 0 || SampleLayers.Num() <= 0) return false;
+
+        // Fast path: single layer - no temp allocation, no ParallelFor overhead
+        if (SampleLayers.Num() == 1)
+        {
+            SampleLayers[0](Input, DensityOut);
+            return true;
+        }
+
+        // Multi-layer path
+        TArray<TArray<float>> LayerOutputs;
+        LayerOutputs.SetNum(SampleLayers.Num());
+        for (auto& L : LayerOutputs) L.SetNumUninitialized(Count);
+
+        ParallelFor(SampleLayers.Num(), [&](int32 LayerIdx) {
+            SampleLayers[LayerIdx](Input, LayerOutputs[LayerIdx].GetData());
+            });
+
+        FMemory::Memcpy(DensityOut, LayerOutputs[0].GetData(), Count * sizeof(float));
+        for (int32 LayerIdx = 1; LayerIdx < SampleLayers.Num(); LayerIdx++)
+            for (int32 i = 0; i < Count; i++)
+                DensityOut[i] += LayerOutputs[LayerIdx][i];
+        return true;
     }
 };

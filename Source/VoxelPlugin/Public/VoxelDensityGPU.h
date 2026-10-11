@@ -74,16 +74,19 @@ struct FVoxelDensityGPUData
     uint32 LandGullySeed = 0;
 };
 
-/** The sparse edit tree flattened for the GPU (VoxelEditSample.ush). */
+/** The edit store's edits and index for the GPU (VoxelEditSample.ush; the layout is
+ *  VoxelEditCore::Flatten's). */
 struct FVoxelEditGPUData
 {
-    TArray<float> Corners;      // 8 per node
-    TArray<int32> Children;     // 8 per node, -1 for none
-    TArray<uint32> Flags;       // 1 when the node holds edits
-    int32 RootExtent = 0;       // root half-extent in half finest cells (MaxDepth up to 29)
+    TArray<uint32> Cells;       // 4 per slot of the index cells' hash table
+    TArray<uint32> OpList;      // op indices per cell, in order
+    TArray<uint32> Ops;         // 16 per op
+    uint32 TableMask = 0;
+    uint32 CellShift = 0;
+    uint32 OpCount = 0;         // 0: no edits
 
-    /** Flattens Store's current tree. Empty (no edits on the GPU) with a warning when the
-     *  store is not centred on the actor or its extent is not HalfFinest * 2^MaxDepth. */
+    /** Flattens Store's current edits. Empty (no edits on the GPU) with a warning when the
+     *  store is not centred on the actor or its lattice is not the terrain's (HalfFinest). */
     static TSharedRef<FVoxelEditGPUData> Build(const FSparseEditStore* Store, double HalfFinest, int32 MaxDepth);
 };
 
@@ -92,7 +95,7 @@ enum class EVoxelDensityGPUOutput : uint8
 {
     Density,   // the density without edits (FVoxelDensityCPU::Sample)
     Radial,    // |p| - R only: the double-float position path alone
-    Edits      // the edit delta only (FSparseEditStore::Sample)
+    Edits      // the density with the edits (FSparseEditStore::Apply on FVoxelDensityCPU::Sample)
 };
 
 /** A box of lattice points: Dim points per axis from Min, Step apart, all sampled at

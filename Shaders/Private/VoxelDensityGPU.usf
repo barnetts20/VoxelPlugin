@@ -33,11 +33,12 @@ float RidgeGain;
 float SlopeDamping;
 
 // Edits (VoxelEditSample.ush).
-StructuredBuffer<float> EditCorners;
-StructuredBuffer<int> EditChildren;
-StructuredBuffer<uint> EditFlags;
-uint EditNodeCount;
-int EditRootExtent;
+StructuredBuffer<uint> EditCells;
+StructuredBuffer<uint> EditOpList;
+StructuredBuffer<uint> EditOps;
+uint EditTableMask;
+uint EditCellShift;
+uint EditOpCount;
 
 #include "/Plugin/VoxelPlugin/Private/VoxelCubeSphere.ush"
 #include "/Plugin/VoxelPlugin/Private/VoxelLandParameters.ush"
@@ -57,7 +58,7 @@ void MainCS(uint3 Id : SV_DispatchThreadID)
     if (OutputMode == 1u)
         Value = VoxelRadialDF(Index.x, Index.y, Index.z);
     else if (OutputMode == 2u)
-        Value = VoxelEditDelta(Index.x, Index.y, Index.z);
+        Value = VoxelEditApply(Index.x, Index.y, Index.z, SampleFootprint, VoxelSampleDensityDF(Index.x, Index.y, Index.z, SampleFootprint));
     else
         Value = VoxelSampleDensityDF(Index.x, Index.y, Index.z, SampleFootprint);
     OutDensity[OutOffset + Linear] = Value;

@@ -15,6 +15,7 @@
 #include "VoxelBrickTerrain.h"
 #include "RealtimeMeshActor.h"
 #include "VoxelLandCache.h"
+#include "FSparseEditStore.h"
 #include <atomic>
 #include "AdaptiveVoxelActor.generated.h"
 
@@ -216,7 +217,8 @@ public:
     TSharedPtr<FVoxelBrickTerrain> GetBrickTerrain() const { return BrickTerrain; }
 
     /** Game thread. Broadcast from Tick for every edit written to the edit store, as it is
-     *  forwarded to the collision and brick terrain (the ocean rewrites its depth there). */
+     *  forwarded to the collision and brick terrain (the ocean rewrites its depth there):
+     *  within twice Radius of Center the surface may have moved. */
     FOnVoxelTerrainEdited& OnTerrainEdited() { return TerrainEdited; }
 
     /** Called by APlanetActor: uses its compositor (shared density and edits), sets the scale
@@ -255,12 +257,12 @@ protected:
     /** Listeners to the edits (OnTerrainEdited). */
     FOnVoxelTerrainEdited TerrainEdited;
 
-    /** An edit written to the edit store, for the collision bricks and the brick terrain. */
+    /** An edit written to the edit store, for the collision bricks and the brick terrain:
+     *  where the surface may have moved (actor space). */
     struct FEditNotice
     {
         uint32 Sequence;
-        FVector Center;
-        double Radius;
+        FBox Bounds;
     };
 
     /** State shared with the edit task, which holds a reference instead of the actor so it
@@ -366,12 +368,15 @@ protected:
     /** The camera the land surface cache follows, in the planet's frame (cm, no scale). */
     bool GetLandCacheCamera(const FTransform& PlanetFrame, FVector& OutCameraPlanet) const;
 
-    /** Example edit flow (E adds, Q removes), not in shipping builds: traces from the camera
-     *  along the control rotation and edits this terrain where the trace hits one of its
-     *  collision bricks. */
+    /** Example edit flow (E carves, Q fills; held, a stroke), not in shipping builds: traces
+     *  from the camera along the control rotation and edits this terrain where the trace hits
+     *  one of its collision bricks. */
     void TickDebugEdits(UWorld* World);
 
-    /** Background task: writes a spherical brush edit to the edit store and queues its notice.
-     *  InEditResolution: edit-tree levels below the brush-sized node. */
-    void RunEditUpdateTask(FVector InEditCenter, double InEditRadius, double InEditStrength, int InEditResolution);
+    /** The debug brush's stroke: the mode held since the last edit (-1: none). */
+    int32 DebugStrokeMode = -1;
+
+    /** Background task: writes an edit (a sphere at InEditCenter, or the stroke from the
+     *  previous one when bContinueStroke) to the edit store and queues its notice. */
+    void RunEditUpdateTask(EVoxelEditMode Mode, FVector InEditCenter, double InEditRadius, double InEditBlend, bool bContinueStroke);
 };
