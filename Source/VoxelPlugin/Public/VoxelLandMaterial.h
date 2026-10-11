@@ -39,6 +39,12 @@ namespace VoxelLandMaterial
      *  bake (Density.LandMode must be 1). Any thread. */
     VOXELPLUGIN_API void BuildConstantTexels(const FVoxelDensityGPUData& Density, const FVoxelLandBake& Bake, TArray<FVector4f>& Out, int32& OutRows);
 
+    /** voxel.Land.MaterialSource 0: the node reads the land surface cache (VoxelLandCache.h). */
+    VOXELPLUGIN_API bool UsesCache();
+
+    /** voxel.Debug.LandCache: the node shows the cache's levels. */
+    VOXELPLUGIN_API bool ShowsCacheLevels();
+
     /** Whether a material has the land node: its VoxelLandParams vector parameter. */
     VOXELPLUGIN_API bool HasLandNode(const UMaterialInterface* Material);
 
@@ -60,7 +66,8 @@ namespace VoxelLandMaterial
      *  scale) as its origin and axes (double-float), the debug view, the surface tolerance
      *  (m) and the footprint (cm) below which the mesh's normal is used (NearFootprint). The material places each pixel from its own view, so no camera is needed here.
      *  bEnabled false turns the node off (it then reads no texture and leaves the mesh's
-     *  normal). */
+     *  normal); bCacheAvailable false makes it evaluate the land itself (the analytic node)
+     *  whatever voxel.Land.MaterialSource asks. */
     VOXELPLUGIN_API void SetFrameParameters(UMaterialInstanceDynamic* Material, const FTransform& PlanetFrame,
-        int32 View, double Tolerance, double NearFootprint, bool bEnabled);
+        int32 View, double Tolerance, double NearFootprint, bool bEnabled, bool bCacheAvailable);
 }

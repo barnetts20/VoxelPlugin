@@ -14,11 +14,13 @@
 #include "VoxelCollisionBricks.h"
 #include "VoxelBrickTerrain.h"
 #include "RealtimeMeshActor.h"
+#include "VoxelLandCache.h"
 #include <atomic>
 #include "AdaptiveVoxelActor.generated.h"
 
 class UMaterialInstanceDynamic;
 class UTexture2DDynamic;
+class UTextureRenderTarget2D;
 
 /** An edit written to the edit store, as the terrain forwards it to its bricks: its sequence,
  *  centre (actor space without scale) and radius (cm). */
@@ -79,9 +81,10 @@ public:
     /** Terrestrial planets, materials with the land node (VoxelLandMaterial.ush): how far the
      *  rendered surface may lie off the analytic one (m) before the node's normal fades to the
      *  mesh's (edits, overhangs). It also grows by 16 pixel footprints, for the coarse mesh far
-     *  off. */
+     *  off. A mesh surface facing well away from the land's takes the mesh's normal whatever
+     *  this is (VoxelLandFacingToMesh). */
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrain|Materials", meta = (ClampMin = "0.0", UIMax = "50"))
-    double LandSurfaceTolerance = 2.0;
+    double LandSurfaceTolerance = 0.33;
 
     /** Terrestrial planets, the land node: close to the camera, where the finest mesh cells
      *  (ActualPrecision) carry all the land's detail, the node uses the mesh's normal. Below a
@@ -310,8 +313,9 @@ protected:
     /** Drops the land textures (and the instance's references to them). */
     void ReleaseLandTextures();
 
-    /** Game thread, per frame after every actor's tick: the planet's frame for the land node. */
-    void UpdateLandMaterial();
+    /** Game thread, per frame after every actor's tick: the planet's frame for the land node;
+     *  bTickCache (from the end of the actors' tick only) moves the land surface cache too. */
+    void UpdateLandMaterial(bool bTickCache = false);
     void OnWorldPostActorTick(UWorld* World, ELevelTick TickType, float DeltaSeconds);
 
     /** The land material (VoxelLandMaterial.h): the instance, the textures, and what they were
@@ -337,6 +341,30 @@ protected:
     /** The instance's land node is bound to the textures. */
     bool bLandMaterialBound = false;
     FDelegateHandle LandMaterialTickHandle;
+
+    /** The land surface cache (Design/LandSurfaceCache.md): its textures and the levels' plan,
+     *  made with the land textures, ticked with the frame. */
+    UPROPERTY(Transient)
+    TObjectPtr<UTextureRenderTarget2D> LandCacheHeight;
+
+    UPROPERTY(Transient)
+    TObjectPtr<UTextureRenderTarget2D> LandCacheSlope;
+
+    UPROPERTY(Transient)
+    TObjectPtr<UTextureRenderTarget2D> LandCacheFields;
+
+    UPROPERTY(Transient)
+    TObjectPtr<UTexture2DDynamic> LandCacheState;
+
+    TUniquePtr<FVoxelLandCache> LandCache;
+    TWeakPtr<const FVoxelDensityCPU> LandCacheDensity;   // the density the cache was made for
+    TWeakPtr<const FVoxelDensityCPU> LandCacheFailed;    // the cache couldn't be made for it
+
+    /** Makes the cache for Density (or keeps it), and binds it; false when it can't be made. */
+    bool ResolveLandCache(const TSharedPtr<const FVoxelDensityCPU>& Density);
+    void ReleaseLandCache();
+    /** The camera the land surface cache follows, in the planet's frame (cm, no scale). */
+    bool GetLandCacheCamera(const FTransform& PlanetFrame, FVector& OutCameraPlanet) const;
 
     /** Example edit flow (E adds, Q removes), not in shipping builds: traces from the camera
      *  along the control rotation and edits this terrain where the trace hits one of its

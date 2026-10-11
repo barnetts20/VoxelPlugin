@@ -1,0 +1,43 @@
+// VoxelLandCacheWriter.ush - What the land surface cache holds at a point (VoxelLandCache.ush):
+// the density's land chain (VoxelLandHeightDF) band-limited to Footprint, its height about sea
+// level, and its gradient: the bake's and the detail's exact gradients, plus the gullies' (and
+// the detail amplitude's) forward difference over Step (cm). For the compute writer
+// (VoxelLandCacheWrite.usf) and the harness.
+//
+// Shared subset (VoxelShaderCompat.h). Include after VoxelDensitySample.ush.
+
+#ifndef VOXEL_LAND_CACHE_WRITER_USH
+#define VOXEL_LAND_CACHE_WRITER_USH
+
+struct FVoxelLandCacheSurface
+{
+    float Height;          // m about sea level
+    float3 Gradient;       // m/m, tangent at the point (planet frame)
+    float Flow;            // log2 m^2
+    float3 Warped;         // the bake's direction after the sampling warp (the fields' cell)
+};
+
+VOXEL_FUNC FVoxelLandCacheSurface VoxelLandCacheSurfaceAt(VOXEL_LAND_ARGS_DECL float2 PX, float2 PY, float2 PZ, float Footprint, float Step)
+{
+    const FVoxelLandHeight H = VoxelLandHeightDF(VOXEL_LAND_ARGS PX, PY, PZ, Footprint, true);
+    const float2 AboveBase = VoxelDFSub(H.Height, LandHeightOffset);
+    const float3 Up = normalize(float3(PX.x, PY.x, PZ.x));
+    const float3 T1 = normalize(abs(Up.z) < 0.9f ? cross(float3(0.0f, 0.0f, 1.0f), Up) : cross(float3(1.0f, 0.0f, 0.0f), Up));
+    const float3 T2 = cross(Up, T1);
+    const FVoxelLandDifferenced C1 = VoxelLandDifferencedDF(VOXEL_LAND_ARGS
+        VoxelDFAdd(PX, float2(T1.x * Step, 0.0f)), VoxelDFAdd(PY, float2(T1.y * Step, 0.0f)), VoxelDFAdd(PZ, float2(T1.z * Step, 0.0f)), Footprint);
+    const FVoxelLandDifferenced C2 = VoxelLandDifferencedDF(VOXEL_LAND_ARGS
+        VoxelDFAdd(PX, float2(T2.x * Step, 0.0f)), VoxelDFAdd(PY, float2(T2.y * Step, 0.0f)), VoxelDFAdd(PZ, float2(T2.z * Step, 0.0f)), Footprint);
+    const float Inv = 100.0f / Step;
+    const float D1 = ((C1.Gully - H.Gully) + H.DetailUnit * (C1.DetailAmplitudeM - H.DetailAmplitudeM)) * Inv;
+    const float D2 = ((C2.Gully - H.Gully) + H.DetailUnit * (C2.DetailAmplitudeM - H.DetailAmplitudeM)) * Inv;
+
+    FVoxelLandCacheSurface Out;
+    Out.Height = (AboveBase.x + AboveBase.y) * 0.01f;
+    Out.Gradient = H.BakeGradient + (H.DetailGradient - Up * dot(H.DetailGradient, Up)) + T1 * D1 + T2 * D2;
+    Out.Flow = H.Flow;
+    Out.Warped = H.Warped;
+    return Out;
+}
+
+#endif // VOXEL_LAND_CACHE_WRITER_USH

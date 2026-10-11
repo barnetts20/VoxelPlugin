@@ -7,13 +7,18 @@
 #include "FDensitySampleCompositor.h"
 #include "GameFramework/Pawn.h"
 #include "GameFramework/PlayerController.h"
+#include "Camera/PlayerCameraManager.h"
 #include "HAL/IConsoleManager.h"
 #include "Misc/ScopeLock.h"
 #include "FSparseEditStore.h"
 #include "RealtimeMeshComponent.h"
 #include "VoxelTerrainStats.h"
 #include "VoxelLandMaterial.h"
+#include "VoxelLandBake.h"
+#include "VoxelLandCacheLayout.ush"
 #include "Engine/Texture2DDynamic.h"
+#include "Engine/TextureRenderTarget2D.h"
+#include "Engine/Engine.h"
 #include "Materials/MaterialInstanceDynamic.h"
 #include "Engine/World.h"
 #include "Misc/App.h"
@@ -246,8 +251,71 @@ void AAdaptiveVoxelActor::SetSurfaceMaterial(UMaterialInterface* InMaterial)
     }
 }
 
+bool AAdaptiveVoxelActor::ResolveLandCache(const TSharedPtr<const FVoxelDensityCPU>& Density)
+{
+    if (!Density.IsValid()) return false;
+    if (LandCache.IsValid() && LandCache->IsInitialized() && LandCacheDensity.Pin() == Density)
+        return true;
+    // A failure is remembered (as the land textures'), so a later call doesn't try again.
+    if (LandCacheFailed.Pin() == Density) return false;
+    // The textures fit the levels of the bake's radius (kept across densities with the same).
+    const TSharedPtr<const FVoxelLandBake, ESPMode::ThreadSafe> Bake = Density->GetLandBake();
+    if (!Bake.IsValid()) return false;
+    const int32 Levels = FVoxelLandCache::LevelsFor(Bake->SeaRadius);
+    const int32 Capacity = LandCacheHeight ? (LandCacheHeight->SizeY / VOXEL_LAND_CACHE_N) * VOXEL_LAND_CACHE_COLUMNS : 0;
+    if (!LandCacheHeight || !LandCacheSlope || !LandCacheFields || !LandCacheState || Capacity < FVoxelLandCache::TilesFor(Levels))
+    {
+        FVoxelLandCacheTextures Made;
+        if (!FVoxelLandCache::MakeTextures(Levels, this, Made))
+        {
+            ReleaseLandCache();
+            LandCacheFailed = Density;
+            return false;
+        }
+        LandCacheHeight = Made.Height;
+        LandCacheSlope = Made.Slope;
+        LandCacheFields = Made.Fields;
+        LandCacheState = Made.State;
+    }
+    FVoxelLandCacheTextures Textures;
+    Textures.Height = LandCacheHeight;
+    Textures.Slope = LandCacheSlope;
+    Textures.Fields = LandCacheFields;
+    Textures.State = LandCacheState;
+    if (!LandCache.IsValid())
+        LandCache = MakeUnique<FVoxelLandCache>();
+    if (!LandCache->Initialize(*Density, Textures))
+    {
+        ReleaseLandCache();
+        LandCacheFailed = Density;
+        return false;
+    }
+    LandCacheDensity = Density;
+    return true;
+}
+
+void AAdaptiveVoxelActor::ReleaseLandCache()
+{
+    if (LandCache.IsValid())
+        LandCache->Reset();
+    // The instance lets go of the atlases too (so they can be collected).
+    if (LandMaterialInstance)
+    {
+        LandMaterialInstance->SetTextureParameterValue(FVoxelLandCache::HeightTextureName, nullptr);
+        LandMaterialInstance->SetTextureParameterValue(FVoxelLandCache::SlopeTextureName, nullptr);
+        LandMaterialInstance->SetTextureParameterValue(FVoxelLandCache::FieldsTextureName, nullptr);
+        LandMaterialInstance->SetTextureParameterValue(FVoxelLandCache::StateTextureName, nullptr);
+    }
+    LandCacheDensity.Reset();
+    LandCacheHeight = nullptr;
+    LandCacheSlope = nullptr;
+    LandCacheFields = nullptr;
+    LandCacheState = nullptr;
+}
+
 void AAdaptiveVoxelActor::ReleaseLandTextures()
 {
+    ReleaseLandCache();
     LandHeightTexture = nullptr;
     LandFieldTexture = nullptr;
     LandConstantTexture = nullptr;
@@ -314,6 +382,9 @@ UMaterialInterface* AAdaptiveVoxelActor::ResolveBrickMaterial()
         {
             VoxelLandMaterial::SetTextureParameters(LandMaterialInstance, LandHeightTexture, LandFieldTexture, LandConstantTexture);
             bLandMaterialBound = true;
+            // The land surface cache the node reads by default (without it, the analytic node).
+            if (ResolveLandCache(Density))
+                LandCache->SetTextureParameters(LandMaterialInstance);
         }
     }
 
@@ -327,16 +398,63 @@ UMaterialInterface* AAdaptiveVoxelActor::ResolveBrickMaterial()
 void AAdaptiveVoxelActor::OnWorldPostActorTick(UWorld* World, ELevelTick TickType, float DeltaSeconds)
 {
     if (World == GetWorld() && !IsDestroyed)
-        UpdateLandMaterial();
+        UpdateLandMaterial(true);
 }
 
-void AAdaptiveVoxelActor::UpdateLandMaterial()
+void AAdaptiveVoxelActor::UpdateLandMaterial(bool bTickCache)
 {
     if (!LandMaterialInstance) return;
+    const FTransform PlanetFrame(GetActorRotation(), GetActorLocation());
+    // The land surface cache follows the primary camera, kept warm whenever it's bound (so
+    // voxel.Land.MaterialSource switches back to it at once): from the end of the actors' tick
+    // only, when the cameras have moved. Without the write shader or the textures' resources,
+    // the material evaluates the land itself.
+    const bool bCache = bLandMaterialBound && LandCache.IsValid() && LandCache->IsWritable();
+    if (bCache && bTickCache)
+    {
+        FVector CameraPlanet;
+        if (GetLandCacheCamera(PlanetFrame, CameraPlanet))
+            LandCache->Tick(CameraPlanet);
+        if (VoxelLandMaterial::ShowsCacheLevels() && GEngine)
+            GEngine->AddOnScreenDebugMessage((uint64)(UPTRINT)this + 0x1a7dcac4eull, 0.0f, FColor::Cyan, LandCache->Describe());
+    }
     // The planet's frame as it renders this frame (every actor has moved); the material places
     // each pixel from its own view.
-    VoxelLandMaterial::SetFrameParameters(LandMaterialInstance, FTransform(GetActorRotation(), GetActorLocation()),
-        FVoxelBrickTerrain::GetMaterialLandView(), LandSurfaceTolerance, LandNearMeshNormal * ActualPrecision, bLandMaterialBound);
+    VoxelLandMaterial::SetFrameParameters(LandMaterialInstance, PlanetFrame, FVoxelBrickTerrain::GetMaterialLandView(), LandSurfaceTolerance,
+        LandNearMeshNormal * ActualPrecision, bLandMaterialBound, bCache);
+}
+
+bool AAdaptiveVoxelActor::GetLandCacheCamera(const FTransform& PlanetFrame, FVector& OutCameraPlanet) const
+{
+    const UWorld* World = GetWorld();
+    if (!World) return false;
+    // A game (and play in editor): the first local player's camera, this frame's (the cameras
+    // have updated by the end of the actors' tick).
+    if (World->IsGameWorld())
+    {
+        if (const APlayerCameraManager* Camera = UGameplayStatics::GetPlayerCameraManager(World, 0))
+        {
+            OutCameraPlanet = PlanetFrame.InverseTransformPositionNoScale(Camera->GetCameraLocation());
+            return true;
+        }
+    }
+    // The editor (or no player): of the views the last frame rendered, the one nearest the
+    // planet's surface (the viewport looking at it, not a far one framing the planet).
+    const double Sea = LandCache.IsValid() ? LandCache->GetSeaRadius() : 0.0;
+    double Best = TNumericLimits<double>::Max();
+    bool bFound = false;
+    for (const FVector& View : World->ViewLocationsRenderedLastFrame)
+    {
+        const FVector Local = PlanetFrame.InverseTransformPositionNoScale(View);
+        const double Distance = FMath::Abs(Local.Size() - Sea);
+        if (Distance < Best)
+        {
+            Best = Distance;
+            OutCameraPlanet = Local;
+            bFound = true;
+        }
+    }
+    return bFound;
 }
 
 void AAdaptiveVoxelActor::SetDebugSeaRadius(double InSeaRadius)

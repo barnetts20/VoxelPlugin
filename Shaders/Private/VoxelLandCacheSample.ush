@@ -1,0 +1,186 @@
+// VoxelLandCacheSample.ush - Reading the land surface cache (VoxelLandCache.ush) at a point:
+// the level for the pixel's footprint, the next coarser where that one doesn't cover the point
+// (or isn't written yet), a blend into the next level by the footprint's fraction and near a
+// window's edge, and bilinear height and gradient (the fields from the nearest texel). For the
+// terrain material (VoxelLandMaterial.ush) and the harness: Texture2D.Load only.
+//
+// Shared subset (VoxelShaderCompat.h). Include after VoxelDF64.ush and VoxelLandCache.ush.
+
+#ifndef VOXEL_LAND_CACHE_SAMPLE_USH
+#define VOXEL_LAND_CACHE_SAMPLE_USH
+
+#define VOXEL_LAND_CACHE_EDGE_BAND 16.0f      // texels: the blend into the next level near a window's edge
+
+#ifndef VOXEL_LOOP
+#define VOXEL_LOOP [loop]
+#endif
+
+/** A level's view of the point: its texel coordinate in the window (texel centres at integers
+ *  here: 0 .. N-1), and how far inside the window it is (texels). */
+struct FVoxelLandCacheHit
+{
+    bool bHit;
+    float U;
+    float V;
+    float Edge;
+    int OriginI;
+    int OriginJ;
+    int Tile;              // the level's tile in the atlases
+};
+
+VOXEL_FUNC FVoxelLandCacheHit VoxelLandCacheLocate(Texture2D State, int K, float2 PX, float2 PY, float2 PZ, float2 SeaRadius)
+{
+    FVoxelLandCacheHit Hit;
+    Hit.bHit = false;
+    Hit.U = 0.0f;
+    Hit.V = 0.0f;
+    Hit.Edge = 0.0f;
+    Hit.OriginI = 0;
+    Hit.OriginJ = 0;
+    Hit.Tile = 0;
+    const float4 S0 = State.Load(int3(0, 1 + K, 0));     // A, valid
+    if (S0.w < 0.5f) return Hit;
+    const float3 A = float3(S0.x, S0.y, S0.z);
+    // The gnomonic plane only holds the hemisphere about the anchor.
+    if (dot(float3(PX.x, PY.x, PZ.x), A) <= 0.0f) return Hit;
+    const float4 S1 = State.Load(int3(1, 1 + K, 0));     // E1, texel size
+    const float4 S2 = State.Load(int3(2, 1 + K, 0));     // E2, tile
+    const float4 S3 = State.Load(int3(3, 1 + K, 0));     // window origin
+    const FVoxelLandCachePlane Plane = VoxelLandCachePlaneOf(PX, PY, PZ, A, float3(S1.x, S1.y, S1.z), float3(S2.x, S2.y, S2.z), SeaRadius);
+    Hit.OriginI = int(S3.x) + int(S3.y);
+    Hit.OriginJ = int(S3.z) + int(S3.w);
+    Hit.Tile = clamp(int(S2.w + 0.5f), 0, VOXEL_LAND_CACHE_MAX_LEVELS);
+    Hit.U = VoxelLandCacheTexelCoord(Plane.X, Hit.OriginI, S1.w) - 0.5f;
+    Hit.V = VoxelLandCacheTexelCoord(Plane.Y, Hit.OriginJ, S1.w) - 0.5f;
+    const float Last = float(VOXEL_LAND_CACHE_N - 1);
+    // Explicit comparisons: a NaN coordinate fails them (min() would drop it).
+    Hit.bHit = Hit.U >= 0.0f && Hit.V >= 0.0f && Hit.U <= Last && Hit.V <= Last;
+    Hit.Edge = min(min(Hit.U, Hit.V), min(Last - Hit.U, Last - Hit.V));
+    return Hit;
+}
+
+/** The cache's values at a point. */
+struct FVoxelLandCacheSample
+{
+    bool bValid;
+    float Height;          // m about sea level
+    float3 Gradient;       // m/m, tangent (planet frame)
+    float Flow;            // log2 m^2
+    float3 Fields;         // crust, class (+8 under a lake), the kept lake's level (m about sea level;
+                           // VOXEL_LAND_CACHE_NO_LAKE where none)
+    float Level;           // the level read (fractional where blended)
+};
+
+VOXEL_FUNC FVoxelLandCacheSample VoxelLandCacheFetch(Texture2D CacheHeight, Texture2D CacheSlope, Texture2D CacheFields, int K, FVoxelLandCacheHit Hit)
+{
+    // At most N - 2, so the second texel stays in the window (U = N - 1 reads it with weight 1).
+    const int I0 = min(int(floor(Hit.U)), VOXEL_LAND_CACHE_N - 2);
+    const int J0 = min(int(floor(Hit.V)), VOXEL_LAND_CACHE_N - 2);
+    const float FX = Hit.U - float(I0);
+    const float FY = Hit.V - float(J0);
+    const int SX0 = VoxelLandCacheSlot(Hit.OriginI + I0);
+    const int SX1 = VoxelLandCacheSlot(Hit.OriginI + I0 + 1);
+    const int SY0 = VoxelLandCacheSlot(Hit.OriginJ + J0);
+    const int SY1 = VoxelLandCacheSlot(Hit.OriginJ + J0 + 1);
+    const int2 T00 = VoxelLandCacheAtlasTexel(Hit.Tile, SX0, SY0);
+    const int2 T10 = VoxelLandCacheAtlasTexel(Hit.Tile, SX1, SY0);
+    const int2 T01 = VoxelLandCacheAtlasTexel(Hit.Tile, SX0, SY1);
+    const int2 T11 = VoxelLandCacheAtlasTexel(Hit.Tile, SX1, SY1);
+    const float W00 = (1.0f - FX) * (1.0f - FY);
+    const float W10 = FX * (1.0f - FY);
+    const float W01 = (1.0f - FX) * FY;
+    const float W11 = FX * FY;
+
+    FVoxelLandCacheSample Out;
+    const float H00 = CacheHeight.Load(int3(T00, 0)).x;
+    const float H10 = CacheHeight.Load(int3(T10, 0)).x;
+    const float H01 = CacheHeight.Load(int3(T01, 0)).x;
+    const float H11 = CacheHeight.Load(int3(T11, 0)).x;
+    Out.Height = H00 * W00 + H10 * W10 + H01 * W01 + H11 * W11;
+    const float4 S00 = CacheSlope.Load(int3(T00, 0));
+    const float4 S10 = CacheSlope.Load(int3(T10, 0));
+    const float4 S01 = CacheSlope.Load(int3(T01, 0));
+    const float4 S11 = CacheSlope.Load(int3(T11, 0));
+    Out.Gradient = float3(S00.x, S00.y, S00.z) * W00 + float3(S10.x, S10.y, S10.z) * W10
+        + float3(S01.x, S01.y, S01.z) * W01 + float3(S11.x, S11.y, S11.z) * W11;
+    Out.Flow = S00.w * W00 + S10.w * W10 + S01.w * W01 + S11.w * W11;
+    // The fields from the nearest texel (the class is categorical); the lake's level back to
+    // metres about sea level with that texel's height. Not yet written (0): no sample.
+    const bool bRight = FX >= 0.5f;
+    const bool bUp = FY >= 0.5f;
+    const int2 TN = VoxelLandCacheAtlasTexel(Hit.Tile, bRight ? SX1 : SX0, bUp ? SY1 : SY0);
+    const float HN = bUp ? (bRight ? H11 : H01) : (bRight ? H10 : H00);
+    const float4 F = CacheFields.Load(int3(TN, 0));
+    Out.bValid = F.w > 0.5f;
+    Out.Fields = float3(F.x, F.y, F.z > VOXEL_LAND_CACHE_NO_LAKE + 1.0f ? F.z + HN : VOXEL_LAND_CACHE_NO_LAKE);
+    Out.Level = float(K);
+    return Out;
+}
+
+/** The cache at the point P (planet frame, double-float cm) for a pixel of Footprint (cm). */
+VOXEL_FUNC FVoxelLandCacheSample VoxelLandCacheSampleAt(Texture2D CacheHeight, Texture2D CacheSlope, Texture2D CacheFields, Texture2D State,
+    float2 PX, float2 PY, float2 PZ, float2 SeaRadius, float Footprint)
+{
+    FVoxelLandCacheSample None;
+    None.bValid = false;
+    None.Height = 0.0f;
+    None.Gradient = float3(0.0f, 0.0f, 0.0f);
+    None.Flow = 0.0f;
+    None.Fields = float3(0.0f, 0.0f, VOXEL_LAND_CACHE_NO_LAKE);
+    None.Level = -1.0f;
+
+    // Clamped: the loop bound must be sane whatever the texture holds.
+    const int Levels = clamp(int(State.Load(int3(0, 0, 0)).x + 0.5f), 0, VOXEL_LAND_CACHE_MAX_LEVELS);
+    // The level whose texel is the footprint, and the fraction toward the next.
+    const float KF = log2(max(Footprint, 1.0e-3f) / VOXEL_LAND_CACHE_T0);
+    const int K0 = clamp(int(floor(KF)), 0, max(Levels - 1, 0));
+    const float FootprintBlend = KF > 0.0f ? saturate(KF - float(K0)) : 0.0f;
+
+    // The first level from there that covers the point and is written there.
+    int K = -1;
+    FVoxelLandCacheHit Hit;
+    Hit.bHit = false;
+    Hit.U = 0.0f;
+    Hit.V = 0.0f;
+    Hit.Edge = 0.0f;
+    Hit.OriginI = 0;
+    Hit.OriginJ = 0;
+    Hit.Tile = 0;
+    FVoxelLandCacheSample Out = None;
+    VOXEL_LOOP
+    for (int L = K0; L < Levels; L++)
+    {
+        Hit = VoxelLandCacheLocate(State, L, PX, PY, PZ, SeaRadius);
+        if (Hit.bHit)
+        {
+            Out = VoxelLandCacheFetch(CacheHeight, CacheSlope, CacheFields, L, Hit);
+            if (Out.bValid)
+            {
+                K = L;
+                break;
+            }
+        }
+    }
+    if (K < 0) return None;
+
+    // Toward the next level: by the footprint, and near this window's edge.
+    float Toward = K == K0 ? FootprintBlend : 0.0f;
+    Toward = max(Toward, 1.0f - saturate(Hit.Edge / VOXEL_LAND_CACHE_EDGE_BAND));
+    if (Toward > 0.0f && K + 1 < Levels)
+    {
+        const FVoxelLandCacheHit Next = VoxelLandCacheLocate(State, K + 1, PX, PY, PZ, SeaRadius);
+        FVoxelLandCacheSample B = None;
+        if (Next.bHit) B = VoxelLandCacheFetch(CacheHeight, CacheSlope, CacheFields, K + 1, Next);
+        if (B.bValid)
+        {
+            Out.Height = lerp(Out.Height, B.Height, Toward);
+            Out.Gradient = lerp(Out.Gradient, B.Gradient, Toward);
+            Out.Flow = lerp(Out.Flow, B.Flow, Toward);
+            if (Toward >= 0.5f) Out.Fields = B.Fields;
+            Out.Level = float(K) + Toward;
+        }
+    }
+    return Out;
+}
+
+#endif // VOXEL_LAND_CACHE_SAMPLE_USH

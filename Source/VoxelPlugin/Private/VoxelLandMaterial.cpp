@@ -48,6 +48,28 @@ static TAutoConsoleVariable<int32> CVarVoxelLandMaterialCost(
     TEXT(" 4: the node off (the mesh's normal; the vertex colours carry the views)"),
     ECVF_Default);
 
+static TAutoConsoleVariable<int32> CVarVoxelLandMaterialSource(
+    TEXT("voxel.Land.MaterialSource"), 0,
+    TEXT("Where the terrain material's land node reads the land (Design/LandSurfaceCache.md):\n")
+    TEXT(" 0: the land surface cache, written by compute around the camera (default)\n")
+    TEXT(" 1: the analytic node, the land chain per pixel (the reference; M1)"),
+    ECVF_Default);
+
+static TAutoConsoleVariable<int32> CVarVoxelDebugLandCache(
+    TEXT("voxel.Debug.LandCache"), 0,
+    TEXT("1: colour the terrain by the land surface cache's level each pixel reads (a hue a level, darker where two blend; magenta where none is written yet), and print the cache's state."),
+    ECVF_Default);
+
+bool VoxelLandMaterial::UsesCache()
+{
+    return CVarVoxelLandMaterialSource.GetValueOnGameThread() == 0;
+}
+
+bool VoxelLandMaterial::ShowsCacheLevels()
+{
+    return CVarVoxelDebugLandCache.GetValueOnGameThread() != 0;
+}
+
 namespace VoxelLandMaterialDetail
 {
     /** A 32-bit integer as two floats of 16 bits (low, high): exact in a float texel. */
@@ -268,7 +290,7 @@ void VoxelLandMaterial::SetTextureParameters(UMaterialInstanceDynamic* Material,
 }
 
 void VoxelLandMaterial::SetFrameParameters(UMaterialInstanceDynamic* Material, const FTransform& PlanetFrame,
-    int32 View, double Tolerance, double NearFootprint, bool bEnabled)
+    int32 View, double Tolerance, double NearFootprint, bool bEnabled, bool bCacheAvailable)
 {
     using namespace VoxelLandMaterialDetail;
     if (!Material) return;
@@ -287,11 +309,16 @@ void VoxelLandMaterial::SetFrameParameters(UMaterialInstanceDynamic* Material, c
         Set(HighNames[a], High);
         Set(LowNames[a], Low);
     }
-    // x: the view, plus 16 x the normal's sources and 64 x the cost switch (VoxelLandMaterial.ush).
+    // x: the view, plus 16 x the normal's sources, 64 x the cost switch, 512 x the analytic
+    // source and 1024 x the cache's level view (VoxelLandMaterial.ush).
     const int32 NormalMode = FMath::Clamp(CVarVoxelLandNormalMode.GetValueOnGameThread(), 0, 3);
     const int32 Cost = FMath::Clamp(CVarVoxelLandMaterialCost.GetValueOnGameThread(), 0, 4);
     if (Cost == 4) bEnabled = false;
-    const float Packed = (float)(FMath::Clamp(View, 0, 15) + 16 * NormalMode + 64 * Cost);
+    // The cache when it's asked for and there; else the analytic node.
+    const bool bCache = UsesCache() && bCacheAvailable;
+    const int32 Analytic = bCache ? 0 : 1;
+    const int32 LevelView = bCache && ShowsCacheLevels() ? 1 : 0;
+    const float Packed = (float)(FMath::Clamp(View, 0, 15) + 16 * NormalMode + 64 * Cost + 512 * Analytic + 1024 * LevelView);
     Material->SetVectorParameterValue(ParamsName, FLinearColor(bEnabled ? Packed : 0.0f, (float)FMath::Max(Tolerance, 0.0),
         bEnabled ? 1.0f : 0.0f, (float)FMath::Max(NearFootprint, 0.0)));
 }

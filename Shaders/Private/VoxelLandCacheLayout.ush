@@ -1,0 +1,15 @@
+// VoxelLandCacheLayout.ush - The land surface cache's constants (VoxelLandCache.ush explains
+// them), shared with the C++ that creates and fills the cache (VoxelLandCache.cpp). Macros only.
+
+#ifndef VOXEL_LAND_CACHE_LAYOUT_USH
+#define VOXEL_LAND_CACHE_LAYOUT_USH
+
+#define VOXEL_LAND_CACHE_N 512                    // texels along a level's side
+#define VOXEL_LAND_CACHE_T0 25.0f                 // cm: level 0's texel
+#define VOXEL_LAND_CACHE_COLUMNS 3                // tiles a row in the atlases (one a level, and a spare; 3 wastes least for 15-22 levels)
+#define VOXEL_LAND_CACHE_MAX_LEVELS 22
+#define VOXEL_LAND_CACHE_STATE_WIDTH 4            // state texels a level
+#define VOXEL_LAND_CACHE_NO_LAKE -60000.0f
+#define VOXEL_LAND_CACHE_GROUP 8                  // the writer's thread group side
+
+#endif // VOXEL_LAND_CACHE_LAYOUT_USH

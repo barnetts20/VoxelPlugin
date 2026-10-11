@@ -1,0 +1,368 @@
+// VoxelLandCachePlan.h - The land surface cache's plan (Design/LandSurfaceCache.md): which
+// level is anchored where, which window each level shows, and what to write each frame within a
+// texel budget. Plain C++ without engine types, so the harness runs the same code
+// (Tools/LandGullyHarness/cache_harness.cpp); FVoxelLandCache (VoxelLandCache.cpp) wraps it,
+// turns its jobs into compute passes and uploads the state it describes.
+//
+// Every frame (Tick, the camera's direction from the planet's centre):
+//   0. A re-centring completed last frame takes its level's place (its tile and frame), before
+//      any job is planned: a job writes with its level's frame and tile as they stand after the
+//      plan, so neither changes once a job of the level's is planned. A re-centring the camera
+//      has turned back from (nearer the level's own centre than the new one) is dropped.
+//   1. Anchored where they are (and written again): a level never anchored, every level a jump
+//      has left far behind (past HardReanchorDegrees), and a level the camera has left (past
+//      voxel.Land.CacheReanchorDegrees) that isn't readable anyway.
+//   2. A readable level the camera has left re-centres without a gap, one at a time (the
+//      farthest, the coarsest of those): its new frame is written into the spare tile while its
+//      own tile is still read; the two swap once the new one is complete (0).
+//   3. The re-centring, with up to half the budget (it always progresses).
+//   4. Window moves of readable levels, coarse to fine (the cheap ones first): the strips the
+//      move exposes, committed with their writes (a move the budget can't take waits; the old
+//      window stays readable; a move of a window or more writes the level again).
+//   5. Refills in place, coarse to fine (the material falls back to coarser levels meanwhile),
+//      except of a level the camera crosses an eighth of each frame.
+//   6. The re-centring again, with what's left.
+// A level is readable (valid) only once its whole window is written; the state uploaded after a
+// frame's writes describes exactly what they leave.
+
+#pragma once
+
+#include <algorithm>
+#include <cmath>
+#include <cstdint>
+#include <vector>
+
+#include "VoxelLandCacheLayout.ush"
+
+namespace VoxelLandCachePlan
+{
+    constexpr int32_t N = VOXEL_LAND_CACHE_N;
+
+    /** The coarsest level reaches this far along the plane from its centre: tan 70 degrees of
+     *  the sea-level radius (a re-anchor at 10 degrees leaves 60 degrees of arc about the camera:
+     *  the horizon from 1,000 km up at the 1,000 km test scale). */
+    constexpr double ReachTangent = 2.7474774194546216;   // tan 70 degrees
+
+    /** Past this arc from its centre a level re-anchors at once, whatever the one-at-a-time
+     *  rule: a teleport (the window would sit where the plane stretches, or behind the plane). */
+    constexpr double HardReanchorDegrees = 25.0;
+
+    /** Levels for a sea-level radius (cm): the coarsest reaches R tan 70 degrees along the plane,
+     *  at least 1, at most VOXEL_LAND_CACHE_MAX_LEVELS. */
+    inline int32_t LevelsFor(double SeaRadius)
+    {
+        const double FinestReach = 0.5 * N * (double)VOXEL_LAND_CACHE_T0;
+        const double Reach = (std::max)(SeaRadius * ReachTangent, FinestReach);
+        const int32_t Count = (int32_t)std::ceil(std::log2(Reach / FinestReach)) + 1;
+        return std::clamp(Count, 1, (int32_t)VOXEL_LAND_CACHE_MAX_LEVELS);
+    }
+
+    /** Tiles the atlases need: one a level, and the spare a re-centring level is written into. */
+    inline int32_t TilesFor(int32_t Levels) { return Levels + 1; }
+
+    struct FLevel
+    {
+        int32_t Tile = 0;                 // the level's tile in the atlases
+        bool bAnchored = false;
+        float A[3] = { 0, 0, 0 };         // the projection centre (unit, planet frame): floats, as the shaders read them
+        float E1[3] = { 0, 0, 0 };
+        float E2[3] = { 0, 0, 0 };
+        double Inverse[3][3] = {};        // the inverse of the rows E1, E2, A (exact, double)
+        double TexelSize = 0.0;           // cm
+        int32_t OriginI = 0;              // the window's first texel (global indices)
+        int32_t OriginJ = 0;
+        bool bValid = false;              // the whole window is written
+        int32_t FillRow = 0;              // a refill's progress (rows of the window written)
+    };
+
+    /** A rectangle to write (global texel indices); Frame: the level, or Levels.size() for the
+     *  re-centring level's new frame (Next). */
+    struct FJob
+    {
+        int32_t Frame = 0;
+        int32_t I0 = 0;
+        int32_t J0 = 0;
+        int32_t Width = 0;
+        int32_t Height = 0;
+    };
+
+    struct FSettings
+    {
+        int64_t Budget = 131072;          // texels a frame (voxel.Land.CacheTexelsPerFrame)
+        double ReanchorDegrees = 10.0;    // voxel.Land.CacheReanchorDegrees (1 to 20)
+    };
+
+    inline double Dot(const float V[3], const double D[3]) { return (double)V[0] * D[0] + (double)V[1] * D[1] + (double)V[2] * D[2]; }
+
+    inline bool Invert(const double M[3][3], double Out[3][3])
+    {
+        const double C00 = M[1][1] * M[2][2] - M[1][2] * M[2][1];
+        const double C01 = M[1][2] * M[2][0] - M[1][0] * M[2][2];
+        const double C02 = M[1][0] * M[2][1] - M[1][1] * M[2][0];
+        const double Det = M[0][0] * C00 + M[0][1] * C01 + M[0][2] * C02;
+        if (std::fabs(Det) < 1e-12) return false;
+        const double Inv = 1.0 / Det;
+        Out[0][0] = C00 * Inv;
+        Out[0][1] = (M[0][2] * M[2][1] - M[0][1] * M[2][2]) * Inv;
+        Out[0][2] = (M[0][1] * M[1][2] - M[0][2] * M[1][1]) * Inv;
+        Out[1][0] = C01 * Inv;
+        Out[1][1] = (M[0][0] * M[2][2] - M[0][2] * M[2][0]) * Inv;
+        Out[1][2] = (M[0][2] * M[1][0] - M[0][0] * M[1][2]) * Inv;
+        Out[2][0] = C02 * Inv;
+        Out[2][1] = (M[0][1] * M[2][0] - M[0][0] * M[2][1]) * Inv;
+        Out[2][2] = (M[0][0] * M[1][1] - M[0][1] * M[1][0]) * Inv;
+        return true;
+    }
+
+    /** A level's frame about the unit direction D: the axes as floats (the material and the
+     *  writer read the same values), the inverse of exactly those in double. */
+    inline void Anchor(FLevel& Level, const double D[3])
+    {
+        auto Normalize = [](double V[3]) {
+            const double L = std::sqrt(V[0] * V[0] + V[1] * V[1] + V[2] * V[2]);
+            if (L > 0.0) { V[0] /= L; V[1] /= L; V[2] /= L; }
+        };
+        auto Cross = [](const double X[3], const double Y[3], double Out[3]) {
+            Out[0] = X[1] * Y[2] - X[2] * Y[1];
+            Out[1] = X[2] * Y[0] - X[0] * Y[2];
+            Out[2] = X[0] * Y[1] - X[1] * Y[0];
+        };
+        double A[3] = { D[0], D[1], D[2] };
+        Normalize(A);
+        for (int a = 0; a < 3; a++) Level.A[a] = (float)A[a];
+        const double Af[3] = { Level.A[0], Level.A[1], Level.A[2] };
+        const double Reference[3] = { std::fabs(Af[2]) < 0.9 ? 0.0 : 1.0, 0.0, std::fabs(Af[2]) < 0.9 ? 1.0 : 0.0 };
+        double E1[3], E2[3];
+        Cross(Reference, Af, E1);
+        Normalize(E1);
+        for (int a = 0; a < 3; a++) Level.E1[a] = (float)E1[a];
+        const double E1f[3] = { Level.E1[0], Level.E1[1], Level.E1[2] };
+        Cross(Af, E1f, E2);
+        Normalize(E2);
+        for (int a = 0; a < 3; a++) Level.E2[a] = (float)E2[a];
+        const double M[3][3] = {
+            { Level.E1[0], Level.E1[1], Level.E1[2] },
+            { Level.E2[0], Level.E2[1], Level.E2[2] },
+            { Level.A[0], Level.A[1], Level.A[2] } };
+        Invert(M, Level.Inverse);
+        Level.bAnchored = true;
+    }
+
+    /** The plane coordinates of direction D on a level's grid (cm), in double: as
+     *  VoxelLandCachePlaneOf with the same float axes. */
+    inline void PlaneOf(const FLevel& Level, const double D[3], double SeaRadius, double& OutX, double& OutY)
+    {
+        const double PA = Dot(Level.A, D);
+        OutX = SeaRadius * Dot(Level.E1, D) / PA;
+        OutY = SeaRadius * Dot(Level.E2, D) / PA;
+    }
+
+    /** The window's first texel with direction D at its centre. Bounded before the conversion
+     *  (Tick keeps the camera within 25 degrees of the centre; this guards a degenerate input). */
+    inline void Centre(const FLevel& Level, const double D[3], double SeaRadius, int32_t& OutI, int32_t& OutJ)
+    {
+        double X = 0.0, Y = 0.0;
+        PlaneOf(Level, D, SeaRadius, X, Y);
+        const double Limit = (double)(1 << 28);
+        auto Index = [Limit](double V) { return std::isfinite(V) ? (int32_t)std::clamp(std::floor(V), -Limit, Limit) : 0; };
+        OutI = Index(X / Level.TexelSize) - N / 2;
+        OutJ = Index(Y / Level.TexelSize) - N / 2;
+    }
+
+    class FPlan
+    {
+    public:
+        std::vector<FLevel> Levels;
+        /** A level re-centring without a gap: its new frame and window, written into the spare
+         *  tile (Next.Tile) while the level's own tile is still read. -1: none. */
+        int32_t PendingLevel = -1;
+        FLevel Next;
+        int32_t SpareTile = 0;
+        double SeaRadius = 0.0;
+
+        void Init(int32_t Count, double InSeaRadius)
+        {
+            *this = FPlan();
+            SeaRadius = InSeaRadius;
+            Levels.resize((size_t)Count);
+            for (int32_t k = 0; k < Count; k++)
+            {
+                Levels[k].Tile = k;
+                Levels[k].TexelSize = (double)VOXEL_LAND_CACHE_T0 * std::ldexp(1.0, k);
+            }
+            SpareTile = Count;
+        }
+
+        /** Everything is written again (a frame's writes couldn't run). */
+        void InvalidateAll()
+        {
+            for (FLevel& Level : Levels)
+            {
+                Level.bValid = false;
+                Level.FillRow = 0;
+            }
+            PendingLevel = -1;
+        }
+
+        /** The frame's jobs for the camera's direction D (any length; not zero). */
+        void Tick(const double InD[3], const FSettings& Settings, std::vector<FJob>& Jobs)
+        {
+            const double Length = std::sqrt(InD[0] * InD[0] + InD[1] * InD[1] + InD[2] * InD[2]);
+            if (!(Length > 0.0) || !std::isfinite(Length)) return;
+            const double D[3] = { InD[0] / Length, InD[1] / Length, InD[2] / Length };
+            const double Pi = 3.14159265358979323846;
+            const int64_t Total = std::max<int64_t>(Settings.Budget, N);
+            int64_t Budget = Total;
+            const double ReanchorCos = std::cos(std::clamp(Settings.ReanchorDegrees, 1.0, 20.0) * Pi / 180.0);
+            const double HardCos = std::cos(HardReanchorDegrees * Pi / 180.0);
+            const int32_t Count = (int32_t)Levels.size();
+
+            // The camera's travel since the last frame (cm along the sea sphere); a jump of more
+            // than a degree is a teleport, not a speed.
+            double Travel = 0.0;
+            if (bHasLast)
+            {
+                const double Cos = std::clamp(D[0] * Last[0] + D[1] * Last[1] + D[2] * Last[2], -1.0, 1.0);
+                const double Arc = std::acos(Cos);
+                Travel = Arc < Pi / 180.0 ? Arc * SeaRadius : 0.0;
+            }
+            Last[0] = D[0]; Last[1] = D[1]; Last[2] = D[2];
+            bHasLast = true;
+
+            // 0. A re-centring the camera has turned back from (it's nearer the level's own centre
+            // again) is dropped. One completed last frame takes the level's place, before anything
+            // is written this frame (a job of the level's must write the frame and tile it was
+            // planned with); the old tile is spare.
+            if (PendingLevel >= 0 && Dot(Next.A, D) < Dot(Levels[PendingLevel].A, D))
+                PendingLevel = -1;
+            if (PendingLevel >= 0 && Next.FillRow >= N)
+            {
+                const int32_t OldTile = Levels[PendingLevel].Tile;
+                Next.bValid = true;
+                Levels[PendingLevel] = Next;
+                SpareTile = OldTile;
+                PendingLevel = -1;
+            }
+
+            // 1.
+            for (int32_t k = 0; k < Count; k++)
+            {
+                FLevel& Level = Levels[k];
+                const double Cos = Dot(Level.A, D);
+                const bool bFar = Level.bAnchored && !(Cos >= HardCos);
+                const bool bLeft = Level.bAnchored && !(Cos >= ReanchorCos);
+                if (!Level.bAnchored || bFar || (bLeft && !Level.bValid))
+                {
+                    // A re-centring under way for it is moot (the spare tile stays spare).
+                    if (PendingLevel == k)
+                        PendingLevel = -1;
+                    Anchor(Level, D);
+                    Centre(Level, D, SeaRadius, Level.OriginI, Level.OriginJ);
+                    Level.bValid = false;
+                    Level.FillRow = 0;
+                }
+            }
+
+            // 2. The farthest readable level the camera has left; levels anchored together leave
+            // together, and then the coarsest goes first (it covers the most; a finer one missing
+            // falls back to the next coarser).
+            if (PendingLevel < 0)
+            {
+                double Farthest = ReanchorCos;
+                for (int32_t k = Count - 1; k >= 0; k--)
+                {
+                    const double Cos = Dot(Levels[k].A, D);
+                    if (Levels[k].bValid && Cos < Farthest)
+                    {
+                        Farthest = Cos;
+                        PendingLevel = k;
+                    }
+                }
+                if (PendingLevel >= 0)
+                {
+                    Next = FLevel();
+                    Next.Tile = SpareTile;
+                    Next.TexelSize = Levels[PendingLevel].TexelSize;
+                    Anchor(Next, D);
+                    Centre(Next, D, SeaRadius, Next.OriginI, Next.OriginJ);
+                }
+            }
+
+            // The re-centring level's new frame, up to MaxRows rows of what's left (complete, it
+            // takes the level's place at the start of the next frame: 0).
+            auto FillPending = [&](int64_t MaxRows)
+            {
+                if (PendingLevel < 0) return;
+                const int32_t Rows = (int32_t)std::min<int64_t>(std::min<int64_t>(N - Next.FillRow, Budget / N), MaxRows);
+                if (Rows <= 0) return;
+                Jobs.push_back(FJob{ Count, Next.OriginI, Next.OriginJ + Next.FillRow, N, Rows });
+                Next.FillRow += Rows;
+                Budget -= (int64_t)Rows * N;
+            };
+
+            // 3. The re-centring first, with up to half the budget: it always progresses (a
+            // level that reaches 25 degrees first re-anchors with a gap).
+            FillPending(std::max<int64_t>(Total / 2 / N, 1));
+
+            // 4.
+            for (int32_t k = Count - 1; k >= 0; k--)
+            {
+                FLevel& Level = Levels[k];
+                if (!Level.bValid) continue;
+                int32_t I = 0, J = 0;
+                Centre(Level, D, SeaRadius, I, J);
+                const int32_t DI = I - Level.OriginI;
+                const int32_t DJ = J - Level.OriginJ;
+                if (DI == 0 && DJ == 0) continue;
+                const int32_t AI = DI < 0 ? -DI : DI;
+                const int32_t AJ = DJ < 0 ? -DJ : DJ;
+                if (AI >= N || AJ >= N)
+                {
+                    // Too far for strips: written again (a re-centring under way for it is
+                    // dropped: step 1 re-anchors it in place if it's still off-centre).
+                    Level.OriginI = I;
+                    Level.OriginJ = J;
+                    Level.bValid = false;
+                    Level.FillRow = 0;
+                    if (PendingLevel == k)
+                        PendingLevel = -1;
+                    continue;
+                }
+                const int64_t Cost = (int64_t)AI * N + (int64_t)AJ * (N - AI);
+                if (Cost > Budget) continue;
+                // The columns the new window gains (all its rows), then the rows (the columns
+                // both windows share).
+                if (DI != 0)
+                    Jobs.push_back(FJob{ k, DI > 0 ? Level.OriginI + N : I, J, AI, N });
+                if (DJ != 0)
+                    Jobs.push_back(FJob{ k, (std::max)(I, Level.OriginI), DJ > 0 ? Level.OriginJ + N : J, N - AI, AJ });
+                Level.OriginI = I;
+                Level.OriginJ = J;
+                Budget -= Cost;
+            }
+
+            // 5. Not a level the camera crosses an eighth of each frame: it would be stale before
+            // it's readable, and the finest levels can't show at that speed anyway.
+            for (int32_t k = Count - 1; k >= 0 && Budget >= N; k--)
+            {
+                FLevel& Level = Levels[k];
+                if (Level.bValid) continue;
+                if (Travel > Level.TexelSize * (N / 8)) continue;
+                const int32_t Rows = (int32_t)std::min<int64_t>(N - Level.FillRow, Budget / N);
+                if (Rows <= 0) continue;
+                Jobs.push_back(FJob{ k, Level.OriginI, Level.OriginJ + Level.FillRow, N, Rows });
+                Level.FillRow += Rows;
+                Budget -= (int64_t)Rows * N;
+                if (Level.FillRow >= N)
+                    Level.bValid = true;
+            }
+
+            // 6.
+            FillPending(N);
+        }
+
+    private:
+        double Last[3] = { 0, 0, 0 };
+        bool bHasLast = false;
+    };
+}

@@ -72,11 +72,19 @@ namespace VoxelShader
 
     inline uint3 operator+(uint3 a, uint3 b) { return uint3(a.x + b.x, a.y + b.y, a.z + b.z); }
 
+    struct int2
+    {
+        int x, y;
+        int2() : x(0), y(0) {}
+        int2(int InX, int InY) : x(InX), y(InY) {}
+    };
+
     struct int3
     {
         int x, y, z;
         int3() : x(0), y(0), z(0) {}
         int3(int InX, int InY, int InZ) : x(InX), y(InY), z(InZ) {}
+        int3(int2 XY, int InZ) : x(XY.x), y(XY.y), z(InZ) {}
         int& operator[](int i) { return i == 0 ? x : (i == 1 ? y : z); }
         int operator[](int i) const { return i == 0 ? x : (i == 1 ? y : z); }
     };
@@ -162,6 +170,7 @@ namespace VoxelShader
     inline float clamp(float v, float lo, float hi) { return min(max(v, lo), hi); }
     inline float saturate(float v) { return clamp(v, 0.f, 1.f); }
     inline float lerp(float a, float b, float t) { return a + (b - a) * t; }
+    inline float3 lerp(float3 a, float3 b, float t) { return a + (b - a) * t; }
     inline float smoothstep(float e0, float e1, float v)
     {
         const float t = saturate((v - e0) / (e1 - e0));

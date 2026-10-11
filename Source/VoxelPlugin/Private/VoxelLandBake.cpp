@@ -1375,6 +1375,7 @@ FVoxelLandDebugParameters VoxelLandGPU::GetDebugParameters(FRDGBuilder& GraphBui
     Parameters.LandPlateCount = 0;
     Parameters.LandSeed = 0;
     Parameters.LandDebugHasHydro = 0;
+    Parameters.LandDebugHasAttr = 0;
     // The plate model's other inputs: the debug views read only the plates and the seed.
     Parameters.LandRadiusM = 1.0f;
     Parameters.LandWidthScale = 1.0f;
@@ -1385,7 +1386,7 @@ FVoxelLandDebugParameters VoxelLandGPU::GetDebugParameters(FRDGBuilder& GraphBui
     Parameters.LandInteriorHeight = 0.0f;
 
     const FVoxelLandBake* Bake = Mode > 0 && Density.LandMode != 0 ? Density.Land.Get() : nullptr;
-    if (Bake && Bake->GPU.IsValid() && Bake->Attr.Num() == Bake->NumCells() && Bake->Plates.Num() >= 8)
+    if (Bake && Bake->GPU.IsValid() && Bake->Attr.Num() == Bake->NumCells())
     {
         FVoxelLandBakeGPU& Resource = *Bake->GPU;
         if (!Resource.Attr.IsValid())
@@ -1394,15 +1395,25 @@ FVoxelLandDebugParameters VoxelLandGPU::GetDebugParameters(FRDGBuilder& GraphBui
             Resource.Attr = GraphBuilder.ConvertToExternalBuffer(
                 VoxelGPUCommon::UploadStructuredBuffer(GraphBuilder, TEXT("Voxel.LandAttr"), MakeConstArrayView(Packed)));
         }
-        if (!Resource.Plates.IsValid())
-        {
-            Resource.Plates = GraphBuilder.ConvertToExternalBuffer(
-                VoxelGPUCommon::UploadStructuredBuffer(GraphBuilder, TEXT("Voxel.LandDebugPlates"), MakeArrayView(Bake->Plates)));
-        }
         Parameters.LandAttr = GraphBuilder.CreateSRV(GraphBuilder.RegisterExternalBuffer(Resource.Attr));
-        Parameters.LandPlates = GraphBuilder.CreateSRV(GraphBuilder.RegisterExternalBuffer(Resource.Plates));
-        Parameters.LandPlateCount = (uint32)(Bake->Plates.Num() / 8);
-        Parameters.LandSeed = Bake->PlateSeed;
+        Parameters.LandDebugHasAttr = 1;
+        // The plates, when the bake kept them (without, the plates view shows "none"; the
+        // attributes and lakes don't need them: the land surface cache's fields read those).
+        if (Bake->Plates.Num() >= 8)
+        {
+            if (!Resource.Plates.IsValid())
+            {
+                Resource.Plates = GraphBuilder.ConvertToExternalBuffer(
+                    VoxelGPUCommon::UploadStructuredBuffer(GraphBuilder, TEXT("Voxel.LandDebugPlates"), MakeArrayView(Bake->Plates)));
+            }
+            Parameters.LandPlates = GraphBuilder.CreateSRV(GraphBuilder.RegisterExternalBuffer(Resource.Plates));
+            Parameters.LandPlateCount = (uint32)(Bake->Plates.Num() / 8);
+            Parameters.LandSeed = Bake->PlateSeed;
+        }
+        else
+        {
+            Parameters.LandPlates = GraphBuilder.CreateSRV(VoxelGPUCommon::UploadStructuredBuffer<float>(GraphBuilder, TEXT("Voxel.LandPlatesNone"), TConstArrayView<float>()));
+        }
         // The lake levels, for the views that show the hydrology, when the bake has them (the
         // drainage is the density's, VoxelLandGPU::GetParameters).
         const bool bHydro = (Mode == 9 || Mode == 10) /* VOXEL_LAND_VIEW_FLOW, _LAKES */ && Bake->Flow.Num() == Bake->NumCells() && Bake->Water.Num() == Bake->NumCells();

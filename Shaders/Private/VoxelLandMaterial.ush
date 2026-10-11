@@ -23,12 +23,15 @@
 //
 // Inputs: HeightTex, FieldTex, ConstTex = the VoxelLandHeight, VoxelLandFields and
 // VoxelLandConstants texture parameters (Texture Objects; the terrain's dynamic material instance
-// sets them); OriginHigh, OriginLow = VoxelLandOriginHigh and VoxelLandOriginLow (the planet's
+// sets them); CacheHeight, CacheSlope, CacheFields, CacheState = VoxelLandCacheHeight,
+// VoxelLandCacheSlope, VoxelLandCacheFields and VoxelLandCacheState (the land surface cache,
+// Design/LandSurfaceCache.md: what the node reads by default); OriginHigh, OriginLow = VoxelLandOriginHigh and VoxelLandOriginLow (the planet's
 // origin in world, double-float cm); AxisX, AxisY, AxisZ = VoxelLandAxisX/Y/Z (the planet frame's
 // axes in world) and AxisXLow, AxisYLow, AxisZLow = VoxelLandAxisXLow/YLow/ZLow (their
 // double-float remainders); Params = VoxelLandParams (x the debug view, voxel.Debug.LandView, plus
 // 16 x the normal's sources, voxel.Debug.LandNormalMode (VoxelLandPixel), plus 64 x the cost
-// switch, voxel.Land.MaterialCost; y the
+// switch, voxel.Land.MaterialCost, plus 512 when the analytic node is to be used (asked for, or
+// the cache missing), plus 1024 for the cache's level view, voxel.Debug.LandCache; y the
 // surface tolerance, m: the normal fades to the mesh's beyond y + 16 pixel footprints off the
 // analytic surface; z 1 when the land textures are bound, else 0: the node then reads nothing;
 // w the footprint, cm, below which the mesh's normal is used (close to the camera, where the
@@ -40,7 +43,14 @@
 // view's pre-view translation), exact for every view at any distance from the world origin.
 //
 // Custom node code:
-//   return VoxelLandMaterial(Parameters, HeightTex, FieldTex, ConstTex, OriginHigh, OriginLow, AxisX, AxisY, AxisZ, AxisXLow, AxisYLow, AxisZLow, Params, Height, NormalWS, NormalTS, Fields, Terms, DebugMask);
+//   return VoxelLandMaterial(Parameters, HeightTex, FieldTex, ConstTex, CacheHeight, CacheSlope, CacheFields, CacheState, OriginHigh, OriginLow, AxisX, AxisY, AxisZ, AxisXLow, AxisYLow, AxisZLow, Params, Height, NormalWS, NormalTS, Fields, Terms, DebugMask);
+//
+// Two sources (voxel.Land.MaterialSource): 0 (default) the land surface cache, computed once by
+// compute and sampled here (VoxelLandCacheSample.ush); 1 the analytic node, the land chain
+// evaluated per pixel (VoxelLandPixel), kept as the reference. VoxelLandMaterialCached (same
+// arguments) leaves the analytic node out of the shader: the cache only, and lighter. In the cache's source, Terms holds
+// only the pixel's height above the surface (w), and the views of the analytic terms (bake,
+// detail, plates, cells, gullies) evaluate the analytic node for the view only.
 //
 // The gullies' and the detail's share of the normal needs screen-space derivatives: other stages
 // that compile the material's pixel inputs (ray-tracing hit shaders) get the bake's gradient
@@ -58,6 +68,8 @@
 #include "/Plugin/VoxelPlugin/Private/VoxelDensitySample.ush"
 #include "/Plugin/VoxelPlugin/Private/VoxelLandDebugPalette.ush"
 #include "/Plugin/VoxelPlugin/Private/VoxelLandDebugColor.ush"
+#include "/Plugin/VoxelPlugin/Private/VoxelLandCache.ush"
+#include "/Plugin/VoxelPlugin/Private/VoxelLandCacheSample.ush"
 
 // The engine's view of the pixel (UE 5.4 and later: double-float pre-view translation). The
 // translated world position is world plus the pre-view translation (the camera's negative):
@@ -246,7 +258,55 @@ float VoxelLandPixelFootprint(float3 TranslatedWorld, float3 DdxLocal, float3 Dd
 #endif
 }
 
-#define VOXEL_LAND_MATERIAL_BODY \
+/** How far the pixel shows the mesh's normal for facing alone: a mesh surface facing well away
+ *  from the land's at the pixel (more than 55 degrees, fully past 75) isn't the land's surface,
+ *  wherever it is in height: a wall or ceiling of an edit or an overhang, near the original
+ *  surface's height. Without it, such a pixel within the height tolerance took the land's
+ *  (upward) normal, and a blend between near-opposite normals collapsed to noise. A far
+ *  coarse mesh smooths the land by far less than 55 degrees, so the land's detail stays. */
+float VoxelLandFacingToMesh(float3 Land, float3 Mesh)
+{
+    return 1.0f - smoothstep(0.2588190f, 0.5735764f, dot(Land, Mesh));   // cos 75, cos 55 degrees
+}
+
+/** A cache view's display (sRGB) colour: the views the cache holds (elevation, slope, crust,
+ *  class, drainage, lakes), from its values. */
+float3 VoxelLandCacheColor(FVoxelLandCacheSample C, uint Mode, float Elevation, float SlopeDegrees, float CellM, bool bHydro)
+{
+    if (Mode == VOXEL_LAND_VIEW_ELEVATION) return VoxelLandViewHeight(Elevation, CellM);
+    if (Mode == VOXEL_LAND_VIEW_SLOPE) return VoxelLandViewSlope(SlopeDegrees);
+    if (Mode == VOXEL_LAND_VIEW_CRUST) return VoxelLandViewCrust(C.Fields.x);
+    if (Mode == VOXEL_LAND_VIEW_CLASS) return VoxelLandViewClass(uint(C.Fields.y + 0.5f) & 7u, C.Fields.x);
+    if (Mode == VOXEL_LAND_VIEW_FLOW)
+    {
+        if (!bHydro) return VoxelLandViewNone();
+        return VoxelLandViewFlow(C.Flow * 0.30103f - 6.0f, Elevation <= 0.0f);
+    }
+    if (Mode == VOXEL_LAND_VIEW_LAKES)
+    {
+        if (!bHydro) return VoxelLandViewNone();
+        const bool bHasLake = C.Fields.z > VOXEL_LAND_CACHE_NO_LAKE + 1.0f;
+        return VoxelLandViewLake(C.Fields.z - Elevation, bHasLake && Elevation < C.Fields.z, Elevation <= 0.0f);
+    }
+    return VoxelLandViewNone();
+}
+
+/** The cache's views (VOXEL_LAND_VIEW_*) read from it; the others need the analytic terms. */
+bool VoxelLandCacheHasView(uint Mode)
+{
+    return Mode == VOXEL_LAND_VIEW_ELEVATION || Mode == VOXEL_LAND_VIEW_SLOPE || Mode == VOXEL_LAND_VIEW_CRUST
+        || Mode == VOXEL_LAND_VIEW_CLASS || Mode == VOXEL_LAND_VIEW_FLOW || Mode == VOXEL_LAND_VIEW_LAKES;
+}
+
+/** The cache's level as a colour (voxel.Debug.LandCache): a hue a level, darker between two. */
+float3 VoxelLandCacheLevelColor(float Level)
+{
+    const float K = floor(Level);
+    const float3 Hue = saturate(abs(frac(K * 0.618034f + float3(0.0f, 0.6667f, 0.3333f)) * 6.0f - 3.0f) - 1.0f);
+    return lerp(float3(0.15f, 0.15f, 0.15f), Hue, 0.85f) * (1.0f - 0.5f * (Level - K));
+}
+
+#define VOXEL_LAND_MATERIAL_BODY(WITH_ANALYTIC) \
     Height = 0.0f; \
     NormalWS = Parameters.TangentToWorld[2]; \
     NormalTS = float3(0.0f, 0.0f, 1.0f); \
@@ -265,11 +325,71 @@ float VoxelLandPixelFootprint(float3 TranslatedWorld, float3 DdxLocal, float3 Dd
     const float3 DdxLocal = float3(dot(DdxWorld, AxisX), dot(DdxWorld, AxisY), dot(DdxWorld, AxisZ)); \
     const float3 DdyLocal = float3(dot(DdyWorld, AxisX), dot(DdyWorld, AxisY), dot(DdyWorld, AxisZ)); \
     const float Footprint = VoxelLandPixelFootprint(TranslatedWorld, DdxLocal, DdyLocal); \
-    /* x: the view (4 bits), the normal's sources (2 bits), the cost switch (3 bits). */ \
+    /* x: the view (4 bits), the normal's sources (2), the cost switch (3), the source (1: */ \
+    /* 1 the analytic node), the cache's level view (1). */ \
     const uint Packed = uint(Params.x + 0.5f); \
+    const uint Mode = Packed & 15u; \
+    const bool bAnalytic = WITH_ANALYTIC && ((Packed >> 9u) & 1u) != 0u; \
+    const bool bLevelView = ((Packed >> 10u) & 1u) != 0u; \
     const uint Cost = (Packed >> 6u) & 7u; \
     GVoxelLandSkipGullies = Cost >= 2u; \
     GVoxelLandSkipDetail = Cost >= 3u; \
+    const float3 MeshWS = normalize(Parameters.TangentToWorld[2]); \
+    const float3 MeshLocal = float3(dot(MeshWS, AxisX), dot(MeshWS, AxisY), dot(MeshWS, AxisZ)); \
+    const float Tolerance = max(Params.y + 16.0f * Footprint * 0.01f, 0.01f); \
+    const bool bHydro = VoxelLandConstU(ConstTex, VOXEL_LAND_MC_HAS_HYDRO) != 0u; \
+    /* The cache-only entry can't evaluate the land: asked for the analytic node (the cache */ \
+    /* missing, or voxel.Land.MaterialSource 1), the node is off. */ \
+    if (!WITH_ANALYTIC && ((Packed >> 9u) & 1u) != 0u) return float3(0.0f, 0.0f, 0.0f); \
+    if (!bAnalytic) \
+    { \
+        /* The views of the analytic terms (bake, detail, plates, cells, gullies) evaluate */ \
+        /* the analytic node for the view, here in uniform control flow (its derivatives). */ \
+        FVoxelLandPixel Debug = (FVoxelLandPixel)0; \
+        const bool bDebugAnalytic = WITH_ANALYTIC && Mode != 0u && !bLevelView && !VoxelLandCacheHasView(Mode); \
+        if (bDebugAnalytic) \
+            Debug = VoxelLandPixel(HeightTex, FieldTex, ConstTex, Point.X, Point.Y, Point.Z, DdxLocal, DdyLocal, Footprint, 3u, 0.0f); \
+        /* The cache (Design/LandSurfaceCache.md): a few texture reads. */ \
+        const float2 SeaRadius = VoxelDFAdd(VoxelLandConstF2(ConstTex, VOXEL_LAND_MC_PLANET_RADIUS), VoxelLandConstF2(ConstTex, VOXEL_LAND_MC_HEIGHT_OFFSET)); \
+        const FVoxelLandCacheSample C = VoxelLandCacheSampleAt(CacheHeight, CacheSlope, CacheFields, CacheState, Point.X, Point.Y, Point.Z, SeaRadius, Footprint); \
+        if (!C.bValid) \
+        { \
+            /* Not written yet here (a first fill, a jump): the mesh's normal. */ \
+            if (Mode == 0u && !bLevelView) return float3(0.0f, 0.0f, 0.0f); \
+            DebugMask = 1.0f; \
+            return VoxelLandViewSrgbToLinear(VoxelLandViewNone()); \
+        } \
+        const float2 Radius = VoxelDFSqrt(VoxelDFAdd(VoxelDFAdd(VoxelDFMul(Point.X, Point.X), VoxelDFMul(Point.Y, Point.Y)), VoxelDFMul(Point.Z, Point.Z))); \
+        const float2 Above = VoxelDFSub(Radius, VoxelDFAdd(SeaRadius, float2(C.Height * 100.0f, 0.0f))); \
+        const float Offset = (Above.x + Above.y) * 0.01f; \
+        const float3 Up = normalize(float3(Point.X.x, Point.Y.x, Point.Z.x)); \
+        const float3 Analytic = normalize(Up - (C.Gradient - Up * dot(C.Gradient, Up))); \
+        const float ToMesh = max(saturate(abs(Offset) / Tolerance - 1.0f), VoxelLandFacingToMesh(Analytic, MeshLocal)); \
+        const float3 Shown = normalize(lerp(Analytic, MeshLocal, ToMesh)); \
+        NormalWS = normalize(AxisX * Shown.x + AxisY * Shown.y + AxisZ * Shown.z); \
+        NormalTS = normalize(mul(Parameters.TangentToWorld, NormalWS)); \
+        Height = C.Height; \
+        Fields = float4(C.Flow, C.Fields.x, C.Fields.y, C.Fields.z > VOXEL_LAND_CACHE_NO_LAKE + 1.0f ? max(C.Fields.z - C.Height, 0.0f) : 0.0f); \
+        Terms = float4(0.0f, 0.0f, 0.0f, Offset); \
+        if (bLevelView) \
+        { \
+            DebugMask = 1.0f; \
+            return VoxelLandViewSrgbToLinear(VoxelLandCacheLevelColor(C.Level)); \
+        } \
+        if (Mode == 0u) return float3(0.0f, 0.0f, 0.0f); \
+        DebugMask = 1.0f; \
+        if (VoxelLandCacheHasView(Mode)) \
+        { \
+            const float SlopeDegrees = acos(clamp(dot(Shown, Up), -1.0f, 1.0f)) * 57.2957795f; \
+            return VoxelLandViewSrgbToLinear(VoxelLandCacheColor(C, Mode, C.Height + Offset * ToMesh, SlopeDegrees, Footprint * 0.01f, bHydro)); \
+        } \
+        /* The views of the analytic terms (bake, detail, plates, cells, gullies): the */ \
+        /* analytic node, for the debug view only (none in the cache-only entry). */ \
+        if (!bDebugAnalytic) return VoxelLandViewSrgbToLinear(VoxelLandViewNone()); \
+        return VoxelLandViewSrgbToLinear(VoxelLandPixelColor(HeightTex, FieldTex, ConstTex, Debug, Shown, ToMesh, Footprint, Mode)); \
+    } \
+    if (!WITH_ANALYTIC) return float3(0.0f, 0.0f, 0.0f); \
+    /* The analytic node (voxel.Land.MaterialSource 1): the land chain at the pixel. */ \
     /* Close to the camera (pixels far finer than the finest mesh cell, Params.w cm and below) */ \
     /* the mesh carries all the land's detail, and its normal is cleaner than a screen-space */ \
     /* difference over a centimetre: the mesh's normal there, the node's from 2.5 Params.w. */ \
@@ -280,23 +400,32 @@ float VoxelLandPixelFootprint(float3 TranslatedWorld, float3 DdxLocal, float3 Dd
     Fields = Pixel.Fields; \
     Terms = Pixel.Terms; \
     /* Off the analytic surface (an edit, an overhang, a coarse mesh far off): the mesh's normal. */ \
-    const float3 MeshWS = normalize(Parameters.TangentToWorld[2]); \
-    const float3 MeshLocal = float3(dot(MeshWS, AxisX), dot(MeshWS, AxisY), dot(MeshWS, AxisZ)); \
-    const float Tolerance = max(Params.y + 16.0f * Footprint * 0.01f, 0.01f); \
-    const float ToMesh = max(saturate(abs(Pixel.Offset) / Tolerance - 1.0f), Near); \
+    const float ToMesh = max(max(saturate(abs(Pixel.Offset) / Tolerance - 1.0f), Near), VoxelLandFacingToMesh(Pixel.Normal, MeshLocal)); \
     const float3 Shown = normalize(lerp(Pixel.Normal, MeshLocal, ToMesh)); \
     NormalWS = normalize(AxisX * Shown.x + AxisY * Shown.y + AxisZ * Shown.z); \
     NormalTS = normalize(mul(Parameters.TangentToWorld, NormalWS)); \
-    const uint Mode = Packed & 15u; \
     if (Mode == 0u) return float3(0.0f, 0.0f, 0.0f); \
     DebugMask = 1.0f; \
     return VoxelLandViewSrgbToLinear(VoxelLandPixelColor(HeightTex, FieldTex, ConstTex, Pixel, Shown, ToMesh, Footprint, Mode));
 
 float3 VoxelLandMaterial(FMaterialPixelParameters Parameters, Texture2D HeightTex, Texture2D FieldTex, Texture2D ConstTex,
+    Texture2D CacheHeight, Texture2D CacheSlope, Texture2D CacheFields, Texture2D CacheState,
     float3 OriginHigh, float3 OriginLow, float3 AxisX, float3 AxisY, float3 AxisZ, float3 AxisXLow, float3 AxisYLow, float3 AxisZLow, float4 Params,
     out float Height, out float3 NormalWS, out float3 NormalTS, out float4 Fields, out float4 Terms, out float DebugMask)
 {
-    VOXEL_LAND_MATERIAL_BODY
+    VOXEL_LAND_MATERIAL_BODY(true)
+}
+
+/** The same without the analytic node compiled in: the cache only (the views of the analytic
+ *  terms show "none"; voxel.Land.MaterialSource 1, or no cache, turns the node off: the mesh's
+ *  normal). Lighter: the shader
+ *  doesn't carry the land chain's registers. */
+float3 VoxelLandMaterialCached(FMaterialPixelParameters Parameters, Texture2D HeightTex, Texture2D FieldTex, Texture2D ConstTex,
+    Texture2D CacheHeight, Texture2D CacheSlope, Texture2D CacheFields, Texture2D CacheState,
+    float3 OriginHigh, float3 OriginLow, float3 AxisX, float3 AxisY, float3 AxisZ, float3 AxisXLow, float3 AxisYLow, float3 AxisZLow, float4 Params,
+    out float Height, out float3 NormalWS, out float3 NormalTS, out float4 Fields, out float4 Terms, out float DebugMask)
+{
+    VOXEL_LAND_MATERIAL_BODY(false)
 }
 
 #undef VOXEL_LAND_MATERIAL_BODY

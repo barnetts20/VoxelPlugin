@@ -1,0 +1,113 @@
+// VoxelLandCache.ush - The land surface cache's geometry (Design/LandSurfaceCache.md): a clipmap
+// of VOXEL_LAND_CACHE_N x VOXEL_LAND_CACHE_N texel levels around the camera, each level a
+// toroidal window on a fixed gnomonic grid. Shared by the compute writer
+// (VoxelLandCacheWrite.usf), the terrain material's sampler (VoxelLandMaterial.ush), the C++
+// that plans the updates (VoxelLandCache.cpp, the same rules in double) and the harness.
+//
+// A level's grid: an anchor frame (A, E1, E2: float vectors, the level's projection centre and
+// tangent axes in the planet frame) and a texel size T (cm, a power of two times
+// VOXEL_LAND_CACHE_T0). A point P (planet frame, double-float cm) has plane coordinates
+//   X = S (P . E1) / (P . A),   Y = S (P . E2) / (P . A)       (S: the sea-level radius)
+// (gnomonic: straight lines through the centre; exact in double-float, no trigonometry), and
+// lies in texel (floor(X / T), floor(Y / T)). The writer inverts this with the frame's exact
+// inverse (as double-float rows, from the C++), so the two agree to double-float precision at
+// any radius. Texel (I, J) is stored at slot (I mod N, J mod N) of the level's tile in the atlas
+// textures (VOXEL_LAND_CACHE_COLUMNS tiles a row). The atlases hold a tile more than the levels:
+// a level that re-centres is written into the spare tile while its old tile is still read, and
+// the two swap once it's complete (the state names each level's tile).
+//
+// Contents (one texel each in three atlases):
+//   Height  R32F     m about sea level (the analytic surface: bake, gullies, detail)
+//   Slope   RGBA16F  xyz the surface's gradient (m/m, a tangent vector in the planet frame);
+//                    w the drainage (log2 m^2)
+//   Fields  RGBA16F  x the crust (0..1), y the boundary class (0..6, +8 under a kept lake),
+//                    z the kept lake's level above the texel's height (m;
+//                    VOXEL_LAND_CACHE_NO_LAKE where none), w 1 (written: the sampler skips
+//                    texels still 0)
+//
+// The state texture (RGBA32F, VOXEL_LAND_CACHE_STATE_WIDTH texels a row): row 0 (the level
+// count, N, T0, 0); row 1 + k for level k: (A, valid), (E1, T), (E2, the level's tile), (the
+// window's origin: I as a multiple of 4096 and the rest, J likewise; every part an exact float).
+//
+// Shared subset (VoxelShaderCompat.h). Include after VoxelDF64.ush.
+
+#ifndef VOXEL_LAND_CACHE_USH
+#define VOXEL_LAND_CACHE_USH
+
+#include "VoxelLandCacheLayout.ush"
+
+#ifndef VOXEL_FUNC
+#define VOXEL_FUNC
+#endif
+
+/** A point's gnomonic plane coordinates on a level's grid (cm, double-float). */
+struct FVoxelLandCachePlane
+{
+    float2 X;
+    float2 Y;
+};
+
+VOXEL_FUNC FVoxelLandCachePlane VoxelLandCachePlaneOf(float2 PX, float2 PY, float2 PZ, float3 A, float3 E1, float3 E2, float2 SeaRadius)
+{
+    const float2 PA = VoxelDFAdd(VoxelDFAdd(VoxelDFMulFloat(PX, A.x), VoxelDFMulFloat(PY, A.y)), VoxelDFMulFloat(PZ, A.z));
+    const float2 P1 = VoxelDFAdd(VoxelDFAdd(VoxelDFMulFloat(PX, E1.x), VoxelDFMulFloat(PY, E1.y)), VoxelDFMulFloat(PZ, E1.z));
+    const float2 P2 = VoxelDFAdd(VoxelDFAdd(VoxelDFMulFloat(PX, E2.x), VoxelDFMulFloat(PY, E2.y)), VoxelDFMulFloat(PZ, E2.z));
+    const float2 Scale = VoxelDFDiv(SeaRadius, PA);
+    FVoxelLandCachePlane Out;
+    Out.X = VoxelDFMul(P1, Scale);
+    Out.Y = VoxelDFMul(P2, Scale);
+    return Out;
+}
+
+/** A level's texel coordinate of plane coordinate X, relative to the window origin (texels;
+ *  texel centres at .5): exact near the window, where it matters. */
+VOXEL_FUNC float VoxelLandCacheTexelCoord(float2 X, int Origin, float TexelSize)
+{
+    const float2 Rel = VoxelDFSub(X, VoxelDFMulFloat(VoxelDFFromInt(Origin), TexelSize));
+    return (Rel.x + Rel.y) / TexelSize;
+}
+
+/** The toroidal slot of global texel index I (0 .. N-1). */
+VOXEL_FUNC int VoxelLandCacheSlot(int I)
+{
+    // N is a power of two: the mask is the non-negative remainder (two's complement).
+    return I & (VOXEL_LAND_CACHE_N - 1);
+}
+
+/** The atlas texel of slot (SX, SY) of a tile. */
+VOXEL_FUNC int2 VoxelLandCacheAtlasTexel(int Tile, int SX, int SY)
+{
+    const uint UT = uint(Tile);
+    return int2(int(UT % uint(VOXEL_LAND_CACHE_COLUMNS)) * VOXEL_LAND_CACHE_N + SX, int(UT / uint(VOXEL_LAND_CACHE_COLUMNS)) * VOXEL_LAND_CACHE_N + SY);
+}
+
+/** The writer's inverse: texel (I, J)'s centre on the sea-level sphere (cm, double-float),
+ *  through the frame's inverse M (rows R0, R1, R2, double-float each component: the inverse of
+ *  the matrix with rows E1, E2, A). */
+struct FVoxelLandCachePoint
+{
+    float2 X;
+    float2 Y;
+    float2 Z;
+};
+
+VOXEL_FUNC FVoxelLandCachePoint VoxelLandCacheTexelPoint(int I, int J, float TexelSize,
+    float3 R0High, float3 R0Low, float3 R1High, float3 R1Low, float3 R2High, float3 R2Low, float2 SeaRadius)
+{
+    // The texel centre's plane coordinates: (2 I + 1) T / 2, exact.
+    const float2 U = VoxelDFMulFloat(VoxelDFFromInt(2 * I + 1), 0.5f * TexelSize);
+    const float2 V = VoxelDFMulFloat(VoxelDFFromInt(2 * J + 1), 0.5f * TexelSize);
+    // M^-1 (U, V, S): a point on the ray, then onto the sphere.
+    const float2 DX = VoxelDFAdd(VoxelDFAdd(VoxelDFMul(float2(R0High.x, R0Low.x), U), VoxelDFMul(float2(R0High.y, R0Low.y), V)), VoxelDFMul(float2(R0High.z, R0Low.z), SeaRadius));
+    const float2 DY = VoxelDFAdd(VoxelDFAdd(VoxelDFMul(float2(R1High.x, R1Low.x), U), VoxelDFMul(float2(R1High.y, R1Low.y), V)), VoxelDFMul(float2(R1High.z, R1Low.z), SeaRadius));
+    const float2 DZ = VoxelDFAdd(VoxelDFAdd(VoxelDFMul(float2(R2High.x, R2Low.x), U), VoxelDFMul(float2(R2High.y, R2Low.y), V)), VoxelDFMul(float2(R2High.z, R2Low.z), SeaRadius));
+    const float2 Length = VoxelDFSqrt(VoxelDFAdd(VoxelDFAdd(VoxelDFMul(DX, DX), VoxelDFMul(DY, DY)), VoxelDFMul(DZ, DZ)));
+    const float2 Scale = VoxelDFDiv(SeaRadius, Length);
+    FVoxelLandCachePoint Out;
+    Out.X = VoxelDFMul(DX, Scale);
+    Out.Y = VoxelDFMul(DY, Scale);
+    Out.Z = VoxelDFMul(DZ, Scale);
+    return Out;
+}
+
+#endif // VOXEL_LAND_CACHE_USH

@@ -1,0 +1,112 @@
+// VoxelLandCacheWrite.usf - Writes a rectangle of one level (into one tile) of the land surface cache
+// (VoxelLandCache.ush; FVoxelLandCacheWriteCS, VoxelLandCache.cpp): at each texel's centre on
+// the sea-level sphere, the density's land chain (VoxelLandHeightDF) band-limited to the texel,
+// its height, its gradient and the bake's fields. The global-shader host of the shared land code,
+// so its inputs are constants and buffers, not the material's textures.
+//
+// The values: VoxelLandCacheWriter.ush (shared with the harness).
+
+#include "/Engine/Public/Platform.ush"
+#include "/Plugin/VoxelPlugin/Private/VoxelDensityCore.ush"
+#include "/Plugin/VoxelPlugin/Private/VoxelDF64.ush"
+
+StructuredBuffer<FVoxelOctave> Octaves;
+
+uint ContinentOctaves;
+uint MountainOctaves;
+uint DetailOctaves;
+float2 InvNormContinent;
+float2 InvNormMountain;
+float2 InvNormDetail;
+float2 PlanetRadius;
+float2 NoiseAmplitude;
+float2 HalfFinest;
+float2 ContinentWeight;
+float2 MountainWeight;
+float2 MountainStart;
+float2 MountainBlend;
+float2 DetailWeight;
+float RidgeGain;
+float SlopeDamping;
+
+// The debug inputs (VoxelLandGPU.h FVoxelLandDebugParameters): the bake's attributes, lake
+// levels and plates, for the fields.
+uint LandDebugMode;
+StructuredBuffer<uint> LandAttr;
+float2 LandDebugSeaRadius;
+StructuredBuffer<float> LandWater;
+uint LandDebugHasHydro;
+uint LandDebugHasAttr;
+StructuredBuffer<float> LandPlates;
+uint LandPlateCount;
+uint LandSeed;
+float LandRadiusM;
+float LandWidthScale;
+float LandReliefScale;
+float LandShelfDepth;
+float LandAbyssDepth;
+float LandCoastHeight;
+float LandInteriorHeight;
+
+// The rectangle: the tile written, texel size, global texel indices, the frame's inverse.
+int CacheTile;
+float TexelSize;
+int2 RectMin;
+int2 RectSize;
+float3 InverseRow0High;
+float3 InverseRow0Low;
+float3 InverseRow1High;
+float3 InverseRow1Low;
+float3 InverseRow2High;
+float3 InverseRow2Low;
+float2 SeaRadius;
+
+RWTexture2D<float> OutHeight;
+RWTexture2D<float4> OutSlope;
+RWTexture2D<float4> OutFields;
+
+#include "/Plugin/VoxelPlugin/Private/VoxelCubeSphere.ush"
+#include "/Plugin/VoxelPlugin/Private/VoxelLandParameters.ush"
+#include "/Plugin/VoxelPlugin/Private/VoxelLandSample.ush"
+#include "/Plugin/VoxelPlugin/Private/VoxelLandGully.ush"
+#include "/Plugin/VoxelPlugin/Private/VoxelLandPlates.ush"
+#include "/Plugin/VoxelPlugin/Private/VoxelDensitySample.ush"
+#include "/Plugin/VoxelPlugin/Private/VoxelLandDebugPalette.ush"
+#include "/Plugin/VoxelPlugin/Private/VoxelLandDebugColor.ush"
+#include "/Plugin/VoxelPlugin/Private/VoxelLandCache.ush"
+#include "/Plugin/VoxelPlugin/Private/VoxelLandCacheWriter.ush"
+
+[numthreads(VOXEL_LAND_CACHE_GROUP, VOXEL_LAND_CACHE_GROUP, 1)]
+void WriteCS(uint3 Id : SV_DispatchThreadID)
+{
+    if (Id.x >= (uint)RectSize.x || Id.y >= (uint)RectSize.y) return;
+    const int I = RectMin.x + int(Id.x);
+    const int J = RectMin.y + int(Id.y);
+    const FVoxelLandCachePoint P = VoxelLandCacheTexelPoint(I, J, TexelSize, InverseRow0High, InverseRow0Low,
+        InverseRow1High, InverseRow1Low, InverseRow2High, InverseRow2Low, SeaRadius);
+
+    // The land, band-limited to the texel; the gullies differenced over max(T0, T / 2).
+    const FVoxelLandCacheSurface Surface = VoxelLandCacheSurfaceAt(P.X, P.Y, P.Z, TexelSize, max(VOXEL_LAND_CACHE_T0, 0.5f * TexelSize));
+    const float HeightM = Surface.Height;
+
+    // The bake's fields at the nearest cell of the warped direction (when the bake has them).
+    float4 Fields = float4(0.0f, 0.0f, VOXEL_LAND_CACHE_NO_LAKE, 1.0f);
+    if (LandMode != 0u && LandDebugHasAttr != 0u)
+    {
+        const FVoxelLandDebugCell Cell = VoxelLandDebugCellOf(Surface.Warped);
+        const uint Index = VoxelLandDebugIndex(Cell);
+        const uint Attr = VOXEL_LAND_ATTR(Index);
+        Fields.x = float(Attr & 0xffu) / 255.0f;
+        Fields.y = float((Attr >> 8u) & 7u) + ((Attr & 0x1000u) != 0u ? 8.0f : 0.0f);
+        if (LandDebugHasHydro != 0u)
+        {
+            const float LakeLevel = VOXEL_LAND_WATER(Index);
+            if (LakeLevel > -1.0e30f) Fields.z = clamp(LakeLevel - HeightM, VOXEL_LAND_CACHE_NO_LAKE + 1000.0f, 60000.0f);
+        }
+    }
+
+    const int2 Atlas = VoxelLandCacheAtlasTexel(CacheTile, VoxelLandCacheSlot(I), VoxelLandCacheSlot(J));
+    OutHeight[Atlas] = HeightM;
+    OutSlope[Atlas] = float4(Surface.Gradient, Surface.Flow);
+    OutFields[Atlas] = Fields;
+}
