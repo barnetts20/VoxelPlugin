@@ -16,6 +16,11 @@
 //      farthest, the coarsest of those): its new frame is written into the spare tile while its
 //      own tile is still read; the two swap once the new one is complete (0).
 //   3. The re-centring, with up to half the budget (it always progresses).
+//   E. Texels an edit changed (MarkDirty: the edit's box, projected into every level's frame and
+//      the re-centring's), written again in place: brush-sized rectangles fine to coarse with up
+//      to half the budget, then large ones with up to a quarter; the level stays readable
+//      meanwhile. The jobs are clipped to the windows as they stand after the plan (a window
+//      that moves this frame doesn't write a texel it leaves).
 //   4. Window moves of readable levels, coarse to fine (the cheap ones first): the strips the
 //      move exposes, committed with their writes (a move the budget can't take waits; the old
 //      window stays readable; a move of a window or more writes the level again).
@@ -60,6 +65,38 @@ namespace VoxelLandCachePlan
     /** Tiles the atlases need: one a level, and the spare a re-centring level is written into. */
     inline int32_t TilesFor(int32_t Levels) { return Levels + 1; }
 
+    /** A rectangle of texels (global indices). */
+    struct FRect
+    {
+        int32_t I0 = 0;
+        int32_t J0 = 0;
+        int32_t Width = 0;
+        int32_t Height = 0;
+    };
+
+    /** A rectangle clipped to the window at (OI, OJ); false when nothing is left. */
+    inline bool ClipToWindow(FRect& R, int32_t OI, int32_t OJ)
+    {
+        const int64_t I0 = (std::max)((int64_t)R.I0, (int64_t)OI);
+        const int64_t J0 = (std::max)((int64_t)R.J0, (int64_t)OJ);
+        const int64_t I1 = (std::min)((int64_t)R.I0 + R.Width, (int64_t)OI + N);
+        const int64_t J1 = (std::min)((int64_t)R.J0 + R.Height, (int64_t)OJ + N);
+        if (I1 <= I0 || J1 <= J0)
+        {
+            R.Width = 0;
+            R.Height = 0;
+            return false;
+        }
+        R = FRect{ (int32_t)I0, (int32_t)J0, (int32_t)(I1 - I0), (int32_t)(J1 - J0) };
+        return true;
+    }
+
+    /** Dirty rectangles kept a level before they merge into their bounds. */
+    constexpr size_t MaxDirtyRects = 16;
+
+    /** A dirty rectangle written after the brush-sized ones (more than a sixteenth of a window). */
+    inline bool IsLargeRect(const FRect& R) { return (int64_t)R.Width * R.Height > (int64_t)N * N / 16; }
+
     struct FLevel
     {
         int32_t Tile = 0;                 // the level's tile in the atlases
@@ -73,6 +110,7 @@ namespace VoxelLandCachePlan
         int32_t OriginJ = 0;
         bool bValid = false;              // the whole window is written
         int32_t FillRow = 0;              // a refill's progress (rows of the window written)
+        std::vector<FRect> Dirty;         // texels an edit changed, to write again (in the window)
     };
 
     /** A rectangle to write (global texel indices); Frame: the level, or Levels.size() for the
@@ -200,8 +238,33 @@ namespace VoxelLandCachePlan
             {
                 Level.bValid = false;
                 Level.FillRow = 0;
+                Level.Dirty.clear();
             }
             PendingLevel = -1;
+            Next.Dirty.clear();
+        }
+
+        /** An edit changed the density in the box (planet frame, cm): the texels whose columns
+         *  pass through it, and a texel around them (the gradient's differences), are written
+         *  again, in every level's window and the re-centring's (the next Tick plans them). */
+        void MarkDirty(const double Min[3], const double Max[3])
+        {
+            for (FLevel& Level : Levels)
+                MarkDirtyIn(Level, Min, Max);
+            if (PendingLevel >= 0)
+                MarkDirtyIn(Next, Min, Max);
+        }
+
+        /** Texels still to write again for edits (the levels' and the re-centring's). */
+        int64_t DirtyTexels() const
+        {
+            int64_t Total = 0;
+            auto Add = [&Total](const FLevel& Level) {
+                for (const FRect& R : Level.Dirty) Total += (int64_t)R.Width * R.Height;
+            };
+            for (const FLevel& Level : Levels) Add(Level);
+            if (PendingLevel >= 0) Add(Next);
+            return Total;
         }
 
         /** The frame's jobs for the camera's direction D (any length; not zero). */
@@ -260,6 +323,7 @@ namespace VoxelLandCachePlan
                     Centre(Level, D, SeaRadius, Level.OriginI, Level.OriginJ);
                     Level.bValid = false;
                     Level.FillRow = 0;
+                    Level.Dirty.clear();
                 }
             }
 
@@ -304,6 +368,53 @@ namespace VoxelLandCachePlan
             // level that reaches 25 degrees first re-anchors with a gap).
             FillPending(std::max<int64_t>(Total / 2 / N, 1));
 
+            // E. The edits' texels, after the re-centring's share: the brush-sized rectangles
+            // first (fine to coarse, then the re-centring's), with up to half the budget, so a
+            // brush near the camera shows at once whatever else is queued; then the large ones
+            // (a reload's) with up to a quarter. Clipped again to the final windows at the end.
+            std::vector<size_t> DirtyJobs;
+            {
+                int64_t DirtyBudget = 0;
+                auto Drain = [&](FLevel& Level, int32_t Frame, bool bLarge)
+                {
+                    for (size_t r = 0; r < Level.Dirty.size() && DirtyBudget > 0;)
+                    {
+                        FRect& R = Level.Dirty[r];
+                        if (!ClipToWindow(R, Level.OriginI, Level.OriginJ))
+                        {
+                            Level.Dirty.erase(Level.Dirty.begin() + (std::ptrdiff_t)r);
+                            continue;
+                        }
+                        if (IsLargeRect(R) != bLarge)
+                        {
+                            r++;
+                            continue;
+                        }
+                        const int32_t Rows = (int32_t)std::min<int64_t>(R.Height, DirtyBudget / R.Width);
+                        if (Rows <= 0) break;
+                        Jobs.push_back(FJob{ Frame, R.I0, R.J0, R.Width, Rows });
+                        DirtyJobs.push_back(Jobs.size() - 1);
+                        const int64_t Cost = (int64_t)Rows * R.Width;
+                        DirtyBudget -= Cost;
+                        Budget -= Cost;
+                        R.J0 += Rows;
+                        R.Height -= Rows;
+                        if (R.Height <= 0)
+                            Level.Dirty.erase(Level.Dirty.begin() + (std::ptrdiff_t)r);
+                        else
+                            r++;
+                    }
+                };
+                for (int Pass = 0; Pass < 2; Pass++)
+                {
+                    DirtyBudget = std::min<int64_t>(Budget, Pass == 0 ? Total / 2 : Total / 4);
+                    for (int32_t k = 0; k < Count; k++)
+                        Drain(Levels[k], k, Pass == 1);
+                    if (PendingLevel >= 0)
+                        Drain(Next, Count, Pass == 1);
+                }
+            }
+
             // 4.
             for (int32_t k = Count - 1; k >= 0; k--)
             {
@@ -324,6 +435,7 @@ namespace VoxelLandCachePlan
                     Level.OriginJ = J;
                     Level.bValid = false;
                     Level.FillRow = 0;
+                    Level.Dirty.clear();
                     if (PendingLevel == k)
                         PendingLevel = -1;
                     continue;
@@ -359,10 +471,84 @@ namespace VoxelLandCachePlan
 
             // 6.
             FillPending(N);
+
+            // The edits' jobs clipped to the windows as they stand now (the frame the jobs write
+            // with): a window that moved this frame shares a texel's slot between the texel it
+            // left and the one it gained, and only the latter is written. Overlaps with this
+            // frame's other jobs remain, writing the same values.
+            for (size_t Index : DirtyJobs)
+            {
+                FJob& Job = Jobs[Index];
+                const FLevel& Level = Job.Frame == Count ? Next : Levels[Job.Frame];
+                FRect R{ Job.I0, Job.J0, Job.Width, Job.Height };
+                ClipToWindow(R, Level.OriginI, Level.OriginJ);
+                Job.I0 = R.I0;
+                Job.J0 = R.J0;
+                Job.Width = R.Width;
+                Job.Height = R.Height;
+            }
+            Jobs.erase(std::remove_if(Jobs.begin(), Jobs.end(), [](const FJob& Job) { return Job.Width <= 0 || Job.Height <= 0; }), Jobs.end());
         }
 
     private:
         double Last[3] = { 0, 0, 0 };
         bool bHasLast = false;
+
+        /** The box's texels in a level's frame (its corners projected along their rays: the
+         *  projection of the box lies in their bounds), a texel around, within the window. Every
+         *  corner past 84 degrees from the level's centre: none (a window reaches 73 at most);
+         *  some: the whole window (a box that large is a reload, not a brush). */
+        void MarkDirtyIn(FLevel& Level, const double Min[3], const double Max[3]) const
+        {
+            if (!Level.bAnchored) return;
+            double X0 = 0.0, X1 = 0.0, Y0 = 0.0, Y1 = 0.0;
+            int32_t Behind = 0, Projected = 0;
+            for (int c = 0; c < 8; c++)
+            {
+                const double P[3] = { (c & 1) ? Max[0] : Min[0], (c & 2) ? Max[1] : Min[1], (c & 4) ? Max[2] : Min[2] };
+                const double Length = std::sqrt(P[0] * P[0] + P[1] * P[1] + P[2] * P[2]);
+                if (!(Dot(Level.A, P) > 0.1 * Length))
+                {
+                    Behind++;
+                    continue;
+                }
+                double X = 0.0, Y = 0.0;
+                PlaneOf(Level, P, SeaRadius, X, Y);
+                if (Projected++ == 0) { X0 = X1 = X; Y0 = Y1 = Y; }
+                X0 = (std::min)(X0, X); X1 = (std::max)(X1, X);
+                Y0 = (std::min)(Y0, Y); Y1 = (std::max)(Y1, Y);
+            }
+            if (Behind == 8) return;
+            const bool bWhole = Behind > 0;
+            FRect R{ Level.OriginI, Level.OriginJ, N, N };
+            if (!bWhole)
+            {
+                // Bounded before the conversion (the window is what's kept).
+                const double Limit = (double)(1 << 29);
+                auto Index = [Limit](double V) { return (int64_t)std::clamp(std::floor(V), -Limit, Limit); };
+                const int64_t I0 = Index(X0 / Level.TexelSize) - 1, I1 = Index(X1 / Level.TexelSize) + 1;
+                const int64_t J0 = Index(Y0 / Level.TexelSize) - 1, J1 = Index(Y1 / Level.TexelSize) + 1;
+                if (I1 < Level.OriginI || J1 < Level.OriginJ || I0 >= (int64_t)Level.OriginI + N || J0 >= (int64_t)Level.OriginJ + N) return;
+                const int64_t CI0 = (std::max)(I0, (int64_t)Level.OriginI), CJ0 = (std::max)(J0, (int64_t)Level.OriginJ);
+                const int64_t CI1 = (std::min)(I1, (int64_t)Level.OriginI + N - 1), CJ1 = (std::min)(J1, (int64_t)Level.OriginJ + N - 1);
+                R = FRect{ (int32_t)CI0, (int32_t)CJ0, (int32_t)(CI1 - CI0 + 1), (int32_t)(CJ1 - CJ0 + 1) };
+            }
+            // Coalesced: a rectangle inside one queued with it (both brush-sized, so written as
+            // soon) adds nothing; past the limit, all merge into their bounds.
+            for (const FRect& Q : Level.Dirty)
+                if (IsLargeRect(Q) == IsLargeRect(R) && R.I0 >= Q.I0 && R.J0 >= Q.J0 && R.I0 + R.Width <= Q.I0 + Q.Width && R.J0 + R.Height <= Q.J0 + Q.Height)
+                    return;
+            Level.Dirty.push_back(R);
+            if (Level.Dirty.size() > MaxDirtyRects)
+            {
+                int64_t I0 = Level.Dirty[0].I0, J0 = Level.Dirty[0].J0, I1 = I0 + Level.Dirty[0].Width, J1 = J0 + Level.Dirty[0].Height;
+                for (const FRect& Q : Level.Dirty)
+                {
+                    I0 = (std::min)(I0, (int64_t)Q.I0); J0 = (std::min)(J0, (int64_t)Q.J0);
+                    I1 = (std::max)(I1, (int64_t)Q.I0 + Q.Width); J1 = (std::max)(J1, (int64_t)Q.J0 + Q.Height);
+                }
+                Level.Dirty.assign(1, FRect{ (int32_t)I0, (int32_t)J0, (int32_t)(I1 - I0), (int32_t)(J1 - J0) });
+            }
+        }
     };
 }

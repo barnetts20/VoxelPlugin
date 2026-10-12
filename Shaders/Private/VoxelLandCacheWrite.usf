@@ -4,7 +4,8 @@
 // its height, its gradient and the bake's fields. The global-shader host of the shared land code,
 // so its inputs are constants and buffers, not the material's textures.
 //
-// The values: VoxelLandCacheWriter.ush (shared with the harness).
+// The values: VoxelLandCacheWriter.ush (shared with the harness); with the terrain edits applied
+// along the texel's column, VoxelLandCacheEdits.ush (Design/EditsAndCaves.md, E2).
 
 #include "/Engine/Public/Platform.ush"
 #include "/Plugin/VoxelPlugin/Private/VoxelDensityCore.ush"
@@ -48,6 +49,16 @@ float LandAbyssDepth;
 float LandCoastHeight;
 float LandInteriorHeight;
 
+// The terrain edits (VoxelEditSample.ush, VoxelLandCacheEdits.ush; FVoxelEditGPUData).
+StructuredBuffer<uint> EditCells;
+StructuredBuffer<uint> EditOpList;
+StructuredBuffer<uint> EditOps;
+uint EditTableMask;
+uint EditCellShift;
+uint EditOpCount;
+int3 EditCellMin;
+int3 EditCellMax;
+
 // The rectangle: the tile written, texel size, global texel indices, the frame's inverse.
 int CacheTile;
 float TexelSize;
@@ -75,6 +86,8 @@ RWTexture2D<float4> OutFields;
 #include "/Plugin/VoxelPlugin/Private/VoxelLandDebugColor.ush"
 #include "/Plugin/VoxelPlugin/Private/VoxelLandCache.ush"
 #include "/Plugin/VoxelPlugin/Private/VoxelLandCacheWriter.ush"
+#include "/Plugin/VoxelPlugin/Private/VoxelEditSample.ush"
+#include "/Plugin/VoxelPlugin/Private/VoxelLandCacheEdits.ush"
 
 [numthreads(VOXEL_LAND_CACHE_GROUP, VOXEL_LAND_CACHE_GROUP, 1)]
 void WriteCS(uint3 Id : SV_DispatchThreadID)
@@ -87,10 +100,14 @@ void WriteCS(uint3 Id : SV_DispatchThreadID)
 
     // The land, band-limited to the texel; the gullies differenced over max(T0, T / 2).
     const FVoxelLandCacheSurface Surface = VoxelLandCacheSurfaceAt(P.X, P.Y, P.Z, TexelSize, max(VOXEL_LAND_CACHE_T0, 0.5f * TexelSize));
-    const float HeightM = Surface.Height;
+
+    // The edits along the texel's column: the edited surface where there is one, else flagged
+    // (the material shows the mesh's normal there).
+    const FVoxelLandCacheEdited Edited = VoxelLandCacheEditColumn(P.X, P.Y, P.Z, SeaRadius, Surface.Height, Surface.Gradient, TexelSize);
+    const float HeightM = Edited.Height;
 
     // The bake's fields at the nearest cell of the warped direction (when the bake has them).
-    float4 Fields = float4(0.0f, 0.0f, VOXEL_LAND_CACHE_NO_LAKE, 1.0f);
+    float4 Fields = float4(0.0f, 0.0f, VOXEL_LAND_CACHE_NO_LAKE, Edited.State == 2u ? 2.0f : 1.0f);
     if (LandMode != 0u && LandDebugHasAttr != 0u)
     {
         const FVoxelLandDebugCell Cell = VoxelLandDebugCellOf(Surface.Warped);
@@ -107,6 +124,6 @@ void WriteCS(uint3 Id : SV_DispatchThreadID)
 
     const int2 Atlas = VoxelLandCacheAtlasTexel(CacheTile, VoxelLandCacheSlot(I), VoxelLandCacheSlot(J));
     OutHeight[Atlas] = HeightM;
-    OutSlope[Atlas] = float4(Surface.Gradient, Surface.Flow);
+    OutSlope[Atlas] = float4(Edited.Gradient, Surface.Flow);
     OutFields[Atlas] = Fields;
 }

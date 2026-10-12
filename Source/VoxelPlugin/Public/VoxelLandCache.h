@@ -6,6 +6,10 @@
 // The terrain actor owns one per terrestrial density: the textures (render targets, kept alive
 // by the actor's properties) and the plan (Private/VoxelLandCachePlan.h: the levels' anchors and
 // windows, and what to write each frame within a texel budget, voxel.Land.CacheTexelsPerFrame).
+//
+// The terrain edits are in it (Design/EditsAndCaves.md, E2; VoxelLandCacheEdits.ush): the writes
+// apply the brick terrain's GPU edit data (SetEdits), and an edit's texels are written again
+// (NotifyEdit) once that data carries it, so the cache and the mesh change together.
 
 #pragma once
 
@@ -14,6 +18,7 @@
 
 class FVoxelDensityCPU;
 struct FVoxelDensityGPUData;
+struct FVoxelEditGPUData;
 class UMaterialInstanceDynamic;
 class UTextureRenderTarget2D;
 class UTexture2DDynamic;
@@ -75,6 +80,17 @@ public:
      *  follows what is written. Waits while the write shader or the textures aren't ready. */
     void Tick(const FVector& CameraPlanet);
 
+    /** Game thread, every frame before Tick: the terrain edits the writes apply (the brick
+     *  terrain's GPU data, built at Sequence; null: not built yet, the last set stays). A notice
+     *  at or before Sequence then writes its texels again. A sequence going back (the edit
+     *  store replaced) writes everything again. */
+    void SetEdits(TSharedPtr<const FVoxelEditGPUData> InEdits, uint32 Sequence);
+
+    /** Game thread. Edit Sequence changed the density within Bounds (the planet's frame, cm):
+     *  its texels are written again, in place and ahead of the other writes, once the edits set
+     *  carry it (SetEdits). */
+    void NotifyEdit(uint32 Sequence, const FBox& Bounds);
+
     /** Game thread. The textures on a material instance. */
     void SetTextureParameters(UMaterialInstanceDynamic* Material) const;
 
@@ -88,6 +104,16 @@ private:
 
     TUniquePtr<VoxelLandCachePlan::FPlan> Plan;
     TSharedPtr<const FVoxelDensityGPUData, ESPMode::ThreadSafe> GPUData;
+    /** The edits the writes apply, and the edit sequence they were built at. */
+    TSharedPtr<const FVoxelEditGPUData> Edits;
+    uint32 EditsSequence = 0;
+    /** Notices the edits set doesn't carry yet. */
+    struct FPendingEdit
+    {
+        uint32 Sequence = 0;
+        FBox Bounds = FBox(ForceInit);
+    };
+    TArray<FPendingEdit> PendingEdits;
     double SeaRadius = 0.0;
     FVoxelLandCacheTextures Textures;
     uint64 TexelsWritten = 0;

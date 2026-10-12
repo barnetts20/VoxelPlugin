@@ -1416,7 +1416,8 @@ FVoxelLandDebugParameters VoxelLandGPU::GetDebugParameters(FRDGBuilder& GraphBui
         }
         // The lake levels, for the views that show the hydrology, when the bake has them (the
         // drainage is the density's, VoxelLandGPU::GetParameters).
-        const bool bHydro = (Mode == 9 || Mode == 10) /* VOXEL_LAND_VIEW_FLOW, _LAKES */ && Bake->Flow.Num() == Bake->NumCells() && Bake->Water.Num() == Bake->NumCells();
+        // VOXEL_LAND_VIEW_FLOW, _LAKES, _WATER, _TERRAIN_WATER.
+        const bool bHydro = (Mode == 9 || Mode == 10 || Mode == 12 || Mode == 13) && Bake->Flow.Num() == Bake->NumCells() && Bake->Water.Num() == Bake->NumCells();
         if (bHydro && !Resource.Water.IsValid())
         {
             Resource.Water = GraphBuilder.ConvertToExternalBuffer(

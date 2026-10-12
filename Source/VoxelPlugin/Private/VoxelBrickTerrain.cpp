@@ -60,7 +60,9 @@ TAutoConsoleVariable<int32> CVarVoxelDebugLandView(
     TEXT(" 9: drainage (rivers: blue from 1,000 km^2)\n")
     TEXT(" 10: lakes by depth\n")
     TEXT(" 11: the gullies (blue down, red up, over their local depth)\n")
-    TEXT("2 to 6 and 8 to 11 need a terrestrial planet, 9 and 10 a GPU bake (magenta otherwise)."),
+    TEXT(" 12: lakes and rivers (blue over neutral ground)\n")
+    TEXT(" 13: elevation with the lakes and rivers over it\n")
+    TEXT("2 to 6 and 8 to 13 need a terrestrial planet, 9, 10, 12 and 13 a GPU bake (magenta otherwise)."),
     ECVF_Default);
 
 static TAutoConsoleVariable<int32> CVarVoxelBrickPerf(
@@ -537,7 +539,8 @@ namespace VoxelBrickTerrainDetail
     {
         using namespace VoxelShader;
         static const TCHAR* Names[VOXEL_LAND_VIEW_COUNT] = { TEXT("off"), TEXT("elevation"), TEXT("bake height"), TEXT("detail layer"),
-            TEXT("crust"), TEXT("boundary class"), TEXT("plates"), TEXT("slope"), TEXT("bake cells"), TEXT("drainage"), TEXT("lakes"), TEXT("gullies") };
+            TEXT("crust"), TEXT("boundary class"), TEXT("plates"), TEXT("slope"), TEXT("bake cells"), TEXT("drainage"), TEXT("lakes"), TEXT("gullies"),
+            TEXT("lakes and rivers"), TEXT("elevation, lakes and rivers") };
         TArray<FLegendLine> Lines;
         Lines.Add({ FString::Printf(TEXT("voxel.Debug.LandView %d: %s (0 hides it; %s)"), View, Names[View],
             bPerPixel
@@ -634,6 +637,21 @@ namespace VoxelBrickTerrainDetail
             Add(TEXT("sea"), VoxelLandViewLake(0.0f, false, true));
             Add(TEXT("magenta: the bake has no drainage (a CPU bake)"), VoxelLandViewNone());
             break;
+        case VOXEL_LAND_VIEW_WATER:
+        case VOXEL_LAND_VIEW_TERRAIN_WATER:
+        {
+            const bool bTerrain = View == (int32)VOXEL_LAND_VIEW_TERRAIN_WATER;
+            const float3 Land = bTerrain ? VoxelLandViewHeight(300.0f, 1.0e9f) : VoxelLandViewDry(false);
+            Add(TEXT("lake, shallow"), VoxelLandViewWater(Land, 0.0f, 0.0f, true, false));
+            Add(TEXT("lake, 100 m and deeper"), VoxelLandViewWater(Land, 0.0f, 100.0f, true, false));
+            Add(TEXT("stream, 10 km^2"), VoxelLandViewWater(Land, 1.0f, 0.0f, false, false));
+            Add(TEXT("river, 1,000 km^2"), VoxelLandViewWater(Land, 3.0f, 0.0f, false, false));
+            Add(TEXT("river, 100,000 km^2"), VoxelLandViewWater(Land, 5.0f, 0.0f, false, false));
+            Add(bTerrain ? TEXT("land (the elevation's colours; 300 m here)") : TEXT("land"), Land);
+            Add(TEXT("sea"), bTerrain ? VoxelLandViewHeight(-800.0f, 1.0e9f) : VoxelLandViewDry(true));
+            Add(TEXT("magenta: the bake has no drainage (a CPU bake)"), VoxelLandViewNone());
+            break;
+        }
         default:
             break;
         }
@@ -698,6 +716,7 @@ void FVoxelBrickTerrain::Initialize(AActor* InOwner, USceneComponent* InAttachRo
     LastLandView = GetVertexLandView(Settings.bMaterialLandViews);
     GPUDensity.Reset();
     GPUEdits.Reset();
+    GPUEditsSequence = 0;
     EditBuild.Reset();
     bWarnedUnavailable = false;
     bReportedMorph = false;

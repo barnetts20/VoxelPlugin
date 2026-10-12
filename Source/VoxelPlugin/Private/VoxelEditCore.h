@@ -368,6 +368,12 @@ namespace VoxelEditCore
         double StrokeTolerance = 0.02;           // of the radius: straight-line and stay-put tolerance
         double MaxSegment = 2.0;                 // of the radius: a stroke's capsule grows no longer
                                                  // (an extension rewrites its whole length's surface)
+        bool bStretch = false;                   // a continued stroke stretches its one capsule from
+                                                 // where it started to the new centre, any direction
+                                                 // (a tunnel dragged out while held); the containment
+                                                 // rule waits for EndStroke
+        double MaxStretch = 100.0;               // of the radius: a stretched capsule's longest (its
+                                                 // end stops there along the way to the centre)
     };
 
     /** The state after one more edit (a sphere at Centre), continuing the previous call's stroke
@@ -397,7 +403,47 @@ namespace VoxelEditCore
 
         int32_t Changed = -1;   // the op added or extended
         const bool bStroke = Options.bCompact && bContinue && S.StrokeOp >= 0 && S.StrokeOp == (int32_t)S.Ops.size() - 1;
-        if (bStroke)
+        if (bStroke && Options.bStretch)
+        {
+            FOp& Last = S.Ops[S.StrokeOp];
+            const bool bSameBrush = Last.Mode == Mode && std::fabs(Last.Radius - Radius) <= 1e-6 * (1.0 + Radius) && std::fabs(Last.Blend - Blend) <= 1e-6 * (1.0 + Blend);
+            if (bSameBrush)
+            {
+                // The end, at most MaxStretch radii from the start.
+                double End[3] = { Centre[0], Centre[1], Centre[2] };
+                double Length2 = 0.0;
+                for (int a = 0; a < 3; a++) Length2 += (End[a] - Last.A[a]) * (End[a] - Last.A[a]);
+                const double MaxLength = Options.MaxStretch * Radius;
+                if (Length2 > MaxLength * MaxLength)
+                {
+                    const double Scale = MaxLength / std::sqrt(Length2);
+                    for (int a = 0; a < 3; a++) End[a] = Last.A[a] + (End[a] - Last.A[a]) * Scale;
+                }
+                double Move2 = 0.0;
+                for (int a = 0; a < 3; a++) Move2 += (End[a] - Last.B[a]) * (End[a] - Last.B[a]);
+                if (Move2 <= Tolerance * Tolerance)
+                {
+                    // Held still: nothing changes.
+                    S.Cells = Old.Cells;
+                    S.Bounds = Old.Bounds;
+                    return S;
+                }
+                // The capsule's end moves (it may shorten or turn: what it covered before and
+                // doesn't now is the earlier ops' again, so both shapes are dirty). No
+                // containment: an op inside the capsule now may not be once it moves on.
+                const FOp Before = Last;
+                for (int a = 0; a < 3; a++) Last.B[a] = End[a];
+                Last.Sequence = S.LastSequence + 1;
+                S.LastSequence++;
+                for (int a = 0; a < 3; a++) S.StrokeEnd[a] = End[a];
+                S.Reindex();
+                Out.bChanged = true;
+                Out.Dirty = BoundsOf(Before, S.MaxBlend);
+                Out.Dirty.Add(BoundsOf(Last, S.MaxBlend));
+                return S;
+            }
+        }
+        else if (bStroke)
         {
             FOp& Last = S.Ops[S.StrokeOp];
             double Move2 = 0.0;
@@ -510,6 +556,38 @@ namespace VoxelEditCore
         Out.Dirty = BoundsOf(Latest, S.MaxBlend);
         if (S.MaxBlend > Old.MaxBlend)
             Out.Dirty.Add(S.Bounds);
+        return S;
+    }
+
+    /** The state once the brush is released: the stroke ends (the next edit starts a new one),
+     *  and a stretched capsule, final now, applies the containment rule it skipped while held.
+     *  The surface doesn't change (Out.bChanged false, Out.Dirty empty); Out.Dropped counts the
+     *  ops it made irrelevant. */
+    inline FState EndStroke(const FState& Old, const FInsertOptions& Options, FInsertResult& Out)
+    {
+        Out = FInsertResult();
+        FState S = Old;
+        const int32_t Stroke = S.StrokeOp;
+        S.StrokeOp = -1;
+        if (!Options.bCompact || Stroke < 0 || Stroke >= (int32_t)S.Ops.size()) return S;
+        const FOp Latest = S.Ops[Stroke];
+        std::vector<FOp> Kept;
+        Kept.reserve(S.Ops.size());
+        // Only ops before the stroke: it is the newest (a stroke op is always the last).
+        for (int32_t i = 0; i < (int32_t)S.Ops.size(); i++)
+        {
+            if (i < Stroke && Contains(Latest, S.Ops[i], 4.0 * S.HalfFinest, S.MaxBlend))
+            {
+                Out.Dropped++;
+                continue;
+            }
+            Kept.push_back(S.Ops[i]);
+        }
+        if (Out.Dropped > 0)
+        {
+            S.Ops.swap(Kept);
+            S.Reindex();
+        }
         return S;
     }
 

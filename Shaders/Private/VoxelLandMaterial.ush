@@ -11,7 +11,9 @@
 //                 warp, plus the screen-space change of the gullies and the detail (their analytic
 //                 gradients leave out terms as large as they keep). Where the pixel lies off the
 //                 analytic surface by more than the tolerance (edits, overhangs, a coarse mesh far
-//                 off), it fades to the mesh's normal;
+//                 off), it fades to the mesh's normal. The cache holds the edited surface
+//                 (Design/EditsAndCaves.md, E2), and flags what a height can't describe (an
+//                 overhang, a tunnel's mouth, a wall): the mesh's normal there too;
 //   NormalTS      the same in tangent space (for materials with Tangent Space Normal on);
 //   Fields        x the drainage (log2 m^2), y the crust (0 oceanic..1 continental), z the boundary
 //                 class (0..6; +8 under a kept lake), w the kept lake's depth above the analytic
@@ -270,7 +272,7 @@ float VoxelLandFacingToMesh(float3 Land, float3 Mesh)
 }
 
 /** A cache view's display (sRGB) colour: the views the cache holds (elevation, slope, crust,
- *  class, drainage, lakes), from its values. */
+ *  class, drainage, lakes, and the water views), from its values. */
 float3 VoxelLandCacheColor(FVoxelLandCacheSample C, uint Mode, float Elevation, float SlopeDegrees, float CellM, bool bHydro)
 {
     if (Mode == VOXEL_LAND_VIEW_ELEVATION) return VoxelLandViewHeight(Elevation, CellM);
@@ -288,6 +290,14 @@ float3 VoxelLandCacheColor(FVoxelLandCacheSample C, uint Mode, float Elevation, 
         const bool bHasLake = C.Fields.z > VOXEL_LAND_CACHE_NO_LAKE + 1.0f;
         return VoxelLandViewLake(C.Fields.z - Elevation, bHasLake && Elevation < C.Fields.z, Elevation <= 0.0f);
     }
+    if (Mode == VOXEL_LAND_VIEW_WATER || Mode == VOXEL_LAND_VIEW_TERRAIN_WATER)
+    {
+        if (!bHydro) return VoxelLandViewNone();
+        const bool bSea = Elevation <= 0.0f;
+        const bool bLake = C.Fields.z > VOXEL_LAND_CACHE_NO_LAKE + 1.0f && Elevation < C.Fields.z;
+        const float3 Ground = Mode == VOXEL_LAND_VIEW_WATER ? VoxelLandViewDry(bSea) : VoxelLandViewHeight(Elevation, CellM);
+        return VoxelLandViewWater(Ground, C.Flow * 0.30103f - 6.0f, C.Fields.z - Elevation, bLake, bSea);
+    }
     return VoxelLandViewNone();
 }
 
@@ -295,7 +305,8 @@ float3 VoxelLandCacheColor(FVoxelLandCacheSample C, uint Mode, float Elevation, 
 bool VoxelLandCacheHasView(uint Mode)
 {
     return Mode == VOXEL_LAND_VIEW_ELEVATION || Mode == VOXEL_LAND_VIEW_SLOPE || Mode == VOXEL_LAND_VIEW_CRUST
-        || Mode == VOXEL_LAND_VIEW_CLASS || Mode == VOXEL_LAND_VIEW_FLOW || Mode == VOXEL_LAND_VIEW_LAKES;
+        || Mode == VOXEL_LAND_VIEW_CLASS || Mode == VOXEL_LAND_VIEW_FLOW || Mode == VOXEL_LAND_VIEW_LAKES
+        || Mode == VOXEL_LAND_VIEW_WATER || Mode == VOXEL_LAND_VIEW_TERRAIN_WATER;
 }
 
 /** The cache's level as a colour (voxel.Debug.LandCache): a hue a level, darker between two. */
@@ -364,7 +375,9 @@ float3 VoxelLandCacheLevelColor(float Level)
         const float Offset = (Above.x + Above.y) * 0.01f; \
         const float3 Up = normalize(float3(Point.X.x, Point.Y.x, Point.Z.x)); \
         const float3 Analytic = normalize(Up - (C.Gradient - Up * dot(C.Gradient, Up))); \
-        const float ToMesh = max(saturate(abs(Offset) / Tolerance - 1.0f), VoxelLandFacingToMesh(Analytic, MeshLocal)); \
+        /* The mesh's normal off the cached surface, facing away from it, or where the edits */ \
+        /* flag the cache (an overhang, a tunnel's mouth, a wall: VoxelLandCacheEdits.ush). */ \
+        const float ToMesh = max(max(saturate(abs(Offset) / Tolerance - 1.0f), VoxelLandFacingToMesh(Analytic, MeshLocal)), C.Edited); \
         const float3 Shown = normalize(lerp(Analytic, MeshLocal, ToMesh)); \
         NormalWS = normalize(AxisX * Shown.x + AxisY * Shown.y + AxisZ * Shown.z); \
         NormalTS = normalize(mul(Parameters.TangentToWorld, NormalWS)); \

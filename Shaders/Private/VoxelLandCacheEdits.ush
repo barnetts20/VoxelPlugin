@@ -1,0 +1,188 @@
+// VoxelLandCacheEdits.ush - The terrain edits in the land surface cache (Design/EditsAndCaves.md,
+// E2): what the cache's writer (VoxelLandCacheWrite.usf) stores for a texel whose column the
+// edits reach. The density with the edits applied (VoxelEditSample.ush) is evaluated along the
+// texel's column, about the land's height there:
+//   - one crossing, solid below and air above (a crater, a mound, a dug-out slope): that height,
+//     and the gradient of the edited surface there (a central difference over at most half a
+//     texel), so edited ground gets the cache's normals;
+//   - several crossings, none in the column, or a surface steeper than 75 degrees (an overhang,
+//     a tunnel's mouth, a wall, a pit deeper than the column): the texel is flagged, and the
+//     terrain material shows the mesh's normal there (VoxelLandCacheSample.ush). It still holds
+//     the topmost crossing (or the land's height), so its neighbours' bilinear reads stay sane.
+// A column whose surface no edit moves keeps the land's own values (its exact gradient): its
+// sides are the land's at every sample, and its values within two samples of the land's height.
+//
+// Near the surface the land's density is the height above it (cm, positive in air;
+// VoxelDensitySample.ush): along the column exactly the distance from the land's height, and
+// across it the land's own slope, so the base density about the surface point is
+// dot(Offset, Up - Gradient). The edits then apply as in the mesher, at the texel's footprint
+// (an edit narrower than a texel closes, as it does in the mesh at that size).
+//
+// Inputs, declared by the includer: the edit inputs (VoxelEditSample.ush, included before this),
+// HalfFinest, and
+//   int3 EditCellMin, EditCellMax;    the index cells any edit reaches (inclusive): a column
+//                                     away from them is the land's
+//
+// Shared subset (VoxelShaderCompat.h). Include after VoxelDF64.ush and VoxelEditSample.ush.
+
+#ifndef VOXEL_LAND_CACHE_EDITS_USH
+#define VOXEL_LAND_CACHE_EDITS_USH
+
+#define VOXEL_LAND_CACHE_EDIT_HALF 24                 // samples each side of the land's height
+#define VOXEL_LAND_CACHE_EDIT_SPACING 100.0f          // cm between samples: the column is +-24 m
+#define VOXEL_LAND_CACHE_EDIT_BISECT 12               // bisection steps in a sample interval (0.25 mm)
+#define VOXEL_LAND_CACHE_EDIT_STEP_MAX 100.0f         // cm: the gradient's largest difference step
+#define VOXEL_LAND_CACHE_EDIT_STEEP 0.2588190f        // cos 75 degrees: steeper is flagged
+#define VOXEL_LAND_CACHE_EDIT_MAX_SLOPE 4.0f          // m/m: the largest gradient stored
+
+#ifndef VOXEL_LOOP
+#define VOXEL_LOOP [loop]
+#endif
+
+/** What the cache stores for a texel's column with the edits. */
+struct FVoxelLandCacheEdited
+{
+    uint State;          // 0 no edit changes the column (the land's values stand); 1 one surface;
+                         // 2 flagged (the mesh's normal there)
+    float Height;        // m about sea level
+    float3 Gradient;     // m/m, tangent (planet frame)
+};
+
+/** A column: a lattice point near the land's surface point, the surface point from it (cm), the
+ *  column's direction, and the land density's gradient. */
+struct FVoxelLandCacheColumn
+{
+    int LX;
+    int LY;
+    int LZ;
+    float3 Base;
+    float3 Up;
+    float3 Slope;
+    float Footprint;
+    float CellHalf;      // HalfFinest as one float
+};
+
+/** The edited density at Offset (cm) from the column's surface point, the land's there being D. */
+VOXEL_FUNC float VoxelLandCacheEditAt(FVoxelLandCacheColumn C, float3 Offset, float D)
+{
+    const float3 P = C.Base + Offset;
+    // The lattice point the offset lies past: its index cell holds the point.
+    const int X = C.LX + int(floor(P.x / C.CellHalf));
+    const int Y = C.LY + int(floor(P.y / C.CellHalf));
+    const int Z = C.LZ + int(floor(P.z / C.CellHalf));
+    const uint Range = VoxelEditFindCell(X, Y, Z);
+    if (Range == 0u) return D;
+    return VoxelEditApplyRange(Range, C.LX, C.LY, C.LZ, P, C.Footprint, D);
+}
+
+/** The texel at P (its centre on the sea-level sphere, planet frame, double-float cm) whose land
+ *  is HeightM (m about sea level) with Gradient (tangent, m/m), written at TexelSize (cm). */
+VOXEL_FUNC FVoxelLandCacheEdited VoxelLandCacheEditColumn(float2 PX, float2 PY, float2 PZ, float2 SeaRadius, float HeightM, float3 Gradient, float TexelSize)
+{
+    FVoxelLandCacheEdited Out;
+    Out.State = 0u;
+    Out.Height = HeightM;
+    Out.Gradient = Gradient;
+    if (EditOpCount == 0u) return Out;
+
+    // The land's surface point, on the texel's ray (double-float), and the lattice point below
+    // it on each axis.
+    const float2 Scale = VoxelDFDiv(VoxelDFAdd(SeaRadius, float2(HeightM * 100.0f, 0.0f)), SeaRadius);
+    const float2 SX = VoxelDFMul(PX, Scale);
+    const float2 SY = VoxelDFMul(PY, Scale);
+    const float2 SZ = VoxelDFMul(PZ, Scale);
+    const FVoxelLatticeSplit LX = VoxelDFLatticeSplit(VoxelDFDiv(SX, HalfFinest));
+    const FVoxelLatticeSplit LY = VoxelDFLatticeSplit(VoxelDFDiv(SY, HalfFinest));
+    const FVoxelLatticeSplit LZ = VoxelDFLatticeSplit(VoxelDFDiv(SZ, HalfFinest));
+
+    FVoxelLandCacheColumn C;
+    C.LX = LX.Cell;
+    C.LY = LY.Cell;
+    C.LZ = LZ.Cell;
+    C.CellHalf = HalfFinest.x + HalfFinest.y;
+    C.Base = float3(LX.Frac, LY.Frac, LZ.Frac) * C.CellHalf;
+    C.Up = normalize(float3(SX.x, SY.x, SZ.x));
+    C.Slope = C.Up - (Gradient - C.Up * dot(Gradient, C.Up));
+    C.Footprint = TexelSize;
+
+    // Away from every index cell an edit reaches (the column and the differences reach
+    // 25 m and a lattice cell from the surface point).
+    const float CellSize = C.CellHalf * float(1u << EditCellShift);
+    const int Reach = int(ceil((float(VOXEL_LAND_CACHE_EDIT_HALF) * VOXEL_LAND_CACHE_EDIT_SPACING + VOXEL_LAND_CACHE_EDIT_STEP_MAX + C.CellHalf) / CellSize));
+    const int CX = C.LX >> int(EditCellShift);
+    const int CY = C.LY >> int(EditCellShift);
+    const int CZ = C.LZ >> int(EditCellShift);
+    if (CX + Reach < EditCellMin.x || CX - Reach > EditCellMax.x || CY + Reach < EditCellMin.y || CY - Reach > EditCellMax.y
+        || CZ + Reach < EditCellMin.z || CZ - Reach > EditCellMax.z)
+        return Out;
+
+    // The column, bottom to top: the sign changes, and the topmost from solid to air.
+    bool bChanged = false;
+    bool bAirBelow = false;
+    bool bAirBottom = false;
+    int Changes = 0;
+    int Upper = -1;
+    VOXEL_LOOP
+    for (int k = 0; k <= 2 * VOXEL_LAND_CACHE_EDIT_HALF; k++)
+    {
+        const float T = float(k - VOXEL_LAND_CACHE_EDIT_HALF) * VOXEL_LAND_CACHE_EDIT_SPACING;
+        const float F = VoxelLandCacheEditAt(C, C.Up * T, T);
+        const bool bAir = F > 0.0f;
+        // The surface moved: a side changed, or a value near the land's height. (Farther in
+        // solid or air an index cell's ops change values without reaching the surface.)
+        bChanged = bChanged || bAir != (T > 0.0f) || (abs(T) <= 2.0f * VOXEL_LAND_CACHE_EDIT_SPACING && F != T);
+        if (k == 0)
+            bAirBottom = bAir;
+        else if (bAir != bAirBelow)
+        {
+            Changes++;
+            if (bAir) Upper = k - 1;
+        }
+        bAirBelow = bAir;
+    }
+    if (!bChanged) return Out;
+    Out.State = 2u;
+    // No surface in the column (dug or filled past it): the land's values, flagged.
+    if (Upper < 0) return Out;
+
+    // The topmost crossing.
+    float Lo = float(Upper - VOXEL_LAND_CACHE_EDIT_HALF) * VOXEL_LAND_CACHE_EDIT_SPACING;
+    float Hi = Lo + VOXEL_LAND_CACHE_EDIT_SPACING;
+    VOXEL_LOOP
+    for (int b = 0; b < VOXEL_LAND_CACHE_EDIT_BISECT; b++)
+    {
+        const float Mid = 0.5f * (Lo + Hi);
+        if (VoxelLandCacheEditAt(C, C.Up * Mid, Mid) > 0.0f)
+            Hi = Mid;
+        else
+            Lo = Mid;
+    }
+    const float Tc = 0.5f * (Lo + Hi);
+    Out.Height = HeightM + Tc * 0.01f;
+
+    // The edited density's gradient there: central differences over half a texel (at most a
+    // metre: the land's own detail is the land's gradient, already in Slope).
+    const float Step = min(0.5f * TexelSize, VOXEL_LAND_CACHE_EDIT_STEP_MAX);
+    const float3 At = C.Up * Tc;
+    const float3 EX = float3(Step, 0.0f, 0.0f);
+    const float3 EY = float3(0.0f, Step, 0.0f);
+    const float3 EZ = float3(0.0f, 0.0f, Step);
+    const float3 Grad = float3(
+        VoxelLandCacheEditAt(C, At + EX, dot(At + EX, C.Slope)) - VoxelLandCacheEditAt(C, At - EX, dot(At - EX, C.Slope)),
+        VoxelLandCacheEditAt(C, At + EY, dot(At + EY, C.Slope)) - VoxelLandCacheEditAt(C, At - EY, dot(At - EY, C.Slope)),
+        VoxelLandCacheEditAt(C, At + EZ, dot(At + EZ, C.Slope)) - VoxelLandCacheEditAt(C, At - EZ, dot(At - EZ, C.Slope)));
+    const float GradLength = length(Grad);
+    if (!(GradLength > 0.0f)) return Out;
+    const float3 Normal = Grad / GradLength;
+    const float Facing = dot(Normal, C.Up);
+    // The height field's gradient for that normal (Normal ~ Up - Gradient), bounded.
+    float3 G = -(Normal - C.Up * Facing) / max(Facing, 1.0f / VOXEL_LAND_CACHE_EDIT_MAX_SLOPE);
+    const float GLength = length(G);
+    if (GLength > VOXEL_LAND_CACHE_EDIT_MAX_SLOPE) G = G * (VOXEL_LAND_CACHE_EDIT_MAX_SLOPE / GLength);
+    Out.Gradient = G;
+    if (Changes == 1 && !bAirBottom && Facing >= VOXEL_LAND_CACHE_EDIT_STEEP)
+        Out.State = 1u;
+    return Out;
+}
+
+#endif // VOXEL_LAND_CACHE_EDITS_USH

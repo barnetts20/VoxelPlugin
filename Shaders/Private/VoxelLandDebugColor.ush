@@ -98,6 +98,15 @@ VOXEL_FUNC float3 VoxelLandDebugColor(VOXEL_LAND_ARGS_DECL FVoxelLandDebugInput 
         const bool bLake = Level > -1.0e30f && In.Elevation < Level;
         return VoxelLandViewLake(Level - In.Elevation, bLake, In.Elevation <= 0.0f);
     }
+    if (In.Mode == VOXEL_LAND_VIEW_WATER || In.Mode == VOXEL_LAND_VIEW_TERRAIN_WATER)
+    {
+        if (!In.bHydro) return VoxelLandViewNone();
+        const float Level = VOXEL_LAND_WATER(Index);
+        const bool bLake = Level > -1.0e30f && In.Elevation < Level;
+        const bool bSea = In.Elevation <= 0.0f;
+        const float3 Ground = In.Mode == VOXEL_LAND_VIEW_WATER ? VoxelLandViewDry(bSea) : VoxelLandViewHeight(In.Elevation, In.CellM);
+        return VoxelLandViewWater(Ground, VoxelLandFlowAt(VOXEL_LAND_ARGS Index) * 0.30103f - 6.0f, Level - In.Elevation, bLake, bSea);
+    }
     const uint Attr = VOXEL_LAND_ATTR(Index);
     const float Crust = float(Attr & 0xffu) / 255.0f;
     if (In.Mode == VOXEL_LAND_VIEW_CRUST) return VoxelLandViewCrust(Crust);

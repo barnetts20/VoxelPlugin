@@ -395,6 +395,122 @@ int main()
                 Sink += Strokes.Apply(P.data(), 0.0, 0.0);
         printf("  CPU: %.0f ns a sample near the edits (%g)\n", (Now() - T0) * 1e9 / (5.0 * Points.size()), Sink * 0.0);
     }
+    // Stretching (FInsertOptions::bStretch, the debug brush held): one capsule from the press
+    // point to the brush, any length and direction, over earlier digs. While held, the field
+    // must be the earlier ops plus that capsule exactly (none dropped: the capsule may shrink
+    // back off them), and each update's dirty box must hold every change; released
+    // (EndStroke), the contained digs go and the surface stays.
+    {
+        printf("\n== stretch: a capsule dragged forward 40 m, back to 10 m, sideways, over 35 earlier digs\n");
+        std::uniform_real_distribution<double> U(-1.0, 1.0);
+        const double A[3] = { 2000.0, -6000.0, Ground(2000.0, -6000.0) - 400.0 };
+        std::vector<FHit> Before;
+        for (int i = 0; i < 30; i++)
+        {
+            const double X = A[0] + 3000.0 * (0.5 + 0.5 * U(Rng)), Y = A[1] + 150.0 * U(Rng);
+            Before.push_back({ EMode::Carve, { X, Y, Ground(X, Y) - 400.0 + 100.0 * U(Rng) }, 80.0, 20.0, false });
+        }
+        // Five more on the final capsule's axis (inside it once released; the brush passes over
+        // them on the way out and back).
+        const double FinalB[3] = { A[0] + 1000.0, A[1] + 1500.0, A[2] - 40.0 };
+        for (int i = 1; i <= 5; i++)
+        {
+            const double T = i / 6.0;
+            Before.push_back({ EMode::Carve, { A[0] + T * (FinalB[0] - A[0]), A[1] + T * (FinalB[1] - A[1]), A[2] + T * (FinalB[2] - A[2]) }, 80.0, 20.0, false });
+        }
+        int32_t Dropped = 0;
+        double Ms = 0.0;
+        FState S = Build(Before, true, false, Dropped, Ms);
+        const size_t BeforeOps = S.Ops.size();
+        FInsertOptions Stretch;
+        Stretch.bStretch = true;
+        FInsertResult R;
+        S = Insert(S, EMode::Carve, A, 300.0, 75.0, false, FInsertOptions(), R);   // the press: a sphere
+        const size_t PressOps = S.Ops.size();
+
+        // The path of the brush: forward 40 m, back to 10 m, then 15 m sideways.
+        std::vector<std::array<double, 3>> Path;
+        for (int i = 1; i <= 80; i++) Path.push_back({ A[0] + 50.0 * i, A[1], A[2] - 2.0 * i });
+        for (int i = 1; i <= 60; i++) Path.push_back({ A[0] + 4000.0 - 50.0 * i, A[1], A[2] - 160.0 + 2.0 * i });
+        for (int i = 1; i <= 30; i++) Path.push_back({ A[0] + 1000.0, A[1] + 50.0 * i, A[2] - 40.0 });
+
+        // Probes along the corridor.
+        std::vector<std::array<double, 3>> Points;
+        for (int i = 0; i < 30000; i++)
+            Points.push_back({ A[0] - 500.0 + 5000.0 * (0.5 + 0.5 * U(Rng)), A[1] - 500.0 + 2500.0 * (0.5 + 0.5 * U(Rng)), A[2] - 700.0 + 1000.0 * U(Rng) });
+
+        int64_t Wrong = 0, Outside = 0, Updates = 0;
+        size_t MinOps = (size_t)-1;
+        std::vector<double> Prev(Points.size());
+        for (size_t p = 0; p < Points.size(); p++) Prev[p] = S.Apply(Points[p].data(), 0.0, Base(Points[p].data()));
+        for (const auto& B : Path)
+        {
+            S = Insert(S, EMode::Carve, B.data(), 300.0, 75.0, true, Stretch, R);
+            if (!R.bChanged) continue;
+            Updates++;
+            MinOps = std::min(MinOps, S.Ops.size());
+            // The reference: the earlier ops and the capsule from the press to here.
+            FOp Capsule = S.Ops.back();
+            for (int a = 0; a < 3; a++) { Capsule.A[a] = A[a]; Capsule.B[a] = B[a]; }
+            for (size_t p = 0; p < Points.size(); p += 7)
+            {
+                const double* P = Points[p].data();
+                double Ref = Base(P);
+                for (size_t o = 0; o + 1 < S.Ops.size(); o++) Ref = ApplyOp(S.Ops[o], P, 0.0, Ref);
+                Ref = ApplyOp(Capsule, P, 0.0, Ref);
+                const double Ours = S.ApplyWithin(P, 1e30, 0.0, Base(P));
+                if (std::fabs(Ref - Ours) > 1e-9) Wrong++;
+            }
+            for (size_t p = 0; p < Points.size(); p++)
+            {
+                const double* P = Points[p].data();
+                const double Now = S.Apply(P, 0.0, Base(P));
+                // The surface moving outside the box: a side changed, or a value within 5 cm of it
+                // (farther from the surface an op reaches past its box by its blend: E1's deep
+                // values, which the consumers' margins cover).
+                if (((Now > 0.0) != (Prev[p] > 0.0)) || ((std::fabs(Now) < 5.0 || std::fabs(Prev[p]) < 5.0) && std::fabs(Now - Prev[p]) > 1e-9))
+                {
+                    bool bIn = R.Dirty.bValid;
+                    for (int a = 0; a < 3 && bIn; a++) bIn = P[a] >= R.Dirty.Min[a] && P[a] <= R.Dirty.Max[a];
+                    if (!bIn && Outside < 3 && getenv("EDIT_DEBUG"))
+                    {
+                        const FOp& L = S.Ops.back();
+                        printf("    outside: P %.0f %.0f %.0f, before %.3f now %.3f; capsule %.0f %.0f %.0f - %.0f %.0f %.0f, distance %.1f; dirty %.0f..%.0f %.0f..%.0f %.0f..%.0f\n",
+                            P[0], P[1], P[2], Prev[p], Now, L.A[0], L.A[1], L.A[2], L.B[0], L.B[1], L.B[2], SegmentDistance(P, L.A, L.B),
+                            R.Dirty.Min[0], R.Dirty.Max[0], R.Dirty.Min[1], R.Dirty.Max[1], R.Dirty.Min[2], R.Dirty.Max[2]);
+                    }
+                    Outside += bIn ? 0 : 1;
+                }
+                Prev[p] = Now;
+            }
+        }
+        // Dragged 500 m out: the capsule stops at 100 radii (a copy; the release below is from
+        // the path's end).
+        double Clamped = 0.0;
+        {
+            const double Far[3] = { A[0] + 50000.0, A[1], A[2] };
+            FInsertResult FarResult;
+            const FState Long = Insert(S, EMode::Carve, Far, 300.0, 75.0, true, Stretch, FarResult);
+            const FOp& L = Long.Ops.back();
+            Clamped = std::sqrt((L.B[0] - L.A[0]) * (L.B[0] - L.A[0]) + (L.B[1] - L.A[1]) * (L.B[1] - L.A[1]) + (L.B[2] - L.A[2]) * (L.B[2] - L.A[2]));
+        }
+        const FState Held = S;
+        S = EndStroke(S, FInsertOptions(), R);
+        int64_t Flips = 0;
+        double Near = 0.0;
+        Compare(Held, S, Points, 25.0, Flips, Near);
+        const double* LastB = S.Ops.back().B;
+        const bool bOk = Wrong == 0 && Outside == 0 && MinOps == PressOps && S.StrokeOp < 0 && Flips == 0 && Near < 0.5 && R.Dropped >= 5
+            && std::fabs(LastB[0] - Path.back()[0]) < 1e-9 && std::fabs(Clamped - 30000.0) < 1e-6;
+        if (!bOk) Failures++;
+        printf("  %lld updates; ops %zu before the press, %zu while held (none dropped: %s); field against the earlier ops plus the capsule: %lld differ;"
+               " the surface moving outside the update's dirty box: %lld\n",
+            (long long)Updates, BeforeOps, MinOps, MinOps == PressOps ? "yes" : "NO", (long long)Wrong, (long long)Outside);
+        printf("  released: %d earlier digs inside the final capsule dropped (%zu ops); %lld probes change side, largest change near the surface %.3f cm\n",
+            R.Dropped, S.Ops.size(), (long long)Flips, Near);
+        printf("  dragged 500 m out: the capsule stops at %.1f m (100 radii)\n", Clamped * 0.01);
+    }
+
     printf("\n%s\n", Failures ? "FAILURES" : "all checks passed");
     return Failures;
 }

@@ -84,6 +84,9 @@ struct FVoxelEditGPUData
     uint32 TableMask = 0;
     uint32 CellShift = 0;
     uint32 OpCount = 0;         // 0: no edits
+    FIntVector CellMin = FIntVector(1);     // the index cells listed (inclusive; empty when none)
+    FIntVector CellMax = FIntVector(0);
+    double HalfFinest = 0.0;    // the lattice's half cell (cm): lattice point I is at I * HalfFinest
 
     /** Flattens Store's current edits. Empty (no edits on the GPU) with a warning when the
      *  store is not centred on the actor or its lattice is not the terrain's (HalfFinest). */

@@ -21,7 +21,8 @@
 //
 // Lattice indices count half finest cells from the root centre, so point I is at I * HalfFinest
 // in the store's frame. A point's offset from an edit's anchor is an integer difference times
-// the half cell: exact near the edit at any planet size.
+// the half cell: exact near the edit at any planet size. A point off the lattice (the land
+// surface cache's columns, VoxelLandCacheEdits.ush) is a lattice point and an offset from it.
 
 #ifndef VOXEL_EDIT_SAMPLE_USH
 #define VOXEL_EDIT_SAMPLE_USH
@@ -47,12 +48,10 @@ VOXEL_FUNC uint VoxelEditCellHash(int CX, int CY, int CZ)
     return (uint(CX) * 73856093u) ^ (uint(CY) * 19349663u) ^ (uint(CZ) * 83492791u);
 }
 
-/** Density D at lattice point (X, Y, Z) with the edits applied, for a footprint (cm): an edit
- *  narrower than the footprint shrinks by the difference (VoxelEditCore::ApplyOp). */
-VOXEL_FUNC float VoxelEditApply(int X, int Y, int Z, float Footprint, float D)
+/** The op-list range (offset << 12 | count) of the index cell holding lattice point (X, Y, Z);
+ *  0 when no edit reaches that cell. */
+VOXEL_FUNC uint VoxelEditFindCell(int X, int Y, int Z)
 {
-    if (EditOpCount == 0u) return D;
-
     // Arithmetic shifts: floor division for negative indices too.
     const int CX = X >> int(EditCellShift);
     const int CY = Y >> int(EditCellShift);
@@ -72,8 +71,14 @@ VOXEL_FUNC float VoxelEditApply(int X, int Y, int Z, float Footprint, float D)
         }
         Slot = (Slot + 1u) & EditTableMask;
     }
-    if (Range == 0u) return D;
+    return Range;
+}
 
+/** Density D with the ops of a cell's Range applied, at the point Offset (cm) from lattice point
+ *  (X, Y, Z), for a footprint (cm): an edit narrower than the footprint shrinks by the
+ *  difference (VoxelEditCore::ApplyOp). The cell is the caller's: the one holding the point. */
+VOXEL_FUNC float VoxelEditApplyRange(uint Range, int X, int Y, int Z, float3 Offset, float Footprint, float D)
+{
     const uint First = Range >> VOXEL_EDIT_COUNT_BITS;
     const uint Count = Range & ((1u << VOXEL_EDIT_COUNT_BITS) - 1u);
     const float H = HalfFinest.x;
@@ -81,10 +86,11 @@ VOXEL_FUNC float VoxelEditApply(int X, int Y, int Z, float Footprint, float D)
     for (uint i = 0u; i < Count; i++)
     {
         const uint O = EditOpList[First + i] * VOXEL_EDIT_OP_STRIDE;
-        // The point from the edit's anchor (cm).
-        const float PX = float(X - int(EditOps[O + 0u])) * H;
-        const float PY = float(Y - int(EditOps[O + 1u])) * H;
-        const float PZ = float(Z - int(EditOps[O + 2u])) * H;
+        // The point from the edit's anchor (cm): the lattice points' integer difference, exact
+        // at any planet size, then the offset.
+        const float PX = float(X - int(EditOps[O + 0u])) * H + Offset.x;
+        const float PY = float(Y - int(EditOps[O + 1u])) * H + Offset.y;
+        const float PZ = float(Z - int(EditOps[O + 2u])) * H + Offset.z;
         const float AX = asfloat(EditOps[O + 4u]), AY = asfloat(EditOps[O + 5u]), AZ = asfloat(EditOps[O + 6u]);
         const float BAX = asfloat(EditOps[O + 8u]) - AX, BAY = asfloat(EditOps[O + 9u]) - AY, BAZ = asfloat(EditOps[O + 10u]) - AZ;
         const float Radius = asfloat(EditOps[O + 7u]);
@@ -97,6 +103,15 @@ VOXEL_FUNC float VoxelEditApply(int X, int Y, int Z, float Footprint, float D)
         D = EditOps[O + 3u] != 0u ? VoxelEditSmoothMin(D, S, Blend) : -VoxelEditSmoothMin(-D, S, Blend);
     }
     return D;
+}
+
+/** Density D at lattice point (X, Y, Z) with the edits applied, for a footprint (cm). */
+VOXEL_FUNC float VoxelEditApply(int X, int Y, int Z, float Footprint, float D)
+{
+    if (EditOpCount == 0u) return D;
+    const uint Range = VoxelEditFindCell(X, Y, Z);
+    if (Range == 0u) return D;
+    return VoxelEditApplyRange(Range, X, Y, Z, float3(0.0f, 0.0f, 0.0f), Footprint, D);
 }
 
 #endif // VOXEL_EDIT_SAMPLE_USH

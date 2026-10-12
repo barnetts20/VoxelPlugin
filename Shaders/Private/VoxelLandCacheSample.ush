@@ -1,8 +1,9 @@
 // VoxelLandCacheSample.ush - Reading the land surface cache (VoxelLandCache.ush) at a point:
 // the level for the pixel's footprint, the next coarser where that one doesn't cover the point
 // (or isn't written yet), a blend into the next level by the footprint's fraction and near a
-// window's edge, and bilinear height and gradient (the fields from the nearest texel). For the
-// terrain material (VoxelLandMaterial.ush) and the harness: Texture2D.Load only.
+// window's edge, and bilinear height and gradient (the fields from the nearest texel; the edits'
+// flag bilinear too, VoxelLandCacheEdits.ush: the share of the mesh's normal). For the terrain
+// material (VoxelLandMaterial.ush) and the harness: Texture2D.Load only.
 //
 // Shared subset (VoxelShaderCompat.h). Include after VoxelDF64.ush and VoxelLandCache.ush.
 
@@ -69,6 +70,8 @@ struct FVoxelLandCacheSample
     float3 Fields;         // crust, class (+8 under a lake), the kept lake's level (m about sea level;
                            // VOXEL_LAND_CACHE_NO_LAKE where none)
     float Level;           // the level read (fractional where blended)
+    float Edited;          // 0..1: how much of the point the edits flag (an overhang, a tunnel's
+                           // mouth, a wall: the mesh's normal there)
 };
 
 VOXEL_FUNC FVoxelLandCacheSample VoxelLandCacheFetch(Texture2D CacheHeight, Texture2D CacheSlope, Texture2D CacheFields, int K, FVoxelLandCacheHit Hit)
@@ -114,6 +117,13 @@ VOXEL_FUNC FVoxelLandCacheSample VoxelLandCacheFetch(Texture2D CacheHeight, Text
     Out.bValid = F.w > 0.5f;
     Out.Fields = float3(F.x, F.y, F.z > VOXEL_LAND_CACHE_NO_LAKE + 1.0f ? F.z + HN : VOXEL_LAND_CACHE_NO_LAKE);
     Out.Level = float(K);
+    // The flag (w 2: VoxelLandCacheWrite.usf), bilinear: the flagged texels' share of the height
+    // and gradient read here is at most what the mesh's normal gets.
+    const float E00 = CacheFields.Load(int3(T00, 0)).w > 1.5f ? 1.0f : 0.0f;
+    const float E10 = CacheFields.Load(int3(T10, 0)).w > 1.5f ? 1.0f : 0.0f;
+    const float E01 = CacheFields.Load(int3(T01, 0)).w > 1.5f ? 1.0f : 0.0f;
+    const float E11 = CacheFields.Load(int3(T11, 0)).w > 1.5f ? 1.0f : 0.0f;
+    Out.Edited = E00 * W00 + E10 * W10 + E01 * W01 + E11 * W11;
     return Out;
 }
 
@@ -128,6 +138,7 @@ VOXEL_FUNC FVoxelLandCacheSample VoxelLandCacheSampleAt(Texture2D CacheHeight, T
     None.Flow = 0.0f;
     None.Fields = float3(0.0f, 0.0f, VOXEL_LAND_CACHE_NO_LAKE);
     None.Level = -1.0f;
+    None.Edited = 0.0f;
 
     // Clamped: the loop bound must be sane whatever the texture holds.
     const int Levels = clamp(int(State.Load(int3(0, 0, 0)).x + 0.5f), 0, VOXEL_LAND_CACHE_MAX_LEVELS);
@@ -176,6 +187,7 @@ VOXEL_FUNC FVoxelLandCacheSample VoxelLandCacheSampleAt(Texture2D CacheHeight, T
             Out.Height = lerp(Out.Height, B.Height, Toward);
             Out.Gradient = lerp(Out.Gradient, B.Gradient, Toward);
             Out.Flow = lerp(Out.Flow, B.Flow, Toward);
+            Out.Edited = lerp(Out.Edited, B.Edited, Toward);
             if (Toward >= 0.5f) Out.Fields = B.Fields;
             Out.Level = float(K) + Toward;
         }

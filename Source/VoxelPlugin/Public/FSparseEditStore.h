@@ -79,8 +79,14 @@ public:
     /** Adds an edit: a sphere at Center, or (bContinueStroke, the same brush held since the
      *  previous call) the stroke from the previous centre to this one, merged into the
      *  previous capsule while the brush moves straight. Earlier edits it makes irrelevant are
-     *  removed. Thread safe (edits are serialised). */
-    FVoxelEditResult ApplyEdit(EVoxelEditMode Mode, const FVector& Center, double Radius, double Blend, bool bContinueStroke);
+     *  removed. bStretch: a continued stroke is one capsule from where it started to Center,
+     *  any length and direction, until EndStroke (a tunnel dragged out while held). Thread
+     *  safe (edits are serialised). */
+    FVoxelEditResult ApplyEdit(EVoxelEditMode Mode, const FVector& Center, double Radius, double Blend, bool bContinueStroke, bool bStretch = false);
+
+    /** The brush released: the stroke ends, and a stretched capsule drops the earlier edits it
+     *  holds (the surface doesn't change: Result.bChanged is false). */
+    FVoxelEditResult EndStroke();
 
     /** The current edits, oldest first (compacted: what persistence saves). */
     TArray<FVoxelEditOp> GetEditLog() const;

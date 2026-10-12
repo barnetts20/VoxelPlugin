@@ -368,15 +368,26 @@ protected:
     /** The camera the land surface cache follows, in the planet's frame (cm, no scale). */
     bool GetLandCacheCamera(const FTransform& PlanetFrame, FVector& OutCameraPlanet) const;
 
-    /** Example edit flow (E carves, Q fills; held, a stroke), not in shipping builds: traces
-     *  from the camera along the control rotation and edits this terrain where the trace hits
-     *  one of its collision bricks. */
+    /** Example edit flow (E carves, Q fills), not in shipping builds: traces from the camera
+     *  along the control rotation and edits this terrain where the trace hits one of its
+     *  collision bricks. Held: one capsule stretched from there to a point kept at that
+     *  distance along the view until released (voxel.Debug.EditStretch 1, the default), or a
+     *  stroke of segments along the surface the trace hits (0). */
     void TickDebugEdits(UWorld* World);
 
     /** The debug brush's stroke: the mode held since the last edit (-1: none). */
     int32 DebugStrokeMode = -1;
+    /** The stroke stretches one capsule; its end is DebugStretchDistance (world cm) along the view. */
+    bool bDebugStretching = false;
+    double DebugStretchDistance = 0.0;
+    /** A stretched stroke released whose end (EndStroke) hasn't run yet. */
+    bool bDebugStrokeEndPending = false;
 
     /** Background task: writes an edit (a sphere at InEditCenter, or the stroke from the
-     *  previous one when bContinueStroke) to the edit store and queues its notice. */
-    void RunEditUpdateTask(EVoxelEditMode Mode, FVector InEditCenter, double InEditRadius, double InEditBlend, bool bContinueStroke);
+     *  previous one when bContinueStroke; stretched to InEditCenter when bStretch) to the edit
+     *  store and queues its notice. */
+    void RunEditUpdateTask(EVoxelEditMode Mode, FVector InEditCenter, double InEditRadius, double InEditBlend, bool bContinueStroke, bool bStretch = false);
+
+    /** Background task: ends the store's stroke (FSparseEditStore::EndStroke). */
+    void RunEndStrokeTask();
 };

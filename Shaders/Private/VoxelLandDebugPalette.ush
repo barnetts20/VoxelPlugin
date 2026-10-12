@@ -27,7 +27,9 @@
 #define VOXEL_LAND_VIEW_FLOW 9u        // drainage area: rivers (eroded bakes)
 #define VOXEL_LAND_VIEW_LAKES 10u      // kept lakes by depth (eroded bakes)
 #define VOXEL_LAND_VIEW_GULLY 11u      // the gullies, signed, over their local half-depth
-#define VOXEL_LAND_VIEW_COUNT 12u
+#define VOXEL_LAND_VIEW_WATER 12u      // lakes and rivers in blue over neutral ground (eroded bakes)
+#define VOXEL_LAND_VIEW_TERRAIN_WATER 13u   // elevation with the lakes and rivers over it (eroded bakes)
+#define VOXEL_LAND_VIEW_COUNT 14u      // at most 16: the material packs the view in 4 bits
 
 VOXEL_FUNC float3 VoxelLandViewRgb(float R, float G, float B)
 {
@@ -168,6 +170,30 @@ VOXEL_FUNC float3 VoxelLandViewLake(float Depth, bool bLake, bool bSea)
 {
     if (bLake) return VoxelLandViewMix(VoxelLandViewRgb(120.0f, 225.0f, 240.0f), VoxelLandViewRgb(20.0f, 60.0f, 165.0f), Depth / 100.0f);
     return bSea ? VoxelLandViewRgb(70.0f, 75.0f, 90.0f) : VoxelLandViewRgb(150.0f, 155.0f, 140.0f);
+}
+
+/** A river's blue by drainage area (log10 km^2): the drainage view's blues. */
+VOXEL_FUNC float3 VoxelLandViewRiver(float Log10Km2)
+{
+    const float X = Log10Km2;
+    if (X < 3.0f) return VoxelLandViewMix(VoxelLandViewRgb(150.0f, 190.0f, 235.0f), VoxelLandViewRgb(40.0f, 100.0f, 225.0f), (X - 1.0f) / 2.0f);
+    return VoxelLandViewMix(VoxelLandViewRgb(40.0f, 100.0f, 225.0f), VoxelLandViewRgb(10.0f, 25.0f, 120.0f), (X - 3.0f) / 2.0f);
+}
+
+/** The water views' ground without water: light neutral on land, dark grey at sea. */
+VOXEL_FUNC float3 VoxelLandViewDry(bool bSea)
+{
+    return bSea ? VoxelLandViewRgb(70.0f, 75.0f, 90.0f) : VoxelLandViewRgb(212.0f, 210.0f, 202.0f);
+}
+
+/** Lakes and rivers over Ground (a display colour): a kept lake in the lakes view's colour by
+ *  depth (m); elsewhere on land the river's blue by drainage (log10 km^2), fading in from
+ *  3 km^2 to full at 30 km^2 (streams light, rivers deep). The sea keeps Ground. */
+VOXEL_FUNC float3 VoxelLandViewWater(float3 Ground, float Log10Km2, float LakeDepth, bool bLake, bool bSea)
+{
+    if (bSea) return Ground;
+    if (bLake) return VoxelLandViewLake(LakeDepth, true, false);
+    return VoxelLandViewMix(Ground, VoxelLandViewRiver(Log10Km2), Log10Km2 - 0.5f);
 }
 
 /** A cube face (VoxelCubeSphere.ush order: +X, -X, +Y, -Y, +Z, -Z). */

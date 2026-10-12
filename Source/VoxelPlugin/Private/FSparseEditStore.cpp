@@ -108,15 +108,17 @@ bool FSparseEditStore::HasEditsInBox(const FBox& Box) const
     return Pinned->AnyInBox(Local);
 }
 
-FVoxelEditResult FSparseEditStore::ApplyEdit(EVoxelEditMode Mode, const FVector& InCenter, double Radius, double Blend, bool bContinueStroke)
+FVoxelEditResult FSparseEditStore::ApplyEdit(EVoxelEditMode Mode, const FVector& InCenter, double Radius, double Blend, bool bContinueStroke, bool bStretch)
 {
     FScopeLock WriteLock(&WriteCS);
     const FStatePtr Old = PinState();
     const double P[3] = { InCenter.X - Center.X, InCenter.Y - Center.Y, InCenter.Z - Center.Z };
+    VoxelEditCore::FInsertOptions Options;
+    Options.bStretch = bStretch;
     VoxelEditCore::FInsertResult Inserted;
     TSharedRef<VoxelEditCore::FState, ESPMode::ThreadSafe> New = MakeShared<VoxelEditCore::FState, ESPMode::ThreadSafe>(
         VoxelEditCore::Insert(*Old, Mode == EVoxelEditMode::Fill ? VoxelEditCore::EMode::Fill : VoxelEditCore::EMode::Carve, P, Radius, Blend,
-            bContinueStroke, VoxelEditCore::FInsertOptions(), Inserted));
+            bContinueStroke, Options, Inserted));
 
     FVoxelEditResult Result;
     Result.bChanged = Inserted.bChanged;
@@ -128,6 +130,29 @@ FVoxelEditResult FSparseEditStore::ApplyEdit(EVoxelEditMode Mode, const FVector&
         || New->StrokeEnd[1] != Old->StrokeEnd[1] || New->StrokeEnd[2] != Old->StrokeEnd[2];
     if (Inserted.bChanged || bStrokeMoved)
         Publish(New);
+    Result.Sequence = GetLastSequence();
+    return Result;
+}
+
+FVoxelEditResult FSparseEditStore::EndStroke()
+{
+    FScopeLock WriteLock(&WriteCS);
+    const FStatePtr Old = PinState();
+    FVoxelEditResult Result;
+    if (Old->StrokeOp < 0)
+    {
+        Result.Sequence = GetLastSequence();
+        return Result;
+    }
+    VoxelEditCore::FInsertResult Ended;
+    TSharedRef<VoxelEditCore::FState, ESPMode::ThreadSafe> New = MakeShared<VoxelEditCore::FState, ESPMode::ThreadSafe>(
+        VoxelEditCore::EndStroke(*Old, VoxelEditCore::FInsertOptions(), Ended));
+    Result.Dropped = Ended.Dropped;
+    // A new sequence when edits were dropped, so the GPU's copies drop them too (the surface
+    // is the same: no notice).
+    if (Ended.Dropped > 0)
+        New->LastSequence++;
+    Publish(New);
     Result.Sequence = GetLastSequence();
     return Result;
 }

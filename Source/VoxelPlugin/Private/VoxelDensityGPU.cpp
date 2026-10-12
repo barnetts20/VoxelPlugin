@@ -195,6 +195,7 @@ void VoxelDensityGPU::SampleBlocksAsync(TSharedRef<const FVoxelDensityGPUData> D
 TSharedRef<FVoxelEditGPUData> FVoxelEditGPUData::Build(const FSparseEditStore* Store, double HalfFinest, int32 MaxDepth)
 {
     const TSharedRef<FVoxelEditGPUData> Data = MakeShared<FVoxelEditGPUData>();
+    Data->HalfFinest = HalfFinest;
     if (!Store) return Data;
     const TSharedPtr<const VoxelEditCore::FState, ESPMode::ThreadSafe> State = Store->GetSnapshot();
     if (!State.IsValid() || State->Ops.empty()) return Data;
@@ -220,5 +221,16 @@ TSharedRef<FVoxelEditGPUData> FVoxelEditGPUData::Build(const FSparseEditStore* S
     Data->TableMask = Arrays.TableMask;
     Data->CellShift = Arrays.CellShift;
     Data->OpCount = Arrays.OpCount;
+    // The cells' bounds: a consumer that walks far from every edit skips the table (the land
+    // surface cache's columns).
+    bool bAny = false;
+    for (size_t Slot = 0; Slot + 3 < Arrays.Cells.size(); Slot += 4)
+    {
+        if (Arrays.Cells[Slot + 3] == 0u) continue;
+        const FIntVector Cell((int32)Arrays.Cells[Slot], (int32)Arrays.Cells[Slot + 1], (int32)Arrays.Cells[Slot + 2]);
+        Data->CellMin = bAny ? FIntVector(FMath::Min(Data->CellMin.X, Cell.X), FMath::Min(Data->CellMin.Y, Cell.Y), FMath::Min(Data->CellMin.Z, Cell.Z)) : Cell;
+        Data->CellMax = bAny ? FIntVector(FMath::Max(Data->CellMax.X, Cell.X), FMath::Max(Data->CellMax.Y, Cell.Y), FMath::Max(Data->CellMax.Z, Cell.Z)) : Cell;
+        bAny = true;
+    }
     return Data;
 }

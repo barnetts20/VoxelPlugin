@@ -5,8 +5,13 @@
 //     toroidal strips, refills, re-centring into the spare tile and the swap);
 //   - the camera's point is read from a valid level, and how fine (a gap: none, or coarser than
 //     the footprint asks);
-//   - the budget is kept.
-// Flights: a slow walk, a fast flight, an orbital pass, a teleport.
+//   - the budget is kept;
+//   - edits (MarkDirty, Design/EditsAndCaves.md E2): every texel of a valid level whose column
+//     passes through an edit's box is written after the edit, a few frames on (the simulated
+//     atlas records the edit count each texel was written at), and no frame's jobs write one
+//     slot of a tile with two different texels (a window that moved and an edit's rectangle).
+// Flights: a slow walk, a fast flight, an orbital pass, a teleport; brush-sized edits near the
+// camera every 37 frames, one 100 km box, one on the far side of the planet.
 //
 // g++ -O2 -std=c++20 -I<Source/VoxelPlugin/Private> -I<Shaders/Private> cache_plan_harness.cpp
 // cache_plan_harness RadiusKm
@@ -16,6 +21,7 @@
 #include <cstring>
 #include <random>
 #include <string>
+#include <unordered_map>
 
 using namespace VoxelLandCachePlan;
 
@@ -37,6 +43,12 @@ namespace
     {
         FPlan Plan;
         std::vector<std::vector<uint64_t>> Tiles;
+        std::vector<std::vector<uint32_t>> Versions;     // the edit count each texel was written at
+        struct FEdit { double Min[3], Max[3]; uint32_t Version; int64_t Due; };
+        std::vector<FEdit> Edits;
+        uint32_t Version = 0;
+        int64_t EditTexelsChecked = 0, Stale = 0, Aliased = 0, DirtyWritten = 0;
+        std::unordered_map<uint64_t, uint64_t> FrameSlots;
         std::mt19937 Rng{ 7 };
         int64_t Frames = 0, BadTexels = 0, NoLevel = 0, OverBudget = 0, Worst = 0;
         int64_t FinerMissing = 0;   // frames the camera reads a level coarser than its first valid could be (level 0)
@@ -45,12 +57,80 @@ namespace
         const double ArcDegrees[Arcs] = { 1.0, 10.0, 30.0, 45.0, 60.0 };
         int64_t Uncovered[Arcs] = {};
         int64_t Probes = 0;
-        int64_t Reanchors = 0, Swaps = 0, ValidSum = 0;
+        int64_t Reanchors = 0, Swaps = 0, ValidSum = 0, EditCount = 0;
 
         void Init(double SeaRadius)
         {
             Plan.Init(LevelsFor(SeaRadius), SeaRadius);
             Tiles.assign((size_t)TilesFor((int32_t)Plan.Levels.size()), std::vector<uint64_t>((size_t)N * N, 0));
+            Versions.assign(Tiles.size(), std::vector<uint32_t>((size_t)N * N, 0));
+        }
+
+        /** An edit: the box (planet frame, cm) changes, the next frame's jobs see it. */
+        void AddEdit(const double Min[3], const double Max[3], int64_t SettleFrames)
+        {
+            Version++;
+            FEdit E;
+            for (int a = 0; a < 3; a++) { E.Min[a] = Min[a]; E.Max[a] = Max[a]; }
+            E.Version = Version;
+            E.Due = Frames + SettleFrames;
+            Edits.push_back(E);
+            Plan.MarkDirty(Min, Max);
+        }
+
+        /** Whether the ray from the planet's centre along Dir passes through the box. */
+        static bool RayHits(const double Dir[3], const double Min[3], const double Max[3])
+        {
+            double T0 = 0.0, T1 = 1e30;
+            for (int a = 0; a < 3; a++)
+            {
+                if (std::fabs(Dir[a]) < 1e-300)
+                {
+                    if (0.0 < Min[a] || 0.0 > Max[a]) return false;
+                    continue;
+                }
+                double A = Min[a] / Dir[a], B = Max[a] / Dir[a];
+                if (A > B) std::swap(A, B);
+                T0 = std::max(T0, A);
+                T1 = std::min(T1, B);
+                if (T0 > T1) return false;
+            }
+            return true;
+        }
+
+        /** Texels of valid levels whose columns pass through the edit's box hold a write after it. */
+        void CheckEdit(const FEdit& E)
+        {
+            const double C[3] = { 0.5 * (E.Min[0] + E.Max[0]), 0.5 * (E.Min[1] + E.Max[1]), 0.5 * (E.Min[2] + E.Max[2]) };
+            const double Half = 0.5 * std::sqrt((E.Max[0] - E.Min[0]) * (E.Max[0] - E.Min[0]) + (E.Max[1] - E.Min[1]) * (E.Max[1] - E.Min[1]) + (E.Max[2] - E.Min[2]) * (E.Max[2] - E.Min[2]));
+            for (const FLevel& L : Plan.Levels)
+            {
+                if (!L.bValid || Dot(L.A, C) <= 0.0) continue;
+                double X, Y;
+                PlaneOf(L, C, Plan.SeaRadius, X, Y);
+                // Texels about the centre's (the box's reach on the plane, generously).
+                const int64_t R = (int64_t)std::ceil(3.0 * Half / L.TexelSize) + 2;
+                const int64_t CI = (int64_t)std::floor(X / L.TexelSize), CJ = (int64_t)std::floor(Y / L.TexelSize);
+                const int64_t I0 = std::max(CI - R, (int64_t)L.OriginI), I1 = std::min(CI + R, (int64_t)L.OriginI + N - 1);
+                const int64_t J0 = std::max(CJ - R, (int64_t)L.OriginJ), J1 = std::min(CJ + R, (int64_t)L.OriginJ + N - 1);
+                for (int64_t J = J0; J <= J1; J++)
+                    for (int64_t I = I0; I <= I1; I++)
+                    {
+                        const double U = (I + 0.5) * L.TexelSize, V = (J + 0.5) * L.TexelSize;
+                        double Dir[3];
+                        for (int r = 0; r < 3; r++) Dir[r] = L.Inverse[r][0] * U + L.Inverse[r][1] * V + L.Inverse[r][2] * Plan.SeaRadius;
+                        if (!RayHits(Dir, E.Min, E.Max)) continue;
+                        EditTexelsChecked++;
+                        const size_t SlotIndex = (size_t)Slot((int32_t)J) * N + Slot((int32_t)I);
+                        if (Versions[L.Tile][SlotIndex] < E.Version || !Check(L, (int32_t)I, (int32_t)J))
+                        {
+                            if (Stale++ < 10 && getenv("PLAN_DEBUG"))
+                                printf("    frame %lld: edit %u (due %lld) stale at level %d texel %lld %lld (written at %u, key %s)\n", (long long)Frames, E.Version, (long long)E.Due,
+                                    (int)(&L - Plan.Levels.data()), (long long)(I - L.OriginI), (long long)(J - L.OriginJ), Versions[L.Tile][SlotIndex],
+                                    Check(L, (int32_t)I, (int32_t)J) ? "ok" : "wrong");
+                        }
+                    }
+            }
         }
 
         int Slot(int32_t I) { return I & (N - 1); }
@@ -76,7 +156,13 @@ namespace
                 for (int32_t i = 0; i < Job.Width; i++)
                 {
                     const int32_t I = Job.I0 + i, J = Job.J0 + j;
-                    Tiles[L.Tile][(size_t)Slot(J) * N + Slot(I)] = Key(L, I, J);
+                    const size_t SlotIndex = (size_t)Slot(J) * N + Slot(I);
+                    const uint64_t K = Key(L, I, J);
+                    // One frame's jobs run unordered: a slot written twice must get one texel.
+                    auto [It, bNew] = FrameSlots.emplace(((uint64_t)L.Tile << 32) | SlotIndex, K);
+                    if (!bNew && It->second != K) Aliased++;
+                    Tiles[L.Tile][SlotIndex] = K;
+                    Versions[L.Tile][SlotIndex] = Version;
                 }
         }
 
@@ -87,7 +173,10 @@ namespace
             std::vector<FJob> Jobs;
             const int32_t PendingBefore = Plan.PendingLevel;
             std::vector<FLevel> Before = Plan.Levels;
+            const int64_t DirtyBefore = Plan.DirtyTexels();
             Plan.Tick(D, Settings, Jobs);
+            DirtyWritten += std::max<int64_t>(DirtyBefore - Plan.DirtyTexels(), 0);
+            FrameSlots.clear();
             // The jobs write with the frames as they stand after the tick (as Dispatch does).
             int64_t Texels = 0;
             for (const FJob& Job : Jobs)
@@ -166,6 +255,10 @@ namespace
                     Probes++;
                 }
             }
+            // The edits due now are written (and every one at the full checks).
+            for (const FEdit& E : Edits)
+                if (E.Due == Frames || (bFull && E.Due < Frames))
+                    CheckEdit(E);
             Frames++;
         }
     };
@@ -197,8 +290,10 @@ int main(int argc, char** argv)
         { "teleport 90 deg, then 20 m/frame for 0.2 deg", 20.0, 0.2, 90.0 },
     };
     int Failures = 0;
+    const int Only = getenv("PLAN_FLIGHT") ? atoi(getenv("PLAN_FLIGHT")) : -1;
     for (const FFlight& F : Flights)
     {
+        if (Only >= 0 && &F - Flights != Only) continue;
         FSim Sim;
         Sim.Init(S);
         FSettings Settings;
@@ -236,21 +331,41 @@ int main(int argc, char** argv)
         }
         const double Step = F.SpeedMPerFrame * 100.0 / S;
         const int64_t Count = (int64_t)(F.ArcDegrees * 3.14159265358979 / 180.0 / Step);
+        std::uniform_real_distribution<double> Spread(-30000.0, 30000.0), Size(250.0, 1000.0);
         for (int64_t f = 0; f < Count; f++)
         {
             Rotate(D, Axis, F.bTurnBack && f >= Count / 2 ? -Step : Step);
+            // Brush-sized edits within 300 m of the camera's ground point; a 100 km box once
+            // (every level's window, rewritten in place); one on the far side (nothing to write).
+            if (f % 37 == 5 || f == Count / 2 || f == Count / 3)
+            {
+                const bool bHuge = f == Count / 2;
+                const double Sign = f == Count / 3 ? -1.0 : 1.0;
+                const double Half = bHuge ? 5.0e6 : Size(Sim.Rng);
+                double Min[3], Max[3];
+                for (int a = 0; a < 3; a++)
+                {
+                    const double C = Sign * D[a] * S + (bHuge ? 0.0 : Spread(Sim.Rng));
+                    Min[a] = C - Half;
+                    Max[a] = C + Half;
+                }
+                Sim.AddEdit(Min, Max, bHuge ? 200 : 3);
+                Sim.EditCount++;
+            }
             Sim.Step(D, Settings, f % 500 == 499, true);
         }
         Sim.Step(D, Settings, true, true);
         // The guarantee: everything within 45 degrees of arc (the coarsest level reaches 70 from a
         // centre at most 25 off); past that, while every level is within 10 degrees, to 60.
         const bool bOk = Sim.BadTexels == 0 && Sim.NoLevel == 0 && Sim.OverBudget == 0 && Sim.Uncovered[0] == 0 && Sim.Uncovered[1] == 0
-            && Sim.Uncovered[2] == 0 && Sim.Uncovered[3] == 0;
+            && Sim.Uncovered[2] == 0 && Sim.Uncovered[3] == 0 && Sim.Stale == 0 && Sim.Aliased == 0;
         Failures += bOk ? 0 : 1;
         printf("%s %s: warm-up %d frames; %lld frames flown; bad texels %lld, frames with no level at the camera %lld, frames over budget %lld (worst %lld texels);"
                " camera read from a coarser level than 0 in %lld frames (worst level %d); %lld in-place re-anchors, %lld gapless re-centrings; %.1f levels valid on average\n",
             bOk ? "OK  " : "FAIL", F.Name, WarmFrames, (long long)Count, (long long)Sim.BadTexels, (long long)Sim.NoLevel, (long long)Sim.OverBudget,
             (long long)Sim.Worst, (long long)Sim.FinerMissing, Sim.WorstLevel, (long long)Sim.Reanchors, (long long)Sim.Swaps, (double)Sim.ValidSum / std::max<int64_t>(Sim.Frames, 1));
+        printf("     edits: %lld; texels under them checked %lld, stale %lld; slots written twice with different texels %lld; %lld texels written again for edits\n",
+            (long long)Sim.EditCount, (long long)Sim.EditTexelsChecked, (long long)Sim.Stale, (long long)Sim.Aliased, (long long)Sim.DirtyWritten);
         printf("     far field uncovered (of %lld probes each): 1 deg %lld, 10 deg %lld, 30 deg %lld, 45 deg %lld, 60 deg %lld\n", (long long)Sim.Probes,
             (long long)Sim.Uncovered[0], (long long)Sim.Uncovered[1], (long long)Sim.Uncovered[2], (long long)Sim.Uncovered[3], (long long)Sim.Uncovered[4]);
     }

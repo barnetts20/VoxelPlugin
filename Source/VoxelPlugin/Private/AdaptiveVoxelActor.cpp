@@ -29,6 +29,13 @@ DECLARE_CYCLE_STAT(TEXT("Collision tick"), STAT_VoxelCollisionTick, STATGROUP_Vo
 // An edit task taking longer than this (ms) is logged.
 static constexpr double EditLogThresholdMs = 50.0;
 
+#if !UE_BUILD_SHIPPING
+static TAutoConsoleVariable<int32> CVarVoxelDebugEditStretch(
+    TEXT("voxel.Debug.EditStretch"), 1,
+    TEXT("The debug brush (E carves, Q fills) held down. 1 (default): one capsule stretched from where it was pressed to a point kept at that distance along the view, any direction, up to 100 brush radii (300 m) long, until released (drag out a tunnel by walking or turning; a press more than 50 radii away strokes instead). 0: a stroke of segments along the surface the trace hits."),
+    ECVF_Default);
+#endif
+
 AAdaptiveVoxelActor::AAdaptiveVoxelActor()
 {
     PrimaryActorTick.bCanEverTick = true;
@@ -412,6 +419,10 @@ void AAdaptiveVoxelActor::UpdateLandMaterial(bool bTickCache)
     const bool bCache = bLandMaterialBound && LandCache.IsValid() && LandCache->IsWritable();
     if (bCache && bTickCache)
     {
+        // The edits the cache's writes apply: the mesh's (the cache rewrites an edit's texels
+        // once these carry it, so both change together).
+        if (BrickTerrain.IsValid())
+            LandCache->SetEdits(BrickTerrain->GetGPUEdits(), BrickTerrain->GetGPUEditsSequence());
         FVector CameraPlanet;
         if (GetLandCacheCamera(PlanetFrame, CameraPlanet))
             LandCache->Tick(CameraPlanet);
@@ -629,6 +640,9 @@ void AAdaptiveVoxelActor::TickCollision(UWorld* World)
         CollisionBricks->NotifyEdit(Notice.Sequence, Center, Radius);
         if (BrickTerrain.IsValid())
             BrickTerrain->NotifyEdit(Notice.Sequence, Notice.Bounds);
+        // The land surface cache's columns through the box (its frame is the actor's).
+        if (LandCache.IsValid())
+            LandCache->NotifyEdit(Notice.Sequence, Notice.Bounds);
         TerrainEdited.Broadcast(Notice.Sequence, Center, Radius);
     }
 
@@ -661,17 +675,17 @@ void AAdaptiveVoxelActor::TickCollision(UWorld* World)
         CollisionBricks->DrawDebug(World, BrickAttachmentRoot->GetComponentTransform());
 }
 
-void AAdaptiveVoxelActor::RunEditUpdateTask(EVoxelEditMode Mode, FVector InEditCenter, double InEditRadius, double InEditBlend, bool bContinueStroke)
+void AAdaptiveVoxelActor::RunEditUpdateTask(EVoxelEditMode Mode, FVector InEditCenter, double InEditRadius, double InEditBlend, bool bContinueStroke, bool bStretch)
 {
     if (EditQueue->bRunning || IsDestroyed || !DensityCompositor.IsValid()) return;
     const TSharedPtr<FSparseEditStore> Store = DensityCompositor->GetEditStore();
     if (!Store.IsValid()) return;
 
     EditQueue->bRunning = true;
-    FFunctionGraphTask::CreateAndDispatchWhenReady([Queue = EditQueue, Store, Mode, InEditCenter, InEditRadius, InEditBlend, bContinueStroke]()
+    FFunctionGraphTask::CreateAndDispatchWhenReady([Queue = EditQueue, Store, Mode, InEditCenter, InEditRadius, InEditBlend, bContinueStroke, bStretch]()
         {
             const double StartTime = FPlatformTime::Seconds();
-            const FVoxelEditResult Result = Store->ApplyEdit(Mode, InEditCenter, InEditRadius, InEditBlend, bContinueStroke);
+            const FVoxelEditResult Result = Store->ApplyEdit(Mode, InEditCenter, InEditRadius, InEditBlend, bContinueStroke, bStretch);
 
             // The collision bricks and the brick terrain rebuild what this edit reaches (nothing
             // when it changed nothing: repeated, or the brush stayed put).
@@ -693,6 +707,25 @@ void AAdaptiveVoxelActor::RunEditUpdateTask(EVoxelEditMode Mode, FVector InEditC
 
             // Cleared last: Rebuild waits on the flag and then clears the notices, so a
             // notice for a replaced store never lands after that clear.
+            Queue->bRunning = false;
+        }, TStatId(), nullptr, ENamedThreads::AnyNormalThreadHiPriTask);
+}
+
+void AAdaptiveVoxelActor::RunEndStrokeTask()
+{
+    if (EditQueue->bRunning || IsDestroyed || !DensityCompositor.IsValid()) return;
+    const TSharedPtr<FSparseEditStore> Store = DensityCompositor->GetEditStore();
+    if (!Store.IsValid()) return;
+
+    EditQueue->bRunning = true;
+    FFunctionGraphTask::CreateAndDispatchWhenReady([Queue = EditQueue, Store]()
+        {
+            // The surface doesn't change: no notice.
+            const FVoxelEditResult Result = Store->EndStroke();
+            if (Result.Dropped > 0)
+            {
+                UE_LOG(LogVoxelPlugin, Log, TEXT("[VoxelEdit] The stretched stroke made %d earlier edits irrelevant; the store holds %d."), Result.Dropped, Store->Num());
+            }
             Queue->bRunning = false;
         }, TStatId(), nullptr, ENamedThreads::AnyNormalThreadHiPriTask);
 }
@@ -752,23 +785,60 @@ void AAdaptiveVoxelActor::TickDebugEdits(UWorld* World)
     if (!PC) return;
     const bool bCarve = PC->IsInputKeyDown(EKeys::E);
     const bool bFill = PC->IsInputKeyDown(EKeys::Q);
+    const bool bStretch = CVarVoxelDebugEditStretch.GetValueOnGameThread() != 0;
     if (!bCarve && !bFill)
     {
-        // Released: the next press starts a new stroke.
+        // Released: the next press starts a new stroke; a stretched one is final now.
+        if (DebugStrokeMode >= 0 && bDebugStretching)
+            bDebugStrokeEndPending = true;
         DebugStrokeMode = -1;
+        bDebugStretching = false;
+        if (bDebugStrokeEndPending && !EditQueue->bRunning)
+        {
+            RunEndStrokeTask();
+            bDebugStrokeEndPending = false;
+        }
         return;
     }
     // The previous edit is still being written: the stroke goes on with the next one.
     if (EditQueue->bRunning) return;
+    // A stroke released and pressed again before its end ran: ended first.
+    if (bDebugStrokeEndPending)
+    {
+        RunEndStrokeTask();
+        bDebugStrokeEndPending = false;
+        return;
+    }
 
     const EVoxelEditMode Mode = bCarve ? EVoxelEditMode::Carve : EVoxelEditMode::Fill;
     const double EditRadius = 300.0;
     const double EditBlend = 0.25 * EditRadius;
     const float DebugDrawTime = 0.1f;
+    const FColor Color = bCarve ? FColor::Red : FColor::Green;
 
     const FTransform NoScaleTransform(GetActorRotation(), GetActorLocation());
     const FVector Start = NoScaleTransform.TransformPosition(CameraPosition);
-    const FVector End = Start + PC->GetControlRotation().Vector() * (GetActorScale3D().GetMax() * 3.0);
+    const FVector Direction = PC->GetControlRotation().Vector();
+
+    // Stretching: the capsule's end at the pressed distance along the view (no trace: the
+    // trace would hit the end of the tunnel being dug, and run away from the brush).
+    if (bDebugStretching && DebugStrokeMode == (int32)Mode)
+    {
+        const FVector Point = Start + Direction * DebugStretchDistance;
+        RunEditUpdateTask(Mode, NoScaleTransform.InverseTransformPosition(Point), EditRadius, EditBlend, true, true);
+        DrawDebugSphere(World, Point, (float)EditRadius, 32, Color, false, DebugDrawTime);
+        return;
+    }
+    // The other key while stretching: that stroke ends first.
+    if (bDebugStretching && DebugStrokeMode >= 0)
+    {
+        RunEndStrokeTask();
+        DebugStrokeMode = -1;
+        bDebugStretching = false;
+        return;
+    }
+
+    const FVector End = Start + Direction * (GetActorScale3D().GetMax() * 3.0);
     FHitResult Hit;
     if (!World->LineTraceSingleByChannel(Hit, Start, End, ECC_Visibility) || Hit.GetActor() != this)
     {
@@ -779,9 +849,15 @@ void AAdaptiveVoxelActor::TickDebugEdits(UWorld* World)
 
     const FVector LocalHit = NoScaleTransform.InverseTransformPosition(Hit.ImpactPoint);
     LogEditHit(Hit, LocalHit);
+    // Stretching starts with a sphere where the trace hits, within 50 brush radii (farther, a
+    // turn of the view would swing the capsule's end by hundreds of metres); otherwise a
+    // segment stroke goes on along the surface the trace hits.
+    const double Distance = (Hit.ImpactPoint - Start).Size();
     const bool bContinueStroke = DebugStrokeMode == (int32)Mode;
-    RunEditUpdateTask(Mode, LocalHit, EditRadius, EditBlend, bContinueStroke);
+    RunEditUpdateTask(Mode, LocalHit, EditRadius, EditBlend, bContinueStroke, false);
     DebugStrokeMode = (int32)Mode;
-    DrawDebugSphere(World, Hit.ImpactPoint, (float)EditRadius, 32, bCarve ? FColor::Red : FColor::Green, false, DebugDrawTime);
+    bDebugStretching = bStretch && Distance <= 50.0 * EditRadius;
+    DebugStretchDistance = Distance;
+    DrawDebugSphere(World, Hit.ImpactPoint, (float)EditRadius, 32, Color, false, DebugDrawTime);
 }
 #endif

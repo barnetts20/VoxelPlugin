@@ -64,6 +64,14 @@ public:
         SHADER_PARAMETER(float, SlopeDamping)
         SHADER_PARAMETER_STRUCT_INCLUDE(FVoxelLandShaderParameters, Land)
         SHADER_PARAMETER_STRUCT_INCLUDE(FVoxelLandDebugParameters, LandDebug)
+        SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, EditCells)
+        SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, EditOpList)
+        SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, EditOps)
+        SHADER_PARAMETER(uint32, EditTableMask)
+        SHADER_PARAMETER(uint32, EditCellShift)
+        SHADER_PARAMETER(uint32, EditOpCount)
+        SHADER_PARAMETER(FIntVector, EditCellMin)
+        SHADER_PARAMETER(FIntVector, EditCellMax)
         SHADER_PARAMETER(int32, CacheTile)
         SHADER_PARAMETER(float, TexelSize)
         SHADER_PARAMETER(FIntPoint, RectMin)
@@ -201,6 +209,9 @@ void FVoxelLandCache::Reset()
 {
     Plan.Reset();
     GPUData.Reset();
+    Edits.Reset();
+    EditsSequence = 0;
+    PendingEdits.Reset();
     Textures = FVoxelLandCacheTextures();
     SeaRadius = 0.0;
     TexelsWritten = 0;
@@ -221,6 +232,41 @@ void FVoxelLandCache::SetTextureParameters(UMaterialInstanceDynamic* Material) c
     Material->SetTextureParameterValue(SlopeTextureName, Textures.Slope);
     Material->SetTextureParameterValue(FieldsTextureName, Textures.Fields);
     Material->SetTextureParameterValue(StateTextureName, Textures.State);
+}
+
+void FVoxelLandCache::SetEdits(TSharedPtr<const FVoxelEditGPUData> InEdits, uint32 Sequence)
+{
+    // Not built yet (the brick terrain starting again): the edits written stay, and notices
+    // wait for data that carries them.
+    if (!InEdits.IsValid()) return;
+    // The store replaced (its sequences start again): every texel may hold edits it no longer
+    // has, and the notices are the old store's.
+    if (Sequence < EditsSequence)
+    {
+        if (Plan.IsValid())
+            Plan->InvalidateAll();
+        PendingEdits.Reset();
+    }
+    Edits = MoveTemp(InEdits);
+    EditsSequence = Sequence;
+}
+
+void FVoxelLandCache::NotifyEdit(uint32 Sequence, const FBox& Bounds)
+{
+    if (!IsInitialized() || !Bounds.IsValid) return;
+    PendingEdits.Add({ Sequence, Bounds });
+    // Unticked for long (the cache not bound to a material): one box for them all.
+    if (PendingEdits.Num() > 256)
+    {
+        FPendingEdit All = PendingEdits[0];
+        for (const FPendingEdit& Pending : PendingEdits)
+        {
+            All.Sequence = FMath::Max(All.Sequence, Pending.Sequence);
+            All.Bounds += Pending.Bounds;
+        }
+        PendingEdits.Reset();
+        PendingEdits.Add(All);
+    }
 }
 
 bool FVoxelLandCache::IsWritable() const
@@ -249,6 +295,21 @@ void FVoxelLandCache::Tick(const FVector& CameraPlanet)
     {
         Plan->InvalidateAll();
         Generation = Failed;
+    }
+
+    // The edits the writes now apply: their texels are written again, ahead of the rest.
+    for (int32 i = 0; i < PendingEdits.Num();)
+    {
+        if (PendingEdits[i].Sequence > EditsSequence)
+        {
+            i++;
+            continue;
+        }
+        const FBox& Box = PendingEdits[i].Bounds;
+        const double Min[3] = { Box.Min.X, Box.Min.Y, Box.Min.Z };
+        const double Max[3] = { Box.Max.X, Box.Max.Y, Box.Max.Z };
+        Plan->MarkDirty(Min, Max);
+        PendingEdits.RemoveAtSwap(i);
     }
 
     VoxelLandCachePlan::FSettings Settings;
@@ -313,7 +374,7 @@ bool FVoxelLandCache::Dispatch(const VoxelLandCachePlan::FJob* InJobs, int32 Num
     if (!HeightResource || !SlopeResource || !FieldsResource || !StateResource) return false;
 
     ENQUEUE_RENDER_COMMAND(VoxelLandCacheWrite)(
-        [Data = GPUData, Jobs = MoveTemp(Jobs), Frames = MoveTemp(Frames), State = MoveTemp(State), Sea = SeaRadius, Failed = FailedGeneration,
+        [Data = GPUData, EditData = Edits, Jobs = MoveTemp(Jobs), Frames = MoveTemp(Frames), State = MoveTemp(State), Sea = SeaRadius, Failed = FailedGeneration,
          Gen = Generation, HeightResource, SlopeResource, FieldsResource, StateResource](FRHICommandListImmediate& RHICmdList) mutable
         {
             FGlobalShaderMap* ShaderMap = GetGlobalShaderMap(GMaxRHIFeatureLevel);
@@ -344,6 +405,12 @@ bool FVoxelLandCache::Dispatch(const VoxelLandCachePlan::FJob* InJobs, int32 Num
                 const FVoxelLandShaderParameters Land = VoxelLandGPU::GetParameters(GraphBuilder, *Data);
                 // The fields need the attributes and the lake levels (the lakes view uploads both).
                 const FVoxelLandDebugParameters LandDebug = VoxelLandGPU::GetDebugParameters(GraphBuilder, *Data, 10, 0.0);
+                // The edits (kilobytes; VoxelLandCacheEdits.ush).
+                const FVoxelEditGPUData NoEdits;
+                const FVoxelEditGPUData& EditView = EditData.IsValid() ? *EditData : NoEdits;
+                FRDGBufferSRVRef EditCellsSRV = GraphBuilder.CreateSRV(VoxelGPUCommon::UploadStructuredBuffer(GraphBuilder, TEXT("Voxel.LandCacheEditCells"), MakeArrayView(EditView.Cells)));
+                FRDGBufferSRVRef EditOpListSRV = GraphBuilder.CreateSRV(VoxelGPUCommon::UploadStructuredBuffer(GraphBuilder, TEXT("Voxel.LandCacheEditOpList"), MakeArrayView(EditView.OpList)));
+                FRDGBufferSRVRef EditOpsSRV = GraphBuilder.CreateSRV(VoxelGPUCommon::UploadStructuredBuffer(GraphBuilder, TEXT("Voxel.LandCacheEditOps"), MakeArrayView(EditView.Ops)));
                 TShaderMapRef<FVoxelLandCacheWriteCS> Shader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
                 for (const FJob& Job : Jobs)
                 {
@@ -359,7 +426,8 @@ bool FVoxelLandCache::Dispatch(const VoxelLandCachePlan::FJob* InJobs, int32 Num
                     Parameters->InvNormDetail = Data->InvNormDetail;
                     Parameters->PlanetRadius = Data->PlanetRadius;
                     Parameters->NoiseAmplitude = Data->NoiseAmplitude;
-                    Parameters->HalfFinest = FVector2f::ZeroVector;
+                    // The edits' lattice (the land chain itself doesn't read it).
+                    Parameters->HalfFinest = VoxelDoubleFloat(EditView.HalfFinest);
                     Parameters->ContinentWeight = Data->ContinentWeight;
                     Parameters->MountainWeight = Data->MountainWeight;
                     Parameters->MountainStart = Data->MountainStart;
@@ -369,6 +437,15 @@ bool FVoxelLandCache::Dispatch(const VoxelLandCachePlan::FJob* InJobs, int32 Num
                     Parameters->SlopeDamping = Data->SlopeDamping;
                     Parameters->Land = Land;
                     Parameters->LandDebug = LandDebug;
+                    Parameters->EditCells = EditCellsSRV;
+                    Parameters->EditOpList = EditOpListSRV;
+                    Parameters->EditOps = EditOpsSRV;
+                    Parameters->EditTableMask = EditView.TableMask;
+                    Parameters->EditCellShift = EditView.CellShift;
+                    // No edits without the lattice they're on.
+                    Parameters->EditOpCount = EditView.HalfFinest > 0.0 ? EditView.OpCount : 0u;
+                    Parameters->EditCellMin = EditView.CellMin;
+                    Parameters->EditCellMax = EditView.CellMax;
                     Parameters->CacheTile = Frame.Tile;
                     Parameters->TexelSize = Frame.TexelSize;
                     Parameters->RectMin = FIntPoint(Job.I0, Job.J0);
@@ -409,6 +486,9 @@ FString FVoxelLandCache::Describe() const
         Valid += Level.bValid ? 1 : 0;
     const FString Pending = Plan->PendingLevel >= 0
         ? FString::Printf(TEXT(", level %d re-centring (%d%%)"), Plan->PendingLevel, Plan->Next.FillRow * 100 / VOXEL_LAND_CACHE_N) : FString();
-    return FString::Printf(TEXT("land cache: %d of %d levels written%s, %llu texels written so far"), Valid, (int32)Plan->Levels.size(), *Pending,
+    const int64 Dirty = Plan->DirtyTexels();
+    const FString Edited = Dirty > 0 || PendingEdits.Num() > 0
+        ? FString::Printf(TEXT(", edits: %lld texels to write again, %d notices waiting for the edit data"), (long long)Dirty, PendingEdits.Num()) : FString();
+    return FString::Printf(TEXT("land cache: %d of %d levels written%s%s, %llu texels written so far"), Valid, (int32)Plan->Levels.size(), *Pending, *Edited,
         (unsigned long long)TexelsWritten);
 }
