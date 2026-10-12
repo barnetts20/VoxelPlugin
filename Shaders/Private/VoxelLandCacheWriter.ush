@@ -1,7 +1,7 @@
 // VoxelLandCacheWriter.ush - What the land surface cache holds at a point (VoxelLandCache.ush):
 // the density's land chain (VoxelLandHeightDF) band-limited to Footprint, its height about sea
-// level, and its gradient: the bake's and the detail's exact gradients, plus the gullies' (and
-// the detail amplitude's) forward difference over Step (cm). For the compute writer
+// level, and its gradient: the bake's, the detail's and the hills' exact gradients, plus the
+// gullies' (and the detail's and the hills' amplitudes') forward difference over Step (cm). For the compute writer
 // (VoxelLandCacheWrite.usf) and the harness.
 //
 // Shared subset (VoxelShaderCompat.h). Include after VoxelDensitySample.ush.
@@ -29,12 +29,14 @@ VOXEL_FUNC FVoxelLandCacheSurface VoxelLandCacheSurfaceAt(VOXEL_LAND_ARGS_DECL f
     const FVoxelLandDifferenced C2 = VoxelLandDifferencedDF(VOXEL_LAND_ARGS
         VoxelDFAdd(PX, float2(T2.x * Step, 0.0f)), VoxelDFAdd(PY, float2(T2.y * Step, 0.0f)), VoxelDFAdd(PZ, float2(T2.z * Step, 0.0f)), Footprint);
     const float Inv = 100.0f / Step;
-    const float D1 = ((C1.Gully - H.Gully) + H.DetailUnit * (C1.DetailAmplitudeM - H.DetailAmplitudeM)) * Inv;
-    const float D2 = ((C2.Gully - H.Gully) + H.DetailUnit * (C2.DetailAmplitudeM - H.DetailAmplitudeM)) * Inv;
+    const float D1 = ((C1.Gully - H.Gully) + H.DetailUnit * (C1.DetailAmplitudeM - H.DetailAmplitudeM)
+        + H.HillUnit * (C1.HillAmplitudeM - H.HillAmplitudeM)) * Inv;
+    const float D2 = ((C2.Gully - H.Gully) + H.DetailUnit * (C2.DetailAmplitudeM - H.DetailAmplitudeM)
+        + H.HillUnit * (C2.HillAmplitudeM - H.HillAmplitudeM)) * Inv;
 
     FVoxelLandCacheSurface Out;
     Out.Height = (AboveBase.x + AboveBase.y) * 0.01f;
-    Out.Gradient = H.BakeGradient + (H.DetailGradient - Up * dot(H.DetailGradient, Up)) + T1 * D1 + T2 * D2;
+    Out.Gradient = H.BakeGradient + H.HillGradient + (H.DetailGradient - Up * dot(H.DetailGradient, Up)) + T1 * D1 + T2 * D2;
     Out.Flow = H.Flow;
     Out.Warped = H.Warped;
     return Out;

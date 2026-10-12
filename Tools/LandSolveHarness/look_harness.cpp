@@ -49,6 +49,7 @@ namespace VoxelShader
         const float* BakeUp = nullptr;
         const float* BakeCrust = nullptr;
         const uint* BakeAttr = nullptr;
+        const uint* BakeForm = nullptr;
         float SolvePlainsUplift = 400.0f, SolveRampWidth = 300.0f, SolveUpliftTime = 5.0e6f;
         float SolveKdt = 0.4f, SolveDt = 0.4f / 4.3e-7f, SolveEps = 0.01f;
         uint SolveSeed = 7;
@@ -62,7 +63,7 @@ namespace VoxelShader
         uint* SolveFlags = nullptr;
         float SolveFactor = 1.0f, SolveReliefKnee = 1.0e9f, SolveReliefTop = 1.0e9f;
         float SolveMinLakeDepth = 10.0f, SolveMinLakeArea = 20.0e6f;
-        float SolveJitter = 0.0f, SolveRouteNoise = 0.0f, SolveSpreadCells = 0.0f, SolveUndulation = 0.0f, SolveUpliftVariation = 0.0f, SolveErodibilityVariation = 0.0f, SolveVariationWavelength = 1.2e5f, SolveRoughness = 0.0f, SolveReliefScale = 0.0f;
+        float SolveJitter = 0.0f, SolveRouteNoise = 0.0f, SolveSpreadCells = 0.0f, SolveUndulation = 0.0f, SolveLandformErosion = 0.0f, SolveUpliftVariation = 0.0f, SolveErodibilityVariation = 0.0f, SolveVariationWavelength = 1.2e5f, SolveRoughness = 0.0f, SolveReliefScale = 0.0f;
         uint SolveFillDepressions = 1u, SolveModel = 0u;
         float SolvePlainsRelief = 0.0f, SolveIncision = 0.0f;
         float* SlotK = nullptr;
@@ -119,7 +120,7 @@ struct FPlateBake
     int Side() const { return N + 2 * Pad; }
     int Cells() const { return 6 * Side() * Side(); }
     std::vector<float> Height, Up, Crust;
-    std::vector<uint> Attr;
+    std::vector<uint> Attr, Form;
     std::vector<float2> Tan;
     std::vector<float> Plates;
 };
@@ -160,6 +161,7 @@ static void BakePlates(FPlateBake& B, uint32_t Seed, int K, float LandFraction, 
     B.Up.assign(B.Cells(), 0.f);
     B.Crust.assign(B.Cells(), 0.f);
     B.Attr.assign(B.Cells(), 0u);
+    B.Form.assign(B.Cells(), 0u);
     ParallelFor(B.Cells(), [&](int Idx) {
         const int F = Idx / (S * S), R = Idx % (S * S), J = R / S - B.Pad, I = R % S - B.Pad;
         const float3 D = VoxelCubeDirection(F, VoxelCubeCellCentre(I, N), VoxelCubeCellCentre(J, N));
@@ -168,6 +170,7 @@ static void BakePlates(FPlateBake& B, uint32_t Seed, int K, float LandFraction, 
         B.Up[Idx] = E.Up;
         B.Crust[Idx] = E.Crust;
         B.Attr[Idx] = P.VoxelLandPackAttr(E.Crust, E.Class);
+        B.Form[Idx] = P.VoxelLandPackForm(P.VoxelLandFormAt(D, E));
     });
     B.Tan.resize(S);
     for (int i = 0; i < S; i++)
@@ -520,10 +523,30 @@ int main(int argc, char** argv)
     double T = Now();
     BakePlates(B, Seed, 10, 0.30f, RadiusM);
     printf("plates 6x%d^2 in %.1f s\n", N, Now() - T);
+    if (Get("FormOnly", 0.0) != 0.0)
+    {
+        // The landform field alone (T2): its shares over the land, without a solve.
+        std::vector<float> H, C;
+        const bool bPlains = Get("FormPlains", 0.0) != 0.0;
+        for (int c = 0; c < B.Cells(); c++)
+        {
+            if (B.Height[c] <= 0.0f || (bPlains && B.Up[c] >= 400.0f)) continue;
+            H.push_back((float)(B.Form[c] & 0xffu) / 255.0f);
+            C.push_back((float)((B.Form[c] >> 8) & 0xffu) / 255.0f);
+        }
+        double SH = 0, SC = 0; int Flat = 0, Hill = 0;
+        for (size_t i = 0; i < H.size(); i++) { SH += H[i]; SC += C[i]; Flat += H[i] < 0.12f; Hill += H[i] > 0.75f; }
+        std::sort(H.begin(), H.end());
+        printf("landform over the %s (%zu cells): hilliness mean %.3f, p10 %.2f, p50 %.2f, p90 %.2f; flat (< 0.12) %.2f, hill country (> 0.75) %.2f; character mean %.3f\n",
+            bPlains ? "plains (uplift under 400 m)" : "land", H.size(), SH / H.size(), H[H.size() / 10], H[H.size() / 2], H[H.size() * 9 / 10], (double)Flat / H.size(), (double)Hill / H.size(), SC / C.size());
+        FILE* F = fopen((Tag + "_form.u32").c_str(), "wb"); fwrite(B.Form.data(), 4, B.Cells(), F); fclose(F);
+        F = fopen((Tag + "_plates.f32").c_str(), "wb"); fwrite(B.Height.data(), 4, B.Cells(), F); fclose(F);
+        return 0;
+    }
 
     FSolve S;
     S.SolveN = N; S.SolvePad = B.Pad; S.SolveRadiusM = RadiusM; S.SolveSeed = Seed;
-    S.SolveTan = B.Tan.data(); S.BakeHeight = B.Height.data(); S.BakeUp = B.Up.data(); S.BakeCrust = B.Crust.data(); S.BakeAttr = B.Attr.data();
+    S.SolveTan = B.Tan.data(); S.BakeHeight = B.Height.data(); S.BakeUp = B.Up.data(); S.BakeCrust = B.Crust.data(); S.BakeAttr = B.Attr.data(); S.BakeForm = B.Form.data();
     // The look test's settings (FSolve members), from the command line.
     S.SolveMinLakeDepth = (float)Get("MinLakeDepth", S.SolveMinLakeDepth);
     S.SolveMinLakeArea = (float)Get("MinLakeArea", S.SolveMinLakeArea);
@@ -531,6 +554,7 @@ int main(int argc, char** argv)
     S.SolveRouteNoise = (float)Get("RouteNoise", 0.0);
     S.SolveSpreadCells = (float)Get("SpreadCells", 0.0);
     S.SolveUndulation = (float)Get("Undulation", 0.0);
+    S.SolveLandformErosion = (float)Get("LandformErosion", 0.0);
     S.SolveUpliftVariation = (float)Get("UpliftVariation", 0.0);
     S.SolveErodibilityVariation = (float)Get("ErodibilityVariation", 0.0);
     S.SolveVariationWavelength = (float)Get("VariationWavelength", 1.2e5);
@@ -556,6 +580,7 @@ int main(int argc, char** argv)
     Dump("plates.f32", B.Height.data(), Cells * 4);
     Dump("up.f32", B.Up.data(), Cells * 4);
     Dump("attr.u32", Buf.OAttr.data(), Cells * 4);
+    Dump("form.u32", B.Form.data(), Cells * 4);
     FILE* J = fopen((Tag + ".json").c_str(), "w");
     fprintf(J, "{\"n\": %d, \"pad\": %d, \"radius_m\": %.1f, \"steps\": %zu, \"lakes\": %d, \"seconds\": %.1f}\n", N, B.Pad, RadiusM, R.Residuals.size(), R.Lakes, R.Seconds);
     fclose(J);

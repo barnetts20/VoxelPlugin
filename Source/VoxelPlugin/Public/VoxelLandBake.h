@@ -36,7 +36,7 @@ struct VOXELPLUGIN_API FVoxelLandBake
     static constexpr int32 Pad = 4;
     /** Changes whenever the bake's content or file layout changes (old cache files are then
      *  ignored). */
-    static constexpr uint32 Version = 3;
+    static constexpr uint32 Version = 4;
 
     FVoxelLandBake();
     ~FVoxelLandBake();
@@ -68,6 +68,11 @@ struct VOXELPLUGIN_API FVoxelLandBake
      *  (bit 11, stage L5), under a kept lake (bit 12). */
     TArray<uint16> Attr;
     static constexpr uint16 LakeBit = 1u << 12;
+
+    /** Per cell: the landform (VoxelLandPlates.ush VoxelLandFormAt): the hilliness (0 flat
+     *  plains .. 255 hill country) in the low byte, the character (0 smooth, rolling .. 255
+     *  rough-topped) in the high byte. The hills layer's shape and height (VoxelLandHills.ush). */
+    TArray<uint16> Form;
 
     /** Per cell: log2 of the drainage area (m^2), a cell's own area off the land; empty when
      *  not eroded. */
@@ -162,7 +167,7 @@ private:
 namespace VoxelLand
 {
     /** Bump when the generator's output changes for the same settings (invalidates caches). */
-    constexpr uint32 GeneratorVersion = 5;
+    constexpr uint32 GeneratorVersion = 6;
 
     /** voxel.Land.Erosion: whether bakes run the erosion solve (part of the key). */
     VOXELPLUGIN_API bool IsErosionEnabled();
@@ -192,6 +197,19 @@ namespace VoxelLand
     /** The gully octaves a bake gets (VoxelLandGully.ush): from two bake cells down to
      *  Settings.GullyFinestWavelength, at most 12; 0 without gullies. */
     VOXELPLUGIN_API int32 GullyOctavesFor(const FVoxelTerrestrialSettings& Settings, const FVoxelLandBake& Bake);
+
+    /** The hills' constants (VOXEL_LAND_HILL_MAX_OCTAVES in VoxelLandHills.ush; keep equal),
+     *  and a bound on their shape (a bound for the planet's height range: gully_harness hgrad
+     *  measures -0.15 .. 1.93 over 800k points). */
+    constexpr int32 HillMaxOctaves = 12;
+    constexpr double HillMaxUnit = 2.5;
+
+    /** The hill octaves (VoxelLandHills.ush): from HillWavelength down to HillFinestWavelength,
+     *  at most 12; 0 without hills. */
+    VOXELPLUGIN_API int32 HillOctavesFor(const FVoxelTerrestrialSettings& Settings);
+
+    /** The finest hill octave's frequency (cycles per cm). */
+    VOXELPLUGIN_API double HillFinestFrequency(const FVoxelTerrestrialSettings& Settings);
 
     /** How far the gullies can move the surface either way (cm). */
     VOXELPLUGIN_API double GullyReach(const FVoxelTerrestrialSettings& Settings, const FVoxelLandBake& Bake);

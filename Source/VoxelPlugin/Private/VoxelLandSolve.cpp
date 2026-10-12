@@ -21,6 +21,7 @@ BEGIN_SHADER_PARAMETER_STRUCT(FVoxelLandSolveParameters, )
     SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<float>, BakeUp)
     SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<float>, BakeCrust)
     SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, BakeAttr)
+    SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, BakeForm)
     // The model.
     SHADER_PARAMETER(float, SolvePlainsUplift)
     SHADER_PARAMETER(float, SolveRampWidth)
@@ -48,6 +49,7 @@ BEGIN_SHADER_PARAMETER_STRUCT(FVoxelLandSolveParameters, )
     SHADER_PARAMETER(uint32, SolveModel)
     SHADER_PARAMETER(float, SolvePlainsRelief)
     SHADER_PARAMETER(float, SolveUndulation)
+    SHADER_PARAMETER(float, SolveLandformErosion)
     SHADER_PARAMETER(float, SolveIncision)
     // Per cell.
     SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<float>, SolveH)
@@ -290,7 +292,7 @@ struct VoxelLandSolve::FJob::FImpl
     /** This frame's view of the buffers. */
     struct FFrame
     {
-        FRDGBufferRef BakeHeight = nullptr, BakeUp = nullptr, BakeCrust = nullptr, BakeAttr = nullptr;
+        FRDGBufferRef BakeHeight = nullptr, BakeUp = nullptr, BakeCrust = nullptr, BakeAttr = nullptr, BakeForm = nullptr;
         FRDGBufferRef Tan = nullptr, H = nullptr, W = nullptr, Water = nullptr, Rec = nullptr, Slot = nullptr, Label = nullptr, Cell = nullptr;
         FRDGBufferRef GroupCounts = nullptr, Counts = nullptr, Flags = nullptr, State = nullptr, Partials = nullptr, Log = nullptr, Histogram = nullptr;
         FRDGBufferRef U = nullptr, Erodibility = nullptr, Area = nullptr, Dist = nullptr, H0 = nullptr, WOut = nullptr;
@@ -344,6 +346,7 @@ struct VoxelLandSolve::FJob::FImpl
         F.BakeUp = GraphBuilder.RegisterExternalBuffer(Fields.Up);
         F.BakeCrust = GraphBuilder.RegisterExternalBuffer(Fields.Crust);
         F.BakeAttr = GraphBuilder.RegisterExternalBuffer(Fields.Attr);
+        F.BakeForm = GraphBuilder.RegisterExternalBuffer(Fields.Form);
         if (!Tan.IsValid())
         {
             F.Tan = VoxelGPUCommon::UploadStructuredBuffer(GraphBuilder, TEXT("Voxel.LandSolveTan"), MakeConstArrayView(S.TanTable));
@@ -403,6 +406,7 @@ struct VoxelLandSolve::FJob::FImpl
         Params.BakeUp = GraphBuilder.CreateSRV(F.BakeUp);
         Params.BakeCrust = GraphBuilder.CreateSRV(F.BakeCrust);
         Params.BakeAttr = GraphBuilder.CreateSRV(F.BakeAttr);
+        Params.BakeForm = GraphBuilder.CreateSRV(F.BakeForm);
         Params.SolvePlainsUplift = S.PlainsUplift;
         Params.SolveRampWidth = S.RampWidth;
         Params.SolveUpliftTime = S.UpliftTime;
@@ -427,6 +431,7 @@ struct VoxelLandSolve::FJob::FImpl
         Params.SolveModel = 1u;
         Params.SolvePlainsRelief = S.PlainsRelief;
         Params.SolveUndulation = S.Undulation;
+        Params.SolveLandformErosion = S.LandformErosion;
         Params.SolveIncision = S.Incision;
         Params.SolveH = GraphBuilder.CreateUAV(F.H);
         Params.SolveW = GraphBuilder.CreateUAV(F.W);
@@ -645,7 +650,8 @@ void VoxelLandSolve::FJob::Tick(FRHICommandListImmediate& RHICmdList, const FPla
     using EPhase = FImpl::EPhase;
     FImpl& I = *Impl;
     if (Status.load(std::memory_order_acquire) != 0) return;
-    if (!AreShadersReady() || !Fields.Height.IsValid() || !Fields.Up.IsValid() || !Fields.Crust.IsValid() || !Fields.Attr.IsValid())
+    if (!AreShadersReady() || !Fields.Height.IsValid() || !Fields.Up.IsValid() || !Fields.Crust.IsValid() || !Fields.Attr.IsValid()
+        || !Fields.Form.IsValid())
     {
         I.Release();
         Status.store(-1, std::memory_order_release);
@@ -913,20 +919,23 @@ void VoxelLandSolve::FJob::Tick(FRHICommandListImmediate& RHICmdList, const FPla
             I.Pending.Add(VLS::Enqueue(GraphBuilder, F.LakeCount, 4, TEXT("Voxel.LandSolveLakeCountReadback")));
             I.Pending.Add(VLS::Enqueue(GraphBuilder, F.LakeList, 16 * VLS::MaxLakes, TEXT("Voxel.LandSolveLakesReadback")));
             I.Pending.Add(VLS::Enqueue(GraphBuilder, F.Flags, 8, TEXT("Voxel.LandSolveFlagsReadback")));
+            // The plate pass's landform, which the bake keeps as it is.
+            I.Pending.Add(VLS::Enqueue(GraphBuilder, F.BakeForm, Bytes, TEXT("Voxel.LandSolveFormReadback")));
             I.SetPhase(EPhase::OutputWait, Result);
             Progress.store(0.97f, std::memory_order_relaxed);
             break;
         }
         case EPhase::OutputWait:
         {
-            bool bReady = I.Pending.Num() == 7;
+            bool bReady = I.Pending.Num() == 8;
             for (const VLS::FReadback& R : I.Pending)
                 bReady &= R.IsReady();
             if (!bReady) break;
             TArray<float> Heights, Flows, Waters;
-            TArray<uint32> Attrs, LakeCount, LakeWords, FlagWords;
+            TArray<uint32> Attrs, LakeCount, LakeWords, FlagWords, Forms;
             if (!VLS::Read(I.Pending[0], Heights) || !VLS::Read(I.Pending[1], Flows) || !VLS::Read(I.Pending[2], Waters) || !VLS::Read(I.Pending[3], Attrs)
-                || !VLS::Read(I.Pending[4], LakeCount) || !VLS::Read(I.Pending[5], LakeWords) || !VLS::Read(I.Pending[6], FlagWords))
+                || !VLS::Read(I.Pending[4], LakeCount) || !VLS::Read(I.Pending[5], LakeWords) || !VLS::Read(I.Pending[6], FlagWords)
+                || !VLS::Read(I.Pending[7], Forms))
             {
                 bFailed = true;
                 break;
@@ -938,6 +947,7 @@ void VoxelLandSolve::FJob::Tick(FRHICommandListImmediate& RHICmdList, const FPla
             Result.Water = MoveTemp(Waters);
             Result.Attr = MoveTemp(Attrs);
             Result.Flow = MoveTemp(Flows);
+            Result.Form = MoveTemp(Forms);
             Result.LakesFound = (int32)LakeCount[0];
             const int32 Kept = FMath::Min<int32>(Result.LakesFound, (int32)VLS::MaxLakes);
             const double CellAreaKm2 = 1.0e-2;   // the list's area unit (1e4 m^2) in km^2

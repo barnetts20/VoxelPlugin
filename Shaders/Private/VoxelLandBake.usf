@@ -4,8 +4,8 @@
 //                a histogram weighted by the cell's solid angle;
 //   ThresholdCS  one thread: the crust threshold that leaves LandFraction of the sphere above
 //                it (linear inside the histogram bin);
-//   FieldsCS     a chunk of cells (aprons included): height and attributes from the plate
-//                model (VoxelLandPlates.ush), and the uplift and crust the erosion solve
+//   FieldsCS     a chunk of cells (aprons included): height, attributes and landform from the
+//                plate model (VoxelLandPlates.ush), and the uplift and crust the erosion solve
 //                starts from (VoxelLandSolve.usf).
 // Cells are numbered face-major, f * Side^2 + (j + Pad) * Side + (i + Pad), i and j from -Pad.
 
@@ -43,6 +43,7 @@ RWStructuredBuffer<float> OutHeight;
 RWStructuredBuffer<uint> OutAttr;
 RWStructuredBuffer<float> OutUp;         // the boundary uplift and the crust, for the solve
 RWStructuredBuffer<float> OutCrust;      // (VoxelLandSolve.usf)
+RWStructuredBuffer<uint> OutForm;        // the landform (VoxelLandPackForm), one cell a word
 
 #include "/Plugin/VoxelPlugin/Private/VoxelLandPlates.ush"
 
@@ -120,4 +121,5 @@ void FieldsCS(uint3 GroupId : SV_GroupID, uint GroupThread : SV_GroupIndex)
     OutAttr[Index] = VoxelLandPackAttr(E.Crust, E.Class);
     OutUp[Index] = E.Up;
     OutCrust[Index] = E.Crust;
+    OutForm[Index] = VoxelLandPackForm(VoxelLandFormAt(P, E));
 }

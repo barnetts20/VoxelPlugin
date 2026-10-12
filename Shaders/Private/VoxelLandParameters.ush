@@ -1,6 +1,6 @@
 // VoxelLandParameters.ush - The land bake's shader inputs (FVoxelLandShaderParameters in
 // VoxelLandGPU.h), for passes that evaluate the density. Include before VoxelLandSample.ush,
-// VoxelLandGully.ush and VoxelDensitySample.ush.
+// VoxelLandGully.ush (which includes VoxelLandHills.ush) and VoxelDensitySample.ush.
 
 #ifndef VOXEL_LAND_PARAMETERS_USH
 #define VOXEL_LAND_PARAMETERS_USH
@@ -9,9 +9,11 @@ uint LandMode;                          // 0 the noise surface, 1 the terrestria
 StructuredBuffer<float> LandHeight;     // VoxelLandSample.ush
 StructuredBuffer<float2> LandTanTable;
 StructuredBuffer<uint> LandFlow;        // f16 log2 m^2, two cells per word (when LandHasFlow)
+StructuredBuffer<uint> LandForm;        // the landform, two cells per word (when LandHasForm)
 uint LandN;
 uint LandPad;
 uint LandHasFlow;
+uint LandHasForm;
 float LandCellM;                        // a bake cell's arc at the face centre (m)
 uint LandWarpOctaves;                   // per warp component, after the detail octaves
 float LandWarpInvNorm;
@@ -23,5 +25,9 @@ uint LandGullyOctaves;
 float LandGullyFlowGain;
 float LandGullyDetail;
 uint LandGullySeed;
+float LandHillRelief;                   // VoxelLandHills.ush (0: no hills)
+float2 LandHillFrequency;               // the finest octave's (cycles per cm, double-float)
+uint LandHillOctaves;
+uint LandHillSeed;
 
 #endif // VOXEL_LAND_PARAMETERS_USH

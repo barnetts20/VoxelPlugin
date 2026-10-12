@@ -62,7 +62,9 @@ TAutoConsoleVariable<int32> CVarVoxelDebugLandView(
     TEXT(" 11: the gullies (blue down, red up, over their local depth)\n")
     TEXT(" 12: lakes and rivers (blue over neutral ground)\n")
     TEXT(" 13: elevation with the lakes and rivers over it\n")
-    TEXT("2 to 6 and 8 to 13 need a terrestrial planet, 9, 10, 12 and 13 a GPU bake (magenta otherwise)."),
+    TEXT(" 14: the landform (flat plains straw, rolling ground green, hill country dark green to brown by roughness)\n")
+    TEXT(" 15: the hills layer (white none, green to brown over HillRelief)\n")
+    TEXT("2 to 6 and 8 to 15 need a terrestrial planet, 9, 10, 12 and 13 a GPU bake (magenta otherwise)."),
     ECVF_Default);
 
 static TAutoConsoleVariable<int32> CVarVoxelBrickPerf(
@@ -540,7 +542,7 @@ namespace VoxelBrickTerrainDetail
         using namespace VoxelShader;
         static const TCHAR* Names[VOXEL_LAND_VIEW_COUNT] = { TEXT("off"), TEXT("elevation"), TEXT("bake height"), TEXT("detail layer"),
             TEXT("crust"), TEXT("boundary class"), TEXT("plates"), TEXT("slope"), TEXT("bake cells"), TEXT("drainage"), TEXT("lakes"), TEXT("gullies"),
-            TEXT("lakes and rivers"), TEXT("elevation, lakes and rivers") };
+            TEXT("lakes and rivers"), TEXT("elevation, lakes and rivers"), TEXT("landform"), TEXT("hills") };
         TArray<FLegendLine> Lines;
         Lines.Add({ FString::Printf(TEXT("voxel.Debug.LandView %d: %s (0 hides it; %s)"), View, Names[View],
             bPerPixel
@@ -652,6 +654,21 @@ namespace VoxelBrickTerrainDetail
             Add(TEXT("magenta: the bake has no drainage (a CPU bake)"), VoxelLandViewNone());
             break;
         }
+        case VOXEL_LAND_VIEW_LANDFORM:
+            Add(TEXT("flat plains"), VoxelLandViewLandform(0.0f, 0.0f, false));
+            Add(TEXT("rolling ground"), VoxelLandViewLandform(0.4f, 0.0f, false));
+            Add(TEXT("hill country, smooth"), VoxelLandViewLandform(1.0f, 0.0f, false));
+            Add(TEXT("hill country, rough-topped"), VoxelLandViewLandform(1.0f, 1.0f, false));
+            Add(TEXT("sea"), VoxelLandViewLandform(0.0f, 0.0f, true));
+            Add(TEXT("magenta: the bake has no landform"), VoxelLandViewNone());
+            break;
+        case VOXEL_LAND_VIEW_HILLS:
+            Add(TEXT("none (flat plains, river corridors, coasts)"), VoxelLandViewHills(0.0f));
+            Add(TEXT("half HillRelief"), VoxelLandViewHills(0.5f));
+            Add(TEXT("HillRelief"), VoxelLandViewHills(1.0f));
+            Add(TEXT("1.5 x HillRelief"), VoxelLandViewHills(1.5f));
+            Add(TEXT("magenta: no hills (HillRelief 0, or no landform)"), VoxelLandViewNone());
+            break;
         default:
             break;
         }

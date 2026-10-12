@@ -18,7 +18,7 @@
 //   Fields        x the drainage (log2 m^2), y the crust (0 oceanic..1 continental), z the boundary
 //                 class (0..6; +8 under a kept lake), w the kept lake's depth above the analytic
 //                 surface (m, 0 where there is none);
-//   Terms         x the bake (m), y the gullies (m), z the detail (m), w the pixel's height above
+//   Terms         x the bake (m), y the hillsides: hills and gullies (m), z the detail (m), w the pixel's height above
 //                 the analytic surface (m: the mesh's error, or an edit);
 //   DebugMask     1 where the node shows a debug view (lerp the base colour to the return value),
 //                 else 0 (no view, or the node off: the vertex colours then carry the views).
@@ -52,7 +52,7 @@
 // evaluated per pixel (VoxelLandPixel), kept as the reference. VoxelLandMaterialCached (same
 // arguments) leaves the analytic node out of the shader: the cache only, and lighter. In the cache's source, Terms holds
 // only the pixel's height above the surface (w), and the views of the analytic terms (bake,
-// detail, plates, cells, gullies) evaluate the analytic node for the view only.
+// detail, plates, cells, gullies, landform, hills) evaluate the analytic node for the view only.
 //
 // The gullies' and the detail's share of the normal needs screen-space derivatives: other stages
 // that compile the material's pixel inputs (ray-tracing hit shaders) get the bake's gradient
@@ -120,10 +120,10 @@ struct FVoxelLandPixel
     FVoxelLandHeight Land; // the terms behind them (the debug views)
 };
 
-/** The normal's sources (voxel.Debug.LandNormalMode, VoxelLandParams.x / 16): 0 the bake's and
- *  the detail's exact gradients plus the gullies' (and the detail amplitude's) screen-space
- *  change; 1 the screen-space change of gullies and detail together (M1); 2 the bake and the
- *  detail exact, no gullies; 3 the bake alone. */
+/** The normal's sources (voxel.Debug.LandNormalMode, VoxelLandParams.x / 16): 0 the bake's, the
+ *  hills' and the detail's exact gradients plus the gullies' (and the detail's and the hills'
+ *  amplitudes') screen-space change; 1 the screen-space change of hills, gullies and detail
+ *  together (M1); 2 the bake, the hills and the detail exact, no gullies; 3 the bake alone. */
 FVoxelLandPixel VoxelLandPixel(VOXEL_LAND_ARGS_DECL float2 PX, float2 PY, float2 PZ, float3 DdxLocal, float3 DdyLocal, float Footprint,
     uint NormalMode, float FixedScale)
 {
@@ -149,13 +149,15 @@ FVoxelLandPixel VoxelLandPixel(VOXEL_LAND_ARGS_DECL float2 PX, float2 PY, float2
     const float3 Up = normalize(float3(PX.x, PY.x, PZ.x));
     Out.Up = Up;
     // Every derivative is taken (uniform control flow); the mode picks.
-    const float Rest = H.Gully + H.Detail;
+    const float Rest = H.Gully + H.Detail + H.Hills;
     const float RestX = VOXEL_LAND_DDX(Rest);
     const float RestY = VOXEL_LAND_DDY(Rest);
     const float GullyX = VOXEL_LAND_DDX(H.Gully);
     const float GullyY = VOXEL_LAND_DDY(H.Gully);
     const float AmplitudeX = VOXEL_LAND_DDX(H.DetailAmplitudeM);
     const float AmplitudeY = VOXEL_LAND_DDY(H.DetailAmplitudeM);
+    const float HillAmplitudeX = VOXEL_LAND_DDX(H.HillAmplitudeM);
+    const float HillAmplitudeY = VOXEL_LAND_DDY(H.HillAmplitudeM);
     float DRx = 0.0f;
     float DRy = 0.0f;
     float3 Exact = H.BakeGradient;
@@ -166,11 +168,11 @@ FVoxelLandPixel VoxelLandPixel(VOXEL_LAND_ARGS_DECL float2 PX, float2 PY, float2
     }
     else if (NormalMode != 3u)
     {
-        Exact = Exact + (H.DetailGradient - Up * dot(H.DetailGradient, Up));
+        Exact = Exact + H.HillGradient + (H.DetailGradient - Up * dot(H.DetailGradient, Up));
         if (NormalMode == 0u)
         {
-            DRx = GullyX + H.DetailUnit * AmplitudeX;
-            DRy = GullyY + H.DetailUnit * AmplitudeY;
+            DRx = GullyX + H.DetailUnit * AmplitudeX + H.HillUnit * HillAmplitudeX;
+            DRy = GullyY + H.DetailUnit * AmplitudeY + H.HillUnit * HillAmplitudeY;
         }
     }
     const float3 Tx = (DdxLocal - Up * dot(DdxLocal, Up)) * 0.01f;
@@ -203,6 +205,7 @@ FVoxelLandPixel VoxelLandPixel(VOXEL_LAND_ARGS_DECL float2 PX, float2 PY, float2
         FVoxelLandDifferenced C0;
         C0.Gully = H.Gully;
         C0.DetailAmplitudeM = H.DetailAmplitudeM;
+        C0.HillAmplitudeM = H.HillAmplitudeM;
         const FVoxelLandDifferenced C1 = VoxelLandDifferencedDF(VOXEL_LAND_ARGS
             VoxelDFAdd(LPX, float2(T1.x * VOXEL_LAND_FIXED_STEP, 0.0f)), VoxelDFAdd(LPY, float2(T1.y * VOXEL_LAND_FIXED_STEP, 0.0f)),
             VoxelDFAdd(LPZ, float2(T1.z * VOXEL_LAND_FIXED_STEP, 0.0f)), Footprint);
@@ -211,8 +214,10 @@ FVoxelLandPixel VoxelLandPixel(VOXEL_LAND_ARGS_DECL float2 PX, float2 PY, float2
             VoxelDFAdd(LPZ, float2(T2.z * VOXEL_LAND_FIXED_STEP, 0.0f)), Footprint);
         // m per m: the step is in cm.
         const float Inv = 100.0f / VOXEL_LAND_FIXED_STEP;
-        const float D1 = ((C1.Gully - C0.Gully) + H.DetailUnit * (C1.DetailAmplitudeM - C0.DetailAmplitudeM)) * Inv;
-        const float D2 = ((C2.Gully - C0.Gully) + H.DetailUnit * (C2.DetailAmplitudeM - C0.DetailAmplitudeM)) * Inv;
+        const float D1 = ((C1.Gully - C0.Gully) + H.DetailUnit * (C1.DetailAmplitudeM - C0.DetailAmplitudeM)
+            + H.HillUnit * (C1.HillAmplitudeM - C0.HillAmplitudeM)) * Inv;
+        const float D2 = ((C2.Gully - C0.Gully) + H.DetailUnit * (C2.DetailAmplitudeM - C0.DetailAmplitudeM)
+            + H.HillUnit * (C2.HillAmplitudeM - C0.HillAmplitudeM)) * Inv;
         ScreenPart = lerp(ScreenPart, T1 * D1 + T2 * D2, FixedBlend);
     }
     Gradient = Gradient + ScreenPart;
@@ -225,7 +230,7 @@ FVoxelLandPixel VoxelLandPixel(VOXEL_LAND_ARGS_DECL float2 PX, float2 PY, float2
     const float Level = VOXEL_LAND_WATER(Index);
     const float LakeDepth = Level > -1.0e30f ? max(Level - Out.Height, 0.0f) : 0.0f;
     Out.Fields = float4(H.Flow, float(Attr & 0xffu) / 255.0f, float((Attr >> 8u) & 7u) + ((Attr & 0x1000u) != 0u ? 8.0f : 0.0f), LakeDepth);
-    Out.Terms = float4(H.Bake, H.Gully, H.Detail, Out.Offset);
+    Out.Terms = float4(H.Bake, H.Hills + H.Gully, H.Detail, Out.Offset);
     return Out;
 }
 
@@ -243,6 +248,7 @@ float3 VoxelLandPixelColor(VOXEL_LAND_ARGS_DECL FVoxelLandPixel Pixel, float3 No
     In.Bake = Pixel.Land.Bake;
     In.Gully = Pixel.Land.Gully;
     In.GullyScale = Pixel.Land.GullyScale;
+    In.Hills = Pixel.Land.Hills;
     In.DetailNorm = LandDetailAmplitude > 0.0f ? Pixel.Land.Detail * 100.0f / LandDetailAmplitude : 0.0f;
     In.bTerrestrial = true;
     In.bHydro = VoxelLandConstU(LandConstTex, VOXEL_LAND_MC_HAS_HYDRO) != 0u;
@@ -345,6 +351,7 @@ float3 VoxelLandCacheLevelColor(float Level)
     const uint Cost = (Packed >> 6u) & 7u; \
     GVoxelLandSkipGullies = Cost >= 2u; \
     GVoxelLandSkipDetail = Cost >= 3u; \
+    GVoxelLandSkipHills = Cost >= 3u; \
     const float3 MeshWS = normalize(Parameters.TangentToWorld[2]); \
     const float3 MeshLocal = float3(dot(MeshWS, AxisX), dot(MeshWS, AxisY), dot(MeshWS, AxisZ)); \
     const float Tolerance = max(Params.y + 16.0f * Footprint * 0.01f, 0.01f); \

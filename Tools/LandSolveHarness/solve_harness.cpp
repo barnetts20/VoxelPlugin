@@ -52,6 +52,7 @@ namespace VoxelShader
         const float* BakeUp = nullptr;
         const float* BakeCrust = nullptr;
         const uint* BakeAttr = nullptr;
+        const uint* BakeForm = nullptr;
         float SolvePlainsUplift = 400.0f, SolveRampWidth = 300.0f, SolveUpliftTime = 5.0e6f;
         float SolveKdt = 0.4f, SolveDt = 0.4f / 4.3e-7f, SolveEps = 0.01f;
         uint SolveSeed = 7;
@@ -65,7 +66,7 @@ namespace VoxelShader
         uint* SolveFlags = nullptr;
         float SolveFactor = 1.0f, SolveReliefKnee = 1.0e9f, SolveReliefTop = 1.0e9f;
         float SolveMinLakeDepth = 10.0f, SolveMinLakeArea = 20.0e6f;
-        float SolveJitter = 0.0f, SolveRouteNoise = 0.0f, SolveSpreadCells = 0.0f, SolveUndulation = 0.0f, SolveUpliftVariation = 0.0f, SolveErodibilityVariation = 0.0f, SolveVariationWavelength = 1.2e5f, SolveRoughness = 0.0f, SolveReliefScale = 0.0f;
+        float SolveJitter = 0.0f, SolveRouteNoise = 0.0f, SolveSpreadCells = 0.0f, SolveUndulation = 0.0f, SolveLandformErosion = 0.0f, SolveUpliftVariation = 0.0f, SolveErodibilityVariation = 0.0f, SolveVariationWavelength = 1.2e5f, SolveRoughness = 0.0f, SolveReliefScale = 0.0f;
         uint SolveFillDepressions = 1u, SolveModel = 0u;
         float SolvePlainsRelief = 0.0f, SolveIncision = 0.0f;
         float* SlotK = nullptr;
@@ -122,7 +123,7 @@ struct FPlateBake
     int Side() const { return N + 2 * Pad; }
     int Cells() const { return 6 * Side() * Side(); }
     std::vector<float> Height, Up, Crust;
-    std::vector<uint> Attr;
+    std::vector<uint> Attr, Form;
     std::vector<float2> Tan;
     std::vector<float> Plates;
 };
@@ -163,6 +164,7 @@ static void BakePlates(FPlateBake& B, uint32_t Seed, int K, float LandFraction, 
     B.Up.assign(B.Cells(), 0.f);
     B.Crust.assign(B.Cells(), 0.f);
     B.Attr.assign(B.Cells(), 0u);
+    B.Form.assign(B.Cells(), 0u);
     ParallelFor(B.Cells(), [&](int Idx) {
         const int F = Idx / (S * S), R = Idx % (S * S), J = R / S - B.Pad, I = R % S - B.Pad;
         const float3 D = VoxelCubeDirection(F, VoxelCubeCellCentre(I, N), VoxelCubeCellCentre(J, N));
@@ -171,6 +173,7 @@ static void BakePlates(FPlateBake& B, uint32_t Seed, int K, float LandFraction, 
         B.Up[Idx] = E.Up;
         B.Crust[Idx] = E.Crust;
         B.Attr[Idx] = P.VoxelLandPackAttr(E.Crust, E.Class);
+        B.Form[Idx] = P.VoxelLandPackForm(P.VoxelLandFormAt(D, E));
     });
     B.Tan.resize(S);
     for (int i = 0; i < S; i++)
@@ -217,6 +220,7 @@ static void ApplyT1(FSolve& S)
     S.SolveRouteNoise = 1.0f;
     S.SolveSpreadCells = 16.0f;
     S.SolveUndulation = 60.0f;
+    S.SolveLandformErosion = 1.0f;
 }
 
 /** The drainage field's spread computed sequentially, donors before receivers (the routing
@@ -562,7 +566,7 @@ int main(int argc, char** argv)
 
     FSolve S;
     S.SolveN = N; S.SolvePad = B.Pad; S.SolveRadiusM = RadiusM;
-    S.SolveTan = B.Tan.data(); S.BakeHeight = B.Height.data(); S.BakeUp = B.Up.data(); S.BakeCrust = B.Crust.data(); S.BakeAttr = B.Attr.data();
+    S.SolveTan = B.Tan.data(); S.BakeHeight = B.Height.data(); S.BakeUp = B.Up.data(); S.BakeCrust = B.Crust.data(); S.BakeAttr = B.Attr.data(); S.BakeForm = B.Form.data();
     FSolveBuffers Buf;
     Buf.Bind(S, B.Cells());
     const uint Cells = B.Cells();
@@ -584,6 +588,7 @@ int main(int argc, char** argv)
         Dump(Tag + "_plates.f32", B.Height.data(), Cells * 4);
         Dump(Tag + "_up.f32", B.Up.data(), Cells * 4);
         Dump(Tag + "_crust.f32", B.Crust.data(), Cells * 4);
+        Dump(Tag + "_form.u32", B.Form.data(), Cells * 4);
         return 0;
     }
     // 1. Neighbour symmetry.
@@ -775,7 +780,7 @@ int main(int argc, char** argv)
             }
         }
         S.SolveModel = 0u; S.SolveJitter = 0.0f; S.SolveUpliftVariation = 0.0f; S.SolveErodibilityVariation = 0.0f; S.SolveRoughness = 0.0f;
-        S.SolvePlainsRelief = 0.0f; S.SolveIncision = 0.0f; S.SolveReliefScale = 0.0f; S.SolveRouteNoise = 0.0f; S.SolveSpreadCells = 0.0f; S.SolveUndulation = 0.0f;
+        S.SolvePlainsRelief = 0.0f; S.SolveIncision = 0.0f; S.SolveReliefScale = 0.0f; S.SolveRouteNoise = 0.0f; S.SolveSpreadCells = 0.0f; S.SolveUndulation = 0.0f; S.SolveLandformErosion = 0.0f;
     }
     // The plates alone, for comparison.
     for (uint c = 0; c < Cells; c++) Buf.OHeight[c] = B.Height[c];

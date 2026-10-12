@@ -29,7 +29,9 @@
 #define VOXEL_LAND_VIEW_GULLY 11u      // the gullies, signed, over their local half-depth
 #define VOXEL_LAND_VIEW_WATER 12u      // lakes and rivers in blue over neutral ground (eroded bakes)
 #define VOXEL_LAND_VIEW_TERRAIN_WATER 13u   // elevation with the lakes and rivers over it (eroded bakes)
-#define VOXEL_LAND_VIEW_COUNT 14u      // at most 16: the material packs the view in 4 bits
+#define VOXEL_LAND_VIEW_LANDFORM 14u   // the landform field: hilliness, by character (T2)
+#define VOXEL_LAND_VIEW_HILLS 15u      // the hills layer over HillRelief (T2)
+#define VOXEL_LAND_VIEW_COUNT 16u      // at most 16: the material packs the view in 4 bits
 
 VOXEL_FUNC float3 VoxelLandViewRgb(float R, float G, float B)
 {
@@ -194,6 +196,26 @@ VOXEL_FUNC float3 VoxelLandViewWater(float3 Ground, float Log10Km2, float LakeDe
     if (bSea) return Ground;
     if (bLake) return VoxelLandViewLake(LakeDepth, true, false);
     return VoxelLandViewMix(Ground, VoxelLandViewRiver(Log10Km2), Log10Km2 - 0.5f);
+}
+
+/** The landform (T2): flat plains pale straw, rolling ground green, hill country deep green
+ *  (smooth character) to brown (rough). The sea keeps Ground. */
+VOXEL_FUNC float3 VoxelLandViewLandform(float Hilliness, float Character, bool bSea)
+{
+    if (bSea) return VoxelLandViewRgb(70.0f, 75.0f, 90.0f);
+    const float3 Flat = VoxelLandViewRgb(236.0f, 226.0f, 170.0f);
+    const float3 Rolling = VoxelLandViewRgb(150.0f, 200.0f, 110.0f);
+    const float3 Hill = VoxelLandViewMix(VoxelLandViewRgb(40.0f, 120.0f, 60.0f), VoxelLandViewRgb(140.0f, 80.0f, 40.0f), Character);
+    if (Hilliness < 0.4f) return VoxelLandViewMix(Flat, Rolling, Hilliness / 0.4f);
+    return VoxelLandViewMix(Rolling, Hill, (Hilliness - 0.4f) / 0.6f);
+}
+
+/** The hills over their relief (0..1.5): white none, green to brown up. */
+VOXEL_FUNC float3 VoxelLandViewHills(float X)
+{
+    if (X < 0.5f) return VoxelLandViewMix(VoxelLandViewRgb(250.0f, 250.0f, 245.0f), VoxelLandViewRgb(130.0f, 190.0f, 100.0f), X / 0.5f);
+    if (X < 1.0f) return VoxelLandViewMix(VoxelLandViewRgb(130.0f, 190.0f, 100.0f), VoxelLandViewRgb(150.0f, 110.0f, 60.0f), (X - 0.5f) / 0.5f);
+    return VoxelLandViewMix(VoxelLandViewRgb(150.0f, 110.0f, 60.0f), VoxelLandViewRgb(90.0f, 50.0f, 30.0f), (X - 1.0f) / 0.5f);
 }
 
 /** A cube face (VoxelCubeSphere.ush order: +X, -X, +Y, -Y, +Z, -Z). */

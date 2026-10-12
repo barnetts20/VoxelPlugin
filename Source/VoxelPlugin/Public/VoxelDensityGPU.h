@@ -56,7 +56,8 @@ struct FVoxelDensityGPUData
     double MinFootprint = 0.0;   // footprints below it are raised to it, as on the CPU
 
     // The terrestrial generator (VoxelLandSample.ush; LandMode 0 for the noise surface). The
-    // height is the bake's (m) plus the gullies (VoxelLandGully.ush) and the detail layer,
+    // height is the bake's (m) plus the hills (VoxelLandHills.ush), the gullies
+    // (VoxelLandGully.ush) and the detail layer,
     // offset to the height above PlanetRadius; the warp's three layers follow the detail
     // octaves in Octaves.
     uint32 LandMode = 0;
@@ -72,6 +73,10 @@ struct FVoxelDensityGPUData
     float LandGullyFlowGain = 0.0f;
     float LandGullyDetail = 1.0f;
     uint32 LandGullySeed = 0;
+    float LandHillRelief = 0.0f;         // VoxelLandHills.ush (0: none)
+    FVector2f LandHillFrequency = FVector2f::ZeroVector;   // cycles per cm, double-float
+    uint32 LandHillOctaves = 0;
+    uint32 LandHillSeed = 0;
 };
 
 /** The edit store's edits and index for the GPU (VoxelEditSample.ush; the layout is

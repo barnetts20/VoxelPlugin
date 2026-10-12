@@ -35,6 +35,10 @@ namespace VoxelLandMaterial
     /** The field texels of a bake (Side x 6 Side, the bake's cell order). Any thread. */
     VOXELPLUGIN_API void BuildFieldTexels(const FVoxelLandBake& Bake, TArray<FFloat16Color>& Out);
 
+    /** The height texture's texels (RG32F, VoxelLandMaterialLayout.ush): the height, and the
+     *  landform's 16 bits as a float (0 without it). */
+    VOXELPLUGIN_API void BuildHeightTexels(const FVoxelLandBake& Bake, TArray<FVector2f>& Out);
+
     /** The constant texels (VOXEL_LAND_MATERIAL_CONST_WIDTH x OutRows) for a density's land
      *  bake (Density.LandMode must be 1). Any thread. */
     VOXELPLUGIN_API void BuildConstantTexels(const FVoxelDensityGPUData& Density, const FVoxelLandBake& Bake, TArray<FVector4f>& Out, int32& OutRows);

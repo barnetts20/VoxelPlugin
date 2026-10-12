@@ -19,6 +19,7 @@ struct FMaterialHeight
     float Bake, Gully, Detail, GullyScale, Flow, DetailScale;
     float BakeGradient[3], Warped[3];
     float DetailGradient[3], DetailUnit, DetailAmplitudeM;
+    float Hills, HillUnit, HillAmplitudeM, HillGradient[3];
 };
 
 FMaterialHeight MaterialLandHeight(const FMaterialTextures& T, const float X[2], const float Y[2], const float Z[2], float Footprint, bool bGradient);

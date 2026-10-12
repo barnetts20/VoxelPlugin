@@ -12,8 +12,8 @@
 
 struct FVoxelDensityGPUData;
 
-/** The GPU copy of an FVoxelLandBake (render thread only). The heights, the tan table and
- *  the drainage are the density's; the attributes, the plates and the lake levels are
+/** The GPU copy of an FVoxelLandBake (render thread only). The heights, the tan table, the
+ *  drainage and the landform are the density's; the attributes, the plates and the lake levels are
  *  uploaded only for the land debug views. */
 struct FVoxelLandBakeGPU
 {
@@ -22,6 +22,7 @@ struct FVoxelLandBakeGPU
     TRefCountPtr<FRDGPooledBuffer> Attr;     // two cells per word
     TRefCountPtr<FRDGPooledBuffer> Plates;
     TRefCountPtr<FRDGPooledBuffer> Flow;     // two cells per word (f16)
+    TRefCountPtr<FRDGPooledBuffer> Form;     // two cells per word (the landform)
     TRefCountPtr<FRDGPooledBuffer> Water;
 };
 
@@ -33,9 +34,11 @@ BEGIN_SHADER_PARAMETER_STRUCT(FVoxelLandShaderParameters, )
     SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<float>, LandHeight)
     SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<float2>, LandTanTable)
     SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, LandFlow)
+    SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, LandForm)
     SHADER_PARAMETER(uint32, LandN)
     SHADER_PARAMETER(uint32, LandPad)
     SHADER_PARAMETER(uint32, LandHasFlow)
+    SHADER_PARAMETER(uint32, LandHasForm)
     SHADER_PARAMETER(float, LandCellM)
     SHADER_PARAMETER(uint32, LandWarpOctaves)
     SHADER_PARAMETER(float, LandWarpInvNorm)
@@ -47,6 +50,10 @@ BEGIN_SHADER_PARAMETER_STRUCT(FVoxelLandShaderParameters, )
     SHADER_PARAMETER(float, LandGullyFlowGain)
     SHADER_PARAMETER(float, LandGullyDetail)
     SHADER_PARAMETER(uint32, LandGullySeed)
+    SHADER_PARAMETER(float, LandHillRelief)
+    SHADER_PARAMETER(FVector2f, LandHillFrequency)
+    SHADER_PARAMETER(uint32, LandHillOctaves)
+    SHADER_PARAMETER(uint32, LandHillSeed)
 END_SHADER_PARAMETER_STRUCT()
 
 /** The land debug views' inputs (VoxelLandDebug.ush, declared in VoxelBrickMesherGPU.usf):

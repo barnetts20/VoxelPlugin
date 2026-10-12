@@ -17,6 +17,7 @@ StructuredBuffer<float> BakeHeight;
 StructuredBuffer<float> BakeUp;
 StructuredBuffer<float> BakeCrust;
 StructuredBuffer<uint> BakeAttr;
+StructuredBuffer<uint> BakeForm;
 
 // The model.
 float SolvePlainsUplift;
@@ -46,6 +47,7 @@ uint SolveFillDepressions;
 uint SolveModel;
 float SolvePlainsRelief;
 float SolveUndulation;
+float SolveLandformErosion;
 float SolveIncision;
 
 // Per cell.

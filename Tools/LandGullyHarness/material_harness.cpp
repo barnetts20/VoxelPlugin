@@ -2,7 +2,7 @@
 // constants texture) against the global shaders' (buffers and uniforms), as C++: both compile
 // the same shared land code (VoxelLandSample/Gully/Plates.ush, VoxelDensitySample.ush,
 // VoxelLandDebugColor.ush), one through each set of accessors. The textures are packed here as
-// VoxelLandMaterial::BuildFieldTexels and BuildConstantTexels pack them (layout VoxelLandMaterialLayout.ush). The two
+// VoxelLandMaterial::BuildHeightTexels, BuildFieldTexels and BuildConstantTexels pack them (layout VoxelLandMaterialLayout.ush). The two
 // must agree bit for bit.
 //
 // g++ -O2 -std=c++20 -ffp-contract=off -pthread -I<Public> -I<Shaders/Private> material_harness.cpp material_side.cpp
@@ -37,6 +37,7 @@ int main(int argc, char** argv)
     for (int i = 0; i < Cells; i++)
     {
         HeightTex[4 * (size_t)i] = P.Height[i];
+        HeightTex[4 * (size_t)i + 1] = P.Form.empty() ? 0.0f : (float)(P.Form[i] & 0xffffu);   // BuildHeightTexels
         const uint16_t FlowBits = (uint16_t)((P.FlowPacked[i >> 1] >> ((i & 1) * 16)) & 0xffffu);
         FieldTex[4 * (size_t)i] = HalfToFloat(FlowBits);
         const float L = Water[i];
@@ -66,6 +67,11 @@ int main(int argc, char** argv)
     S[VOXEL_LAND_MC_TAN_BASE] = (float)TanBase; S[VOXEL_LAND_MC_OCTAVE_BASE] = (float)OctaveBase; S[VOXEL_LAND_MC_PLATE_BASE] = (float)PlateBase;
     S[VOXEL_LAND_MC_PLATE_RADIUS_M] = (float)RadiusM; S[VOXEL_LAND_MC_PLATE_WIDTH_SCALE] = 1.0f;
     S[VOXEL_LAND_MC_SIDE] = (float)Side;
+    S[VOXEL_LAND_MC_HILL_RELIEF] = P.S.LandHillRelief;
+    S[VOXEL_LAND_MC_HILL_FREQUENCY] = P.S.LandHillFrequency.x; S[VOXEL_LAND_MC_HILL_FREQUENCY + 1] = P.S.LandHillFrequency.y;
+    S[VOXEL_LAND_MC_HILL_OCTAVES] = (float)P.S.LandHillOctaves;
+    PutU32(S, VOXEL_LAND_MC_HILL_SEED, P.S.LandHillSeed);
+    S[VOXEL_LAND_MC_HAS_FORM] = (float)P.S.LandHasForm;
     for (size_t i = 0; i < P.Tan.size(); i++) { float* T = S + 4 * (TanBase + i / 2) + 2 * (i & 1); T[0] = P.Tan[i].x; T[1] = P.Tan[i].y; }
     for (size_t o = 0; o < Gpu.size(); o++)
     {
@@ -111,7 +117,7 @@ int main(int argc, char** argv)
     // The full land chain through both accessors.
     std::mt19937 Rng(31);
     std::normal_distribution<double> G;
-    int Mismatch = 0, Count = 0, ColorBad = 0, HeightChanged = 0;
+    int Mismatch = 0, Count = 0, ColorBad = 0, HeightChanged = 0, HillPoints = 0;
     for (int i = 0; i < 20000; i++)
     {
         double D[3] = { G(Rng), G(Rng), G(Rng) }; Normalize(D);
@@ -125,7 +131,9 @@ int main(int argc, char** argv)
             && A.BakeGradient.x == B.BakeGradient[0] && A.BakeGradient.y == B.BakeGradient[1] && A.BakeGradient.z == B.BakeGradient[2]
             && A.Warped.x == B.Warped[0] && A.Warped.y == B.Warped[1] && A.Warped.z == B.Warped[2]
             && A.DetailGradient.x == B.DetailGradient[0] && A.DetailGradient.y == B.DetailGradient[1] && A.DetailGradient.z == B.DetailGradient[2]
-            && A.DetailUnit == B.DetailUnit && A.DetailAmplitudeM == B.DetailAmplitudeM;
+            && A.DetailUnit == B.DetailUnit && A.DetailAmplitudeM == B.DetailAmplitudeM
+            && A.Hills == B.Hills && A.HillUnit == B.HillUnit && A.HillAmplitudeM == B.HillAmplitudeM
+            && A.HillGradient.x == B.HillGradient[0] && A.HillGradient.y == B.HillGradient[1] && A.HillGradient.z == B.HillGradient[2];
         // The exact detail path (bGradient) leaves the height as the density's own path has it.
         const VoxelShader::FVoxelLandHeight A0 = VoxelShader::VoxelLandHeightDF(X, Y, Z, F, false);
         HeightChanged += A0.Height.x != A.Height.x || A0.Height.y != A.Height.y || A0.Detail != A.Detail;
@@ -133,16 +141,17 @@ int main(int argc, char** argv)
             printf("  differs at %d: height %.9g/%.9g vs %.9g/%.9g, bake %.9g vs %.9g, gully %.9g vs %.9g, detail %.9g vs %.9g\n", i,
                 A.Height.x, A.Height.y, B.Height[0], B.Height[1], A.Bake, B.Bake, A.Gully, B.Gully, A.Detail, B.Detail);
         Mismatch += !bSame;
+        HillPoints += A.Hills != 0.0f;
         Count++;
         // Every debug view's colour is finite and in range.
-        for (uint32_t Mode = 1; Mode < 12; Mode++)
+        for (uint32_t Mode = 1; Mode < 16u; Mode++)   // every view (VOXEL_LAND_VIEW_COUNT)
         {
             float C[3];
             MaterialDebugColor(Tex, Mode, B, F * 0.01f, C);
             for (float V : C) ColorBad += !(std::isfinite(V) && V >= 0.0f && V <= 1.001f);
         }
     }
-    printf("land chain through the material's accessors against the global shaders': %d of %d points differ in any bit; %d debug colours out of range; height with the exact detail gradient against without: %d differ\n", Mismatch, Count, ColorBad, HeightChanged);
+    printf("land chain through the material's accessors against the global shaders': %d of %d points differ in any bit (%d with hills); %d debug colours out of range; height with the exact detail gradient against without: %d differ\n", Mismatch, Count, HillPoints, ColorBad, HeightChanged);
 
     // The pixel's planet-frame position from the view (VoxelLandFramePoint), against doubles:
     // planets anywhere within 10^9 cm of the world origin, rotated, cameras near their surface.

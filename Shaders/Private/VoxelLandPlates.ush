@@ -36,6 +36,19 @@
 #define VOXEL_LAND_SALT_WARP 0x3a1u
 #define VOXEL_LAND_SALT_CRUST 0x5c3u
 #define VOXEL_LAND_SALT_TEXTURE 0x7e5u
+#define VOXEL_LAND_SALT_FORM 0x9a7u
+// The landform field (VoxelLandFormAt): hill country comes in provinces of about this size
+// (m, Earth widths; the noise's thresholds put a fifth to a quarter of the plains in hill
+// country, and a quarter to a half flat, more on larger planets' wide interiors), its
+// character varies over about this much; range fronts and ranges by the boundary uplift (m).
+#define VOXEL_LAND_FORM_PROVINCE_M 700000.0f
+#define VOXEL_LAND_FORM_PROVINCE_LO -0.05f
+#define VOXEL_LAND_FORM_PROVINCE_HI 0.25f
+#define VOXEL_LAND_FORM_CHARACTER_M 400000.0f
+#define VOXEL_LAND_FORM_FRONT_LO 60.0f
+#define VOXEL_LAND_FORM_FRONT_HI 300.0f
+#define VOXEL_LAND_FORM_RANGE_LO 400.0f
+#define VOXEL_LAND_FORM_RANGE_HI 1500.0f
 
 // --- Noise -------------------------------------------------------------------------------
 
@@ -381,6 +394,41 @@ VOXEL_FUNC FVoxelLandElevation VoxelLandElevationAt(VOXEL_LAND_ARGS_DECL float3 
     Out.Base = VoxelLandBaseElevation(VOXEL_LAND_ARGS Out.Crust)
         + 250.0f * LandReliefScale * TextureWeight * VoxelLandFbm(P, 6.0f, 5u, LandSeed + VOXEL_LAND_SALT_TEXTURE);
     return Out;
+}
+
+/** The landform at direction P (unit) whose plate fields are E (Design/SurfaceLook.md, T2): the
+ *  hilliness H (0 flat plains .. 1 hill country) and the character C (0 smooth, rolling ..
+ *  1 rough-topped), for the hills layer (VoxelLandHills.ush) and the erosion's plains relief
+ *  (VoxelLandSolve.ush).
+ *   - Provinces: hill country and flat plains alternate in regions of several hundred
+ *     kilometres (a low-frequency noise), rolling ground between.
+ *   - Range fronts: where the boundary uplift starts (a hundred to a few hundred metres, rift
+ *     shoulders too) the plains are hillier: foothills.
+ *   - Inside the ranges (uplift above about a kilometre) a middling value: the peaks layer
+ *     (T3) shapes them.
+ *   - Low coastal plains are flatter.
+ *  The character follows its own noise, rougher toward the ranges. */
+VOXEL_FUNC float2 VoxelLandFormAt(VOXEL_LAND_ARGS_DECL float3 P, FVoxelLandElevation E)
+{
+    const float Height = E.Base + E.Up - E.Down;
+    const float Width = max(LandWidthScale, 0.01f);
+    const float Mountain = smoothstep(VOXEL_LAND_FORM_RANGE_LO, VOXEL_LAND_FORM_RANGE_HI, E.Up);
+    const float Front = smoothstep(VOXEL_LAND_FORM_FRONT_LO, VOXEL_LAND_FORM_FRONT_HI, E.Up) * (1.0f - Mountain);
+    const float Province = smoothstep(VOXEL_LAND_FORM_PROVINCE_LO, VOXEL_LAND_FORM_PROVINCE_HI,
+        VoxelLandFbm(P, LandRadiusM / (VOXEL_LAND_FORM_PROVINCE_M * Width), 3u, LandSeed + VOXEL_LAND_SALT_FORM));
+    const float Plains = saturate(Province + 0.6f * Front * (1.0f - Province));
+    const float Coast = lerp(0.4f, 1.0f, smoothstep(30.0f, 400.0f, Height));
+    const float Hilliness = lerp(Plains, 0.45f, Mountain) * Coast;
+    const float Character = saturate(0.5f + 2.0f * VoxelLandFbm(P, LandRadiusM / (VOXEL_LAND_FORM_CHARACTER_M * Width), 3u,
+        LandSeed + VOXEL_LAND_SALT_FORM + 1u) + 0.3f * Front + 0.3f * Mountain);
+    return float2(Hilliness, Character);
+}
+
+/** Packs a landform (FVoxelLandBake::Form: the hilliness in the low byte, the character in the
+ *  high byte; VoxelLandUnpackForm reads it). */
+VOXEL_FUNC uint VoxelLandPackForm(float2 Form)
+{
+    return uint(saturate(Form.x) * 255.0f + 0.5f) | (uint(saturate(Form.y) * 255.0f + 0.5f) << 8u);
 }
 
 /** Packs a cell's attributes: crust fraction (8 bits), boundary class (3 bits at bit 8). */

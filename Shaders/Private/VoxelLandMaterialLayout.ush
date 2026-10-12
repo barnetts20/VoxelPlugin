@@ -2,8 +2,9 @@
 // (VoxelLandMaterialAccess.ush), shared with the C++ that fills them (VoxelLandMaterial.h).
 // Macros only, so both sides include it.
 //
-// Height texture (R32F): the bake's heights (m), Side x 6 Side texels, cell I at (I % Side,
-// I / Side) (the bake's padded index: face-major, rows of U).
+// Height texture (RG32F): R the bake's heights (m), G its landform (FVoxelLandBake::Form, the
+// 16-bit value as a float: exact), Side x 6 Side texels, cell I at (I % Side, I / Side) (the
+// bake's padded index: face-major, rows of U).
 // Field texture (RGBA16F), the same texels: R the drainage (log2 m^2, 0 without it), G the kept
 // lake's level above the cell's own height (m: small, so the half keeps it to a few cm in lakes
 // tens of metres deep, 0.25 m at 500 m;
@@ -55,7 +56,12 @@
 #define VOXEL_LAND_MC_SIDE 35
 #define VOXEL_LAND_MC_PLATE_RADIUS_M 36     // the plate model's warp (the plates view)
 #define VOXEL_LAND_MC_PLATE_WIDTH_SCALE 37
-#define VOXEL_LAND_MC_COUNT 38              // scalars in use (10 texels)
-#define VOXEL_LAND_MC_TEXELS 10
+#define VOXEL_LAND_MC_HILL_RELIEF 38        // the hills (VoxelLandHills.ush)
+#define VOXEL_LAND_MC_HILL_FREQUENCY 39     // double-float: two
+#define VOXEL_LAND_MC_HILL_OCTAVES 41
+#define VOXEL_LAND_MC_HILL_SEED 42          // two
+#define VOXEL_LAND_MC_HAS_FORM 44
+#define VOXEL_LAND_MC_COUNT 45              // scalars in use (12 texels)
+#define VOXEL_LAND_MC_TEXELS 12
 
 #endif // VOXEL_LAND_MATERIAL_LAYOUT_USH

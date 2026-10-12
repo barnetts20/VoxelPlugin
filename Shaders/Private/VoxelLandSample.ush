@@ -21,13 +21,17 @@
 //                                            face coordinate of cell centre i - Pad
 //   StructuredBuffer<uint> LandFlow;         the drainage (f16 log2 m^2), two cells per word,
 //                                            lower index in the low half (read when LandHasFlow)
+//   StructuredBuffer<uint> LandForm;         the landform (VoxelLandAccess.ush VOXEL_LAND_FORM),
+//                                            two cells per word (read when LandHasForm)
 //   uint LandN;
 //   uint LandPad;                            at least 4
 //   uint LandHasFlow;                        1 when the bake has the drainage (eroded)
+//   uint LandHasForm;                        1 when the bake has the landform
 //   float LandCellM;                         a cell's arc at the face centre (m)
 //
-// With the height, VoxelLandBakeSampleDF gives the surface gradient (m/m, a tangent vector)
-// and the drainage, both from the same B-spline, for the hillside layers (VoxelLandGully.ush).
+// With the height, VoxelLandBakeSampleDF gives the surface gradient (m/m, a tangent vector),
+// the drainage and the landform, all from the same B-spline, for the hillside layers
+// (VoxelLandHills.ush, VoxelLandGully.ush).
 
 #ifndef VOXEL_LAND_SAMPLE_USH
 #define VOXEL_LAND_SAMPLE_USH
@@ -126,7 +130,8 @@ VOXEL_FUNC float VoxelLandFlowAt(VOXEL_LAND_ARGS_DECL uint Index)
 }
 
 /** One face's spline at the point: the height (m), its first and second derivatives along the
- *  face's U and V (m per cell, m per cell^2) and the drainage (log2 m^2; 0 without it). */
+ *  face's U and V (m per cell, m per cell^2), the drainage (log2 m^2; 0 without it) and the
+ *  landform (hilliness, character; 0 without it). */
 struct FVoxelLandFaceSample
 {
     float Height;
@@ -136,10 +141,11 @@ struct FVoxelLandFaceSample
     float DUV;
     float DVV;
     float Flow;
+    float2 Form;
 };
 
-/** One face's spline at the point's segments along U and V. bSlopes adds the derivatives and
- *  the drainage (a constant argument: the compiler drops them when false). */
+/** One face's spline at the point's segments along U and V. bSlopes adds the derivatives, the
+ *  drainage and the landform (a constant argument: the compiler drops them when false). */
 VOXEL_FUNC FVoxelLandFaceSample VoxelLandFaceSampleAt(VOXEL_LAND_ARGS_DECL uint Face, FVoxelLandAxis U, FVoxelLandAxis V, bool bSlopes)
 {
     const uint Side = LandN + 2u * LandPad;
@@ -159,6 +165,7 @@ VOXEL_FUNC FVoxelLandFaceSample VoxelLandFaceSampleAt(VOXEL_LAND_ARGS_DECL uint 
     Out.DUV = 0.0f;
     Out.DVV = 0.0f;
     Out.Flow = 0.0f;
+    Out.Form = float2(0.0f, 0.0f);
     if (!bSlopes)
     {
         for (uint b = 0u; b < 4u; b++)
@@ -195,6 +202,16 @@ VOXEL_FUNC FVoxelLandFaceSample VoxelLandFaceSampleAt(VOXEL_LAND_ARGS_DECL uint 
         {
             Out.Flow += VoxelLandWeightAt(WV, b) * (WU.W0 * VoxelLandFlowAt(VOXEL_LAND_ARGS Row) + WU.W1 * VoxelLandFlowAt(VOXEL_LAND_ARGS Row + 1u)
                 + WU.W2 * VoxelLandFlowAt(VOXEL_LAND_ARGS Row + 2u) + WU.W3 * VoxelLandFlowAt(VOXEL_LAND_ARGS Row + 3u));
+        }
+        if (LandHasForm != 0u)
+        {
+            const float2 F0 = VOXEL_LAND_FORM(Row);
+            const float2 F1 = VOXEL_LAND_FORM(Row + 1u);
+            const float2 F2 = VOXEL_LAND_FORM(Row + 2u);
+            const float2 F3 = VOXEL_LAND_FORM(Row + 3u);
+            const float WB = VoxelLandWeightAt(WV, b);
+            Out.Form.x += WB * (WU.W0 * F0.x + WU.W1 * F1.x + WU.W2 * F2.x + WU.W3 * F3.x);
+            Out.Form.y += WB * (WU.W0 * F0.y + WU.W1 * F1.y + WU.W2 * F2.y + WU.W3 * F3.y);
         }
     }
     Out.Height += Ref;
@@ -246,13 +263,15 @@ VOXEL_FUNC float2 VoxelLandPick(float2 X, float2 Y, float2 Z, uint Axis)
 /** The bake at a point: the height (m about sea level), its gradient on the sphere (m/m, a
  *  tangent vector; zero unless asked for), how fast the gradient's direction turns along the
  *  surface (rad/m: |Hessian x the gradient turned a right angle| / |gradient|^2, in the face's
- *  metres; large at valley floors and crests), and the drainage (log2 m^2; 0 without it). */
+ *  metres; large at valley floors and crests), the drainage (log2 m^2; 0 without it) and the
+ *  landform (hilliness, character; 0 without it). */
 struct FVoxelLandBakeSample
 {
     float Height;
     float3 Gradient;
     float Turn;
     float Flow;
+    float2 Form;
 };
 
 /** The bake in the direction of the double-float point P (any length): each face on P's side
@@ -270,6 +289,7 @@ VOXEL_FUNC FVoxelLandBakeSample VoxelLandBakeSampleDF(VOXEL_LAND_ARGS_DECL float
     float3 Gradient = float3(0.0f, 0.0f, 0.0f);
     float Turn = 0.0f;
     float Flow = 0.0f;
+    float2 Form = float2(0.0f, 0.0f);
     for (uint Axis = 0u; Axis < 3u; Axis++)
     {
         const float2 PN = VoxelLandPick(PX, PY, PZ, Axis);
@@ -305,6 +325,8 @@ VOXEL_FUNC FVoxelLandBakeSample VoxelLandBakeSampleDF(VOXEL_LAND_ARGS_DECL float
             const float TurnV = (F.DUV * -HV + F.DVV * HU) * InvCell2;
             Turn += W * sqrt(TurnU * TurnU + TurnV * TurnV) / max(HU * HU + HV * HV, 1.0e-12f);
             Flow += W * F.Flow;
+            Form.x += W * F.Form.x;
+            Form.y += W * F.Form.y;
         }
     }
     FVoxelLandBakeSample Out;
@@ -312,6 +334,7 @@ VOXEL_FUNC FVoxelLandBakeSample VoxelLandBakeSampleDF(VOXEL_LAND_ARGS_DECL float
     Out.Gradient = WSum > 0.0f ? Gradient / WSum : float3(0.0f, 0.0f, 0.0f);
     Out.Turn = WSum > 0.0f ? Turn / WSum : 0.0f;
     Out.Flow = WSum > 0.0f ? Flow / WSum : 0.0f;
+    Out.Form = WSum > 0.0f ? float2(Form.x / WSum, Form.y / WSum) : float2(0.0f, 0.0f);
     return Out;
 }
 

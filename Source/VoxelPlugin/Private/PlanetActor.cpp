@@ -572,6 +572,18 @@ namespace PlanetActorLandExport
             Bytes.SetNumUninitialized(Bake->Attr.Num() * sizeof(uint16));
             FMemory::Memcpy(Bytes.GetData(), Bake->Attr.GetData(), Bytes.Num());
             FFileHelper::SaveArrayToFile(Bytes, *(Base + TEXT("_attr.u16")));
+            // The landform (VoxelLandPackForm: hilliness low byte, character high), a u32 per
+            // cell as the harnesses read it (Tag_form.u32).
+            if (Bake->Form.Num() == Bake->Height.Num())
+            {
+                TArray<uint32> Form;
+                Form.SetNumUninitialized(Bake->Form.Num());
+                for (int32 i = 0; i < Form.Num(); i++)
+                    Form[i] = Bake->Form[i];
+                Bytes.SetNumUninitialized(Form.Num() * sizeof(uint32));
+                FMemory::Memcpy(Bytes.GetData(), Form.GetData(), Bytes.Num());
+                FFileHelper::SaveArrayToFile(Bytes, *(Base + TEXT("_form.u32")));
+            }
             // The drainage (log2 m^2) and the lake levels, as f32, when the bake is eroded.
             if (Bake->Flow.Num() == Bake->Height.Num() && Bake->Water.Num() == Bake->Height.Num())
             {
@@ -605,6 +617,6 @@ namespace PlanetActorLandExport
 
     FAutoConsoleCommandWithWorldAndArgs Command(
         TEXT("voxel.Land.ExportBake"),
-        TEXT("Writes every terrestrial planet's bake (heights f32, attributes u16, drainage and lake levels f32 when eroded, a json header with the lakes) to Saved/VoxelLand/Export_* (Tools/LandView/view_bake.py renders them)."),
+        TEXT("Writes every terrestrial planet's bake (heights f32, attributes u16, the landform u32, drainage and lake levels f32 when eroded, a json header with the lakes) to Saved/VoxelLand/Export_* (Tools/LandView/view_bake.py renders them)."),
         FConsoleCommandWithWorldAndArgsDelegate::CreateStatic(&Run));
 }

@@ -179,7 +179,12 @@ private:
     float LandGullyFlowGain = 0.0f;
     float LandGullyDetail = 1.0f;
     uint32 LandGullySeed = 0;
+    float LandHillRelief = 0.0f;        // VoxelLandHills.ush
+    double LandHillFrequency = 0.0;     // cycles per cm (the finest octave's)
+    uint32 LandHillOctaves = 0;
+    uint32 LandHillSeed = 0;
     TArray<uint32> LandFlowPacked;      // the bake's drainage, two f16 cells per word (empty: none)
+    TArray<uint32> LandFormPacked;      // the bake's landform, two cells per word (empty: none)
 };
 
 namespace VoxelDensity

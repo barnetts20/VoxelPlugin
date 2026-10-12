@@ -151,11 +151,13 @@ VOXEL_FUNC FVoxelLandFramePoint VoxelLandFramePoint(float3 TranslatedWorld, floa
  *  leave the gullies or the detail layer out, to measure what each costs. */
 static bool GVoxelLandSkipGullies = false;
 static bool GVoxelLandSkipDetail = false;
+static bool GVoxelLandSkipHills = false;
 
 // The accessors (VoxelLandAccess.ush).
 #define VOXEL_LAND_HEIGHT(I) LandHeightTex.Load(VoxelLandCellTexel(LandConstTex, (I))).x
 #define VOXEL_LAND_TAN(I) VoxelLandMaterialTan(LandConstTex, (I))
 #define VOXEL_LAND_FLOW(I) LandFieldTex.Load(VoxelLandCellTexel(LandConstTex, (I))).x
+#define VOXEL_LAND_FORM(I) VoxelLandUnpackForm(uint(LandHeightTex.Load(VoxelLandCellTexel(LandConstTex, (I))).y))
 #define VOXEL_LAND_ATTR(I) VoxelLandMaterialAttr(LandFieldTex, LandConstTex, (I))
 #define VOXEL_LAND_WATER(I) VoxelLandMaterialWater(LandHeightTex, LandFieldTex, LandConstTex, (I))
 #define VOXEL_LAND_PLATE(I) VoxelLandMaterialPlate(LandConstTex, (I))
@@ -171,6 +173,11 @@ static bool GVoxelLandSkipDetail = false;
 #define LandGullyFlowGain VoxelLandConstF(LandConstTex, VOXEL_LAND_MC_GULLY_FLOW_GAIN)
 #define LandGullyDetail VoxelLandConstF(LandConstTex, VOXEL_LAND_MC_GULLY_DETAIL)
 #define LandGullySeed VoxelLandConstU32(LandConstTex, VOXEL_LAND_MC_GULLY_SEED)
+#define LandHillRelief (GVoxelLandSkipHills ? 0.0f : VoxelLandConstF(LandConstTex, VOXEL_LAND_MC_HILL_RELIEF))
+#define LandHillFrequency VoxelLandConstF2(LandConstTex, VOXEL_LAND_MC_HILL_FREQUENCY)
+#define LandHillOctaves VoxelLandConstU(LandConstTex, VOXEL_LAND_MC_HILL_OCTAVES)
+#define LandHillSeed VoxelLandConstU32(LandConstTex, VOXEL_LAND_MC_HILL_SEED)
+#define LandHasForm VoxelLandConstU(LandConstTex, VOXEL_LAND_MC_HAS_FORM)
 #define LandMode VoxelLandConstU(LandConstTex, VOXEL_LAND_MC_LAND_MODE)
 #define LandWarpOctaves VoxelLandConstU(LandConstTex, VOXEL_LAND_MC_WARP_OCTAVES)
 #define LandWarpInvNorm VoxelLandConstF(LandConstTex, VOXEL_LAND_MC_WARP_INV_NORM)

@@ -12,6 +12,11 @@
 #undef LandGullyFlowGain
 #undef LandGullyDetail
 #undef LandGullySeed
+#undef LandHillRelief
+#undef LandHillFrequency
+#undef LandHillOctaves
+#undef LandHillSeed
+#undef LandHasForm
 #undef LandMode
 #undef LandWarpOctaves
 #undef LandWarpInvNorm

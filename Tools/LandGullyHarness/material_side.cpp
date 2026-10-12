@@ -76,6 +76,8 @@ FMaterialHeight MaterialLandHeight(const FMaterialTextures& T, const float X[2],
     O.Warped[0] = L.Warped.x; O.Warped[1] = L.Warped.y; O.Warped[2] = L.Warped.z;
     O.DetailGradient[0] = L.DetailGradient.x; O.DetailGradient[1] = L.DetailGradient.y; O.DetailGradient[2] = L.DetailGradient.z;
     O.DetailUnit = L.DetailUnit; O.DetailAmplitudeM = L.DetailAmplitudeM;
+    O.Hills = L.Hills; O.HillUnit = L.HillUnit; O.HillAmplitudeM = L.HillAmplitudeM;
+    O.HillGradient[0] = L.HillGradient.x; O.HillGradient[1] = L.HillGradient.y; O.HillGradient[2] = L.HillGradient.z;
     return O;
 }
 
@@ -96,7 +98,7 @@ void MaterialDebugColor(const FMaterialTextures& T, uint32_t Mode, const FMateri
     FVoxelLandDebugInput In;
     In.Mode = Mode; In.Elevation = L.Bake + L.Gully; In.SlopeDegrees = 12.0f; In.CellM = CellM;
     In.Warped = float3(L.Warped[0], L.Warped[1], L.Warped[2]);
-    In.Bake = L.Bake; In.Gully = L.Gully; In.GullyScale = L.GullyScale;
+    In.Bake = L.Bake; In.Gully = L.Gully; In.GullyScale = L.GullyScale; In.Hills = L.Hills;
     In.DetailNorm = L.Detail / 250.0f;
     In.bTerrestrial = true; In.bHydro = true;
     const float3 Color = VoxelLandDebugColor(H, F, C, In);

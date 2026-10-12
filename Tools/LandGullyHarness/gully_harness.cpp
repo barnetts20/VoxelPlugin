@@ -46,7 +46,11 @@ namespace VoxelShader
     const float* LandHeight = nullptr;
     const float2* LandTanTable = nullptr;
     const uint* LandFlow = nullptr;
-    uint LandN = 0, LandPad = 4, LandHasFlow = 0, LandWarpOctaves = 3;
+    const uint* LandForm = nullptr;
+    uint LandN = 0, LandPad = 4, LandHasFlow = 0, LandHasForm = 0, LandWarpOctaves = 3;
+    float LandHillRelief = 0.0f;
+    float2 LandHillFrequency;
+    uint LandHillOctaves = 0, LandHillSeed = 0;
     float LandCellM = 1.0f;
     float LandWarpInvNorm = 0, LandWarpAmplitude = 0, LandDetailAmplitude = 0;
     float2 LandHeightOffset;
@@ -64,13 +68,18 @@ namespace VoxelShader
         const float* LandHeight = nullptr;
         const float2* LandTanTable = nullptr;
         const uint* LandFlow = nullptr;
-        uint LandN = 1, LandPad = 0, LandHasFlow = 0;
+        const uint* LandForm = nullptr;
+        uint LandN = 1, LandPad = 0, LandHasFlow = 0, LandHasForm = 0;
+        float LandHillRelief = 0.0f;
+        float2 LandHillFrequency;
+        uint LandHillOctaves = 0, LandHillSeed = 0;
         float LandCellM = 1.0f;
         float LandGullyStrength = 0.0f;
         uint LandGullyOctaves = 0;
         float LandGullyFlowGain = 0.0f, LandGullyDetail = 1.0f;
         uint LandGullySeed = 0;
 #undef VOXEL_LAND_SAMPLE_USH
+#undef VOXEL_LAND_HILLS_USH
 #undef VOXEL_LAND_GULLY_USH
 #include "VoxelLandSample.ush"
 #include "VoxelLandGully.ush"
@@ -180,7 +189,8 @@ struct FPlanet
     double R = 0, NA = 0;      // the density's base radius and range (cm)
     double Cell = 0;           // cm
     std::vector<float> Height, FlowF;
-    std::vector<uint32_t> FlowPacked;
+    std::vector<uint32_t> FlowPacked, FormPacked;
+    std::vector<uint32_t> Form;        // per cell (VoxelLandPackForm)
     std::vector<float2> Tan;
     FLay Det, W[3];
     double WarpAmp = 0, DetailAmp = 0, Offset = 0, Finest = 0, Half = 0;
@@ -208,6 +218,15 @@ static void Load(FPlanet& P, const std::string& Tag, int N, double RadiusM, doub
     P.Tan.resize(T.size() / 8); std::memcpy(P.Tan.data(), T.data(), T.size());
     P.FlowPacked.resize(P.FlowF.size() / 2);
     for (size_t i = 0; i < P.FlowPacked.size(); i++) P.FlowPacked[i] = ToHalf(P.FlowF[2 * i]) | ((uint32_t)ToHalf(P.FlowF[2 * i + 1]) << 16);
+    // The landform (T2), when the dump has it.
+    if (FILE* FF = fopen((Tag + "_form.u32").c_str(), "rb"))
+    {
+        fclose(FF);
+        auto Fo = ReadFile(Tag + "_form.u32");
+        P.Form.resize(Fo.size() / 4); std::memcpy(P.Form.data(), Fo.data(), Fo.size());
+        P.FormPacked.resize(P.Form.size() / 2);
+        for (size_t i = 0; i < P.FormPacked.size(); i++) P.FormPacked[i] = (P.Form[2 * i] & 0xffffu) | ((P.Form[2 * i + 1] & 0xffffu) << 16);
+    }
     float Mn = 1e9, Mx = -1e9; for (float h : P.Height) { Mn = std::min(Mn, h); Mx = std::max(Mx, h); }
     P.Cell = M_PI * 0.5 * P.SeaRadius / N;
     // VoxelLand::GullyOctavesFor and GullyReach.
@@ -216,7 +235,14 @@ static void Load(FPlanet& P, const std::string& Tag, int N, double RadiusM, doub
     double GS = 0, Gn = 1; for (int o = 0; o < Octaves; o++) { GS += Gn; Gn *= 0.42; }
     const double GullyReach = 0.5 * Strength * Lambda0 * 100.0 * 0.8 * GS;
     P.DetailAmp = 250.0 * 100;
-    const double Reach = 2.5 * P.DetailAmp + GullyReach + 100;
+    // The hills (VoxelLand::HillOctavesFor, HillFinestFrequency), from the environment.
+    constexpr double HillMaxUnit = 2.5;   // VoxelLand::HillMaxUnit (VoxelLandBake.h)
+    const double HillRelief = getenv("HILL_RELIEF") ? atof(getenv("HILL_RELIEF")) : 150.0;
+    const double HillLongest = getenv("HILL_WAVELENGTH") ? atof(getenv("HILL_WAVELENGTH")) : 4000.0;
+    const double HillFinest = getenv("HILL_FINEST") ? atof(getenv("HILL_FINEST")) : 25.0;
+    const int HillOctaves = P.Form.empty() || HillRelief <= 0 ? 0 : std::clamp((int)std::floor(std::log2(HillLongest / HillFinest)) + 1, 1, 12);
+    const double HillFrequency = 1.0 / (HillLongest * 100.0 / std::pow(2.0, std::max(HillOctaves, 1) - 1));
+    const double Reach = 2.5 * P.DetailAmp + GullyReach + HillMaxUnit * HillRelief * 100.0 + 100;
     const double Low = Mn * 100.0 - Reach, High = Mx * 100.0 + Reach;
     P.R = P.SeaRadius + Low; P.NA = High - Low;
     const double Root = (P.R + P.NA) * 1.05;
@@ -234,16 +260,20 @@ static void Load(FPlanet& P, const std::string& Tag, int N, double RadiusM, doub
     S.LandN = N; S.LandPad = P.Pad; S.LandHasFlow = 1; S.LandCellM = (float)(P.Cell * 0.01);
     S.LandGullyStrength = (float)Strength; S.LandGullyOctaves = Octaves; S.LandGullyFlowGain = 0.5f; S.LandGullyDetail = 0.5f;
     S.LandGullySeed = VoxelHashSeed(7, 0x21u);
+    S.LandForm = P.FormPacked.data(); S.LandHasForm = P.FormPacked.empty() ? 0u : 1u;
+    S.LandHillRelief = (float)HillRelief; S.LandHillOctaves = (uint)HillOctaves; S.LandHillFrequency = DF(HillFrequency);
+    S.LandHillSeed = VoxelHashSeed(7, 0x31u);
     if (getenv("GULLY_DETAIL")) S.LandGullyDetail = (float)atof(getenv("GULLY_DETAIL"));
     if (getenv("DETAIL_AMP")) P.DetailAmp = atof(getenv("DETAIL_AMP")) * 100.0;
-    printf("planet %s: R %.0f km, N %d, cell %.0f m, lambda0 %.0f m, %d gully octaves, gully reach %.0f m, heights %.0f..%.0f m, lattice finest %.0f cm\n",
-        Tag.c_str(), RadiusM * 1e-3, N, P.Cell * 0.01, Lambda0, Octaves, GullyReach * 0.01, Mn, Mx, P.Finest);
+    printf("planet %s: R %.0f km, N %d, cell %.0f m, lambda0 %.0f m, %d gully octaves, gully reach %.0f m, heights %.0f..%.0f m, lattice finest %.0f cm; hills %.0f m, %d octaves%s\n",
+        Tag.c_str(), RadiusM * 1e-3, N, P.Cell * 0.01, Lambda0, Octaves, GullyReach * 0.01, Mn, Mx, P.Finest, HillRelief, HillOctaves,
+        P.Form.empty() ? " (no landform in the dump)" : "");
 }
 
-struct FTerms { double Bake, Gully, Detail, Height; float DetailScale; };
+struct FTerms { double Bake, Hills, Gully, Detail, Height; float DetailScale; };
 
 /** FVoxelDensityCPU::LandHeightAt at direction D (unit), Footprint (cm). Height in m above sea. */
-static FTerms Terms(const FPlanet& P, const double D[3], double Footprint, bool bGullies = true, bool bWarpJacobian = true)
+static FTerms Terms(const FPlanet& P, const double D[3], double Footprint, bool bGullies = true, bool bWarpJacobian = true, bool bHills = true)
 {
     double SP[3] = { D[0] * P.SeaRadius, D[1] * P.SeaRadius, D[2] * P.SeaRadius };
     double Q[3], DW[3][3];
@@ -254,15 +284,16 @@ static FTerms Terms(const FPlanet& P, const double D[3], double Footprint, bool 
     }
     FSampler S = P.S;
     if (!bGullies) S.LandGullyStrength = 0;
+    if (!bHills) S.LandHillRelief = 0;
     const auto L = S.VoxelLandSurfaceDF(DF(SP[0]), DF(SP[1]), DF(SP[2]), DF(Q[0]), DF(Q[1]), DF(Q[2]),
         float3((float)DW[0][0], (float)DW[0][1], (float)DW[0][2]), float3((float)DW[1][0], (float)DW[1][1], (float)DW[1][2]),
         float3((float)DW[2][0], (float)DW[2][1], (float)DW[2][2]), (float)std::max(Footprint, P.Finest), false);
     const float Wd = lerp(0.25f, 1.0f, smoothstep(-50.0f, 50.0f, L.Bake));
     const double Dd = Evaluate(P.Det, SP, std::max(Footprint, P.Finest));
     FTerms T;
-    T.Bake = L.Bake; T.Gully = L.Gully; T.DetailScale = L.DetailScale;
+    T.Bake = L.Bake; T.Hills = L.Hills; T.Gully = L.Gully; T.DetailScale = L.DetailScale;
     T.Detail = Dd * (double)((float)P.DetailAmp * Wd * L.DetailScale) * 0.01;
-    T.Height = T.Bake + T.Gully + T.Detail;
+    T.Height = T.Bake + T.Hills + T.Gully + T.Detail;
     return T;
 }
 
@@ -339,6 +370,89 @@ static std::vector<float3> Render(const FPlanet& P, const double C[3], double Wi
     return Out;
 }
 
+/** Hillshade of a square WidthM wide around C (as Render), with the hills and the gullies on or
+ *  off; bTerm draws the hills term alone (white 0 to brown at Scale m). */
+static std::vector<float3> RenderHills(const FPlanet& P, const double C[3], double WidthM, int Px, bool bHills, bool bGullies, bool bTerm, double Scale,
+    std::vector<double>* OutH = nullptr)
+{
+    double E1[3], E2[3]; Frame(C, E1, E2);
+    const double Pix = WidthM / Px;
+    std::vector<double> H(Px * Px);
+    ParallelFor(Px * Px, [&](int k) {
+        const int x = k % Px, y = k / Px;
+        const double U = ((x + 0.5) / Px - 0.5) * WidthM * 100.0 / P.SeaRadius, V = (0.5 - (y + 0.5) / Px) * WidthM * 100.0 / P.SeaRadius;
+        double D[3] = { C[0] + U * E1[0] + V * E2[0], C[1] + U * E1[1] + V * E2[1], C[2] + U * E1[2] + V * E2[2] };
+        Normalize(D);
+        const FTerms T = Terms(P, D, Pix * 100.0, bGullies, true, bHills);
+        H[k] = bTerm ? T.Hills : T.Height;
+    });
+    if (OutH) *OutH = H;
+    std::vector<float3> Out(Px * Px);
+    for (int y = 0; y < Px; y++)
+        for (int x = 0; x < Px; x++)
+        {
+            const int k = y * Px + x;
+            if (bTerm)
+            {
+                const float t = (float)std::clamp(H[k] / Scale, 0.0, 1.0);
+                Out[k] = float3(1.0f - 0.45f * t, 1.0f - 0.6f * t, 1.0f - 0.8f * t);
+                continue;
+            }
+            const int x0 = std::max(x - 1, 0), x1 = std::min(x + 1, Px - 1), y0 = std::max(y - 1, 0), y1 = std::min(y + 1, Px - 1);
+            const double dx = (H[y * Px + x1] - H[y * Px + x0]) / ((x1 - x0) * Pix), dy = (H[y0 * Px + x] - H[y1 * Px + x]) / ((y1 - y0) * Pix);
+            const double Nx = -dx, Ny = -dy, Nz = 1, L = std::sqrt(Nx * Nx + Ny * Ny + Nz * Nz);
+            const double Shade = std::clamp((Nx * -0.5 + Ny * 0.5 + Nz * 0.7071) / L, 0.0, 1.0);
+            float3 Base;
+            const double h = H[k];
+            if (h <= 0) Base = float3(0.25f, 0.4f, 0.6f);
+            else
+            {
+                const double t = std::min(h / 2500.0, 1.0);
+                Base = float3((float)(0.42 + 0.4 * t), (float)(0.56 + 0.22 * t), (float)(0.33 + 0.4 * t));
+            }
+            Out[k] = Base * (float)(0.25 + 0.85 * Shade);
+        }
+    return Out;
+}
+
+/** A land cell of the given landform (hilliness in [HMin, HMax], at least 200 m up, a gentle
+ *  bake): a view centre for the hills. Which picks among the candidates. */
+static bool FindLandform(const FPlanet& P, double HMin, double HMax, int Which, double OutC[3])
+{
+    if (P.Form.empty()) return false;
+    const int Side = P.Side();
+    std::vector<int> Cand;
+    for (int f = 0; f < 6; f++)
+        for (int j = 16; j < P.N - 16; j += 8)
+            for (int i = 16; i < P.N - 16; i += 8)
+            {
+                const int c = f * Side * Side + (j + P.Pad) * Side + i + P.Pad;
+                const double Hl = (P.Form[c] & 0xffu) / 255.0;
+                if (Hl < HMin || Hl > HMax || P.Height[c] < 200 || P.Height[c] > 2000 || P.FlowF[c] > 2 * std::log2(P.Cell * 0.01) + 3) continue;
+                Cand.push_back(c);
+            }
+    if (Cand.empty()) return false;
+    const int c = Cand[(size_t)(Which * 7919) % Cand.size()];
+    const int f = c / (Side * Side), r = c % (Side * Side), j = r / Side - P.Pad, i = r % Side - P.Pad;
+    const float3 D = VoxelCubeDirection(f, VoxelCubeCellCentre(i, P.N), VoxelCubeCellCentre(j, P.N));
+    OutC[0] = D.x; OutC[1] = D.y; OutC[2] = D.z;
+    return true;
+}
+
+/** Slope percentiles (degrees) of a height grid Px x Px with pixel Pix (m). */
+static void SlopeStats(const std::vector<double>& H, int Px, double Pix, double Out[3])
+{
+    std::vector<double> S;
+    for (int y = 1; y < Px - 1; y++)
+        for (int x = 1; x < Px - 1; x++)
+        {
+            const double dx = (H[y * Px + x + 1] - H[y * Px + x - 1]) / (2 * Pix), dy = (H[(y + 1) * Px + x] - H[(y - 1) * Px + x]) / (2 * Pix);
+            S.push_back(std::atan(std::sqrt(dx * dx + dy * dy)) * 57.29578);
+        }
+    std::sort(S.begin(), S.end());
+    Out[0] = S[S.size() / 2]; Out[1] = S[S.size() * 9 / 10]; Out[2] = S[S.size() * 99 / 100];
+}
+
 /** A land cell with steep slopes and some height: the view centre. */
 static void FindMountain(const FPlanet& P, double OutC[3], int Which)
 {
@@ -386,6 +500,9 @@ static void SetGpuGlobals(const FPlanet& P, std::vector<FVoxelOctave>& Gpu)
     LandDetailAmplitude = (float)P.DetailAmp; LandHeightOffset = DF(P.Offset);
     VoxelShader::LandGullyStrength = P.S.LandGullyStrength; VoxelShader::LandGullyOctaves = P.S.LandGullyOctaves;
     VoxelShader::LandGullyFlowGain = P.S.LandGullyFlowGain; VoxelShader::LandGullyDetail = P.S.LandGullyDetail; VoxelShader::LandGullySeed = P.S.LandGullySeed;
+    VoxelShader::LandForm = P.FormPacked.data(); VoxelShader::LandHasForm = P.S.LandHasForm;
+    VoxelShader::LandHillRelief = P.S.LandHillRelief; VoxelShader::LandHillFrequency = P.S.LandHillFrequency;
+    VoxelShader::LandHillOctaves = P.S.LandHillOctaves; VoxelShader::LandHillSeed = P.S.LandHillSeed;
 }
 // ---------------------------------------------------------------------------------------------
 
@@ -415,6 +532,124 @@ int main(int argc, char** argv)
                 printf("wrote %s (left: L2 bake + detail; middle: + gullies; right: the gully term)\n", Name);
             }
         }
+    }
+    else if (Mode == "hills")
+    {
+        // The hills layer (T2) by landform: hill country, rolling plains, flat plains. Each sheet:
+        // without hills and gullies; with the hills; with hills and gullies (the full surface);
+        // the hills term. Slopes at the pixel size, with and without the hills.
+        if (P.Form.empty()) { printf("the dump has no landform (Tag_form.u32)\n"); return 1; }
+        struct FKind { const char* Name; double Lo, Hi; };
+        const FKind Kinds[] = { { "hillcountry", 0.75, 1.0 }, { "rolling", 0.3, 0.6 }, { "flat", 0.0, 0.12 } };
+        const int Views = getenv("VIEWS") ? atoi(getenv("VIEWS")) : 1;
+        std::vector<double> Widths = { 30000.0, 8000.0, 2000.0 };
+        if (getenv("WIDTH")) Widths = { atof(getenv("WIDTH")) };
+        const int Px = getenv("PX") ? atoi(getenv("PX")) : 400;
+        for (const FKind& K : Kinds)
+            for (int v = 0; v < Views; v++)
+            {
+                double C[3];
+                if (!FindLandform(P, K.Lo, K.Hi, v + 1, C)) { printf("no %s cell\n", K.Name); continue; }
+                for (double Width : Widths)
+                {
+                    std::vector<double> H0, H1;
+                    auto A = RenderHills(P, C, Width, Px, false, false, false, 1.0, &H0);
+                    auto B = RenderHills(P, C, Width, Px, true, false, false, 1.0);
+                    auto F = RenderHills(P, C, Width, Px, true, true, false, 1.0, &H1);
+                    auto T = RenderHills(P, C, Width, Px, true, false, true, P.S.LandHillRelief);
+                    char Name[256]; snprintf(Name, sizeof Name, "%s%s_hills_%s%d_%.0fkm.ppm", Tag.c_str(), getenv("SUFFIX") ? getenv("SUFFIX") : "", K.Name, v, Width / 1000);
+                    Sheet(Name, { A, B, F, T }, Px);
+                    double S0[3], S1[3]; SlopeStats(H0, Px, Width / Px, S0); SlopeStats(H1, Px, Width / Px, S1);
+                    printf("wrote %s: slope p50/p90/p99 %.1f/%.1f/%.1f deg without hills and gullies, %.1f/%.1f/%.1f with\n",
+                        Name, S0[0], S0[1], S0[2], S1[0], S1[1], S1[2]);
+                }
+            }
+    }
+    else if (Mode == "hgrad")
+    {
+        // The hills' analytic gradient (VoxelLandHillsDF, at a fixed amplitude: the same landform,
+        // drainage and bake height at both ends) against central differences of the hills, in
+        // random tangent directions at random points, at a fine footprint.
+        if (P.Form.empty()) { printf("the dump has no landform\n"); return 1; }
+        std::mt19937 Rng(5);
+        std::normal_distribution<double> G;
+        double WorstRel = 0, SumRel = 0; int Count = 0;
+        const float2 Form(1.0f, 0.7f);
+        for (int i = 0; i < 4000; i++)
+        {
+            double D[3] = { G(Rng), G(Rng), G(Rng) }; Normalize(D);
+            double E1[3], E2[3]; Frame(D, E1, E2);
+            const double Th = std::uniform_real_distribution<double>(0, 2 * M_PI)(Rng);
+            double T[3]; for (int a = 0; a < 3; a++) T[a] = std::cos(Th) * E1[a] + std::sin(Th) * E2[a];
+            const double Step = 20.0;   // cm
+            auto At = [&](double S) {
+                double Q[3]; for (int a = 0; a < 3; a++) Q[a] = D[a] * P.SeaRadius + T[a] * S;
+                return P.S.VoxelLandHillsDF(DF(Q[0]), DF(Q[1]), DF(Q[2]), Form, 0.0f, 500.0f, 100.0f);
+            };
+            const auto C = At(0), A = At(Step), B = At(-Step);
+            const double Num = ((double)A.Unit * A.AmplitudeM - (double)B.Unit * B.AmplitudeM) / (2 * Step * 0.01);
+            const double Ana = C.Gradient.x * T[0] + C.Gradient.y * T[1] + C.Gradient.z * T[2];
+            const double Rel = std::fabs(Num - Ana) / std::max(std::fabs(Ana) + std::fabs(Num), 0.02);
+            WorstRel = std::max(WorstRel, Rel); SumRel += Rel; Count++;
+        }
+        printf("hills gradient against differences over 20 cm: mean relative error %.2g, worst %.2g (of %d)\n", SumRel / Count, WorstRel, Count);
+        // The shape's range (VoxelLand::HillMaxUnit bounds it for the planet's height range).
+        double Lo = 1e9, Hi = -1e9, Mean = 0; const int Range = 400000;
+        for (int c = 0; c <= 1; c++)
+            for (int i = 0; i < Range; i++)
+            {
+                double D[3] = { G(Rng), G(Rng), G(Rng) }; Normalize(D);
+                const auto H = P.S.VoxelLandHillsDF(DF(D[0] * P.SeaRadius), DF(D[1] * P.SeaRadius), DF(D[2] * P.SeaRadius), float2(1.0f, (float)c), 0.0f, 500.0f, 100.0f);
+                Lo = std::min(Lo, (double)H.Unit); Hi = std::max(Hi, (double)H.Unit); Mean += H.Unit;
+            }
+        printf("hills shape over %d points (character 0 and 1): %.3f .. %.3f, mean %.3f\n", 2 * Range, Lo, Hi, Mean / (2 * Range));
+        // Continuity: lines of 1 cm steps, the largest step against the typical one.
+        double WorstJump = 0, WorstRatio = 0;
+        for (int l = 0; l < 200; l++)
+        {
+            double D[3] = { G(Rng), G(Rng), G(Rng) }; Normalize(D);
+            double E1[3], E2[3]; Frame(D, E1, E2);
+            double Prev = 0, SumStep = 0, MaxStep = 0;
+            for (int k = 0; k <= 5000; k++)
+            {
+                double Q[3]; for (int a = 0; a < 3; a++) Q[a] = D[a] * P.SeaRadius + E1[a] * (double)k;
+                const auto H = P.S.VoxelLandHillsDF(DF(Q[0]), DF(Q[1]), DF(Q[2]), float2(1.0f, 1.0f), 0.0f, 500.0f, 100.0f);
+                const double V = (double)H.Unit * H.AmplitudeM;
+                if (k > 0) { const double St = std::fabs(V - Prev); SumStep += St; MaxStep = std::max(MaxStep, St); }
+                Prev = V;
+            }
+            WorstJump = std::max(WorstJump, MaxStep);
+            WorstRatio = std::max(WorstRatio, MaxStep / std::max(SumStep / 5000.0, 1e-9));
+        }
+        printf("hills along 200 lines of 50 m in 1 cm steps: largest step %.4f m, at most %.1f times the line's mean step\n", WorstJump, WorstRatio);
+        // Continuity over the footprint: each octave fades out with its band, so the shape, its
+        // gradient and the gullies' steering (the two coarsest octaves) change smoothly as the
+        // footprint grows; the largest change over a 0.1% step, against the outputs' size.
+        double WorstUnit = 0, WorstGrad = 0, WorstSteer = 0;
+        for (int l = 0; l < 200; l++)
+        {
+            double D[3] = { G(Rng), G(Rng), G(Rng) }; Normalize(D);
+            const float2 F2(1.0f, (float)(l % 3) * 0.5f);
+            double PrevU = 0, PrevG[3] = {}, PrevS[3] = {};
+            for (int k = 0; k <= 12000; k++)
+            {
+                const float Footprint = (float)(100.0 * std::pow(1.001, (double)k));   // 1 m .. about 1600 km
+                const auto H = P.S.VoxelLandHillsDF(DF(D[0] * P.SeaRadius), DF(D[1] * P.SeaRadius), DF(D[2] * P.SeaRadius), F2, 0.0f, 500.0f, Footprint);
+                const double Gr[3] = { H.Gradient.x, H.Gradient.y, H.Gradient.z }, St[3] = { H.Steer.x, H.Steer.y, H.Steer.z };
+                if (k > 0)
+                {
+                    WorstUnit = std::max(WorstUnit, std::fabs(H.Unit - PrevU));
+                    double DG = 0, DS = 0;
+                    for (int a = 0; a < 3; a++) { DG += (Gr[a] - PrevG[a]) * (Gr[a] - PrevG[a]); DS += (St[a] - PrevS[a]) * (St[a] - PrevS[a]); }
+                    WorstGrad = std::max(WorstGrad, std::sqrt(DG));
+                    WorstSteer = std::max(WorstSteer, std::sqrt(DS));
+                }
+                PrevU = H.Unit;
+                for (int a = 0; a < 3; a++) { PrevG[a] = Gr[a]; PrevS[a] = St[a]; }
+            }
+        }
+        printf("hills over the footprint (200 points, 1 m .. 1600 km in 0.1%% steps): largest change of the shape %.4f, gradient %.5f m/m, steering %.5f m/m\n",
+            WorstUnit, WorstGrad, WorstSteer);
     }
     else if (Mode == "slope")
     {

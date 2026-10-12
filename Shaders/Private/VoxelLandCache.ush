@@ -17,7 +17,7 @@
 // the two swap once it's complete (the state names each level's tile).
 //
 // Contents (one texel each in three atlases):
-//   Height  R32F     m about sea level (the analytic surface: bake, gullies, detail)
+//   Height  R32F     m about sea level (the analytic surface: bake, hills, gullies, detail)
 //   Slope   RGBA16F  xyz the surface's gradient (m/m, a tangent vector in the planet frame);
 //                    w the drainage (log2 m^2)
 //   Fields  RGBA16F  x the crust (0..1), y the boundary class (0..6, +8 under a kept lake),

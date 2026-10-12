@@ -1,5 +1,5 @@
 // VoxelLandAccess.ush - How the shared land code reaches its data. The land code
-// (VoxelLandSample.ush, VoxelLandGully.ush, VoxelLandPlates.ush, the land parts of
+// (VoxelLandSample.ush, VoxelLandHills.ush, VoxelLandGully.ush, VoxelLandPlates.ush, the land parts of
 // VoxelDensitySample.ush, VoxelLandDebugColor.ush) runs in three hosts:
 //   - global shaders (the mesher, the density check, the ocean pages, the bake): its inputs are
 //     shader parameters (StructuredBuffers and uniforms), declared at global scope;
@@ -38,6 +38,19 @@
  *  half. */
 #ifndef VOXEL_LAND_FLOW
 #define VOXEL_LAND_FLOW(I) f16tof32((LandFlow[(I) >> 1u] >> (((I) & 1u) * 16u)) & 0xffffu)
+#endif
+
+/** A cell's landform (FVoxelLandBake::Form: the hilliness in the low byte, the character in the
+ *  high byte) as 0..1 values. */
+VOXEL_FUNC float2 VoxelLandUnpackForm(uint Packed)
+{
+    return float2(float(Packed & 0xffu) * (1.0f / 255.0f), float((Packed >> 8u) & 0xffu) * (1.0f / 255.0f));
+}
+
+/** The bake's landform (hilliness, character; VoxelLandPlates.ush VoxelLandFormAt) at cell I:
+ *  two cells per word, the lower index in the low half (read when LandHasForm). */
+#ifndef VOXEL_LAND_FORM
+#define VOXEL_LAND_FORM(I) VoxelLandUnpackForm((LandForm[(I) >> 1u] >> (((I) & 1u) * 16u)) & 0xffffu)
 #endif
 
 /** The bake's attributes (FVoxelLandBake::Attr) at cell I: two cells per word, low half first

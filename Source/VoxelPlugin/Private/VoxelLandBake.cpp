@@ -283,6 +283,7 @@ namespace VoxelLandBakeDetail
         const int32 NumCells = Bake->NumCells();
         Bake->Height.SetNumUninitialized(NumCells);
         Bake->Attr.SetNumUninitialized(NumCells);
+        Bake->Form.SetNumUninitialized(NumCells);
         constexpr int32 Chunk = 4096;
         const int32 NumCellChunks = FMath::DivideAndRoundUp(NumCells, Chunk);
         ParallelFor(NumCellChunks, [&](int32 c)
@@ -300,6 +301,7 @@ namespace VoxelLandBakeDetail
                     const VoxelShader::FVoxelLandPlatesCPU::FVoxelLandElevation E = P.VoxelLandElevationAt(Dir, Threshold);
                     Bake->Height[Index] = E.Base + E.Up - E.Down;
                     Bake->Attr[Index] = (uint16)P.VoxelLandPackAttr(E.Crust, E.Class);
+                    Bake->Form[Index] = (uint16)P.VoxelLandPackForm(P.VoxelLandFormAt(Dir, E));
                 }
                 if (Progress) Progress->fetch_add(Chunk, std::memory_order_relaxed);
             }, EParallelForFlags::BackgroundPriority);
@@ -325,7 +327,7 @@ uint32 FVoxelTerrestrialSettings::GetBakeHash() const
     for (const double V : { ContinentalFraction, LandformWidthScale, RangeRelief, CoastHeight, InteriorHeight, ShelfDepth, AbyssDepth,
         PlainsUpliftThreshold, MountainRampWidth, SolveResidual, MinLakeDepth, MinLakeArea, RoutingJitter, UpliftVariation,
         ErodibilityVariation, VariationWavelength, InitialRoughness, PlainsRelief, RiverIncision, SummitHeightScale,
-        RoutingRandomness, DrainageSpreadCells, PlainsUndulation })
+        RoutingRandomness, DrainageSpreadCells, PlainsUndulation, LandformErosion })
         H = HashCombine(H, ::GetTypeHash(V));
     H = HashCombine(H, ::GetTypeHash(SolveMaxSteps));
     return H;
@@ -335,7 +337,7 @@ uint32 FVoxelTerrestrialSettings::GetSettingsHash() const
 {
     uint32 H = GetBakeHash();
     for (const double V : { BakeWarp, DetailAmplitude, DetailWavelength, DetailSlopeDamping,
-        GullyStrength, GullyFinestWavelength, GullyFlowGain, GullyDetailScale })
+        GullyStrength, GullyFinestWavelength, GullyFlowGain, GullyDetailScale, HillRelief, HillWavelength, HillFinestWavelength })
         H = HashCombine(H, ::GetTypeHash(V));
     return H;
 }
@@ -422,7 +424,7 @@ uint32 VoxelLand::BakeCheck(const FVoxelTerrestrialSettings& Settings, double Se
         Settings.SolveResidual, (double)Settings.SolveMaxSteps, Settings.MinLakeDepth, Settings.MinLakeArea, IsErosionEnabled() ? 1.0 : 0.0,
         Settings.RoutingJitter, Settings.UpliftVariation, Settings.ErodibilityVariation, Settings.VariationWavelength, Settings.InitialRoughness,
         Settings.PlainsRelief, Settings.RiverIncision, Settings.SummitHeightScale, Settings.RoutingRandomness, Settings.DrainageSpreadCells,
-        Settings.PlainsUndulation };
+        Settings.PlainsUndulation, Settings.LandformErosion };
     return FCrc::MemCrc32(Values.GetData(), Values.Num() * (int32)sizeof(double));
 }
 
@@ -434,6 +436,22 @@ int32 VoxelLand::GullyOctavesFor(const FVoxelTerrestrialSettings& Settings, cons
     const double Finest = FMath::Max(Settings.GullyFinestWavelength, 1.0);
     if (Lambda0 < Finest) return 0;
     return FMath::Clamp(FMath::FloorToInt(FMath::Log2(Lambda0 / Finest)) + 1, 0, GullyMaxOctaves);
+}
+
+int32 VoxelLand::HillOctavesFor(const FVoxelTerrestrialSettings& Settings)
+{
+    if (Settings.HillRelief <= 0.0) return 0;
+    const double Longest = FMath::Max(Settings.HillWavelength, 1.0);
+    const double Finest = FMath::Max(Settings.HillFinestWavelength, 1.0);
+    if (Longest < Finest) return 1;
+    return FMath::Clamp(FMath::FloorToInt(FMath::Log2(Longest / Finest)) + 1, 1, HillMaxOctaves);
+}
+
+double VoxelLand::HillFinestFrequency(const FVoxelTerrestrialSettings& Settings)
+{
+    const int32 Octaves = FMath::Max(HillOctavesFor(Settings), 1);
+    const double FinestCm = FMath::Max(Settings.HillWavelength, 1.0) * 100.0 / FMath::Pow(2.0, (double)(Octaves - 1));
+    return 1.0 / FinestCm;
 }
 
 double VoxelLand::GullyReach(const FVoxelTerrestrialSettings& Settings, const FVoxelLandBake& Bake)
@@ -457,9 +475,11 @@ void VoxelLand::ShapeFor(const FVoxelTerrestrialSettings& Settings, const FVoxel
 {
     // The B-spline and the face blend are convex combinations of the cells, so the bake's
     // range holds; the detail reaches at most about 2.4 times its amplitude (MakeLayer's
-    // normalisation), the gullies GullyReach either way, and a metre of margin either side.
+    // normalisation), the gullies GullyReach either way, the hills HillMaxUnit times their
+    // relief (up; down by less), and a metre of margin either side.
     const double DetailReach = 2.5 * FMath::Max(Settings.DetailAmplitude, 0.0) * 100.0;
-    const double Reach = DetailReach + GullyReach(Settings, Bake) + 100.0;
+    const double HillReach = HillMaxUnit * FMath::Max(Settings.HillRelief, 0.0) * 100.0;
+    const double Reach = DetailReach + GullyReach(Settings, Bake) + HillReach + 100.0;
     const double Low = (double)Bake.MinHeight * 100.0 - Reach;
     const double High = (double)Bake.MaxHeight * 100.0 + Reach;
     OutPlanetRadius = FMath::Max(Bake.SeaRadius + Low, 1.0);
@@ -490,11 +510,11 @@ namespace VoxelLandCache
         float ReliefFactor = 1.0f;
     };
 
-    /** The raw (uncompressed) size of a bake's data: heights, attributes, then for an eroded
-     *  bake the drainage and the lake levels, then the lakes. */
+    /** The raw (uncompressed) size of a bake's data: heights, attributes, landform, then for an
+     *  eroded bake the drainage and the lake levels, then the lakes. */
     int64 RawBytes(int64 NumCells, bool bEroded, int64 NumLakes)
     {
-        return NumCells * (int64)(sizeof(float) + sizeof(uint16))
+        return NumCells * (int64)(sizeof(float) + 2 * sizeof(uint16))
             + (bEroded ? NumCells * (int64)(sizeof(uint16) + sizeof(float)) : 0)
             + NumLakes * (int64)sizeof(FVoxelLandLake);
     }
@@ -505,7 +525,7 @@ namespace VoxelLandCache
     /** A bake fit to keep or use: finite heights and a range. */
     bool IsUsable(const FVoxelLandBake& Bake)
     {
-        if (Bake.Height.Num() != Bake.NumCells() || Bake.Attr.Num() != Bake.NumCells()) return false;
+        if (Bake.Height.Num() != Bake.NumCells() || Bake.Attr.Num() != Bake.NumCells() || Bake.Form.Num() != Bake.NumCells()) return false;
         if (Bake.bEroded && (Bake.Flow.Num() != Bake.NumCells() || Bake.Water.Num() != Bake.NumCells())) return false;
         if (!(Bake.MinHeight <= Bake.MaxHeight)) return false;
         for (const float H : Bake.Height)
@@ -552,6 +572,7 @@ namespace VoxelLandCache
             };
         Append(Bake.Height.GetData(), NumCells * sizeof(float));
         Append(Bake.Attr.GetData(), NumCells * sizeof(uint16));
+        Append(Bake.Form.GetData(), NumCells * sizeof(uint16));
         if (Bake.bEroded)
         {
             Append(Bake.Flow.GetData(), NumCells * sizeof(uint16));
@@ -645,8 +666,10 @@ namespace VoxelLandCache
             };
         Bake->Height.SetNumUninitialized((int32)NumCells);
         Bake->Attr.SetNumUninitialized((int32)NumCells);
+        Bake->Form.SetNumUninitialized((int32)NumCells);
         Take(Bake->Height.GetData(), NumCells * sizeof(float));
         Take(Bake->Attr.GetData(), NumCells * sizeof(uint16));
+        Take(Bake->Form.GetData(), NumCells * sizeof(uint16));
         if (Bake->bEroded)
         {
             Bake->Flow.SetNumUninitialized((int32)NumCells);
@@ -696,6 +719,7 @@ BEGIN_SHADER_PARAMETER_STRUCT(FVoxelLandBakeParameters, )
     SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint>, OutAttr)
     SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<float>, OutUp)
     SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<float>, OutCrust)
+    SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint>, OutForm)
 END_SHADER_PARAMETER_STRUCT()
 
 #define VOXEL_LAND_BAKE_SHADER(ShaderName) \
@@ -734,6 +758,7 @@ struct FVoxelLandBakeJob
     TRefCountPtr<FRDGPooledBuffer> Attr;
     TRefCountPtr<FRDGPooledBuffer> Up;
     TRefCountPtr<FRDGPooledBuffer> Crust;
+    TRefCountPtr<FRDGPooledBuffer> Form;
     TUniquePtr<FRHIGPUBufferReadback> ThresholdReadback;
 
     /** The solve (VoxelLandSolve.h), run once the plate pass is done; bErode: with the
@@ -774,6 +799,7 @@ struct FVoxelLandBakeJob
         Attr.SafeRelease();
         Up.SafeRelease();
         Crust.SafeRelease();
+        Form.SafeRelease();
         ThresholdReadback.Reset();
     }
 };
@@ -826,6 +852,7 @@ namespace VoxelLandBakeDetail
         S.Roughness = (float)FMath::Max(Settings.InitialRoughness, 0.0);
         S.PlainsRelief = (float)FMath::Max(Settings.PlainsRelief, 0.0);
         S.Undulation = (float)FMath::Max(Settings.PlainsUndulation, 0.0);
+        S.LandformErosion = (float)FMath::Clamp(Settings.LandformErosion, 0.0, 1.0);
         S.Incision = (float)FMath::Max(Settings.RiverIncision, 0.0);
         S.ReliefTopScale = (float)FMath::Clamp(Settings.SummitHeightScale, 1.0, 2.0);
         S.bErode = VoxelLand::IsErosionEnabled();
@@ -860,6 +887,7 @@ namespace VoxelLandBakeDetail
         FRDGBufferRef Attr;
         FRDGBufferRef Up;
         FRDGBufferRef Crust;
+        FRDGBufferRef Form;
         if (Step == 0)
         {
             auto Create = [&GraphBuilder](uint32 Stride, uint32 Count, const TCHAR* Name)
@@ -875,6 +903,7 @@ namespace VoxelLandBakeDetail
             Attr = Create(sizeof(uint32), NumCells, TEXT("Voxel.LandBakeAttr"));
             Up = Create(sizeof(float), NumCells, TEXT("Voxel.LandBakeUp"));
             Crust = Create(sizeof(float), NumCells, TEXT("Voxel.LandBakeCrust"));
+            Form = Create(sizeof(uint32), NumCells, TEXT("Voxel.LandBakeForm"));
         }
         else
         {
@@ -885,6 +914,7 @@ namespace VoxelLandBakeDetail
             Attr = GraphBuilder.RegisterExternalBuffer(Job.Attr);
             Up = GraphBuilder.RegisterExternalBuffer(Job.Up);
             Crust = GraphBuilder.RegisterExternalBuffer(Job.Crust);
+            Form = GraphBuilder.RegisterExternalBuffer(Job.Form);
         }
 
         FVoxelLandBakeParameters Template;
@@ -910,6 +940,7 @@ namespace VoxelLandBakeDetail
         Template.OutAttr = GraphBuilder.CreateUAV(Attr);
         Template.OutUp = GraphBuilder.CreateUAV(Up);
         Template.OutCrust = GraphBuilder.CreateUAV(Crust);
+        Template.OutForm = GraphBuilder.CreateUAV(Form);
         FGlobalShaderMap* ShaderMap = GetGlobalShaderMap(GMaxRHIFeatureLevel);
 
         const int32 CrustSteps = Job.CrustSteps();
@@ -961,6 +992,7 @@ namespace VoxelLandBakeDetail
             Job.Attr = GraphBuilder.ConvertToExternalBuffer(Attr);
             Job.Up = GraphBuilder.ConvertToExternalBuffer(Up);
             Job.Crust = GraphBuilder.ConvertToExternalBuffer(Crust);
+            Job.Form = GraphBuilder.ConvertToExternalBuffer(Form);
         }
         GraphBuilder.Execute();
     }
@@ -990,6 +1022,7 @@ namespace VoxelLandBakeDetail
         Fields.Up = Job.Up;
         Fields.Crust = Job.Crust;
         Fields.Attr = Job.Attr;
+        Fields.Form = Job.Form;
         Job.Solve->Tick(RHICmdList, Fields);
         const int32 SolveStatus = Job.Solve->Status.load(std::memory_order_acquire);
         if (SolveStatus < 0 || (SolveStatus > 0 && !Job.bThresholdRead && !Job.ThresholdReadback.IsValid()))
@@ -1002,7 +1035,8 @@ namespace VoxelLandBakeDetail
         {
             const VoxelLandSolve::FResult& R = Job.Solve->Result;
             const int32 NumCells = Job.NumCells();
-            const bool bOk = R.Height.Num() == NumCells && R.Attr.Num() == NumCells && R.Flow.Num() == NumCells && R.Water.Num() == NumCells;
+            const bool bOk = R.Height.Num() == NumCells && R.Attr.Num() == NumCells && R.Flow.Num() == NumCells && R.Water.Num() == NumCells
+                && R.Form.Num() == NumCells;
             Job.ReleaseBuffers();
             Job.Status.store(bOk ? 1 : -1, std::memory_order_release);
         }
@@ -1180,9 +1214,11 @@ void FVoxelLandBaker::Tick()
                 Bake->Lakes = MoveTemp(R->Lakes);
                 Bake->Attr.SetNumUninitialized(Num);
                 Bake->Flow.SetNumUninitialized(Num);
+                Bake->Form.SetNumUninitialized(Num);
                 for (int32 i = 0; i < Num; i++)
                 {
                     Bake->Attr[i] = (uint16)R->Attr[i];
+                    Bake->Form[i] = (uint16)R->Form[i];
                     if (!FMath::IsFinite(R->Flow[i])) return nullptr;
                     Bake->Flow[i] = FFloat16(R->Flow[i]);
                 }
@@ -1325,6 +1361,7 @@ FVoxelLandShaderParameters VoxelLandGPU::GetParameters(FRDGBuilder& GraphBuilder
     Parameters.LandN = 1;
     Parameters.LandPad = 0;
     Parameters.LandHasFlow = 0;
+    Parameters.LandHasForm = 0;
     Parameters.LandCellM = 1.0f;
     Parameters.LandWarpOctaves = 0;
     Parameters.LandWarpInvNorm = 0.0f;
@@ -1336,6 +1373,10 @@ FVoxelLandShaderParameters VoxelLandGPU::GetParameters(FRDGBuilder& GraphBuilder
     Parameters.LandGullyFlowGain = 0.0f;
     Parameters.LandGullyDetail = 1.0f;
     Parameters.LandGullySeed = 0;
+    Parameters.LandHillRelief = 0.0f;
+    Parameters.LandHillFrequency = FVector2f::ZeroVector;
+    Parameters.LandHillOctaves = 0;
+    Parameters.LandHillSeed = 0;
 
     const FVoxelLandBake* Bake = Density.LandMode != 0 ? Density.Land.Get() : nullptr;
     if (Bake && Bake->GPU.IsValid() && Bake->Height.Num() == Bake->NumCells() && Bake->TanTable.Num() == Bake->Side())
@@ -1356,6 +1397,17 @@ FVoxelLandShaderParameters VoxelLandGPU::GetParameters(FRDGBuilder& GraphBuilder
             Resource.Flow = GraphBuilder.ConvertToExternalBuffer(
                 VoxelGPUCommon::UploadStructuredBuffer(GraphBuilder, TEXT("Voxel.LandFlow"), MakeConstArrayView(Packed)));
         }
+        // The landform shapes the hills.
+        const bool bHasForm = Bake->Form.Num() == Bake->NumCells();
+        if (bHasForm && !Resource.Form.IsValid())
+        {
+            const TArray<uint32> Packed = VoxelLandBakeDetail::PackHalves(Bake->Form.Num(), [Bake](int32 i) { return (uint32)Bake->Form[i]; });
+            Resource.Form = GraphBuilder.ConvertToExternalBuffer(
+                VoxelGPUCommon::UploadStructuredBuffer(GraphBuilder, TEXT("Voxel.LandForm"), MakeConstArrayView(Packed)));
+        }
+        Parameters.LandForm = bHasForm ? GraphBuilder.CreateSRV(GraphBuilder.RegisterExternalBuffer(Resource.Form))
+            : GraphBuilder.CreateSRV(VoxelGPUCommon::UploadStructuredBuffer<uint32>(GraphBuilder, TEXT("Voxel.LandFormNone"), TConstArrayView<uint32>()));
+        Parameters.LandHasForm = bHasForm ? 1u : 0u;
         Parameters.LandHeight = GraphBuilder.CreateSRV(GraphBuilder.RegisterExternalBuffer(Resource.Height));
         Parameters.LandTanTable = GraphBuilder.CreateSRV(GraphBuilder.RegisterExternalBuffer(Resource.TanTable));
         Parameters.LandFlow = bHasFlow ? GraphBuilder.CreateSRV(GraphBuilder.RegisterExternalBuffer(Resource.Flow))
@@ -1375,6 +1427,10 @@ FVoxelLandShaderParameters VoxelLandGPU::GetParameters(FRDGBuilder& GraphBuilder
         Parameters.LandGullyFlowGain = Density.LandGullyFlowGain;
         Parameters.LandGullyDetail = Density.LandGullyDetail;
         Parameters.LandGullySeed = Density.LandGullySeed;
+        Parameters.LandHillRelief = Density.LandHillRelief;
+        Parameters.LandHillFrequency = Density.LandHillFrequency;
+        Parameters.LandHillOctaves = Density.LandHillOctaves;
+        Parameters.LandHillSeed = Density.LandHillSeed;
         return Parameters;
     }
 
@@ -1382,6 +1438,7 @@ FVoxelLandShaderParameters VoxelLandGPU::GetParameters(FRDGBuilder& GraphBuilder
     Parameters.LandHeight = GraphBuilder.CreateSRV(VoxelGPUCommon::UploadStructuredBuffer<float>(GraphBuilder, TEXT("Voxel.LandHeightNone"), TConstArrayView<float>()));
     Parameters.LandTanTable = GraphBuilder.CreateSRV(VoxelGPUCommon::UploadStructuredBuffer<FVector2f>(GraphBuilder, TEXT("Voxel.LandTanTableNone"), TConstArrayView<FVector2f>()));
     Parameters.LandFlow = GraphBuilder.CreateSRV(VoxelGPUCommon::UploadStructuredBuffer<uint32>(GraphBuilder, TEXT("Voxel.LandFlowNone"), TConstArrayView<uint32>()));
+    Parameters.LandForm = GraphBuilder.CreateSRV(VoxelGPUCommon::UploadStructuredBuffer<uint32>(GraphBuilder, TEXT("Voxel.LandFormNone"), TConstArrayView<uint32>()));
     return Parameters;
 }
 

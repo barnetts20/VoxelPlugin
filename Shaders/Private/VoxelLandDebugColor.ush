@@ -59,6 +59,7 @@ struct FVoxelLandDebugInput
     float Bake;           // m (FVoxelLandHeight)
     float Gully;          // m
     float GullyScale;     // m
+    float Hills;          // m (VoxelLandHills.ush)
     float DetailNorm;     // the detail as added, over its full amplitude (about -1..1)
     bool bTerrestrial;    // the land inputs are bound (else the bake views show "none")
     bool bHydro;          // the bake has drainage and lakes (eroded)
@@ -78,6 +79,11 @@ VOXEL_FUNC float3 VoxelLandDebugColor(VOXEL_LAND_ARGS_DECL FVoxelLandDebugInput 
         if (LandGullyStrength <= 0.0f || LandGullyOctaves == 0u) return VoxelLandViewNone();
         return VoxelLandViewSigned(In.GullyScale > 1.0e-3f ? In.Gully / In.GullyScale : 0.0f);
     }
+    if (In.Mode == VOXEL_LAND_VIEW_HILLS)
+    {
+        if (LandHillRelief <= 0.0f || LandHillOctaves == 0u || LandHasForm == 0u) return VoxelLandViewNone();
+        return VoxelLandViewHills(In.Hills / LandHillRelief);
+    }
 
     const FVoxelLandDebugCell Cell = VoxelLandDebugCellOf(VOXEL_LAND_ARGS In.Warped);
     const uint Index = VoxelLandDebugIndex(VOXEL_LAND_ARGS Cell);
@@ -85,6 +91,12 @@ VOXEL_FUNC float3 VoxelLandDebugColor(VOXEL_LAND_ARGS_DECL FVoxelLandDebugInput 
     {
         // The checker shows from two samples a cell.
         return VoxelLandViewCell(Cell.Face, Cell.I, Cell.J, saturate(2.0f - 4.0f * In.CellM / max(LandCellM, 1.0e-3f)));
+    }
+    if (In.Mode == VOXEL_LAND_VIEW_LANDFORM)
+    {
+        if (LandHasForm == 0u) return VoxelLandViewNone();
+        const float2 Form = VOXEL_LAND_FORM(Index);
+        return VoxelLandViewLandform(Form.x, Form.y, In.Elevation <= 0.0f);
     }
     if (In.Mode == VOXEL_LAND_VIEW_FLOW)
     {

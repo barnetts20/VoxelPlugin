@@ -156,6 +156,12 @@ struct VOXELPLUGIN_API FVoxelTerrestrialSettings
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrestrial|Solve", meta = (ClampMin = "1.0", ClampMax = "2.0"))
     double SummitHeightScale = 1.2;
 
+    /** How much the landform field (flat plains to hill country, Design/SurfaceLook.md T2)
+     *  scales the erosion's plains relief and rolling ground: at 1, 0.3 times on flat plains,
+     *  2.05 times in hill country (about the same on average); 0: the same everywhere. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrestrial|Solve", meta = (ClampMin = "0.0", ClampMax = "1.0"))
+    double LandformErosion = 1.0;
+
     // --- Bake: grid ---
 
     /** Cells per cube face edge: 1024 (1.5 km on a 1,000 km planet, 9.8 km on Earth), or 512 or
@@ -204,6 +210,22 @@ struct VOXELPLUGIN_API FVoxelTerrestrialSettings
      *  replace much of the isotropic detail. */
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrestrial|Sample", meta = (ClampMin = "0.0", ClampMax = "1.0"))
     double GullyDetailScale = 0.5;
+
+    /** Hills on the bake (Design/SurfaceLook.md T2): their height (m) where the landform field
+     *  makes hill country; flat plains get none, rolling plains some. Rounded rises between a
+     *  network of valleys, smooth on rolling ground, rough-topped in hill country; they leave
+     *  the bake's river corridors and the coasts flat. 0 turns them off. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrestrial|Sample", meta = (ClampMin = "0.0", UIMax = "600"))
+    double HillRelief = 150.0;
+
+    /** The hills' longest wavelength (m): a hill and its valley. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrestrial|Sample", meta = (ClampMin = "200.0", UIMin = "1000", UIMax = "20000"))
+    double HillWavelength = 4000.0;
+
+    /** The hills' finest wavelength (m); finer octaves are left out (and coarse levels leave
+     *  out the ones they can't show). */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrestrial|Sample", meta = (ClampMin = "5.0", UIMin = "10", UIMax = "1000"))
+    double HillFinestWavelength = 25.0;
 
     /** Hash of the settings that change the bake (with the radius and the generator version,
      *  the cache key). */

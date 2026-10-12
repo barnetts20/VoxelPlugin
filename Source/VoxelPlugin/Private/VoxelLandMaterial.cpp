@@ -44,7 +44,7 @@ static TAutoConsoleVariable<int32> CVarVoxelLandMaterialCost(
     TEXT(" 0: everything (default)\n")
     TEXT(" 1: no fixed-step gully difference close up (screen-space instead)\n")
     TEXT(" 2: no gullies\n")
-    TEXT(" 3: no gullies and no detail layer (the bake alone)\n")
+    TEXT(" 3: no gullies, no detail layer and no hills (the bake alone)\n")
     TEXT(" 4: the node off (the mesh's normal; the vertex colours carry the views)"),
     ECVF_Default);
 
@@ -137,12 +137,27 @@ void VoxelLandMaterial::BuildFieldTexels(const FVoxelLandBake& Bake, TArray<FFlo
         });
 }
 
+void VoxelLandMaterial::BuildHeightTexels(const FVoxelLandBake& Bake, TArray<FVector2f>& Out)
+{
+    const int32 NumCells = Bake.NumCells();
+    const bool bForm = Bake.Form.Num() == NumCells;
+    Out.SetNumUninitialized(NumCells);
+    constexpr int32 Chunk = 1 << 16;
+    ParallelFor((NumCells + Chunk - 1) / Chunk, [&](int32 c)
+        {
+            const int32 End = FMath::Min(NumCells, (c + 1) * Chunk);
+            for (int32 i = c * Chunk; i < End; i++)
+                Out[i] = FVector2f(Bake.Height[i], bForm ? (float)Bake.Form[i] : 0.0f);
+        });
+}
+
 void VoxelLandMaterial::BuildConstantTexels(const FVoxelDensityGPUData& Density, const FVoxelLandBake& Bake, TArray<FVector4f>& Out, int32& OutRows)
 {
     using namespace VoxelLandMaterialDetail;
     const int32 NumCells = Bake.NumCells();
     const bool bFlow = Bake.Flow.Num() == NumCells;
     const bool bWater = Bake.Water.Num() == NumCells;
+    const bool bForm = Bake.Form.Num() == NumCells;
 
     // The constants: scalars, then the tan table, the octaves, the plates.
     const int32 TanBase = VOXEL_LAND_MC_TEXELS;
@@ -192,6 +207,12 @@ void VoxelLandMaterial::BuildConstantTexels(const FVoxelDensityGPUData& Density,
     S[VOXEL_LAND_MC_SIDE] = (float)Bake.Side();
     S[VOXEL_LAND_MC_PLATE_RADIUS_M] = Bake.PlateRadiusM;
     S[VOXEL_LAND_MC_PLATE_WIDTH_SCALE] = Bake.PlateWidthScale;
+    S[VOXEL_LAND_MC_HILL_RELIEF] = Density.LandHillRelief;
+    S[VOXEL_LAND_MC_HILL_FREQUENCY] = Density.LandHillFrequency.X;
+    S[VOXEL_LAND_MC_HILL_FREQUENCY + 1] = Density.LandHillFrequency.Y;
+    S[VOXEL_LAND_MC_HILL_OCTAVES] = (float)Density.LandHillOctaves;
+    PutU32(S, VOXEL_LAND_MC_HILL_SEED, Density.LandHillSeed);
+    S[VOXEL_LAND_MC_HAS_FORM] = bForm ? 1.0f : 0.0f;
 
     for (int32 i = 0; i < Bake.TanTable.Num(); i++)
     {
@@ -242,7 +263,7 @@ bool VoxelLandMaterial::MakeBakeTextures(const TSharedPtr<const FVoxelLandBake, 
             Side, 6 * Side, GetMax2DTextureDimension());
         return false;
     }
-    UTexture2DDynamic* Height = Make(Side, 6 * Side, PF_R32_FLOAT);
+    UTexture2DDynamic* Height = Make(Side, 6 * Side, PF_G32R32F);
     UTexture2DDynamic* Fields = Make(Side, 6 * Side, PF_FloatRGBA);
     if (!Height || !Fields)
     {
@@ -251,9 +272,10 @@ bool VoxelLandMaterial::MakeBakeTextures(const TSharedPtr<const FVoxelLandBake, 
     }
     TArray<FFloat16Color> FieldTexels;
     BuildFieldTexels(*Bake, FieldTexels);
-    // The heights straight from the bake (immutable, held by the command until it ran).
-    Upload(Height, Bake, [](const TSharedPtr<const FVoxelLandBake, ESPMode::ThreadSafe>& B) { return (const void*)B->Height.GetData(); },
-        Side, 6 * Side, (int32)sizeof(float));
+    TArray<FVector2f> HeightTexels;
+    BuildHeightTexels(*Bake, HeightTexels);
+    Upload(Height, MoveTemp(HeightTexels), [](const TArray<FVector2f>& T) { return (const void*)T.GetData(); },
+        Side, 6 * Side, (int32)sizeof(FVector2f));
     Upload(Fields, MoveTemp(FieldTexels), [](const TArray<FFloat16Color>& T) { return (const void*)T.GetData(); },
         Side, 6 * Side, (int32)sizeof(FFloat16Color));
     OutHeight = Height;

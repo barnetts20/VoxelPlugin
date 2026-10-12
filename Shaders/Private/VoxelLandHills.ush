@@ -1,0 +1,240 @@
+// VoxelLandHills.ush - The hills layer of the terrestrial generator (Design/SurfaceLook.md, T2):
+// rolling ground and hill country below the bake's resolution, from LandHillWavelength down to
+// the finest octave, shaped and scaled by the bake's landform field (VoxelLandPlates.ush,
+// VoxelLandFormAt: the hilliness H and the character C of each cell).
+//
+// The shape: octaves of gradient noise on the sea-level sphere, at a domain-warped point (the
+// outlines flow instead of sitting in round cells). The coarsest is a soft |n|:
+// its zero lines are a connected network of rounded valleys at the bake's surface, with
+// isolated rises between them, so the hills drain along that network into the bake's own
+// valleys instead of leaving pits. The finer octaves are zero-mean (an octave a coarse level
+// leaves out by the footprint band moves the surface by its own small relief, not by its mean)
+// and weighted by the shape so far by up to the character (a hybrid multifractal): rolling
+// ground (C = 0) is smooth everywhere, hill country (C = 1) keeps smooth valley floors under
+// rough tops. The gain rises with the character.
+//
+// The amplitude: LandHillRelief x H, faded out where the bake's drainage gathers into channels
+// (river corridors keep the bake's valley floors) and toward the coast.
+//
+// The lattice: each octave's coordinate is the finest octave's in 32.32 fixed point shifted
+// right (VoxelFixedLattice), from the double-float point: exact at any radius, on every host.
+// The gradient is exact for a fixed amplitude (the amplitude's own change is left to the hosts
+// that need it: the cache and the material difference it, as they do the detail's).
+//
+// Shared subset (VoxelShaderCompat.h). Included by VoxelLandGully.ush (after VoxelLandSample.ush);
+// its inputs, declared by the host:
+//
+//   float LandHillRelief;        m at hilliness 1 (0: no hills)
+//   float2 LandHillFrequency;    the finest octave's frequency (cycles per cm, double-float)
+//   uint LandHillOctaves;        octaves, coarsest first (at most VOXEL_LAND_HILL_MAX_OCTAVES)
+//   uint LandHillSeed;
+//   uint LandHasForm;            1 when the bake has the landform field (VOXEL_LAND_FORM)
+
+#ifndef VOXEL_LAND_HILLS_USH
+#define VOXEL_LAND_HILLS_USH
+
+#include "VoxelLandAccess.ush"
+
+#ifndef VOXEL_LOOP
+#define VOXEL_LOOP [loop]
+#endif
+
+#define VOXEL_LAND_HILL_MAX_OCTAVES 12u
+// The soft |n|'s rounding (noise units: gradient noise spans about +-0.7, sigma 0.19).
+#define VOXEL_LAND_HILL_SOFT 0.05f
+// The soft |n|'s mean over the noise, and the scale that puts the coarsest octave's 99th
+// percentile at 1 (measured over 2M points: mean 0.117, 99th percentile 0.428).
+#define VOXEL_LAND_HILL_MEAN 0.1171f
+#define VOXEL_LAND_HILL_SCALE 2.35f
+// The domain warp (in the coarsest octave's lattice units): the lattice point moves by this
+// much times two octaves of noise (at half and the full coarsest frequency, the second half as
+// strong), so the hills' outlines flow and curve instead of sitting in round cells.
+#define VOXEL_LAND_HILL_WARP 0.4f
+// The hybrid weight's slope: an octave's weight reaches 1 where the shape so far reaches this
+// reciprocal (with character 1).
+#define VOXEL_LAND_HILL_HYBRID 1.6f
+// The weight the valleys keep (with character 1): some texture on the floors too.
+#define VOXEL_LAND_HILL_HYBRID_FLOOR 0.35f
+// The drainage (log2 m^2 above a cell's own area) over which the hills fade out: full up to
+// 6 cells' drainage, gone from 64.
+#define VOXEL_LAND_HILL_CHANNEL_START 2.5f
+#define VOXEL_LAND_HILL_CHANNEL_END 6.0f
+// The bake height (m) over which they fade in from the coast.
+#define VOXEL_LAND_HILL_COAST_START 2.0f
+#define VOXEL_LAND_HILL_COAST_END 40.0f
+
+/** The hills at a point: Unit the shape (about 0 .. 1.5; Height = Unit x AmplitudeM),
+ *  AmplitudeM (m), Gradient, the shape's gradient times the amplitude (m/m, a tangent vector
+ *  at the point: the amplitude's own change left out), Steer, the part of it the two coarsest
+ *  octaves make (the gullies run down that: the finer octaves turn too fast for their stripes,
+ *  which would fold), and Curve, a typical curvature of the coarsest octave there (1/m: a
+ *  quarter of its largest), for the gullies' steering fade, and that octave's wavelength Lambda
+ *  (m: the gullies take the hills' slope from a quarter of it down). */
+struct FVoxelLandHills
+{
+    float Unit;
+    float AmplitudeM;
+    float3 Gradient;
+    float3 Steer;        // the two coarsest octaves' share of Gradient (m/m): what steers the gullies
+    float Curve;
+    float Lambda;        // the coarsest octave's wavelength (m)
+};
+
+/** The soft |n| and its derivative in n. */
+VOXEL_FUNC float2 VoxelLandHillSoftAbs(float N)
+{
+    const float R = sqrt(N * N + VOXEL_LAND_HILL_SOFT * VOXEL_LAND_HILL_SOFT);
+    return float2(R - VOXEL_LAND_HILL_SOFT, N / R);
+}
+
+/** The amplitude (m) from the landform's hilliness, the drainage (log2 m^2; used when
+ *  LandHasFlow) and the bake height (m). */
+VOXEL_FUNC float VoxelLandHillAmplitude(VOXEL_LAND_ARGS_DECL float Hilliness, float Flow, float Bake)
+{
+    float Fade = smoothstep(VOXEL_LAND_HILL_COAST_START, VOXEL_LAND_HILL_COAST_END, Bake);
+    if (LandHasFlow != 0u)
+    {
+        const float Above = Flow - 2.0f * log2(LandCellM);
+        Fade *= 1.0f - smoothstep(VOXEL_LAND_HILL_CHANNEL_START, VOXEL_LAND_HILL_CHANNEL_END, Above);
+    }
+    return LandHillRelief * saturate(Hilliness) * Fade;
+}
+
+/** A lattice point (cell and fraction) of a fixed-point coordinate shifted right by Shift with
+ *  a hashed offset, moved by D lattice units (the warp, already in this octave's units). */
+struct FVoxelLandHillPoint
+{
+    uint3 Cell;
+    float3 Frac;
+};
+
+VOXEL_FUNC FVoxelLandHillPoint VoxelLandHillLattice(FVoxelFixed FX, FVoxelFixed FY, FVoxelFixed FZ, uint Shift, uint H, float3 D)
+{
+    const FVoxelFixed LX = VoxelFixedLattice(FX, Shift, H & 0x3ffu, H * 0x9e3779b9u);
+    const FVoxelFixed LY = VoxelFixedLattice(FY, Shift, (H >> 10u) & 0x3ffu, H * 0x85ebca6bu);
+    const FVoxelFixed LZ = VoxelFixedLattice(FZ, Shift, (H >> 20u) & 0x3ffu, H * 0xc2b2ae35u);
+    const float TX = VoxelFixedFraction(LX.Frac) + D.x;
+    const float TY = VoxelFixedFraction(LY.Frac) + D.y;
+    const float TZ = VoxelFixedFraction(LZ.Frac) + D.z;
+    const float KX = floor(TX);
+    const float KY = floor(TY);
+    const float KZ = floor(TZ);
+    FVoxelLandHillPoint P;
+    P.Cell = uint3(LX.Cell + asuint(int(KX)), LY.Cell + asuint(int(KY)), LZ.Cell + asuint(int(KZ)));
+    P.Frac = float3(TX - KX, TY - KY, TZ - KZ);
+    return P;
+}
+
+/** The hills at the sea-level sphere point P (double-float, cm) with the landform Form
+ *  (hilliness, character), the bake's drainage Flow (log2 m^2) and height Bake (m), band-
+ *  limited to Footprint (cm). */
+VOXEL_FUNC FVoxelLandHills VoxelLandHillsDF(VOXEL_LAND_ARGS_DECL float2 PX, float2 PY, float2 PZ, float2 Form, float Flow, float Bake, float Footprint)
+{
+    FVoxelLandHills Out;
+    Out.Unit = 0.0f;
+    Out.AmplitudeM = 0.0f;
+    Out.Gradient = float3(0.0f, 0.0f, 0.0f);
+    Out.Steer = float3(0.0f, 0.0f, 0.0f);
+    Out.Curve = 0.0f;
+    Out.Lambda = 0.0f;
+    if (LandHillRelief <= 0.0f || LandHillOctaves == 0u || LandHasForm == 0u) return Out;
+    Out.AmplitudeM = VoxelLandHillAmplitude(VOXEL_LAND_ARGS Form.x, Flow, Bake);
+    if (Out.AmplitudeM <= 0.0f) return Out;
+
+    const uint Count = min(LandHillOctaves, VOXEL_LAND_HILL_MAX_OCTAVES);
+    const float Character = saturate(Form.y);
+    const float Gain = lerp(0.36f, 0.52f, Character);
+    // The finest octave's wavelength (cm); octave o's is 2^(Count - 1 - o) times it.
+    const float Finest = 1.0f / (LandHillFrequency.x + LandHillFrequency.y);
+    const FVoxelFixed FX = VoxelDFToFixed(VoxelDFMul(PX, LandHillFrequency));
+    const FVoxelFixed FY = VoxelDFToFixed(VoxelDFMul(PY, LandHillFrequency));
+    const FVoxelFixed FZ = VoxelDFToFixed(VoxelDFMul(PZ, LandHillFrequency));
+    const float Coarsest = 0.01f * Finest * float(1u << (Count - 1u));   // m
+    Out.Lambda = Coarsest;
+    Out.Curve = 0.25f * 0.5f * Out.AmplitudeM * (6.28318531f * 6.28318531f) / (Coarsest * Coarsest);
+
+    // Nothing to add when the footprint's band leaves out even the coarsest octave.
+    if (VoxelOctaveBandWeight(Finest * float(1u << (Count - 1u)), Footprint) <= 0.0f) return Out;
+
+    // The warp W (coarsest-octave lattice units) and its gradients in those units (DW: of each
+    // component), from two octaves per component: shifts Count (half the coarsest frequency) and
+    // Count - 1 (the coarsest).
+    float3 W = float3(0.0f, 0.0f, 0.0f);
+    float3 DWX = float3(0.0f, 0.0f, 0.0f);
+    float3 DWY = float3(0.0f, 0.0f, 0.0f);
+    float3 DWZ = float3(0.0f, 0.0f, 0.0f);
+    for (uint a = 0u; a < 3u; a++)
+    {
+        for (uint k = 0u; k < 2u; k++)
+        {
+            const uint WSeed = LandHillSeed + 0x51ed270bu + (a * 2u + k) * 0x632be5abu;
+            const uint WH = VoxelHash(uint3(a, k, 0x77617270u), WSeed);
+            const FVoxelLandHillPoint WP = VoxelLandHillLattice(FX, FY, FZ, Count - k, WH, float3(0.0f, 0.0f, 0.0f));
+            const FVoxelNoiseSample WN = VoxelGradientNoise(WP.Cell, WP.Frac, WSeed);
+            // Half as strong for the second; its frequency is the coarsest's, the first's half.
+            const float Strength = VOXEL_LAND_HILL_WARP * (k == 0u ? 1.0f : 0.5f);
+            const float3 G = WN.Gradient * (Strength * (k == 0u ? 0.5f : 1.0f));
+            if (a == 0u) { W.x += Strength * WN.Value; DWX = DWX + G; }
+            else if (a == 1u) { W.y += Strength * WN.Value; DWY = DWY + G; }
+            else { W.z += Strength * WN.Value; DWZ = DWZ + G; }
+        }
+    }
+
+    float Sum = 0.0f;
+    float3 Grad = float3(0.0f, 0.0f, 0.0f);   // per cm, of the shape at the warped point
+    float3 SteerGrad = float3(0.0f, 0.0f, 0.0f);
+    float Amp = 1.0f;
+    VOXEL_LOOP
+    for (uint o = 0u; o < Count; o++)
+    {
+        const uint Shift = Count - 1u - o;
+        const float Wavelength = Finest * float(1u << Shift);
+        const float Band = VoxelOctaveBandWeight(Wavelength, Footprint);
+        if (Band <= 0.0f) break;
+        const uint Seed = LandHillSeed + o * 0x9e3779b9u;
+        const uint H = VoxelHash(uint3(o, 0x68696c6cu, 0x2545f491u), Seed);
+        // The warp in this octave's lattice units: 2^o of the coarsest's.
+        const FVoxelLandHillPoint L = VoxelLandHillLattice(FX, FY, FZ, Shift, H, W * float(1u << o));
+        const FVoxelNoiseSample N = VoxelGradientNoise(L.Cell, L.Frac, Seed);
+        const float2 Soft = VoxelLandHillSoftAbs(N.Value);
+        // The noise's gradient per cm.
+        const float3 NG = N.Gradient * (1.0f / Wavelength);
+        if (o == 0u)
+        {
+            Sum = Band * VOXEL_LAND_HILL_SCALE * Soft.x;
+            Grad = NG * (Band * VOXEL_LAND_HILL_SCALE * Soft.y);
+        }
+        else
+        {
+            // Zero-mean, weighted by the shape so far (by up to the character).
+            const float U = VOXEL_LAND_HILL_SCALE * (Soft.x - VOXEL_LAND_HILL_MEAN);
+            const float3 DU = NG * (VOXEL_LAND_HILL_SCALE * Soft.y);
+            const float X = Sum * VOXEL_LAND_HILL_HYBRID;
+            const float Clamped = saturate(X);
+            const float Weight = lerp(1.0f, VOXEL_LAND_HILL_HYBRID_FLOOR + (1.0f - VOXEL_LAND_HILL_HYBRID_FLOOR) * Clamped, Character);
+            const float3 DW = (X > 0.0f && X < 1.0f)
+                ? Grad * (Character * (1.0f - VOXEL_LAND_HILL_HYBRID_FLOOR) * VOXEL_LAND_HILL_HYBRID) : float3(0.0f, 0.0f, 0.0f);
+            const float A = Amp * Band;
+            Sum += A * Weight * U;
+            Grad = Grad + (DU * Weight + DW * U) * A;
+        }
+        Amp *= Gain;
+        // The steering: the two coarsest octaves, the second fading with its band like the rest
+        // (continuous across the footprint that drops it).
+        if (o <= 1u)
+            SteerGrad = Grad;
+    }
+    Out.Unit = Sum;
+    // Through the warp (the point is P's lattice coordinate plus W): Grad + its components times
+    // W's gradients. Then m per cm of the shape times m of amplitude: x100 for m/m; tangent at P.
+    const float3 Warped = Grad + DWX * Grad.x + DWY * Grad.y + DWZ * Grad.z;
+    const float3 WarpedSteer = SteerGrad + DWX * SteerGrad.x + DWY * SteerGrad.y + DWZ * SteerGrad.z;
+    const float3 Up = normalize(float3(PX.x, PY.x, PZ.x));
+    const float3 G = Warped * (100.0f * Out.AmplitudeM);
+    const float3 GS = WarpedSteer * (100.0f * Out.AmplitudeM);
+    Out.Gradient = G - Up * dot(G, Up);
+    Out.Steer = GS - Up * dot(GS, Up);
+    return Out;
+}
+
+#endif // VOXEL_LAND_HILLS_USH

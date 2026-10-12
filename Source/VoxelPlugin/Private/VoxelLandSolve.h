@@ -65,6 +65,7 @@ namespace VoxelLandSolve
         float Roughness = 150.0f;        // m
         float PlainsRelief = 100.0f;     // m
         float Undulation = 60.0f;        // m (T1b)
+        float LandformErosion = 1.0f;    // T2: the landform scales PlainsRelief and Undulation
         float Incision = 150.0f;         // m
         float ReliefTopScale = 1.2f;     // the top over the profile's 99.9th percentile
         bool bErode = true;
@@ -80,6 +81,7 @@ namespace VoxelLandSolve
         TRefCountPtr<FRDGPooledBuffer> Up;
         TRefCountPtr<FRDGPooledBuffer> Crust;
         TRefCountPtr<FRDGPooledBuffer> Attr;
+        TRefCountPtr<FRDGPooledBuffer> Form;     // the landform, one cell a word (VoxelLandPackForm)
     };
 
     /** The bake's fields after the solve, on the padded grid, as read back (the baker narrows
@@ -88,6 +90,7 @@ namespace VoxelLandSolve
     {
         TArray<float> Height;
         TArray<uint32> Attr;             // FVoxelLandBake::Attr in the low 16 bits
+        TArray<uint32> Form;             // FVoxelLandBake::Form in the low 16 bits (the plate pass's, read back)
         TArray<float> Flow;              // log2 m^2
         TArray<float> Water;
         TArray<FVoxelLandLake> Lakes;

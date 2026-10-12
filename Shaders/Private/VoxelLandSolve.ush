@@ -61,6 +61,10 @@
 //                                               mass on it, rivers cut at most SolveIncision below
 //   float SolveUndulation;                      model 1: the static surface's rolling ground on
 //                                               land (m, coarsest octave; T1b)
+//   StructuredBuffer<uint> BakeForm;            the landform (VoxelLandPlates.ush), one cell a word
+//   float SolveLandformErosion;                 T2: how much the hilliness H scales the plains
+//                                               relief and the rolling ground (x lerp(1,
+//                                               0.3 + 1.75 H, e))
 //   float SolvePlainsRelief;                    model 1: the plains' uplift as relief (m): they
 //                                               join the solve, so they get drained valleys
 //   float SolveIncision;                        model 1: how far rivers may cut below the static
@@ -328,6 +332,10 @@ VOXEL_FUNC FVoxelSolveSetup VoxelSolveSetupOf(uint Cell)
     const float Solid = 1.0f - (1.0f - CrustRamp) * (1.0f - LandRamp);   // a smooth union
     S.Mix = Solid * smoothstep(Lo, SolvePlainsUplift + Half, Up);
     S.Static = H - Up * S.Mix;
+    // The landform (T2): flat plains erode flatter, hill country deeper: 0.3 at hilliness 0, 1
+    // at 0.4 (about the plains' mean), 2.05 at 1; SolveLandformErosion 0 leaves 1.
+    const float Hilliness = float(BakeForm[Cell] & 0xffu) * (1.0f / 255.0f);
+    const float FormScale = lerp(1.0f, 0.3f + 1.75f * Hilliness, SolveLandformErosion);
     if (SolveModel == 1u && SolveUndulation > 0.0f && H > 0.0f)
     {
         // The static surface's undulation (T1b): the plate profile is a smooth ramp between
@@ -342,7 +350,7 @@ VOXEL_FUNC FVoxelSolveSetup VoxelSolveSetupOf(uint Cell)
         const float Wavelength = max(SolveVariationWavelength * (1.0f / 3.0f), 6.0f * CellM);
         const uint Octaves = uint(clamp(floor(log2(Wavelength / (3.0f * CellM))) + 1.0f, 1.0f, 3.0f));
         const float3 Dir = VoxelSolveCellDirection(Cell);
-        const float Undulation = SolveUndulation * Solid * VoxelSolveFbm(Dir, Wavelength, Octaves, 5u);
+        const float Undulation = SolveUndulation * FormScale * Solid * VoxelSolveFbm(Dir, Wavelength, Octaves, 5u);
         const float Bound = 0.7f * max(S.Static, 0.0f);
         S.Static += clamp(Undulation, -Bound, Bound);
     }
@@ -354,7 +362,7 @@ VOXEL_FUNC FVoxelSolveSetup VoxelSolveSetupOf(uint Cell)
         // The plains join with a small uplift of their own: drained valleys and interfluves on
         // the static surface.
         const float Land = Solid * smoothstep(0.0f, 100.0f, H) * (1.0f - S.Mix);
-        S.Uplift += SolvePlainsRelief * Land / max(SolveUpliftTime, 1.0f);
+        S.Uplift += SolvePlainsRelief * FormScale * Land / max(SolveUpliftTime, 1.0f);
         S.bMoving = S.bMoving || Land > 0.0f;
     }
     S.bMoving = S.bMoving && VoxelSolveIsInterior(VoxelSolveDecode(Cell));
