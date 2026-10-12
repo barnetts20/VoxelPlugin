@@ -195,12 +195,12 @@ static bool GVoxelLandSkipDetail = false;
 #define MountainStart float2(0.0f, 0.0f)
 #define MountainBlend float2(1.0f, 0.0f)
 #define DetailWeight float2(0.0f, 0.0f)
-// ... and the plate model's (VoxelLandPlates.ush; the debug views read only the plates and the
-// seed, the profile inputs are unused).
+// ... and the plate model's (VoxelLandPlates.ush; the debug views read only the plates, the
+// seed, and the warp's radius and width scale; the profile inputs are unused).
 #define LandPlateCount VoxelLandConstU(LandConstTex, VOXEL_LAND_MC_PLATE_COUNT)
 #define LandSeed VoxelLandConstU32(LandConstTex, VOXEL_LAND_MC_PLATE_SEED)
-#define LandRadiusM 1.0f
-#define LandWidthScale 1.0f
+#define LandRadiusM VoxelLandConstF(LandConstTex, VOXEL_LAND_MC_PLATE_RADIUS_M)
+#define LandWidthScale VoxelLandConstF(LandConstTex, VOXEL_LAND_MC_PLATE_WIDTH_SCALE)
 #define LandReliefScale 1.0f
 #define LandShelfDepth 0.0f
 #define LandAbyssDepth 0.0f

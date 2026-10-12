@@ -91,6 +91,71 @@ struct VOXELPLUGIN_API FVoxelTerrestrialSettings
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrestrial|Solve", meta = (ClampMin = "0.0", UIMax = "1000"))
     double MinLakeArea = 20.0;
 
+    /** How far each bake cell's node in the drainage graph is moved, at random (cells): water
+     *  no longer runs along the grid's 8 directions, so channels wander and branch instead of
+     *  running in straight, parallel grooves. 0: the plain grid. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrestrial|Solve", meta = (ClampMin = "0.0", ClampMax = "0.45"))
+    double RoutingJitter = 0.4;
+
+    /** How freely water picks among the lower neighbours instead of the steepest (each
+     *  neighbour's slope times a fixed random factor between 2^-x and 2^x). On even slopes the
+     *  steepest descent keeps every channel parallel to its neighbours; with a random choice
+     *  they wander, meet and merge into branching networks. 0: steepest descent. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrestrial|Solve", meta = (ClampMin = "0.0", ClampMax = "3.0"))
+    double RoutingRandomness = 1.0;
+
+    /** The drainage field (the water views' rivers, the gullies' steering) spreads water over
+     *  every lower neighbour on hillslopes, cells draining fewer than this many cells, so a
+     *  slope carries an even sheet instead of a comb of parallel lines; channels keep a single
+     *  path. The terrain itself is unaffected. 0: single paths everywhere. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrestrial|Solve", meta = (ClampMin = "0.0", ClampMax = "1024.0"))
+    double DrainageSpreadCells = 16.0;
+
+    /** Uplift along the mountain belts varies by up to this fraction (a noise field): massifs
+     *  and saddles instead of a ridge of even height. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrestrial|Solve", meta = (ClampMin = "0.0", ClampMax = "1.5"))
+    double UpliftVariation = 0.8;
+
+    /** Rock hardness: erodibility varies by a factor of exp(+-this) (a noise field at half the
+     *  variation wavelength). Rivers bend around hard rock, which holds the higher peaks. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrestrial|Solve", meta = (ClampMin = "0.0", ClampMax = "2.0"))
+    double ErodibilityVariation = 0.7;
+
+    /** The longest wavelength of the uplift variation (km); erodibility uses half, the initial
+     *  roughness a quarter. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrestrial|Solve", meta = (ClampMin = "10.0", UIMax = "500"))
+    double VariationWavelength = 90.0;
+
+    /** The initial surface's roughness (m): how the drainage network starts to branch. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrestrial|Solve", meta = (ClampMin = "0.0", UIMax = "500"))
+    double InitialRoughness = 150.0;
+
+    /** The plains take part in the erosion with this much uplift of their own (m): drained,
+     *  branching valleys on the plains, and closed basins drain through cut outlets. 0: the
+     *  plains keep the plate model's smooth surface. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrestrial|Solve", meta = (ClampMin = "0.0", UIMax = "500"))
+    double PlainsRelief = 100.0;
+
+    /** Rolling ground (m, the largest of its scales) added to the land's base surface before
+     *  the erosion, at a third of VariationWavelength and below. The plate model's surface is a
+     *  smooth ramp between belts and coasts, and rivers on a smooth ramp run straight down it
+     *  side by side; the hollows make them gather into branching networks. Raises the number of
+     *  small lakes somewhat. 0: the plate model's ramps. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrestrial|Solve", meta = (ClampMin = "0.0", UIMax = "400"))
+    double PlainsUndulation = 60.0;
+
+    /** How far a small river may cut below the plate model's surface (m); larger ones may cut
+     *  deeper with the square root of their drainage, through basins' sills (never below the
+     *  sea). */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrestrial|Solve", meta = (ClampMin = "0.0", UIMax = "1000"))
+    double RiverIncision = 150.0;
+
+    /** The highest summits relative to the profile's highest uplift: the eroded relief keeps
+     *  its shape up to the profile's 90th percentile, then follows a power fitted so the
+     *  highest 0.1% land here. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrestrial|Solve", meta = (ClampMin = "1.0", ClampMax = "2.0"))
+    double SummitHeightScale = 1.2;
+
     // --- Bake: grid ---
 
     /** Cells per cube face edge: 1024 (1.5 km on a 1,000 km planet, 9.8 km on Earth), or 512 or

@@ -53,7 +53,9 @@
 #define VOXEL_LAND_MC_OCTAVE_BASE 33
 #define VOXEL_LAND_MC_PLATE_BASE 34
 #define VOXEL_LAND_MC_SIDE 35
-#define VOXEL_LAND_MC_COUNT 36              // scalars in use (9 texels)
-#define VOXEL_LAND_MC_TEXELS 9
+#define VOXEL_LAND_MC_PLATE_RADIUS_M 36     // the plate model's warp (the plates view)
+#define VOXEL_LAND_MC_PLATE_WIDTH_SCALE 37
+#define VOXEL_LAND_MC_COUNT 38              // scalars in use (10 texels)
+#define VOXEL_LAND_MC_TEXELS 10
 
 #endif // VOXEL_LAND_MATERIAL_LAYOUT_USH

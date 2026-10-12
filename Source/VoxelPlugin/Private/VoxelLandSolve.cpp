@@ -36,6 +36,19 @@ BEGIN_SHADER_PARAMETER_STRUCT(FVoxelLandSolveParameters, )
     SHADER_PARAMETER(float, SolveMinLakeArea)
     SHADER_PARAMETER(uint32, SolveMaxLakes)
     SHADER_PARAMETER(uint32, SolveErode)
+    SHADER_PARAMETER(float, SolveJitter)
+    SHADER_PARAMETER(float, SolveRouteNoise)
+    SHADER_PARAMETER(float, SolveSpreadCells)
+    SHADER_PARAMETER(float, SolveUpliftVariation)
+    SHADER_PARAMETER(float, SolveErodibilityVariation)
+    SHADER_PARAMETER(float, SolveVariationWavelength)
+    SHADER_PARAMETER(float, SolveRoughness)
+    SHADER_PARAMETER(float, SolveReliefScale)
+    SHADER_PARAMETER(uint32, SolveFillDepressions)
+    SHADER_PARAMETER(uint32, SolveModel)
+    SHADER_PARAMETER(float, SolvePlainsRelief)
+    SHADER_PARAMETER(float, SolveUndulation)
+    SHADER_PARAMETER(float, SolveIncision)
     // Per cell.
     SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<float>, SolveH)
     SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<float>, SolveW)
@@ -46,6 +59,7 @@ BEGIN_SHADER_PARAMETER_STRUCT(FVoxelLandSolveParameters, )
     // Per slot.
     SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint>, SlotCell)
     SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<float>, SlotU)
+    SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<float>, SlotK)
     SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<float>, SlotArea)
     SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<float>, SlotDist)
     SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<float>, SlotH0)
@@ -119,6 +133,8 @@ END_SHADER_PARAMETER_STRUCT()
     X(FVoxelSolveReceiversCS, "ReceiversCS") \
     X(FVoxelSolveAccumulateJacobiCS, "AccumulateJacobiCS") \
     X(FVoxelSolveAccumulateInPlaceCS, "AccumulateInPlaceCS") \
+    X(FVoxelSolveSpreadInitCS, "SpreadInitCS") \
+    X(FVoxelSolveSpreadCS, "SpreadCS") \
     X(FVoxelSolveTreeFillInitCS, "TreeFillInitCS") \
     X(FVoxelSolveTreeFillJumpCS, "TreeFillJumpCS") \
     X(FVoxelSolveTreeFillFinishCS, "TreeFillFinishCS") \
@@ -126,6 +142,9 @@ END_SHADER_PARAMETER_STRUCT()
     X(FVoxelSolveImplicitJumpCS, "ImplicitJumpCS") \
     X(FVoxelSolveImplicitFinishCS, "ImplicitFinishCS") \
     X(FVoxelSolveResidualCS, "ResidualCS") \
+    X(FVoxelSolveSettleMarkCS, "SettleMarkCS") \
+    X(FVoxelSolveSettleInitCS, "SettleInitCS") \
+    X(FVoxelSolveSettleCS, "SettleCS") \
     X(FVoxelSolveOutletInitCS, "OutletInitCS") \
     X(FVoxelSolveOutletJumpCS, "OutletJumpCS") \
     X(FVoxelSolveHistogramCS, "HistogramCS") \
@@ -238,6 +257,7 @@ struct VoxelLandSolve::FJob::FImpl
         Fill0,          // the routing's lake levels
         Fill1,          // the routing's fill
         Accumulate,     // the routing's drainage
+        Spread,         // the drainage field's spread (T1b)
         Labels,         // lake labels
         OutputWait,     // the fields
         Done
@@ -256,6 +276,7 @@ struct VoxelLandSolve::FJob::FImpl
     float Factor = 1.0f;
     float Knee = 1.0e30f;
     float Top = 1.0e30f;
+    float ReliefScale = 0.0f;
     uint32 Errors = 0;
     double PhaseStart = 0.0;
     int32 PhaseFrames = 0;
@@ -263,7 +284,7 @@ struct VoxelLandSolve::FJob::FImpl
 
     // Pooled buffers kept between frames (render thread).
     TRefCountPtr<FRDGPooledBuffer> Tan, H, W, Water, Rec, Slot, Label, Cell, GroupCounts, Counts, Flags, State, Partials, Log, Histogram;
-    TRefCountPtr<FRDGPooledBuffer> U, Area, Dist, H0, WOut;
+    TRefCountPtr<FRDGPooledBuffer> U, Erodibility, Area, Dist, H0, WOut;
     TRefCountPtr<FRDGPooledBuffer> A[2], X[2], Y[2], P[2];
 
     /** This frame's view of the buffers. */
@@ -272,7 +293,7 @@ struct VoxelLandSolve::FJob::FImpl
         FRDGBufferRef BakeHeight = nullptr, BakeUp = nullptr, BakeCrust = nullptr, BakeAttr = nullptr;
         FRDGBufferRef Tan = nullptr, H = nullptr, W = nullptr, Water = nullptr, Rec = nullptr, Slot = nullptr, Label = nullptr, Cell = nullptr;
         FRDGBufferRef GroupCounts = nullptr, Counts = nullptr, Flags = nullptr, State = nullptr, Partials = nullptr, Log = nullptr, Histogram = nullptr;
-        FRDGBufferRef U = nullptr, Area = nullptr, Dist = nullptr, H0 = nullptr, WOut = nullptr;
+        FRDGBufferRef U = nullptr, Erodibility = nullptr, Area = nullptr, Dist = nullptr, H0 = nullptr, WOut = nullptr;
         FRDGBufferRef A[2] = {}, X[2] = {}, Y[2] = {}, P[2] = {};
         // The last frame's lake and output buffers (else stand-ins).
         FRDGBufferRef LakeArea = nullptr, LakeDepth = nullptr, LakeOutlet = nullptr, LakeCount = nullptr, LakeList = nullptr;
@@ -353,6 +374,7 @@ struct VoxelLandSolve::FJob::FImpl
         const uint32 SlotCount = FMath::Max(NumSlots, 1u);
         F.Partials = Get(GraphBuilder, Partials, 4, 2 * FMath::DivideAndRoundUp(SlotCount, 64u), TEXT("Voxel.LandSolvePartials"));
         F.U = Get(GraphBuilder, U, 4, SlotCount, TEXT("Voxel.LandSolveU"));
+        F.Erodibility = Get(GraphBuilder, Erodibility, 4, SlotCount, TEXT("Voxel.LandSolveK"));
         F.Area = Get(GraphBuilder, Area, 4, SlotCount, TEXT("Voxel.LandSolveArea"));
         F.Dist = Get(GraphBuilder, Dist, 4, SlotCount, TEXT("Voxel.LandSolveDist"));
         F.H0 = Get(GraphBuilder, H0, 4, SlotCount, TEXT("Voxel.LandSolveH0"));
@@ -392,6 +414,20 @@ struct VoxelLandSolve::FJob::FImpl
         Params.SolveMinLakeArea = S.MinLakeArea;
         Params.SolveMaxLakes = VLS::MaxLakes;
         Params.SolveErode = S.bErode ? 1u : 0u;
+        Params.SolveJitter = S.Jitter;
+        Params.SolveRouteNoise = S.RouteNoise;
+        Params.SolveSpreadCells = S.SpreadCells;
+        Params.SolveUpliftVariation = S.UpliftVariation;
+        Params.SolveErodibilityVariation = S.ErodibilityVariation;
+        Params.SolveVariationWavelength = S.VariationWavelength;
+        Params.SolveRoughness = S.Roughness;
+        Params.SolveReliefScale = ReliefScale;
+        // The T1 model (Design/SurfaceLook.md): the static surface kept, the plains solved.
+        Params.SolveFillDepressions = 1u;
+        Params.SolveModel = 1u;
+        Params.SolvePlainsRelief = S.PlainsRelief;
+        Params.SolveUndulation = S.Undulation;
+        Params.SolveIncision = S.Incision;
         Params.SolveH = GraphBuilder.CreateUAV(F.H);
         Params.SolveW = GraphBuilder.CreateUAV(F.W);
         Params.SolveWater = GraphBuilder.CreateUAV(F.Water);
@@ -400,6 +436,7 @@ struct VoxelLandSolve::FJob::FImpl
         Params.SolveLabel = GraphBuilder.CreateUAV(F.Label);
         Params.SlotCell = GraphBuilder.CreateUAV(F.Cell);
         Params.SlotU = GraphBuilder.CreateUAV(F.U);
+        Params.SlotK = GraphBuilder.CreateUAV(F.Erodibility);
         Params.SlotArea = GraphBuilder.CreateUAV(F.Area);
         Params.SlotDist = GraphBuilder.CreateUAV(F.Dist);
         Params.SlotH0 = GraphBuilder.CreateUAV(F.H0);
@@ -445,6 +482,7 @@ struct VoxelLandSolve::FJob::FImpl
         Params.SolveFactor = Factor;
         Params.SolveReliefKnee = Knee;
         Params.SolveReliefTop = Top;
+        Params.SolveReliefScale = ReliefScale;
         Params.SlotA = F.AUav[AParity];
         Params.SlotAOut = F.AUav[1 - AParity];
         Params.JumpX = F.XUav[JumpParity];
@@ -491,7 +529,7 @@ struct VoxelLandSolve::FJob::FImpl
     {
         const double Now = FPlatformTime::Seconds();
         static const TCHAR* Names[] = { TEXT("start"), TEXT("count"), TEXT("initial fill"), TEXT("steps"), TEXT("normalisation"),
-            TEXT("lake levels"), TEXT("routing fill"), TEXT("drainage"), TEXT("lake labels"), TEXT("output"), TEXT("done") };
+            TEXT("lake levels"), TEXT("routing fill"), TEXT("drainage"), TEXT("drainage spread"), TEXT("lake labels"), TEXT("output"), TEXT("done") };
         OutResult.PhaseLog.Add(FString::Printf(TEXT("%s %d frames %.2f s"), Names[(int32)Phase], PhaseFrames, Now - PhaseStart));
         Phase = InPhase;
         PhaseStart = Now;
@@ -589,7 +627,7 @@ struct VoxelLandSolve::FJob::FImpl
     void Release()
     {
         for (TRefCountPtr<FRDGPooledBuffer>* B : { &Tan, &H, &W, &Water, &Rec, &Slot, &Label, &Cell, &GroupCounts, &Counts, &Flags, &State, &Partials, &Log,
-            &Histogram, &U, &Area, &Dist, &H0, &WOut, &A[0], &A[1], &X[0], &X[1], &Y[0], &Y[1], &P[0], &P[1] })
+            &Histogram, &U, &Erodibility, &Area, &Dist, &H0, &WOut, &A[0], &A[1], &X[0], &X[1], &Y[0], &Y[1], &P[0], &P[1] })
             B->SafeRelease();
         Pending.Reset();
     }
@@ -758,12 +796,42 @@ void VoxelLandSolve::FJob::Tick(FRHICommandListImmediate& RHICmdList, const FPla
             {
                 I.Factor = FMath::Clamp(TargetP90 / SolvedP90, 0.01f, 100.0f);
                 I.Knee = TargetP90;
-                I.Top = FMath::Max(1.3f * TargetTop, 1.2f * TargetP90);
+                I.Top = FMath::Max(S.ReliefTopScale * TargetTop, 1.2f * TargetP90);
+                // Above the knee a logarithm, K + s ln(1 + (R - K) / s) (VoxelSolveCompressRelief),
+                // with s fitted so the solved 99.9th percentile lands on the top: s ln(1 + D / s)
+                // rises from 0 to D with s, so any top is reached (a large s: nearly linear).
+                const float SolvedTop = VLS::Quantile(Bins.GetData(), 0.999);
+                const float D = I.Factor * SolvedTop - I.Knee;
+                const float Want = I.Top - I.Knee;
+                I.ReliefScale = 1.0e9f;
+                if (D > Want && Want > 0.0f)
+                {
+                    double Lo = 1.0e-3 * Want, Hi = 1.0e3 * FMath::Max((double)D, 1.0);
+                    for (int32 Iteration = 0; Iteration < 80; Iteration++)
+                    {
+                        const double Mid = FMath::Sqrt(Lo * Hi);
+                        (Mid * FMath::Loge(1.0 + D / Mid) > Want ? Hi : Lo) = Mid;
+                    }
+                    I.ReliefScale = (float)FMath::Sqrt(Lo * Hi);
+                }
             }
             Result.Factor = I.Factor;
             Result.ReliefKnee = I.Knee;
             Result.ReliefTop = I.Top;
+            Result.ReliefScale = I.ReliefScale;
+            // The links already uphill (lakes behind sills) before the normalisation; after it,
+            // no new step uphill along the last step's receivers (VoxelSolveSettlePass): a tree
+            // fill that stops at those links, then each solved cell up to its level.
+            I.Pass<FVoxelSolveSettleMarkCS>(GraphBuilder, F, I.NumSlots, TEXT("settle mark"));
             I.Pass<FVoxelSolveNormaliseCS>(GraphBuilder, F, I.NumCells, TEXT("normalise"));
+            I.Pass<FVoxelSolveSettleInitCS>(GraphBuilder, F, I.NumSlots, TEXT("settle fill"));
+            for (int32 r = 0; r < VLS::JumpRounds; r++)
+            {
+                I.Pass<FVoxelSolveTreeFillJumpCS>(GraphBuilder, F, I.NumSlots, TEXT("settle fill jump"), 0, 0);
+                I.JumpParity ^= 1;
+            }
+            I.Pass<FVoxelSolveTreeFillFinishCS>(GraphBuilder, F, I.NumSlots, TEXT("settle fill finish"), 0, 0);
+            I.Pass<FVoxelSolveSettleCS>(GraphBuilder, F, I.NumSlots, TEXT("settle"));
             Progress.store(0.85f, std::memory_order_relaxed);
             I.CountDomainSlots(GraphBuilder, F, 1, Result);
             break;
@@ -789,6 +857,24 @@ void VoxelLandSolve::FJob::Tick(FRHICommandListImmediate& RHICmdList, const FPla
         case EPhase::Accumulate:
         {
             if (I.NumSlots > 0 && !I.Loop<FVoxelSolveAccumulateInPlaceCS>(GraphBuilder, F, TEXT("drainage"), 0, bFailed)) break;
+            if (bFailed) break;
+            // The drainage field's spread over the hillslopes (VoxelSolveSpreadPass), from the
+            // D8 areas just converged; the solve and the lakes keep D8.
+            if (S.SpreadCells > 0.0f && I.NumSlots > 0)
+            {
+                I.Pass<FVoxelSolveSpreadInitCS>(GraphBuilder, F, I.NumSlots, TEXT("drainage spread init"));
+                I.SetPhase(EPhase::Spread, Result);
+                Progress.store(0.92f, std::memory_order_relaxed);
+                break;
+            }
+            I.Pass<FVoxelSolveLabelInitCS>(GraphBuilder, F, I.NumSlots, TEXT("lake labels"));
+            I.SetPhase(EPhase::Labels, Result);
+            Progress.store(0.94f, std::memory_order_relaxed);
+            break;
+        }
+        case EPhase::Spread:
+        {
+            if (!I.Loop<FVoxelSolveSpreadCS>(GraphBuilder, F, TEXT("drainage spread"), 0, bFailed)) break;
             if (bFailed) break;
             I.Pass<FVoxelSolveLabelInitCS>(GraphBuilder, F, I.NumSlots, TEXT("lake labels"));
             I.SetPhase(EPhase::Labels, Result);

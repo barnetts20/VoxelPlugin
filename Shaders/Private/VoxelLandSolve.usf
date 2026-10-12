@@ -33,6 +33,20 @@ float SolveMinLakeDepth;
 float SolveMinLakeArea;
 uint SolveMaxLakes;
 uint SolveErode;
+// The T1 model (Design/SurfaceLook.md; VoxelLandSolve.ush lists them).
+float SolveJitter;
+float SolveRouteNoise;
+float SolveSpreadCells;
+float SolveUpliftVariation;
+float SolveErodibilityVariation;
+float SolveVariationWavelength;
+float SolveRoughness;
+float SolveReliefScale;
+uint SolveFillDepressions;
+uint SolveModel;
+float SolvePlainsRelief;
+float SolveUndulation;
+float SolveIncision;
 
 // Per cell.
 RWStructuredBuffer<float> SolveH;
@@ -45,6 +59,7 @@ RWStructuredBuffer<uint> SolveLabel;
 // Per slot.
 RWStructuredBuffer<uint> SlotCell;
 RWStructuredBuffer<float> SlotU;
+RWStructuredBuffer<float> SlotK;
 RWStructuredBuffer<float> SlotArea;
 RWStructuredBuffer<float> SlotDist;
 RWStructuredBuffer<float> SlotH0;
@@ -255,6 +270,18 @@ void AccumulateInPlaceCS(uint3 GroupId : SV_GroupID, uint GroupThread : SV_Group
 }
 
 [numthreads(64, 1, 1)]
+void SpreadInitCS(uint3 GroupId : SV_GroupID, uint GroupThread : SV_GroupIndex)
+{
+    VoxelSolveSpreadInitPass(ThreadIndex(GroupId, GroupThread), NumSlots);
+}
+
+[numthreads(64, 1, 1)]
+void SpreadCS(uint3 GroupId : SV_GroupID, uint GroupThread : SV_GroupIndex)
+{
+    VoxelSolveSpreadPass(ThreadIndex(GroupId, GroupThread), NumSlots);
+}
+
+[numthreads(64, 1, 1)]
 void TreeFillInitCS(uint3 GroupId : SV_GroupID, uint GroupThread : SV_GroupIndex)
 {
     if (Skipped()) return;
@@ -363,6 +390,24 @@ void ResidualCS(uint GroupThread : SV_GroupIndex)
 }
 
 [numthreads(64, 1, 1)]
+void SettleMarkCS(uint3 GroupId : SV_GroupID, uint GroupThread : SV_GroupIndex)
+{
+    VoxelSolveSettleMarkPass(ThreadIndex(GroupId, GroupThread), NumSlots);
+}
+
+[numthreads(64, 1, 1)]
+void SettleInitCS(uint3 GroupId : SV_GroupID, uint GroupThread : SV_GroupIndex)
+{
+    VoxelSolveSettleInitPass(ThreadIndex(GroupId, GroupThread), NumSlots, SolveEps);
+}
+
+[numthreads(64, 1, 1)]
+void SettleCS(uint3 GroupId : SV_GroupID, uint GroupThread : SV_GroupIndex)
+{
+    VoxelSolveSettlePass(ThreadIndex(GroupId, GroupThread), NumSlots);
+}
+
+[numthreads(64, 1, 1)]
 void OutletInitCS(uint3 GroupId : SV_GroupID, uint GroupThread : SV_GroupIndex)
 {
     VoxelSolveOutletInitPass(ThreadIndex(GroupId, GroupThread), NumSlots);
@@ -385,6 +430,7 @@ void HistogramCS(uint3 GroupId : SV_GroupID, uint GroupThread : SV_GroupIndex)
     const uint Slot = ThreadIndex(GroupId, GroupThread);
     if (Slot >= NumSlots) return;
     const FVoxelSolveRelief R = VoxelSolveReliefOf(Slot);
+    if (!R.bCounted) return;
     InterlockedAdd(Histogram[HistogramBin(R.Solved)], 1u);
     InterlockedAdd(Histogram[VOXEL_SOLVE_BINS + HistogramBin(R.Target)], 1u);
 }

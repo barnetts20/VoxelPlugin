@@ -190,6 +190,8 @@ void VoxelLandMaterial::BuildConstantTexels(const FVoxelDensityGPUData& Density,
     S[VOXEL_LAND_MC_OCTAVE_BASE] = (float)OctaveBase;
     S[VOXEL_LAND_MC_PLATE_BASE] = (float)PlateBase;
     S[VOXEL_LAND_MC_SIDE] = (float)Bake.Side();
+    S[VOXEL_LAND_MC_PLATE_RADIUS_M] = Bake.PlateRadiusM;
+    S[VOXEL_LAND_MC_PLATE_WIDTH_SCALE] = Bake.PlateWidthScale;
 
     for (int32 i = 0; i < Bake.TanTable.Num(); i++)
     {

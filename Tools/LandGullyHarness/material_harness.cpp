@@ -64,6 +64,7 @@ int main(int argc, char** argv)
     S[VOXEL_LAND_MC_CONTINENT_OCTAVES] = 0; S[VOXEL_LAND_MC_MOUNTAIN_OCTAVES] = 0; S[VOXEL_LAND_MC_DETAIL_OCTAVES] = (float)VoxelShader::DetailOctaves;
     S[VOXEL_LAND_MC_LAND_MODE] = 1; S[VOXEL_LAND_MC_PLATE_COUNT] = 0; S[VOXEL_LAND_MC_HAS_HYDRO] = 1;
     S[VOXEL_LAND_MC_TAN_BASE] = (float)TanBase; S[VOXEL_LAND_MC_OCTAVE_BASE] = (float)OctaveBase; S[VOXEL_LAND_MC_PLATE_BASE] = (float)PlateBase;
+    S[VOXEL_LAND_MC_PLATE_RADIUS_M] = (float)RadiusM; S[VOXEL_LAND_MC_PLATE_WIDTH_SCALE] = 1.0f;
     S[VOXEL_LAND_MC_SIDE] = (float)Side;
     for (size_t i = 0; i < P.Tan.size(); i++) { float* T = S + 4 * (TanBase + i / 2) + 2 * (i & 1); T[0] = P.Tan[i].x; T[1] = P.Tan[i].y; }
     for (size_t o = 0; o < Gpu.size(); o++)

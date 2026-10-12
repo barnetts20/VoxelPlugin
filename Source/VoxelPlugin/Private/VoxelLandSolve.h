@@ -1,15 +1,19 @@
 // VoxelLandSolve.h - The land bake's erosion solve and final routing on the GPU (Design/LandGen.md
 // section 5; stage L2). After the plate pass (VoxelLandBake.cpp), a render-thread job runs, a
 // few compute passes a frame:
-//   1. the mountain cells (continental crust whose uplift is past the range-front ramp) are
-//      compacted into slots, start at their static height, and are filled until they drain;
+//   1. the land cells (the mountains, continental crust whose uplift is past the range-front
+//      ramp, and since T1 the plains with a small uplift of their own) are compacted into
+//      slots, start at their static height with roughness, and are filled until they drain;
 //   2. steps of the implicit stream-power solve, each: the fill along the previous receivers
 //      and a few Planchon-Darboux refinements, the receivers (steepest descent; depressions
 //      filled), drainage accumulation (warm-started Jacobi), the implicit update (pointer
 //      jumping over affine maps), the residual; until it is below the setting or the step
 //      limit (the GPU decides, so the step count is reproducible);
-//   3. the relief above each cell's outlet is scaled so its 90th percentile matches the
-//      profile's, and eased above it toward the profile's top;
+//   3. the uplifted mass above each cell's static surface is scaled so its 90th percentile
+//      matches the profile's (the mountains'), and mapped above it by a logarithm fitted to
+//      put the 99.9th percentile on the top, then settled so no path steps uphill
+//      (Design/SurfaceLook.md, T1; L2 scaled the relief above the outlet, which lost the
+//      static surface under ranges, and eased it flat);
 //   4. the land is routed on the final heights: lake levels (a fill without descent), the
 //      routing fill, receivers, exact drainage, lake labels; lakes past the size settings are
 //      kept, smaller depressions filled;
@@ -47,6 +51,22 @@ namespace VoxelLandSolve
         float Tolerance = 0.02f;
         float MinLakeDepth = 10.0f;      // m
         float MinLakeArea = 20.0e6f;     // m^2
+        // The T1 model (Design/SurfaceLook.md; VoxelLandSolve.ush): the static surface kept,
+        // the plains solved with a small uplift, a jittered routing graph, uplift and
+        // erodibility fields, initial roughness, the power relief map.
+        float Jitter = 0.4f;             // cells
+        // T1b (Design/SurfaceLook.md): the receivers' random choice, and the drainage field's
+        // spread over hillslopes (cells; 0 the D8 areas).
+        float RouteNoise = 1.0f;
+        float SpreadCells = 16.0f;
+        float UpliftVariation = 0.8f;
+        float ErodibilityVariation = 0.7f;
+        float VariationWavelength = 9.0e4f;   // m
+        float Roughness = 150.0f;        // m
+        float PlainsRelief = 100.0f;     // m
+        float Undulation = 60.0f;        // m (T1b)
+        float Incision = 150.0f;         // m
+        float ReliefTopScale = 1.2f;     // the top over the profile's 99.9th percentile
         bool bErode = true;
         int64 StepCellsPerFrame = 1 << 22;        // slot-steps a frame
         int64 IterationCellsPerFrame = 1 << 26;   // slot-iterations a frame (the fills, drainage, labels)
@@ -78,6 +98,7 @@ namespace VoxelLandSolve
         float Factor = 1.0f;
         float ReliefKnee = 0.0f;
         float ReliefTop = 0.0f;
+        float ReliefScale = 0.0f;        // the logarithm's scale above the knee (m; large: nearly linear)
         uint32 Errors = 0;               // VOXEL_SOLVE_ERROR_* bits
         int32 LakesFound = 0;            // kept lakes, before the list's cap
         TArray<FString> PhaseLog;        // per phase: frames and seconds (voxel.Debug.Land)

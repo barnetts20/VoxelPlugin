@@ -61,14 +61,39 @@ VOXEL_FUNC float VoxelLandFbm(float3 P, float Frequency, uint NumOctaves, uint S
     return Norm > 0.0f ? Sum / Norm * VOXEL_LAND_NOISE_SCALE : 0.0f;
 }
 
+// The profile warp (Design/SurfaceLook.md, T1b): the boundary distance's contours bend by about
+// this much (m, Earth widths), over wavelengths from this (m) down to a quarter. Without it a
+// belt's flanks are planes between bisectors, and their rivers run straight and parallel.
+// Kept small: where the continental warp already nearly folds (its Jacobian's determinant
+// falls to 0.007), more warp folds it (a fold mirrors the contours over a sliver): at 30 km
+// 0.015% of the sphere, at 50 km 0.05% (Tools/LandSolveHarness/look_harness.cpp, WarpFolds).
+#ifndef VOXEL_LAND_PROFILE_WARP_M
+#define VOXEL_LAND_PROFILE_WARP_M 30000.0f
+#endif
+#ifndef VOXEL_LAND_PROFILE_WARP_WAVELENGTH_M
+#define VOXEL_LAND_PROFILE_WARP_WAVELENGTH_M 240000.0f
+#endif
+
 /** The plates' domain warp: a vector fBm offset of the direction (hides the Voronoi
- *  polygons), back on the unit sphere. */
+ *  polygons; the boundary profiles are measured from the warped point too), back on the unit
+ *  sphere. Two parts: the continental one (0.12 rad, 2.5 per radian), and the profile warp in
+ *  metres at Earth widths, which bends the profiles' contours at the scale of a range. */
 VOXEL_FUNC float3 VoxelLandWarp(VOXEL_LAND_ARGS_DECL float3 P)
 {
     const float WX = VoxelLandFbm(P + float3(3.1f, 0.0f, 0.0f), 2.5f, 4u, LandSeed + VOXEL_LAND_SALT_WARP + 1u);
     const float WY = VoxelLandFbm(P + float3(0.0f, 7.7f, 0.0f), 2.5f, 4u, LandSeed + VOXEL_LAND_SALT_WARP + 2u);
     const float WZ = VoxelLandFbm(P + float3(0.0f, 0.0f, 1.9f), 2.5f, 4u, LandSeed + VOXEL_LAND_SALT_WARP + 3u);
-    return normalize(P + float3(WX, WY, WZ) * 0.12f);
+    float3 Offset = float3(WX, WY, WZ) * 0.12f;
+    if (VOXEL_LAND_PROFILE_WARP_M > 0.0f)
+    {
+        const float Frequency = LandRadiusM / (VOXEL_LAND_PROFILE_WARP_WAVELENGTH_M * max(LandWidthScale, 0.01f));
+        const float Amount = VOXEL_LAND_PROFILE_WARP_M * max(LandWidthScale, 0.01f) / max(LandRadiusM, 1.0f);
+        const float DX = VoxelLandFbm(P + float3(5.3f, 1.1f, 0.0f), Frequency, 3u, LandSeed + VOXEL_LAND_SALT_WARP + 4u);
+        const float DY = VoxelLandFbm(P + float3(0.0f, 2.9f, 6.1f), Frequency, 3u, LandSeed + VOXEL_LAND_SALT_WARP + 5u);
+        const float DZ = VoxelLandFbm(P + float3(8.3f, 0.0f, 4.7f), Frequency, 3u, LandSeed + VOXEL_LAND_SALT_WARP + 6u);
+        Offset = Offset + float3(DX, DY, DZ) * Amount;
+    }
+    return normalize(P + Offset);
 }
 
 // --- Plates ------------------------------------------------------------------------------

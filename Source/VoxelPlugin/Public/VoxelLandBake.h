@@ -84,10 +84,13 @@ struct VOXELPLUGIN_API FVoxelLandBake
      *  pairs: the sampler's exact fractions. */
     TArray<FVector2f> TanTable;
 
-    /** The plate model's plates (8 floats each, VoxelLandPlates.ush) and seed, for the land
-     *  debug views; made from the settings when the bake is ready (not cached). */
+    /** The plate model's plates (8 floats each, VoxelLandPlates.ush), seed, radius (m) and
+     *  landform width scale, for the land debug views (the plates view warps as the bake did);
+     *  made from the settings when the bake is ready (not cached). */
     TArray<float> Plates;
     uint32 PlateSeed = 0;
+    float PlateRadiusM = 1.0f;
+    float PlateWidthScale = 1.0f;
 
     int32 Side() const { return N + 2 * Pad; }
     int32 NumCells() const { return 6 * Side() * Side(); }
@@ -159,7 +162,7 @@ private:
 namespace VoxelLand
 {
     /** Bump when the generator's output changes for the same settings (invalidates caches). */
-    constexpr uint32 GeneratorVersion = 3;
+    constexpr uint32 GeneratorVersion = 5;
 
     /** voxel.Land.Erosion: whether bakes run the erosion solve (part of the key). */
     VOXELPLUGIN_API bool IsErosionEnabled();

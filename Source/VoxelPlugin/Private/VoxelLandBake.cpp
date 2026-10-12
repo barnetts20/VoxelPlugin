@@ -323,7 +323,9 @@ uint32 FVoxelTerrestrialSettings::GetBakeHash() const
     H = HashCombine(H, ::GetTypeHash(PlateCount));
     H = HashCombine(H, ::GetTypeHash(BakeResolution));
     for (const double V : { ContinentalFraction, LandformWidthScale, RangeRelief, CoastHeight, InteriorHeight, ShelfDepth, AbyssDepth,
-        PlainsUpliftThreshold, MountainRampWidth, SolveResidual, MinLakeDepth, MinLakeArea })
+        PlainsUpliftThreshold, MountainRampWidth, SolveResidual, MinLakeDepth, MinLakeArea, RoutingJitter, UpliftVariation,
+        ErodibilityVariation, VariationWavelength, InitialRoughness, PlainsRelief, RiverIncision, SummitHeightScale,
+        RoutingRandomness, DrainageSpreadCells, PlainsUndulation })
         H = HashCombine(H, ::GetTypeHash(V));
     H = HashCombine(H, ::GetTypeHash(SolveMaxSteps));
     return H;
@@ -417,7 +419,10 @@ uint32 VoxelLand::BakeCheck(const FVoxelTerrestrialSettings& Settings, double Se
         Settings.ContinentalFraction, Settings.LandformWidthScale, Settings.RangeRelief, Settings.CoastHeight,
         Settings.InteriorHeight, Settings.ShelfDepth, Settings.AbyssDepth, FMath::RoundToDouble(SeaRadius),
         (double)FVoxelLandBake::Version, (double)GeneratorVersion, Settings.PlainsUpliftThreshold, Settings.MountainRampWidth,
-        Settings.SolveResidual, (double)Settings.SolveMaxSteps, Settings.MinLakeDepth, Settings.MinLakeArea, IsErosionEnabled() ? 1.0 : 0.0 };
+        Settings.SolveResidual, (double)Settings.SolveMaxSteps, Settings.MinLakeDepth, Settings.MinLakeArea, IsErosionEnabled() ? 1.0 : 0.0,
+        Settings.RoutingJitter, Settings.UpliftVariation, Settings.ErodibilityVariation, Settings.VariationWavelength, Settings.InitialRoughness,
+        Settings.PlainsRelief, Settings.RiverIncision, Settings.SummitHeightScale, Settings.RoutingRandomness, Settings.DrainageSpreadCells,
+        Settings.PlainsUndulation };
     return FCrc::MemCrc32(Values.GetData(), Values.Num() * (int32)sizeof(double));
 }
 
@@ -812,6 +817,17 @@ namespace VoxelLandBakeDetail
         S.Tolerance = (float)FMath::Clamp(Settings.SolveResidual, 0.001, 0.5);
         S.MinLakeDepth = (float)FMath::Max(Settings.MinLakeDepth, 0.0);
         S.MinLakeArea = (float)(FMath::Max(Settings.MinLakeArea, 0.0) * 1.0e6);
+        S.Jitter = (float)FMath::Clamp(Settings.RoutingJitter, 0.0, 0.45);
+        S.RouteNoise = (float)FMath::Clamp(Settings.RoutingRandomness, 0.0, 3.0);
+        S.SpreadCells = (float)FMath::Clamp(Settings.DrainageSpreadCells, 0.0, 1024.0);
+        S.UpliftVariation = (float)FMath::Clamp(Settings.UpliftVariation, 0.0, 1.5);
+        S.ErodibilityVariation = (float)FMath::Clamp(Settings.ErodibilityVariation, 0.0, 2.0);
+        S.VariationWavelength = (float)(FMath::Max(Settings.VariationWavelength, 10.0) * 1000.0);
+        S.Roughness = (float)FMath::Max(Settings.InitialRoughness, 0.0);
+        S.PlainsRelief = (float)FMath::Max(Settings.PlainsRelief, 0.0);
+        S.Undulation = (float)FMath::Max(Settings.PlainsUndulation, 0.0);
+        S.Incision = (float)FMath::Max(Settings.RiverIncision, 0.0);
+        S.ReliefTopScale = (float)FMath::Clamp(Settings.SummitHeightScale, 1.0, 2.0);
         S.bErode = VoxelLand::IsErosionEnabled();
         S.StepCellsPerFrame = FMath::Max(CVarVoxelLandSolveStepCells.GetValueOnGameThread(), 1 << 16);
         S.IterationCellsPerFrame = FMath::Max(CVarVoxelLandSolveIterationCells.GetValueOnGameThread(), 1 << 18);
@@ -1144,8 +1160,8 @@ void FVoxelLandBaker::Tick()
         // The render thread is done with the result; the fields are narrowed and checked on a
         // worker (a few passes over every cell).
         const TSharedPtr<VoxelLandSolve::FResult, ESPMode::ThreadSafe> R = MakeShared<VoxelLandSolve::FResult, ESPMode::ThreadSafe>(MoveTemp(Job->Solve->Result));
-        UE_LOG(LogVoxelPlugin, Log, TEXT("[VoxelLand] Solve %08x: %d mountain cells, %d steps (residual %.4f), relief x %.3f (eased above %.0f m toward %.0f m); routing over %d land cells, %d lakes kept%s."),
-            Key, R->SolvedCells, R->Steps, R->Residual, R->Factor, R->ReliefKnee, R->ReliefTop, R->LandCells, R->Lakes.Num(),
+        UE_LOG(LogVoxelPlugin, Log, TEXT("[VoxelLand] Solve %08x: %d solved cells, %d steps (residual %.4f), relief x %.3f (a logarithm of scale %.0f m above %.0f m, the top %.0f m); routing over %d land cells, %d lakes kept%s."),
+            Key, R->SolvedCells, R->Steps, R->Residual, R->Factor, R->ReliefScale, R->ReliefKnee, R->ReliefTop, R->LandCells, R->Lakes.Num(),
             R->Errors != 0 ? *FString::Printf(TEXT("; error bits 0x%x"), R->Errors) : TEXT(""));
         if (CVarVoxelDebugLand.GetValueOnGameThread() != 0)
             UE_LOG(LogVoxelPlugin, Log, TEXT("[VoxelLand] Solve phases: %s."), *FString::Join(R->PhaseLog, TEXT(", ")));
@@ -1258,6 +1274,8 @@ void FVoxelLandBaker::Finish(TSharedPtr<FVoxelLandBake, ESPMode::ThreadSafe> Bak
     const VoxelLandBakeDetail::FInputs Inputs = VoxelLandBakeDetail::MakeInputs(Settings, SeaRadius, Key);
     Bake->Plates = Inputs.Plates;
     Bake->PlateSeed = Inputs.Seed;
+    Bake->PlateRadiusM = Inputs.RadiusM;
+    Bake->PlateWidthScale = Inputs.WidthScale;
     if (!Bake->bFromCache)
         Bake->BakeSeconds = FPlatformTime::Seconds() - StartSeconds;
     Result = Bake;
@@ -1376,7 +1394,8 @@ FVoxelLandDebugParameters VoxelLandGPU::GetDebugParameters(FRDGBuilder& GraphBui
     Parameters.LandSeed = 0;
     Parameters.LandDebugHasHydro = 0;
     Parameters.LandDebugHasAttr = 0;
-    // The plate model's other inputs: the debug views read only the plates and the seed.
+    // The plate model's other inputs: the debug views read only the plates, the seed, and the
+    // radius and width scale (the warp's; set with the plates below).
     Parameters.LandRadiusM = 1.0f;
     Parameters.LandWidthScale = 1.0f;
     Parameters.LandReliefScale = 1.0f;
@@ -1409,6 +1428,8 @@ FVoxelLandDebugParameters VoxelLandGPU::GetDebugParameters(FRDGBuilder& GraphBui
             Parameters.LandPlates = GraphBuilder.CreateSRV(GraphBuilder.RegisterExternalBuffer(Resource.Plates));
             Parameters.LandPlateCount = (uint32)(Bake->Plates.Num() / 8);
             Parameters.LandSeed = Bake->PlateSeed;
+            Parameters.LandRadiusM = Bake->PlateRadiusM;
+            Parameters.LandWidthScale = Bake->PlateWidthScale;
         }
         else
         {

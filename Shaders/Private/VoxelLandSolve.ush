@@ -45,6 +45,32 @@
 //                                               where the scaled relief starts to ease toward
 //                                               the top (m)
 //   float SolveMinLakeDepth, SolveMinLakeArea;  m, m^2
+//   float SolveJitter;                          the routing graph's node offsets (cells, 0..0.45;
+//                                               Design/SurfaceLook.md T1): breaks D8's 8 directions
+//   float SolveSpreadCells;                     the drainage field's hillslopes (cells; T1b, see
+//                                               VoxelSolveSpreadPass)
+//   float SolveRouteNoise;                      the receivers' choice: each neighbour's slope
+//                                               times 2^(this x u), u a fixed hash in -1..1 per
+//                                               cell and neighbour (T1b; 0 steepest descent)
+//   float SolveUpliftVariation;                 uplift x max(0, 1 + this x n1): massifs, saddles
+//   float SolveErodibilityVariation;            erodibility x exp(this x n2): hard and soft rock
+//   float SolveVariationWavelength;             the coarsest wavelength of n1 and n2 (m)
+//   float SolveRoughness;                       the initial surface's noise (m, coarsest octave)
+//   uint SolveModel;                            0 (L2): relief above the outlet; 1 (T1): the static
+//                                               surface stays, the solve adds the eroded uplifted
+//                                               mass on it, rivers cut at most SolveIncision below
+//   float SolveUndulation;                      model 1: the static surface's rolling ground on
+//                                               land (m, coarsest octave; T1b)
+//   float SolvePlainsRelief;                    model 1: the plains' uplift as relief (m): they
+//                                               join the solve, so they get drained valleys
+//   float SolveIncision;                        model 1: how far rivers may cut below the static
+//                                               surface (m; never below the sea)
+//   uint SolveFillDepressions;                  1: the solve fills depressions with sediment each step
+//   float SolveReliefScale;                     the relief map above the knee: 0 the L2 easing toward
+//                                               SolveReliefTop, else K + s ln(1 + (R - K) / s) with
+//                                               this s (m), fitted so the 99.9th percentile lands on
+//                                               the top (large: nearly linear)
+//   RWStructuredBuffer<float> SlotK;            per slot: the erodibility factor
 
 #ifndef VOXEL_LAND_SOLVE_USH
 #define VOXEL_LAND_SOLVE_USH
@@ -206,6 +232,68 @@ VOXEL_FUNC float VoxelSolveNoise(uint Cell)
     return float(VoxelSolveHash(Cell ^ VoxelSolveHash(SolveSeed + 0x51ed27u)) >> 8u) * (2.0f / 16777216.0f) - 1.0f;
 }
 
+/** A cell's node in the routing graph: its centre moved by up to SolveJitter cells along each
+ *  face axis (a hash of the cell and the seed), on the sphere. The fields stay at the centres;
+ *  only the distances the receivers and slopes see move, so a plane no longer drains along one
+ *  of 8 directions (the regular-grid form of an irregular sampling, Cordonnier et al. 2016). */
+VOXEL_FUNC float3 VoxelSolveNodeDirection(uint Cell)
+{
+    if (!(SolveJitter > 0.0f)) return VoxelSolveCellDirection(Cell);
+    const FVoxelSolveCell C = VoxelSolveDecode(Cell);
+    const uint H = VoxelSolveHash(Cell ^ VoxelSolveHash(SolveSeed + 0x2c1b3c6du));
+    const float DU = (float(H & 0xffffu) * (1.0f / 65535.0f) - 0.5f) * 2.0f * SolveJitter;
+    const float DV = (float(H >> 16u) * (1.0f / 65535.0f) - 0.5f) * 2.0f * SolveJitter;
+    const float Step = 2.0f / float(SolveN);
+    const float A = tan((-1.0f + (float(C.I) + 0.5f + DU) * Step) * (0.5f * VOXEL_SOLVE_HALF_PI));
+    const float B = tan((-1.0f + (float(C.J) + 0.5f + DV) * Step) * (0.5f * VOXEL_SOLVE_HALF_PI));
+    const float3 N = VoxelCubeAxisVector(VoxelCubeNormalAxis(C.Face)) * VoxelCubeNormalSign(C.Face);
+    return normalize(N + VoxelCubeAxisVector(VoxelCubeUAxis(C.Face)) * A + VoxelCubeAxisVector(VoxelCubeVAxis(C.Face)) * B);
+}
+
+/** A cell's weight for its neighbour c in the receivers' choice: 2^(SolveRouteNoise x u), u a
+ *  fixed hash of the cell, c and the seed in -1..1. Steepest descent sends every cell of a
+ *  planar flank the same way, so its channels run parallel and never meet; a random choice
+ *  among the downhill neighbours makes them random walks down the slope that merge, as in
+ *  Rho8 (Fairfield and Leymarie 1991) and Scheidegger's networks, and the erosion then deepens
+ *  the merged channels into valleys (Design/SurfaceLook.md, T1b). Fixed per cell, so the
+ *  routing settles. */
+VOXEL_FUNC float VoxelSolveRouteWeight(uint Cell, uint c)
+{
+    if (!(SolveRouteNoise > 0.0f)) return 1.0f;
+    const uint H = VoxelSolveHash((Cell * 8u + c) ^ VoxelSolveHash(SolveSeed + 0x6a09e667u));
+    return exp2(SolveRouteNoise * (float(H >> 8u) * (2.0f / 16777216.0f) - 1.0f));
+}
+
+/** A smooth noise on the sphere (about -1..1): Octaves of gradient noise from WavelengthM,
+ *  halving, at the unit direction Dir; Salt picks the field. */
+VOXEL_FUNC float VoxelSolveFbm(float3 Dir, float WavelengthM, uint Octaves, uint Salt)
+{
+    float Sum = 0.0f;
+    float Amp = 1.0f;
+    float Norm = 0.0f;
+    float Scale = SolveRadiusM / max(WavelengthM, 1.0f);
+    for (uint o = 0u; o < Octaves; o++)
+    {
+        const float3 P = Dir * Scale + float3(17.31f, 5.77f, 11.13f) * float(o + 1u);
+        const float3 Fl = float3(floor(P.x), floor(P.y), floor(P.z));
+        const FVoxelNoiseSample N = VoxelGradientNoise(uint3(asuint(int(Fl.x)), asuint(int(Fl.y)), asuint(int(Fl.z))), P - Fl,
+            VoxelSolveHash(SolveSeed * 0x9e3779b9u + Salt * 0x85ebca6bu + o));
+        Sum += Amp * N.Value;
+        Norm += Amp;
+        Amp *= 0.5f;
+        Scale *= 2.0f;
+    }
+    // Gradient noise spans about +-0.7: to about -1..1.
+    return Sum / max(Norm, 1.0e-6f) * 1.4f;
+}
+
+/** The erodibility factor of a cell (hard rock below 1, soft above). */
+VOXEL_FUNC float VoxelSolveErodibility(float3 Dir)
+{
+    if (!(SolveErodibilityVariation > 0.0f)) return 1.0f;
+    return exp(SolveErodibilityVariation * VoxelSolveFbm(Dir, 0.5f * SolveVariationWavelength, 3u, 2u));
+}
+
 // --- The solve's inputs --------------------------------------------------------------------
 
 /** The plate height (m) over which land on oceanic crust joins the solve. */
@@ -240,9 +328,36 @@ VOXEL_FUNC FVoxelSolveSetup VoxelSolveSetupOf(uint Cell)
     const float Solid = 1.0f - (1.0f - CrustRamp) * (1.0f - LandRamp);   // a smooth union
     S.Mix = Solid * smoothstep(Lo, SolvePlainsUplift + Half, Up);
     S.Static = H - Up * S.Mix;
+    if (SolveModel == 1u && SolveUndulation > 0.0f && H > 0.0f)
+    {
+        // The static surface's undulation (T1b): the plate profile is a smooth ramp between
+        // its belts and coasts, and the solve keeps it, so every river on a ramp ran straight
+        // down it beside its neighbours. Rolling ground at a third of the variation wavelength
+        // and below gives the drainage hollows to gather in. It moves the static surface by at
+        // most 70% of its height either way, so the coastline stays the plate model's with no
+        // step at it, and the coastal ramps, where the straight runs were longest, undulate.
+        // Band-limited to the bake: at least 6 cells for the coarsest scale, and no finer one
+        // under 3 cells (finer noise would be pits, so lakes, at every few cells).
+        const float CellM = VOXEL_SOLVE_HALF_PI / float(SolveN) * SolveRadiusM;
+        const float Wavelength = max(SolveVariationWavelength * (1.0f / 3.0f), 6.0f * CellM);
+        const uint Octaves = uint(clamp(floor(log2(Wavelength / (3.0f * CellM))) + 1.0f, 1.0f, 3.0f));
+        const float3 Dir = VoxelSolveCellDirection(Cell);
+        const float Undulation = SolveUndulation * Solid * VoxelSolveFbm(Dir, Wavelength, Octaves, 5u);
+        const float Bound = 0.7f * max(S.Static, 0.0f);
+        S.Static += clamp(Undulation, -Bound, Bound);
+    }
     S.Target = Up * S.Mix;
     S.Uplift = S.Mix * max(Up - Lo, 0.0f) / max(SolveUpliftTime, 1.0f);
-    S.bMoving = S.Mix > 0.0f && VoxelSolveIsInterior(VoxelSolveDecode(Cell));
+    S.bMoving = S.Mix > 0.0f;
+    if (SolveModel == 1u && SolvePlainsRelief > 0.0f)
+    {
+        // The plains join with a small uplift of their own: drained valleys and interfluves on
+        // the static surface.
+        const float Land = Solid * smoothstep(0.0f, 100.0f, H) * (1.0f - S.Mix);
+        S.Uplift += SolvePlainsRelief * Land / max(SolveUpliftTime, 1.0f);
+        S.bMoving = S.bMoving || Land > 0.0f;
+    }
+    S.bMoving = S.bMoving && VoxelSolveIsInterior(VoxelSolveDecode(Cell));
     return S;
 }
 
@@ -279,22 +394,76 @@ VOXEL_FUNC void VoxelSolveInitPass(uint Cell)
         SolveW[Cell] = max(S.Static, 0.0f);
         return;
     }
-    SolveH[Cell] = S.Static + 8.66f * VoxelSolveNoise(Cell);
+    const float3 Dir = VoxelSolveCellDirection(Cell);
+    float Rough = 8.66f * VoxelSolveNoise(Cell);
+    if (SolveRoughness > 0.0f)
+        Rough += SolveRoughness * VoxelSolveFbm(Dir, 0.25f * SolveVariationWavelength, 4u, 3u);
+    SolveH[Cell] = S.Static + Rough;
     SolveW[Cell] = VOXEL_SOLVE_INF;
-    SlotU[Slot] = S.Uplift;
+    float Uplift = S.Uplift;
+    if (SolveUpliftVariation > 0.0f)
+        Uplift *= max(0.0f, 1.0f + SolveUpliftVariation * VoxelSolveFbm(Dir, SolveVariationWavelength, 3u, 1u));
+    SlotU[Slot] = Uplift;
+    SlotK[Slot] = VoxelSolveErodibility(Dir);
     SlotArea[Slot] = VoxelSolveCellArea(Cell);
     SlotA[Slot] = SlotArea[Slot];
 }
 
-/** The lowest water level among a cell's neighbours. */
-VOXEL_FUNC float VoxelSolveLowestNeighbour(uint Cell)
+/** Whether the fills randomise their descent (T1b): with the receivers' random choice. */
+VOXEL_FUNC bool VoxelSolveRandomFill(float Eps)
 {
+    return SolveRouteNoise > 0.0f && Eps > 0.0f;
+}
+
+/** The fill's descent into Cell from its neighbour C (m): Eps, or with VoxelSolveRandomFill,
+ *  Eps times the step's length in cells (diagonals, C = 0, 2, 5 or 7, the square root of 2;
+ *  across a face's edge too) and the cell's fixed random factor (VoxelSolveFillFactor).
+ *  A filled flat drains along the least total descent to its outlet. With Eps per cell that
+ *  is the fewest steps (the chessboard distance): every path of a flat's quarter funnels into
+ *  the one diagonal from the outlet, so each flat drained by a dead straight diagonal channel,
+ *  which the erosion then cut and kept (the long straight runs on range flanks). The step's
+ *  length makes the descent's metric near Euclidean, and the random factors make the least
+ *  paths a branching, wandering tree (first-passage percolation) (Design/SurfaceLook.md). */
+VOXEL_FUNC float VoxelSolveFillDescent(float Factor, uint C)
+{
+    return (C == 0u || C == 2u || C == 5u || C == 7u) ? Factor * 1.41421356f : Factor;
+}
+
+/** A cell's descent per cell of step (m): Eps, or with VoxelSolveRandomFill, Eps times a fixed
+ *  random factor of the cell between 2^(-e) and 2^e, e = 2 SolveRouteNoise at most 2 (the
+ *  least descent, Eps / 4, stays a few float steps at the highest summits' levels). */
+VOXEL_FUNC float VoxelSolveFillFactor(uint Cell, float Eps)
+{
+    if (!VoxelSolveRandomFill(Eps)) return Eps;
+    const uint H = VoxelSolveHash(Cell ^ VoxelSolveHash(SolveSeed + 0x3c6ef372u));
+    const float U = float(H >> 8u) * (2.0f / 16777216.0f) - 1.0f;
+    return Eps * exp2(min(2.0f * SolveRouteNoise, 2.0f) * U);
+}
+
+/** The descent into Cell from its receiver Rec (a neighbour): finds Rec's neighbour index. */
+VOXEL_FUNC float VoxelSolveFillDescentTo(uint Cell, uint Rec, float Eps)
+{
+    if (!VoxelSolveRandomFill(Eps)) return Eps;
+    const float Factor = VoxelSolveFillFactor(Cell, Eps);
+    for (uint c = 0u; c < 8u; c++)
+    {
+        if (VoxelSolveNeighbour(Cell, c) == Rec)
+            return VoxelSolveFillDescent(Factor, c);
+    }
+    return Factor;
+}
+
+/** The lowest neighbour's water level plus the descent from it (the fill's candidate). */
+VOXEL_FUNC float VoxelSolveFillFloor(uint Cell, float Eps)
+{
+    const bool bRandom = VoxelSolveRandomFill(Eps);
+    const float Factor = VoxelSolveFillFactor(Cell, Eps);
     float Lowest = VOXEL_SOLVE_INF;
     for (uint c = 0u; c < 8u; c++)
     {
         const uint N = VoxelSolveNeighbour(Cell, c);
         if (N != VOXEL_SOLVE_NONE)
-            Lowest = min(Lowest, SolveW[N]);
+            Lowest = min(Lowest, SolveW[N] + (bRandom ? VoxelSolveFillDescent(Factor, c) : Eps));
     }
     return Lowest;
 }
@@ -307,7 +476,7 @@ VOXEL_FUNC void VoxelSolveFillInPlacePass(uint Slot, uint NumSlots, float Eps)
 {
     if (Slot >= NumSlots) return;
     const uint Cell = SlotCell[Slot];
-    const float Candidate = max(SolveH[Cell], VoxelSolveLowestNeighbour(Cell) + Eps);
+    const float Candidate = max(SolveH[Cell], VoxelSolveFillFloor(Cell, Eps));
     if (Candidate < SolveW[Cell])
     {
         SolveW[Cell] = Candidate;
@@ -321,7 +490,7 @@ VOXEL_FUNC void VoxelSolveFillJacobiPass(uint Slot, uint NumSlots, float Eps)
 {
     if (Slot >= NumSlots) return;
     const uint Cell = SlotCell[Slot];
-    const float Candidate = max(SolveH[Cell], VoxelSolveLowestNeighbour(Cell) + Eps);
+    const float Candidate = max(SolveH[Cell], VoxelSolveFillFloor(Cell, Eps));
     SlotWOut[Slot] = min(SolveW[Cell], Candidate);
 }
 
@@ -350,7 +519,7 @@ VOXEL_FUNC void VoxelSolveReceiversPass(uint Slot, uint NumSlots, bool bFill)
     if (Slot >= NumSlots) return;
     const uint Cell = SlotCell[Slot];
     const float W = SolveW[Cell];
-    const float3 Dir = VoxelSolveCellDirection(Cell);
+    const float3 Dir = VoxelSolveNodeDirection(Cell);
     float Best = 0.0f;
     uint Rec = Cell;
     float Dist = 1.0f;
@@ -358,8 +527,8 @@ VOXEL_FUNC void VoxelSolveReceiversPass(uint Slot, uint NumSlots, bool bFill)
     {
         const uint N = VoxelSolveNeighbour(Cell, c);
         if (N == VOXEL_SOLVE_NONE) continue;
-        const float D = VoxelSolveDistance(Dir, VoxelSolveCellDirection(N));
-        const float Slope = (W - SolveW[N]) / D;
+        const float D = VoxelSolveDistance(Dir, VoxelSolveNodeDirection(N));
+        const float Slope = (W - SolveW[N]) / D * VoxelSolveRouteWeight(Cell, c);
         if (Slope > Best)
         {
             Best = Slope;
@@ -373,8 +542,12 @@ VOXEL_FUNC void VoxelSolveReceiversPass(uint Slot, uint NumSlots, bool bFill)
     SlotDist[Slot] = Dist;
     if (bFill)
     {
-        SolveH[Cell] = W;
-        SlotH0[Slot] = W;
+        // Filled with sediment at once (SolveFillDepressions), or left for the implicit update
+        // to raise toward the spill while the outlet erodes: a basin drains through a cut sill
+        // instead of turning into one flat sediment plain.
+        if (SolveFillDepressions != 0u)
+            SolveH[Cell] = W;
+        SlotH0[Slot] = SolveH[Cell];
     }
 }
 
@@ -422,7 +595,8 @@ VOXEL_FUNC void VoxelSolveAccumulateInPlacePass(uint Slot, uint NumSlots)
 // cells of its path.
 
 /** The fill along the previous receivers: W_i = max(h_i, W_r + Eps), as a record (c, k) for
- *  W = max(c, W_next + k Eps). Composes to the level the old tree gives every cell, which
+ *  W = max(c, W_next + k Eps) (with VoxelSolveRandomFill, (c, e) for W = max(c, W_next + e),
+ *  e the descents' sum in metres, as float bits). Composes to the level the old tree gives every cell, which
  *  drains, so the receivers stay valid however the heights moved. */
 VOXEL_FUNC void VoxelSolveTreeFillInitPass(uint Slot, uint NumSlots, float Eps)
 {
@@ -439,14 +613,15 @@ VOXEL_FUNC void VoxelSolveTreeFillInitPass(uint Slot, uint NumSlots, float Eps)
     }
     else if (Next == VOXEL_SOLVE_NONE)
     {
-        JumpX[Slot] = max(H, SolveW[Rec] + Eps);
+        JumpX[Slot] = max(H, SolveW[Rec] + VoxelSolveFillDescentTo(Cell, Rec, Eps));
         JumpY[Slot] = 0u;
         JumpP[Slot] = VOXEL_SOLVE_NONE;
     }
     else
     {
         JumpX[Slot] = H;
-        JumpY[Slot] = 1u;
+        // The descent to the next cell: a count of Eps, or the random fill's metres (as bits).
+        JumpY[Slot] = VoxelSolveRandomFill(Eps) ? asuint(VoxelSolveFillDescentTo(Cell, Rec, Eps)) : 1u;
         JumpP[Slot] = Next;
     }
 }
@@ -462,9 +637,18 @@ VOXEL_FUNC void VoxelSolveTreeFillJumpPass(uint Slot, uint NumSlots, float Eps)
         JumpPOut[Slot] = P;
         return;
     }
-    const uint K = JumpY[Slot];
-    JumpXOut[Slot] = max(JumpX[Slot], JumpX[P] + float(K) * Eps);
-    JumpYOut[Slot] = K + JumpY[P];
+    if (VoxelSolveRandomFill(Eps))
+    {
+        const float E = asfloat(JumpY[Slot]);
+        JumpXOut[Slot] = max(JumpX[Slot], JumpX[P] + E);
+        JumpYOut[Slot] = asuint(E + asfloat(JumpY[P]));
+    }
+    else
+    {
+        const uint K = JumpY[Slot];
+        JumpXOut[Slot] = max(JumpX[Slot], JumpX[P] + float(K) * Eps);
+        JumpYOut[Slot] = K + JumpY[P];
+    }
     JumpPOut[Slot] = JumpP[P];
 }
 
@@ -497,7 +681,7 @@ VOXEL_FUNC void VoxelSolveImplicitInitPass(uint Slot, uint NumSlots)
         JumpP[Slot] = VOXEL_SOLVE_NONE;
         return;
     }
-    const float F = SolveKdt * sqrt(SlotA[Slot]) / max(SlotDist[Slot], 1.0f);
+    const float F = SolveKdt * SlotK[Slot] * sqrt(SlotA[Slot]) / max(SlotDist[Slot], 1.0f);
     const uint Next = SolveSlot[Rec];
     if (Next == VOXEL_SOLVE_NONE)
     {
@@ -538,7 +722,16 @@ VOXEL_FUNC float VoxelSolveImplicitFinishPass(uint Slot, uint NumSlots)
         return 0.0f;
     }
     const uint Cell = SlotCell[Slot];
-    const float H = JumpX[Slot];
+    float H = JumpX[Slot];
+    if (SolveModel == 1u)
+    {
+        // Rivers may cut deeper the more they drain (a cell draining 100 cells the incision,
+        // ten times that at 10,000): they cut through the sills, so basins drain, while the
+        // land between them (a cell's own drainage: a tenth) keeps near its static surface.
+        const float Allow = SolveIncision * sqrt(SlotA[Slot] / (100.0f * SlotArea[Slot]));
+        const float Static = VoxelSolveSetupOf(Cell).Static;
+        H = max(H, Static > 0.0f ? max(Static - Allow, 0.0f) : Static);
+    }
     SolveH[Cell] = H;
     return abs(H - SlotH0[Slot]);
 }
@@ -576,14 +769,21 @@ struct FVoxelSolveRelief
 {
     float Solved;
     float Target;
+    bool bCounted;      // in the histograms: model 1 counts the mountains (the plains' relief
+                        // is their own, not the profile's)
 };
 
 VOXEL_FUNC FVoxelSolveRelief VoxelSolveReliefOf(uint Slot)
 {
     const uint Cell = SlotCell[Slot];
     FVoxelSolveRelief R;
-    R.Solved = max(SolveH[Cell] - JumpX[Slot], 0.0f);
-    R.Target = VoxelSolveSetupOf(Cell).Target;
+    const FVoxelSolveSetup S = VoxelSolveSetupOf(Cell);
+    // Model 1: the mass above the static surface (above the sea where that is under it: the
+    // solve never made the water column); else the relief above the outlet.
+    R.Solved = max(SolveH[Cell] - (SolveModel == 1u ? max(S.Static, 0.0f) : JumpX[Slot]), 0.0f);
+    // Model 1 measures both above the sea where the static surface is under it.
+    R.Target = SolveModel == 1u ? max(BakeHeight[Cell], 0.0f) - max(S.Static, 0.0f) : S.Target;
+    R.bCounted = SolveModel != 1u || S.Mix >= 0.5f;
     return R;
 }
 
@@ -594,6 +794,26 @@ VOXEL_FUNC FVoxelSolveRelief VoxelSolveReliefOf(uint Slot)
 VOXEL_FUNC float VoxelSolveCompressRelief(float R)
 {
     if (R <= SolveReliefKnee) return R;
+    // Model 1: a logarithm above the knee, K + s ln(1 + (R - K) / s), s fitted on the CPU so
+    // the 99.9th percentile lands on the top: slope 1 at the knee, 1 / (1 + (R - K) / s)
+    // above; the few above the top ease within 15% over it. (The easing below flattened all
+    // high ground: slope 1 / (1 + x)^2, equal summits, plateaus.)
+    if (SolveReliefScale > 0.0f)
+    {
+        // ln(1 + y), stable for small y (a large scale: nearly linear, and a plain float log
+        // of 1 + y would step by 1.2e-7 of the scale).
+        const float Y = (R - SolveReliefKnee) / SolveReliefScale;
+        const float U = 1.0f + Y;
+        const float Log1p = U == 1.0f ? Y : log(U) * Y / (U - 1.0f);
+        float Mapped = SolveReliefKnee + SolveReliefScale * Log1p;
+        if (Mapped > SolveReliefTop)
+        {
+            const float Span = 0.15f * max(SolveReliefTop, 1.0f);
+            const float Over = (Mapped - SolveReliefTop) / Span;
+            Mapped = SolveReliefTop + Span * Over / (1.0f + Over);
+        }
+        return Mapped;
+    }
     const float Span = max(SolveReliefTop - SolveReliefKnee, 1.0f);
     const float X = (R - SolveReliefKnee) / Span;
     return SolveReliefKnee + Span * X / (1.0f + X);
@@ -612,8 +832,71 @@ VOXEL_FUNC void VoxelSolveNormalisePass(uint Cell)
         SolveH[Cell] = VoxelSolveSetupOf(Cell).Static;
         return;
     }
+    if (SolveModel == 1u)
+    {
+        // The static surface (the sea where that is under it), the mass above it scaled (by the
+        // mountains' factor, fading to 1 over the range-front ramp: the plains keep their own
+        // relief), the cuts below it as they are. Not monotone along every path where the
+        // static surface changes: VoxelSolveSettlePass follows.
+        const FVoxelSolveSetup S = VoxelSolveSetupOf(Cell);
+        const float Ref = max(S.Static, 0.0f);
+        const float E = SolveH[Cell] - Ref;
+        SolveH[Cell] = Ref + (E > 0.0f ? VoxelSolveCompressRelief(lerp(1.0f, SolveFactor, S.Mix) * E) : E);
+        return;
+    }
     const float Outlet = JumpX[Slot];
     SolveH[Cell] = Outlet + VoxelSolveCompressRelief(SolveFactor * max(SolveH[Cell] - Outlet, 0.0f));
+}
+
+/** Model 1, before the normalisation: whether a solved cell's link to its receiver goes
+ *  uphill already (a basin behind a sill the rivers couldn't cut: a lake), into SlotWOut
+ *  (free until the routing). The settle leaves those alone. */
+VOXEL_FUNC void VoxelSolveSettleMarkPass(uint Slot, uint NumSlots)
+{
+    if (Slot >= NumSlots) return;
+    const uint Cell = SlotCell[Slot];
+    const uint Rec = SolveRec[Cell];
+    SlotWOut[Slot] = Rec != Cell && SolveH[Rec] > SolveH[Cell] ? 1.0f : 0.0f;
+}
+
+/** The settle's tree fill (VoxelSolveTreeFillInitPass, then its jump and finish passes):
+ *  W = max(h, W_r + Eps) along the last step's receivers, except across a link that went
+ *  uphill before the normalisation (marked), where the path stops. */
+VOXEL_FUNC void VoxelSolveSettleInitPass(uint Slot, uint NumSlots, float Eps)
+{
+    if (Slot >= NumSlots) return;
+    const uint Cell = SlotCell[Slot];
+    const uint Rec = SolveRec[Cell];
+    const float H = SolveH[Cell];
+    const uint Next = Rec == Cell ? VOXEL_SOLVE_NONE : SolveSlot[Rec];
+    if (Rec == Cell || SlotWOut[Slot] > 0.5f)
+    {
+        JumpX[Slot] = H;
+        JumpY[Slot] = 0u;
+        JumpP[Slot] = VOXEL_SOLVE_NONE;
+    }
+    else if (Next == VOXEL_SOLVE_NONE)
+    {
+        JumpX[Slot] = max(H, SolveW[Rec] + VoxelSolveFillDescentTo(Cell, Rec, Eps));
+        JumpY[Slot] = 0u;
+        JumpP[Slot] = VOXEL_SOLVE_NONE;
+    }
+    else
+    {
+        JumpX[Slot] = H;
+        JumpY[Slot] = VoxelSolveRandomFill(Eps) ? asuint(VoxelSolveFillDescentTo(Cell, Rec, Eps)) : 1u;
+        JumpP[Slot] = Next;
+    }
+}
+
+/** Model 1, after the normalisation and the settle's tree fill: each solved cell rises to its
+ *  level, at least its receiver's plus Eps, so the scaling (relative to each cell's static
+ *  surface) adds no step uphill along a path (those were lakes no sill made). */
+VOXEL_FUNC void VoxelSolveSettlePass(uint Slot, uint NumSlots)
+{
+    if (Slot >= NumSlots) return;
+    const uint Cell = SlotCell[Slot];
+    SolveH[Cell] = max(SolveH[Cell], SolveW[Cell]);
 }
 
 /** Every cell, once SolveSlot and SlotCell are set for the routing domain: land cells start
@@ -681,16 +964,103 @@ VOXEL_FUNC void VoxelSolveLabelPass(uint Slot, uint NumSlots)
     }
 }
 
-/** The bake's drainage field: log2 of the drainage area (m^2), a cell's own off the land. */
+// --- The drainage field's spread (Design/SurfaceLook.md, T1b) --------------------------------
+//
+// The routing's D8 areas make every cell of a planar slope the head of its own line, so the
+// drainage field (the rivers in the water views, the gullies' steering) shows combs of parallel
+// lines a cell apart on every flank. The field is instead accumulated as Quinn et al. (1991,
+// 1995) do: a hillslope cell (its D8 drainage under SolveSpreadCells cells) spreads its water
+// over all its lower neighbours by slope^1.1 (Freeman 1991), a channel cell sends it all to its
+// receiver. A slope then carries an even sheet, and lines start where the flow converges.
+// The solve, the lakes and the receivers stay D8. After the routing's accumulation, on its
+// receivers and fill:
+//   float SolveSpreadCells;                     0: the field is the D8 areas
+//   SlotAOut                                    the spread areas (m^2; the routing's other area
+//                                               buffer, unused there)
+//   SlotDist                                    a hillslope slot's 1 / its weights' sum (0 a
+//                                               channel; the routing has no use for the
+//                                               receivers' distances)
+
+#define VOXEL_SOLVE_SPREAD_EXPONENT 1.1f
+
+/** Whether a slot spreads (its D8 drainage under SolveSpreadCells of its own cell). */
+VOXEL_FUNC bool VoxelSolveSpreads(uint Slot)
+{
+    return SlotA[Slot] < SolveSpreadCells * SlotArea[Slot];
+}
+
+/** The spread's weight from cell From (its routing level WFrom) to its neighbour To: the drop's
+ *  slope^1.1, 0 unless To is lower. The same expression in both passes, so the fractions sum
+ *  to one exactly as computed. */
+VOXEL_FUNC float VoxelSolveSpreadWeight(uint From, float WFrom, uint To)
+{
+    const float Drop = WFrom - SolveW[To];
+    if (!(Drop > 0.0f)) return 0.0f;
+    const float D = VoxelSolveDistance(VoxelSolveNodeDirection(From), VoxelSolveNodeDirection(To));
+    return pow(Drop / max(D, 1.0f), VOXEL_SOLVE_SPREAD_EXPONENT);
+}
+
+/** Each slot's own area, and a hillslope slot's normalisation (its weights over every lower
+ *  neighbour, the sea's and the outside's included: that water leaves the land). */
+VOXEL_FUNC void VoxelSolveSpreadInitPass(uint Slot, uint NumSlots)
+{
+    if (Slot >= NumSlots) return;
+    const uint Cell = SlotCell[Slot];
+    SlotAOut[Slot] = SlotArea[Slot];
+    float Sum = 0.0f;
+    if (VoxelSolveSpreads(Slot))
+    {
+        const float W = SolveW[Cell];
+        for (uint c = 0u; c < 8u; c++)
+        {
+            const uint N = VoxelSolveNeighbour(Cell, c);
+            if (N != VOXEL_SOLVE_NONE)
+                Sum += VoxelSolveSpreadWeight(Cell, W, N);
+        }
+    }
+    // No lower neighbour (a fixed cell): it keeps its water, as the D8 routing does.
+    SlotDist[Slot] = Sum > 0.0f ? 1.0f / Sum : 0.0f;
+}
+
+/** The spread areas in place, until nothing changes (from the slots' own areas, they only
+ *  grow toward the fixed point on the routing's acyclic fill, in neighbour order). */
+VOXEL_FUNC void VoxelSolveSpreadPass(uint Slot, uint NumSlots)
+{
+    if (Slot >= NumSlots) return;
+    const uint Cell = SlotCell[Slot];
+    float A = SlotArea[Slot];
+    for (uint c = 0u; c < 8u; c++)
+    {
+        const uint N = VoxelSolveNeighbour(Cell, c);
+        if (N == VOXEL_SOLVE_NONE) continue;
+        const uint S = SolveSlot[N];
+        if (S == VOXEL_SOLVE_NONE) continue;
+        const float Norm = SlotDist[S];
+        if (Norm > 0.0f)
+            A += SlotAOut[S] * (VoxelSolveSpreadWeight(N, SolveW[N], Cell) * Norm);
+        else if (SolveRec[N] == Cell)
+            A += SlotAOut[S];
+    }
+    if (A != SlotAOut[Slot])
+    {
+        SlotAOut[Slot] = A;
+        InterlockedOr(SolveFlags[0], 1u);
+    }
+}
+
+/** The bake's drainage field: log2 of the drainage area (m^2; spread, with SolveSpreadCells), a
+ *  cell's own off the land. */
 VOXEL_FUNC float VoxelSolveFlowOf(uint Cell)
 {
     const uint Slot = SolveSlot[Cell];
     // if/else, not ?: (HLSL evaluates both sides, and SlotA[NONE] is out of range).
     float A;
-    if (Slot != VOXEL_SOLVE_NONE)
-        A = SlotA[Slot];
-    else
+    if (Slot == VOXEL_SOLVE_NONE)
         A = VoxelSolveCellArea(Cell);
+    else if (SolveSpreadCells > 0.0f)
+        A = SlotAOut[Slot];
+    else
+        A = SlotA[Slot];
     return log2(max(A, 1.0f));
 }
 

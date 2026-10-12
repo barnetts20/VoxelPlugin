@@ -6,8 +6,8 @@
 // g++ -O2 -std=c++20 -ffp-contract=off -pthread -I<Public> -I<Shaders/Private> solve_harness.cpp
 //
 // solve_harness N Tag: the checks and the full runs at 6 x N^2 (1,000 km planet), images Tag_*.ppm.
-// solve_harness N Tag dump [RadiusM]: one GPU-sequence run, its fields written to Tag_*.f32 (the
-// gully harness's input, Tools/LandGullyHarness).
+// solve_harness N Tag dump [RadiusM] [l2]: one GPU-sequence run with the engine's T1 model (l2:
+// the L2 model), its fields written to Tag_*.f32 (the gully harness's input, Tools/LandGullyHarness).
 #include "VoxelShaderCompat.h"
 #include <cstdio>
 #include <cstdlib>
@@ -65,6 +65,10 @@ namespace VoxelShader
         uint* SolveFlags = nullptr;
         float SolveFactor = 1.0f, SolveReliefKnee = 1.0e9f, SolveReliefTop = 1.0e9f;
         float SolveMinLakeDepth = 10.0f, SolveMinLakeArea = 20.0e6f;
+        float SolveJitter = 0.0f, SolveRouteNoise = 0.0f, SolveSpreadCells = 0.0f, SolveUndulation = 0.0f, SolveUpliftVariation = 0.0f, SolveErodibilityVariation = 0.0f, SolveVariationWavelength = 1.2e5f, SolveRoughness = 0.0f, SolveReliefScale = 0.0f;
+        uint SolveFillDepressions = 1u, SolveModel = 0u;
+        float SolvePlainsRelief = 0.0f, SolveIncision = 0.0f;
+        float* SlotK = nullptr;
         uint* LakeArea = nullptr; uint* LakeDepth = nullptr; uint* LakeOutlet = nullptr;
         uint* LakeCount = nullptr; uint* LakeList = nullptr;
         uint SolveMaxLakes = 65536;
@@ -176,7 +180,7 @@ static void BakePlates(FPlateBake& B, uint32_t Seed, int K, float LandFraction, 
 /** The solve's buffers, owned. */
 struct FSolveBuffers
 {
-    std::vector<float> H, W, Water, U, Area, Dist, H0, A, AOut, WOut, X, XOut;
+    std::vector<float> H, W, Water, U, K, Area, Dist, H0, A, AOut, WOut, X, XOut;
     std::vector<uint> Rec, Slot, Label, Cell, Y, YOut, P, POut, Flags, LArea, LDepth, LOutlet, LCount, LList, OAttr;
     std::vector<float> OHeight, OFlow, OWater;
 
@@ -185,12 +189,12 @@ struct FSolveBuffers
         auto Fz = [](std::vector<float>& V, int n) { V.assign(n, 0.f); };
         auto Uz = [](std::vector<uint>& V, int n) { V.assign(n, 0u); };
         Fz(H, Cells); Fz(W, Cells); Fz(Water, Cells); Uz(Rec, Cells); Uz(Slot, Cells); Uz(Label, Cells);
-        for (auto* V : { &U, &Area, &Dist, &H0, &A, &AOut, &WOut, &X, &XOut, &OHeight, &OFlow, &OWater }) Fz(*V, Cells);
+        for (auto* V : { &U, &K, &Area, &Dist, &H0, &A, &AOut, &WOut, &X, &XOut, &OHeight, &OFlow, &OWater }) Fz(*V, Cells);
         for (auto* V : { &Cell, &Y, &YOut, &P, &POut, &LArea, &LDepth, &LOutlet, &OAttr }) Uz(*V, Cells);
         Uz(Flags, 4); Uz(LCount, 1); Uz(LList, 65536 * 4);
         S.SolveH = H.data(); S.SolveW = W.data(); S.SolveWater = Water.data();
         S.SolveRec = Rec.data(); S.SolveSlot = Slot.data(); S.SolveLabel = Label.data();
-        S.SlotCell = Cell.data(); S.SlotU = U.data(); S.SlotArea = Area.data(); S.SlotDist = Dist.data(); S.SlotH0 = H0.data();
+        S.SlotCell = Cell.data(); S.SlotU = U.data(); S.SlotK = K.data(); S.SlotArea = Area.data(); S.SlotDist = Dist.data(); S.SlotH0 = H0.data();
         S.SlotA = A.data(); S.SlotAOut = AOut.data(); S.SlotWOut = WOut.data();
         S.JumpX = X.data(); S.JumpXOut = XOut.data(); S.JumpY = Y.data(); S.JumpYOut = YOut.data(); S.JumpP = P.data(); S.JumpPOut = POut.data();
         S.SolveFlags = Flags.data();
@@ -198,6 +202,59 @@ struct FSolveBuffers
         S.OutHeight = OHeight.data(); S.OutFlow = OFlow.data(); S.OutWater = OWater.data(); S.OutAttr = OAttr.data();
     }
 };
+
+/** The T1 model's settings (the engine's defaults, VoxelLandSolve.h FSettings). */
+static void ApplyT1(FSolve& S)
+{
+    S.SolveModel = 1u;
+    S.SolveJitter = 0.4f;
+    S.SolveUpliftVariation = 0.8f;
+    S.SolveErodibilityVariation = 0.7f;
+    S.SolveVariationWavelength = 9.0e4f;
+    S.SolveRoughness = 150.0f;
+    S.SolvePlainsRelief = 100.0f;
+    S.SolveIncision = 150.0f;
+    S.SolveRouteNoise = 1.0f;
+    S.SolveSpreadCells = 16.0f;
+    S.SolveUndulation = 60.0f;
+}
+
+/** The drainage field's spread computed sequentially, donors before receivers (the routing
+ *  fill's levels, highest first), against the in-place passes' fixed point: the largest
+ *  relative difference (only the sums' order differs). */
+static double SpreadReference(FSolve& S, uint L)
+{
+    std::vector<uint> Order(L);
+    for (uint s = 0; s < L; s++) Order[s] = s;
+    std::stable_sort(Order.begin(), Order.end(), [&](uint a, uint b) { return S.SolveW[S.SlotCell[a]] > S.SolveW[S.SlotCell[b]]; });
+    std::vector<double> A(L);
+    for (uint s = 0; s < L; s++) A[s] = S.SlotArea[s];
+    for (const uint s : Order)
+    {
+        const uint Cell = S.SlotCell[s];
+        const float Norm = S.SlotDist[s];
+        if (Norm > 0.0f)
+        {
+            for (uint c = 0; c < 8; c++)
+            {
+                const uint N = S.VoxelSolveNeighbour(Cell, c);
+                if (N == VOXEL_SOLVE_NONE) continue;
+                const uint T = S.SolveSlot[N];
+                if (T == VOXEL_SOLVE_NONE) continue;
+                const float W = S.VoxelSolveSpreadWeight(Cell, S.SolveW[Cell], N);
+                if (W > 0.0f) A[T] += A[s] * (double)(W * Norm);
+            }
+        }
+        else
+        {
+            const uint R = S.SolveRec[Cell];
+            if (R != Cell && S.SolveSlot[R] != VOXEL_SOLVE_NONE) A[S.SolveSlot[R]] += A[s];
+        }
+    }
+    double Worst = 0.0;
+    for (uint s = 0; s < L; s++) Worst = std::max(Worst, std::abs(A[s] - (double)S.SlotAOut[s]) / std::max(A[s], 1.0));
+    return Worst;
+}
 
 static void SwapJump(FSolve& S) { std::swap(S.JumpX, S.JumpXOut); std::swap(S.JumpY, S.JumpYOut); std::swap(S.JumpP, S.JumpPOut); }
 
@@ -256,6 +313,36 @@ static float Percentile(std::vector<float> V, double Q)
 // --- Sequential reference (the prototype) --------------------------------------------------
 
 /** Priority flood with Eps from every fixed cell (Barnes 2014): the least draining surface. */
+/** The least fill with the random descents (T1b, VoxelSolveFillDescent): Dijkstra from the
+ *  fixed cells, W_i = max(h_i, W_n + the descent into i from n), with the shader's own
+ *  arithmetic, so the in-place fill's fixed point should match it exactly. */
+static void ReferenceRandomFill(FSolve& S, uint NumSlots, float Eps)
+{
+    const uint Cells = S.VoxelSolveNumCells();
+    typedef std::pair<float, uint> E;
+    std::priority_queue<E, std::vector<E>, std::greater<E>> Q;
+    for (uint s = 0; s < NumSlots; s++) S.SolveW[S.SlotCell[s]] = VOXEL_SOLVE_INF;
+    for (uint c = 0; c < Cells; c++)
+        if (S.VoxelSolveIsInterior(S.VoxelSolveDecode(c)) && S.SolveSlot[c] == VOXEL_SOLVE_NONE) Q.push(E(S.SolveW[c], c));
+    while (!Q.empty())
+    {
+        const E Top = Q.top(); Q.pop();
+        if (Top.first > S.SolveW[Top.second]) continue;
+        for (uint k = 0; k < 8; k++)
+        {
+            const uint M = S.VoxelSolveNeighbour(Top.second, k);
+            if (M == VOXEL_SOLVE_NONE || S.SolveSlot[M] == VOXEL_SOLVE_NONE) continue;
+            // The descent into M from Top: M's neighbour index of Top.
+            const float Factor = S.VoxelSolveFillFactor(M, Eps);
+            float Descent = Factor;
+            for (uint q = 0; q < 8; q++)
+                if (S.VoxelSolveNeighbour(M, q) == Top.second) { Descent = S.VoxelSolveFillDescent(Factor, q); break; }
+            const float Candidate = std::max(S.SolveH[M], Top.first + Descent);
+            if (Candidate < S.SolveW[M]) { S.SolveW[M] = Candidate; Q.push(E(Candidate, M)); }
+        }
+    }
+}
+
 static void ReferenceFill(FSolve& S, uint NumSlots, float Eps)
 {
     const uint Cells = S.VoxelSolveNumCells();
@@ -307,7 +394,7 @@ static double ReferenceImplicit(FSolve& S, uint NumSlots, const std::vector<uint
         if (r == c) Hn = Raised;
         else
         {
-            const float F = S.SolveKdt * std::sqrt(S.SlotA[s]) / std::max(S.SlotDist[s], 1.0f);
+            const float F = S.SolveKdt * S.SlotK[s] * std::sqrt(S.SlotA[s]) / std::max(S.SlotDist[s], 1.0f);
             const float Hr = S.SolveSlot[r] == VOXEL_SOLVE_NONE ? S.SolveW[r] : S.SolveH[r];
             Hn = (Raised + F * Hr) / (1.0f + F);
         }
@@ -380,8 +467,9 @@ static FRunResult Run(FSolve& S, const FRunOptions& O, bool bLog)
     // Outlets, the normalisation.
     ParallelFor(M, [&](int s) { S.VoxelSolveOutletInitPass(s, M); });
     for (int r = 0; r < O.R; r++) { ParallelFor(M, [&](int s) { S.VoxelSolveOutletJumpPass(s, M); }); SwapJump(S); }
-    std::vector<float> Solved(M), Target(M);
-    for (uint s = 0; s < M; s++) { const auto R = S.VoxelSolveReliefOf(s); Solved[s] = R.Solved; Target[s] = R.Target; }
+    std::vector<float> Solved, Target;
+    Solved.clear(); Target.clear();
+    for (uint s = 0; s < M; s++) { const auto R = S.VoxelSolveReliefOf(s); if (!R.bCounted) continue; Solved.push_back(R.Solved); Target.push_back(R.Target); }
     if (bLog)
     {
         for (double q : { 0.5, 0.75, 0.9, 0.95, 0.99, 0.999, 1.0 })
@@ -392,8 +480,33 @@ static FRunResult Run(FSolve& S, const FRunOptions& O, bool bLog)
     S.SolveFactor = std::clamp(Res.P90Target / std::max(Res.P90Solved, 1.0f), 0.01f, 100.0f);
     S.SolveReliefKnee = Res.P90Target;
     S.SolveReliefTop = std::max(1.3f * Percentile(Target, 0.999), 1.2f * Res.P90Target);
+    if (S.SolveModel == 1u)
+    {
+        // As VoxelLandSolve.cpp: the top, and the logarithm's scale that puts the solved 99.9th percentile on it.
+        S.SolveReliefTop = std::max(1.2f * Percentile(Target, 0.999), 1.2f * Res.P90Target);
+        const double D = S.SolveFactor * Percentile(Solved, 0.999) - S.SolveReliefKnee;
+        const double Want = S.SolveReliefTop - S.SolveReliefKnee;
+        double Sc = 1.0e9;
+        if (D > Want && Want > 0.0)
+        {
+            double Lo = 1.0e-3 * Want, Hi = 1.0e3 * std::max(D, 1.0);
+            for (int i = 0; i < 80; i++) { const double Mid = std::sqrt(Lo * Hi); (Mid * std::log(1.0 + D / Mid) > Want ? Hi : Lo) = Mid; }
+            Sc = std::sqrt(Lo * Hi);
+        }
+        S.SolveReliefScale = (float)Sc;
+    }
     Res.Factor = S.SolveFactor;
+    if (S.SolveModel == 1u)
+        ParallelFor(M, [&](int s) { S.VoxelSolveSettleMarkPass(s, M); });
     ParallelFor(Cells, [&](int c) { S.VoxelSolveNormalisePass(c); });
+    if (S.SolveModel == 1u)
+    {
+        // As the GPU job: the settle's tree fill along the last step's receivers, then the settle.
+        ParallelFor(M, [&](int s) { S.VoxelSolveSettleInitPass(s, M, S.SolveEps); });
+        for (int r = 0; r < O.R; r++) { ParallelFor(M, [&](int s) { S.VoxelSolveTreeFillJumpPass(s, M, S.SolveEps); }); SwapJump(S); }
+        ParallelFor(M, [&](int s) { S.VoxelSolveTreeFillFinishPass(s, M); });
+        ParallelFor(M, [&](int s) { S.VoxelSolveSettlePass(s, M); });
+    }
     // Routing.
     const uint L = Compact(S, 1);
     Res.Land = L;
@@ -403,6 +516,12 @@ static FRunResult Run(FSolve& S, const FRunOptions& O, bool bLog)
     const int It1 = UntilConverged(S, [&]() { for (uint s = 0; s < L; s++) S.VoxelSolveFillInPlacePass(s, L, S.SolveEps); }, 100000);
     ParallelFor(L, [&](int s) { S.VoxelSolveReceiversPass(s, L, false); });
     const int It2 = UntilConverged(S, [&]() { for (uint s = 0; s < L; s++) S.VoxelSolveAccumulateInPlacePass(s, L); }, 100000);
+    int ItSpread = 0;
+    if (S.SolveSpreadCells > 0.0f)
+    {
+        ParallelFor(L, [&](int s) { S.VoxelSolveSpreadInitPass(s, L); });
+        ItSpread = UntilConverged(S, [&]() { for (uint s = 0; s < L; s++) S.VoxelSolveSpreadPass(s, L); }, 100000);
+    }
     ParallelFor(L, [&](int s) { S.VoxelSolveLabelInitPass(s, L); });
     const int It3 = UntilConverged(S, [&]() { for (uint s = 0; s < L; s++) S.VoxelSolveLabelPass(s, L); }, 100000);
     for (uint c = 0; c < Cells; c++) { S.LakeArea[c] = 0; S.LakeDepth[c] = 0; S.LakeOutlet[c] = VOXEL_SOLVE_NONE; }
@@ -413,7 +532,7 @@ static FRunResult Run(FSolve& S, const FRunOptions& O, bool bLog)
     Res.Lakes = (int)S.LakeCount[0];
     Res.Errors = S.SolveFlags[1];
     Res.Seconds = Now() - T0;
-    if (bLog) printf("  routing sweeps: lakes fill %d, fill %d, accumulation %d, labels %d\n", It0, It1, It2, It3);
+    if (bLog) printf("  routing sweeps: lakes fill %d, fill %d, accumulation %d, spread %d, labels %d\n", It0, It1, It2, ItSpread, It3);
     return Res;
 }
 
@@ -453,6 +572,8 @@ int main(int argc, char** argv)
         FRunOptions O;
         O.bReference = false;
         Buf.Bind(S, Cells);
+        if (!(argc > 5 && std::string(argv[5]) == "l2"))
+            ApplyT1(S);
         const FRunResult R = Run(S, O, true);
         printf("  %zu steps, final residual %.4f, %.1f s; factor %.3f; %d lakes\n", R.Residuals.size(), R.Residuals.back(), R.Seconds, R.Factor, R.Lakes);
         auto Dump = [&](const std::string& Name, const void* Data, size_t Bytes) { FILE* F = fopen(Name.c_str(), "wb"); fwrite(Data, 1, Bytes, F); fclose(F); };
@@ -539,6 +660,30 @@ int main(int argc, char** argv)
         for (uint s = 0; s < M; s++) MaxImp = std::max(MaxImp, (double)std::fabs(Hjump[S.SlotCell[s]] - Buf.H[S.SlotCell[s]]));
         printf("implicit update by pointer jumping against the sequential one: max |diff| %.3g m (errors 0x%x)\n", MaxImp, S.SolveFlags[1]);
     }
+    // 2b. The same with the random fill (T1b): the in-place fill against its Dijkstra, every
+    // cell draining to its receiver, and the tree fill's float records reproducing the fill.
+    {
+        S.SolveRouteNoise = 1.0f;
+        const uint M = Compact(S, 0);
+        for (uint c = 0; c < Cells; c++) S.VoxelSolveInitPass(c);
+        S.SolveFlags[1] = 0;
+        const int Sweeps = UntilConverged(S, [&]() { for (uint s = 0; s < M; s++) S.VoxelSolveFillInPlacePass(s, M, S.SolveEps); }, 100000);
+        std::vector<float> Wpd = Buf.W;
+        ReferenceRandomFill(S, M, S.SolveEps);
+        double MaxFill = 0;
+        for (uint s = 0; s < M; s++) MaxFill = std::max(MaxFill, (double)std::fabs(Wpd[S.SlotCell[s]] - Buf.W[S.SlotCell[s]]));
+        ParallelFor(M, [&](int s) { S.VoxelSolveReceiversPass(s, M, true); });
+        uint Undrained = 0;
+        for (uint s = 0; s < M; s++) { const uint c = S.SlotCell[s], r = S.SolveRec[c]; Undrained += (r == c || !(Buf.W[r] < Buf.W[c])) ? 1u : 0u; }
+        ParallelFor(M, [&](int s) { S.VoxelSolveTreeFillInitPass(s, M, S.SolveEps); });
+        for (int r = 0; r < 20; r++) { ParallelFor(M, [&](int s) { S.VoxelSolveTreeFillJumpPass(s, M, S.SolveEps); }); SwapJump(S); }
+        ParallelFor(M, [&](int s) { S.VoxelSolveTreeFillFinishPass(s, M); });
+        double MaxTree = 0;
+        for (uint s = 0; s < M; s++) MaxTree = std::max(MaxTree, (double)std::fabs(Buf.W[S.SlotCell[s]] - Buf.H[S.SlotCell[s]]));
+        printf("random fill (T1b): %d sweeps, against its Dijkstra max |diff| %.3g m; %u cells without a lower receiver; tree fill max |W - h| %.3g m (errors 0x%x)\n",
+            Sweeps, MaxFill, Undrained, MaxTree, S.SolveFlags[1]);
+        S.SolveRouteNoise = 0.0f;
+    }
 
     // 3. Full runs: the GPU's sequence and the reference.
     auto Image = [&](const char* Name, int Mode) {
@@ -601,6 +746,36 @@ int main(int argc, char** argv)
             Image((Tag + (Pass == 0 ? "_gpu.ppm" : "_ref.ppm")).c_str(), 0);
             Image((Tag + (Pass == 0 ? "_gpu_rivers.ppm" : "_ref_rivers.ppm")).c_str(), 1);
         }
+    }
+    // The T1 model (the engine's): two runs, bit-identical; the pass checks above are L2's
+    // model, which the sequential reference implements.
+    {
+        ApplyT1(S);
+        std::vector<float> First, FirstFlow;
+        for (int Pass = 0; Pass < 2; Pass++)
+        {
+            Buf.Bind(S, Cells);
+            O.bReference = false;
+            const FRunResult R = Run(S, O, false);
+            printf("T1 run %d: %zu steps, final residual %.4f, %.1f s; %u solved cells, %u land cells; factor %.3f, log scale %.0f m; %d lakes kept; errors 0x%x\n",
+                Pass + 1, R.Residuals.size(), R.Residuals.back(), R.Seconds, R.Moving, R.Land, R.Factor, S.SolveReliefScale, R.Lakes, R.Errors);
+            if (Pass == 0)
+            {
+                First = Buf.OHeight;
+                FirstFlow = Buf.OFlow;
+                Image((Tag + "_t1.ppm").c_str(), 0);
+                Image((Tag + "_t1_rivers.ppm").c_str(), 1);
+                printf("  drainage spread against the sequential order: largest relative difference %.2g\n", SpreadReference(S, R.Land));
+            }
+            else
+            {
+                printf("  bit-identical to the first T1 run: heights %s, drainage %s\n",
+                    std::memcmp(First.data(), Buf.OHeight.data(), First.size() * 4) == 0 ? "yes" : "NO",
+                    std::memcmp(FirstFlow.data(), Buf.OFlow.data(), FirstFlow.size() * 4) == 0 ? "yes" : "NO");
+            }
+        }
+        S.SolveModel = 0u; S.SolveJitter = 0.0f; S.SolveUpliftVariation = 0.0f; S.SolveErodibilityVariation = 0.0f; S.SolveRoughness = 0.0f;
+        S.SolvePlainsRelief = 0.0f; S.SolveIncision = 0.0f; S.SolveReliefScale = 0.0f; S.SolveRouteNoise = 0.0f; S.SolveSpreadCells = 0.0f; S.SolveUndulation = 0.0f;
     }
     // The plates alone, for comparison.
     for (uint c = 0; c < Cells; c++) Buf.OHeight[c] = B.Height[c];
