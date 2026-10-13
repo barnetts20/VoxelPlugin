@@ -1,6 +1,7 @@
 // Copyright Epic Games, Inc. All Rights Reserved.
 
 #include "VoxelPlugin.h"
+#include "VoxelLandBake.h"
 #include "Interfaces/IPluginManager.h"
 #include "Misc/Paths.h"
 #include "ShaderCore.h"
@@ -11,6 +12,10 @@ DEFINE_LOG_CATEGORY(LogVoxelPlugin);
 
 void FVoxelPluginModule::StartupModule()
 {
+	// Where the authored noise sets are (found here, on the game thread, for the workers that
+	// read them).
+	VoxelLand::NoiseSetDirectory();
+
 	// The module loads at PostConfigInit (VoxelPlugin.uplugin) so its global shaders register
 	// before the engine compiles them. Map /Plugin/VoxelPlugin to the plugin's Shaders folder
 	// unless the engine already mapped it.
@@ -24,8 +29,8 @@ void FVoxelPluginModule::StartupModule()
 
 void FVoxelPluginModule::ShutdownModule()
 {
-	// This function may be called during shutdown to clean up your module.  For modules that support dynamic reloading,
-	// we call this function before unloading the module.
+	// The peaks' shared noise sets (VoxelLandBake.cpp), if the engine's pre-exit didn't drop them.
+	VoxelLand::ReleasePeakNoise();
 }
 
 #undef LOCTEXT_NAMESPACE

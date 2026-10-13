@@ -12,14 +12,16 @@ namespace VoxelShader
 #include "VoxelCubeSphere.ush"
 
     /** The land bake's sampler on the CPU: VoxelLandSample.ush and VoxelLandGully.ush (with
-     *  VoxelLandHills.ush) with the shader's buffers and constants as members (the GPU runs the
-     *  same code). */
+     *  VoxelLandHills.ush, VoxelLandNoise.ush and VoxelLandPeaks.ush) with the shader's buffers
+     *  and constants as members (the GPU runs the same code). */
     struct FVoxelLandSamplerCPU
     {
         const float* LandHeight = nullptr;
         const float2* LandTanTable = nullptr;
         const uint* LandFlow = nullptr;
         const uint* LandForm = nullptr;
+        const uint* LandRelief = nullptr;
+        const uint* LandNoise = nullptr;
         uint LandN = 1;
         uint LandPad = 0;
         uint LandHasFlow = 0;
@@ -34,6 +36,14 @@ namespace VoxelShader
         float2 LandHillFrequency = float2(0.0f, 0.0f);
         uint LandHillOctaves = 0;
         uint LandHillSeed = 0;
+        float LandPeakStrength = 0.0f;
+        uint LandPeakOctaves = 0;
+        uint LandPeakSeed = 0;
+        uint LandNoiseN = 0;
+        uint LandNoiseMips = 0;
+        uint LandNoiseCellShift = 0;
+        float LandPeakMeanShape = 0.0f;
+        float LandPeakMeanG = 0.0f;
 
 #include "VoxelLandSample.ush"
 #include "VoxelLandGully.ush"
@@ -48,6 +58,7 @@ namespace
     constexpr uint32 SaltLandWarp = 0x11u;   // + component
     constexpr uint32 SaltLandGully = 0x21u;
     constexpr uint32 SaltLandHill = 0x31u;
+    constexpr uint32 SaltLandPeak = 0x41u;
 
     /** The sampling warp of the land bake: three octaves of fBm per component, its longest
      *  wavelength six bake cells. */
@@ -179,6 +190,24 @@ FVoxelDensityCPU::FVoxelDensityCPU(const FVoxelTerrestrialSettings& InLand, TSha
         LandFormPacked.SetNumUninitialized(LandBake->NumCells() / 2);
         for (int32 i = 0; i < LandFormPacked.Num(); i++)
             LandFormPacked[i] = (uint32)LandBake->Form[2 * i] | ((uint32)LandBake->Form[2 * i + 1] << 16);
+    }
+
+    // The peaks (VoxelLandPeaks.ush), on the local relief, with the shared noise set.
+    LandPeakOctaves = (uint32)VoxelLand::PeakOctavesFor(InLand, *LandBake);
+    LandPeakStrength = (float)FMath::Max(InLand.PeakStrength, 0.0);
+    LandPeakSeed = VoxelShader::VoxelHashSeed(Seed, SaltLandPeak);
+    if (LandBake->Relief.Num() == LandBake->NumCells())
+    {
+        LandReliefPacked.SetNumZeroed((LandBake->Relief.Num() + 3) / 4);
+        for (int32 i = 0; i < LandBake->Relief.Num(); i++)
+            LandReliefPacked[i >> 2] |= (uint32)LandBake->Relief[i] << ((i & 3) * 8);
+    }
+    if (LandPeakOctaves > 0 && LandFormPacked.Num() > 0 && LandReliefPacked.Num() > 0)
+        LandNoise = VoxelLand::GetPeakNoise(VoxelLand::PeakNoiseNameFor(InLand));
+    if (!LandNoise.IsValid())
+    {
+        LandPeakOctaves = 0;
+        LandPeakStrength = 0.0f;
     }
 }
 
@@ -341,11 +370,25 @@ double FVoxelDensityCPU::LandHeightAt(const FVector& SurfacePoint, double Footpr
     Sampler.LandTanTable = reinterpret_cast<const float2*>(LandBake->TanTable.GetData());
     Sampler.LandFlow = LandFlowPacked.GetData();
     Sampler.LandForm = LandFormPacked.GetData();
-    Sampler.LandHasForm = LandFormPacked.Num() > 0 ? 1u : 0u;
+    // The landform with the local relief (the GPU's LandHasForm the same).
+    Sampler.LandHasForm = LandFormPacked.Num() > 0 && LandReliefPacked.Num() > 0 ? 1u : 0u;
     Sampler.LandHillRelief = LandHillRelief;
     Sampler.LandHillFrequency = ToDoubleFloat(LandHillFrequency);
     Sampler.LandHillOctaves = LandHillOctaves;
     Sampler.LandHillSeed = LandHillSeed;
+    Sampler.LandRelief = LandReliefPacked.GetData();
+    if (LandNoise.IsValid())
+    {
+        Sampler.LandNoise = LandNoise->Words.GetData();
+        Sampler.LandNoiseN = LandNoise->N;
+        Sampler.LandNoiseMips = LandNoise->Mips;
+        Sampler.LandNoiseCellShift = LandNoise->CellShift;
+        Sampler.LandPeakMeanShape = LandNoise->MeanShape;
+        Sampler.LandPeakMeanG = LandNoise->MeanG;
+        Sampler.LandPeakStrength = LandPeakStrength;
+        Sampler.LandPeakOctaves = LandPeakOctaves;
+        Sampler.LandPeakSeed = LandPeakSeed;
+    }
     Sampler.LandN = (uint32)LandBake->N;
     Sampler.LandPad = (uint32)FVoxelLandBake::Pad;
     Sampler.LandHasFlow = LandFlowPacked.Num() > 0 ? 1u : 0u;
@@ -365,7 +408,7 @@ double FVoxelDensityCPU::LandHeightAt(const FVector& SurfacePoint, double Footpr
     const float DetailWeight = lerp(0.25f, 1.0f, smoothstep(-50.0f, 50.0f, Land.Bake));
     const double D = EvaluateLayer(Detail, SurfacePoint, Footprint);
     const double Height = (double)Land.Bake * 100.0 + LandHeightOffset + D * (double)((float)LandDetailAmplitude * DetailWeight * Land.DetailScale)
-        + (double)Land.Hills * 100.0 + (double)Land.Gully * 100.0;
+        + (double)Land.Hills * 100.0 + (double)Land.Peaks * 100.0 + (double)Land.Gully * 100.0;
     return FMath::Clamp(Height, 0.0, NoiseAmplitude);
 }
 
@@ -459,6 +502,10 @@ void FVoxelDensityCPU::BuildGPUData(FVoxelDensityGPUData& Out) const
         Out.LandHillFrequency = VoxelDoubleFloat(LandHillFrequency);
         Out.LandHillOctaves = LandHillOctaves;
         Out.LandHillSeed = LandHillSeed;
+        Out.LandNoise = LandNoise;
+        Out.LandPeakStrength = LandPeakStrength;
+        Out.LandPeakOctaves = LandPeakOctaves;
+        Out.LandPeakSeed = LandPeakSeed;
     }
 
     // The GPU converts lattice coordinates to int32 before wrapping; the CPU wraps through

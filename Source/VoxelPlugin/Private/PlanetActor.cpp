@@ -216,11 +216,22 @@ bool APlanetActor::TickLandBake()
 {
     const double SeaRadius = GetActorScale3D().GetMax();
     const uint32 Key = VoxelLand::BakeKey(TerrestrialSettings, SeaRadius);
+    // The peaks' shared noise set: the density takes it when it is built, so it is read or
+    // generated in the background first (the game thread never waits for it), and held here
+    // from then on (it can't go before the density takes it).
+    auto NoiseReady = [this]()
+    {
+        if (TerrestrialSettings.PeakStrength <= 0.0) return true;
+        const FString Name = VoxelLand::PeakNoiseNameFor(TerrestrialSettings);
+        if (VoxelLand::TryGetPeakNoise(Name, PeakNoise)) return true;
+        VoxelLand::PrewarmPeakNoise(Name);
+        return false;
+    };
     if (LandBake.IsValid() && LandBake->Key == Key && LandBake->N == VoxelLand::BakeResolutionFor(TerrestrialSettings))
     {
         // Only the per-sample settings changed: the bake is reused.
         LandBaker.Reset();
-        return true;
+        return NoiseReady();
     }
     if (!LandBaker.IsValid() || LandBaker->GetKey() != Key)
         LandBaker = MakeShared<FVoxelLandBaker>(TerrestrialSettings, SeaRadius);
@@ -229,7 +240,7 @@ bool APlanetActor::TickLandBake()
         return false;
     LandBake = LandBaker->GetResult();
     LandBaker.Reset();
-    return LandBake.IsValid();
+    return LandBake.IsValid() && NoiseReady();
 }
 
 float APlanetActor::GetBakeProgress() const
@@ -276,6 +287,7 @@ void APlanetActor::Initialize()
         // The noise surface needs no bake: release one a terrestrial build left.
         LandBake.Reset();
         LandBaker.Reset();
+        PeakNoise.Reset();
     }
     double PlanetRadius = 0.0;
     double NoiseAmplitude = 0.0;

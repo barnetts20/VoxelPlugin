@@ -25,6 +25,7 @@
 class APlanetGravityZone;
 class FVoxelLandBaker;
 struct FVoxelLandBake;
+struct FVoxelLandNoiseSet;
 
 /** Top-level planet actor that spawns and coordinates terrain, ocean, and
  *  gravity child actors. The atmosphere is not attached while mesh generation is
@@ -229,6 +230,10 @@ private:
     /** The terrestrial bake the planet is built with: kept while a new one is made, so the
      *  planet shows the old surface until then. */
     TSharedPtr<const FVoxelLandBake, ESPMode::ThreadSafe> LandBake;
+
+    /** The peaks' noise set for the current settings, once ready (TickLandBake): held so it is
+     *  there when the density takes it (VoxelLand::TryGetPeakNoise). */
+    TSharedPtr<const FVoxelLandNoiseSet, ESPMode::ThreadSafe> PeakNoise;
 
     /** Terrestrial: advances the bake for the current settings and radius; true once LandBake
      *  is it. */

@@ -31,7 +31,9 @@
 #define VOXEL_LAND_VIEW_TERRAIN_WATER 13u   // elevation with the lakes and rivers over it (eroded bakes)
 #define VOXEL_LAND_VIEW_LANDFORM 14u   // the landform field: hilliness, by character (T2)
 #define VOXEL_LAND_VIEW_HILLS 15u      // the hills layer over HillRelief (T2)
-#define VOXEL_LAND_VIEW_COUNT 16u      // at most 16: the material packs the view in 4 bits
+#define VOXEL_LAND_VIEW_PEAKS 16u      // the peaks layer, signed, over its amplitude (T3)
+#define VOXEL_LAND_VIEW_PEAK_AREA 17u  // the peaks' amplitude: where they rise and how high (T3)
+#define VOXEL_LAND_VIEW_COUNT 18u      // at most 32: the material packs the view in 5 bits
 
 VOXEL_FUNC float3 VoxelLandViewRgb(float R, float G, float B)
 {
@@ -216,6 +218,12 @@ VOXEL_FUNC float3 VoxelLandViewHills(float X)
     if (X < 0.5f) return VoxelLandViewMix(VoxelLandViewRgb(250.0f, 250.0f, 245.0f), VoxelLandViewRgb(130.0f, 190.0f, 100.0f), X / 0.5f);
     if (X < 1.0f) return VoxelLandViewMix(VoxelLandViewRgb(130.0f, 190.0f, 100.0f), VoxelLandViewRgb(150.0f, 110.0f, 60.0f), (X - 0.5f) / 0.5f);
     return VoxelLandViewMix(VoxelLandViewRgb(150.0f, 110.0f, 60.0f), VoxelLandViewRgb(90.0f, 50.0f, 30.0f), (X - 1.0f) / 0.5f);
+}
+
+/** The peaks' amplitude (m): white none, through green and brown, dark at 1.5 km. */
+VOXEL_FUNC float3 VoxelLandViewPeakArea(float AmplitudeM)
+{
+    return VoxelLandViewHills(AmplitudeM * (1.0f / 1000.0f));
 }
 
 /** A cube face (VoxelCubeSphere.ush order: +X, -X, +Y, -Y, +Z, -Z). */

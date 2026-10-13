@@ -227,6 +227,24 @@ struct VOXELPLUGIN_API FVoxelTerrestrialSettings
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrestrial|Sample", meta = (ClampMin = "5.0", UIMin = "10", UIMax = "1000"))
     double HillFinestWavelength = 25.0;
 
+    /** Peaks on the bake's mountains (Design/SurfaceLook.md T3): summits, arêtes and faces below
+     *  the bake's resolution, their height this fraction of the local relief (the height range
+     *  within about two bake cells), on crests and upper slopes. Sharp pyramids where the
+     *  landform's character is rough, rounded domes where it is smooth. 0 turns them off. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrestrial|Sample", meta = (ClampMin = "0.0", UIMax = "1.0"))
+    double PeakStrength = 0.25;
+
+    /** The peaks' finest wavelength (m): octaves from two bake cells down to it. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrestrial|Sample", meta = (ClampMin = "20.0", UIMin = "100", UIMax = "5000"))
+    double PeakFinestWavelength = 1000.0;
+
+    /** The packed noise set the peaks are drawn from: a file name in the plugin's NoiseSets
+     *  folder without .vxnt (e.g. peaks_b), or empty to pick one of the folder's peaks* sets by
+     *  the seed. Without any (or if it can't be read: the log says why) the plugin's own
+     *  generated set. A different set gives different summits. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrestrial|Sample")
+    FString PeakNoiseSet;
+
     /** Hash of the settings that change the bake (with the radius and the generator version,
      *  the cache key). */
     uint32 GetBakeHash() const;

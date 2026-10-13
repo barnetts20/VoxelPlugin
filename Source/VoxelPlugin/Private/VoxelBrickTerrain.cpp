@@ -64,7 +64,9 @@ TAutoConsoleVariable<int32> CVarVoxelDebugLandView(
     TEXT(" 13: elevation with the lakes and rivers over it\n")
     TEXT(" 14: the landform (flat plains straw, rolling ground green, hill country dark green to brown by roughness)\n")
     TEXT(" 15: the hills layer (white none, green to brown over HillRelief)\n")
-    TEXT("2 to 6 and 8 to 15 need a terrestrial planet, 9, 10, 12 and 13 a GPU bake (magenta otherwise)."),
+    TEXT(" 16: the peaks layer (blue saddles, red summits, over its local amplitude)\n")
+    TEXT(" 17: the peaks' amplitude (white none, green to brown, dark at 1.5 km: mountain crests)\n")
+    TEXT("2 to 6 and 8 to 17 need a terrestrial planet, 9, 10, 12 and 13 a GPU bake (magenta otherwise)."),
     ECVF_Default);
 
 static TAutoConsoleVariable<int32> CVarVoxelBrickPerf(
@@ -542,7 +544,7 @@ namespace VoxelBrickTerrainDetail
         using namespace VoxelShader;
         static const TCHAR* Names[VOXEL_LAND_VIEW_COUNT] = { TEXT("off"), TEXT("elevation"), TEXT("bake height"), TEXT("detail layer"),
             TEXT("crust"), TEXT("boundary class"), TEXT("plates"), TEXT("slope"), TEXT("bake cells"), TEXT("drainage"), TEXT("lakes"), TEXT("gullies"),
-            TEXT("lakes and rivers"), TEXT("elevation, lakes and rivers"), TEXT("landform"), TEXT("hills") };
+            TEXT("lakes and rivers"), TEXT("elevation, lakes and rivers"), TEXT("landform"), TEXT("hills"), TEXT("peaks"), TEXT("peak amplitude") };
         TArray<FLegendLine> Lines;
         Lines.Add({ FString::Printf(TEXT("voxel.Debug.LandView %d: %s (0 hides it; %s)"), View, Names[View],
             bPerPixel
@@ -668,6 +670,22 @@ namespace VoxelBrickTerrainDetail
             Add(TEXT("HillRelief"), VoxelLandViewHills(1.0f));
             Add(TEXT("1.5 x HillRelief"), VoxelLandViewHills(1.5f));
             Add(TEXT("magenta: no hills (HillRelief 0, or no landform)"), VoxelLandViewNone());
+            break;
+        case VOXEL_LAND_VIEW_PEAKS:
+            Add(TEXT("-1 (a saddle: down by the local amplitude)"), VoxelLandViewSigned(-1.0f));
+            Add(TEXT("-0.5"), VoxelLandViewSigned(-0.5f));
+            Add(TEXT("0 (none: plains, valleys, the sea, or too coarse a level)"), VoxelLandViewSigned(0.0f));
+            Add(TEXT("+0.5"), VoxelLandViewSigned(0.5f));
+            Add(TEXT("+1 (a summit)"), VoxelLandViewSigned(1.0f));
+            Add(TEXT("magenta: no peaks (PeakStrength 0, or no landform)"), VoxelLandViewNone());
+            break;
+        case VOXEL_LAND_VIEW_PEAK_AREA:
+            Add(TEXT("none (plains, valleys, coasts)"), VoxelLandViewPeakArea(0.0f));
+            Add(TEXT("250 m"), VoxelLandViewPeakArea(250.0f));
+            Add(TEXT("500 m"), VoxelLandViewPeakArea(500.0f));
+            Add(TEXT("1 km"), VoxelLandViewPeakArea(1000.0f));
+            Add(TEXT("1.5 km"), VoxelLandViewPeakArea(1500.0f));
+            Add(TEXT("magenta: no peaks (PeakStrength 0, or no landform)"), VoxelLandViewNone());
             break;
         default:
             break;

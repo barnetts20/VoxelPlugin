@@ -1,5 +1,5 @@
 // VoxelLandMaterialAccess.ush - The land code's inputs as the terrain material has them
-// (VoxelLandAccess.ush explains the scheme): three textures passed down as function arguments
+// (VoxelLandAccess.ush explains the scheme): four textures passed down as function arguments
 // (VoxelLandMaterialLayout.ush gives their layout), every buffer read a texture load, every
 // scalar input a macro that reads the constants texture. Include before the land code; the
 // macros named like the global shaders' inputs (LandN, Octaves' accessor, PlanetRadius, ...)
@@ -13,8 +13,8 @@
 
 #include "VoxelLandMaterialLayout.ush"
 
-#define VOXEL_LAND_ARGS_DECL Texture2D LandHeightTex, Texture2D LandFieldTex, Texture2D LandConstTex,
-#define VOXEL_LAND_ARGS LandHeightTex, LandFieldTex, LandConstTex,
+#define VOXEL_LAND_ARGS_DECL Texture2D LandHeightTex, Texture2D LandFieldTex, Texture2D LandConstTex, Texture2D LandNoiseTex,
+#define VOXEL_LAND_ARGS LandHeightTex, LandFieldTex, LandConstTex, LandNoiseTex,
 
 /** Texel T (in order, VOXEL_LAND_MATERIAL_CONST_WIDTH a row) of the constants texture. */
 VOXEL_FUNC float4 VoxelLandConstTexel(Texture2D ConstTex, uint T)
@@ -152,12 +152,26 @@ VOXEL_FUNC FVoxelLandFramePoint VoxelLandFramePoint(float3 TranslatedWorld, floa
 static bool GVoxelLandSkipGullies = false;
 static bool GVoxelLandSkipDetail = false;
 static bool GVoxelLandSkipHills = false;
+static bool GVoxelLandSkipPeaks = false;
+
+/** Two channels (Half 0: R, G; 1: B, A) of the noise set's texel I (VoxelLandNoise.ush): the
+ *  texture holds the packed chain in rows of N texels (VoxelLandMaterial::MakeNoiseTexture), and
+ *  is unsigned normalised 16-bit, so the load gives the unit values. */
+VOXEL_FUNC float2 VoxelLandMaterialNoise(Texture2D NoiseTex, Texture2D ConstTex, uint I, uint Half)
+{
+    const uint Shift = VoxelLandConstU(ConstTex, VOXEL_LAND_MC_NOISE_SHIFT);
+    const float4 V = NoiseTex.Load(int3(int(I & ((1u << Shift) - 1u)), int(I >> Shift), 0));
+    return Half == 0u ? float2(V.x, V.y) : float2(V.z, V.w);
+}
 
 // The accessors (VoxelLandAccess.ush).
 #define VOXEL_LAND_HEIGHT(I) LandHeightTex.Load(VoxelLandCellTexel(LandConstTex, (I))).x
 #define VOXEL_LAND_TAN(I) VoxelLandMaterialTan(LandConstTex, (I))
 #define VOXEL_LAND_FLOW(I) LandFieldTex.Load(VoxelLandCellTexel(LandConstTex, (I))).x
-#define VOXEL_LAND_FORM(I) VoxelLandUnpackForm(uint(LandHeightTex.Load(VoxelLandCellTexel(LandConstTex, (I))).y))
+#define VOXEL_LAND_FORM(I) VoxelLandUnpackForm(uint(LandHeightTex.Load(VoxelLandCellTexel(LandConstTex, (I))).y) & 0xffffu)
+#define VOXEL_LAND_RELIEF(I) VoxelLandDecodeRelief(uint(LandHeightTex.Load(VoxelLandCellTexel(LandConstTex, (I))).y) >> 16u)
+#define VOXEL_LAND_NOISE_RG(I) VoxelLandMaterialNoise(LandNoiseTex, LandConstTex, (I), 0u)
+#define VOXEL_LAND_NOISE_BA(I) VoxelLandMaterialNoise(LandNoiseTex, LandConstTex, (I), 1u)
 #define VOXEL_LAND_ATTR(I) VoxelLandMaterialAttr(LandFieldTex, LandConstTex, (I))
 #define VOXEL_LAND_WATER(I) VoxelLandMaterialWater(LandHeightTex, LandFieldTex, LandConstTex, (I))
 #define VOXEL_LAND_PLATE(I) VoxelLandMaterialPlate(LandConstTex, (I))
@@ -178,6 +192,14 @@ static bool GVoxelLandSkipHills = false;
 #define LandHillOctaves VoxelLandConstU(LandConstTex, VOXEL_LAND_MC_HILL_OCTAVES)
 #define LandHillSeed VoxelLandConstU32(LandConstTex, VOXEL_LAND_MC_HILL_SEED)
 #define LandHasForm VoxelLandConstU(LandConstTex, VOXEL_LAND_MC_HAS_FORM)
+#define LandPeakStrength (GVoxelLandSkipPeaks ? 0.0f : VoxelLandConstF(LandConstTex, VOXEL_LAND_MC_PEAK_STRENGTH))
+#define LandPeakOctaves VoxelLandConstU(LandConstTex, VOXEL_LAND_MC_PEAK_OCTAVES)
+#define LandPeakSeed VoxelLandConstU32(LandConstTex, VOXEL_LAND_MC_PEAK_SEED)
+#define LandNoiseN VoxelLandConstU(LandConstTex, VOXEL_LAND_MC_NOISE_N)
+#define LandNoiseMips VoxelLandConstU(LandConstTex, VOXEL_LAND_MC_NOISE_MIPS)
+#define LandNoiseCellShift VoxelLandConstU(LandConstTex, VOXEL_LAND_MC_NOISE_CELL_SHIFT)
+#define LandPeakMeanShape VoxelLandConstF(LandConstTex, VOXEL_LAND_MC_PEAK_MEAN_SHAPE)
+#define LandPeakMeanG VoxelLandConstF(LandConstTex, VOXEL_LAND_MC_PEAK_MEAN_G)
 #define LandMode VoxelLandConstU(LandConstTex, VOXEL_LAND_MC_LAND_MODE)
 #define LandWarpOctaves VoxelLandConstU(LandConstTex, VOXEL_LAND_MC_WARP_OCTAVES)
 #define LandWarpInvNorm VoxelLandConstF(LandConstTex, VOXEL_LAND_MC_WARP_INV_NORM)

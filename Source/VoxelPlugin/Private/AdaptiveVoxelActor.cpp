@@ -326,6 +326,7 @@ void AAdaptiveVoxelActor::ReleaseLandTextures()
     LandHeightTexture = nullptr;
     LandFieldTexture = nullptr;
     LandConstantTexture = nullptr;
+    LandNoiseTexture = nullptr;
     LandTexturesBake.Reset();
     LandTexturesDensity.Reset();
     // The instance lets go of them too (the frame parameters are set again every frame).
@@ -374,11 +375,12 @@ UMaterialInterface* AAdaptiveVoxelActor::ResolveBrickMaterial()
             LandTexturesBake = Bake;
             LandTexturesDensity.Reset();
         }
-        if (!bFailed && (LandTexturesDensity.Pin() != Density || !LandConstantTexture))
+        if (!bFailed && (LandTexturesDensity.Pin() != Density || !LandConstantTexture || !LandNoiseTexture))
         {
             LandConstantTexture = VoxelLandMaterial::MakeConstantTexture(*Density);
+            LandNoiseTexture = VoxelLandMaterial::MakeNoiseTexture(*Density);
             LandTexturesDensity = Density;
-            bFailed = !LandConstantTexture;
+            bFailed = !LandConstantTexture || !LandNoiseTexture;
         }
         if (bFailed)
         {
@@ -387,7 +389,7 @@ UMaterialInterface* AAdaptiveVoxelActor::ResolveBrickMaterial()
         }
         else
         {
-            VoxelLandMaterial::SetTextureParameters(LandMaterialInstance, LandHeightTexture, LandFieldTexture, LandConstantTexture);
+            VoxelLandMaterial::SetTextureParameters(LandMaterialInstance, LandHeightTexture, LandFieldTexture, LandConstantTexture, LandNoiseTexture);
             bLandMaterialBound = true;
             // The land surface cache the node reads by default (without it, the analytic node).
             if (ResolveLandCache(Density))

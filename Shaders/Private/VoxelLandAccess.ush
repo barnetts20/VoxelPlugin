@@ -53,6 +53,21 @@ VOXEL_FUNC float2 VoxelLandUnpackForm(uint Packed)
 #define VOXEL_LAND_FORM(I) VoxelLandUnpackForm((LandForm[(I) >> 1u] >> (((I) & 1u) * 16u)) & 0xffffu)
 #endif
 
+/** A cell's local relief (m; FVoxelLandBake::Relief, VoxelLandRelief.h): q^2 x this. */
+#define VOXEL_LAND_RELIEF_SCALE (12000.0f / 65025.0f)
+
+VOXEL_FUNC float VoxelLandDecodeRelief(uint Q)
+{
+    const float F = float(Q);
+    return F * F * VOXEL_LAND_RELIEF_SCALE;
+}
+
+/** The bake's local relief (m) at cell I: four cells per word, the lowest index in the low byte
+ *  (read when LandHasForm: the bakes that have the landform have it too). */
+#ifndef VOXEL_LAND_RELIEF
+#define VOXEL_LAND_RELIEF(I) VoxelLandDecodeRelief((LandRelief[(I) >> 2u] >> (((I) & 3u) * 8u)) & 0xffu)
+#endif
+
 /** The bake's attributes (FVoxelLandBake::Attr) at cell I: two cells per word, low half first
  *  (the debug views' buffer). */
 #ifndef VOXEL_LAND_ATTR

@@ -69,6 +69,8 @@ void VoxelLandDebugPass(uint Id)
     In.Gully = 0.0f;
     In.GullyScale = 0.0f;
     In.Hills = 0.0f;
+    In.Peaks = 0.0f;
+    In.PeakAmplitude = 0.0f;
     In.DetailNorm = 0.0f;
     In.bTerrestrial = LandMode != 0u && Radius.x > 1.0e-6f;
     In.bHydro = LandDebugHasHydro != 0u;
@@ -80,7 +82,7 @@ void VoxelLandDebugPass(uint Id)
         const float2 SPY = VoxelDFMul(PY, Scale);
         const float2 SPZ = VoxelDFMul(PZ, Scale);
         if (LandDebugMode == VOXEL_LAND_VIEW_BAKE || LandDebugMode == VOXEL_LAND_VIEW_DETAIL || LandDebugMode == VOXEL_LAND_VIEW_GULLY
-            || LandDebugMode == VOXEL_LAND_VIEW_HILLS)
+            || LandDebugMode == VOXEL_LAND_VIEW_HILLS || LandDebugMode == VOXEL_LAND_VIEW_PEAKS || LandDebugMode == VOXEL_LAND_VIEW_PEAK_AREA)
         {
             const FVoxelLandHeight H = VoxelLandHeightDF(VOXEL_LAND_ARGS SPX, SPY, SPZ, Footprint, false);
             In.Warped = H.Warped;
@@ -88,6 +90,8 @@ void VoxelLandDebugPass(uint Id)
             In.Gully = H.Gully;
             In.GullyScale = H.GullyScale;
             In.Hills = H.Hills;
+            In.Peaks = H.Peaks;
+            In.PeakAmplitude = H.PeakAmplitudeM;
             In.DetailNorm = LandDetailAmplitude > 0.0f ? H.Detail * 100.0f / LandDetailAmplitude : 0.0f;
         }
         else

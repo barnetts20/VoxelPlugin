@@ -75,6 +75,10 @@ public class VoxelPlugin : ModuleRules
 			);
 		
 		
+		// The authored noise sets (VoxelLand::NoiseSetDirectory, Design/NoiseTiles2D_Handoff.md):
+		// read as files at runtime, so staged with a cooked game.
+		RuntimeDependencies.Add(Path.Combine(PluginDirectory, "NoiseSets", "*.vxnt"), StagedFileType.UFS);
+
 		DynamicallyLoadedModuleNames.AddRange(
 			new string[]
 			{

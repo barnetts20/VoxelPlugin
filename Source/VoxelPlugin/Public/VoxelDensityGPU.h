@@ -8,6 +8,7 @@
 
 class FSparseEditStore;
 struct FVoxelLandBake;
+struct FVoxelLandNoiseSet;
 
 /** A double as the shaders take it (VoxelDF64.ush): the nearest float and the remainder. */
 inline FVector2f VoxelDoubleFloat(double V)
@@ -56,7 +57,7 @@ struct FVoxelDensityGPUData
     double MinFootprint = 0.0;   // footprints below it are raised to it, as on the CPU
 
     // The terrestrial generator (VoxelLandSample.ush; LandMode 0 for the noise surface). The
-    // height is the bake's (m) plus the hills (VoxelLandHills.ush), the gullies
+    // height is the bake's (m) plus the hills (VoxelLandHills.ush), the peaks (VoxelLandPeaks.ush), the gullies
     // (VoxelLandGully.ush) and the detail layer,
     // offset to the height above PlanetRadius; the warp's three layers follow the detail
     // octaves in Octaves.
@@ -77,6 +78,10 @@ struct FVoxelDensityGPUData
     FVector2f LandHillFrequency = FVector2f::ZeroVector;   // cycles per cm, double-float
     uint32 LandHillOctaves = 0;
     uint32 LandHillSeed = 0;
+    TSharedPtr<const FVoxelLandNoiseSet, ESPMode::ThreadSafe> LandNoise;   // the peaks' set (null: no peaks)
+    float LandPeakStrength = 0.0f;       // VoxelLandPeaks.ush (0: none)
+    uint32 LandPeakOctaves = 0;
+    uint32 LandPeakSeed = 0;
 };
 
 /** The edit store's edits and index for the GPU (VoxelEditSample.ush; the layout is

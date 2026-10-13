@@ -22,6 +22,7 @@ namespace VoxelLandMaterial
     VOXELPLUGIN_API extern const FName HeightTextureName;      // VoxelLandHeight (texture)
     VOXELPLUGIN_API extern const FName FieldTextureName;       // VoxelLandFields (texture)
     VOXELPLUGIN_API extern const FName ConstantTextureName;    // VoxelLandConstants (texture)
+    VOXELPLUGIN_API extern const FName NoiseTextureName;       // VoxelLandNoise (texture: the peaks' noise set, T3)
     VOXELPLUGIN_API extern const FName OriginHighName;         // VoxelLandOriginHigh (vector: the planet's origin in world, cm)
     VOXELPLUGIN_API extern const FName OriginLowName;          // VoxelLandOriginLow (its double-float remainder)
     VOXELPLUGIN_API extern const FName AxisXName;              // VoxelLandAxisX (vector: the planet frame's X in world)
@@ -36,7 +37,8 @@ namespace VoxelLandMaterial
     VOXELPLUGIN_API void BuildFieldTexels(const FVoxelLandBake& Bake, TArray<FFloat16Color>& Out);
 
     /** The height texture's texels (RG32F, VoxelLandMaterialLayout.ush): the height, and the
-     *  landform's 16 bits as a float (0 without it). */
+     *  landform's 16 bits plus the local relief's 8 above them, as a float (exact: 24 bits;
+     *  0 without them). */
     VOXELPLUGIN_API void BuildHeightTexels(const FVoxelLandBake& Bake, TArray<FVector2f>& Out);
 
     /** The constant texels (VOXEL_LAND_MATERIAL_CONST_WIDTH x OutRows) for a density's land
@@ -62,9 +64,14 @@ namespace VoxelLandMaterial
     /** Game thread. The constants texture of a terrestrial density (null for the noise surface). */
     VOXELPLUGIN_API UTexture2DDynamic* MakeConstantTexture(const FVoxelDensityCPU& Density);
 
+    /** Game thread. The peaks' noise set as a texture (RGBA16 unsigned normalised: its packed mip
+     *  chain in rows of N texels, VoxelLandNoise.ush), one for every planet sharing the set, or a
+     *  1 x 1 stand-in when the density has none (the constants then turn the peaks off). */
+    VOXELPLUGIN_API UTexture2DDynamic* MakeNoiseTexture(const FVoxelDensityCPU& Density);
+
     /** Game thread. The textures on a material instance. */
     VOXELPLUGIN_API void SetTextureParameters(UMaterialInstanceDynamic* Material, UTexture2DDynamic* Height, UTexture2DDynamic* Fields,
-        UTexture2DDynamic* Constants);
+        UTexture2DDynamic* Constants, UTexture2DDynamic* Noise);
 
     /** Game thread, every frame: the planet's frame (PlanetFrame: its location and rotation, no
      *  scale) as its origin and axes (double-float), the debug view, the surface tolerance

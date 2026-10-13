@@ -335,6 +335,9 @@ protected:
     TObjectPtr<UTexture2DDynamic> LandConstantTexture;
 
     UPROPERTY(Transient)
+    TObjectPtr<UTexture2DDynamic> LandNoiseTexture;
+
+    UPROPERTY(Transient)
     TObjectPtr<UMaterialInterface> LandMaterialParent;
 
     TWeakPtr<const FVoxelLandBake, ESPMode::ThreadSafe> LandTexturesBake;   // the height and field textures'

@@ -60,6 +60,8 @@ struct FVoxelLandDebugInput
     float Gully;          // m
     float GullyScale;     // m
     float Hills;          // m (VoxelLandHills.ush)
+    float Peaks;          // m (VoxelLandPeaks.ush)
+    float PeakAmplitude;  // m
     float DetailNorm;     // the detail as added, over its full amplitude (about -1..1)
     bool bTerrestrial;    // the land inputs are bound (else the bake views show "none")
     bool bHydro;          // the bake has drainage and lakes (eroded)
@@ -83,6 +85,12 @@ VOXEL_FUNC float3 VoxelLandDebugColor(VOXEL_LAND_ARGS_DECL FVoxelLandDebugInput 
     {
         if (LandHillRelief <= 0.0f || LandHillOctaves == 0u || LandHasForm == 0u) return VoxelLandViewNone();
         return VoxelLandViewHills(In.Hills / LandHillRelief);
+    }
+    if (In.Mode == VOXEL_LAND_VIEW_PEAKS || In.Mode == VOXEL_LAND_VIEW_PEAK_AREA)
+    {
+        if (LandPeakStrength <= 0.0f || LandPeakOctaves == 0u || LandNoiseN == 0u || LandHasForm == 0u) return VoxelLandViewNone();
+        if (In.Mode == VOXEL_LAND_VIEW_PEAK_AREA) return VoxelLandViewPeakArea(In.PeakAmplitude);
+        return VoxelLandViewSigned(In.PeakAmplitude > 1.0f ? In.Peaks / In.PeakAmplitude : 0.0f);
     }
 
     const FVoxelLandDebugCell Cell = VoxelLandDebugCellOf(VOXEL_LAND_ARGS In.Warped);

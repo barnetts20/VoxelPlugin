@@ -17,6 +17,14 @@
 #undef LandHillOctaves
 #undef LandHillSeed
 #undef LandHasForm
+#undef LandPeakStrength
+#undef LandPeakOctaves
+#undef LandPeakSeed
+#undef LandNoiseN
+#undef LandNoiseMips
+#undef LandNoiseCellShift
+#undef LandPeakMeanShape
+#undef LandPeakMeanG
 #undef LandMode
 #undef LandWarpOctaves
 #undef LandWarpInvNorm

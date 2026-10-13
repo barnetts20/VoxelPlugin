@@ -10,7 +10,8 @@ struct FMaterialTextures
     const float* Height = nullptr;   // four floats a texel (as the material loads them), Side x 6 Side
     const float* Fields = nullptr;   // the same
     const float* Constants = nullptr; // VOXEL_LAND_MATERIAL_CONST_WIDTH x Rows
-    int Side = 0, Rows = 0;
+    const float* Noise = nullptr;    // four unit values a texel (an RGBA16 load), NoiseN x NoiseRows
+    int Side = 0, Rows = 0, NoiseN = 1, NoiseRows = 1;
 };
 
 struct FMaterialHeight
@@ -20,6 +21,7 @@ struct FMaterialHeight
     float BakeGradient[3], Warped[3];
     float DetailGradient[3], DetailUnit, DetailAmplitudeM;
     float Hills, HillUnit, HillAmplitudeM, HillGradient[3];
+    float Peaks, PeakUnit, PeakAmplitudeM, PeakGradient[3];
 };
 
 FMaterialHeight MaterialLandHeight(const FMaterialTextures& T, const float X[2], const float Y[2], const float Z[2], float Footprint, bool bGradient);

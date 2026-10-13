@@ -37,7 +37,7 @@ int main(int argc, char** argv)
     for (int i = 0; i < Cells; i++)
     {
         HeightTex[4 * (size_t)i] = P.Height[i];
-        HeightTex[4 * (size_t)i + 1] = P.Form.empty() ? 0.0f : (float)(P.Form[i] & 0xffffu);   // BuildHeightTexels
+        HeightTex[4 * (size_t)i + 1] = P.Form.empty() ? 0.0f : (float)((P.Form[i] & 0xffffu) | ((uint32_t)P.Relief[i] << 16));   // BuildHeightTexels
         const uint16_t FlowBits = (uint16_t)((P.FlowPacked[i >> 1] >> ((i & 1) * 16)) & 0xffffu);
         FieldTex[4 * (size_t)i] = HalfToFloat(FlowBits);
         const float L = Water[i];
@@ -72,6 +72,16 @@ int main(int argc, char** argv)
     S[VOXEL_LAND_MC_HILL_OCTAVES] = (float)P.S.LandHillOctaves;
     PutU32(S, VOXEL_LAND_MC_HILL_SEED, P.S.LandHillSeed);
     S[VOXEL_LAND_MC_HAS_FORM] = (float)P.S.LandHasForm;
+    S[VOXEL_LAND_MC_PEAK_STRENGTH] = P.S.LandPeakStrength; S[VOXEL_LAND_MC_PEAK_OCTAVES] = (float)P.S.LandPeakOctaves;
+    PutU32(S, VOXEL_LAND_MC_PEAK_SEED, P.S.LandPeakSeed);
+    S[VOXEL_LAND_MC_NOISE_N] = (float)P.S.LandNoiseN; S[VOXEL_LAND_MC_NOISE_MIPS] = (float)P.S.LandNoiseMips;
+    S[VOXEL_LAND_MC_NOISE_CELL_SHIFT] = (float)P.S.LandNoiseCellShift;
+    S[VOXEL_LAND_MC_NOISE_SHIFT] = (float)std::log2((double)P.NoiseSet.N);
+    S[VOXEL_LAND_MC_PEAK_MEAN_SHAPE] = P.S.LandPeakMeanShape; S[VOXEL_LAND_MC_PEAK_MEAN_G] = P.S.LandPeakMeanG;
+    // The noise texture (MakeNoiseTexture: the words' rows, RGBA16 unsigned normalised; a load
+    // gives q / 65535).
+    std::vector<float> NoiseTex(P.NoiseWords.size() * 2);
+    for (size_t i = 0; i < NoiseTex.size(); i++) NoiseTex[i] = (float)((P.NoiseWords[i / 2] >> (16 * (i & 1))) & 0xffffu) / 65535.0f;
     for (size_t i = 0; i < P.Tan.size(); i++) { float* T = S + 4 * (TanBase + i / 2) + 2 * (i & 1); T[0] = P.Tan[i].x; T[1] = P.Tan[i].y; }
     for (size_t o = 0; o < Gpu.size(); o++)
     {
@@ -86,6 +96,7 @@ int main(int argc, char** argv)
     }
     FMaterialTextures Tex;
     Tex.Height = HeightTex.data(); Tex.Fields = FieldTex.data(); Tex.Constants = Const.data(); Tex.Side = Side; Tex.Rows = Rows;
+    Tex.Noise = NoiseTex.data(); Tex.NoiseN = (int)P.NoiseSet.N; Tex.NoiseRows = (int)P.NoiseRows;
 
     // Decode checks: every attribute and lake level, every octave field.
     int AttrBad = 0, WaterBad = 0, Lakes = 0;
@@ -117,7 +128,7 @@ int main(int argc, char** argv)
     // The full land chain through both accessors.
     std::mt19937 Rng(31);
     std::normal_distribution<double> G;
-    int Mismatch = 0, Count = 0, ColorBad = 0, HeightChanged = 0, HillPoints = 0;
+    int Mismatch = 0, Count = 0, ColorBad = 0, HeightChanged = 0, HillPoints = 0, PeakPoints = 0;
     for (int i = 0; i < 20000; i++)
     {
         double D[3] = { G(Rng), G(Rng), G(Rng) }; Normalize(D);
@@ -133,7 +144,9 @@ int main(int argc, char** argv)
             && A.DetailGradient.x == B.DetailGradient[0] && A.DetailGradient.y == B.DetailGradient[1] && A.DetailGradient.z == B.DetailGradient[2]
             && A.DetailUnit == B.DetailUnit && A.DetailAmplitudeM == B.DetailAmplitudeM
             && A.Hills == B.Hills && A.HillUnit == B.HillUnit && A.HillAmplitudeM == B.HillAmplitudeM
-            && A.HillGradient.x == B.HillGradient[0] && A.HillGradient.y == B.HillGradient[1] && A.HillGradient.z == B.HillGradient[2];
+            && A.HillGradient.x == B.HillGradient[0] && A.HillGradient.y == B.HillGradient[1] && A.HillGradient.z == B.HillGradient[2]
+            && A.Peaks == B.Peaks && A.PeakUnit == B.PeakUnit && A.PeakAmplitudeM == B.PeakAmplitudeM
+            && A.PeakGradient.x == B.PeakGradient[0] && A.PeakGradient.y == B.PeakGradient[1] && A.PeakGradient.z == B.PeakGradient[2];
         // The exact detail path (bGradient) leaves the height as the density's own path has it.
         const VoxelShader::FVoxelLandHeight A0 = VoxelShader::VoxelLandHeightDF(X, Y, Z, F, false);
         HeightChanged += A0.Height.x != A.Height.x || A0.Height.y != A.Height.y || A0.Detail != A.Detail;
@@ -142,16 +155,17 @@ int main(int argc, char** argv)
                 A.Height.x, A.Height.y, B.Height[0], B.Height[1], A.Bake, B.Bake, A.Gully, B.Gully, A.Detail, B.Detail);
         Mismatch += !bSame;
         HillPoints += A.Hills != 0.0f;
+        PeakPoints += A.Peaks != 0.0f;
         Count++;
         // Every debug view's colour is finite and in range.
-        for (uint32_t Mode = 1; Mode < 16u; Mode++)   // every view (VOXEL_LAND_VIEW_COUNT)
+        for (uint32_t Mode = 1; Mode < 18u; Mode++)   // every view (VOXEL_LAND_VIEW_COUNT)
         {
             float C[3];
             MaterialDebugColor(Tex, Mode, B, F * 0.01f, C);
             for (float V : C) ColorBad += !(std::isfinite(V) && V >= 0.0f && V <= 1.001f);
         }
     }
-    printf("land chain through the material's accessors against the global shaders': %d of %d points differ in any bit (%d with hills); %d debug colours out of range; height with the exact detail gradient against without: %d differ\n", Mismatch, Count, HillPoints, ColorBad, HeightChanged);
+    printf("land chain through the material's accessors against the global shaders': %d of %d points differ in any bit (%d with hills, %d with peaks); %d debug colours out of range; height with the exact detail gradient against without: %d differ\n", Mismatch, Count, HillPoints, PeakPoints, ColorBad, HeightChanged);
 
     // The pixel's planet-frame position from the view (VoxelLandFramePoint), against doubles:
     // planets anywhere within 10^9 cm of the world origin, rotated, cameras near their surface.

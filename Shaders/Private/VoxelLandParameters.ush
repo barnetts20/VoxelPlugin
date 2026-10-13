@@ -1,6 +1,7 @@
 // VoxelLandParameters.ush - The land bake's shader inputs (FVoxelLandShaderParameters in
 // VoxelLandGPU.h), for passes that evaluate the density. Include before VoxelLandSample.ush,
-// VoxelLandGully.ush (which includes VoxelLandHills.ush) and VoxelDensitySample.ush.
+// VoxelLandGully.ush (which includes VoxelLandHills.ush, VoxelLandNoise.ush and VoxelLandPeaks.ush)
+// and VoxelDensitySample.ush.
 
 #ifndef VOXEL_LAND_PARAMETERS_USH
 #define VOXEL_LAND_PARAMETERS_USH
@@ -10,6 +11,8 @@ StructuredBuffer<float> LandHeight;     // VoxelLandSample.ush
 StructuredBuffer<float2> LandTanTable;
 StructuredBuffer<uint> LandFlow;        // f16 log2 m^2, two cells per word (when LandHasFlow)
 StructuredBuffer<uint> LandForm;        // the landform, two cells per word (when LandHasForm)
+StructuredBuffer<uint> LandRelief;      // the local relief, four cells per word (when LandHasForm)
+StructuredBuffer<uint> LandNoise;       // the peaks' noise set (VoxelLandNoise.ush), two words a texel
 uint LandN;
 uint LandPad;
 uint LandHasFlow;
@@ -29,5 +32,13 @@ float LandHillRelief;                   // VoxelLandHills.ush (0: no hills)
 float2 LandHillFrequency;               // the finest octave's (cycles per cm, double-float)
 uint LandHillOctaves;
 uint LandHillSeed;
+float LandPeakStrength;                 // VoxelLandPeaks.ush (0: no peaks)
+uint LandPeakOctaves;
+uint LandPeakSeed;
+uint LandNoiseN;                        // VoxelLandNoise.ush (0: no set)
+uint LandNoiseMips;
+uint LandNoiseCellShift;
+float LandPeakMeanShape;
+float LandPeakMeanG;
 
 #endif // VOXEL_LAND_PARAMETERS_USH

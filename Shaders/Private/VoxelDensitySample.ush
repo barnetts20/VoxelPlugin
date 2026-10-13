@@ -214,13 +214,14 @@ VOXEL_FUNC FVoxelLandWarp VoxelLandWarpDF(VOXEL_LAND_ARGS_DECL float2 SPX, float
 }
 
 // The terrestrial surface at the point LP on the sea-level sphere (double-float, cm, planet
-// frame): the bake through the sampling warp, the hills, the gullies and the detail layer, as
+// frame): the bake through the sampling warp, the hills, the peaks, the gullies and the detail layer, as
 // the density adds them. Height is cm above PlanetRadius (double-float, before the density's clamp to
 // [0, NoiseAmplitude]); the terms are m. bGradient (a constant: dropped when false) adds the
 // bake's exact gradient through the warp (m/m, a tangent vector at LP) and the drainage, for the
 // terrain material (VoxelLandMaterial.ush), and the detail layer's exact gradient at fixed
-// amplitude (VoxelLayerSumDampedExactDF, damping included), and the hills' at their amplitude
-// (VoxelLandHills.ush; its change, like the detail's, is left to differences). The gullies'
+// amplitude (VoxelLayerSumDampedExactDF, damping included), and the hills' and the peaks' at
+// their amplitudes (VoxelLandHills.ush, VoxelLandPeaks.ush; their change, like the detail's, is
+// left to differences). The gullies'
 // gradient is not given:
 // its analytic form leaves out terms of the same size as it keeps (the steering's turn, the
 // octaves' slope-dependent depths), so the material takes it, and the change of the detail's
@@ -233,6 +234,10 @@ struct FVoxelLandHeight
     float HillUnit;         // the hills per metre of amplitude (Hills = HillUnit x HillAmplitudeM)
     float HillAmplitudeM;   // m
     float3 HillGradient;    // m/m at LP, tangent, at the hills' amplitude
+    float Peaks;            // m
+    float PeakUnit;         // Peaks = PeakUnit x PeakAmplitudeM
+    float PeakAmplitudeM;   // m
+    float3 PeakGradient;    // m/m at LP, tangent, at the peaks' amplitude
     float Gully;
     float Detail;
     float GullyScale;
@@ -268,6 +273,7 @@ VOXEL_FUNC FVoxelLandHeight VoxelLandHeightDF(VOXEL_LAND_ARGS_DECL float2 LPX, f
     float2 Total = VoxelDFAdd(VoxelDFAdd(VoxelDFMulFloat(float2(Land.Bake, 0.0f), 100.0f), LandHeightOffset),
         VoxelDFMulFloat(Detail, DetailAmplitude));
     Total = VoxelDFAdd(Total, VoxelDFMulFloat(float2(Land.Hills, 0.0f), 100.0f));
+    Total = VoxelDFAdd(Total, VoxelDFMulFloat(float2(Land.Peaks, 0.0f), 100.0f));
     Total = VoxelDFAdd(Total, VoxelDFMulFloat(float2(Land.Gully, 0.0f), 100.0f));
 
     FVoxelLandHeight Out;
@@ -277,6 +283,10 @@ VOXEL_FUNC FVoxelLandHeight VoxelLandHeightDF(VOXEL_LAND_ARGS_DECL float2 LPX, f
     Out.HillUnit = Land.HillUnit;
     Out.HillAmplitudeM = Land.HillAmplitudeM;
     Out.HillGradient = Land.HillGradient;
+    Out.Peaks = Land.Peaks;
+    Out.PeakUnit = Land.PeakUnit;
+    Out.PeakAmplitudeM = Land.PeakAmplitudeM;
+    Out.PeakGradient = Land.PeakGradient;
     Out.Gully = Land.Gully;
     Out.Detail = (Detail.x + Detail.y) * DetailAmplitude * 0.01f;
     Out.GullyScale = Land.GullyScale;
@@ -291,9 +301,9 @@ VOXEL_FUNC FVoxelLandHeight VoxelLandHeightDF(VOXEL_LAND_ARGS_DECL float2 LPX, f
     return Out;
 }
 
-/** The terms VoxelLandHeightDF leaves to differences (the gullies, m, and the detail's and the
- *  hills' amplitudes, m: they follow the bake's height near the coast, the hills also the
- *  landform and the drainage), computed as it computes them, at LP (on the sea-level sphere).
+/** The terms VoxelLandHeightDF leaves to differences (the gullies, m, and the detail's, the
+ *  hills' and the peaks' amplitudes, m: they follow the bake's height near the coast, the hills
+ *  and peaks also the landform, the relief and the drainage), computed as it computes them, at LP (on the sea-level sphere).
  *  For the terrain material's normal close up, where it differences them over a fixed step
  *  rather than a pixel, and the land surface cache. */
 struct FVoxelLandDifferenced
@@ -301,18 +311,21 @@ struct FVoxelLandDifferenced
     float Gully;
     float DetailAmplitudeM;
     float HillAmplitudeM;
+    float PeakAmplitudeM;
 };
 
 VOXEL_FUNC FVoxelLandDifferenced VoxelLandDifferencedDF(VOXEL_LAND_ARGS_DECL float2 LPX, float2 LPY, float2 LPZ, float Footprint)
 {
     const FVoxelLandWarp Warp = VoxelLandWarpDF(VOXEL_LAND_ARGS LPX, LPY, LPZ);
-    const FVoxelLandSurface Land = VoxelLandSurfaceDF(VOXEL_LAND_ARGS LPX, LPY, LPZ, Warp.QX, Warp.QY, Warp.QZ, Warp.DWX, Warp.DWY, Warp.DWZ,
-        Footprint, true);
+    // The peaks' shape isn't needed (only their amplitude, and their steering of the gullies).
+    const FVoxelLandSurface Land = VoxelLandSurfaceTermsDF(VOXEL_LAND_ARGS LPX, LPY, LPZ, Warp.QX, Warp.QY, Warp.QZ, Warp.DWX, Warp.DWY, Warp.DWZ,
+        Footprint, true, false);
     const float SeaWeight = lerp(0.25f, 1.0f, smoothstep(-50.0f, 50.0f, Land.Bake));
     FVoxelLandDifferenced Out;
     Out.Gully = Land.Gully;
     Out.DetailAmplitudeM = LandDetailAmplitude * SeaWeight * Land.DetailScale * 0.01f;
     Out.HillAmplitudeM = Land.HillAmplitudeM;
+    Out.PeakAmplitudeM = Land.PeakAmplitudeM;
     return Out;
 }
 

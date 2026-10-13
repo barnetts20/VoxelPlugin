@@ -16,6 +16,7 @@
 #include "VoxelLandSettings.h"
 
 struct FVoxelLandBakeGPU;
+struct FVoxelLandNoiseGPU;
 struct FVoxelLandBakeJob;
 struct FVoxelLandCpuProgress;
 
@@ -71,8 +72,15 @@ struct VOXELPLUGIN_API FVoxelLandBake
 
     /** Per cell: the landform (VoxelLandPlates.ush VoxelLandFormAt): the hilliness (0 flat
      *  plains .. 255 hill country) in the low byte, the character (0 smooth, rolling .. 255
-     *  rough-topped) in the high byte. The hills layer's shape and height (VoxelLandHills.ush). */
+     *  rough-topped) in the high byte. The hills layer's shape and height (VoxelLandHills.ush),
+     *  and the peaks' sharpness (VoxelLandPeaks.ush). */
     TArray<uint16> Form;
+
+    /** Per cell: the local relief (VoxelLandRelief.h: the height range within about two cells,
+     *  8 bits, q^2 x 12000 / 65025 m), the peaks' scale. Derived from Height when the bake is
+     *  ready (BuildRelief), not cached. */
+    TArray<uint8> Relief;
+    float MaxRelief = 0.0f;       // m, the largest decoded
 
     /** Per cell: log2 of the drainage area (m^2), a cell's own area off the land; empty when
      *  not eroded. */
@@ -106,9 +114,41 @@ struct VOXELPLUGIN_API FVoxelLandBake
     /** Fills MinHeight and MaxHeight from Height. */
     void UpdateRange();
 
+    /** Fills Relief and MaxRelief from Height (any thread; parallel). */
+    void BuildRelief();
+
     /** The GPU copy the density samples (render thread; uploaded on first use, released on
      *  the render thread with the bake). */
     TSharedPtr<FVoxelLandBakeGPU, ESPMode::ThreadSafe> GPU;
+};
+
+/** A packed noise set (VoxelNoiseTiles.h; Design/NoiseTiles2D_Handoff.md) as the land samples it
+ *  (VoxelLandNoise.ush): the mip chain as words (two a texel: R | G << 16, B | A << 16, the
+ *  .vxnt files' own bytes), padded to whole rows of N texels (the material's texture is those
+ *  rows), its size and mips, and what the peaks layer normalises with (VoxelLandPeaks.ush).
+ *  Immutable once made; shared by every planet's density that uses it. */
+struct VOXELPLUGIN_API FVoxelLandNoiseSet
+{
+    FVoxelLandNoiseSet();
+    ~FVoxelLandNoiseSet();
+    FVoxelLandNoiseSet(const FVoxelLandNoiseSet&) = delete;
+    FVoxelLandNoiseSet& operator=(const FVoxelLandNoiseSet&) = delete;
+
+    FString Name;                 // the file's name without .vxnt, or VoxelLand::GeneratedNoiseName
+    FString LookTag;
+    uint32 N = 0;                 // texels per side of mip 0
+    uint32 Mips = 0;
+    uint32 Rows = 0;              // rows of N texels holding the chain (the last one padded)
+    uint32 CellShift = 0;         // log2 of the texels per R cell
+    TArray<uint32> Words;         // Rows x N texels, two words each
+    float MeanShape = 0.0f;       // over mip 0, in unit values: (0.6 + 0.8 A) R (VoxelLandPeaks.ush's summit scale), and G
+    float MeanG = 0.0f;
+
+    /** Whether the words hold the whole chain (the sampler's bounds). */
+    bool IsComplete() const { return N > 0 && Rows > 0 && Words.Num() == (int32)(2 * Rows * N); }
+
+    /** The GPU copy (render thread; uploaded on first use, released on the render thread). */
+    TSharedPtr<FVoxelLandNoiseGPU, ESPMode::ThreadSafe> GPU;
 };
 
 /** Makes a planet's bake: from the disk cache when it holds one for the key, else on the GPU
@@ -210,6 +250,60 @@ namespace VoxelLand
 
     /** The finest hill octave's frequency (cycles per cm). */
     VOXELPLUGIN_API double HillFinestFrequency(const FVoxelTerrestrialSettings& Settings);
+
+    /** The peaks' constants (VOXEL_LAND_PEAK_MAX_OCTAVES, the summit scale's range and the ridged
+     *  weight in VoxelLandPeaks.ush; keep equal). */
+    constexpr int32 PeakMaxOctaves = 8;
+    /** Bounds on the peaks' shape (Unit), for the planet's height range: gully_harness pgrad
+     *  measures -0.50 .. 1.21 over 900k points of the generated set; aligned summits at the
+     *  roughest gain could reach about 2.2 up, 0.7 down. */
+    constexpr double PeakMaxUnit = 2.2;
+    constexpr double PeakMinUnit = 1.0;
+
+    /** The peak octaves (VoxelLandPeaks.ush): from two bake cells down to
+     *  Settings.PeakFinestWavelength, at most 8; 0 without peaks. */
+    VOXELPLUGIN_API int32 PeakOctavesFor(const FVoxelTerrestrialSettings& Settings, const FVoxelLandBake& Bake);
+
+    /** How far the peaks can raise the surface (bUp; else lower it), cm. They act only on land
+     *  (from 2 m up), so they lower it below the bake's land at most this far. */
+    VOXELPLUGIN_API double PeakReach(const FVoxelTerrestrialSettings& Settings, const FVoxelLandBake& Bake, bool bUp);
+
+    /** The name of the plugin's own generated `peaks` set (VoxelNoiseTiles.h): the stand-in
+     *  when no authored set is there, or one fails to load. */
+    VOXELPLUGIN_API extern const TCHAR* GeneratedNoiseName;
+
+    /** The folder the authored sets are read from: the plugin's NoiseSets folder (staged with a
+     *  cooked game by VoxelPlugin.Build.cs). Found on the game thread (StartupModule); empty
+     *  before that, or without the plugin. */
+    VOXELPLUGIN_API FString NoiseSetDirectory();
+
+    /** The noise set a planet's peaks sample (Design/SurfaceLook.md T3): Settings.PeakNoiseSet if
+     *  set (a file name without .vxnt); else one of the usable `peaks*` sets in NoiseSetDirectory,
+     *  picked by the planet's seed (rendezvous hashing: adding or removing a set moves only the
+     *  planets that pick it); else the generated one. The folder is listed once a session (the
+     *  first call reads its sets' headers). */
+    VOXELPLUGIN_API FString PeakNoiseNameFor(const FVoxelTerrestrialSettings& Settings);
+
+    /** The peaks' noise set Name (PeakNoiseNameFor): read (about 0.1 s for a 2048 set) or
+     *  generated (about a second of worker time), then shared while densities hold it (and the
+     *  four most recent kept regardless); read again when asked for after that. A file that is
+     *  missing or isn't a valid `peaks` set logs an error and gives the generated set. Null only
+     *  if that fails too (the peaks are then off). Thread-safe; blocks while it's made (the
+     *  planet waits for TryGetPeakNoise before it builds a density, so the game thread
+     *  doesn't). */
+    VOXELPLUGIN_API TSharedPtr<const FVoxelLandNoiseSet, ESPMode::ThreadSafe> GetPeakNoise(const FString& Name);
+
+    /** Starts making it in the background, if it isn't already there or under way. */
+    VOXELPLUGIN_API void PrewarmPeakNoise(const FString& Name);
+
+    /** Whether it is ready (GetPeakNoise won't block): if so, Out is it (null if none could be
+     *  made). The caller holds Out until its density has taken the set, so the set can't go in
+     *  between and GetPeakNoise then finds it at once. */
+    VOXELPLUGIN_API bool TryGetPeakNoise(const FString& Name, TSharedPtr<const FVoxelLandNoiseSet, ESPMode::ThreadSafe>& Out);
+
+    /** Drops the shared references (before the RHI shuts down: each set's GPU copy goes with its
+     *  last holder, on the render thread). */
+    VOXELPLUGIN_API void ReleasePeakNoise();
 
     /** How far the gullies can move the surface either way (cm). */
     VOXELPLUGIN_API double GullyReach(const FVoxelTerrestrialSettings& Settings, const FVoxelLandBake& Bake);

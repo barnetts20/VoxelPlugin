@@ -23,7 +23,14 @@ struct FVoxelLandBakeGPU
     TRefCountPtr<FRDGPooledBuffer> Plates;
     TRefCountPtr<FRDGPooledBuffer> Flow;     // two cells per word (f16)
     TRefCountPtr<FRDGPooledBuffer> Form;     // two cells per word (the landform)
+    TRefCountPtr<FRDGPooledBuffer> Relief;   // four cells per word (the local relief)
     TRefCountPtr<FRDGPooledBuffer> Water;
+};
+
+/** The GPU copy of an FVoxelLandNoiseSet (render thread only): its chain's words. */
+struct FVoxelLandNoiseGPU
+{
+    TRefCountPtr<FRDGPooledBuffer> Words;
 };
 
 /** Declared in the shader by VoxelLandParameters.ush, read by VoxelLandSample.ush and the land
@@ -35,6 +42,8 @@ BEGIN_SHADER_PARAMETER_STRUCT(FVoxelLandShaderParameters, )
     SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<float2>, LandTanTable)
     SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, LandFlow)
     SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, LandForm)
+    SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, LandRelief)
+    SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, LandNoise)
     SHADER_PARAMETER(uint32, LandN)
     SHADER_PARAMETER(uint32, LandPad)
     SHADER_PARAMETER(uint32, LandHasFlow)
@@ -54,6 +63,14 @@ BEGIN_SHADER_PARAMETER_STRUCT(FVoxelLandShaderParameters, )
     SHADER_PARAMETER(FVector2f, LandHillFrequency)
     SHADER_PARAMETER(uint32, LandHillOctaves)
     SHADER_PARAMETER(uint32, LandHillSeed)
+    SHADER_PARAMETER(float, LandPeakStrength)
+    SHADER_PARAMETER(uint32, LandPeakOctaves)
+    SHADER_PARAMETER(uint32, LandPeakSeed)
+    SHADER_PARAMETER(uint32, LandNoiseN)
+    SHADER_PARAMETER(uint32, LandNoiseMips)
+    SHADER_PARAMETER(uint32, LandNoiseCellShift)
+    SHADER_PARAMETER(float, LandPeakMeanShape)
+    SHADER_PARAMETER(float, LandPeakMeanG)
 END_SHADER_PARAMETER_STRUCT()
 
 /** The land debug views' inputs (VoxelLandDebug.ush, declared in VoxelBrickMesherGPU.usf):

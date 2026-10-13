@@ -58,17 +58,18 @@ namespace VoxelShader
 }
 using namespace VoxelShader;
 
-static void Textures(const FMaterialTextures& T, Texture2D& H, Texture2D& F, Texture2D& C)
+static void Textures(const FMaterialTextures& T, Texture2D& H, Texture2D& F, Texture2D& C, Texture2D& N)
 {
     H = Texture2D{ T.Height, T.Side, 6 * T.Side };
     F = Texture2D{ T.Fields, T.Side, 6 * T.Side };
     C = Texture2D{ T.Constants, VOXEL_LAND_MATERIAL_CONST_WIDTH, T.Rows };
+    N = Texture2D{ T.Noise, T.NoiseN, T.NoiseRows };
 }
 
 FMaterialHeight MaterialLandHeight(const FMaterialTextures& T, const float X[2], const float Y[2], const float Z[2], float Footprint, bool bGradient)
 {
-    Texture2D H, F, C; Textures(T, H, F, C);
-    const FVoxelLandHeight L = VoxelLandHeightDF(H, F, C, float2(X[0], X[1]), float2(Y[0], Y[1]), float2(Z[0], Z[1]), Footprint, bGradient);
+    Texture2D H, F, C, N; Textures(T, H, F, C, N);
+    const FVoxelLandHeight L = VoxelLandHeightDF(H, F, C, N, float2(X[0], X[1]), float2(Y[0], Y[1]), float2(Z[0], Z[1]), Footprint, bGradient);
     FMaterialHeight O;
     O.Height[0] = L.Height.x; O.Height[1] = L.Height.y;
     O.Bake = L.Bake; O.Gully = L.Gully; O.Detail = L.Detail; O.GullyScale = L.GullyScale; O.Flow = L.Flow; O.DetailScale = L.DetailScale;
@@ -78,15 +79,17 @@ FMaterialHeight MaterialLandHeight(const FMaterialTextures& T, const float X[2],
     O.DetailUnit = L.DetailUnit; O.DetailAmplitudeM = L.DetailAmplitudeM;
     O.Hills = L.Hills; O.HillUnit = L.HillUnit; O.HillAmplitudeM = L.HillAmplitudeM;
     O.HillGradient[0] = L.HillGradient.x; O.HillGradient[1] = L.HillGradient.y; O.HillGradient[2] = L.HillGradient.z;
+    O.Peaks = L.Peaks; O.PeakUnit = L.PeakUnit; O.PeakAmplitudeM = L.PeakAmplitudeM;
+    O.PeakGradient[0] = L.PeakGradient.x; O.PeakGradient[1] = L.PeakGradient.y; O.PeakGradient[2] = L.PeakGradient.z;
     return O;
 }
 
-uint32_t MaterialAttr(const FMaterialTextures& T, uint32_t Cell) { Texture2D H, F, C; Textures(T, H, F, C); return AttrAt(H, F, C, Cell); }
-float MaterialWater(const FMaterialTextures& T, uint32_t Cell) { Texture2D H, F, C; Textures(T, H, F, C); return WaterAt(H, F, C, Cell); }
+uint32_t MaterialAttr(const FMaterialTextures& T, uint32_t Cell) { Texture2D H, F, C, N; Textures(T, H, F, C, N); return AttrAt(H, F, C, Cell); }
+float MaterialWater(const FMaterialTextures& T, uint32_t Cell) { Texture2D H, F, C, N; Textures(T, H, F, C, N); return WaterAt(H, F, C, Cell); }
 
 void MaterialOctave(const FMaterialTextures& T, uint32_t I, void* Out)
 {
-    Texture2D H, F, C; Textures(T, H, F, C);
+    Texture2D H, F, C, N; Textures(T, H, F, C, N);
     const FVoxelOctave O = VoxelLandMaterialOctave(C, I);
     static_assert(sizeof(FVoxelOctave) == 80, "FVoxelOctave layout");
     std::memcpy(Out, &O, 80);
@@ -94,14 +97,15 @@ void MaterialOctave(const FMaterialTextures& T, uint32_t I, void* Out)
 
 void MaterialDebugColor(const FMaterialTextures& T, uint32_t Mode, const FMaterialHeight& L, float CellM, float Out[3])
 {
-    Texture2D H, F, C; Textures(T, H, F, C);
+    Texture2D H, F, C, N; Textures(T, H, F, C, N);
     FVoxelLandDebugInput In;
     In.Mode = Mode; In.Elevation = L.Bake + L.Gully; In.SlopeDegrees = 12.0f; In.CellM = CellM;
     In.Warped = float3(L.Warped[0], L.Warped[1], L.Warped[2]);
     In.Bake = L.Bake; In.Gully = L.Gully; In.GullyScale = L.GullyScale; In.Hills = L.Hills;
+    In.Peaks = L.Peaks; In.PeakAmplitude = L.PeakAmplitudeM;
     In.DetailNorm = L.Detail / 250.0f;
     In.bTerrestrial = true; In.bHydro = true;
-    const float3 Color = VoxelLandDebugColor(H, F, C, In);
+    const float3 Color = VoxelLandDebugColor(H, F, C, N, In);
     Out[0] = Color.x; Out[1] = Color.y; Out[2] = Color.z;
     (void)CellMOf;
 }

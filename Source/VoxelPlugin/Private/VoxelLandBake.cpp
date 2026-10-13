@@ -3,6 +3,8 @@
 #include "VoxelLandSolve.h"
 #include "VoxelDensityGPU.h"
 #include "VoxelGPUCommon.h"
+#include "VoxelLandRelief.h"
+#include "VoxelNoiseTiles.h"
 #include "VoxelPlugin.h"
 #include "VoxelShaderCompat.h"
 #include "GlobalShader.h"
@@ -18,7 +20,9 @@
 #include "Misc/FileHelper.h"
 #include "Misc/Guid.h"
 #include "Misc/Crc.h"
+#include "Misc/CoreDelegates.h"
 #include "Misc/Paths.h"
+#include "Interfaces/IPluginManager.h"
 #include "Math/RandomStream.h"
 #include <atomic>
 
@@ -307,6 +311,7 @@ namespace VoxelLandBakeDetail
             }, EParallelForFlags::BackgroundPriority);
         if (Cancelled()) return nullptr;
         Bake->UpdateRange();
+        Bake->BuildRelief();
         // Checked here, on the worker (a scan of every cell).
         if (!VoxelLandCache::IsUsable(*Bake)) return nullptr;
         return Bake;
@@ -337,8 +342,12 @@ uint32 FVoxelTerrestrialSettings::GetSettingsHash() const
 {
     uint32 H = GetBakeHash();
     for (const double V : { BakeWarp, DetailAmplitude, DetailWavelength, DetailSlopeDamping,
-        GullyStrength, GullyFinestWavelength, GullyFlowGain, GullyDetailScale, HillRelief, HillWavelength, HillFinestWavelength })
+        GullyStrength, GullyFinestWavelength, GullyFlowGain, GullyDetailScale, HillRelief, HillWavelength, HillFinestWavelength,
+        PeakStrength, PeakFinestWavelength })
         H = HashCombine(H, ::GetTypeHash(V));
+    // FString's hash is found by argument-dependent lookup only (not at global scope).
+    const FString NoiseSetName = PeakNoiseSet.TrimStartAndEnd();
+    H = HashCombine(H, GetTypeHash(NoiseSetName));
     return H;
 }
 
@@ -387,6 +396,383 @@ void FVoxelLandBake::UpdateRange()
         MinHeight = FMath::Min(MinHeight, H);
         MaxHeight = FMath::Max(MaxHeight, H);
     }
+}
+
+void FVoxelLandBake::BuildRelief()
+{
+    const int32 S = Side();
+    Relief.SetNumZeroed(Height.Num());
+    MaxRelief = 0.0f;
+    if (Height.Num() != NumCells()) return;
+    ParallelFor(6 * S, [this, S](int32 Row)
+        {
+            VoxelLandRelief::BuildRow(Height.GetData(), S, Row / S, Row % S, Relief.GetData());
+        }, EParallelForFlags::BackgroundPriority);
+    uint8 Max = 0;
+    for (const uint8 Q : Relief)
+        Max = FMath::Max(Max, Q);
+    MaxRelief = VoxelLandRelief::Decode(Max);
+}
+
+// ---------------------------------------------------------------------------------------------
+// The peaks' noise set
+// ---------------------------------------------------------------------------------------------
+
+FVoxelLandNoiseSet::FVoxelLandNoiseSet()
+    : GPU(MakeShared<FVoxelLandNoiseGPU, ESPMode::ThreadSafe>())
+{
+}
+
+FVoxelLandNoiseSet::~FVoxelLandNoiseSet()
+{
+    if (GPU.IsValid())
+    {
+        TSharedPtr<FVoxelLandNoiseGPU, ESPMode::ThreadSafe> Resource = MoveTemp(GPU);
+        ENQUEUE_RENDER_COMMAND(VoxelLandReleaseNoise)([Resource](FRHICommandListImmediate&) mutable
+            {
+                Resource.Reset();
+            });
+    }
+}
+
+const TCHAR* VoxelLand::GeneratedNoiseName = TEXT("generated");
+
+namespace VoxelLandNoiseDetail
+{
+    // The generated set's seed: one set for every planet (each planet offsets and turns it by its
+    // own seed, VoxelLandPeaks.ush).
+    constexpr uint32 PeakSetSeed = 0x7065616bu;
+
+    /** A set by name. The densities that sample it hold it; the registry only watches it (and
+     *  keeps the few most recent alive: Recent), so a set nobody uses any more goes, with its GPU
+     *  copy, and is read again if asked for. */
+    struct FEntry
+    {
+        TWeakPtr<const FVoxelLandNoiseSet, ESPMode::ThreadSafe> Set;
+        bool bReady = false;
+        bool bNone = false;       // ready, and none could be made (the peaks are off)
+        bool bPending = false;
+    };
+
+    // The sets kept alive whatever uses them: those just made, so a planet that waited for one
+    // finds it when it builds its density.
+    constexpr int32 RecentCount = 4;
+
+    FCriticalSection Lock;        // Entries, Recent, the folder's list, the flags (held briefly)
+    FCriticalSection MakeLock;    // one set made at a time (held while reading or generating)
+    TMap<FString, FEntry> Entries;
+    TArray<TSharedPtr<const FVoxelLandNoiseSet, ESPMode::ThreadSafe>> Recent;
+    FString Directory;            // NoiseSetDirectory, found on the game thread (StartupModule)
+    bool bDirectoryKnown = false;
+    TArray<FString> AuthoredPeaks;
+    bool bListed = false;
+    bool bExitHooked = false;
+    bool bClosed = false;         // ReleasePeakNoise ran (the engine is exiting)
+
+    /** The sampler's set from a checked FSet's header (CheckPeaks) and its words (the chain,
+     *  padded to whole rows: FVoxelLandNoiseSet::Words). */
+    TSharedPtr<FVoxelLandNoiseSet, ESPMode::ThreadSafe> Finish(const VoxelNoiseTiles::FSet& Set, TArray<uint32>&& Words)
+    {
+        const TSharedPtr<FVoxelLandNoiseSet, ESPMode::ThreadSafe> Out = MakeShared<FVoxelLandNoiseSet, ESPMode::ThreadSafe>();
+        Out->Name = UTF8_TO_TCHAR(Set.Name.c_str());
+        Out->LookTag = UTF8_TO_TCHAR(Set.LookTag.c_str());
+        Out->N = Set.N;
+        Out->Mips = Set.Mips;
+        Out->Rows = (uint32)((VoxelNoiseTiles::ChainTexels(Set.N) + Set.N - 1) / Set.N);
+        Out->CellShift = (uint32)FMath::FloorLog2(Set.N / Set.Channel[0].CellsPerTile);
+        Out->Words = MoveTemp(Words);
+        // The means in unit values (0..1 over each channel's range): what the shader sees.
+        auto Unit = [&Set](int Channel, double V) {
+            const VoxelNoiseTiles::FChannel& C = Set.Channel[Channel];
+            return (V - (double)C.Min) / FMath::Max((double)C.Max - (double)C.Min, 1e-12);
+        };
+        // The summit-scaled pyramid's mean (VOXEL_LAND_PEAK_SUMMIT_LO and _RANGE: 0.6 + 0.8 A),
+        // and the ridged channel's.
+        const uint16* Texels = (const uint16*)Out->Words.GetData();
+        Out->MeanShape = (float)VoxelNoiseTiles::MeanOf2(Set, Texels, 0, 3, [&](double R, double A) { return (0.6 + 0.8 * Unit(3, A)) * Unit(0, R); });
+        Out->MeanG = (float)VoxelNoiseTiles::MeanOf(Set, Texels, 1, [&](double V) { return Unit(1, V); });
+        return Out;
+    }
+
+    /** The plugin's own `peaks` set. */
+    TSharedPtr<const FVoxelLandNoiseSet, ESPMode::ThreadSafe> Generate()
+    {
+        const double Start = FPlatformTime::Seconds();
+        VoxelNoiseTiles::FSet Set = VoxelNoiseTiles::PeaksDefinition(PeakSetSeed);
+        VoxelNoiseTiles::Generate(Set, [](int32 Count, auto&& Body)
+            {
+                ParallelFor(Count, [&Body](int32 i) { Body(i); }, EParallelForFlags::BackgroundPriority);
+            });
+        Set.Name = TCHAR_TO_UTF8(VoxelLand::GeneratedNoiseName);
+        const std::string Error = VoxelNoiseTiles::CheckPeaks(Set);
+        if (!Error.empty() || !Set.IsValid())
+        {
+            UE_LOG(LogVoxelPlugin, Error, TEXT("[VoxelLand] The generated peaks' noise set is malformed (%s); the peaks are off."), UTF8_TO_TCHAR(Error.c_str()));
+            return nullptr;
+        }
+        const uint32 Rows = (uint32)((VoxelNoiseTiles::ChainTexels(Set.N) + Set.N - 1) / Set.N);
+        TArray<uint32> Words;
+        Words.SetNumZeroed(2 * Rows * Set.N);
+        FMemory::Memcpy(Words.GetData(), Set.Texels.data(), Set.Texels.size() * sizeof(uint16));
+        const TSharedPtr<const FVoxelLandNoiseSet, ESPMode::ThreadSafe> Out = Finish(Set, MoveTemp(Words));
+        UE_LOG(LogVoxelPlugin, Log, TEXT("[VoxelLand] Generated the peaks' noise set (%u^2, %u mips) in %.2f s."), Out->N, Out->Mips,
+            FPlatformTime::Seconds() - Start);
+        return Out;
+    }
+
+    /** An authored set from NoiseSetDirectory()/Name.vxnt: the header checked, then the texels
+     *  read straight into the words. Null (and Error) if it can't be used. */
+    TSharedPtr<const FVoxelLandNoiseSet, ESPMode::ThreadSafe> Read(const FString& Name, FString& Error)
+    {
+        const double Start = FPlatformTime::Seconds();
+        const FString Folder = VoxelLand::NoiseSetDirectory();
+        if (Folder.IsEmpty())
+        {
+            Error = TEXT("the plugin's NoiseSets folder wasn't found");
+            return nullptr;
+        }
+        const FString Path = FPaths::Combine(Folder, Name + TEXT(".vxnt"));
+        const TUniquePtr<FArchive> File(IFileManager::Get().CreateFileReader(*Path));
+        if (!File.IsValid())
+        {
+            Error = FString::Printf(TEXT("%s isn't there"), *Path);
+            return nullptr;
+        }
+        const int64 FileSize = File->TotalSize();
+        if (FileSize <= 0)
+        {
+            Error = FString::Printf(TEXT("%s is empty or unreadable"), *Path);
+            return nullptr;
+        }
+        TArray<uint8> Header;
+        Header.SetNumZeroed((int32)FMath::Min<int64>(FileSize, 4096));
+        File->Serialize(Header.GetData(), Header.Num());
+        VoxelNoiseTiles::FSet Set;
+        uint64_t DataOffset = 0;
+        std::string Why = VoxelNoiseTiles::ReadVxntHeader(Header.GetData(), (size_t)Header.Num(), (uint64_t)FileSize, Set, DataOffset);
+        if (Why.empty())
+            Why = VoxelNoiseTiles::CheckPeaks(Set);
+        if (!Why.empty() || File->IsError())
+        {
+            Error = FString::Printf(TEXT("%s: %s"), *Path, Why.empty() ? TEXT("unreadable") : UTF8_TO_TCHAR(Why.c_str()));
+            return nullptr;
+        }
+        const uint64 Texels = VoxelNoiseTiles::ChainTexels(Set.N);
+        const uint32 Rows = (uint32)((Texels + Set.N - 1) / Set.N);
+        TArray<uint32> Words;
+        Words.SetNumUninitialized(2 * Rows * Set.N);
+        // The texels as they lie (u16 little-endian, R G B A: two words a texel), then the
+        // padding of the last row.
+        File->Seek((int64)DataOffset);
+        File->Serialize(Words.GetData(), (int64)(Texels * 8));
+        FMemory::Memzero(Words.GetData() + 2 * Texels, (Words.Num() - 2 * Texels) * sizeof(uint32));
+        if (File->IsError())
+        {
+            Error = FString::Printf(TEXT("%s: the texels couldn't be read"), *Path);
+            return nullptr;
+        }
+        const TSharedPtr<FVoxelLandNoiseSet, ESPMode::ThreadSafe> Out = Finish(Set, MoveTemp(Words));
+        // The name it's asked by (the file's), whatever the header calls it.
+        Out->Name = Name;
+        UE_LOG(LogVoxelPlugin, Log, TEXT("[VoxelLand] Read the peaks' noise set %s (%u^2, %u mips, \"%s\") in %.2f s."), *Name, Out->N, Out->Mips,
+            *Out->LookTag, FPlatformTime::Seconds() - Start);
+        return Out;
+    }
+
+    /** Stores Set under Name (Lock taken here). */
+    void Store(const FString& Name, const TSharedPtr<const FVoxelLandNoiseSet, ESPMode::ThreadSafe>& Set)
+    {
+        FScopeLock ScopeLock(&Lock);
+        if (bClosed) return;
+        FEntry& Entry = Entries.FindOrAdd(Name);
+        Entry.Set = Set;
+        Entry.bNone = !Set.IsValid();
+        Entry.bReady = true;
+        if (Set.IsValid())
+        {
+            Recent.Remove(Set);
+            Recent.Insert(Set, 0);
+            if (Recent.Num() > RecentCount) Recent.SetNum(RecentCount);
+        }
+        // Dropped before the RHI goes (each set's GPU copy is released on the render thread).
+        if (!bExitHooked)
+        {
+            bExitHooked = true;
+            FCoreDelegates::OnEnginePreExit.AddStatic(&VoxelLand::ReleasePeakNoise);
+        }
+    }
+
+    /** Whether Name's set is there (Lock held): its set (null if none could be made). */
+    bool FindReadyLocked(const FString& Name, TSharedPtr<const FVoxelLandNoiseSet, ESPMode::ThreadSafe>& Out)
+    {
+        const FEntry* Entry = Entries.Find(Name);
+        if (!Entry || !Entry->bReady) return false;
+        Out = Entry->Set.Pin();
+        return Entry->bNone || Out.IsValid();
+    }
+
+    bool FindReady(const FString& Name, TSharedPtr<const FVoxelLandNoiseSet, ESPMode::ThreadSafe>& Out)
+    {
+        FScopeLock ScopeLock(&Lock);
+        return FindReadyLocked(Name, Out);
+    }
+
+    /** The generated set (MakeLock held). */
+    TSharedPtr<const FVoxelLandNoiseSet, ESPMode::ThreadSafe> GeneratedLocked()
+    {
+        TSharedPtr<const FVoxelLandNoiseSet, ESPMode::ThreadSafe> Set;
+        if (FindReady(VoxelLand::GeneratedNoiseName, Set)) return Set;
+        Set = Generate();
+        Store(VoxelLand::GeneratedNoiseName, Set);
+        return Set;
+    }
+
+    /** A set name as the setting gives it: trimmed, without a .vxnt; empty if it names a path. */
+    FString CleanName(const FString& In)
+    {
+        FString Name = In.TrimStartAndEnd();
+        Name.RemoveFromEnd(TEXT(".vxnt"), ESearchCase::IgnoreCase);
+        if (Name.Contains(TEXT("/")) || Name.Contains(TEXT("\\")) || Name.Contains(TEXT("..")) || Name.Contains(TEXT(":")))
+        {
+            UE_LOG(LogVoxelPlugin, Warning, TEXT("[VoxelLand] PeakNoiseSet \"%s\" isn't a set name (a file name in %s without .vxnt); picking by the seed."),
+                *In, *VoxelLand::NoiseSetDirectory());
+            return FString();
+        }
+        return Name;
+    }
+
+    /** Lists the folder's usable peaks sets (Lock held, Directory known; once a session): their
+     *  headers read and checked, so a file the peaks can't use doesn't take a share of the
+     *  planets. A few small reads, on the game thread the first time a planet asks. */
+    void ListLocked()
+    {
+        if (bListed) return;
+        bListed = true;
+        const FString Folder = Directory;
+        TArray<FString> Files;
+        if (!Folder.IsEmpty())
+            IFileManager::Get().FindFiles(Files, *FPaths::Combine(Folder, TEXT("peaks*.vxnt")), true, false);
+        Files.Sort();
+        for (const FString& File : Files)
+        {
+            const FString Path = FPaths::Combine(Folder, File);
+            const TUniquePtr<FArchive> Reader(IFileManager::Get().CreateFileReader(*Path));
+            const int64 Size = Reader.IsValid() ? Reader->TotalSize() : 0;
+            TArray<uint8> Header;
+            Header.SetNumZeroed((int32)FMath::Clamp<int64>(Size, 0, 4096));
+            if (Header.Num() > 0) Reader->Serialize(Header.GetData(), Header.Num());
+            VoxelNoiseTiles::FSet Set;
+            uint64_t DataOffset = 0;
+            std::string Why = Header.Num() > 0 && !Reader->IsError()
+                ? VoxelNoiseTiles::ReadVxntHeader(Header.GetData(), (size_t)Header.Num(), (uint64_t)Size, Set, DataOffset) : std::string("unreadable");
+            if (Why.empty()) Why = VoxelNoiseTiles::CheckPeaks(Set);
+            if (Why.empty())
+                AuthoredPeaks.Add(FPaths::GetBaseFilename(File));
+            else
+                UE_LOG(LogVoxelPlugin, Warning, TEXT("[VoxelLand] %s isn't a usable peaks set (%s); left out."), *Path, UTF8_TO_TCHAR(Why.c_str()));
+        }
+        UE_LOG(LogVoxelPlugin, Log, TEXT("[VoxelLand] Peaks noise sets in %s: %s."), *Folder,
+            AuthoredPeaks.Num() > 0 ? *FString::Join(AuthoredPeaks, TEXT(", ")) : TEXT("none (the generated set stands in)"));
+    }
+}
+
+FString VoxelLand::NoiseSetDirectory()
+{
+    using namespace VoxelLandNoiseDetail;
+    FScopeLock ScopeLock(&Lock);
+    // Found once, on the game thread (StartupModule calls this first): the plugin manager isn't
+    // for workers.
+    if (!bDirectoryKnown && IsInGameThread())
+    {
+        bDirectoryKnown = true;
+        const TSharedPtr<IPlugin> Plugin = IPluginManager::Get().FindPlugin(TEXT("VoxelPlugin"));
+        Directory = Plugin.IsValid() ? FPaths::Combine(Plugin->GetBaseDir(), TEXT("NoiseSets")) : FString();
+    }
+    return Directory;
+}
+
+FString VoxelLand::PeakNoiseNameFor(const FVoxelTerrestrialSettings& Settings)
+{
+    using namespace VoxelLandNoiseDetail;
+    const FString Chosen = CleanName(Settings.PeakNoiseSet);
+    if (!Chosen.IsEmpty()) return Chosen;
+    NoiseSetDirectory();
+    FScopeLock ScopeLock(&Lock);
+    ListLocked();
+    if (AuthoredPeaks.Num() == 0) return GeneratedNoiseName;
+    // By the seed, rendezvous-hashed (the set with the highest hash of the seed and its name):
+    // adding or removing a set moves only the planets that pick it. Name it in PeakNoiseSet to
+    // keep a planet's set whatever the folder holds.
+    const FString* Best = nullptr;
+    uint32 BestScore = 0;
+    for (const FString& Name : AuthoredPeaks)
+    {
+        const uint32 Score = VoxelNoiseTiles::Mix((uint32)Settings.Seed ^ VoxelNoiseTiles::Mix(FCrc::StrCrc32(*Name.ToLower()) + 0x7065616bu));
+        if (!Best || Score > BestScore) { Best = &Name; BestScore = Score; }
+    }
+    return *Best;
+}
+
+TSharedPtr<const FVoxelLandNoiseSet, ESPMode::ThreadSafe> VoxelLand::GetPeakNoise(const FString& Name)
+{
+    using namespace VoxelLandNoiseDetail;
+    TSharedPtr<const FVoxelLandNoiseSet, ESPMode::ThreadSafe> Set;
+    if (FindReady(Name, Set)) return Set;
+    FScopeLock MakeScope(&MakeLock);
+    // Made meanwhile by another thread?
+    if (FindReady(Name, Set)) return Set;
+    if (Name == GeneratedNoiseName) return GeneratedLocked();
+    FString Error;
+    Set = Read(Name, Error);
+    if (!Set.IsValid())
+    {
+        // Kept under the name while a planet uses it (the error isn't repeated meanwhile); asked
+        // for again after that, the file is read again.
+        UE_LOG(LogVoxelPlugin, Error, TEXT("[VoxelLand] The peaks' noise set %s can't be used (%s); the generated set stands in."), *Name, *Error);
+        Set = GeneratedLocked();
+    }
+    Store(Name, Set);
+    return Set;
+}
+
+bool VoxelLand::TryGetPeakNoise(const FString& Name, TSharedPtr<const FVoxelLandNoiseSet, ESPMode::ThreadSafe>& Out)
+{
+    using namespace VoxelLandNoiseDetail;
+    TSharedPtr<const FVoxelLandNoiseSet, ESPMode::ThreadSafe> Set;
+    if (!FindReady(Name, Set)) return false;
+    Out = MoveTemp(Set);
+    return true;
+}
+
+void VoxelLand::PrewarmPeakNoise(const FString& Name)
+{
+    using namespace VoxelLandNoiseDetail;
+    {
+        FScopeLock ScopeLock(&Lock);
+        if (bClosed) return;
+        TSharedPtr<const FVoxelLandNoiseSet, ESPMode::ThreadSafe> Set;
+        if (FindReadyLocked(Name, Set)) return;
+        FEntry& Entry = Entries.FindOrAdd(Name);
+        if (Entry.bPending) return;
+        Entry.bPending = true;
+    }
+    Async(EAsyncExecution::ThreadPool, [Name]()
+        {
+            GetPeakNoise(Name);
+            FScopeLock ScopeLock(&VoxelLandNoiseDetail::Lock);
+            if (VoxelLandNoiseDetail::FEntry* Entry = VoxelLandNoiseDetail::Entries.Find(Name))
+                Entry->bPending = false;
+        });
+}
+
+void VoxelLand::ReleasePeakNoise()
+{
+    using namespace VoxelLandNoiseDetail;
+    FScopeLock ScopeLock(&Lock);
+    // The engine is exiting: a set still being made is handed to its caller but not kept.
+    bClosed = true;
+    Entries.Empty();
+    Recent.Empty();
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -454,6 +840,24 @@ double VoxelLand::HillFinestFrequency(const FVoxelTerrestrialSettings& Settings)
     return 1.0 / FinestCm;
 }
 
+int32 VoxelLand::PeakOctavesFor(const FVoxelTerrestrialSettings& Settings, const FVoxelLandBake& Bake)
+{
+    if (Settings.PeakStrength <= 0.0) return 0;
+    // From two bake cells (the gullies' lambda0), halving, while at least the finest.
+    const double Lambda0 = 2.0 * CellArc(Bake.SeaRadius, Bake.N) * 0.01;
+    const double Finest = FMath::Max(Settings.PeakFinestWavelength, 1.0);
+    if (Lambda0 < Finest) return 1;
+    return FMath::Clamp(FMath::FloorToInt(FMath::Log2(Lambda0 / Finest)) + 1, 1, PeakMaxOctaves);
+}
+
+double VoxelLand::PeakReach(const FVoxelTerrestrialSettings& Settings, const FVoxelLandBake& Bake, bool bUp)
+{
+    // The amplitude is at most the strength times the largest local relief; the shape within
+    // PeakMinUnit .. PeakMaxUnit (the face blend and the B-splines are convex).
+    if (PeakOctavesFor(Settings, Bake) == 0) return 0.0;
+    return (bUp ? PeakMaxUnit : PeakMinUnit) * FMath::Max(Settings.PeakStrength, 0.0) * (double)Bake.MaxRelief * 100.0;
+}
+
 double VoxelLand::GullyReach(const FVoxelTerrestrialSettings& Settings, const FVoxelLandBake& Bake)
 {
     // Each octave is half its depth times a value in -1..1, its depth at most strength x
@@ -476,12 +880,13 @@ void VoxelLand::ShapeFor(const FVoxelTerrestrialSettings& Settings, const FVoxel
     // The B-spline and the face blend are convex combinations of the cells, so the bake's
     // range holds; the detail reaches at most about 2.4 times its amplitude (MakeLayer's
     // normalisation), the gullies GullyReach either way, the hills HillMaxUnit times their
-    // relief (up; down by less), and a metre of margin either side.
+    // relief (up; down by less), the peaks PeakReach up (and down from the land's lowest, sea
+    // level), and a metre of margin either side.
     const double DetailReach = 2.5 * FMath::Max(Settings.DetailAmplitude, 0.0) * 100.0;
     const double HillReach = HillMaxUnit * FMath::Max(Settings.HillRelief, 0.0) * 100.0;
     const double Reach = DetailReach + GullyReach(Settings, Bake) + HillReach + 100.0;
-    const double Low = (double)Bake.MinHeight * 100.0 - Reach;
-    const double High = (double)Bake.MaxHeight * 100.0 + Reach;
+    const double Low = FMath::Min((double)Bake.MinHeight * 100.0, -PeakReach(Settings, Bake, false)) - Reach;
+    const double High = (double)Bake.MaxHeight * 100.0 + PeakReach(Settings, Bake, true) + Reach;
     OutPlanetRadius = FMath::Max(Bake.SeaRadius + Low, 1.0);
     OutNoiseAmplitude = FMath::Max(High - Low, 1.0);
 }
@@ -681,6 +1086,7 @@ namespace VoxelLandCache
         Take(Bake->Lakes.GetData(), (int64)Header.LakeCount * sizeof(FVoxelLandLake));
         Bake->BuildTanTable();
         Bake->UpdateRange();
+        Bake->BuildRelief();
         if (!IsUsable(*Bake))
         {
             UE_LOG(LogVoxelPlugin, Warning, TEXT("[VoxelLand] Cache file %s holds an invalid bake; baking again."), *Path);
@@ -1062,6 +1468,10 @@ FVoxelLandBaker::FVoxelLandBaker(const FVoxelTerrestrialSettings& InSettings, do
     , Key(VoxelLand::BakeKey(InSettings, InSeaRadius))
     , N(VoxelLand::BakeResolutionFor(InSettings))
 {
+    // The peaks' noise set, read or generated meanwhile (the density takes it once the bake is
+    // ready).
+    if (InSettings.PeakStrength > 0.0)
+        VoxelLand::PrewarmPeakNoise(VoxelLand::PeakNoiseNameFor(InSettings));
 }
 
 namespace VoxelLandBakeDetail
@@ -1223,6 +1633,7 @@ void FVoxelLandBaker::Tick()
                     Bake->Flow[i] = FFloat16(R->Flow[i]);
                 }
                 Bake->UpdateRange();
+                Bake->BuildRelief();
                 return VoxelLandCache::IsUsable(*Bake) ? Bake : nullptr;
             });
         State = EState::GpuAssembling;
@@ -1377,6 +1788,14 @@ FVoxelLandShaderParameters VoxelLandGPU::GetParameters(FRDGBuilder& GraphBuilder
     Parameters.LandHillFrequency = FVector2f::ZeroVector;
     Parameters.LandHillOctaves = 0;
     Parameters.LandHillSeed = 0;
+    Parameters.LandPeakStrength = 0.0f;
+    Parameters.LandPeakOctaves = 0;
+    Parameters.LandPeakSeed = 0;
+    Parameters.LandNoiseN = 0;
+    Parameters.LandNoiseMips = 0;
+    Parameters.LandNoiseCellShift = 0;
+    Parameters.LandPeakMeanShape = 0.0f;
+    Parameters.LandPeakMeanG = 0.0f;
 
     const FVoxelLandBake* Bake = Density.LandMode != 0 ? Density.Land.Get() : nullptr;
     if (Bake && Bake->GPU.IsValid() && Bake->Height.Num() == Bake->NumCells() && Bake->TanTable.Num() == Bake->Side())
@@ -1397,16 +1816,49 @@ FVoxelLandShaderParameters VoxelLandGPU::GetParameters(FRDGBuilder& GraphBuilder
             Resource.Flow = GraphBuilder.ConvertToExternalBuffer(
                 VoxelGPUCommon::UploadStructuredBuffer(GraphBuilder, TEXT("Voxel.LandFlow"), MakeConstArrayView(Packed)));
         }
-        // The landform shapes the hills.
-        const bool bHasForm = Bake->Form.Num() == Bake->NumCells();
+        // The landform shapes the hills and the peaks; the local relief scales the peaks.
+        const bool bHasForm = Bake->Form.Num() == Bake->NumCells() && Bake->Relief.Num() == Bake->NumCells();
         if (bHasForm && !Resource.Form.IsValid())
         {
             const TArray<uint32> Packed = VoxelLandBakeDetail::PackHalves(Bake->Form.Num(), [Bake](int32 i) { return (uint32)Bake->Form[i]; });
             Resource.Form = GraphBuilder.ConvertToExternalBuffer(
                 VoxelGPUCommon::UploadStructuredBuffer(GraphBuilder, TEXT("Voxel.LandForm"), MakeConstArrayView(Packed)));
         }
+        if (bHasForm && !Resource.Relief.IsValid())
+        {
+            // Four cells per word, the lowest index in the low byte.
+            TArray<uint32> Packed;
+            Packed.SetNumZeroed((Bake->Relief.Num() + 3) / 4);
+            for (int32 i = 0; i < Bake->Relief.Num(); i++)
+                Packed[i >> 2] |= (uint32)Bake->Relief[i] << ((i & 3) * 8);
+            Resource.Relief = GraphBuilder.ConvertToExternalBuffer(
+                VoxelGPUCommon::UploadStructuredBuffer(GraphBuilder, TEXT("Voxel.LandRelief"), MakeConstArrayView(Packed)));
+        }
         Parameters.LandForm = bHasForm ? GraphBuilder.CreateSRV(GraphBuilder.RegisterExternalBuffer(Resource.Form))
             : GraphBuilder.CreateSRV(VoxelGPUCommon::UploadStructuredBuffer<uint32>(GraphBuilder, TEXT("Voxel.LandFormNone"), TConstArrayView<uint32>()));
+        Parameters.LandRelief = bHasForm ? GraphBuilder.CreateSRV(GraphBuilder.RegisterExternalBuffer(Resource.Relief))
+            : GraphBuilder.CreateSRV(VoxelGPUCommon::UploadStructuredBuffer<uint32>(GraphBuilder, TEXT("Voxel.LandReliefNone"), TConstArrayView<uint32>()));
+        // The peaks' noise set (shared by the planets that use it: uploaded once).
+        const FVoxelLandNoiseSet* Noise = Density.LandNoise.Get();
+        const bool bHasNoise = Noise && Noise->GPU.IsValid() && Noise->IsComplete();
+        if (bHasNoise && !Noise->GPU->Words.IsValid())
+        {
+            Noise->GPU->Words = GraphBuilder.ConvertToExternalBuffer(
+                VoxelGPUCommon::UploadStructuredBuffer(GraphBuilder, TEXT("Voxel.LandNoise"), MakeConstArrayView(Noise->Words)));
+        }
+        Parameters.LandNoise = bHasNoise ? GraphBuilder.CreateSRV(GraphBuilder.RegisterExternalBuffer(Noise->GPU->Words))
+            : GraphBuilder.CreateSRV(VoxelGPUCommon::UploadStructuredBuffer<uint32>(GraphBuilder, TEXT("Voxel.LandNoiseNone"), TConstArrayView<uint32>()));
+        if (bHasNoise)
+        {
+            Parameters.LandPeakStrength = Density.LandPeakStrength;
+            Parameters.LandPeakOctaves = Density.LandPeakOctaves;
+            Parameters.LandPeakSeed = Density.LandPeakSeed;
+            Parameters.LandNoiseN = Noise->N;
+            Parameters.LandNoiseMips = Noise->Mips;
+            Parameters.LandNoiseCellShift = Noise->CellShift;
+            Parameters.LandPeakMeanShape = Noise->MeanShape;
+            Parameters.LandPeakMeanG = Noise->MeanG;
+        }
         Parameters.LandHasForm = bHasForm ? 1u : 0u;
         Parameters.LandHeight = GraphBuilder.CreateSRV(GraphBuilder.RegisterExternalBuffer(Resource.Height));
         Parameters.LandTanTable = GraphBuilder.CreateSRV(GraphBuilder.RegisterExternalBuffer(Resource.TanTable));
@@ -1439,6 +1891,8 @@ FVoxelLandShaderParameters VoxelLandGPU::GetParameters(FRDGBuilder& GraphBuilder
     Parameters.LandTanTable = GraphBuilder.CreateSRV(VoxelGPUCommon::UploadStructuredBuffer<FVector2f>(GraphBuilder, TEXT("Voxel.LandTanTableNone"), TConstArrayView<FVector2f>()));
     Parameters.LandFlow = GraphBuilder.CreateSRV(VoxelGPUCommon::UploadStructuredBuffer<uint32>(GraphBuilder, TEXT("Voxel.LandFlowNone"), TConstArrayView<uint32>()));
     Parameters.LandForm = GraphBuilder.CreateSRV(VoxelGPUCommon::UploadStructuredBuffer<uint32>(GraphBuilder, TEXT("Voxel.LandFormNone"), TConstArrayView<uint32>()));
+    Parameters.LandRelief = GraphBuilder.CreateSRV(VoxelGPUCommon::UploadStructuredBuffer<uint32>(GraphBuilder, TEXT("Voxel.LandReliefNone"), TConstArrayView<uint32>()));
+    Parameters.LandNoise = GraphBuilder.CreateSRV(VoxelGPUCommon::UploadStructuredBuffer<uint32>(GraphBuilder, TEXT("Voxel.LandNoiseNone"), TConstArrayView<uint32>()));
     return Parameters;
 }
 

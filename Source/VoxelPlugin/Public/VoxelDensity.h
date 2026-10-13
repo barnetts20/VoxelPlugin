@@ -10,6 +10,7 @@
 
 struct FVoxelDensityGPUData;
 struct FVoxelLandBake;
+struct FVoxelLandNoiseSet;
 struct FVoxelTerrestrialSettings;
 
 /** Shape of the planet's surface heightfield. Wavelengths are fractions of the planet radius,
@@ -124,6 +125,9 @@ public:
     /** The terrestrial generator's bake (null for the noise surface). */
     const TSharedPtr<const FVoxelLandBake, ESPMode::ThreadSafe>& GetLandBake() const { return LandBake; }
 
+    /** The peaks' noise set (VoxelLandPeaks.ush; null without peaks). */
+    const TSharedPtr<const FVoxelLandNoiseSet, ESPMode::ThreadSafe>& GetLandNoise() const { return LandNoise; }
+
 private:
     /** One octave, fixed at construction; both backends read these. With a lacunarity of 2,
      *  at most 32 octaves and the finest coordinate below 2^30 (radius times the finest
@@ -183,6 +187,11 @@ private:
     double LandHillFrequency = 0.0;     // cycles per cm (the finest octave's)
     uint32 LandHillOctaves = 0;
     uint32 LandHillSeed = 0;
+    TSharedPtr<const FVoxelLandNoiseSet, ESPMode::ThreadSafe> LandNoise;   // VoxelLandPeaks.ush's set (null: no peaks)
+    float LandPeakStrength = 0.0f;      // VoxelLandPeaks.ush
+    uint32 LandPeakOctaves = 0;
+    uint32 LandPeakSeed = 0;
+    TArray<uint32> LandReliefPacked;    // the bake's local relief, four cells per word (empty: none)
     TArray<uint32> LandFlowPacked;      // the bake's drainage, two f16 cells per word (empty: none)
     TArray<uint32> LandFormPacked;      // the bake's landform, two cells per word (empty: none)
 };

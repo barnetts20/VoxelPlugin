@@ -18,22 +18,22 @@
 //   Fields        x the drainage (log2 m^2), y the crust (0 oceanic..1 continental), z the boundary
 //                 class (0..6; +8 under a kept lake), w the kept lake's depth above the analytic
 //                 surface (m, 0 where there is none);
-//   Terms         x the bake (m), y the hillsides: hills and gullies (m), z the detail (m), w the pixel's height above
+//   Terms         x the bake (m), y the hillsides: hills, peaks and gullies (m), z the detail (m), w the pixel's height above
 //                 the analytic surface (m: the mesh's error, or an edit);
 //   DebugMask     1 where the node shows a debug view (lerp the base colour to the return value),
 //                 else 0 (no view, or the node off: the vertex colours then carry the views).
 //
-// Inputs: HeightTex, FieldTex, ConstTex = the VoxelLandHeight, VoxelLandFields and
-// VoxelLandConstants texture parameters (Texture Objects; the terrain's dynamic material instance
-// sets them); CacheHeight, CacheSlope, CacheFields, CacheState = VoxelLandCacheHeight,
+// Inputs: HeightTex, FieldTex, ConstTex, NoiseTex = the VoxelLandHeight, VoxelLandFields,
+// VoxelLandConstants and VoxelLandNoise texture parameters (Texture Objects; the terrain's dynamic
+// material instance sets them; NoiseTex is the peaks' noise set, VoxelLandNoise.ush, T3); CacheHeight, CacheSlope, CacheFields, CacheState = VoxelLandCacheHeight,
 // VoxelLandCacheSlope, VoxelLandCacheFields and VoxelLandCacheState (the land surface cache,
 // Design/LandSurfaceCache.md: what the node reads by default); OriginHigh, OriginLow = VoxelLandOriginHigh and VoxelLandOriginLow (the planet's
 // origin in world, double-float cm); AxisX, AxisY, AxisZ = VoxelLandAxisX/Y/Z (the planet frame's
 // axes in world) and AxisXLow, AxisYLow, AxisZLow = VoxelLandAxisXLow/YLow/ZLow (their
 // double-float remainders); Params = VoxelLandParams (x the debug view, voxel.Debug.LandView, plus
-// 16 x the normal's sources, voxel.Debug.LandNormalMode (VoxelLandPixel), plus 64 x the cost
-// switch, voxel.Land.MaterialCost, plus 512 when the analytic node is to be used (asked for, or
-// the cache missing), plus 1024 for the cache's level view, voxel.Debug.LandCache; y the
+// 32 x the normal's sources, voxel.Debug.LandNormalMode (VoxelLandPixel), plus 128 x the cost
+// switch, voxel.Land.MaterialCost, plus 1024 when the analytic node is to be used (asked for, or
+// the cache missing), plus 2048 for the cache's level view, voxel.Debug.LandCache; y the
 // surface tolerance, m: the normal fades to the mesh's beyond y + 16 pixel footprints off the
 // analytic surface; z 1 when the land textures are bound, else 0: the node then reads nothing;
 // w the footprint, cm, below which the mesh's normal is used (close to the camera, where the
@@ -45,14 +45,14 @@
 // view's pre-view translation), exact for every view at any distance from the world origin.
 //
 // Custom node code:
-//   return VoxelLandMaterial(Parameters, HeightTex, FieldTex, ConstTex, CacheHeight, CacheSlope, CacheFields, CacheState, OriginHigh, OriginLow, AxisX, AxisY, AxisZ, AxisXLow, AxisYLow, AxisZLow, Params, Height, NormalWS, NormalTS, Fields, Terms, DebugMask);
+//   return VoxelLandMaterial(Parameters, HeightTex, FieldTex, ConstTex, NoiseTex, CacheHeight, CacheSlope, CacheFields, CacheState, OriginHigh, OriginLow, AxisX, AxisY, AxisZ, AxisXLow, AxisYLow, AxisZLow, Params, Height, NormalWS, NormalTS, Fields, Terms, DebugMask);
 //
 // Two sources (voxel.Land.MaterialSource): 0 (default) the land surface cache, computed once by
 // compute and sampled here (VoxelLandCacheSample.ush); 1 the analytic node, the land chain
 // evaluated per pixel (VoxelLandPixel), kept as the reference. VoxelLandMaterialCached (same
 // arguments) leaves the analytic node out of the shader: the cache only, and lighter. In the cache's source, Terms holds
 // only the pixel's height above the surface (w), and the views of the analytic terms (bake,
-// detail, plates, cells, gullies, landform, hills) evaluate the analytic node for the view only.
+// detail, plates, cells, gullies, landform, hills, peaks, relief) evaluate the analytic node for the view only.
 //
 // The gullies' and the detail's share of the normal needs screen-space derivatives: other stages
 // that compile the material's pixel inputs (ray-tracing hit shaders) get the bake's gradient
@@ -120,7 +120,7 @@ struct FVoxelLandPixel
     FVoxelLandHeight Land; // the terms behind them (the debug views)
 };
 
-/** The normal's sources (voxel.Debug.LandNormalMode, VoxelLandParams.x / 16): 0 the bake's, the
+/** The normal's sources (voxel.Debug.LandNormalMode, VoxelLandParams.x / 32): 0 the bake's, the
  *  hills' and the detail's exact gradients plus the gullies' (and the detail's and the hills'
  *  amplitudes') screen-space change; 1 the screen-space change of hills, gullies and detail
  *  together (M1); 2 the bake, the hills and the detail exact, no gullies; 3 the bake alone. */
@@ -149,7 +149,7 @@ FVoxelLandPixel VoxelLandPixel(VOXEL_LAND_ARGS_DECL float2 PX, float2 PY, float2
     const float3 Up = normalize(float3(PX.x, PY.x, PZ.x));
     Out.Up = Up;
     // Every derivative is taken (uniform control flow); the mode picks.
-    const float Rest = H.Gully + H.Detail + H.Hills;
+    const float Rest = H.Gully + H.Detail + H.Hills + H.Peaks;
     const float RestX = VOXEL_LAND_DDX(Rest);
     const float RestY = VOXEL_LAND_DDY(Rest);
     const float GullyX = VOXEL_LAND_DDX(H.Gully);
@@ -158,6 +158,8 @@ FVoxelLandPixel VoxelLandPixel(VOXEL_LAND_ARGS_DECL float2 PX, float2 PY, float2
     const float AmplitudeY = VOXEL_LAND_DDY(H.DetailAmplitudeM);
     const float HillAmplitudeX = VOXEL_LAND_DDX(H.HillAmplitudeM);
     const float HillAmplitudeY = VOXEL_LAND_DDY(H.HillAmplitudeM);
+    const float PeakAmplitudeX = VOXEL_LAND_DDX(H.PeakAmplitudeM);
+    const float PeakAmplitudeY = VOXEL_LAND_DDY(H.PeakAmplitudeM);
     float DRx = 0.0f;
     float DRy = 0.0f;
     float3 Exact = H.BakeGradient;
@@ -168,11 +170,11 @@ FVoxelLandPixel VoxelLandPixel(VOXEL_LAND_ARGS_DECL float2 PX, float2 PY, float2
     }
     else if (NormalMode != 3u)
     {
-        Exact = Exact + H.HillGradient + (H.DetailGradient - Up * dot(H.DetailGradient, Up));
+        Exact = Exact + H.HillGradient + H.PeakGradient + (H.DetailGradient - Up * dot(H.DetailGradient, Up));
         if (NormalMode == 0u)
         {
-            DRx = GullyX + H.DetailUnit * AmplitudeX + H.HillUnit * HillAmplitudeX;
-            DRy = GullyY + H.DetailUnit * AmplitudeY + H.HillUnit * HillAmplitudeY;
+            DRx = GullyX + H.DetailUnit * AmplitudeX + H.HillUnit * HillAmplitudeX + H.PeakUnit * PeakAmplitudeX;
+            DRy = GullyY + H.DetailUnit * AmplitudeY + H.HillUnit * HillAmplitudeY + H.PeakUnit * PeakAmplitudeY;
         }
     }
     const float3 Tx = (DdxLocal - Up * dot(DdxLocal, Up)) * 0.01f;
@@ -206,6 +208,7 @@ FVoxelLandPixel VoxelLandPixel(VOXEL_LAND_ARGS_DECL float2 PX, float2 PY, float2
         C0.Gully = H.Gully;
         C0.DetailAmplitudeM = H.DetailAmplitudeM;
         C0.HillAmplitudeM = H.HillAmplitudeM;
+        C0.PeakAmplitudeM = H.PeakAmplitudeM;
         const FVoxelLandDifferenced C1 = VoxelLandDifferencedDF(VOXEL_LAND_ARGS
             VoxelDFAdd(LPX, float2(T1.x * VOXEL_LAND_FIXED_STEP, 0.0f)), VoxelDFAdd(LPY, float2(T1.y * VOXEL_LAND_FIXED_STEP, 0.0f)),
             VoxelDFAdd(LPZ, float2(T1.z * VOXEL_LAND_FIXED_STEP, 0.0f)), Footprint);
@@ -215,9 +218,9 @@ FVoxelLandPixel VoxelLandPixel(VOXEL_LAND_ARGS_DECL float2 PX, float2 PY, float2
         // m per m: the step is in cm.
         const float Inv = 100.0f / VOXEL_LAND_FIXED_STEP;
         const float D1 = ((C1.Gully - C0.Gully) + H.DetailUnit * (C1.DetailAmplitudeM - C0.DetailAmplitudeM)
-            + H.HillUnit * (C1.HillAmplitudeM - C0.HillAmplitudeM)) * Inv;
+            + H.HillUnit * (C1.HillAmplitudeM - C0.HillAmplitudeM) + H.PeakUnit * (C1.PeakAmplitudeM - C0.PeakAmplitudeM)) * Inv;
         const float D2 = ((C2.Gully - C0.Gully) + H.DetailUnit * (C2.DetailAmplitudeM - C0.DetailAmplitudeM)
-            + H.HillUnit * (C2.HillAmplitudeM - C0.HillAmplitudeM)) * Inv;
+            + H.HillUnit * (C2.HillAmplitudeM - C0.HillAmplitudeM) + H.PeakUnit * (C2.PeakAmplitudeM - C0.PeakAmplitudeM)) * Inv;
         ScreenPart = lerp(ScreenPart, T1 * D1 + T2 * D2, FixedBlend);
     }
     Gradient = Gradient + ScreenPart;
@@ -230,7 +233,7 @@ FVoxelLandPixel VoxelLandPixel(VOXEL_LAND_ARGS_DECL float2 PX, float2 PY, float2
     const float Level = VOXEL_LAND_WATER(Index);
     const float LakeDepth = Level > -1.0e30f ? max(Level - Out.Height, 0.0f) : 0.0f;
     Out.Fields = float4(H.Flow, float(Attr & 0xffu) / 255.0f, float((Attr >> 8u) & 7u) + ((Attr & 0x1000u) != 0u ? 8.0f : 0.0f), LakeDepth);
-    Out.Terms = float4(H.Bake, H.Hills + H.Gully, H.Detail, Out.Offset);
+    Out.Terms = float4(H.Bake, H.Hills + H.Peaks + H.Gully, H.Detail, Out.Offset);
     return Out;
 }
 
@@ -249,6 +252,8 @@ float3 VoxelLandPixelColor(VOXEL_LAND_ARGS_DECL FVoxelLandPixel Pixel, float3 No
     In.Gully = Pixel.Land.Gully;
     In.GullyScale = Pixel.Land.GullyScale;
     In.Hills = Pixel.Land.Hills;
+    In.Peaks = Pixel.Land.Peaks;
+    In.PeakAmplitude = Pixel.Land.PeakAmplitudeM;
     In.DetailNorm = LandDetailAmplitude > 0.0f ? Pixel.Land.Detail * 100.0f / LandDetailAmplitude : 0.0f;
     In.bTerrestrial = true;
     In.bHydro = VoxelLandConstU(LandConstTex, VOXEL_LAND_MC_HAS_HYDRO) != 0u;
@@ -342,23 +347,24 @@ float3 VoxelLandCacheLevelColor(float Level)
     const float3 DdxLocal = float3(dot(DdxWorld, AxisX), dot(DdxWorld, AxisY), dot(DdxWorld, AxisZ)); \
     const float3 DdyLocal = float3(dot(DdyWorld, AxisX), dot(DdyWorld, AxisY), dot(DdyWorld, AxisZ)); \
     const float Footprint = VoxelLandPixelFootprint(TranslatedWorld, DdxLocal, DdyLocal); \
-    /* x: the view (4 bits), the normal's sources (2), the cost switch (3), the source (1: */ \
+    /* x: the view (5 bits), the normal's sources (2), the cost switch (3), the source (1: */ \
     /* 1 the analytic node), the cache's level view (1). */ \
     const uint Packed = uint(Params.x + 0.5f); \
-    const uint Mode = Packed & 15u; \
-    const bool bAnalytic = WITH_ANALYTIC && ((Packed >> 9u) & 1u) != 0u; \
-    const bool bLevelView = ((Packed >> 10u) & 1u) != 0u; \
-    const uint Cost = (Packed >> 6u) & 7u; \
+    const uint Mode = Packed & 31u; \
+    const bool bAnalytic = WITH_ANALYTIC && ((Packed >> 10u) & 1u) != 0u; \
+    const bool bLevelView = ((Packed >> 11u) & 1u) != 0u; \
+    const uint Cost = (Packed >> 7u) & 7u; \
     GVoxelLandSkipGullies = Cost >= 2u; \
     GVoxelLandSkipDetail = Cost >= 3u; \
     GVoxelLandSkipHills = Cost >= 3u; \
+    GVoxelLandSkipPeaks = Cost >= 3u; \
     const float3 MeshWS = normalize(Parameters.TangentToWorld[2]); \
     const float3 MeshLocal = float3(dot(MeshWS, AxisX), dot(MeshWS, AxisY), dot(MeshWS, AxisZ)); \
     const float Tolerance = max(Params.y + 16.0f * Footprint * 0.01f, 0.01f); \
     const bool bHydro = VoxelLandConstU(ConstTex, VOXEL_LAND_MC_HAS_HYDRO) != 0u; \
     /* The cache-only entry can't evaluate the land: asked for the analytic node (the cache */ \
     /* missing, or voxel.Land.MaterialSource 1), the node is off. */ \
-    if (!WITH_ANALYTIC && ((Packed >> 9u) & 1u) != 0u) return float3(0.0f, 0.0f, 0.0f); \
+    if (!WITH_ANALYTIC && ((Packed >> 10u) & 1u) != 0u) return float3(0.0f, 0.0f, 0.0f); \
     if (!bAnalytic) \
     { \
         /* The views of the analytic terms (bake, detail, plates, cells, gullies) evaluate */ \
@@ -366,7 +372,7 @@ float3 VoxelLandCacheLevelColor(float Level)
         FVoxelLandPixel Debug = (FVoxelLandPixel)0; \
         const bool bDebugAnalytic = WITH_ANALYTIC && Mode != 0u && !bLevelView && !VoxelLandCacheHasView(Mode); \
         if (bDebugAnalytic) \
-            Debug = VoxelLandPixel(HeightTex, FieldTex, ConstTex, Point.X, Point.Y, Point.Z, DdxLocal, DdyLocal, Footprint, 3u, 0.0f); \
+            Debug = VoxelLandPixel(HeightTex, FieldTex, ConstTex, NoiseTex, Point.X, Point.Y, Point.Z, DdxLocal, DdyLocal, Footprint, 3u, 0.0f); \
         /* The cache (Design/LandSurfaceCache.md): a few texture reads. */ \
         const float2 SeaRadius = VoxelDFAdd(VoxelLandConstF2(ConstTex, VOXEL_LAND_MC_PLANET_RADIUS), VoxelLandConstF2(ConstTex, VOXEL_LAND_MC_HEIGHT_OFFSET)); \
         const FVoxelLandCacheSample C = VoxelLandCacheSampleAt(CacheHeight, CacheSlope, CacheFields, CacheState, Point.X, Point.Y, Point.Z, SeaRadius, Footprint); \
@@ -406,7 +412,7 @@ float3 VoxelLandCacheLevelColor(float Level)
         /* The views of the analytic terms (bake, detail, plates, cells, gullies): the */ \
         /* analytic node, for the debug view only (none in the cache-only entry). */ \
         if (!bDebugAnalytic) return VoxelLandViewSrgbToLinear(VoxelLandViewNone()); \
-        return VoxelLandViewSrgbToLinear(VoxelLandPixelColor(HeightTex, FieldTex, ConstTex, Debug, Shown, ToMesh, Footprint, Mode)); \
+        return VoxelLandViewSrgbToLinear(VoxelLandPixelColor(HeightTex, FieldTex, ConstTex, NoiseTex, Debug, Shown, ToMesh, Footprint, Mode)); \
     } \
     if (!WITH_ANALYTIC) return float3(0.0f, 0.0f, 0.0f); \
     /* The analytic node (voxel.Land.MaterialSource 1): the land chain at the pixel. */ \
@@ -414,8 +420,8 @@ float3 VoxelLandCacheLevelColor(float Level)
     /* the mesh carries all the land's detail, and its normal is cleaner than a screen-space */ \
     /* difference over a centimetre: the mesh's normal there, the node's from 2.5 Params.w. */ \
     const float Near = 1.0f - smoothstep(Params.w, 2.5f * Params.w, Footprint); \
-    const FVoxelLandPixel Pixel = VoxelLandPixel(HeightTex, FieldTex, ConstTex, Point.X, Point.Y, Point.Z, DdxLocal, DdyLocal, Footprint, \
-        (Packed >> 4u) & 3u, Cost == 0u ? 1.0f - Near : 0.0f); \
+    const FVoxelLandPixel Pixel = VoxelLandPixel(HeightTex, FieldTex, ConstTex, NoiseTex, Point.X, Point.Y, Point.Z, DdxLocal, DdyLocal, Footprint, \
+        (Packed >> 5u) & 3u, Cost == 0u ? 1.0f - Near : 0.0f); \
     Height = Pixel.Height; \
     Fields = Pixel.Fields; \
     Terms = Pixel.Terms; \
@@ -426,9 +432,9 @@ float3 VoxelLandCacheLevelColor(float Level)
     NormalTS = normalize(mul(Parameters.TangentToWorld, NormalWS)); \
     if (Mode == 0u) return float3(0.0f, 0.0f, 0.0f); \
     DebugMask = 1.0f; \
-    return VoxelLandViewSrgbToLinear(VoxelLandPixelColor(HeightTex, FieldTex, ConstTex, Pixel, Shown, ToMesh, Footprint, Mode));
+    return VoxelLandViewSrgbToLinear(VoxelLandPixelColor(HeightTex, FieldTex, ConstTex, NoiseTex, Pixel, Shown, ToMesh, Footprint, Mode));
 
-float3 VoxelLandMaterial(FMaterialPixelParameters Parameters, Texture2D HeightTex, Texture2D FieldTex, Texture2D ConstTex,
+float3 VoxelLandMaterial(FMaterialPixelParameters Parameters, Texture2D HeightTex, Texture2D FieldTex, Texture2D ConstTex, Texture2D NoiseTex,
     Texture2D CacheHeight, Texture2D CacheSlope, Texture2D CacheFields, Texture2D CacheState,
     float3 OriginHigh, float3 OriginLow, float3 AxisX, float3 AxisY, float3 AxisZ, float3 AxisXLow, float3 AxisYLow, float3 AxisZLow, float4 Params,
     out float Height, out float3 NormalWS, out float3 NormalTS, out float4 Fields, out float4 Terms, out float DebugMask)
@@ -440,7 +446,7 @@ float3 VoxelLandMaterial(FMaterialPixelParameters Parameters, Texture2D HeightTe
  *  terms show "none"; voxel.Land.MaterialSource 1, or no cache, turns the node off: the mesh's
  *  normal). Lighter: the shader
  *  doesn't carry the land chain's registers. */
-float3 VoxelLandMaterialCached(FMaterialPixelParameters Parameters, Texture2D HeightTex, Texture2D FieldTex, Texture2D ConstTex,
+float3 VoxelLandMaterialCached(FMaterialPixelParameters Parameters, Texture2D HeightTex, Texture2D FieldTex, Texture2D ConstTex, Texture2D NoiseTex,
     Texture2D CacheHeight, Texture2D CacheSlope, Texture2D CacheFields, Texture2D CacheState,
     float3 OriginHigh, float3 OriginLow, float3 AxisX, float3 AxisY, float3 AxisZ, float3 AxisXLow, float3 AxisYLow, float3 AxisZLow, float4 Params,
     out float Height, out float3 NormalWS, out float3 NormalTS, out float4 Fields, out float4 Terms, out float DebugMask)

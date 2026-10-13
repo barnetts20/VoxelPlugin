@@ -61,7 +61,16 @@
 #define VOXEL_LAND_MC_HILL_OCTAVES 41
 #define VOXEL_LAND_MC_HILL_SEED 42          // two
 #define VOXEL_LAND_MC_HAS_FORM 44
-#define VOXEL_LAND_MC_COUNT 45              // scalars in use (12 texels)
-#define VOXEL_LAND_MC_TEXELS 12
+#define VOXEL_LAND_MC_PEAK_STRENGTH 45      // the peaks (VoxelLandPeaks.ush)
+#define VOXEL_LAND_MC_PEAK_OCTAVES 46
+#define VOXEL_LAND_MC_PEAK_SEED 47          // two
+#define VOXEL_LAND_MC_NOISE_N 49            // the noise set (VoxelLandNoise.ush)
+#define VOXEL_LAND_MC_NOISE_MIPS 50
+#define VOXEL_LAND_MC_NOISE_CELL_SHIFT 51
+#define VOXEL_LAND_MC_PEAK_MEAN_SHAPE 52
+#define VOXEL_LAND_MC_PEAK_MEAN_G 53
+#define VOXEL_LAND_MC_NOISE_SHIFT 54        // log2 N: the noise texture's rows (VoxelLandMaterialAccess.ush)
+#define VOXEL_LAND_MC_COUNT 55              // scalars in use (14 texels)
+#define VOXEL_LAND_MC_TEXELS 14
 
 #endif // VOXEL_LAND_MATERIAL_LAYOUT_USH

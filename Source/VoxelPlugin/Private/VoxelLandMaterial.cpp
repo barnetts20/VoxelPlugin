@@ -19,6 +19,7 @@
 const FName VoxelLandMaterial::HeightTextureName(TEXT("VoxelLandHeight"));
 const FName VoxelLandMaterial::FieldTextureName(TEXT("VoxelLandFields"));
 const FName VoxelLandMaterial::ConstantTextureName(TEXT("VoxelLandConstants"));
+const FName VoxelLandMaterial::NoiseTextureName(TEXT("VoxelLandNoise"));
 const FName VoxelLandMaterial::OriginHighName(TEXT("VoxelLandOriginHigh"));
 const FName VoxelLandMaterial::OriginLowName(TEXT("VoxelLandOriginLow"));
 const FName VoxelLandMaterial::AxisXName(TEXT("VoxelLandAxisX"));
@@ -44,7 +45,7 @@ static TAutoConsoleVariable<int32> CVarVoxelLandMaterialCost(
     TEXT(" 0: everything (default)\n")
     TEXT(" 1: no fixed-step gully difference close up (screen-space instead)\n")
     TEXT(" 2: no gullies\n")
-    TEXT(" 3: no gullies, no detail layer and no hills (the bake alone)\n")
+    TEXT(" 3: no gullies, no detail layer, no hills and no peaks (the bake alone)\n")
     TEXT(" 4: the node off (the mesh's normal; the vertex colours carry the views)"),
     ECVF_Default);
 
@@ -106,6 +107,13 @@ namespace VoxelLandMaterialDetail
         FTexture2DDynamicCreateInfo Info(Format, false, false, TF_Nearest, AM_Clamp);
         return UTexture2DDynamic::Create(Width, Height, Info);
     }
+
+    /** Whether the noise set goes into the material (its texture fits this RHI): the constants
+     *  turn the peaks on exactly when the texture is the set's, not the stand-in. */
+    bool NoiseFits(const FVoxelLandNoiseSet* Noise)
+    {
+        return Noise && Noise->IsComplete() && Noise->N <= GetMax2DTextureDimension() && Noise->Rows <= GetMax2DTextureDimension();
+    }
 }
 
 void VoxelLandMaterial::BuildFieldTexels(const FVoxelLandBake& Bake, TArray<FFloat16Color>& Out)
@@ -140,14 +148,14 @@ void VoxelLandMaterial::BuildFieldTexels(const FVoxelLandBake& Bake, TArray<FFlo
 void VoxelLandMaterial::BuildHeightTexels(const FVoxelLandBake& Bake, TArray<FVector2f>& Out)
 {
     const int32 NumCells = Bake.NumCells();
-    const bool bForm = Bake.Form.Num() == NumCells;
+    const bool bForm = Bake.Form.Num() == NumCells && Bake.Relief.Num() == NumCells;
     Out.SetNumUninitialized(NumCells);
     constexpr int32 Chunk = 1 << 16;
     ParallelFor((NumCells + Chunk - 1) / Chunk, [&](int32 c)
         {
             const int32 End = FMath::Min(NumCells, (c + 1) * Chunk);
             for (int32 i = c * Chunk; i < End; i++)
-                Out[i] = FVector2f(Bake.Height[i], bForm ? (float)Bake.Form[i] : 0.0f);
+                Out[i] = FVector2f(Bake.Height[i], bForm ? (float)((uint32)Bake.Form[i] | ((uint32)Bake.Relief[i] << 16)) : 0.0f);
         });
 }
 
@@ -157,7 +165,7 @@ void VoxelLandMaterial::BuildConstantTexels(const FVoxelDensityGPUData& Density,
     const int32 NumCells = Bake.NumCells();
     const bool bFlow = Bake.Flow.Num() == NumCells;
     const bool bWater = Bake.Water.Num() == NumCells;
-    const bool bForm = Bake.Form.Num() == NumCells;
+    const bool bForm = Bake.Form.Num() == NumCells && Bake.Relief.Num() == NumCells;
 
     // The constants: scalars, then the tan table, the octaves, the plates.
     const int32 TanBase = VOXEL_LAND_MC_TEXELS;
@@ -213,6 +221,19 @@ void VoxelLandMaterial::BuildConstantTexels(const FVoxelDensityGPUData& Density,
     S[VOXEL_LAND_MC_HILL_OCTAVES] = (float)Density.LandHillOctaves;
     PutU32(S, VOXEL_LAND_MC_HILL_SEED, Density.LandHillSeed);
     S[VOXEL_LAND_MC_HAS_FORM] = bForm ? 1.0f : 0.0f;
+    // The peaks and their noise set (VoxelLandPeaks.ush, VoxelLandNoise.ush): off without the set.
+    if (const FVoxelLandNoiseSet* Noise = NoiseFits(Density.LandNoise.Get()) ? Density.LandNoise.Get() : nullptr)
+    {
+        S[VOXEL_LAND_MC_PEAK_STRENGTH] = Density.LandPeakStrength;
+        S[VOXEL_LAND_MC_PEAK_OCTAVES] = (float)Density.LandPeakOctaves;
+        PutU32(S, VOXEL_LAND_MC_PEAK_SEED, Density.LandPeakSeed);
+        S[VOXEL_LAND_MC_NOISE_N] = (float)Noise->N;
+        S[VOXEL_LAND_MC_NOISE_MIPS] = (float)Noise->Mips;
+        S[VOXEL_LAND_MC_NOISE_CELL_SHIFT] = (float)Noise->CellShift;
+        S[VOXEL_LAND_MC_NOISE_SHIFT] = (float)FMath::FloorLog2(Noise->N);
+        S[VOXEL_LAND_MC_PEAK_MEAN_SHAPE] = Noise->MeanShape;
+        S[VOXEL_LAND_MC_PEAK_MEAN_G] = Noise->MeanG;
+    }
 
     for (int32 i = 0; i < Bake.TanTable.Num(); i++)
     {
@@ -304,13 +325,60 @@ UTexture2DDynamic* VoxelLandMaterial::MakeConstantTexture(const FVoxelDensityCPU
     return Constants;
 }
 
+UTexture2DDynamic* VoxelLandMaterial::MakeNoiseTexture(const FVoxelDensityCPU& Density)
+{
+    using namespace VoxelLandMaterialDetail;
+    const TSharedPtr<const FVoxelLandNoiseSet, ESPMode::ThreadSafe> Noise = Density.GetLandNoise();
+    const bool bSet = NoiseFits(Noise.Get());
+    // One texture a set, for every planet that uses it (game thread; each planet holds its own).
+    struct FShared
+    {
+        TWeakPtr<const FVoxelLandNoiseSet, ESPMode::ThreadSafe> Set;
+        TWeakObjectPtr<UTexture2DDynamic> Texture;
+    };
+    static TArray<FShared> Shared;
+    static TWeakObjectPtr<UTexture2DDynamic> StandIn;
+    Shared.RemoveAll([](const FShared& E) { return !E.Set.IsValid() || !E.Texture.IsValid(); });
+    if (bSet)
+        for (const FShared& E : Shared)
+            if (E.Set.Pin() == Noise) return E.Texture.Get();
+    if (!bSet && StandIn.IsValid()) return StandIn.Get();
+    const int32 Width = bSet ? (int32)Noise->N : 1;
+    const int32 Height = bSet ? (int32)Noise->Rows : 1;
+    UTexture2DDynamic* Texture = Make(Width, Height, PF_A16B16G16R16);
+    if (!Texture)
+    {
+        UE_LOG(LogVoxelPlugin, Warning, TEXT("[VoxelLand] Couldn't create the land material's noise texture."));
+        return nullptr;
+    }
+    // The chain in rows of N texels (VoxelLandMaterialAccess.ush): two words a texel are the
+    // RGBA16 texel as it lies in memory (R, G, B, A, little-endian); the shared set stays alive
+    // until the upload ran.
+    if (bSet)
+    {
+        Upload(Texture, Noise, [](const TSharedPtr<const FVoxelLandNoiseSet, ESPMode::ThreadSafe>& N) { return (const void*)N->Words.GetData(); },
+            Width, Height, 8);
+        Shared.Add({ Noise, Texture });
+    }
+    else
+    {
+        TArray<uint32> Zero;
+        Zero.Init(0u, 2);
+        Upload(Texture, MoveTemp(Zero), [](const TArray<uint32>& T) { return (const void*)T.GetData(); }, 1, 1, 8);
+        StandIn = Texture;
+    }
+    return Texture;
+}
+
 void VoxelLandMaterial::SetTextureParameters(UMaterialInstanceDynamic* Material, UTexture2DDynamic* Height, UTexture2DDynamic* Fields,
-    UTexture2DDynamic* Constants)
+    UTexture2DDynamic* Constants, UTexture2DDynamic* Noise)
 {
     if (!Material) return;
     Material->SetTextureParameterValue(HeightTextureName, Height);
     Material->SetTextureParameterValue(FieldTextureName, Fields);
     Material->SetTextureParameterValue(ConstantTextureName, Constants);
+    if (Noise)
+        Material->SetTextureParameterValue(NoiseTextureName, Noise);
 }
 
 void VoxelLandMaterial::SetFrameParameters(UMaterialInstanceDynamic* Material, const FTransform& PlanetFrame,
@@ -333,8 +401,8 @@ void VoxelLandMaterial::SetFrameParameters(UMaterialInstanceDynamic* Material, c
         Set(HighNames[a], High);
         Set(LowNames[a], Low);
     }
-    // x: the view, plus 16 x the normal's sources, 64 x the cost switch, 512 x the analytic
-    // source and 1024 x the cache's level view (VoxelLandMaterial.ush).
+    // x: the view, plus 32 x the normal's sources, 128 x the cost switch, 1024 x the analytic
+    // source and 2048 x the cache's level view (VoxelLandMaterial.ush).
     const int32 NormalMode = FMath::Clamp(CVarVoxelLandNormalMode.GetValueOnGameThread(), 0, 3);
     const int32 Cost = FMath::Clamp(CVarVoxelLandMaterialCost.GetValueOnGameThread(), 0, 4);
     if (Cost == 4) bEnabled = false;
@@ -342,7 +410,7 @@ void VoxelLandMaterial::SetFrameParameters(UMaterialInstanceDynamic* Material, c
     const bool bCache = UsesCache() && bCacheAvailable;
     const int32 Analytic = bCache ? 0 : 1;
     const int32 LevelView = bCache && ShowsCacheLevels() ? 1 : 0;
-    const float Packed = (float)(FMath::Clamp(View, 0, 15) + 16 * NormalMode + 64 * Cost + 512 * Analytic + 1024 * LevelView);
+    const float Packed = (float)(FMath::Clamp(View, 0, 31) + 32 * NormalMode + 128 * Cost + 1024 * Analytic + 2048 * LevelView);
     Material->SetVectorParameterValue(ParamsName, FLinearColor(bEnabled ? Packed : 0.0f, (float)FMath::Max(Tolerance, 0.0),
         bEnabled ? 1.0f : 0.0f, (float)FMath::Max(NearFootprint, 0.0)));
 }
