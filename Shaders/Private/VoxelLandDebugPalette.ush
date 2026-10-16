@@ -220,10 +220,11 @@ VOXEL_FUNC float3 VoxelLandViewHills(float X)
     return VoxelLandViewMix(VoxelLandViewRgb(150.0f, 110.0f, 60.0f), VoxelLandViewRgb(90.0f, 50.0f, 30.0f), (X - 1.0f) / 0.5f);
 }
 
-/** The peaks' amplitude (m): white none, through green and brown, dark at 1.5 km. */
+/** The peaks' amplitude (m: their relief from valley to summit): white none, through green and
+ *  brown, dark at 3 km. */
 VOXEL_FUNC float3 VoxelLandViewPeakArea(float AmplitudeM)
 {
-    return VoxelLandViewHills(AmplitudeM * (1.0f / 1000.0f));
+    return VoxelLandViewHills(AmplitudeM * (1.0f / 2000.0f));
 }
 
 /** A cube face (VoxelCubeSphere.ush order: +X, -X, +Y, -Y, +Z, -Z). */

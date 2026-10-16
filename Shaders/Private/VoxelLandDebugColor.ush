@@ -83,13 +83,14 @@ VOXEL_FUNC float3 VoxelLandDebugColor(VOXEL_LAND_ARGS_DECL FVoxelLandDebugInput 
     }
     if (In.Mode == VOXEL_LAND_VIEW_HILLS)
     {
-        if (LandHillRelief <= 0.0f || LandHillOctaves == 0u || LandHasForm == 0u) return VoxelLandViewNone();
+        if (LandHillRelief <= 0.0f || (LandHillOctaves == 0u && !(LandHillTexelsPerCell > 0.0f)) || LandHasForm == 0u) return VoxelLandViewNone();
         return VoxelLandViewHills(In.Hills / LandHillRelief);
     }
     if (In.Mode == VOXEL_LAND_VIEW_PEAKS || In.Mode == VOXEL_LAND_VIEW_PEAK_AREA)
     {
-        if (LandPeakStrength <= 0.0f || LandPeakOctaves == 0u || LandNoiseN == 0u || LandHasForm == 0u) return VoxelLandViewNone();
+        if (!VoxelLandPeaksOn(VOXEL_LAND_ARGS 0.0f)) return VoxelLandViewNone();
         if (In.Mode == VOXEL_LAND_VIEW_PEAK_AREA) return VoxelLandViewPeakArea(In.PeakAmplitude);
+        // The shape is a fraction of the peaks' relief (zero-mean, within -1 .. 1).
         return VoxelLandViewSigned(In.PeakAmplitude > 1.0f ? In.Peaks / In.PeakAmplitude : 0.0f);
     }
 

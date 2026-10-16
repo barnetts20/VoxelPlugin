@@ -43,6 +43,7 @@
 #include "VoxelLandHills.ush"
 #include "VoxelLandNoise.ush"
 #include "VoxelLandPeaks.ush"
+#include "VoxelLandHillSet.ush"
 
 #ifndef VOXEL_LOOP
 #define VOXEL_LOOP [loop]
@@ -354,8 +355,9 @@ VOXEL_FUNC FVoxelLandGully VoxelLandGullyHillsDF(VOXEL_LAND_ARGS_DECL float2 PX,
     Out.Scale = 0.0f;
     if (LandGullyStrength <= 0.0f || LandGullyOctaves == 0u) return Out;
     const float Slope = length(Gradient);
-    // Faded in by the relief the bake makes over the coarsest octave, or the hills or the peaks
-    // over their own coarsest wavelength (gullies on the hills' flanks over a flat bake).
+    // Faded in by the relief the bake makes over the coarsest octave, or the hills over their
+    // coarsest wavelength, or the peaks over their massif spacing (gullies on the hills' flanks
+    // over a flat bake).
     const float Lambda0 = 2.0f * LandCellM;
     const float HillSlope = HillLambda > 0.0f ? length(HillGradient) * (HillLambda / Lambda0) : 0.0f;
     const float PeakSlope = PeakLambda > 0.0f ? length(PeakGradient) * (PeakLambda / Lambda0) : 0.0f;
@@ -454,8 +456,9 @@ struct FVoxelLandSurface
 
 /** bGradients (a constant: dropped when false) asks for the bake's gradient and the drainage
  *  even without gullies or hills (the material's normal). bPeakShape (a constant) false leaves
- *  the peaks' shape out (their amplitude and the gullies' steering stay): for the differenced
- *  terms (VoxelLandDifferencedDF). */
+ *  the baked sets' shapes out, the peaks' and the hill set's (their amplitudes and the gullies'
+ *  steering stay, from the sets' steering channels alone): for the differenced terms
+ *  (VoxelLandDifferencedDF). The procedural hills are whole either way. */
 VOXEL_FUNC FVoxelLandSurface VoxelLandSurfaceTermsDF(VOXEL_LAND_ARGS_DECL float2 PX, float2 PY, float2 PZ, float2 QX, float2 QY, float2 QZ,
     float3 DWX, float3 DWY, float3 DWZ, float Footprint, bool bGradients, bool bPeakShape)
 {
@@ -476,8 +479,8 @@ VOXEL_FUNC FVoxelLandSurface VoxelLandSurfaceTermsDF(VOXEL_LAND_ARGS_DECL float2
     Out.Flow = 0.0f;
     Out.BakeGradient = float3(0.0f, 0.0f, 0.0f);
     const bool bGullies = LandGullyStrength > 0.0f && LandGullyOctaves != 0u;
-    const bool bHills = LandHillRelief > 0.0f && LandHillOctaves != 0u && LandHasForm != 0u;
-    const bool bPeaks = LandPeakStrength > 0.0f && LandPeakOctaves != 0u && LandNoiseN != 0u && LandHasForm != 0u;
+    const bool bHills = VoxelLandHillsOn(VOXEL_LAND_ARGS 0.0f);
+    const bool bPeaks = VoxelLandPeaksOn(VOXEL_LAND_ARGS 0.0f);
     if (!bGullies && !bHills && !bPeaks && !bGradients)
     {
         Out.Bake = VoxelLandBakeSampleDF(VOXEL_LAND_ARGS QX, QY, QZ, false).Height;
@@ -492,8 +495,11 @@ VOXEL_FUNC FVoxelLandSurface VoxelLandSurfaceTermsDF(VOXEL_LAND_ARGS_DECL float2
     float HillLambda = 0.0f;
     if (bHills)
     {
-        // On the sampled point P (the bake's fields at the warped Q).
-        const FVoxelLandHills Hills = VoxelLandHillsDF(VOXEL_LAND_ARGS PX, PY, PZ, Bake.Form, Bake.Flow, Bake.Height, Footprint);
+        // On the sampled point P (the bake's fields at the warped Q). The set's R and G blend by
+        // the character, as the peaks' (T4a; the procedural hills ignore the gradient).
+        const float3 HillCharacterGradient = VoxelLandWarpedGradient(Bake.CharacterGradient, DWX, DWY, DWZ, Normal);
+        const FVoxelLandHills Hills = VoxelLandHillsShapeDF(VOXEL_LAND_ARGS PX, PY, PZ, Bake.Form, HillCharacterGradient, Bake.Relief, Bake.Flow,
+            Bake.Height, Footprint, bPeakShape);
         Out.HillUnit = Hills.Unit;
         Out.HillAmplitudeM = Hills.AmplitudeM;
         Out.Hills = Hills.Unit * Hills.AmplitudeM;
@@ -506,7 +512,10 @@ VOXEL_FUNC FVoxelLandSurface VoxelLandSurfaceTermsDF(VOXEL_LAND_ARGS_DECL float2
     float PeakLambda = 0.0f;
     if (bPeaks)
     {
-        const FVoxelLandPeaks Peaks = VoxelLandPeaksShapeDF(VOXEL_LAND_ARGS PX, PY, PZ, Bake.Form, Bake.Relief, Bake.Flow, Bake.Height, Footprint, bPeakShape);
+        // The character's gradient at P, through the warp (as the bake's).
+        const float3 CharacterGradient = VoxelLandWarpedGradient(Bake.CharacterGradient, DWX, DWY, DWZ, Normal);
+        const FVoxelLandPeaks Peaks = VoxelLandPeaksShapeDF(VOXEL_LAND_ARGS PX, PY, PZ, Bake.Form, CharacterGradient, Bake.Relief, Bake.Flow, Bake.Height,
+            Footprint, bPeakShape);
         Out.PeakUnit = Peaks.Unit;
         Out.PeakAmplitudeM = Peaks.AmplitudeM;
         Out.Peaks = Peaks.Unit * Peaks.AmplitudeM;
@@ -517,8 +526,8 @@ VOXEL_FUNC FVoxelLandSurface VoxelLandSurfaceTermsDF(VOXEL_LAND_ARGS_DECL float2
     }
     if (!bGullies) return Out;
     // The gullies run down the bake, and their octaves finer than the hills (the peaks) down the
-    // hills' (the peaks') two coarsest octaves too, fading where those curve
-    // (VoxelLandGullyHillShare).
+    // hills' steering (the procedural hills' two coarsest octaves, or a hill set's blurred
+    // channel; the peaks' steering channel) too, fading where those curve (VoxelLandGullyHillShare).
     const FVoxelLandGully G = VoxelLandGullyHillsDF(VOXEL_LAND_ARGS PX, PY, PZ, Out.BakeGradient, Out.HillSteer, HillLambda,
         HillCurve, Out.PeakSteer, PeakLambda, PeakCurve, Bake.Turn, Bake.Flow, Bake.Height, Footprint);
     Out.Gully = G.Height;

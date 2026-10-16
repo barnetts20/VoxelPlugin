@@ -162,6 +162,46 @@ struct VOXELPLUGIN_API FVoxelTerrestrialSettings
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrestrial|Solve", meta = (ClampMin = "0.0", ClampMax = "1.0"))
     double LandformErosion = 1.0;
 
+    /** Drainage density (T3g): a cell's river cuts only once it drains this many bake cells
+     *  (ramped in from half), so channels start at heads instead of on every cell, and the land
+     *  above them is hillslope, held at a threshold slope (HillslopeSteepness). Larger: fewer,
+     *  more widely spaced valleys and smoother ground between them. 0: every cell cuts (the
+     *  earlier solve, and no variation). In bake cells, as the bake can't resolve real channel
+     *  heads: the same value gives the same look at any BakeResolution, at the bake's scale. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrestrial|Solve", meta = (ClampMin = "0.0", UIMax = "32"))
+    double ChannelHeadCells = 8.0;
+
+    /** How much the channel heads' area varies over the planet: by a factor of 2^(+-this) (a
+     *  noise field). Regions of sparse, long hillslopes beside finely dissected ones, instead
+     *  of an even valley density everywhere. 0: the same everywhere. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrestrial|Solve", meta = (ClampMin = "0.0", ClampMax = "3.0"))
+    double ChannelAreaVariation = 1.5;
+
+    /** The channel heads' variation's longest wavelength, as a multiple of VariationWavelength
+     *  (the massifs' scale). Regions need to span several valleys to read as regions: at half
+     *  the massifs' scale the variation came and went within a valley or two. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrestrial|Solve", meta = (ClampMin = "0.05", ClampMax = "4.0"))
+    double ChannelAreaVariationWavelength = 2.0;
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrestrial|Solve", meta = (ClampMin = "1", ClampMax = "6"))
+    int32 ChannelAreaVariationOctaves = 3;
+
+    /** The hillslopes' threshold above the channel heads: the steepest a cell may stand above
+     *  the cell it drains to, as a multiple of a river's steady slope at the local head area
+     *  (so it follows the uplift and the rock, as the rivers do, and sparse heads give longer,
+     *  gentler hillslopes). Larger: sharper, higher ridges; 1: hillslopes as steep as their
+     *  channel heads. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrestrial|Solve", meta = (ClampMin = "0.25", ClampMax = "8.0"))
+    double HillslopeSteepness = 1.5;
+
+    /** How far the drainage density sets the landform's character (T3h): where channel heads
+     *  are sparse the land leans smooth (the peaks' soft-rock set, rolling hills), where they
+     *  are dense rough (the hard-rock set, rough-topped hills), so the regional detail agrees
+     *  with the bake's valleys. 0: the plate model's character alone. Needs the variation
+     *  (ChannelHeadCells and ChannelAreaVariation above 0). */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrestrial|Solve", meta = (ClampMin = "0.0", ClampMax = "1.0"))
+    double ChannelCharacterInfluence = 0.75;
+
     // --- Bake: grid ---
 
     /** Cells per cube face edge: 1024 (1.5 km on a 1,000 km planet, 9.8 km on Earth), or 512 or
@@ -211,10 +251,12 @@ struct VOXELPLUGIN_API FVoxelTerrestrialSettings
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrestrial|Sample", meta = (ClampMin = "0.0", ClampMax = "1.0"))
     double GullyDetailScale = 0.5;
 
-    /** Hills on the bake (Design/SurfaceLook.md T2): their height (m) where the landform field
-     *  makes hill country; flat plains get none, rolling plains some. Rounded rises between a
-     *  network of valleys, smooth on rolling ground, rough-topped in hill country; they leave
-     *  the bake's river corridors and the coasts flat. 0 turns them off. */
+    /** Hills on the bake (Design/SurfaceLook.md T2): the procedural hills' height (m) where the
+     *  landform field makes hill country; flat plains get none, rolling plains some. Rounded
+     *  rises between a network of valleys, smooth on rolling ground, rough-topped in hill
+     *  country; they leave the bake's river corridors and the coasts flat. With a hill set
+     *  (HillNoiseSet, T4a) the set's own relief sets their height instead (HillHeightScale).
+     *  0 turns every hill off. */
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrestrial|Sample", meta = (ClampMin = "0.0", UIMax = "600"))
     double HillRelief = 150.0;
 
@@ -227,16 +269,77 @@ struct VOXELPLUGIN_API FVoxelTerrestrialSettings
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrestrial|Sample", meta = (ClampMin = "5.0", UIMin = "10", UIMax = "1000"))
     double HillFinestWavelength = 25.0;
 
-    /** Peaks on the bake's mountains (Design/SurfaceLook.md T3): summits, arêtes and faces below
-     *  the bake's resolution, their height this fraction of the local relief (the height range
-     *  within about two bake cells), on crests and upper slopes. Sharp pyramids where the
-     *  landform's character is rough, rounded domes where it is smooth. 0 turns them off. */
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrestrial|Sample", meta = (ClampMin = "0.0", UIMax = "1.0"))
-    double PeakStrength = 0.25;
+    /** The hills' eroded noise set (Design/NonMountainLand.md, T4a): a file name in the plugin's
+     *  NoiseSets folder without .vxnt (e.g. hills_a), empty to pick one of the folder's hills*
+     *  sets by the seed, or "none". Without one (or if it can't be read: the log says why) the
+     *  procedural hills above. Dissected hill country where the character is rough (the set's
+     *  R), rounded where it is smooth (G); its valleys drain into the bake's. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrestrial|Sample")
+    FString HillNoiseSet;
 
-    /** The peaks' finest wavelength (m): octaves from two bake cells down to it. */
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrestrial|Sample", meta = (ClampMin = "20.0", UIMin = "100", UIMax = "5000"))
-    double PeakFinestWavelength = 1000.0;
+    /** The hill set's height over its own relief at its placement (HillSpacing), at full
+     *  hilliness: 1 keeps the simulated slopes. Never more than half HillSpacing (a bound for
+     *  the planet's height range). 0 turns the set off (the procedural hills then). */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrestrial|Sample", meta = (ClampMin = "0.0", UIMax = "2.0"))
+    double HillHeightScale = 1.0;
+
+    /** The distance between the hill set's main valleys' groups (m): its spacing is placed at
+     *  this. Its relief, and so the hills' height, scales with it. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrestrial|Sample", meta = (ClampMin = "500.0", UIMin = "1000", UIMax = "10000"))
+    double HillSpacing = 2500.0;
+
+    /** Broad swells on rolling plains (m): the hill set's rounded channel again at
+     *  HillSwellScale times the spacing, this high at rolling hilliness, a quarter of it on the
+     *  flats, none in hill country. 0 turns them off. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrestrial|Sample", meta = (ClampMin = "0.0", UIMax = "100"))
+    double HillSwellHeight = 20.0;
+
+    /** The swells' spacing over the hills' (HillSpacing): how much broader they are. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrestrial|Sample", meta = (ClampMin = "1.5", ClampMax = "8.0"))
+    double HillSwellScale = 3.0;
+
+    /** The hill set's detail (as PeakDetailStrength: the peaks' detail tile at the hills' own
+     *  placement and amplitude). 0 turns it off. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrestrial|Sample", meta = (ClampMin = "0.0", UIMax = "2.0"))
+    double HillDetailStrength = 0.5;
+
+    /** Its coarsest wavelength (m); kept within a quarter of HillSpacing in code. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrestrial|Sample", meta = (ClampMin = "16.0", UIMin = "50", UIMax = "2000"))
+    double HillDetailWavelength = 300.0;
+
+    /** The foothills (T4b): how much the hill set's hills grow toward the ranges before the peaks
+     *  take over: their height is x (1 - P)(1 + this x 4P(1 - P)), P the peaks' fade-in, so at 1
+     *  they keep full height where the peaks are half in (relief about 1000 m at the defaults)
+     *  and peak at about 1.3x where the peaks are a fifth in. 0: the hills only fade (a
+     *  smoother band along range fronts). */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrestrial|Sample", meta = (ClampMin = "0.0", ClampMax = "2.0"))
+    double HillFoothillGrowth = 1.0;
+
+    /** Peaks on the bake's mountains (Design/SurfaceLook.md T3, T3d): summits, arêtes, faces and
+     *  the valleys between them below the bake's resolution, from an eroded noise set
+     *  (PeakNoiseSet), on crests and upper slopes. Sharp where the landform's character is rough
+     *  (the set's hard rock), rounded where it is smooth (soft rock). Their height: the set's own
+     *  relief at its placement (PeakSpacing) times this, so 1 keeps the simulated slopes; never
+     *  more than the bake's local relief. 0 turns them off. (Replaces T3's PeakStrength, a
+     *  fraction of the relief: a different meaning, so a new name.) */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrestrial|Sample", meta = (ClampMin = "0.0", UIMax = "2.0"))
+    double PeakHeightScale = 1.0;
+
+    /** The distance between the peaks' massifs (m): the set's spacing is placed at this. Its
+     *  relief, and so the peaks' height, scales with it. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrestrial|Sample", meta = (ClampMin = "500.0", UIMin = "2000", UIMax = "20000"))
+    double PeakSpacing = 6000.0;   // clamped to VoxelLand::PeakMinSpacing in code too
+
+    /** Where the peaks begin and finish fading in, by the bake's local relief (m; T4b): below
+     *  the start the land is the hills' (the hill set's foothills, HillFoothillGrowth), above
+     *  the end the peaks'. The set's peaks are scaled to the relief, not its spacing, so at low
+     *  relief they are broad and gentle: a later start keeps that land in the hills. T3's
+     *  250 .. 900 put a smooth band of flattened peaks along many range fronts. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrestrial|Sample", meta = (ClampMin = "0.0", UIMax = "3000"))
+    double PeakReliefFadeStart = 500.0;
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrestrial|Sample", meta = (ClampMin = "1.0", UIMax = "4000"))
+    double PeakReliefFadeEnd = 1500.0;
 
     /** The packed noise set the peaks are drawn from: a file name in the plugin's NoiseSets
      *  folder without .vxnt (e.g. peaks_b), or empty to pick one of the folder's peaks* sets by
@@ -244,6 +347,19 @@ struct VOXELPLUGIN_API FVoxelTerrestrialSettings
      *  generated set. A different set gives different summits. */
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrestrial|Sample")
     FString PeakNoiseSet;
+
+    /** The peaks' detail (Design/SurfaceLook.md T3e): a second, finer lookup over the peaks for
+     *  the surface below the set's resolution (its finest valleys are hundreds of metres across):
+     *  rocky creases where the character is rough, rounded ground where it is smooth. Its height
+     *  over its own: 1 keeps the tile's slopes (about 19 degrees RMS in hard rock, 12 in soft). It
+     *  lives where the peaks do, scaled with them. 0 turns it off. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrestrial|Sample", meta = (ClampMin = "0.0", UIMax = "2.0"))
+    double PeakDetailStrength = 1.0;
+
+    /** The detail's coarsest wavelength (m); its finest is a sixteenth of it. Kept within a
+     *  quarter of PeakSpacing in code. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrestrial|Sample", meta = (ClampMin = "16.0", UIMin = "50", UIMax = "2000"))
+    double PeakDetailWavelength = 400.0;
 
     /** Hash of the settings that change the bake (with the radius and the generator version,
      *  the cache key). */

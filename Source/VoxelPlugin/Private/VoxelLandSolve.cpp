@@ -51,6 +51,12 @@ BEGIN_SHADER_PARAMETER_STRUCT(FVoxelLandSolveParameters, )
     SHADER_PARAMETER(float, SolveUndulation)
     SHADER_PARAMETER(float, SolveLandformErosion)
     SHADER_PARAMETER(float, SolveIncision)
+    SHADER_PARAMETER(float, SolveChannelCells)
+    SHADER_PARAMETER(float, SolveChannelVariation)
+    SHADER_PARAMETER(float, SolveChannelWavelength)
+    SHADER_PARAMETER(uint32, SolveChannelOctaves)
+    SHADER_PARAMETER(float, SolveHillslope)
+    SHADER_PARAMETER(float, SolveChannelCharacter)
     // Per cell.
     SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<float>, SolveH)
     SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<float>, SolveW)
@@ -62,6 +68,7 @@ BEGIN_SHADER_PARAMETER_STRUCT(FVoxelLandSolveParameters, )
     SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint>, SlotCell)
     SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<float>, SlotU)
     SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<float>, SlotK)
+    SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<float>, SlotAc)
     SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<float>, SlotArea)
     SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<float>, SlotDist)
     SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<float>, SlotH0)
@@ -85,6 +92,7 @@ BEGIN_SHADER_PARAMETER_STRUCT(FVoxelLandSolveParameters, )
     SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<float>, OutFlow)
     SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<float>, OutWater)
     SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint>, OutAttr)
+    SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint>, OutForm)
     // Dispatch, compaction, the steps' state, the histograms.
     SHADER_PARAMETER(uint32, GroupsX)
     SHADER_PARAMETER(uint32, NumSlots)
@@ -143,6 +151,9 @@ END_SHADER_PARAMETER_STRUCT()
     X(FVoxelSolveImplicitInitCS, "ImplicitInitCS") \
     X(FVoxelSolveImplicitJumpCS, "ImplicitJumpCS") \
     X(FVoxelSolveImplicitFinishCS, "ImplicitFinishCS") \
+    X(FVoxelSolveCapInitCS, "CapInitCS") \
+    X(FVoxelSolveCapJumpCS, "CapJumpCS") \
+    X(FVoxelSolveCapFinishCS, "CapFinishCS") \
     X(FVoxelSolveResidualCS, "ResidualCS") \
     X(FVoxelSolveSettleMarkCS, "SettleMarkCS") \
     X(FVoxelSolveSettleInitCS, "SettleInitCS") \
@@ -286,7 +297,7 @@ struct VoxelLandSolve::FJob::FImpl
 
     // Pooled buffers kept between frames (render thread).
     TRefCountPtr<FRDGPooledBuffer> Tan, H, W, Water, Rec, Slot, Label, Cell, GroupCounts, Counts, Flags, State, Partials, Log, Histogram;
-    TRefCountPtr<FRDGPooledBuffer> U, Erodibility, Area, Dist, H0, WOut;
+    TRefCountPtr<FRDGPooledBuffer> U, Erodibility, ChannelFactor, Area, Dist, H0, WOut;
     TRefCountPtr<FRDGPooledBuffer> A[2], X[2], Y[2], P[2];
 
     /** This frame's view of the buffers. */
@@ -295,11 +306,11 @@ struct VoxelLandSolve::FJob::FImpl
         FRDGBufferRef BakeHeight = nullptr, BakeUp = nullptr, BakeCrust = nullptr, BakeAttr = nullptr, BakeForm = nullptr;
         FRDGBufferRef Tan = nullptr, H = nullptr, W = nullptr, Water = nullptr, Rec = nullptr, Slot = nullptr, Label = nullptr, Cell = nullptr;
         FRDGBufferRef GroupCounts = nullptr, Counts = nullptr, Flags = nullptr, State = nullptr, Partials = nullptr, Log = nullptr, Histogram = nullptr;
-        FRDGBufferRef U = nullptr, Erodibility = nullptr, Area = nullptr, Dist = nullptr, H0 = nullptr, WOut = nullptr;
+        FRDGBufferRef U = nullptr, Erodibility = nullptr, ChannelFactor = nullptr, Area = nullptr, Dist = nullptr, H0 = nullptr, WOut = nullptr;
         FRDGBufferRef A[2] = {}, X[2] = {}, Y[2] = {}, P[2] = {};
         // The last frame's lake and output buffers (else stand-ins).
         FRDGBufferRef LakeArea = nullptr, LakeDepth = nullptr, LakeOutlet = nullptr, LakeCount = nullptr, LakeList = nullptr;
-        FRDGBufferRef OutHeight = nullptr, OutFlow = nullptr, OutWater = nullptr, OutAttr = nullptr;
+        FRDGBufferRef OutHeight = nullptr, OutFlow = nullptr, OutWater = nullptr, OutAttr = nullptr, OutForm = nullptr;
         /** Every pass's parameters with this frame's views (BuildBase), and the views of the
          *  double buffers, which the passes pick by parity. */
         FVoxelLandSolveParameters Base;
@@ -378,6 +389,7 @@ struct VoxelLandSolve::FJob::FImpl
         F.Partials = Get(GraphBuilder, Partials, 4, 2 * FMath::DivideAndRoundUp(SlotCount, 64u), TEXT("Voxel.LandSolvePartials"));
         F.U = Get(GraphBuilder, U, 4, SlotCount, TEXT("Voxel.LandSolveU"));
         F.Erodibility = Get(GraphBuilder, Erodibility, 4, SlotCount, TEXT("Voxel.LandSolveK"));
+        F.ChannelFactor = Get(GraphBuilder, ChannelFactor, 4, SlotCount, TEXT("Voxel.LandSolveAc"));
         F.Area = Get(GraphBuilder, Area, 4, SlotCount, TEXT("Voxel.LandSolveArea"));
         F.Dist = Get(GraphBuilder, Dist, 4, SlotCount, TEXT("Voxel.LandSolveDist"));
         F.H0 = Get(GraphBuilder, H0, 4, SlotCount, TEXT("Voxel.LandSolveH0"));
@@ -433,6 +445,13 @@ struct VoxelLandSolve::FJob::FImpl
         Params.SolveUndulation = S.Undulation;
         Params.SolveLandformErosion = S.LandformErosion;
         Params.SolveIncision = S.Incision;
+        // T3g: the channel heads and the hillslopes' threshold.
+        Params.SolveChannelCells = S.ChannelCells;
+        Params.SolveChannelVariation = S.ChannelVariation;
+        Params.SolveChannelWavelength = S.ChannelWavelength;
+        Params.SolveChannelOctaves = (uint32)FMath::Clamp(S.ChannelOctaves, 1, 6);
+        Params.SolveHillslope = S.Hillslope;
+        Params.SolveChannelCharacter = S.ChannelCharacter;
         Params.SolveH = GraphBuilder.CreateUAV(F.H);
         Params.SolveW = GraphBuilder.CreateUAV(F.W);
         Params.SolveWater = GraphBuilder.CreateUAV(F.Water);
@@ -442,6 +461,7 @@ struct VoxelLandSolve::FJob::FImpl
         Params.SlotCell = GraphBuilder.CreateUAV(F.Cell);
         Params.SlotU = GraphBuilder.CreateUAV(F.U);
         Params.SlotK = GraphBuilder.CreateUAV(F.Erodibility);
+        Params.SlotAc = GraphBuilder.CreateUAV(F.ChannelFactor);
         Params.SlotArea = GraphBuilder.CreateUAV(F.Area);
         Params.SlotDist = GraphBuilder.CreateUAV(F.Dist);
         Params.SlotH0 = GraphBuilder.CreateUAV(F.H0);
@@ -467,6 +487,7 @@ struct VoxelLandSolve::FJob::FImpl
         Params.OutFlow = OrStandIn(F.OutFlow, TEXT("Voxel.LandSolveNoOutFlow"));
         Params.OutWater = OrStandIn(F.OutWater, TEXT("Voxel.LandSolveNoOutWater"));
         Params.OutAttr = OrStandIn(F.OutAttr, TEXT("Voxel.LandSolveNoOutAttr"));
+        Params.OutForm = OrStandIn(F.OutForm, TEXT("Voxel.LandSolveNoOutForm"));
         Params.NumScanGroups = NumScanGroups;
         Params.SolveMaxSteps = (uint32)FMath::Max(S.MaxSteps, 1);
         Params.SolveMinSteps = (uint32)FMath::Max(S.MinSteps, 1);
@@ -626,13 +647,24 @@ struct VoxelLandSolve::FJob::FImpl
             JumpParity ^= 1;
         }
         Pass<FVoxelSolveImplicitFinishCS>(GraphBuilder, F, M, TEXT("implicit finish"), 0, 1);
+        if (S.ChannelCells > 0.0f)
+        {
+            // T3g: the hillslopes' threshold (its finish writes the residual's partials again).
+            Pass<FVoxelSolveCapInitCS>(GraphBuilder, F, M, TEXT("slope cap"), 0, 1);
+            for (int32 r = 0; r < VLS::JumpRounds; r++)
+            {
+                Pass<FVoxelSolveCapJumpCS>(GraphBuilder, F, M, TEXT("slope cap jump"), 0, 1);
+                JumpParity ^= 1;
+            }
+            Pass<FVoxelSolveCapFinishCS>(GraphBuilder, F, M, TEXT("slope cap finish"), 0, 1);
+        }
         Single<FVoxelSolveResidualCS>(GraphBuilder, F, TEXT("residual"));
     }
 
     void Release()
     {
         for (TRefCountPtr<FRDGPooledBuffer>* B : { &Tan, &H, &W, &Water, &Rec, &Slot, &Label, &Cell, &GroupCounts, &Counts, &Flags, &State, &Partials, &Log,
-            &Histogram, &U, &Erodibility, &Area, &Dist, &H0, &WOut, &A[0], &A[1], &X[0], &X[1], &Y[0], &Y[1], &P[0], &P[1] })
+            &Histogram, &U, &Erodibility, &ChannelFactor, &Area, &Dist, &H0, &WOut, &A[0], &A[1], &X[0], &X[1], &Y[0], &Y[1], &P[0], &P[1] })
             B->SafeRelease();
         Pending.Reset();
     }
@@ -774,7 +806,9 @@ void VoxelLandSolve::FJob::Tick(FRHICommandListImmediate& RHICmdList, const FPla
                 I.Pending.Add(VLS::Enqueue(GraphBuilder, F.State, 8, TEXT("Voxel.LandSolveStateReadback")));
                 break;
             }
-            const int32 Steps = FMath::Min((int32)FMath::Clamp<int64>(S.StepCellsPerFrame / FMath::Max<int64>(I.NumSlots, 1), 1, VLS::MaxStepsPerFrame), Left);
+            // The slope cap (T3g) adds about a third to a step's passes.
+            const int64 StepCost = S.ChannelCells > 0.0f ? (int64)I.NumSlots * 4 / 3 : (int64)I.NumSlots;
+            const int32 Steps = FMath::Min((int32)FMath::Clamp<int64>(S.StepCellsPerFrame / FMath::Max<int64>(StepCost, 1), 1, VLS::MaxStepsPerFrame), Left);
             for (int32 s = 0; s < Steps; s++)
                 I.Step(GraphBuilder, F);
             I.StepsDispatched += Steps;
@@ -901,6 +935,7 @@ void VoxelLandSolve::FJob::Tick(FRHICommandListImmediate& RHICmdList, const FPla
             F.OutFlow = FImpl::Transient(GraphBuilder, 4, I.NumCells, TEXT("Voxel.LandSolveOutFlow"));
             F.OutWater = FImpl::Transient(GraphBuilder, 4, I.NumCells, TEXT("Voxel.LandSolveOutWater"));
             F.OutAttr = FImpl::Transient(GraphBuilder, 4, I.NumCells, TEXT("Voxel.LandSolveOutAttr"));
+            F.OutForm = FImpl::Transient(GraphBuilder, 4, I.NumCells, TEXT("Voxel.LandSolveOutForm"));
             I.BuildBase(GraphBuilder, F);
             AddClearUAVPass(GraphBuilder, GraphBuilder.CreateUAV(F.LakeArea), 0u);
             AddClearUAVPass(GraphBuilder, GraphBuilder.CreateUAV(F.LakeDepth), 0u);
@@ -919,8 +954,8 @@ void VoxelLandSolve::FJob::Tick(FRHICommandListImmediate& RHICmdList, const FPla
             I.Pending.Add(VLS::Enqueue(GraphBuilder, F.LakeCount, 4, TEXT("Voxel.LandSolveLakeCountReadback")));
             I.Pending.Add(VLS::Enqueue(GraphBuilder, F.LakeList, 16 * VLS::MaxLakes, TEXT("Voxel.LandSolveLakesReadback")));
             I.Pending.Add(VLS::Enqueue(GraphBuilder, F.Flags, 8, TEXT("Voxel.LandSolveFlagsReadback")));
-            // The plate pass's landform, which the bake keeps as it is.
-            I.Pending.Add(VLS::Enqueue(GraphBuilder, F.BakeForm, Bytes, TEXT("Voxel.LandSolveFormReadback")));
+            // The plate pass's landform, its character following the drainage density (T3h).
+            I.Pending.Add(VLS::Enqueue(GraphBuilder, F.OutForm, Bytes, TEXT("Voxel.LandSolveFormReadback")));
             I.SetPhase(EPhase::OutputWait, Result);
             Progress.store(0.97f, std::memory_order_relaxed);
             break;

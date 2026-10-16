@@ -2,6 +2,7 @@
 #include "VoxelDensity.h"
 #include "VoxelDensityGPU.h"
 #include "VoxelLandBake.h"
+#include "VoxelNoiseTiles.h"
 #include "VoxelPlugin.h"
 #include "Async/ParallelFor.h"
 #include "HAL/IConsoleManager.h"
@@ -15,6 +16,9 @@
 
 // The layout the material decodes (shared with VoxelLandMaterialAccess.ush).
 #include "VoxelLandMaterialLayout.ush"
+
+// The scalars must fit their texels, or the next slot overwrites the tan table that follows.
+static_assert(VOXEL_LAND_MC_COUNT <= 4 * VOXEL_LAND_MC_TEXELS, "VOXEL_LAND_MC_COUNT overruns VOXEL_LAND_MC_TEXELS");
 
 const FName VoxelLandMaterial::HeightTextureName(TEXT("VoxelLandHeight"));
 const FName VoxelLandMaterial::FieldTextureName(TEXT("VoxelLandFields"));
@@ -108,11 +112,46 @@ namespace VoxelLandMaterialDetail
         return UTexture2DDynamic::Create(Width, Height, Info);
     }
 
-    /** Whether the noise set goes into the material (its texture fits this RHI): the constants
-     *  turn the peaks on exactly when the texture is the set's, not the stand-in. */
+    /** The row a chain (from texel Base, N texels a side) ends in, in a pack's rows of RowN. */
+    uint32 ChainEndRow(const FVoxelLandNoiseSet& Noise, uint32 Base, uint32 N)
+    {
+        return (uint32)((Base + VoxelNoiseTiles::ChainTexels(N) + Noise.RowN - 1) / Noise.RowN);
+    }
+
+    /** The rows of the noise pack's words the material's texture takes on this RHI: all of them,
+     *  or as many whole chains from the start as fit (the material then shades without the
+     *  rest: the hills' set, then the detail tile; the registry's limit, the same on every
+     *  machine, decides what the geometry has); 0 if not even the first fits. */
+    uint32 NoiseRowsFor(const FVoxelLandNoiseSet* Noise)
+    {
+        const uint32 Max = (uint32)GetMax2DTextureDimension();
+        if (!Noise || !Noise->IsComplete() || Noise->RowN > Max) return 0;
+        if (Noise->Rows <= Max) return Noise->Rows;
+        uint32 Best = 0;
+        for (const uint32 End : { Noise->N > 0 ? ChainEndRow(*Noise, 0u, Noise->N) : 0u,
+                 Noise->DetailN > 0 ? ChainEndRow(*Noise, Noise->DetailBase, Noise->DetailN) : 0u,
+                 Noise->HillN > 0 ? ChainEndRow(*Noise, Noise->HillBase, Noise->HillN) : 0u })
+            if (End <= Max) Best = FMath::Max(Best, End);
+        return Best;
+    }
+
+    /** Whether the noise pack goes into the material (its texture fits this RHI): the constants
+     *  turn a layer on exactly when the texture holds its chain, not the stand-in. */
     bool NoiseFits(const FVoxelLandNoiseSet* Noise)
     {
-        return Noise && Noise->IsComplete() && Noise->N <= GetMax2DTextureDimension() && Noise->Rows <= GetMax2DTextureDimension();
+        return NoiseRowsFor(Noise) > 0;
+    }
+
+    /** Whether the texture holds a chain of the pack. */
+    bool NoiseChainFits(const FVoxelLandNoiseSet* Noise, uint32 Base, uint32 N)
+    {
+        return Noise && N > 0 && ChainEndRow(*Noise, Base, N) <= NoiseRowsFor(Noise);
+    }
+
+    /** Whether the detail tile goes into the material. */
+    bool NoiseDetailFits(const FVoxelLandNoiseSet* Noise)
+    {
+        return Noise && NoiseChainFits(Noise, Noise->DetailBase, Noise->DetailN);
     }
 }
 
@@ -221,18 +260,70 @@ void VoxelLandMaterial::BuildConstantTexels(const FVoxelDensityGPUData& Density,
     S[VOXEL_LAND_MC_HILL_OCTAVES] = (float)Density.LandHillOctaves;
     PutU32(S, VOXEL_LAND_MC_HILL_SEED, Density.LandHillSeed);
     S[VOXEL_LAND_MC_HAS_FORM] = bForm ? 1.0f : 0.0f;
-    // The peaks and their noise set (VoxelLandPeaks.ush, VoxelLandNoise.ush): off without the set.
-    if (const FVoxelLandNoiseSet* Noise = NoiseFits(Density.LandNoise.Get()) ? Density.LandNoise.Get() : nullptr)
+    // The noise pack (VoxelLandNoise.ush): the peaks, the detail tile, the hills' set; each off
+    // without its chain in the texture. The hills' set's relief without it would be the
+    // procedural hills at the set's height: none then.
+    if (Density.LandHillTexelsPerCell > 0.0f && !(Density.LandNoise.IsValid() && NoiseChainFits(Density.LandNoise.Get(), Density.LandNoise->HillBase, Density.LandNoise->HillN)))
+        S[VOXEL_LAND_MC_HILL_RELIEF] = 0.0f;
+    const FVoxelLandNoiseSet* Pack = NoiseFits(Density.LandNoise.Get()) ? Density.LandNoise.Get() : nullptr;
+    if (Pack)
+    {
+        S[VOXEL_LAND_MC_NOISE_SHIFT] = (float)FMath::FloorLog2(Pack->RowN);
+        if (NoiseDetailFits(Pack))
+        {
+            PutU32(S, VOXEL_LAND_MC_PEAK_DETAIL_BASE, Pack->DetailBase);
+            S[VOXEL_LAND_MC_PEAK_DETAIL_N] = (float)Pack->DetailN;
+            S[VOXEL_LAND_MC_PEAK_DETAIL_MIPS] = (float)Pack->DetailMips;
+            S[VOXEL_LAND_MC_PEAK_DETAIL_MEAN_R] = Density.LandPeakDetailMeanR;
+            S[VOXEL_LAND_MC_PEAK_DETAIL_MEAN_G] = Density.LandPeakDetailMeanG;
+        }
+        if (Density.LandHillTexelsPerCell > 0.0f && NoiseChainFits(Pack, Pack->HillBase, Pack->HillN))
+        {
+            PutU32(S, VOXEL_LAND_MC_HILL_BASE, Pack->HillBase);
+            S[VOXEL_LAND_MC_HILL_N] = (float)Pack->HillN;
+            S[VOXEL_LAND_MC_HILL_MIPS] = (float)Pack->HillMips;
+            S[VOXEL_LAND_MC_HILL_TEXELS_PER_CELL] = Density.LandHillTexelsPerCell;
+            S[VOXEL_LAND_MC_HILL_SCALE_R] = Density.LandHillScaleR;
+            S[VOXEL_LAND_MC_HILL_SCALE_G] = Density.LandHillScaleG;
+            S[VOXEL_LAND_MC_HILL_SCALE_B] = Density.LandHillScaleB;
+            S[VOXEL_LAND_MC_HILL_SPACING_M] = Density.LandHillSpacingM;
+            S[VOXEL_LAND_MC_HILL_SWELL_TEXELS_PER_CELL] = Density.LandHillSwellTexelsPerCell;
+            S[VOXEL_LAND_MC_HILL_SWELL_M] = Density.LandHillSwellM;
+            S[VOXEL_LAND_MC_HILL_SWELL_SCALE_G] = Density.LandHillSwellScaleG;
+            S[VOXEL_LAND_MC_HILL_FOOTHILL] = Density.LandHillFoothill;
+            if (NoiseDetailFits(Pack))
+            {
+                S[VOXEL_LAND_MC_HILL_DETAIL_TEXELS_PER_CELL] = Density.LandHillDetailTexelsPerCell;
+                S[VOXEL_LAND_MC_HILL_DETAIL_SCALE_R] = Density.LandHillDetailScaleR;
+                S[VOXEL_LAND_MC_HILL_DETAIL_SCALE_G] = Density.LandHillDetailScaleG;
+                S[VOXEL_LAND_MC_HILL_DETAIL_FADE] = Density.LandHillDetailFade;
+            }
+        }
+    }
+    if (const FVoxelLandNoiseSet* Noise = Pack && Pack->N > 0 && NoiseChainFits(Pack, 0u, Pack->N) ? Pack : nullptr)
     {
         S[VOXEL_LAND_MC_PEAK_STRENGTH] = Density.LandPeakStrength;
-        S[VOXEL_LAND_MC_PEAK_OCTAVES] = (float)Density.LandPeakOctaves;
+        S[VOXEL_LAND_MC_PEAK_TEXELS_PER_CELL] = Density.LandPeakTexelsPerCell;
         PutU32(S, VOXEL_LAND_MC_PEAK_SEED, Density.LandPeakSeed);
         S[VOXEL_LAND_MC_NOISE_N] = (float)Noise->N;
         S[VOXEL_LAND_MC_NOISE_MIPS] = (float)Noise->Mips;
-        S[VOXEL_LAND_MC_NOISE_CELL_SHIFT] = (float)Noise->CellShift;
-        S[VOXEL_LAND_MC_NOISE_SHIFT] = (float)FMath::FloorLog2(Noise->N);
-        S[VOXEL_LAND_MC_PEAK_MEAN_SHAPE] = Noise->MeanShape;
-        S[VOXEL_LAND_MC_PEAK_MEAN_G] = Noise->MeanG;
+        S[VOXEL_LAND_MC_PEAK_SPACING_M] = Density.LandPeakSpacingM;
+        S[VOXEL_LAND_MC_PEAK_RELIEF_M] = Density.LandPeakReliefM;
+        S[VOXEL_LAND_MC_PEAK_RELIEF_START] = Density.LandPeakReliefStart;
+        S[VOXEL_LAND_MC_PEAK_RELIEF_END] = Density.LandPeakReliefEnd;
+        S[VOXEL_LAND_MC_PEAK_MEAN_R] = Density.LandPeakMeanR;
+        S[VOXEL_LAND_MC_PEAK_MEAN_G] = Density.LandPeakMeanG;
+        S[VOXEL_LAND_MC_PEAK_SCALE_R] = Density.LandPeakScaleR;
+        S[VOXEL_LAND_MC_PEAK_SCALE_G] = Density.LandPeakScaleG;
+        S[VOXEL_LAND_MC_PEAK_SCALE_B] = Density.LandPeakScaleB;
+        // The detail tile, in the same texture after the set's chain (T3e).
+        if (Density.LandPeakDetailTexelsPerCell > 0.0f && NoiseDetailFits(Noise))
+        {
+            S[VOXEL_LAND_MC_PEAK_DETAIL_TEXELS_PER_CELL] = Density.LandPeakDetailTexelsPerCell;
+            S[VOXEL_LAND_MC_PEAK_DETAIL_SCALE_R] = Density.LandPeakDetailScaleR;
+            S[VOXEL_LAND_MC_PEAK_DETAIL_SCALE_G] = Density.LandPeakDetailScaleG;
+            S[VOXEL_LAND_MC_PEAK_DETAIL_FADE] = Density.LandPeakDetailFade;
+        }
     }
 
     for (int32 i = 0; i < Bake.TanTable.Num(); i++)
@@ -343,15 +434,15 @@ UTexture2DDynamic* VoxelLandMaterial::MakeNoiseTexture(const FVoxelDensityCPU& D
         for (const FShared& E : Shared)
             if (E.Set.Pin() == Noise) return E.Texture.Get();
     if (!bSet && StandIn.IsValid()) return StandIn.Get();
-    const int32 Width = bSet ? (int32)Noise->N : 1;
-    const int32 Height = bSet ? (int32)Noise->Rows : 1;
+    const int32 Width = bSet ? (int32)Noise->RowN : 1;
+    const int32 Height = bSet ? (int32)NoiseRowsFor(Noise.Get()) : 1;
     UTexture2DDynamic* Texture = Make(Width, Height, PF_A16B16G16R16);
     if (!Texture)
     {
         UE_LOG(LogVoxelPlugin, Warning, TEXT("[VoxelLand] Couldn't create the land material's noise texture."));
         return nullptr;
     }
-    // The chain in rows of N texels (VoxelLandMaterialAccess.ush): two words a texel are the
+    // The chains in rows of RowN texels (VoxelLandMaterialAccess.ush): two words a texel are the
     // RGBA16 texel as it lies in memory (R, G, B, A, little-endian); the shared set stays alive
     // until the upload ran.
     if (bSet)

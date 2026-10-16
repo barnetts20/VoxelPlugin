@@ -68,6 +68,17 @@ namespace VoxelLandSolve
         float LandformErosion = 1.0f;    // T2: the landform scales PlainsRelief and Undulation
         float Incision = 150.0f;         // m
         float ReliefTopScale = 1.2f;     // the top over the profile's 99.9th percentile
+        // T3g (Design/SurfaceLook.md; VoxelLandSolve.ush): the channel heads' area in cells
+        // (0 off: every cell incises, no slope cap), its variation 2^(+-ChannelVariation) over
+        // a noise of ChannelWavelength (m) and ChannelOctaves, and the hillslopes' cap (a
+        // multiple of the steady channel slope at the cell's head area).
+        float ChannelCells = 0.0f;
+        float ChannelVariation = 1.5f;
+        float ChannelWavelength = 1.8e5f;
+        int32 ChannelOctaves = 3;
+        float Hillslope = 1.5f;
+        // T3h: how far the drainage density pulls the landform's character (0 off).
+        float ChannelCharacter = 0.0f;
         bool bErode = true;
         int64 StepCellsPerFrame = 1 << 22;        // slot-steps a frame
         int64 IterationCellsPerFrame = 1 << 26;   // slot-iterations a frame (the fills, drainage, labels)
@@ -90,7 +101,7 @@ namespace VoxelLandSolve
     {
         TArray<float> Height;
         TArray<uint32> Attr;             // FVoxelLandBake::Attr in the low 16 bits
-        TArray<uint32> Form;             // FVoxelLandBake::Form in the low 16 bits (the plate pass's, read back)
+        TArray<uint32> Form;             // FVoxelLandBake::Form in the low 16 bits (the plate pass's; the character after T3h)
         TArray<float> Flow;              // log2 m^2
         TArray<float> Water;
         TArray<FVoxelLandLake> Lakes;

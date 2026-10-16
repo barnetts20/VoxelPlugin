@@ -73,7 +73,8 @@ struct VOXELPLUGIN_API FVoxelLandBake
     /** Per cell: the landform (VoxelLandPlates.ush VoxelLandFormAt): the hilliness (0 flat
      *  plains .. 255 hill country) in the low byte, the character (0 smooth, rolling .. 255
      *  rough-topped) in the high byte. The hills layer's shape and height (VoxelLandHills.ush),
-     *  and the peaks' sharpness (VoxelLandPeaks.ush). */
+     *  and the peaks' sharpness (VoxelLandPeaks.ush). An eroded bake's character also follows
+     *  the solve's drainage density (T3h, VoxelLandSolve.ush VoxelSolveFormOf). */
     TArray<uint16> Form;
 
     /** Per cell: the local relief (VoxelLandRelief.h: the height range within about two cells,
@@ -122,11 +123,13 @@ struct VOXELPLUGIN_API FVoxelLandBake
     TSharedPtr<FVoxelLandBakeGPU, ESPMode::ThreadSafe> GPU;
 };
 
-/** A packed noise set (VoxelNoiseTiles.h; Design/NoiseTiles2D_Handoff.md) as the land samples it
- *  (VoxelLandNoise.ush): the mip chain as words (two a texel: R | G << 16, B | A << 16, the
- *  .vxnt files' own bytes), padded to whole rows of N texels (the material's texture is those
- *  rows), its size and mips, and what the peaks layer normalises with (VoxelLandPeaks.ush).
- *  Immutable once made; shared by every planet's density that uses it. */
+/** The land's baked noise as it samples it (VoxelLandNoise.ush; VoxelNoiseTiles.h,
+ *  Design/NoiseTiles2D_Handoff.md): a pack of packed sets' mip chains as words (two a texel:
+ *  R | G << 16, B | A << 16, the .vxnt files' own bytes), each from a whole row of RowN texels
+ *  (the material's texture is those rows): the peaks' set (from texel 0; N 0 without peaks),
+ *  the detail tile, then the hills' set (T4a; HillN 0 without). With what the layers place
+ *  and normalise them with (VoxelLandPeaks.ush, VoxelLandHillSet.ush). Immutable once made;
+ *  shared by every planet's density that uses the same sets. */
 struct VOXELPLUGIN_API FVoxelLandNoiseSet
 {
     FVoxelLandNoiseSet();
@@ -134,18 +137,48 @@ struct VOXELPLUGIN_API FVoxelLandNoiseSet
     FVoxelLandNoiseSet(const FVoxelLandNoiseSet&) = delete;
     FVoxelLandNoiseSet& operator=(const FVoxelLandNoiseSet&) = delete;
 
-    FString Name;                 // the file's name without .vxnt, or VoxelLand::GeneratedNoiseName
-    FString LookTag;
-    uint32 N = 0;                 // texels per side of mip 0
+    FString Name;                 // the pack's key (VoxelLand::LandNoiseNameFor: "peaks|hills")
+    FString LookTag;              // the peaks set's
+    uint32 RowN = 0;              // texels per row (a power of two: the first chain's N)
+    uint32 N = 0;                 // the peaks' set: texels per side of mip 0 (0: no peaks)
     uint32 Mips = 0;
-    uint32 Rows = 0;              // rows of N texels holding the chain (the last one padded)
-    uint32 CellShift = 0;         // log2 of the texels per R cell
-    TArray<uint32> Words;         // Rows x N texels, two words each
-    float MeanShape = 0.0f;       // over mip 0, in unit values: (0.6 + 0.8 A) R (VoxelLandPeaks.ush's summit scale), and G
+    uint32 Rows = 0;              // rows of RowN texels: the peaks' chain (the last one padded),
+                                  // the detail tile's (from row DetailBase / RowN), the hills'
+    TArray<uint32> Words;         // Rows x RowN texels, two words each
+    // What the peaks layer places and normalises the set with (VoxelLandPeaks.ush): the massif
+    // spacing (mip-0 texels), R's and G's means over mip 0 (unit values), and the decode ranges
+    // (Max - Min, mip-0 texels) of R, G and B.
+    uint32 SpacingTexels = 0;
+    float MeanR = 0.0f;
     float MeanG = 0.0f;
+    float RangeR = 1.0f;
+    float RangeG = 1.0f;
+    float RangeB = 1.0f;
+    // The peaks' detail tile (VoxelNoiseTiles::GeneratePeakDetail; VoxelLandPeaks.ush, T3e): its
+    // chain in the words after the set's (from texel DetailBase, a whole row; 0 size: none), its
+    // coarsest wavelength (mip-0 texels), R's and G's means (unit) and decode ranges (texels).
+    uint32 DetailBase = 0;
+    uint32 DetailN = 0;
+    uint32 DetailMips = 0;
+    uint32 DetailSpacingTexels = 0;
+    float DetailMeanR = 0.0f;
+    float DetailMeanG = 0.0f;
+    float DetailRangeR = 1.0f;
+    float DetailRangeG = 1.0f;
+    // The hills' set (VoxelLandHillSet.ush, T4a): its chain from texel HillBase (a whole row; 0
+    // size: none), its name, spacing (mip-0 texels: N over its cells per tile) and the decode
+    // ranges (texels) of R, G and B. Read from its base network up (no means).
+    FString HillName;
+    uint32 HillBase = 0;
+    uint32 HillN = 0;
+    uint32 HillMips = 0;
+    uint32 HillSpacingTexels = 0;
+    float HillRangeR = 1.0f;
+    float HillRangeG = 1.0f;
+    float HillRangeB = 1.0f;
 
-    /** Whether the words hold the whole chain (the sampler's bounds). */
-    bool IsComplete() const { return N > 0 && Rows > 0 && Words.Num() == (int32)(2 * Rows * N); }
+    /** Whether the words hold every chain (the sampler's bounds). */
+    bool IsComplete() const { return RowN > 0 && Rows > 0 && Words.Num() == (int32)(2 * Rows * RowN); }
 
     /** The GPU copy (render thread; uploaded on first use, released on the render thread). */
     TSharedPtr<FVoxelLandNoiseGPU, ESPMode::ThreadSafe> GPU;
@@ -207,7 +240,7 @@ private:
 namespace VoxelLand
 {
     /** Bump when the generator's output changes for the same settings (invalidates caches). */
-    constexpr uint32 GeneratorVersion = 6;
+    constexpr uint32 GeneratorVersion = 10;   // 7: T3f, belts and the continental slope follow the continents' outline; 8: T3g, channel heads; 9: T3h, the character follows them; 10: T4b, the static surface rises monotonically into the ranges
 
     /** voxel.Land.Erosion: whether bakes run the erosion solve (part of the key). */
     VOXELPLUGIN_API bool IsErosionEnabled();
@@ -224,8 +257,9 @@ namespace VoxelLand
 
     /** The planet shape a bake gives the density: the base radius (sea radius plus the lowest
      *  possible height, cm) and the height range above it (cm), covering the bake and the
-     *  per-sample layers' reach. */
-    VOXELPLUGIN_API void ShapeFor(const FVoxelTerrestrialSettings& Settings, const FVoxelLandBake& Bake,
+     *  per-sample layers' reach. Noise: the noise pack the density takes (LandNoiseNameFor;
+     *  its hill set's relief bounds the hills: T4a), or null (the procedural hills' bound). */
+    VOXELPLUGIN_API void ShapeFor(const FVoxelTerrestrialSettings& Settings, const FVoxelLandBake& Bake, const FVoxelLandNoiseSet* Noise,
         double& OutPlanetRadius, double& OutNoiseAmplitude);
 
     /** The gully filter's constants (VOXEL_LAND_GULLY_MAX_OCTAVES, _GAIN, _MAX_SLOPE in
@@ -251,18 +285,22 @@ namespace VoxelLand
     /** The finest hill octave's frequency (cycles per cm). */
     VOXELPLUGIN_API double HillFinestFrequency(const FVoxelTerrestrialSettings& Settings);
 
-    /** The peaks' constants (VOXEL_LAND_PEAK_MAX_OCTAVES, the summit scale's range and the ridged
-     *  weight in VoxelLandPeaks.ush; keep equal). */
-    constexpr int32 PeakMaxOctaves = 8;
-    /** Bounds on the peaks' shape (Unit), for the planet's height range: gully_harness pgrad
-     *  measures -0.50 .. 1.21 over 900k points of the generated set; aligned summits at the
-     *  roughest gain could reach about 2.2 up, 0.7 down. */
-    constexpr double PeakMaxUnit = 2.2;
-    constexpr double PeakMinUnit = 1.0;
+    /** The smallest massif spacing (m) the code accepts, whatever sets it: it keeps the peaks'
+     *  lattice coordinates (VoxelDFLatticeSplit: under 2^31 texels) in range on any planet. */
+    constexpr double PeakMinSpacing = 500.0;
 
-    /** The peak octaves (VoxelLandPeaks.ush): from two bake cells down to
-     *  Settings.PeakFinestWavelength, at most 8; 0 without peaks. */
-    VOXELPLUGIN_API int32 PeakOctavesFor(const FVoxelTerrestrialSettings& Settings, const FVoxelLandBake& Bake);
+    /** The peaks' placement (VoxelLandPeaks.ush) for a set: its mip-0 texels per bake cell (the
+     *  massif spacing Settings.PeakSpacing over Set's spacing in texels); 0 without peaks. */
+    VOXELPLUGIN_API float PeakTexelsPerCell(const FVoxelTerrestrialSettings& Settings, const FVoxelLandBake& Bake, const FVoxelLandNoiseSet& Set);
+
+    /** The peaks' detail's coarsest wavelength (m): the setting within 16 m .. a quarter of the
+     *  massif spacing. */
+    VOXELPLUGIN_API double PeakDetailWavelength(const FVoxelTerrestrialSettings& Settings);
+
+    /** The detail tile's mip-0 texels per bake cell (VoxelLandPeaks.ush, T3e): its coarsest
+     *  wavelength placed at PeakDetailWavelength. 0 without detail (strength 0, or the set has
+     *  no detail tile). */
+    VOXELPLUGIN_API float PeakDetailTexelsPerCell(const FVoxelTerrestrialSettings& Settings, const FVoxelLandBake& Bake, const FVoxelLandNoiseSet& Set);
 
     /** How far the peaks can raise the surface (bUp; else lower it), cm. They act only on land
      *  (from 2 m up), so they lower it below the bake's land at most this far. */
@@ -277,33 +315,57 @@ namespace VoxelLand
      *  before that, or without the plugin. */
     VOXELPLUGIN_API FString NoiseSetDirectory();
 
-    /** The noise set a planet's peaks sample (Design/SurfaceLook.md T3): Settings.PeakNoiseSet if
-     *  set (a file name without .vxnt); else one of the usable `peaks*` sets in NoiseSetDirectory,
+    /** The peaks' set a planet samples (Design/SurfaceLook.md T3): Settings.PeakNoiseSet if set
+     *  (a file name without .vxnt); else one of the usable `peaks*` sets in NoiseSetDirectory,
      *  picked by the planet's seed (rendezvous hashing: adding or removing a set moves only the
-     *  planets that pick it); else the generated one. The folder is listed once a session (the
-     *  first call reads its sets' headers). */
+     *  planets that pick it); else the generated one. Empty without peaks. The folder is listed
+     *  once a session (the first call reads its sets' headers). */
     VOXELPLUGIN_API FString PeakNoiseNameFor(const FVoxelTerrestrialSettings& Settings);
 
-    /** The peaks' noise set Name (PeakNoiseNameFor): read (about 0.1 s for a 2048 set) or
+    /** The hills' set (T4a): Settings.HillNoiseSet if set ("none": the procedural hills); else
+     *  one of the folder's `hills*` sets by the seed (as the peaks'). Empty without hills, or
+     *  without a set (the procedural hills then). */
+    VOXELPLUGIN_API FString HillNoiseNameFor(const FVoxelTerrestrialSettings& Settings);
+
+    /** The noise pack a planet's density takes: "Peaks|Hills" (PeakNoiseNameFor,
+     *  HillNoiseNameFor); empty when it needs neither. */
+    VOXELPLUGIN_API FString LandNoiseNameFor(const FVoxelTerrestrialSettings& Settings);
+
+    /** The pack Key (LandNoiseNameFor): its sets read (about 0.1 s for a 2048 set) or the peaks'
      *  generated (about a second of worker time), then shared while densities hold it (and the
-     *  four most recent kept regardless); read again when asked for after that. A file that is
-     *  missing or isn't a valid `peaks` set logs an error and gives the generated set. Null only
-     *  if that fails too (the peaks are then off). Thread-safe; blocks while it's made (the
-     *  planet waits for TryGetPeakNoise before it builds a density, so the game thread
-     *  doesn't). */
-    VOXELPLUGIN_API TSharedPtr<const FVoxelLandNoiseSet, ESPMode::ThreadSafe> GetPeakNoise(const FString& Name);
+     *  four most recent kept regardless); made again when asked for after that. A peaks file
+     *  that is missing or isn't a valid set logs an error and gives the generated set; a hills
+     *  file likewise, and the pack goes without it (the procedural hills). Null only if
+     *  nothing could be made. Thread-safe; blocks while it's made (the planet waits for
+     *  TryGetLandNoise before it builds a density, so the game thread doesn't). */
+    VOXELPLUGIN_API TSharedPtr<const FVoxelLandNoiseSet, ESPMode::ThreadSafe> GetLandNoise(const FString& Key);
 
     /** Starts making it in the background, if it isn't already there or under way. */
-    VOXELPLUGIN_API void PrewarmPeakNoise(const FString& Name);
+    VOXELPLUGIN_API void PrewarmLandNoise(const FString& Key);
 
-    /** Whether it is ready (GetPeakNoise won't block): if so, Out is it (null if none could be
-     *  made). The caller holds Out until its density has taken the set, so the set can't go in
-     *  between and GetPeakNoise then finds it at once. */
-    VOXELPLUGIN_API bool TryGetPeakNoise(const FString& Name, TSharedPtr<const FVoxelLandNoiseSet, ESPMode::ThreadSafe>& Out);
+    /** Whether it is ready (GetLandNoise won't block): if so, Out is it (null if none could be
+     *  made). The caller holds Out until its density has taken the pack, so the pack can't go
+     *  in between and GetLandNoise then finds it at once. */
+    VOXELPLUGIN_API bool TryGetLandNoise(const FString& Key, TSharedPtr<const FVoxelLandNoiseSet, ESPMode::ThreadSafe>& Out);
 
-    /** Drops the shared references (before the RHI shuts down: each set's GPU copy goes with its
-     *  last holder, on the render thread). */
-    VOXELPLUGIN_API void ReleasePeakNoise();
+    /** Drops the shared references (before the RHI shuts down: each pack's GPU copy goes with
+     *  its last holder, on the render thread). */
+    VOXELPLUGIN_API void ReleaseLandNoise();
+
+    /** The hills' placement (VoxelLandHillSet.ush, T4a) for a pack: the hill set's mip-0 texels
+     *  per bake cell (HillSpacing over the set's spacing in texels); 0 without hills or a set. */
+    VOXELPLUGIN_API float HillTexelsPerCell(const FVoxelTerrestrialSettings& Settings, const FVoxelLandBake& Bake, const FVoxelLandNoiseSet& Set);
+
+    /** The hill set's height cap (m): HillHeightScale x half HillSpacing. A set's relief beyond it
+     *  is scaled down to it, so the planet's height range (ShapeFor) holds whatever set is read. */
+    VOXELPLUGIN_API double HillSetReliefCap(const FVoxelTerrestrialSettings& Settings);
+
+    /** The hills' detail's coarsest wavelength (m): the setting within 16 m .. a quarter of the
+     *  hill spacing. */
+    VOXELPLUGIN_API double HillDetailWavelength(const FVoxelTerrestrialSettings& Settings);
+
+    /** The smallest hill spacing (m) the code accepts (the lattice's range, as PeakMinSpacing). */
+    constexpr double HillMinSpacing = 500.0;
 
     /** How far the gullies can move the surface either way (cm). */
     VOXELPLUGIN_API double GullyReach(const FVoxelTerrestrialSettings& Settings, const FVoxelLandBake& Bake);

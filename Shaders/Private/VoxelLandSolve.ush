@@ -75,6 +75,18 @@
 //                                               this s (m), fitted so the 99.9th percentile lands on
 //                                               the top (large: nearly linear)
 //   RWStructuredBuffer<float> SlotK;            per slot: the erodibility factor
+//   float SolveChannelCells;                    T3g: the channel heads' drainage area (cells of
+//                                               the cell's own area); 0 off (every cell incises
+//                                               fully, no slope cap: the T3f solve)
+//   float SolveChannelVariation;                the heads' area varies by 2^(this x n3), n3 a
+//                                               smooth noise spread over -1..1: drainage density
+//   float SolveChannelWavelength;               n3's coarsest wavelength (m)
+//   uint SolveChannelOctaves;                   n3's octaves
+//   float SolveHillslope;                       the slope cap above the receiver, as a multiple of
+//                                               the steady channel slope at the cell's head area
+//   RWStructuredBuffer<float> SlotAc;           per slot: the channel heads' area factor,
+//                                               2^(SolveChannelVariation x n3) (1 when off)
+//   float SolveChannelCharacter;                T3h: the character's pull (the output pass)
 
 #ifndef VOXEL_LAND_SOLVE_USH
 #define VOXEL_LAND_SOLVE_USH
@@ -298,6 +310,88 @@ VOXEL_FUNC float VoxelSolveErodibility(float3 Dir)
     return exp(SolveErodibilityVariation * VoxelSolveFbm(Dir, 0.5f * SolveVariationWavelength, 3u, 2u));
 }
 
+// --- Channel heads and the hillslopes (T3g) --------------------------------------------------
+//
+// Drainage density. Without a threshold every cell incises (F grows with sqrt(A) from a cell's
+// own area up), so channels are as dense as the grid allows everywhere. Here a cell incises
+// only once it drains more than the channel heads' area A_c(x), ramped in from A_c / 2, and
+// A_c varies over the planet by 2^(+-V) (a fixed noise): sparse, widely spaced valleys in one
+// region, dense dissection in the next. The cells below the heads are hillslopes. Stream power
+// no longer lowers them, so they would rise with the uplift without end; a threshold slope caps
+// them instead: no cell stands more than C above its receiver (VoxelSolveCapRise), so a
+// hillslope is a plane at the threshold between its divide and the channel head below.
+
+/** Whether the channel heads (and the slope cap) are on. */
+VOXEL_FUNC bool VoxelSolveChannelHeads()
+{
+    return SolveChannelCells > 0.0f;
+}
+
+/** The channel heads' noise is spread over most of -1..1 by this gain and a smooth saturation,
+ *  x / sqrt(1 + x^2): VoxelSolveFbm's own values mostly lie within +-0.3 (p5 to p95), which
+ *  would leave 2^(V n) a fraction of the range V asks for. With 4, p5 to p95 is about +-0.75. */
+#define VOXEL_SOLVE_CHANNEL_CONTRAST 4.0f
+
+/** The channel heads' noise n3 at a direction, in -1..1 (0 when the heads or their variation
+ *  are off): above 0 the heads are sparse, below dense. */
+VOXEL_FUNC float VoxelSolveChannelNoise(float3 Dir)
+{
+    if (!VoxelSolveChannelHeads() || !(SolveChannelVariation > 0.0f)) return 0.0f;
+    const float X = VOXEL_SOLVE_CHANNEL_CONTRAST * VoxelSolveFbm(Dir, SolveChannelWavelength, max(SolveChannelOctaves, 1u), 6u);
+    return X / sqrt(1.0f + X * X);
+}
+
+/** A cell's channel-head area factor, 2^(V n3) (1 when off). */
+VOXEL_FUNC float VoxelSolveChannelFactor(float3 Dir)
+{
+    if (!VoxelSolveChannelHeads() || !(SolveChannelVariation > 0.0f)) return 1.0f;
+    return exp2(SolveChannelVariation * VoxelSolveChannelNoise(Dir));
+}
+
+/** T3h: the bake's landform with the character following the drainage density. The character
+ *  (high byte: 0 smooth, rolling .. 1 rough-topped) picks the peaks' soft (G) or hard (R)
+ *  channel and the hills' shape on the sample side, so the regional detail agrees with the
+ *  bake: where the heads are sparse (broad, smooth slopes) it leans smooth, where they are
+ *  dense (finely cut) rough, by SolveChannelCharacter x |n3| toward 0 or 1. The hilliness
+ *  (low byte) is the plate model's. Unchanged when the heads, their variation or the
+ *  influence are off. */
+VOXEL_FUNC uint VoxelSolveFormOf(uint Cell)
+{
+    const uint Form = BakeForm[Cell];
+    if (!(SolveChannelCharacter > 0.0f)) return Form;
+    const float N = VoxelSolveChannelNoise(VoxelSolveCellDirection(Cell));
+    if (N == 0.0f) return Form;
+    const float C = float((Form >> 8u) & 0xffu) * (1.0f / 255.0f);
+    const float Pulled = lerp(C, N > 0.0f ? 0.0f : 1.0f, saturate(SolveChannelCharacter) * abs(N));
+    return (Form & 0xffu) | (uint(saturate(Pulled) * 255.0f + 0.5f) << 8u);
+}
+
+/** The incision's ramp: 0 below half the cell's channel-head area, a smoothstep to 1 at it. */
+VOXEL_FUNC float VoxelSolveChannelRamp(uint Slot)
+{
+    if (!VoxelSolveChannelHeads()) return 1.0f;
+    const float Ac = SolveChannelCells * SlotArea[Slot] * SlotAc[Slot];
+    const float T = clamp((SlotA[Slot] - 0.5f * Ac) / (0.5f * Ac), 0.0f, 1.0f);
+    return T * T * (3.0f - 2.0f * T);
+}
+
+/** The most a cell may stand above its receiver (m): SolveHillslope times the steady channel
+ *  drop at the cell's own head area, U dt / F(A_c(x)) with F(A) = K dt K sqrt(A) / d: a
+ *  hillslope meets its channel head without a break in slope. Proportional to the uplift and
+ *  inverse to the erodibility, as the channels' own steady slopes are, so the normalisation's
+ *  assumption (relief following the uplift) holds and slow-rising plains get gentle
+ *  hillslopes. Where the heads are sparse the hillslopes are longer and gentler (about the same
+ *  relief between ridge and channel head), so the land reads smooth and broad; where they are
+ *  dense, short, steep and finely cut. (A cap at the base head area everywhere gave sparse
+ *  regions taller ridges instead, and the density hardly showed.) At least the random fill's
+ *  largest descent into a cell (Eps 2^2 sqrt 2), so where the uplift is about 0 the fill and
+ *  the cap don't undo each other every step. */
+VOXEL_FUNC float VoxelSolveCapRise(uint Slot)
+{
+    const float Fc = SolveKdt * SlotK[Slot] * sqrt(SolveChannelCells * SlotArea[Slot] * SlotAc[Slot]) / max(SlotDist[Slot], 1.0f);
+    return max(SolveHillslope * SlotU[Slot] * SolveDt / max(Fc, 1.0e-20f), 6.0f * SolveEps);
+}
+
 // --- The solve's inputs --------------------------------------------------------------------
 
 /** The plate height (m) over which land on oceanic crust joins the solve. */
@@ -331,7 +425,23 @@ VOXEL_FUNC FVoxelSolveSetup VoxelSolveSetupOf(uint Cell)
     const float LandRamp = smoothstep(0.0f, VOXEL_SOLVE_LAND_RAMP, H);
     const float Solid = 1.0f - (1.0f - CrustRamp) * (1.0f - LandRamp);   // a smooth union
     S.Mix = Solid * smoothstep(Lo, SolvePlainsUplift + Half, Up);
-    S.Static = H - Up * S.Mix;
+    // The uplift the solve takes over (T4b): all of it above the range front, less a part that
+    // stays in the static surface: Up - g(Up), g = Up up to Lo, then easing to Lo + Half (the
+    // plains uplift threshold) as Lo + Half (1 - e^(-(Up - Lo) / Half)), with slope 1 at Lo.
+    // (S.Uplift below still uses Mix x (Up - Lo); model 1 normalises it, so only its shape counts.)
+    // So the static surface rises monotonically from the plains into the range. (T1's Up x Mix
+    // took the whole profile out within the ramp: the static surface rose with the uplift to
+    // about 280 m over the base at the ramp's start, then fell back to the base under the
+    // range, a ridge with a moat behind it all along every range front, which turned the
+    // ranges' rivers to run along it instead of out onto the plains.)
+    // Lo is floored at 0 (a plains threshold under half the ramp would otherwise make Kept
+    // negative at zero uplift, taking height off land with none); W is then the easing's
+    // width, Half at the defaults.
+    const float Lo0 = max(Lo, 0.0f);
+    const float W = max(SolvePlainsUplift - Lo0, 1.0f);
+    const float Kept = Up <= Lo0 ? Up : Lo0 + W * (1.0f - exp(-(Up - Lo0) / W));
+    const float Solved = Solid * (Up - Kept);
+    S.Static = H - Solved;
     // The landform (T2): flat plains erode flatter, hill country deeper: 0.3 at hilliness 0, 1
     // at 0.4 (about the plains' mean), 2.05 at 1; SolveLandformErosion 0 leaves 1.
     const float Hilliness = float(BakeForm[Cell] & 0xffu) * (1.0f / 255.0f);
@@ -354,7 +464,7 @@ VOXEL_FUNC FVoxelSolveSetup VoxelSolveSetupOf(uint Cell)
         const float Bound = 0.7f * max(S.Static, 0.0f);
         S.Static += clamp(Undulation, -Bound, Bound);
     }
-    S.Target = Up * S.Mix;
+    S.Target = Solved;
     S.Uplift = S.Mix * max(Up - Lo, 0.0f) / max(SolveUpliftTime, 1.0f);
     S.bMoving = S.Mix > 0.0f;
     if (SolveModel == 1u && SolvePlainsRelief > 0.0f)
@@ -413,6 +523,7 @@ VOXEL_FUNC void VoxelSolveInitPass(uint Cell)
         Uplift *= max(0.0f, 1.0f + SolveUpliftVariation * VoxelSolveFbm(Dir, SolveVariationWavelength, 3u, 1u));
     SlotU[Slot] = Uplift;
     SlotK[Slot] = VoxelSolveErodibility(Dir);
+    SlotAc[Slot] = VoxelSolveChannelFactor(Dir);
     SlotArea[Slot] = VoxelSolveCellArea(Cell);
     SlotA[Slot] = SlotArea[Slot];
 }
@@ -689,7 +800,8 @@ VOXEL_FUNC void VoxelSolveImplicitInitPass(uint Slot, uint NumSlots)
         JumpP[Slot] = VOXEL_SOLVE_NONE;
         return;
     }
-    const float F = SolveKdt * SlotK[Slot] * sqrt(SlotA[Slot]) / max(SlotDist[Slot], 1.0f);
+    // T3g: below the channel heads, no incision (VoxelSolveChannelRamp; 1 when off).
+    const float F = SolveKdt * SlotK[Slot] * sqrt(SlotA[Slot]) / max(SlotDist[Slot], 1.0f) * VoxelSolveChannelRamp(Slot);
     const uint Next = SolveSlot[Rec];
     if (Next == VOXEL_SOLVE_NONE)
     {
@@ -720,7 +832,20 @@ VOXEL_FUNC void VoxelSolveImplicitJumpPass(uint Slot, uint NumSlots)
     JumpPOut[Slot] = JumpP[P];
 }
 
-/** The new height, and its change from the filled height (for the residual). */
+/** Model 1's incision floor applied to a new height: rivers may cut deeper the more they drain
+ *  (a cell draining 100 cells the incision, ten times that at 10,000): they cut through the
+ *  sills, so basins drain, while the land between them (a cell's own drainage: a tenth) keeps
+ *  near its static surface. */
+VOXEL_FUNC float VoxelSolveIncisionFloor(uint Slot, uint Cell, float H)
+{
+    if (SolveModel != 1u) return H;
+    const float Allow = SolveIncision * sqrt(SlotA[Slot] / (100.0f * SlotArea[Slot]));
+    const float Static = VoxelSolveSetupOf(Cell).Static;
+    return max(H, Static > 0.0f ? max(Static - Allow, 0.0f) : Static);
+}
+
+/** The new height, and its change from the filled height (for the residual; with the channel
+ *  heads on, the slope cap follows and its finish gives the change instead). */
 VOXEL_FUNC float VoxelSolveImplicitFinishPass(uint Slot, uint NumSlots)
 {
     if (Slot >= NumSlots) return 0.0f;
@@ -730,16 +855,71 @@ VOXEL_FUNC float VoxelSolveImplicitFinishPass(uint Slot, uint NumSlots)
         return 0.0f;
     }
     const uint Cell = SlotCell[Slot];
-    float H = JumpX[Slot];
-    if (SolveModel == 1u)
+    const float H = VoxelSolveIncisionFloor(Slot, Cell, JumpX[Slot]);
+    SolveH[Cell] = H;
+    return abs(H - SlotH0[Slot]);
+}
+
+/** T3g: the hillslopes' threshold, h_i = min(h_i, h_r + C_i) (C_i VoxelSolveCapRise) along the
+ *  receivers from the outlets up, after the implicit update. As a record (P, C) for
+ *  h = min(P, h_next + C) it composes like the tree fill: min(P, min(P', h'' + C') + C) =
+ *  min(min(P, P' + C), h'' + (C + C')) (Y holds C's bits). Lowering a receiver never puts a
+ *  cell below it, so the cells still drain (but for the incision floor the finish applies
+ *  again, which can leave a cell under its receiver's floor: a pit the next step's fill takes). */
+VOXEL_FUNC void VoxelSolveCapInitPass(uint Slot, uint NumSlots)
+{
+    if (Slot >= NumSlots) return;
+    const uint Cell = SlotCell[Slot];
+    const uint Rec = SolveRec[Cell];
+    const float H = SolveH[Cell];
+    JumpY[Slot] = asuint(0.0f);
+    JumpP[Slot] = VOXEL_SOLVE_NONE;
+    if (Rec == Cell)
     {
-        // Rivers may cut deeper the more they drain (a cell draining 100 cells the incision,
-        // ten times that at 10,000): they cut through the sills, so basins drain, while the
-        // land between them (a cell's own drainage: a tenth) keeps near its static surface.
-        const float Allow = SolveIncision * sqrt(SlotA[Slot] / (100.0f * SlotArea[Slot]));
-        const float Static = VoxelSolveSetupOf(Cell).Static;
-        H = max(H, Static > 0.0f ? max(Static - Allow, 0.0f) : Static);
+        JumpX[Slot] = H;
+        return;
     }
+    const float C = VoxelSolveCapRise(Slot);
+    const uint Next = SolveSlot[Rec];
+    if (Next == VOXEL_SOLVE_NONE)
+    {
+        JumpX[Slot] = min(H, SolveW[Rec] + C);
+        return;
+    }
+    JumpX[Slot] = H;
+    JumpY[Slot] = asuint(C);
+    JumpP[Slot] = Next;
+}
+
+VOXEL_FUNC void VoxelSolveCapJumpPass(uint Slot, uint NumSlots)
+{
+    if (Slot >= NumSlots) return;
+    const uint P = JumpP[Slot];
+    if (P == VOXEL_SOLVE_NONE)
+    {
+        JumpXOut[Slot] = JumpX[Slot];
+        JumpYOut[Slot] = JumpY[Slot];
+        JumpPOut[Slot] = P;
+        return;
+    }
+    const float C = asfloat(JumpY[Slot]);
+    JumpXOut[Slot] = min(JumpX[Slot], JumpX[P] + C);
+    JumpYOut[Slot] = asuint(C + asfloat(JumpY[P]));
+    JumpPOut[Slot] = JumpP[P];
+}
+
+/** The capped height (the incision floor again: the static surface stays), and its change
+ *  from the filled height (for the residual). */
+VOXEL_FUNC float VoxelSolveCapFinishPass(uint Slot, uint NumSlots)
+{
+    if (Slot >= NumSlots) return 0.0f;
+    if (JumpP[Slot] != VOXEL_SOLVE_NONE)
+    {
+        InterlockedOr(SolveFlags[1], VOXEL_SOLVE_ERROR_JUMP);
+        return 0.0f;
+    }
+    const uint Cell = SlotCell[Slot];
+    const float H = VoxelSolveIncisionFloor(Slot, Cell, JumpX[Slot]);
     SolveH[Cell] = H;
     return abs(H - SlotH0[Slot]);
 }
@@ -1081,7 +1261,9 @@ VOXEL_FUNC float VoxelSolveFlowOf(uint Cell)
 //                                               level bits, outlet, area units), unordered
 //   uint SolveMaxLakes;
 //   StructuredBuffer<uint> BakeAttr;            the plate model's attributes
-//   RWStructuredBuffer<float> OutHeight, OutFlow, OutWater;  RWStructuredBuffer<uint> OutAttr;
+//   RWStructuredBuffer<float> OutHeight, OutFlow, OutWater;  RWStructuredBuffer<uint> OutAttr, OutForm;
+//   float SolveChannelCharacter;                T3h: how far the drainage density pulls the
+//                                               landform's character (VoxelSolveFormOf)
 
 /** Every land cell under a lake label adds itself to its lake's area and depth; one draining
  *  out of the lake (its receiver outside it) offers itself as the outlet. */
@@ -1177,6 +1359,8 @@ VOXEL_FUNC void VoxelSolveOutputPass(uint Cell)
     OutFlow[Cell] = Flow;
     OutWater[Cell] = Water;
     OutAttr[Cell] = (BakeAttr[Cell] & ~VOXEL_SOLVE_LAKE_BIT) | (Water > -0.5f * VOXEL_SOLVE_INF ? VOXEL_SOLVE_LAKE_BIT : 0u);
+    // Every cell at its own direction (the noise is on the sphere, so the aprons agree).
+    OutForm[Cell] = VoxelSolveFormOf(Cell);
 }
 
 #endif // VOXEL_LAND_SOLVE_USH

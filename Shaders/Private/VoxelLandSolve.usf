@@ -49,6 +49,13 @@ float SolvePlainsRelief;
 float SolveUndulation;
 float SolveLandformErosion;
 float SolveIncision;
+// T3g: the channel heads and the hillslopes' threshold (VoxelLandSolve.ush).
+float SolveChannelCells;
+float SolveChannelVariation;
+float SolveChannelWavelength;
+uint SolveChannelOctaves;
+float SolveHillslope;
+float SolveChannelCharacter;
 
 // Per cell.
 RWStructuredBuffer<float> SolveH;
@@ -62,6 +69,7 @@ RWStructuredBuffer<uint> SolveLabel;
 RWStructuredBuffer<uint> SlotCell;
 RWStructuredBuffer<float> SlotU;
 RWStructuredBuffer<float> SlotK;
+RWStructuredBuffer<float> SlotAc;
 RWStructuredBuffer<float> SlotArea;
 RWStructuredBuffer<float> SlotDist;
 RWStructuredBuffer<float> SlotH0;
@@ -86,6 +94,7 @@ RWStructuredBuffer<float> OutHeight;
 RWStructuredBuffer<float> OutFlow;
 RWStructuredBuffer<float> OutWater;
 RWStructuredBuffer<uint> OutAttr;
+RWStructuredBuffer<uint> OutForm;
 
 // GPU-only: dispatch, compaction, the steps' state, the histograms.
 uint GroupsX;
@@ -321,22 +330,10 @@ void ImplicitJumpCS(uint3 GroupId : SV_GroupID, uint GroupThread : SV_GroupIndex
 groupshared float ReduceA[64];
 groupshared float ReduceB[64];
 
-// The new heights, and per group the sums of |dh| and of the uplift (a fixed-order tree).
-[numthreads(64, 1, 1)]
-void ImplicitFinishCS(uint3 GroupId : SV_GroupID, uint GroupThread : SV_GroupIndex)
+// Per group, the sums of |dh| and of the uplift (a fixed-order tree), for the residual. Every
+// thread of the group calls it (it has barriers).
+void WritePartials(uint3 GroupId, uint GroupThread, bool bSkip, float Change, float Uplift)
 {
-    // No early return: the barriers below must be reached by every thread.
-    const bool bSkip = Skipped();
-    const uint Slot = ThreadIndex(GroupId, GroupThread);
-    // if, not ?: (HLSL evaluates both sides of ?:, and the pass writes).
-    float Change = 0.0f;
-    float Uplift = 0.0f;
-    if (!bSkip)
-    {
-        Change = VoxelSolveImplicitFinishPass(Slot, NumSlots);
-        if (Slot < NumSlots)
-            Uplift = SlotU[Slot];
-    }
     ReduceA[GroupThread] = Change;
     ReduceB[GroupThread] = Uplift;
     GroupMemoryBarrierWithGroupSync();
@@ -355,6 +352,57 @@ void ImplicitFinishCS(uint3 GroupId : SV_GroupID, uint GroupThread : SV_GroupInd
         Partials[G * 2u] = ReduceA[0];
         Partials[G * 2u + 1u] = ReduceB[0];
     }
+}
+
+// The new heights, and the residual's partials (the slope cap's finish writes them again when
+// the channel heads are on).
+[numthreads(64, 1, 1)]
+void ImplicitFinishCS(uint3 GroupId : SV_GroupID, uint GroupThread : SV_GroupIndex)
+{
+    // No early return: the barriers below must be reached by every thread.
+    const bool bSkip = Skipped();
+    const uint Slot = ThreadIndex(GroupId, GroupThread);
+    // if, not ?: (HLSL evaluates both sides of ?:, and the pass writes).
+    float Change = 0.0f;
+    float Uplift = 0.0f;
+    if (!bSkip)
+    {
+        Change = VoxelSolveImplicitFinishPass(Slot, NumSlots);
+        if (Slot < NumSlots)
+            Uplift = SlotU[Slot];
+    }
+    WritePartials(GroupId, GroupThread, bSkip, Change, Uplift);
+}
+
+// T3g: the hillslopes' threshold after the implicit update.
+[numthreads(64, 1, 1)]
+void CapInitCS(uint3 GroupId : SV_GroupID, uint GroupThread : SV_GroupIndex)
+{
+    if (Skipped()) return;
+    VoxelSolveCapInitPass(ThreadIndex(GroupId, GroupThread), NumSlots);
+}
+
+[numthreads(64, 1, 1)]
+void CapJumpCS(uint3 GroupId : SV_GroupID, uint GroupThread : SV_GroupIndex)
+{
+    if (Skipped()) return;
+    VoxelSolveCapJumpPass(ThreadIndex(GroupId, GroupThread), NumSlots);
+}
+
+[numthreads(64, 1, 1)]
+void CapFinishCS(uint3 GroupId : SV_GroupID, uint GroupThread : SV_GroupIndex)
+{
+    const bool bSkip = Skipped();
+    const uint Slot = ThreadIndex(GroupId, GroupThread);
+    float Change = 0.0f;
+    float Uplift = 0.0f;
+    if (!bSkip)
+    {
+        Change = VoxelSolveCapFinishPass(Slot, NumSlots);
+        if (Slot < NumSlots)
+            Uplift = SlotU[Slot];
+    }
+    WritePartials(GroupId, GroupThread, bSkip, Change, Uplift);
 }
 
 // One group: the step's residual (mean |dh| over the mean uplift of the step), and whether the

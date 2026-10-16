@@ -6,44 +6,83 @@
 // channel's unit range (0..1 over its Min..Max: the layers normalise with the set's statistics).
 //
 // Coordinates: a node position in mip 0's texels as an exact integer and a fraction (from the
-// face lattice, VoxelLandGullyCoordAt, so exact at any radius), turned by one of the 8 exact
+// face lattice: VoxelLandPeakRotated, so exact at any radius), turned by one of the 8 exact
 // orientations, offset by whole texels, wrapped. Mip m's node x sits at the centre of the mip 0
-// texels it averages: u_m = (u_0 + 0.5) / 2^m - 0.5. A fractional level blends two mips.
+// texels it averages: u_m = (u_0 + 0.5) / 2^m - 0.5. A fractional level blends two mips near the
+// middle of the step (VOXEL_LAND_NOISE_BLEND_WIDTH) and reads one elsewhere.
+//
+// One buffer can hold several chains (the peaks' set, then its detail tile: VoxelLandPeaks.ush):
+// a lookup names its chain by an FVoxelLandNoiseSetRef (its first texel, size and mip count).
 //
 // Shared subset (VoxelShaderCompat.h). Include after VoxelLandSample.ush (the B-spline weights),
 // after declaring (global shaders, the CPU struct) or defining the accessors (the material):
 //
-//   StructuredBuffer<uint> LandNoise;    the chain, 2 words a texel: (R | G << 16), (B | A << 16)
-//   uint LandNoiseN;                     texels per side of mip 0 (a power of two; 0: no set)
-//   uint LandNoiseMips;
+//   StructuredBuffer<uint> LandNoise;    the chains, 2 words a texel: (R | G << 16), (B | A << 16)
 
 #ifndef VOXEL_LAND_NOISE_USH
 #define VOXEL_LAND_NOISE_USH
 
 #include "VoxelLandAccess.ush"
 
-/** Two u16 as unit values (q / 65535: what the material's UNORM16 texture load gives, to within
- *  the hardware's conversion tolerance, a unit in the last place). */
+/** Two u16 as the stored values q (0 .. 65535, exact in a float). The sampler sums them and turns
+ *  the sums into unit values (q / 65535) once, at the end (VOXEL_LAND_NOISE_UNIT): no division a
+ *  texel. The material's UNORM16 load is turned back into q (VoxelLandMaterialNoise), so every
+ *  host sums the same exact integers. */
 VOXEL_FUNC float2 VoxelLandUnpackNoise(uint W)
 {
-    return float2(float(W & 0xffffu) / 65535.0f, float(W >> 16u) / 65535.0f);
+    return float2(float(W & 0xffffu), float(W >> 16u));
 }
 
-/** The R and G (B and A) channels of the chain's texel I. */
+#define VOXEL_LAND_NOISE_UNIT (1.0f / 65535.0f)
+
+/** What VoxelLandNoiseMip and VoxelLandNoiseAt compute besides R and G and their gradients (a
+ *  constant at every call: what's left out costs nothing). */
+#define VOXEL_LAND_NOISE_WANT_B 1u              // the B channel and its gradient
+#define VOXEL_LAND_NOISE_WANT_HESSIAN_R 2u      // R's second derivatives
+#define VOXEL_LAND_NOISE_WANT_HESSIAN_B 4u      // B's second derivatives (B implied)
+#define VOXEL_LAND_NOISE_WANT_ONLY_B 8u         // B alone: R, G and A are left out (zero), their texels not read
+#define VOXEL_LAND_NOISE_WANT_A 16u             // the A channel and its gradient
+
+/** The share of a mip level step over which two mips blend (VoxelLandNoiseAt), in (0, 1]:
+ *  outside it a lookup reads one mip. Narrower is cheaper, but the shape then changes faster
+ *  with the level: a transition spans a footprint change of 2^width (half a level: 1.41x).
+ *  Half reads one mip half the time. */
+#define VOXEL_LAND_NOISE_BLEND_WIDTH 0.5f
+
+/** The R and G (B and A) channels of the chain's texel I, as stored values q. */
 #ifndef VOXEL_LAND_NOISE_RG
 #define VOXEL_LAND_NOISE_RG(I) VoxelLandUnpackNoise(LandNoise[(I) * 2u])
 #define VOXEL_LAND_NOISE_BA(I) VoxelLandUnpackNoise(LandNoise[(I) * 2u + 1u])
 #endif
 
-/** The first texel of mip Mip (VoxelNoiseTiles::MipOffset): the mips above hold
- *  N^2 (1 + 1/4 + ...) = 4 (N^2 - S^2) / 3 texels, exactly. */
-VOXEL_FUNC uint VoxelLandNoiseMipBase(VOXEL_LAND_ARGS_DECL uint Size)
+/** A chain in the buffer: its first texel, texels per side of mip 0 (a power of two; 0: none)
+ *  and its mip count. */
+struct FVoxelLandNoiseSetRef
 {
-    return (4u * (LandNoiseN * LandNoiseN - Size * Size)) / 3u;
+    uint Base;
+    uint N;
+    uint Mips;
+};
+
+VOXEL_FUNC FVoxelLandNoiseSetRef VoxelLandNoiseSetOf(uint Base, uint N, uint Mips)
+{
+    FVoxelLandNoiseSetRef Set;
+    Set.Base = Base;
+    Set.N = N;
+    Set.Mips = Mips;
+    return Set;
+}
+
+/** The first texel of the chain's mip of size Size (VoxelNoiseTiles::MipOffset): the mips above
+ *  hold N^2 (1 + 1/4 + ...) = 4 (N^2 - S^2) / 3 texels, exactly. */
+VOXEL_FUNC uint VoxelLandNoiseMipBase(FVoxelLandNoiseSetRef Set, uint Size)
+{
+    return Set.Base + (4u * (Set.N * Set.N - Size * Size)) / 3u;
 }
 
 /** The four channels' values (unit) and derivatives along the tile's two axes, per texel of mip 0,
- *  and R's second derivatives (per texel of mip 0, squared: its local curvature). */
+ *  and R's and B's second derivatives (per texel of mip 0, squared: their local curvature). B, A
+ *  and the second derivatives are zero unless asked for (VOXEL_LAND_NOISE_WANT_*). */
 struct FVoxelLandNoise
 {
     float R;
@@ -61,6 +100,9 @@ struct FVoxelLandNoise
     float RUU;
     float RUV;
     float RVV;
+    float BUU;
+    float BUV;
+    float BVV;
 };
 
 VOXEL_FUNC FVoxelLandNoise VoxelLandNoiseZero()
@@ -70,49 +112,107 @@ VOXEL_FUNC FVoxelLandNoise VoxelLandNoiseZero()
     N.RU = 0.0f; N.RV = 0.0f; N.GU = 0.0f; N.GV = 0.0f;
     N.BU = 0.0f; N.BV = 0.0f; N.AU = 0.0f; N.AV = 0.0f;
     N.RUU = 0.0f; N.RUV = 0.0f; N.RVV = 0.0f;
+    N.BUU = 0.0f; N.BUV = 0.0f; N.BVV = 0.0f;
     return N;
 }
 
 /** One mip's B-spline at node (X + FX, Y + FY) in that mip's texels (any integers: wrapped
- *  here). Derivatives per texel of that mip. */
-VOXEL_FUNC FVoxelLandNoise VoxelLandNoiseMip(VOXEL_LAND_ARGS_DECL int X, float FX, int Y, float FY, uint Mip)
+ *  here), in unit values. Derivatives per texel of that mip. Want: VOXEL_LAND_NOISE_WANT_* (B and
+ *  the Hessian are zero without them). */
+VOXEL_FUNC FVoxelLandNoise VoxelLandNoiseMip(VOXEL_LAND_ARGS_DECL FVoxelLandNoiseSetRef Set, int X, float FX, int Y, float FY, uint Mip, uint Want)
 {
-    const uint Size = LandNoiseN >> Mip;
+    const bool bHessianB = (Want & VOXEL_LAND_NOISE_WANT_HESSIAN_B) != 0u;
+    const bool bB = (Want & (VOXEL_LAND_NOISE_WANT_B | VOXEL_LAND_NOISE_WANT_ONLY_B)) != 0u || bHessianB;
+    const bool bOnlyB = (Want & VOXEL_LAND_NOISE_WANT_ONLY_B) != 0u;
+    const bool bHessian = (Want & VOXEL_LAND_NOISE_WANT_HESSIAN_R) != 0u && !bOnlyB;
+    const bool bA = (Want & VOXEL_LAND_NOISE_WANT_A) != 0u && !bOnlyB;
+    const uint Size = Set.N >> Mip;
     const uint Mask = Size - 1u;
-    const uint Base = VoxelLandNoiseMipBase(VOXEL_LAND_ARGS Size);
+    const uint Base = VoxelLandNoiseMipBase(Set, Size);
     const FVoxelLandWeights WX = VoxelLandBSpline(FX);
     const FVoxelLandWeights WY = VoxelLandBSpline(FY);
     const FVoxelLandWeights DX = VoxelLandBSplineSlope(FX);
     const FVoxelLandWeights DY = VoxelLandBSplineSlope(FY);
     const FVoxelLandWeights CX = VoxelLandBSplineCurve(FX);
     const FVoxelLandWeights CY = VoxelLandBSplineCurve(FY);
+    // The four columns, wrapped (the same for every row).
+    const uint C0 = uint(X - 1) & Mask;
+    const uint C1 = uint(X) & Mask;
+    const uint C2 = uint(X + 1) & Mask;
+    const uint C3 = uint(X + 2) & Mask;
     FVoxelLandNoise N = VoxelLandNoiseZero();
     for (uint j = 0u; j < 4u; j++)
     {
         const uint Row = Base + (uint(Y - 1 + int(j)) & Mask) * Size;
-        float LR = 0.0f, LG = 0.0f, LB = 0.0f, LA = 0.0f;       // along X, value weights
-        float SR = 0.0f, SG = 0.0f, SB = 0.0f, SA = 0.0f;       // along X, slope weights
-        float CR = 0.0f;                                        // along X, curvature weights (R)
-        for (uint i = 0u; i < 4u; i++)
+        // B and A's words only when asked for (R and G alone: half the loads).
+        float2 BA0 = float2(0.0f, 0.0f);
+        float2 BA1 = float2(0.0f, 0.0f);
+        float2 BA2 = float2(0.0f, 0.0f);
+        float2 BA3 = float2(0.0f, 0.0f);
+        if (bB || bA)
         {
-            const uint T = Row + (uint(X - 1 + int(i)) & Mask);
-            const float2 RG = VOXEL_LAND_NOISE_RG(T);
-            const float2 BA = VOXEL_LAND_NOISE_BA(T);
-            const float W = VoxelLandWeightAt(WX, i);
-            const float D = VoxelLandWeightAt(DX, i);
-            LR += W * RG.x; LG += W * RG.y; LB += W * BA.x; LA += W * BA.y;
-            SR += D * RG.x; SG += D * RG.y; SB += D * BA.x; SA += D * BA.y;
-            CR += VoxelLandWeightAt(CX, i) * RG.x;
+            BA0 = VOXEL_LAND_NOISE_BA(Row + C0);
+            BA1 = VOXEL_LAND_NOISE_BA(Row + C1);
+            BA2 = VOXEL_LAND_NOISE_BA(Row + C2);
+            BA3 = VOXEL_LAND_NOISE_BA(Row + C3);
         }
         const float WJ = VoxelLandWeightAt(WY, j);
         const float DJ = VoxelLandWeightAt(DY, j);
-        N.R += WJ * LR; N.G += WJ * LG; N.B += WJ * LB; N.A += WJ * LA;
-        N.RU += WJ * SR; N.GU += WJ * SG; N.BU += WJ * SB; N.AU += WJ * SA;
-        N.RV += DJ * LR; N.GV += DJ * LG; N.BV += DJ * LB; N.AV += DJ * LA;
-        N.RUU += WJ * CR;
-        N.RUV += DJ * SR;
-        N.RVV += VoxelLandWeightAt(CY, j) * LR;
+        // Along X: value weights (L), slope weights (S).
+        float LR = 0.0f;
+        float SR = 0.0f;
+        if (!bOnlyB)
+        {
+            const float2 RG0 = VOXEL_LAND_NOISE_RG(Row + C0);
+            const float2 RG1 = VOXEL_LAND_NOISE_RG(Row + C1);
+            const float2 RG2 = VOXEL_LAND_NOISE_RG(Row + C2);
+            const float2 RG3 = VOXEL_LAND_NOISE_RG(Row + C3);
+            LR = WX.W0 * RG0.x + WX.W1 * RG1.x + WX.W2 * RG2.x + WX.W3 * RG3.x;
+            const float LG = WX.W0 * RG0.y + WX.W1 * RG1.y + WX.W2 * RG2.y + WX.W3 * RG3.y;
+            SR = DX.W0 * RG0.x + DX.W1 * RG1.x + DX.W2 * RG2.x + DX.W3 * RG3.x;
+            const float SG = DX.W0 * RG0.y + DX.W1 * RG1.y + DX.W2 * RG2.y + DX.W3 * RG3.y;
+            N.R += WJ * LR; N.G += WJ * LG;
+            N.RU += WJ * SR; N.GU += WJ * SG;
+            N.RV += DJ * LR; N.GV += DJ * LG;
+            if (bA)
+            {
+                const float LA = WX.W0 * BA0.y + WX.W1 * BA1.y + WX.W2 * BA2.y + WX.W3 * BA3.y;
+                const float SA = DX.W0 * BA0.y + DX.W1 * BA1.y + DX.W2 * BA2.y + DX.W3 * BA3.y;
+                N.A += WJ * LA;
+                N.AU += WJ * SA;
+                N.AV += DJ * LA;
+            }
+            if (bHessian)
+            {
+                // Along X, curvature weights (R).
+                const float CR = CX.W0 * RG0.x + CX.W1 * RG1.x + CX.W2 * RG2.x + CX.W3 * RG3.x;
+                N.RUU += WJ * CR;
+                N.RUV += DJ * SR;
+                N.RVV += VoxelLandWeightAt(CY, j) * LR;
+            }
+        }
+        if (bB)
+        {
+            const float LB = WX.W0 * BA0.x + WX.W1 * BA1.x + WX.W2 * BA2.x + WX.W3 * BA3.x;
+            const float SB = DX.W0 * BA0.x + DX.W1 * BA1.x + DX.W2 * BA2.x + DX.W3 * BA3.x;
+            N.B += WJ * LB;
+            N.BU += WJ * SB;
+            N.BV += DJ * LB;
+            if (bHessianB)
+            {
+                const float CB = CX.W0 * BA0.x + CX.W1 * BA1.x + CX.W2 * BA2.x + CX.W3 * BA3.x;
+                N.BUU += WJ * CB;
+                N.BUV += DJ * SB;
+                N.BVV += VoxelLandWeightAt(CY, j) * LB;
+            }
+        }
     }
+    // The sums of stored values to unit values.
+    const float K = VOXEL_LAND_NOISE_UNIT;
+    N.R *= K; N.G *= K; N.B *= K; N.A *= K;
+    N.RU *= K; N.RV *= K; N.GU *= K; N.GV *= K; N.BU *= K; N.BV *= K; N.AU *= K; N.AV *= K;
+    N.RUU *= K; N.RUV *= K; N.RVV *= K;
+    N.BUU *= K; N.BUV *= K; N.BVV *= K;
     return N;
 }
 
@@ -155,11 +255,13 @@ VOXEL_FUNC FVoxelLandNoiseAxis VoxelLandNoiseMipAxis(uint I, float F, uint Mip)
     return Out;
 }
 
-/** The set at the node (U, V) in mip 0's texels, in orientation Orient (bit 0 swaps the axes,
+/** The chain Set at the node (U, V) in mip 0's texels, in orientation Orient (bit 0 swaps the axes,
  *  bit 1 negates U, bit 2 negates V, before the offset), offset by (OffU, OffV) texels, at the
- *  mip level Level (fractional: two mips blend; clamped to the chain). The derivatives come back
- *  along U and V, per texel of mip 0. */
-VOXEL_FUNC FVoxelLandNoise VoxelLandNoiseAt(VOXEL_LAND_ARGS_DECL FVoxelLandNoiseAxis U, FVoxelLandNoiseAxis V, uint Orient, uint OffU, uint OffV, float Level)
+ *  mip level Level (clamped to the chain; two mips blend within VOXEL_LAND_NOISE_BLEND_WIDTH of a
+ *  step's middle, one is read elsewhere). The derivatives come back along U and V, per texel of
+ *  mip 0. Want: VOXEL_LAND_NOISE_WANT_*. */
+VOXEL_FUNC FVoxelLandNoise VoxelLandNoiseAt(VOXEL_LAND_ARGS_DECL FVoxelLandNoiseSetRef Set, FVoxelLandNoiseAxis U, FVoxelLandNoiseAxis V, uint Orient,
+    uint OffU, uint OffV, float Level, uint Want)
 {
     // (No ?: on structs: HLSL's conditional takes numbers only.)
     FVoxelLandNoiseAxis TU = U;
@@ -171,25 +273,32 @@ VOXEL_FUNC FVoxelLandNoise VoxelLandNoiseAt(VOXEL_LAND_ARGS_DECL FVoxelLandNoise
     }
     if ((Orient & 2u) != 0u) TU = VoxelLandNoiseNegate(TU);
     if ((Orient & 4u) != 0u) TV = VoxelLandNoiseNegate(TV);
-    const uint Mask = LandNoiseN - 1u;
+    const uint Mask = Set.N - 1u;
     const uint IU = (asuint(TU.I) + OffU) & Mask;
     const uint IV = (asuint(TV.I) + OffV) & Mask;
 
-    const float L = min(max(Level, 0.0f), float(LandNoiseMips - 1u));
-    const uint M0 = uint(floor(L));
-    const float T = L - float(M0);
+    const float L = min(max(Level, 0.0f), float(Set.Mips - 1u));
+    uint M0 = uint(floor(L));
+    // The blend between M0 and M0 + 1, narrowed to the middle of the step.
+    float T = saturate((L - float(M0) - 0.5f) * (1.0f / VOXEL_LAND_NOISE_BLEND_WIDTH) + 0.5f);
+    if (T >= 1.0f && M0 + 1u < Set.Mips)
+    {
+        M0 += 1u;
+        T = 0.0f;
+    }
     const FVoxelLandNoiseAxis AU0 = VoxelLandNoiseMipAxis(IU, TU.F, M0);
     const FVoxelLandNoiseAxis AV0 = VoxelLandNoiseMipAxis(IV, TV.F, M0);
-    FVoxelLandNoise N = VoxelLandNoiseMip(VOXEL_LAND_ARGS AU0.I, AU0.F, AV0.I, AV0.F, M0);
+    FVoxelLandNoise N = VoxelLandNoiseMip(VOXEL_LAND_ARGS Set, AU0.I, AU0.F, AV0.I, AV0.F, M0, Want);
     // Per texel of mip 0.
     float K = asfloat(uint(127 - int(M0)) << 23u);
     N.RU *= K; N.RV *= K; N.GU *= K; N.GV *= K; N.BU *= K; N.BV *= K; N.AU *= K; N.AV *= K;
     N.RUU *= K * K; N.RUV *= K * K; N.RVV *= K * K;
-    if (T > 0.0f && M0 + 1u < LandNoiseMips)
+    N.BUU *= K * K; N.BUV *= K * K; N.BVV *= K * K;
+    if (T > 0.0f && M0 + 1u < Set.Mips)
     {
         const FVoxelLandNoiseAxis AU1 = VoxelLandNoiseMipAxis(IU, TU.F, M0 + 1u);
         const FVoxelLandNoiseAxis AV1 = VoxelLandNoiseMipAxis(IV, TV.F, M0 + 1u);
-        const FVoxelLandNoise N1 = VoxelLandNoiseMip(VOXEL_LAND_ARGS AU1.I, AU1.F, AV1.I, AV1.F, M0 + 1u);
+        const FVoxelLandNoise N1 = VoxelLandNoiseMip(VOXEL_LAND_ARGS Set, AU1.I, AU1.F, AV1.I, AV1.F, M0 + 1u, Want);
         const float K1 = 0.5f * K;
         const float S = 1.0f - T;
         N.R = S * N.R + T * N1.R; N.G = S * N.G + T * N1.G; N.B = S * N.B + T * N1.B; N.A = S * N.A + T * N1.A;
@@ -198,6 +307,7 @@ VOXEL_FUNC FVoxelLandNoise VoxelLandNoiseAt(VOXEL_LAND_ARGS_DECL FVoxelLandNoise
         N.BU = S * N.BU + T * K1 * N1.BU; N.BV = S * N.BV + T * K1 * N1.BV;
         N.AU = S * N.AU + T * K1 * N1.AU; N.AV = S * N.AV + T * K1 * N1.AV;
         N.RUU = S * N.RUU + T * K1 * K1 * N1.RUU; N.RUV = S * N.RUV + T * K1 * K1 * N1.RUV; N.RVV = S * N.RVV + T * K1 * K1 * N1.RVV;
+        N.BUU = S * N.BUU + T * K1 * K1 * N1.BUU; N.BUV = S * N.BUV + T * K1 * K1 * N1.BUV; N.BVV = S * N.BVV + T * K1 * K1 * N1.BVV;
     }
     // Back to the caller's axes: a negated axis negates its derivative, then the swap.
     const float SU = (Orient & 2u) != 0u ? -1.0f : 1.0f;
@@ -205,6 +315,7 @@ VOXEL_FUNC FVoxelLandNoise VoxelLandNoiseAt(VOXEL_LAND_ARGS_DECL FVoxelLandNoise
     N.RU *= SU; N.GU *= SU; N.BU *= SU; N.AU *= SU;
     N.RV *= SV; N.GV *= SV; N.BV *= SV; N.AV *= SV;
     N.RUV *= SU * SV;
+    N.BUV *= SU * SV;
     if ((Orient & 1u) != 0u)
     {
         float Tmp;
@@ -213,6 +324,7 @@ VOXEL_FUNC FVoxelLandNoise VoxelLandNoiseAt(VOXEL_LAND_ARGS_DECL FVoxelLandNoise
         Tmp = N.BU; N.BU = N.BV; N.BV = Tmp;
         Tmp = N.AU; N.AU = N.AV; N.AV = Tmp;
         Tmp = N.RUU; N.RUU = N.RVV; N.RVV = Tmp;
+        Tmp = N.BUU; N.BUU = N.BVV; N.BVV = Tmp;
     }
     return N;
 }

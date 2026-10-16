@@ -216,15 +216,14 @@ bool APlanetActor::TickLandBake()
 {
     const double SeaRadius = GetActorScale3D().GetMax();
     const uint32 Key = VoxelLand::BakeKey(TerrestrialSettings, SeaRadius);
-    // The peaks' shared noise set: the density takes it when it is built, so it is read or
-    // generated in the background first (the game thread never waits for it), and held here
-    // from then on (it can't go before the density takes it).
+    // The shared noise pack (the peaks' and the hills' sets): the density takes it when it is
+    // built, so it is read or generated in the background first (the game thread never waits
+    // for it), and held here from then on (it can't go before the density takes it).
     auto NoiseReady = [this]()
     {
-        if (TerrestrialSettings.PeakStrength <= 0.0) return true;
-        const FString Name = VoxelLand::PeakNoiseNameFor(TerrestrialSettings);
-        if (VoxelLand::TryGetPeakNoise(Name, PeakNoise)) return true;
-        VoxelLand::PrewarmPeakNoise(Name);
+        const FString Name = VoxelLand::LandNoiseNameFor(TerrestrialSettings);
+        if (VoxelLand::TryGetLandNoise(Name, LandNoise)) return true;
+        VoxelLand::PrewarmLandNoise(Name);
         return false;
     };
     if (LandBake.IsValid() && LandBake->Key == Key && LandBake->N == VoxelLand::BakeResolutionFor(TerrestrialSettings))
@@ -257,7 +256,7 @@ void APlanetActor::ComputeShape(double& OutPlanetRadius, double& OutNoiseAmplitu
     {
         // Heights about sea level, the actor's radius; the lattice spans the bake's range,
         // within the NoiseAmplitudeRatio ceiling.
-        VoxelLand::ShapeFor(TerrestrialSettings, *LandBake, OutPlanetRadius, OutNoiseAmplitude);
+        VoxelLand::ShapeFor(TerrestrialSettings, *LandBake, LandNoise.Get(), OutPlanetRadius, OutNoiseAmplitude);
         const double Ceiling = Radius * NoiseAmplitudeRatio;
         if (OutNoiseAmplitude > Ceiling)
         {
@@ -287,7 +286,7 @@ void APlanetActor::Initialize()
         // The noise surface needs no bake: release one a terrestrial build left.
         LandBake.Reset();
         LandBaker.Reset();
-        PeakNoise.Reset();
+        LandNoise.Reset();
     }
     double PlanetRadius = 0.0;
     double NoiseAmplitude = 0.0;

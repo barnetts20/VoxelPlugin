@@ -154,14 +154,17 @@ static bool GVoxelLandSkipDetail = false;
 static bool GVoxelLandSkipHills = false;
 static bool GVoxelLandSkipPeaks = false;
 
-/** Two channels (Half 0: R, G; 1: B, A) of the noise set's texel I (VoxelLandNoise.ush): the
- *  texture holds the packed chain in rows of N texels (VoxelLandMaterial::MakeNoiseTexture), and
- *  is unsigned normalised 16-bit, so the load gives the unit values. */
+/** Two channels (Half 0: R, G; 1: B, A) of the noise set's texel I as stored values q
+ *  (VoxelLandNoise.ush): the texture holds the pack's chains in rows of RowN texels
+ *  (VoxelLandMaterial::MakeNoiseTexture) and is unsigned normalised 16-bit, so the load gives
+ *  q / 65535 (to within the hardware's conversion, far under half a step): rounded back to q. */
 VOXEL_FUNC float2 VoxelLandMaterialNoise(Texture2D NoiseTex, Texture2D ConstTex, uint I, uint Half)
 {
     const uint Shift = VoxelLandConstU(ConstTex, VOXEL_LAND_MC_NOISE_SHIFT);
     const float4 V = NoiseTex.Load(int3(int(I & ((1u << Shift) - 1u)), int(I >> Shift), 0));
-    return Half == 0u ? float2(V.x, V.y) : float2(V.z, V.w);
+    const float X = Half == 0u ? V.x : V.z;
+    const float Y = Half == 0u ? V.y : V.w;
+    return float2(floor(X * 65535.0f + 0.5f), floor(Y * 65535.0f + 0.5f));
 }
 
 // The accessors (VoxelLandAccess.ush).
@@ -193,13 +196,44 @@ VOXEL_FUNC float2 VoxelLandMaterialNoise(Texture2D NoiseTex, Texture2D ConstTex,
 #define LandHillSeed VoxelLandConstU32(LandConstTex, VOXEL_LAND_MC_HILL_SEED)
 #define LandHasForm VoxelLandConstU(LandConstTex, VOXEL_LAND_MC_HAS_FORM)
 #define LandPeakStrength (GVoxelLandSkipPeaks ? 0.0f : VoxelLandConstF(LandConstTex, VOXEL_LAND_MC_PEAK_STRENGTH))
-#define LandPeakOctaves VoxelLandConstU(LandConstTex, VOXEL_LAND_MC_PEAK_OCTAVES)
+#define LandPeakTexelsPerCell VoxelLandConstF(LandConstTex, VOXEL_LAND_MC_PEAK_TEXELS_PER_CELL)
 #define LandPeakSeed VoxelLandConstU32(LandConstTex, VOXEL_LAND_MC_PEAK_SEED)
 #define LandNoiseN VoxelLandConstU(LandConstTex, VOXEL_LAND_MC_NOISE_N)
 #define LandNoiseMips VoxelLandConstU(LandConstTex, VOXEL_LAND_MC_NOISE_MIPS)
-#define LandNoiseCellShift VoxelLandConstU(LandConstTex, VOXEL_LAND_MC_NOISE_CELL_SHIFT)
-#define LandPeakMeanShape VoxelLandConstF(LandConstTex, VOXEL_LAND_MC_PEAK_MEAN_SHAPE)
+#define LandPeakSpacingM VoxelLandConstF(LandConstTex, VOXEL_LAND_MC_PEAK_SPACING_M)
+#define LandPeakReliefM VoxelLandConstF(LandConstTex, VOXEL_LAND_MC_PEAK_RELIEF_M)
+#define LandPeakReliefStart VoxelLandConstF(LandConstTex, VOXEL_LAND_MC_PEAK_RELIEF_START)
+#define LandPeakReliefEnd VoxelLandConstF(LandConstTex, VOXEL_LAND_MC_PEAK_RELIEF_END)
+#define LandPeakMeanR VoxelLandConstF(LandConstTex, VOXEL_LAND_MC_PEAK_MEAN_R)
 #define LandPeakMeanG VoxelLandConstF(LandConstTex, VOXEL_LAND_MC_PEAK_MEAN_G)
+#define LandPeakScaleR VoxelLandConstF(LandConstTex, VOXEL_LAND_MC_PEAK_SCALE_R)
+#define LandPeakScaleG VoxelLandConstF(LandConstTex, VOXEL_LAND_MC_PEAK_SCALE_G)
+#define LandPeakScaleB VoxelLandConstF(LandConstTex, VOXEL_LAND_MC_PEAK_SCALE_B)
+#define LandPeakDetailBase VoxelLandConstU32(LandConstTex, VOXEL_LAND_MC_PEAK_DETAIL_BASE)
+#define LandPeakDetailN VoxelLandConstU(LandConstTex, VOXEL_LAND_MC_PEAK_DETAIL_N)
+#define LandPeakDetailMips VoxelLandConstU(LandConstTex, VOXEL_LAND_MC_PEAK_DETAIL_MIPS)
+#define LandPeakDetailTexelsPerCell VoxelLandConstF(LandConstTex, VOXEL_LAND_MC_PEAK_DETAIL_TEXELS_PER_CELL)
+#define LandPeakDetailMeanR VoxelLandConstF(LandConstTex, VOXEL_LAND_MC_PEAK_DETAIL_MEAN_R)
+#define LandPeakDetailMeanG VoxelLandConstF(LandConstTex, VOXEL_LAND_MC_PEAK_DETAIL_MEAN_G)
+#define LandPeakDetailScaleR VoxelLandConstF(LandConstTex, VOXEL_LAND_MC_PEAK_DETAIL_SCALE_R)
+#define LandPeakDetailScaleG VoxelLandConstF(LandConstTex, VOXEL_LAND_MC_PEAK_DETAIL_SCALE_G)
+#define LandPeakDetailFade VoxelLandConstF(LandConstTex, VOXEL_LAND_MC_PEAK_DETAIL_FADE)
+#define LandHillBase VoxelLandConstU32(LandConstTex, VOXEL_LAND_MC_HILL_BASE)
+#define LandHillN VoxelLandConstU(LandConstTex, VOXEL_LAND_MC_HILL_N)
+#define LandHillMips VoxelLandConstU(LandConstTex, VOXEL_LAND_MC_HILL_MIPS)
+#define LandHillTexelsPerCell VoxelLandConstF(LandConstTex, VOXEL_LAND_MC_HILL_TEXELS_PER_CELL)
+#define LandHillScaleR VoxelLandConstF(LandConstTex, VOXEL_LAND_MC_HILL_SCALE_R)
+#define LandHillScaleG VoxelLandConstF(LandConstTex, VOXEL_LAND_MC_HILL_SCALE_G)
+#define LandHillScaleB VoxelLandConstF(LandConstTex, VOXEL_LAND_MC_HILL_SCALE_B)
+#define LandHillSpacingM VoxelLandConstF(LandConstTex, VOXEL_LAND_MC_HILL_SPACING_M)
+#define LandHillSwellTexelsPerCell VoxelLandConstF(LandConstTex, VOXEL_LAND_MC_HILL_SWELL_TEXELS_PER_CELL)
+#define LandHillSwellM VoxelLandConstF(LandConstTex, VOXEL_LAND_MC_HILL_SWELL_M)
+#define LandHillSwellScaleG VoxelLandConstF(LandConstTex, VOXEL_LAND_MC_HILL_SWELL_SCALE_G)
+#define LandHillDetailTexelsPerCell VoxelLandConstF(LandConstTex, VOXEL_LAND_MC_HILL_DETAIL_TEXELS_PER_CELL)
+#define LandHillDetailScaleR VoxelLandConstF(LandConstTex, VOXEL_LAND_MC_HILL_DETAIL_SCALE_R)
+#define LandHillDetailScaleG VoxelLandConstF(LandConstTex, VOXEL_LAND_MC_HILL_DETAIL_SCALE_G)
+#define LandHillDetailFade VoxelLandConstF(LandConstTex, VOXEL_LAND_MC_HILL_DETAIL_FADE)
+#define LandHillFoothill VoxelLandConstF(LandConstTex, VOXEL_LAND_MC_HILL_FOOTHILL)
 #define LandMode VoxelLandConstU(LandConstTex, VOXEL_LAND_MC_LAND_MODE)
 #define LandWarpOctaves VoxelLandConstU(LandConstTex, VOXEL_LAND_MC_WARP_OCTAVES)
 #define LandWarpInvNorm VoxelLandConstF(LandConstTex, VOXEL_LAND_MC_WARP_INV_NORM)

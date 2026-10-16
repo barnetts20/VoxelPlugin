@@ -162,20 +162,51 @@ VOXEL_FUNC float VoxelLandCrust(VOXEL_LAND_ARGS_DECL float3 P, uint Plate, float
     return saturate((VoxelLandRawCrust(VOXEL_LAND_ARGS P, Plate) - Threshold) / 0.08f + 0.5f);
 }
 
+/** The crust the boundary profiles weigh their pairings by: the raw crust's two coarsest octaves
+ *  (normalised as the full five, so its threshold crossing follows the continents' outline).
+ *  The full crust's finer octaves draw the coastline; with them in the weights, a coastline
+ *  crossing a belt cut its uplift (up to 5.5 km) off within a few kilometres, a cliff into the
+ *  sea where the range ended (Design/SurfaceLook.md, T3f). With the outline alone a belt tapers
+ *  over tens of kilometres and runs on past a fine-scale coastline as headlands and islands. */
+VOXEL_FUNC float VoxelLandBeltCrust(VOXEL_LAND_ARGS_DECL float3 P, uint Plate, float Threshold)
+{
+    float Sum = 0.0f;
+    float Amplitude = 1.0f;
+    float F = 1.6f;
+    for (uint o = 0u; o < 2u; o++)
+    {
+        const float3 X = P * F;
+        const float3 Floor = float3(floor(X.x), floor(X.y), floor(X.z));
+        const uint3 Cell = uint3(asuint(int(Floor.x)), asuint(int(Floor.y)), asuint(int(Floor.z)));
+        const FVoxelNoiseSample N = VoxelGradientNoise(Cell, X - Floor, LandSeed + VOXEL_LAND_SALT_CRUST + o * 0x9e3779b9u);
+        Sum += Amplitude * N.Value;
+        Amplitude *= 0.5f;
+        F *= 2.0f;
+    }
+    // The five octaves' norm: 1 + 1/2 + 1/4 + 1/8 + 1/16.
+    const float Raw = 0.45f * VoxelLandPlateBias(VOXEL_LAND_ARGS Plate) + Sum * (1.0f / 1.9375f) * VOXEL_LAND_NOISE_SCALE;
+    return saturate((Raw - Threshold) / 0.08f + 0.5f);
+}
+
 /** Hypsometry from the continental fraction: abyss, slope, shelf, plains rising inland
- *  (bimodal, like Earth's). Continuous in C. */
-VOXEL_FUNC float VoxelLandBaseElevation(VOXEL_LAND_ARGS_DECL float C)
+ *  (bimodal, like Earth's). Continuous in C. Below the shelf, the depth follows the larger of
+ *  C and the continents' outline (CO, VoxelLandBeltCrust): the coastline's fine octaves move
+ *  the shore, but the continental slope only where the outline turns oceanic too, so bays and
+ *  fine-scale shores stand on shelf, and a range the shore cuts runs out over shallow water
+ *  instead of dropping kilometres to the abyss within a cell (Design/SurfaceLook.md, T3f). */
+VOXEL_FUNC float VoxelLandBaseElevation(VOXEL_LAND_ARGS_DECL float C, float CO)
 {
     if (C >= 0.5f)
         return LandCoastHeight + (LandInteriorHeight - LandCoastHeight) * (C - 0.5f) * 2.0f;
     if (C >= 0.42f)
         return LandShelfDepth + (LandCoastHeight - LandShelfDepth) * (C - 0.42f) / 0.08f;
-    if (C >= 0.25f)
+    const float D = max(C, min(CO, 0.42f));
+    if (D >= 0.25f)
     {
-        const float T = smoothstep(0.25f, 0.42f, C);
+        const float T = smoothstep(0.25f, 0.42f, D);
         return LandAbyssDepth + (LandShelfDepth - LandAbyssDepth) * T;
     }
-    return LandAbyssDepth - 600.0f * LandReliefScale * (0.25f - C) / 0.25f;
+    return LandAbyssDepth - 600.0f * LandReliefScale * (0.25f - D) / 0.25f;
 }
 
 VOXEL_FUNC float VoxelLandGauss(float X, float Mu, float W)
@@ -253,6 +284,7 @@ VOXEL_FUNC FVoxelLandProfile VoxelLandBoundaryProfile(VOXEL_LAND_ARGS_DECL float
 struct FVoxelLandOwnParts
 {
     float Crust;
+    float Outline;   // VoxelLandBeltCrust
     float Up;
     float Down;
     uint Class;
@@ -265,6 +297,7 @@ VOXEL_FUNC FVoxelLandOwnParts VoxelLandPartsForOwn(VOXEL_LAND_ARGS_DECL float3 P
     const float3 SeedOwn = VoxelLandPlateSeed(VOXEL_LAND_ARGS Own);
     const float T1 = acos(clamp(dot(W, SeedOwn), -1.0f, 1.0f));
     const float C1 = VoxelLandCrust(VOXEL_LAND_ARGS P, Own, Threshold);
+    const float B1 = VoxelLandBeltCrust(VOXEL_LAND_ARGS P, Own, Threshold);
     const float3 V1 = cross(VoxelLandPlateOmega(VOXEL_LAND_ARGS Own), P);
     const float Reach = VOXEL_LAND_REACH_M * max(LandWidthScale, 1.0f);
 
@@ -291,9 +324,9 @@ VOXEL_FUNC FVoxelLandOwnParts VoxelLandPartsForOwn(VOXEL_LAND_ARGS_DECL float3 P
 
         // The other side's crust, at the point mirrored across the bisector.
         const float3 M = normalize(P + N * (2.0f * Dist / LandRadiusM));
-        const float C2 = VoxelLandCrust(VOXEL_LAND_ARGS M, q, Threshold);
+        const float B2 = VoxelLandBeltCrust(VOXEL_LAND_ARGS M, q, Threshold);
 
-        const FVoxelLandProfile Profile = VoxelLandBoundaryProfile(VOXEL_LAND_ARGS max(Dist, 0.0f), Conv, C1, C2, VoxelLandPlateDensity(VOXEL_LAND_ARGS Own), VoxelLandPlateDensity(VOXEL_LAND_ARGS q));
+        const FVoxelLandProfile Profile = VoxelLandBoundaryProfile(VOXEL_LAND_ARGS max(Dist, 0.0f), Conv, B1, B2, VoxelLandPlateDensity(VOXEL_LAND_ARGS Own), VoxelLandPlateDensity(VOXEL_LAND_ARGS q));
         const float Up = Profile.Up * Fade;
         const float Down = Profile.Down * Fade;
         Up4 += Up * Up * Up * Up;
@@ -307,6 +340,7 @@ VOXEL_FUNC FVoxelLandOwnParts VoxelLandPartsForOwn(VOXEL_LAND_ARGS_DECL float3 P
 
     FVoxelLandOwnParts Out;
     Out.Crust = C1;
+    Out.Outline = B1;
     Out.Up = sqrt(sqrt(Up4));
     Out.Down = sqrt(sqrt(Down4));
     Out.Class = Class;
@@ -354,6 +388,7 @@ VOXEL_FUNC FVoxelLandElevation VoxelLandElevationAt(VOXEL_LAND_ARGS_DECL float3 
 
     float WSum = 0.0f;
     float Crust = 0.0f;
+    float Outline = 0.0f;
     float Up = 0.0f;
     float Down = 0.0f;
     uint Class = 0u;
@@ -366,6 +401,7 @@ VOXEL_FUNC FVoxelLandElevation VoxelLandElevationAt(VOXEL_LAND_ARGS_DECL float3 
         if (Weight <= 0.0f) continue;
         const FVoxelLandOwnParts Parts = VoxelLandPartsForOwn(VOXEL_LAND_ARGS P, W, K, Threshold);
         Crust += Weight * Parts.Crust;
+        Outline += Weight * Parts.Outline;
         Up += Weight * Parts.Up;
         Down += Weight * Parts.Down;
         if (r == 0u)
@@ -379,6 +415,7 @@ VOXEL_FUNC FVoxelLandElevation VoxelLandElevationAt(VOXEL_LAND_ARGS_DECL float3 
         // Four plates equidistant at one point (a measure-zero case): the nearest alone.
         const FVoxelLandOwnParts Parts = VoxelLandPartsForOwn(VOXEL_LAND_ARGS P, W, K0, Threshold);
         Crust = Parts.Crust;
+        Outline = Parts.Outline;
         Up = Parts.Up;
         Down = Parts.Down;
         Class = Parts.Class;
@@ -391,7 +428,7 @@ VOXEL_FUNC FVoxelLandElevation VoxelLandElevationAt(VOXEL_LAND_ARGS_DECL float3 
     Out.Plate = K0;
     // Low-relief continental texture, and abyssal hills (weaker), blended across the coast.
     const float TextureWeight = lerp(0.4f, 1.0f, smoothstep(0.45f, 0.55f, Out.Crust));
-    Out.Base = VoxelLandBaseElevation(VOXEL_LAND_ARGS Out.Crust)
+    Out.Base = VoxelLandBaseElevation(VOXEL_LAND_ARGS Out.Crust, Outline / WSum)
         + 250.0f * LandReliefScale * TextureWeight * VoxelLandFbm(P, 6.0f, 5u, LandSeed + VOXEL_LAND_SALT_TEXTURE);
     return Out;
 }

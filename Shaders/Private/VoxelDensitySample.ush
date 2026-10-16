@@ -317,7 +317,8 @@ struct FVoxelLandDifferenced
 VOXEL_FUNC FVoxelLandDifferenced VoxelLandDifferencedDF(VOXEL_LAND_ARGS_DECL float2 LPX, float2 LPY, float2 LPZ, float Footprint)
 {
     const FVoxelLandWarp Warp = VoxelLandWarpDF(VOXEL_LAND_ARGS LPX, LPY, LPZ);
-    // The peaks' shape isn't needed (only their amplitude, and their steering of the gullies).
+    // The peaks' shape isn't needed: only their amplitude and their steering of the gullies (the
+    // set's steering channel alone).
     const FVoxelLandSurface Land = VoxelLandSurfaceTermsDF(VOXEL_LAND_ARGS LPX, LPY, LPZ, Warp.QX, Warp.QY, Warp.QZ, Warp.DWX, Warp.DWY, Warp.DWZ,
         Footprint, true, false);
     const float SeaWeight = lerp(0.25f, 1.0f, smoothstep(-50.0f, 50.0f, Land.Bake));

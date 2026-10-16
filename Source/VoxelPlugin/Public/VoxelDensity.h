@@ -187,10 +187,42 @@ private:
     double LandHillFrequency = 0.0;     // cycles per cm (the finest octave's)
     uint32 LandHillOctaves = 0;
     uint32 LandHillSeed = 0;
-    TSharedPtr<const FVoxelLandNoiseSet, ESPMode::ThreadSafe> LandNoise;   // VoxelLandPeaks.ush's set (null: no peaks)
-    float LandPeakStrength = 0.0f;      // VoxelLandPeaks.ush
-    uint32 LandPeakOctaves = 0;
+    TSharedPtr<const FVoxelLandNoiseSet, ESPMode::ThreadSafe> LandNoise;   // the noise pack: the peaks' and the hills' sets (null: neither)
+    // VoxelLandPeaks.ush's inputs: the set's placement and normalisation (the shader's header).
+    float LandPeakStrength = 0.0f;
+    float LandPeakTexelsPerCell = 0.0f; // 0: no peaks
     uint32 LandPeakSeed = 0;
+    float LandPeakSpacingM = 0.0f;
+    float LandPeakReliefM = 0.0f;
+    float LandPeakReliefStart = 500.0f;   // T4b: the peaks' fade-in over the local relief (m)
+    float LandPeakReliefEnd = 1500.0f;
+    float LandPeakMeanR = 0.0f;
+    float LandPeakMeanG = 0.0f;
+    float LandPeakScaleR = 1.0f;
+    float LandPeakScaleG = 1.0f;
+    float LandPeakScaleB = 1.0f;
+    // The peaks' detail tile (VoxelLandPeaks.ush, T3e; its chain follows the set's in LandNoise).
+    float LandPeakDetailTexelsPerCell = 0.0f;  // 0: no detail
+    float LandPeakDetailMeanR = 0.0f;
+    float LandPeakDetailMeanG = 0.0f;
+    float LandPeakDetailScaleR = 0.0f;
+    float LandPeakDetailScaleG = 0.0f;
+    float LandPeakDetailFade = 0.0f;
+    // The hills' set (VoxelLandHillSet.ush, T4a; its chain: LandNoise's Hill*). 0 texels: none
+    // (the procedural hills, LandHillFrequency and LandHillOctaves).
+    float LandHillTexelsPerCell = 0.0f;
+    float LandHillScaleR = 1.0f;
+    float LandHillScaleG = 1.0f;
+    float LandHillScaleB = 1.0f;
+    float LandHillSpacingM = 0.0f;
+    float LandHillSwellTexelsPerCell = 0.0f;   // 0: no swells
+    float LandHillSwellM = 0.0f;
+    float LandHillSwellScaleG = 1.0f;
+    float LandHillDetailTexelsPerCell = 0.0f;  // 0: no detail
+    float LandHillDetailScaleR = 0.0f;
+    float LandHillDetailScaleG = 0.0f;
+    float LandHillDetailFade = 0.0f;
+    float LandHillFoothill = 0.0f;         // T4b: the hills' growth in the foothills
     TArray<uint32> LandReliefPacked;    // the bake's local relief, four cells per word (empty: none)
     TArray<uint32> LandFlowPacked;      // the bake's drainage, two f16 cells per word (empty: none)
     TArray<uint32> LandFormPacked;      // the bake's landform, two cells per word (empty: none)
@@ -206,7 +238,7 @@ namespace VoxelDensity
         double PlanetRadius, double NoiseAmplitude, TSharedPtr<FSparseEditStore> EditStore, double MinFootprint = 0.0);
 
     /** The same for the terrestrial generator: PlanetRadius and NoiseAmplitude from
-     *  VoxelLand::ShapeFor(Land, *Bake). */
+     *  VoxelLand::ShapeFor(Land, *Bake, the noise pack). */
     VOXELPLUGIN_API TSharedPtr<FDensitySampleCompositor> MakeTerrestrialCompositor(const FVoxelTerrestrialSettings& Land,
         TSharedPtr<const FVoxelLandBake, ESPMode::ThreadSafe> Bake, double PlanetRadius, double NoiseAmplitude,
         TSharedPtr<FSparseEditStore> EditStore, double MinFootprint = 0.0);

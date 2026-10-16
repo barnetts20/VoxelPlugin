@@ -67,6 +67,12 @@ namespace VoxelShader
         uint SolveFillDepressions = 1u, SolveModel = 0u;
         float SolvePlainsRelief = 0.0f, SolveIncision = 0.0f;
         float* SlotK = nullptr;
+        // T3g: the channel heads and the hillslopes' threshold (0 cells: off).
+        float SolveChannelCells = 0.0f, SolveChannelVariation = 0.0f, SolveChannelWavelength = 1.8e5f, SolveHillslope = 1.5f;
+        uint SolveChannelOctaves = 3u;
+        float SolveChannelCharacter = 0.0f;
+        uint* OutForm = nullptr;
+        float* SlotAc = nullptr;
         uint* LakeArea = nullptr; uint* LakeDepth = nullptr; uint* LakeOutlet = nullptr;
         uint* LakeCount = nullptr; uint* LakeList = nullptr;
         uint SolveMaxLakes = 65536;
@@ -180,8 +186,8 @@ static void BakePlates(FPlateBake& B, uint32_t Seed, int K, float LandFraction, 
 /** The solve's buffers, owned. */
 struct FSolveBuffers
 {
-    std::vector<float> H, W, Water, U, K, Area, Dist, H0, A, AOut, WOut, X, XOut;
-    std::vector<uint> Rec, Slot, Label, Cell, Y, YOut, P, POut, Flags, LArea, LDepth, LOutlet, LCount, LList, OAttr;
+    std::vector<float> H, W, Water, U, K, Ac, Area, Dist, H0, A, AOut, WOut, X, XOut;
+    std::vector<uint> Rec, Slot, Label, Cell, Y, YOut, P, POut, Flags, LArea, LDepth, LOutlet, LCount, LList, OAttr, OForm;
     std::vector<float> OHeight, OFlow, OWater;
 
     void Bind(FSolve& S, int Cells)
@@ -189,17 +195,17 @@ struct FSolveBuffers
         auto Fz = [](std::vector<float>& V, int n) { V.assign(n, 0.f); };
         auto Uz = [](std::vector<uint>& V, int n) { V.assign(n, 0u); };
         Fz(H, Cells); Fz(W, Cells); Fz(Water, Cells); Uz(Rec, Cells); Uz(Slot, Cells); Uz(Label, Cells);
-        for (auto* V : { &U, &K, &Area, &Dist, &H0, &A, &AOut, &WOut, &X, &XOut, &OHeight, &OFlow, &OWater }) Fz(*V, Cells);
-        for (auto* V : { &Cell, &Y, &YOut, &P, &POut, &LArea, &LDepth, &LOutlet, &OAttr }) Uz(*V, Cells);
+        for (auto* V : { &U, &K, &Ac, &Area, &Dist, &H0, &A, &AOut, &WOut, &X, &XOut, &OHeight, &OFlow, &OWater }) Fz(*V, Cells);
+        for (auto* V : { &Cell, &Y, &YOut, &P, &POut, &LArea, &LDepth, &LOutlet, &OAttr, &OForm }) Uz(*V, Cells);
         Uz(Flags, 4); Uz(LCount, 1); Uz(LList, 65536 * 4);
         S.SolveH = H.data(); S.SolveW = W.data(); S.SolveWater = Water.data();
         S.SolveRec = Rec.data(); S.SolveSlot = Slot.data(); S.SolveLabel = Label.data();
-        S.SlotCell = Cell.data(); S.SlotU = U.data(); S.SlotK = K.data(); S.SlotArea = Area.data(); S.SlotDist = Dist.data(); S.SlotH0 = H0.data();
+        S.SlotCell = Cell.data(); S.SlotU = U.data(); S.SlotK = K.data(); S.SlotAc = Ac.data(); S.SlotArea = Area.data(); S.SlotDist = Dist.data(); S.SlotH0 = H0.data();
         S.SlotA = A.data(); S.SlotAOut = AOut.data(); S.SlotWOut = WOut.data();
         S.JumpX = X.data(); S.JumpXOut = XOut.data(); S.JumpY = Y.data(); S.JumpYOut = YOut.data(); S.JumpP = P.data(); S.JumpPOut = POut.data();
         S.SolveFlags = Flags.data();
         S.LakeArea = LArea.data(); S.LakeDepth = LDepth.data(); S.LakeOutlet = LOutlet.data(); S.LakeCount = LCount.data(); S.LakeList = LList.data();
-        S.OutHeight = OHeight.data(); S.OutFlow = OFlow.data(); S.OutWater = OWater.data(); S.OutAttr = OAttr.data();
+        S.OutHeight = OHeight.data(); S.OutFlow = OFlow.data(); S.OutWater = OWater.data(); S.OutAttr = OAttr.data(); S.OutForm = OForm.data();
     }
 };
 
@@ -300,6 +306,28 @@ static void ReferenceAccumulate(FSolve& S, uint NumSlots, std::vector<uint>& Ord
     }
 }
 
+/** T3g: the slope cap in sequence, receivers first (Order: ascending filled height), each cell
+ *  min(h, h_r + C) on its receiver's capped height (the L2 model: no incision floor). */
+static double ReferenceCap(FSolve& S, uint NumSlots, const std::vector<uint>& Order)
+{
+    double SumDh = 0;
+    for (uint k = 0; k < NumSlots; k++)
+    {
+        const uint s = Order[k], c = S.SlotCell[s], r = S.SolveRec[c];
+        float Hn = S.SolveH[c];
+        if (r != c)
+        {
+            const double Fc = (double)S.SolveKdt * S.SlotK[s] * std::sqrt((double)S.SolveChannelCells * S.SlotArea[s] * S.SlotAc[s]) / std::max(S.SlotDist[s], 1.0f);
+            const float C = (float)std::max((double)S.SolveHillslope * S.SlotU[s] * S.SolveDt / std::max(Fc, 1e-20), 6.0 * S.SolveEps);
+            const float Hr = S.SolveSlot[r] == VOXEL_SOLVE_NONE ? S.SolveW[r] : S.SolveH[r];
+            Hn = std::min(Hn, Hr + C);
+        }
+        SumDh += std::fabs(Hn - S.SlotH0[s]);
+        S.SolveH[c] = Hn;
+    }
+    return SumDh;
+}
+
 static double ReferenceImplicit(FSolve& S, uint NumSlots, const std::vector<uint>& Order)
 {
     double SumDh = 0;
@@ -311,13 +339,21 @@ static double ReferenceImplicit(FSolve& S, uint NumSlots, const std::vector<uint
         if (r == c) Hn = Raised;
         else
         {
-            const float F = S.SolveKdt * S.SlotK[s] * std::sqrt(S.SlotA[s]) / std::max(S.SlotDist[s], 1.0f);
+            float F = S.SolveKdt * S.SlotK[s] * std::sqrt(S.SlotA[s]) / std::max(S.SlotDist[s], 1.0f);
+            if (S.SolveChannelCells > 0.0f)
+            {
+                // T3g: the channel heads' ramp, written out (not the shader's function).
+                const double Ac = (double)S.SolveChannelCells * S.SlotArea[s] * S.SlotAc[s];
+                const double T = std::clamp(((double)S.SlotA[s] - 0.5 * Ac) / (0.5 * Ac), 0.0, 1.0);
+                F *= (float)(T * T * (3.0 - 2.0 * T));
+            }
             const float Hr = S.SolveSlot[r] == VOXEL_SOLVE_NONE ? S.SolveW[r] : S.SolveH[r];
             Hn = (Raised + F * Hr) / (1.0f + F);
         }
-        SumDh += std::fabs(Hn - S.SlotH0[s]);
+        if (S.SolveChannelCells <= 0.0f) SumDh += std::fabs(Hn - S.SlotH0[s]);
         S.SolveH[c] = Hn;
     }
+    if (S.SolveChannelCells > 0.0f) SumDh = ReferenceCap(S, NumSlots, Order);
     return SumDh;
 }
 
@@ -334,6 +370,15 @@ static FRunResult Run(FSolve& S, const FRunOptions& O, bool bLog)
     const uint M = Compact(S, 0);
     Res.Moving = M;
     for (uint c = 0; c < Cells; c++) S.VoxelSolveInitPass(c);
+    if (bLog && S.SolveChannelCells > 0.0f && M > 0)
+    {
+        // T3g: the channel heads' area over the solved cells (the engine logs the nominal range).
+        std::vector<float> Ac(M), Fac(M);
+        for (uint s = 0; s < M; s++) { Fac[s] = S.SlotAc[s]; Ac[s] = S.SolveChannelCells * S.SlotArea[s] * S.SlotAc[s] * 1e-6f; }
+        printf("  channel heads: factor min %.3f p5 %.3f p50 %.3f p95 %.3f max %.3f; area %.1f .. %.1f km^2 (p5 %.1f, p50 %.1f, p95 %.1f)\n",
+            Percentile(Fac, 0.0), Percentile(Fac, 0.05), Percentile(Fac, 0.5), Percentile(Fac, 0.95), Percentile(Fac, 0.999999),
+            Percentile(Ac, 0.0), Percentile(Ac, 0.999999), Percentile(Ac, 0.05), Percentile(Ac, 0.5), Percentile(Ac, 0.95));
+    }
     S.SolveFlags[1] = 0;
     if (O.bReference) ReferenceFill(S, M, S.SolveEps);
     else
@@ -377,6 +422,13 @@ static FRunResult Run(FSolve& S, const FRunOptions& O, bool bLog)
             for (int r = 0; r < O.R; r++) { ParallelFor(M, [&](int s) { S.VoxelSolveImplicitJumpPass(s, M); }); SwapJump(S); }
             std::vector<float> Dh(M);
             ParallelFor(M, [&](int s) { Dh[s] = S.VoxelSolveImplicitFinishPass(s, M); });
+            if (S.SolveChannelCells > 0.0f)
+            {
+                // T3g: the slope cap, as the GPU job.
+                ParallelFor(M, [&](int s) { S.VoxelSolveCapInitPass(s, M); });
+                for (int r = 0; r < O.R; r++) { ParallelFor(M, [&](int s) { S.VoxelSolveCapJumpPass(s, M); }); SwapJump(S); }
+                ParallelFor(M, [&](int s) { Dh[s] = S.VoxelSolveCapFinishPass(s, M); });
+            }
             for (uint s = 0; s < M; s++) SumDh += Dh[s];
         }
         const float Residual = (float)(SumDh / std::max(SumU * S.SolveDt, 1e-30));
@@ -564,6 +616,12 @@ int main(int argc, char** argv)
     S.SolveModel = (uint)Get("Model", 0.0);
     S.SolvePlainsRelief = (float)Get("PlainsRelief", 0.0);
     S.SolveIncision = (float)Get("Incision", 0.0);
+    S.SolveChannelCells = (float)Get("ChannelCells", 0.0);
+    S.SolveChannelVariation = (float)Get("ChannelVariation", 0.0);
+    S.SolveChannelWavelength = (float)Get("ChannelWavelength", 1.8e5);
+    S.SolveChannelOctaves = (uint)Get("ChannelOctaves", 3.0);
+    S.SolveHillslope = (float)Get("Hillslope", 1.5);
+    S.SolveChannelCharacter = (float)Get("ChannelCharacter", 0.0);
     ReliefTopScale = (float)Get("ReliefTopScale", 1.3);
     FSolveBuffers Buf;
     const uint Cells = B.Cells();
@@ -580,7 +638,7 @@ int main(int argc, char** argv)
     Dump("plates.f32", B.Height.data(), Cells * 4);
     Dump("up.f32", B.Up.data(), Cells * 4);
     Dump("attr.u32", Buf.OAttr.data(), Cells * 4);
-    Dump("form.u32", B.Form.data(), Cells * 4);
+    Dump("form.u32", Buf.OForm.data(), Cells * 4);
     FILE* J = fopen((Tag + ".json").c_str(), "w");
     fprintf(J, "{\"n\": %d, \"pad\": %d, \"radius_m\": %.1f, \"steps\": %zu, \"lakes\": %d, \"seconds\": %.1f}\n", N, B.Pad, RadiusM, R.Residuals.size(), R.Lakes, R.Seconds);
     fclose(J);

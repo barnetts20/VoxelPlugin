@@ -16,6 +16,8 @@
 //   agree  the GPU code path (VoxelSampleDensityDF) against the CPU path
 //   noise  the noise set's sampler against the handoff's B-spline in doubles (NOISE_SET=file.vxnt
 //          for an authored set; every mode reads it)
+//   pcost  the peaks' CPU cost and (built with -DVOXEL_HARNESS_COUNT_NOISE) noise loads a sample
+//   cgrad  the peaks' gradient against differences with the real (varying) landform
 // Environment overrides for looks: GULLY_DETAIL, DETAIL_AMP (m), VIEWS, WIDTH (m), SUFFIX.
 #include "VoxelShaderCompat.h"
 #include <array>
@@ -57,9 +59,16 @@ namespace VoxelShader
     float LandHillRelief = 0.0f;
     float2 LandHillFrequency;
     uint LandHillOctaves = 0, LandHillSeed = 0;
-    float LandPeakStrength = 0.0f;
-    uint LandPeakOctaves = 0, LandPeakSeed = 0, LandNoiseN = 0, LandNoiseMips = 0, LandNoiseCellShift = 0;
-    float LandPeakMeanShape = 0.0f, LandPeakMeanG = 0.0f;
+    float LandPeakStrength = 0.0f, LandPeakTexelsPerCell = 0.0f, LandPeakSpacingM = 0.0f, LandPeakReliefM = 0.0f, LandPeakReliefStart = 500.0f, LandPeakReliefEnd = 1500.0f;
+    float LandPeakMeanR = 0.0f, LandPeakMeanG = 0.0f, LandPeakScaleR = 1.0f, LandPeakScaleG = 1.0f, LandPeakScaleB = 1.0f;
+    uint LandPeakSeed = 0, LandNoiseN = 0, LandNoiseMips = 0;
+    uint LandPeakDetailBase = 0, LandPeakDetailN = 0, LandPeakDetailMips = 0;
+    float LandPeakDetailTexelsPerCell = 0.0f, LandPeakDetailMeanR = 0.0f, LandPeakDetailMeanG = 0.0f;
+    float LandPeakDetailScaleR = 0.0f, LandPeakDetailScaleG = 0.0f, LandPeakDetailFade = 0.0f;
+    float LandHillTexelsPerCell = 0.0f, LandHillScaleR = 1.0f, LandHillScaleG = 1.0f, LandHillScaleB = 1.0f, LandHillSpacingM = 0.0f;
+    uint LandHillBase = 0, LandHillN = 0, LandHillMips = 0;
+    float LandHillSwellTexelsPerCell = 0.0f, LandHillSwellM = 0.0f, LandHillSwellScaleG = 1.0f;
+    float LandHillDetailTexelsPerCell = 0.0f, LandHillDetailScaleR = 0.0f, LandHillDetailScaleG = 0.0f, LandHillDetailFade = 0.0f, LandHillFoothill = 0.0f;
     float LandCellM = 1.0f;
     float LandWarpInvNorm = 0, LandWarpAmplitude = 0, LandDetailAmplitude = 0;
     float2 LandHeightOffset;
@@ -67,6 +76,12 @@ namespace VoxelShader
     uint LandGullyOctaves = 0;
     float LandGullyFlowGain = 0.5f, LandGullyDetail = 0.35f;
     uint LandGullySeed = 0;
+#ifdef VOXEL_HARNESS_COUNT_NOISE
+    // Built with -DVOXEL_HARNESS_COUNT_NOISE: counts the noise set's word loads (pcost).
+    static thread_local uint64_t GNoiseLoads = 0;
+#define VOXEL_LAND_NOISE_RG(I) (GNoiseLoads++, VoxelLandUnpackNoise(LandNoise[(I) * 2u]))
+#define VOXEL_LAND_NOISE_BA(I) (GNoiseLoads++, VoxelLandUnpackNoise(LandNoise[(I) * 2u + 1u]))
+#endif
 #include "VoxelLandSample.ush"
 #include "VoxelLandGully.ush"
 #include "VoxelDensitySample.ush"
@@ -84,9 +99,16 @@ namespace VoxelShader
         float LandHillRelief = 0.0f;
         float2 LandHillFrequency;
         uint LandHillOctaves = 0, LandHillSeed = 0;
-        float LandPeakStrength = 0.0f;
-        uint LandPeakOctaves = 0, LandPeakSeed = 0, LandNoiseN = 0, LandNoiseMips = 0, LandNoiseCellShift = 0;
-        float LandPeakMeanShape = 0.0f, LandPeakMeanG = 0.0f;
+        float LandPeakStrength = 0.0f, LandPeakTexelsPerCell = 0.0f, LandPeakSpacingM = 0.0f, LandPeakReliefM = 0.0f, LandPeakReliefStart = 500.0f, LandPeakReliefEnd = 1500.0f;
+        float LandPeakMeanR = 0.0f, LandPeakMeanG = 0.0f, LandPeakScaleR = 1.0f, LandPeakScaleG = 1.0f, LandPeakScaleB = 1.0f;
+        uint LandPeakSeed = 0, LandNoiseN = 0, LandNoiseMips = 0;
+        uint LandPeakDetailBase = 0, LandPeakDetailN = 0, LandPeakDetailMips = 0;
+        float LandPeakDetailTexelsPerCell = 0.0f, LandPeakDetailMeanR = 0.0f, LandPeakDetailMeanG = 0.0f;
+        float LandPeakDetailScaleR = 0.0f, LandPeakDetailScaleG = 0.0f, LandPeakDetailFade = 0.0f;
+        float LandHillTexelsPerCell = 0.0f, LandHillScaleR = 1.0f, LandHillScaleG = 1.0f, LandHillScaleB = 1.0f, LandHillSpacingM = 0.0f;
+        uint LandHillBase = 0, LandHillN = 0, LandHillMips = 0;
+        float LandHillSwellTexelsPerCell = 0.0f, LandHillSwellM = 0.0f, LandHillSwellScaleG = 1.0f;
+        float LandHillDetailTexelsPerCell = 0.0f, LandHillDetailScaleR = 0.0f, LandHillDetailScaleG = 0.0f, LandHillDetailFade = 0.0f, LandHillFoothill = 0.0f;
         float LandCellM = 1.0f;
         float LandGullyStrength = 0.0f;
         uint LandGullyOctaves = 0;
@@ -97,6 +119,7 @@ namespace VoxelShader
 #undef VOXEL_LAND_NOISE_USH
 #undef VOXEL_LAND_PEAKS_USH
 #undef VOXEL_LAND_GULLY_USH
+#undef VOXEL_LAND_HILL_SET_USH
 #include "VoxelLandSample.ush"
 #include "VoxelLandGully.ush"
     };
@@ -210,8 +233,12 @@ struct FPlanet
     std::vector<uint8_t> Relief;       // per cell (VoxelLandRelief.h)
     float MaxRelief = 0;
     VoxelNoiseTiles::FSet NoiseSet;    // the peaks' set (VoxelLand::GetPeakNoise's)
-    std::vector<uint32_t> NoiseWords;  // FVoxelLandNoiseSet::Words: the chain in whole rows of N texels
+    std::vector<uint32_t> NoiseWords;  // FVoxelLandNoiseSet::Words: the chain in whole rows of N texels, then the detail's
     uint32_t NoiseRows = 0;
+    VoxelNoiseTiles::FSet Detail;      // the peaks' detail tile (VoxelLandNoiseDetail::DetailLocked's)
+    uint32_t DetailBase = 0;           // its first texel in NoiseWords
+    VoxelNoiseTiles::FSet HillSet;     // T4a: HILL_SET=file.vxnt, after the detail (whole rows)
+    uint32_t HillBase = 0;
     std::vector<float2> Tan;
     FLay Det, W[3];
     double WarpAmp = 0, DetailAmp = 0, Offset = 0, Finest = 0, Half = 0;
@@ -271,13 +298,32 @@ static void Load(FPlanet& P, const std::string& Tag, int N, double RadiusM, doub
         }
         else
         {
-            P.NoiseSet = VoxelNoiseTiles::PeaksDefinition(0x7065616bu);
-            VoxelNoiseTiles::Generate(P.NoiseSet, [](int32_t Count, auto&& Body) { ParallelFor(Count, [&](int i) { Body(i); }); });
+            P.NoiseSet = VoxelNoiseTiles::GeneratePeaksStandIn(0x7065616bu, 1024, [](int32_t Count, auto&& Body) { ParallelFor(Count, [&](int i) { Body(i); }); });
         }
         const size_t Texels = P.NoiseSet.Texels.size() / 4;
         P.NoiseRows = (uint32_t)((Texels + P.NoiseSet.N - 1) / P.NoiseSet.N);
-        P.NoiseWords.assign(2 * (size_t)P.NoiseRows * P.NoiseSet.N, 0u);
+        // The detail tile after the chain, from a whole row (VoxelLandNoiseDetail::AppendDetailLocked).
+        P.Detail = VoxelNoiseTiles::GeneratePeakDetail(0x64657461u, 1024, [](int32_t Count, auto&& Body) { ParallelFor(Count, [&](int i) { Body(i); }); });
+        const size_t DetailTexels = P.Detail.Texels.size() / 4;
+        const uint32_t DetailRows = (uint32_t)((DetailTexels + P.NoiseSet.N - 1) / P.NoiseSet.N);
+        P.DetailBase = P.NoiseRows * P.NoiseSet.N;
+        P.NoiseWords.assign(2 * (size_t)(P.NoiseRows + DetailRows) * P.NoiseSet.N, 0u);
         std::memcpy(P.NoiseWords.data(), P.NoiseSet.Texels.data(), Texels * 8);
+        std::memcpy(P.NoiseWords.data() + 2 * (size_t)P.DetailBase, P.Detail.Texels.data(), DetailTexels * 8);
+        // T4a: the hills' set (HILL_SET=file.vxnt) after the detail, from a whole row (the
+        // plugin's pack: VoxelLand::GetLandNoise).
+        if (const char* HillPath = getenv("HILL_SET"))
+        {
+            const std::vector<char> Bytes = ReadFile(HillPath);
+            std::string Error = VoxelNoiseTiles::ReadVxnt((const uint8_t*)Bytes.data(), Bytes.size(), P.HillSet);
+            if (Error.empty()) Error = VoxelNoiseTiles::CheckPeaks(P.HillSet);
+            if (!Error.empty()) { fprintf(stderr, "%s: %s\n", HillPath, Error.c_str()); exit(1); }
+            const size_t HillTexels = P.HillSet.Texels.size() / 4;
+            const uint32_t HillRows = (uint32_t)((HillTexels + P.NoiseSet.N - 1) / P.NoiseSet.N);
+            P.HillBase = (P.NoiseRows + DetailRows) * P.NoiseSet.N;
+            P.NoiseWords.resize(2 * (size_t)(P.NoiseRows + DetailRows + HillRows) * P.NoiseSet.N, 0u);
+            std::memcpy(P.NoiseWords.data() + 2 * (size_t)P.HillBase, P.HillSet.Texels.data(), HillTexels * 8);
+        }
     }
     // VoxelLand::GullyOctavesFor and GullyReach.
     const double Lambda0 = 2.0 * P.Cell * 0.01;
@@ -292,13 +338,18 @@ static void Load(FPlanet& P, const std::string& Tag, int N, double RadiusM, doub
     const double HillFinest = getenv("HILL_FINEST") ? atof(getenv("HILL_FINEST")) : 25.0;
     const int HillOctaves = P.Form.empty() || HillRelief <= 0 ? 0 : std::clamp((int)std::floor(std::log2(HillLongest / HillFinest)) + 1, 1, 12);
     const double HillFrequency = 1.0 / (HillLongest * 100.0 / std::pow(2.0, std::max(HillOctaves, 1) - 1));
-    // The peaks (VoxelLand::PeakOctavesFor, PeakReach), from the environment.
-    constexpr double PeakMaxUnit = 2.2, PeakMinUnit = 1.0;   // VoxelLand::PeakMaxUnit, PeakMinUnit (VoxelLandBake.h)
-    const double PeakStrength = getenv("PEAK_STRENGTH") ? atof(getenv("PEAK_STRENGTH")) : 0.25;
-    const double PeakFinest = getenv("PEAK_FINEST") ? atof(getenv("PEAK_FINEST")) : 1000.0;
-    const int PeakOctaves = P.Form.empty() || PeakStrength <= 0 ? 0 : (Lambda0 < PeakFinest ? 1 : std::clamp((int)std::floor(std::log2(Lambda0 / PeakFinest)) + 1, 1, 8));
-    const double PeakUp = PeakOctaves > 0 ? PeakMaxUnit * PeakStrength * P.MaxRelief * 100.0 : 0.0;
-    const double PeakDown = PeakOctaves > 0 ? PeakMinUnit * PeakStrength * P.MaxRelief * 100.0 : 0.0;
+    // The peaks (VoxelLand::PeakTexelsPerCell, PeakReach; FVoxelDensityCPU), from the environment.
+    const double PeakStrength = getenv("PEAK_STRENGTH") ? atof(getenv("PEAK_STRENGTH")) : 1.0;
+    const double PeakSpacing = getenv("PEAK_SPACING") ? atof(getenv("PEAK_SPACING")) : 6000.0;
+    const bool bPeaks = !P.Form.empty() && PeakStrength > 0;
+    // The detail (VoxelLand::PeakDetailWavelength, PeakReach): PEAK_DETAIL its strength,
+    // PEAK_DETAIL_WAVELENGTH its coarsest wavelength (m).
+    const double PeakDetail = getenv("PEAK_DETAIL") ? atof(getenv("PEAK_DETAIL")) : 1.0;
+    const double PeakDetailWave = std::clamp(getenv("PEAK_DETAIL_WAVELENGTH") ? atof(getenv("PEAK_DETAIL_WAVELENGTH")) : 400.0, 16.0,
+        0.25 * std::max(PeakSpacing, 500.0));
+    const double DetailTexelM = PeakDetailWave / (double)(P.Detail.N / P.Detail.Channel[0].CellsPerTile);
+    const double PeakUp = bPeaks ? PeakStrength * (P.MaxRelief + (PeakDetail > 0 ? PeakDetail * VoxelNoiseTiles::DetailRangeTexels * DetailTexelM : 0.0)) * 100.0 : 0.0;
+    const double PeakDown = PeakUp;
     const double Reach = 2.5 * P.DetailAmp + GullyReach + HillMaxUnit * HillRelief * 100.0 + 100;
     const double Low = std::min(Mn * 100.0, -PeakDown) - Reach, High = Mx * 100.0 + PeakUp + Reach;
     P.R = P.SeaRadius + Low; P.NA = High - Low;
@@ -323,19 +374,99 @@ static void Load(FPlanet& P, const std::string& Tag, int N, double RadiusM, doub
     S.LandRelief = P.ReliefPacked.data();
     S.LandNoise = P.NoiseWords.data();
     S.LandNoiseN = P.NoiseSet.N; S.LandNoiseMips = P.NoiseSet.Mips;
-    S.LandNoiseCellShift = (uint)std::log2((double)(P.NoiseSet.N / P.NoiseSet.Channel[0].CellsPerTile));
+    if (bPeaks)
     {
-        auto Unit = [&](int c, double V) { const auto& C = P.NoiseSet.Channel[c]; return (V - (double)C.Min) / std::max((double)C.Max - (double)C.Min, 1e-12); };
-        S.LandPeakMeanShape = (float)VoxelNoiseTiles::MeanOf2(P.NoiseSet, 0, 3, [&](double R, double A) { return (0.6 + 0.8 * Unit(3, A)) * Unit(0, R); });
-        S.LandPeakMeanG = (float)VoxelNoiseTiles::MeanOf(P.NoiseSet, 1, [&](double V) { return Unit(1, V); });
+        // FVoxelDensityCPU's terrestrial constructor (VoxelLand::PeakTexelsPerCell).
+        const auto& Set = P.NoiseSet;
+        auto Unit = [&](int c, double V) { const auto& C = Set.Channel[c]; return (V - (double)C.Min) / std::max((double)C.Max - (double)C.Min, 1e-12); };
+        const double TexelM = PeakSpacing / (double)(Set.N / Set.Channel[0].CellsPerTile);
+        S.LandPeakTexelsPerCell = (float)(P.Cell * 0.01 / TexelM);
+        const float TexelMF = S.LandCellM / S.LandPeakTexelsPerCell;
+        const float RangeR = Set.Channel[0].Max - Set.Channel[0].Min, RangeG = Set.Channel[1].Max - Set.Channel[1].Min, RangeB = Set.Channel[2].Max - Set.Channel[2].Min;
+        S.LandPeakSpacingM = (float)PeakSpacing;
+        const float Range = std::max({ RangeR, RangeG, 1e-6f });
+        S.LandPeakReliefM = Range * TexelMF;
+        S.LandPeakMeanR = (float)VoxelNoiseTiles::MeanOf(Set, 0, [&](double V) { return Unit(0, V); });
+        S.LandPeakMeanG = (float)VoxelNoiseTiles::MeanOf(Set, 1, [&](double V) { return Unit(1, V); });
+        S.LandPeakScaleR = RangeR / Range;
+        S.LandPeakScaleG = RangeG / Range;
+        S.LandPeakScaleB = RangeB / Range;
+        // FVoxelDensityCPU's detail (VoxelLand::PeakDetailTexelsPerCell).
+        if (PeakDetail > 0)
+        {
+            const auto& D = P.Detail;
+            auto DUnit = [&](int c, double V) { const auto& C = D.Channel[c]; return (V - (double)C.Min) / std::max((double)C.Max - (double)C.Min, 1e-12); };
+            S.LandPeakDetailBase = P.DetailBase; S.LandPeakDetailN = D.N; S.LandPeakDetailMips = D.Mips;
+            S.LandPeakDetailTexelsPerCell = (float)(P.Cell * 0.01 / DetailTexelM);
+            const float DTexelMF = S.LandCellM / S.LandPeakDetailTexelsPerCell;
+            S.LandPeakDetailMeanR = (float)VoxelNoiseTiles::MeanOf(D, 0, [&](double V) { return DUnit(0, V); });
+            S.LandPeakDetailMeanG = (float)VoxelNoiseTiles::MeanOf(D, 1, [&](double V) { return DUnit(1, V); });
+            S.LandPeakDetailScaleR = (float)PeakDetail * (D.Channel[0].Max - D.Channel[0].Min) * DTexelMF / S.LandPeakReliefM;
+            S.LandPeakDetailScaleG = (float)PeakDetail * (D.Channel[1].Max - D.Channel[1].Min) * DTexelMF / S.LandPeakReliefM;
+            S.LandPeakDetailFade = (float)std::floor(std::log2((double)(D.N / D.Channel[0].CellsPerTile))) - 1.0f;
+        }
     }
-    S.LandPeakStrength = (float)PeakStrength; S.LandPeakOctaves = (uint)PeakOctaves; S.LandPeakSeed = VoxelHashSeed(7, 0x41u);
+    S.LandPeakStrength = bPeaks ? (float)PeakStrength : 0.0f; S.LandPeakSeed = VoxelHashSeed(7, 0x41u);
+    if (getenv("PEAK_RELIEF_START")) S.LandPeakReliefStart = (float)atof(getenv("PEAK_RELIEF_START"));
+    if (getenv("PEAK_RELIEF_END")) S.LandPeakReliefEnd = (float)atof(getenv("PEAK_RELIEF_END"));
+    S.LandPeakReliefEnd = std::max(S.LandPeakReliefEnd, S.LandPeakReliefStart + 1.0f);
+    // The detail tile's chain and means, whoever reads it (the peaks, the hills' set).
+    {
+        const auto& D = P.Detail;
+        auto DUnit = [&](int c, double V) { const auto& C = D.Channel[c]; return (V - (double)C.Min) / std::max((double)C.Max - (double)C.Min, 1e-12); };
+        S.LandPeakDetailBase = P.DetailBase; S.LandPeakDetailN = D.N; S.LandPeakDetailMips = D.Mips;
+        S.LandPeakDetailMeanR = (float)VoxelNoiseTiles::MeanOf(D, 0, [&](double V) { return DUnit(0, V); });
+        S.LandPeakDetailMeanG = (float)VoxelNoiseTiles::MeanOf(D, 1, [&](double V) { return DUnit(1, V); });
+    }
+    // T4a: the hills from the set (FVoxelDensityCPU's; VoxelLand::HillTexelsPerCell), from the
+    // environment: HILL_SPACING (m), HILL_STRENGTH, HILL_SWELL (m), HILL_SWELL_SCALE (the swells'
+    // spacing over the hills'), HILL_DETAIL (strength), HILL_DETAIL_WAVELENGTH (m).
+    if (!P.HillSet.Texels.empty() && S.LandHasForm && HillRelief > 0)
+    {
+        const auto& Set = P.HillSet;
+        const double Spacing = getenv("HILL_SPACING") ? atof(getenv("HILL_SPACING")) : 2500.0;
+        const double HStrength = getenv("HILL_STRENGTH") ? atof(getenv("HILL_STRENGTH")) : 1.0;
+        const double Swell = getenv("HILL_SWELL") ? atof(getenv("HILL_SWELL")) : 20.0;
+        const double SwellScale = getenv("HILL_SWELL_SCALE") ? atof(getenv("HILL_SWELL_SCALE")) : 3.0;
+        const double HDetail = getenv("HILL_DETAIL") ? atof(getenv("HILL_DETAIL")) : 0.5;
+        const double HDetailWave = std::clamp(getenv("HILL_DETAIL_WAVELENGTH") ? atof(getenv("HILL_DETAIL_WAVELENGTH")) : 300.0, 16.0, 0.25 * Spacing);
+        const double TexelM = Spacing / (double)(Set.N / Set.Channel[0].CellsPerTile);
+        S.LandHillTexelsPerCell = (float)(P.Cell * 0.01 / TexelM);
+        const float TexelMF = S.LandCellM / S.LandHillTexelsPerCell;
+        const float RangeR = Set.Channel[0].Max - Set.Channel[0].Min, RangeG = Set.Channel[1].Max - Set.Channel[1].Min, RangeB = Set.Channel[2].Max - Set.Channel[2].Min;
+        const float Range = std::max({ RangeR, RangeG, 1e-6f });
+        const float ReliefM = Range * TexelMF;
+        S.LandHillRelief = (float)HStrength * ReliefM;
+        S.LandHillBase = P.HillBase; S.LandHillN = Set.N; S.LandHillMips = Set.Mips;
+        S.LandHillScaleR = RangeR / Range; S.LandHillScaleG = RangeG / Range; S.LandHillScaleB = RangeB / Range;
+        S.LandHillSpacingM = (float)Spacing;
+        S.LandHillFoothill = getenv("HILL_FOOTHILL") ? (float)atof(getenv("HILL_FOOTHILL")) : 1.0f;
+        if (Swell > 0 && SwellScale > 0)
+        {
+            S.LandHillSwellTexelsPerCell = (float)(S.LandHillTexelsPerCell / SwellScale);
+            S.LandHillSwellM = (float)Swell;
+            S.LandHillSwellScaleG = 1.0f;
+        }
+        if (HDetail > 0)
+        {
+            const auto& D = P.Detail;
+            const double HDTexelM = HDetailWave / (double)(D.N / D.Channel[0].CellsPerTile);
+            S.LandHillDetailTexelsPerCell = (float)(P.Cell * 0.01 / HDTexelM);
+            const float DTexelMF = S.LandCellM / S.LandHillDetailTexelsPerCell;
+            S.LandHillDetailScaleR = (float)HDetail * (D.Channel[0].Max - D.Channel[0].Min) * DTexelMF / ReliefM;
+            S.LandHillDetailScaleG = (float)HDetail * (D.Channel[1].Max - D.Channel[1].Min) * DTexelMF / ReliefM;
+            S.LandHillDetailFade = (float)std::floor(std::log2((double)(D.N / D.Channel[0].CellsPerTile))) - 1.0f;
+        }
+        printf("hills from %s: spacing %.0f m (texel %.1f m), relief %.0f m at strength %.2f; swells %.0f m at %.1fx; detail %.2f from %.0f m\n",
+            getenv("HILL_SET"), Spacing, TexelMF, S.LandHillRelief, HStrength, S.LandHillSwellM, SwellScale, HDetail, HDetailWave);
+    }
     if (P.FormPacked.empty()) S.LandHasForm = 0;
     if (getenv("GULLY_DETAIL")) S.LandGullyDetail = (float)atof(getenv("GULLY_DETAIL"));
     if (getenv("DETAIL_AMP")) P.DetailAmp = atof(getenv("DETAIL_AMP")) * 100.0;
-    printf("planet %s: R %.0f km, N %d, cell %.0f m, lambda0 %.0f m, %d gully octaves, gully reach %.0f m, heights %.0f..%.0f m, lattice finest %.0f cm; hills %.0f m, %d octaves; peaks %.2f, %d octaves, relief up to %.0f m%s\n",
+    printf("planet %s: R %.0f km, N %d, cell %.0f m, lambda0 %.0f m, %d gully octaves, gully reach %.0f m, heights %.0f..%.0f m, lattice finest %.0f cm; hills %.0f m, %d octaves; peaks %.2f, spacing %.0f m (texel %.1f m, set relief %.0f m), relief up to %.0f m%s\n",
         Tag.c_str(), RadiusM * 1e-3, N, P.Cell * 0.01, Lambda0, Octaves, GullyReach * 0.01, Mn, Mx, P.Finest, HillRelief, HillOctaves,
-        PeakStrength, PeakOctaves, P.MaxRelief, P.Form.empty() ? " (no landform in the dump)" : "");
+        S.LandPeakStrength, PeakSpacing, S.LandPeakTexelsPerCell > 0 ? S.LandCellM / S.LandPeakTexelsPerCell : 0.0f, S.LandPeakReliefM, P.MaxRelief,
+        P.Form.empty() ? " (no landform in the dump)" : "");
 }
 
 struct FTerms { double Bake, Hills, Peaks, Gully, Detail, Height; float DetailScale; };
@@ -533,6 +664,17 @@ static std::vector<float3> RenderPeaks(const FPlanet& P, const double C[3], doub
  *  own): a view centre for the peaks. Which picks among the candidates. */
 static bool FindCrest(const FPlanet& P, double MinRelief, int Which, double OutC[3])
 {
+    // CENTERS="f,i,j;f,i,j;...": the views at these bake cells instead (T3h: chosen regions).
+    if (const char* List = getenv("CENTERS"))
+    {
+        std::string L(List);
+        for (int k = 0; k < Which && L.find(';') != std::string::npos; k++) L = L.substr(L.find(';') + 1);
+        int f = 0, i = 0, j = 0;
+        if (sscanf(L.c_str(), "%d,%d,%d", &f, &i, &j) != 3) return false;
+        const float3 D = VoxelCubeDirection(f, VoxelCubeCellCentre(i, P.N), VoxelCubeCellCentre(j, P.N));
+        OutC[0] = D.x; OutC[1] = D.y; OutC[2] = D.z;
+        return true;
+    }
     const int Side = P.Side();
     std::vector<std::pair<float, int>> Cand;
     for (int f = 0; f < 6; f++)
@@ -642,10 +784,35 @@ static void SetGpuGlobals(const FPlanet& P, std::vector<FVoxelOctave>& Gpu)
     VoxelShader::LandHillRelief = P.S.LandHillRelief; VoxelShader::LandHillFrequency = P.S.LandHillFrequency;
     VoxelShader::LandHillOctaves = P.S.LandHillOctaves; VoxelShader::LandHillSeed = P.S.LandHillSeed;
     VoxelShader::LandRelief = P.S.LandRelief; VoxelShader::LandNoise = P.S.LandNoise;
-    VoxelShader::LandPeakStrength = P.S.LandPeakStrength; VoxelShader::LandPeakOctaves = P.S.LandPeakOctaves; VoxelShader::LandPeakSeed = P.S.LandPeakSeed;
-    VoxelShader::LandNoiseN = P.S.LandNoiseN; VoxelShader::LandNoiseMips = P.S.LandNoiseMips; VoxelShader::LandNoiseCellShift = P.S.LandNoiseCellShift;
-    VoxelShader::LandPeakMeanShape = P.S.LandPeakMeanShape; VoxelShader::LandPeakMeanG = P.S.LandPeakMeanG;
+    VoxelShader::LandPeakStrength = P.S.LandPeakStrength; VoxelShader::LandPeakTexelsPerCell = P.S.LandPeakTexelsPerCell; VoxelShader::LandPeakSeed = P.S.LandPeakSeed;
+    VoxelShader::LandPeakSpacingM = P.S.LandPeakSpacingM; VoxelShader::LandPeakReliefM = P.S.LandPeakReliefM;
+    VoxelShader::LandPeakReliefStart = P.S.LandPeakReliefStart; VoxelShader::LandPeakReliefEnd = P.S.LandPeakReliefEnd;
+    VoxelShader::LandPeakMeanR = P.S.LandPeakMeanR; VoxelShader::LandPeakMeanG = P.S.LandPeakMeanG;
+    VoxelShader::LandPeakScaleR = P.S.LandPeakScaleR; VoxelShader::LandPeakScaleG = P.S.LandPeakScaleG; VoxelShader::LandPeakScaleB = P.S.LandPeakScaleB;
+    VoxelShader::LandNoiseN = P.S.LandNoiseN; VoxelShader::LandNoiseMips = P.S.LandNoiseMips;
+    VoxelShader::LandPeakDetailBase = P.S.LandPeakDetailBase; VoxelShader::LandPeakDetailN = P.S.LandPeakDetailN;
+    VoxelShader::LandPeakDetailMips = P.S.LandPeakDetailMips; VoxelShader::LandPeakDetailTexelsPerCell = P.S.LandPeakDetailTexelsPerCell;
+    VoxelShader::LandPeakDetailMeanR = P.S.LandPeakDetailMeanR; VoxelShader::LandPeakDetailMeanG = P.S.LandPeakDetailMeanG;
+    VoxelShader::LandPeakDetailScaleR = P.S.LandPeakDetailScaleR; VoxelShader::LandPeakDetailScaleG = P.S.LandPeakDetailScaleG;
+    VoxelShader::LandPeakDetailFade = P.S.LandPeakDetailFade;
+    VoxelShader::LandHillTexelsPerCell = P.S.LandHillTexelsPerCell; VoxelShader::LandHillBase = P.S.LandHillBase;
+    VoxelShader::LandHillN = P.S.LandHillN; VoxelShader::LandHillMips = P.S.LandHillMips;
+    VoxelShader::LandHillScaleR = P.S.LandHillScaleR; VoxelShader::LandHillScaleG = P.S.LandHillScaleG; VoxelShader::LandHillScaleB = P.S.LandHillScaleB;
+    VoxelShader::LandHillSpacingM = P.S.LandHillSpacingM;
+    VoxelShader::LandHillSwellTexelsPerCell = P.S.LandHillSwellTexelsPerCell; VoxelShader::LandHillSwellM = P.S.LandHillSwellM;
+    VoxelShader::LandHillSwellScaleG = P.S.LandHillSwellScaleG;
+    VoxelShader::LandHillDetailTexelsPerCell = P.S.LandHillDetailTexelsPerCell; VoxelShader::LandHillDetailScaleR = P.S.LandHillDetailScaleR;
+    VoxelShader::LandHillDetailScaleG = P.S.LandHillDetailScaleG; VoxelShader::LandHillDetailFade = P.S.LandHillDetailFade;
+    VoxelShader::LandHillFoothill = P.S.LandHillFoothill;
 }
+/** pcost's profile pass (kept out of line so a profiler can pick it out). */
+__attribute__((noinline)) static double PcostPass(const FPlanet& P, const std::vector<std::array<double, 3>>& Dirs, bool bPeaks)
+{
+    double Sink = 0;
+    for (auto& D : Dirs) Sink += Terms(P, D.data(), P.Finest, true, true, true, bPeaks).Height;
+    return Sink;
+}
+
 // ---------------------------------------------------------------------------------------------
 
 int main(int argc, char** argv)
@@ -787,7 +954,7 @@ int main(int argc, char** argv)
         };
         Check(false, "random points");
         Check(true, "face blend bands");
-        // The shape's range (VoxelLand::PeakMaxUnit bounds it for the planet's height range).
+        // The shape's range (VoxelLand::PeakReach assumes -1 .. 1).
         double Lo = 1e9, Hi = -1e9, Mean = 0; const int Range = 300000;
         for (int c = 0; c <= 2; c++)
             for (int i = 0; i < Range; i++)
@@ -857,129 +1024,143 @@ int main(int argc, char** argv)
         // offset, the mip map between levels, the blend). Run with NOISE_SET for an authored set.
         std::vector<FVoxelOctave> Gpu;
         SetGpuGlobals(P, Gpu);
-        const VoxelNoiseTiles::FSet& Set = P.NoiseSet;
-        const uint32_t NT = Set.N;
-        printf("set %s (%s): N %u, %u mips; channels", Set.Name.c_str(), Set.LookTag.c_str(), NT, Set.Mips);
-        for (int c = 0; c < 4; c++)
-            printf(" %c kind %u cells %u range %.6g..%.6g", "RGBA"[c], Set.Channel[c].Kind, Set.Channel[c].CellsPerTile, Set.Channel[c].Min, Set.Channel[c].Max);
-        printf("\n");
-        auto Tex = [&](uint32_t m, int64_t x, int64_t y, int c) {
-            const int64_t S = (int64_t)(NT >> m);
-            x = ((x % S) + S) % S; y = ((y % S) + S) % S;
-            return (double)Set.Texels[(size_t)(VoxelNoiseTiles::MipOffset(NT, m) + (uint64_t)(y * S + x)) * 4 + c] / 65535.0;
-        };
-        auto Weights = [](double s, double* w, double* d, double* d2) {
-            w[0] = (1 - s) * (1 - s) * (1 - s) / 6; w[1] = (3 * s * s * s - 6 * s * s + 4) / 6;
-            w[2] = (-3 * s * s * s + 3 * s * s + 3 * s + 1) / 6; w[3] = s * s * s / 6;
-            d[0] = -(1 - s) * (1 - s) / 2; d[1] = (3 * s * s - 4 * s) / 2; d[2] = (-3 * s * s + 2 * s + 1) / 2; d[3] = s * s / 2;
-            d2[0] = 1 - s; d2[1] = 3 * s - 2; d2[2] = -3 * s + 1; d2[3] = s;
-        };
-        // Value, d/du, d/dv per channel, and R's uu, uv, vv; per texel of mip m.
-        struct FRef { double V[4], U[4], W[4], RUU, RUV, RVV; };
-        auto Ref = [&](uint32_t m, double u, double v) {
-            FRef O{};
-            const double x0 = std::floor(u), y0 = std::floor(v);
-            double wx[4], dx[4], cx[4], wy[4], dy[4], cy[4];
-            Weights(u - x0, wx, dx, cx); Weights(v - y0, wy, dy, cy);
-            for (int j = 0; j < 4; j++)
-                for (int i = 0; i < 4; i++)
-                    for (int c = 0; c < 4; c++)
-                    {
-                        const double T = Tex(m, (int64_t)x0 - 1 + i, (int64_t)y0 - 1 + j, c);
-                        O.V[c] += wx[i] * wy[j] * T; O.U[c] += dx[i] * wy[j] * T; O.W[c] += wx[i] * dy[j] * T;
-                        if (c == 0) { O.RUU += cx[i] * wy[j] * T; O.RUV += dx[i] * dy[j] * T; O.RVV += wx[i] * cy[j] * T; }
-                    }
-            return O;
-        };
-        auto Get = [](const FVoxelLandNoise& Nz, double V[4], double U[4], double W[4]) {
-            V[0] = Nz.R; V[1] = Nz.G; V[2] = Nz.B; V[3] = Nz.A;
-            U[0] = Nz.RU; U[1] = Nz.GU; U[2] = Nz.BU; U[3] = Nz.AU;
-            W[0] = Nz.RV; W[1] = Nz.GV; W[2] = Nz.BV; W[3] = Nz.AV;
-        };
-        std::mt19937 Rng(11);
-        std::uniform_real_distribution<double> U01(0, 1);
-        // Gradient scale per channel: the mip-0 gradient RMS in unit values per texel.
-        double GradRms[4] = {};
-        for (int i = 0; i < 20000; i++)
+        // The peaks' set (from the buffer's start), then the detail tile appended after it.
+        for (int Which = 0; Which < 2; Which++)
         {
-            const FRef R0 = Ref(0, U01(Rng) * NT, U01(Rng) * NT);
-            for (int c = 0; c < 4; c++) GradRms[c] += R0.U[c] * R0.U[c] + R0.W[c] * R0.W[c];
-        }
-        for (int c = 0; c < 4; c++) GradRms[c] = std::sqrt(GradRms[c] / 20000);
-        double WorstV = 0, WorstG[4] = {}, WorstH = 0;
-        const int Count = 100000;
-        for (int i = 0; i < Count; i++)
-        {
-            const uint32_t m = (uint32_t)(U01(Rng) * Set.Mips) % Set.Mips;
-            const uint32_t S = NT >> m;
-            const int X = (int)(U01(Rng) * S), Y = (int)(U01(Rng) * S);
-            const float FX = (float)U01(Rng), FY = (float)U01(Rng);
-            const FVoxelLandNoise Nz = VoxelLandNoiseMip(X, FX, Y, FY, m);
-            const FRef R = Ref(m, X + (double)FX, Y + (double)FY);
-            double V[4], U[4], W[4]; Get(Nz, V, U, W);
+            const VoxelNoiseTiles::FSet& Set = Which == 0 ? P.NoiseSet : P.Detail;
+            const uint32_t SetBase = Which == 0 ? 0u : P.DetailBase;
+            const uint32_t NT = Set.N;
+            const FVoxelLandNoiseSetRef SetRef = VoxelLandNoiseSetOf(SetBase, NT, Set.Mips);
+            printf("set %s (%s): N %u, %u mips; channels", Set.Name.c_str(), Set.LookTag.c_str(), NT, Set.Mips);
             for (int c = 0; c < 4; c++)
+                printf(" %c kind %u cells %u range %.6g..%.6g", "RGBA"[c], Set.Channel[c].Kind, Set.Channel[c].CellsPerTile, Set.Channel[c].Min, Set.Channel[c].Max);
+            printf("\n");
+            auto Tex = [&](uint32_t m, int64_t x, int64_t y, int c) {
+                const int64_t S = (int64_t)(NT >> m);
+                x = ((x % S) + S) % S; y = ((y % S) + S) % S;
+                return (double)Set.Texels[(size_t)(VoxelNoiseTiles::MipOffset(NT, m) + (uint64_t)(y * S + x)) * 4 + c] / 65535.0;
+            };
+            auto Weights = [](double s, double* w, double* d, double* d2) {
+                w[0] = (1 - s) * (1 - s) * (1 - s) / 6; w[1] = (3 * s * s * s - 6 * s * s + 4) / 6;
+                w[2] = (-3 * s * s * s + 3 * s * s + 3 * s + 1) / 6; w[3] = s * s * s / 6;
+                d[0] = -(1 - s) * (1 - s) / 2; d[1] = (3 * s * s - 4 * s) / 2; d[2] = (-3 * s * s + 2 * s + 1) / 2; d[3] = s * s / 2;
+                d2[0] = 1 - s; d2[1] = 3 * s - 2; d2[2] = -3 * s + 1; d2[3] = s;
+            };
+            // Value, d/du, d/dv per channel, and R's uu, uv, vv; per texel of mip m.
+            struct FRef { double V[4], U[4], W[4], RUU, RUV, RVV, BUU, BUV, BVV; };
+            auto Ref = [&](uint32_t m, double u, double v) {
+                FRef O{};
+                const double x0 = std::floor(u), y0 = std::floor(v);
+                double wx[4], dx[4], cx[4], wy[4], dy[4], cy[4];
+                Weights(u - x0, wx, dx, cx); Weights(v - y0, wy, dy, cy);
+                for (int j = 0; j < 4; j++)
+                    for (int i = 0; i < 4; i++)
+                        for (int c = 0; c < 4; c++)
+                        {
+                            const double T = Tex(m, (int64_t)x0 - 1 + i, (int64_t)y0 - 1 + j, c);
+                            O.V[c] += wx[i] * wy[j] * T; O.U[c] += dx[i] * wy[j] * T; O.W[c] += wx[i] * dy[j] * T;
+                            if (c == 0) { O.RUU += cx[i] * wy[j] * T; O.RUV += dx[i] * dy[j] * T; O.RVV += wx[i] * cy[j] * T; }
+                            if (c == 2) { O.BUU += cx[i] * wy[j] * T; O.BUV += dx[i] * dy[j] * T; O.BVV += wx[i] * cy[j] * T; }
+                        }
+                return O;
+            };
+            auto Get = [](const FVoxelLandNoise& Nz, double V[4], double U[4], double W[4]) {
+                V[0] = Nz.R; V[1] = Nz.G; V[2] = Nz.B; V[3] = Nz.A;
+                U[0] = Nz.RU; U[1] = Nz.GU; U[2] = Nz.BU; U[3] = Nz.AU;
+                W[0] = Nz.RV; W[1] = Nz.GV; W[2] = Nz.BV; W[3] = Nz.AV;
+            };
+            std::mt19937 Rng(11);
+            std::uniform_real_distribution<double> U01(0, 1);
+            // Gradient scale per channel: the mip-0 gradient RMS in unit values per texel.
+            double GradRms[4] = {};
+            for (int i = 0; i < 20000; i++)
             {
-                WorstV = std::max(WorstV, std::fabs(V[c] - R.V[c]));
-                WorstG[c] = std::max(WorstG[c], std::max(std::fabs(U[c] - R.U[c]), std::fabs(W[c] - R.W[c])) / std::max(GradRms[c], 1e-12));
+                const FRef R0 = Ref(0, U01(Rng) * NT, U01(Rng) * NT);
+                for (int c = 0; c < 4; c++) GradRms[c] += R0.U[c] * R0.U[c] + R0.W[c] * R0.W[c];
             }
-            const double HS = std::max({ std::fabs(R.RUU), std::fabs(R.RUV), std::fabs(R.RVV), 1e-3 });
-            WorstH = std::max(WorstH, std::max({ std::fabs(Nz.RUU - R.RUU), std::fabs(Nz.RUV - R.RUV), std::fabs(Nz.RVV - R.RVV) }) / HS);
+            for (int c = 0; c < 4; c++) GradRms[c] = std::sqrt(GradRms[c] / 20000);
+            double WorstV = 0, WorstG[4] = {}, WorstH = 0;
+            const int Count = 100000;
+            for (int i = 0; i < Count; i++)
+            {
+                const uint32_t m = (uint32_t)(U01(Rng) * Set.Mips) % Set.Mips;
+                const uint32_t S = NT >> m;
+                const int X = (int)(U01(Rng) * S), Y = (int)(U01(Rng) * S);
+                const float FX = (float)U01(Rng), FY = (float)U01(Rng);
+                const FVoxelLandNoise Nz = VoxelLandNoiseMip(SetRef, X, FX, Y, FY, m, VOXEL_LAND_NOISE_WANT_B | VOXEL_LAND_NOISE_WANT_A | VOXEL_LAND_NOISE_WANT_HESSIAN_R | VOXEL_LAND_NOISE_WANT_HESSIAN_B);
+                const FRef R = Ref(m, X + (double)FX, Y + (double)FY);
+                double V[4], U[4], W[4]; Get(Nz, V, U, W);
+                for (int c = 0; c < 4; c++)
+                {
+                    WorstV = std::max(WorstV, std::fabs(V[c] - R.V[c]));
+                    WorstG[c] = std::max(WorstG[c], std::max(std::fabs(U[c] - R.U[c]), std::fabs(W[c] - R.W[c])) / std::max(GradRms[c], 1e-12));
+                }
+                const double HS = std::max({ std::fabs(R.RUU), std::fabs(R.RUV), std::fabs(R.RVV), 1e-3 });
+                WorstH = std::max(WorstH, std::max({ std::fabs(Nz.RUU - R.RUU), std::fabs(Nz.RUV - R.RUV), std::fabs(Nz.RVV - R.RVV) }) / HS);
+                const double HB = std::max({ std::fabs(R.BUU), std::fabs(R.BUV), std::fabs(R.BVV), 1e-3 });
+                WorstH = std::max(WorstH, std::max({ std::fabs(Nz.BUU - R.BUU), std::fabs(Nz.BUV - R.BUV), std::fabs(Nz.BVV - R.BVV) }) / HB);
+            }
+            printf("one mip, %d points: value worst %.3g (unit); gradient worst R %.3g G %.3g B %.3g A %.3g (of each channel's RMS); R's and B's curvature worst %.3g (relative)\n",
+                Count, WorstV, WorstG[0], WorstG[1], WorstG[2], WorstG[3], WorstH);
+            // The full lookup.
+            double WorstFV = 0, WorstFG = 0;
+            int Fails = 0;
+            for (int i = 0; i < Count; i++)
+            {
+                FVoxelLandNoiseAxis AU, AV;
+                AU.I = (int)(U01(Rng) * 8 * NT) - 4 * (int)NT; AV.I = (int)(U01(Rng) * 8 * NT) - 4 * (int)NT;
+                AU.F = i % 7 == 0 ? 0.0f : (float)U01(Rng); AV.F = i % 11 == 0 ? 0.0f : (float)U01(Rng);
+                const uint32_t Orient = (uint32_t)(U01(Rng) * 8) & 7u;
+                const uint32_t OffU = (uint32_t)(U01(Rng) * 4294967295.0), OffV = (uint32_t)(U01(Rng) * 4294967295.0);
+                const float Level = (float)(U01(Rng) * (Set.Mips + 1) - 1.0);
+                const FVoxelLandNoise Nz = VoxelLandNoiseAt(SetRef, AU, AV, Orient, OffU, OffV, Level, VOXEL_LAND_NOISE_WANT_B | VOXEL_LAND_NOISE_WANT_A);
+                // The reference: the node in the set's axes, wrapped, mapped to each mip.
+                double u = AU.I + (double)AU.F, v = AV.I + (double)AV.F;
+                if (Orient & 1u) std::swap(u, v);
+                if (Orient & 2u) u = -u;
+                if (Orient & 4u) v = -v;
+                u = std::fmod(u + (double)(OffU & (NT - 1)), (double)NT); if (u < 0) u += NT;
+                v = std::fmod(v + (double)(OffV & (NT - 1)), (double)NT); if (v < 0) v += NT;
+                const double L = std::min(std::max((double)Level, 0.0), (double)(Set.Mips - 1));
+                const uint32_t M0 = (uint32_t)std::floor(L);
+                // The blend narrowed to the step's middle (VOXEL_LAND_NOISE_BLEND_WIDTH).
+                const double T = std::clamp((L - M0 - 0.5) / (double)VOXEL_LAND_NOISE_BLEND_WIDTH + 0.5, 0.0, 1.0);
+                double V[4] = {}, U[4] = {}, W[4] = {};
+                for (int k = 0; k < 2; k++)
+                {
+                    const uint32_t m = M0 + k;
+                    const double Wt = k == 0 ? 1 - T : T;
+                    if (Wt == 0 || m >= Set.Mips) continue;
+                    const double Sc = std::ldexp(1.0, -(int)m);
+                    const FRef R = Ref(m, (u + 0.5) * Sc - 0.5, (v + 0.5) * Sc - 0.5);
+                    for (int c = 0; c < 4; c++) { V[c] += Wt * R.V[c]; U[c] += Wt * R.U[c] * Sc; W[c] += Wt * R.W[c] * Sc; }
+                }
+                // Back to the caller's axes.
+                for (int c = 0; c < 4; c++)
+                {
+                    if (Orient & 2u) U[c] = -U[c];
+                    if (Orient & 4u) W[c] = -W[c];
+                    if (Orient & 1u) std::swap(U[c], W[c]);
+                }
+                double GV[4], GU[4], GW[4]; Get(Nz, GV, GU, GW);
+                for (int c = 0; c < 4; c++)
+                {
+                    const double EV = std::fabs(GV[c] - V[c]);
+                    const double EG = std::max(std::fabs(GU[c] - U[c]), std::fabs(GW[c] - W[c])) / std::max(GradRms[c], 1e-12);
+                    WorstFV = std::max(WorstFV, EV); WorstFG = std::max(WorstFG, EG);
+                    if (EV > 1e-4 || EG > 1e-3) Fails++;
+                }
+            }
+            printf("full lookup (8 orientations, offsets, levels -1 .. %u), %d points: value worst %.3g (unit), gradient worst %.3g (of the RMS); %d channel samples off\n",
+                Set.Mips, Count, WorstFV, WorstFG, Fails);
         }
-        printf("one mip, %d points: value worst %.3g (unit); gradient worst R %.3g G %.3g B %.3g A %.3g (of each channel's RMS); R's curvature worst %.3g (relative)\n",
-            Count, WorstV, WorstG[0], WorstG[1], WorstG[2], WorstG[3], WorstH);
-        // The full lookup.
-        double WorstFV = 0, WorstFG = 0;
-        int Fails = 0;
-        for (int i = 0; i < Count; i++)
-        {
-            FVoxelLandNoiseAxis AU, AV;
-            AU.I = (int)(U01(Rng) * 8 * NT) - 4 * (int)NT; AV.I = (int)(U01(Rng) * 8 * NT) - 4 * (int)NT;
-            AU.F = i % 7 == 0 ? 0.0f : (float)U01(Rng); AV.F = i % 11 == 0 ? 0.0f : (float)U01(Rng);
-            const uint32_t Orient = (uint32_t)(U01(Rng) * 8) & 7u;
-            const uint32_t OffU = (uint32_t)(U01(Rng) * 4294967295.0), OffV = (uint32_t)(U01(Rng) * 4294967295.0);
-            const float Level = (float)(U01(Rng) * (Set.Mips + 1) - 1.0);
-            const FVoxelLandNoise Nz = VoxelLandNoiseAt(AU, AV, Orient, OffU, OffV, Level);
-            // The reference: the node in the set's axes, wrapped, mapped to each mip.
-            double u = AU.I + (double)AU.F, v = AV.I + (double)AV.F;
-            if (Orient & 1u) std::swap(u, v);
-            if (Orient & 2u) u = -u;
-            if (Orient & 4u) v = -v;
-            u = std::fmod(u + (double)(OffU & (NT - 1)), (double)NT); if (u < 0) u += NT;
-            v = std::fmod(v + (double)(OffV & (NT - 1)), (double)NT); if (v < 0) v += NT;
-            const double L = std::min(std::max((double)Level, 0.0), (double)(Set.Mips - 1));
-            const uint32_t M0 = (uint32_t)std::floor(L);
-            const double T = L - M0;
-            double V[4] = {}, U[4] = {}, W[4] = {};
-            for (int k = 0; k < 2; k++)
-            {
-                const uint32_t m = M0 + k;
-                const double Wt = k == 0 ? 1 - T : T;
-                if (Wt == 0 || m >= Set.Mips) continue;
-                const double Sc = std::ldexp(1.0, -(int)m);
-                const FRef R = Ref(m, (u + 0.5) * Sc - 0.5, (v + 0.5) * Sc - 0.5);
-                for (int c = 0; c < 4; c++) { V[c] += Wt * R.V[c]; U[c] += Wt * R.U[c] * Sc; W[c] += Wt * R.W[c] * Sc; }
-            }
-            // Back to the caller's axes.
-            for (int c = 0; c < 4; c++)
-            {
-                if (Orient & 2u) U[c] = -U[c];
-                if (Orient & 4u) W[c] = -W[c];
-                if (Orient & 1u) std::swap(U[c], W[c]);
-            }
-            double GV[4], GU[4], GW[4]; Get(Nz, GV, GU, GW);
-            for (int c = 0; c < 4; c++)
-            {
-                const double EV = std::fabs(GV[c] - V[c]);
-                const double EG = std::max(std::fabs(GU[c] - U[c]), std::fabs(GW[c] - W[c])) / std::max(GradRms[c], 1e-12);
-                WorstFV = std::max(WorstFV, EV); WorstFG = std::max(WorstFG, EG);
-                if (EV > 1e-4 || EG > 1e-3) Fails++;
-            }
-        }
-        printf("full lookup (8 orientations, offsets, levels -1 .. %u), %d points: value worst %.3g (unit), gradient worst %.3g (of the RMS); %d channel samples off\n",
-            Set.Mips, Count, WorstFV, WorstFG, Fails);
         // The statistics the plugin normalises with.
-        printf("peaks normalisation: MeanShape %.6f, MeanG %.6f, cells %u (CellShift %u)\n", P.S.LandPeakMeanShape, P.S.LandPeakMeanG,
-            Set.Channel[0].CellsPerTile, P.S.LandNoiseCellShift);
+        printf("detail: base %u, MeanR %.6f, MeanG %.6f, ScaleR %.5f, ScaleG %.5f, texel %.2f m, fade level %.0f\n", P.S.LandPeakDetailBase,
+            P.S.LandPeakDetailMeanR, P.S.LandPeakDetailMeanG, P.S.LandPeakDetailScaleR, P.S.LandPeakDetailScaleG,
+            P.S.LandPeakDetailTexelsPerCell > 0 ? P.S.LandCellM / P.S.LandPeakDetailTexelsPerCell : 0.0f, P.S.LandPeakDetailFade);
+        printf("peaks normalisation: MeanR %.6f, MeanG %.6f, ScaleG %.4f, ScaleB %.4f, %u massifs a side (spacing %u texels)\n", P.S.LandPeakMeanR,
+            P.S.LandPeakMeanG, P.S.LandPeakScaleG, P.S.LandPeakScaleB, P.NoiseSet.Channel[0].CellsPerTile,
+            P.NoiseSet.N / std::max(P.NoiseSet.Channel[0].CellsPerTile, 1u));
     }
     else if (Mode == "hgrad")
     {
@@ -990,9 +1171,10 @@ int main(int argc, char** argv)
         std::mt19937 Rng(5);
         std::normal_distribution<double> G;
         double WorstRel = 0, SumRel = 0; int Count = 0;
-        const float2 Form(1.0f, 0.7f);
         for (int i = 0; i < 4000; i++)
         {
+            // Hill country, and rolling ground (where a hill set's swells join, T4a).
+            const float2 Form(i % 2 ? 1.0f : 0.3f, 0.7f);
             double D[3] = { G(Rng), G(Rng), G(Rng) }; Normalize(D);
             double E1[3], E2[3]; Frame(D, E1, E2);
             const double Th = std::uniform_real_distribution<double>(0, 2 * M_PI)(Rng);
@@ -1000,7 +1182,7 @@ int main(int argc, char** argv)
             const double Step = 20.0;   // cm
             auto At = [&](double S) {
                 double Q[3]; for (int a = 0; a < 3; a++) Q[a] = D[a] * P.SeaRadius + T[a] * S;
-                return P.S.VoxelLandHillsDF(DF(Q[0]), DF(Q[1]), DF(Q[2]), Form, 0.0f, 500.0f, 100.0f);
+                return P.S.VoxelLandHillsShapeDF(DF(Q[0]), DF(Q[1]), DF(Q[2]), Form, float3(0.0f, 0.0f, 0.0f), 0.0f, 0.0f, 500.0f, 100.0f, true);
             };
             const auto C = At(0), A = At(Step), B = At(-Step);
             const double Num = ((double)A.Unit * A.AmplitudeM - (double)B.Unit * B.AmplitudeM) / (2 * Step * 0.01);
@@ -1015,7 +1197,7 @@ int main(int argc, char** argv)
             for (int i = 0; i < Range; i++)
             {
                 double D[3] = { G(Rng), G(Rng), G(Rng) }; Normalize(D);
-                const auto H = P.S.VoxelLandHillsDF(DF(D[0] * P.SeaRadius), DF(D[1] * P.SeaRadius), DF(D[2] * P.SeaRadius), float2(1.0f, (float)c), 0.0f, 500.0f, 100.0f);
+                const auto H = P.S.VoxelLandHillsShapeDF(DF(D[0] * P.SeaRadius), DF(D[1] * P.SeaRadius), DF(D[2] * P.SeaRadius), float2(1.0f, (float)c), float3(0.0f, 0.0f, 0.0f), 0.0f, 0.0f, 500.0f, 100.0f, true);
                 Lo = std::min(Lo, (double)H.Unit); Hi = std::max(Hi, (double)H.Unit); Mean += H.Unit;
             }
         printf("hills shape over %d points (character 0 and 1): %.3f .. %.3f, mean %.3f\n", 2 * Range, Lo, Hi, Mean / (2 * Range));
@@ -1029,7 +1211,7 @@ int main(int argc, char** argv)
             for (int k = 0; k <= 5000; k++)
             {
                 double Q[3]; for (int a = 0; a < 3; a++) Q[a] = D[a] * P.SeaRadius + E1[a] * (double)k;
-                const auto H = P.S.VoxelLandHillsDF(DF(Q[0]), DF(Q[1]), DF(Q[2]), float2(1.0f, 1.0f), 0.0f, 500.0f, 100.0f);
+                const auto H = P.S.VoxelLandHillsShapeDF(DF(Q[0]), DF(Q[1]), DF(Q[2]), float2(1.0f, 1.0f), float3(0.0f, 0.0f, 0.0f), 0.0f, 0.0f, 500.0f, 100.0f, true);
                 const double V = (double)H.Unit * H.AmplitudeM;
                 if (k > 0) { const double St = std::fabs(V - Prev); SumStep += St; MaxStep = std::max(MaxStep, St); }
                 Prev = V;
@@ -1050,7 +1232,7 @@ int main(int argc, char** argv)
             for (int k = 0; k <= 12000; k++)
             {
                 const float Footprint = (float)(100.0 * std::pow(1.001, (double)k));   // 1 m .. about 1600 km
-                const auto H = P.S.VoxelLandHillsDF(DF(D[0] * P.SeaRadius), DF(D[1] * P.SeaRadius), DF(D[2] * P.SeaRadius), F2, 0.0f, 500.0f, Footprint);
+                const auto H = P.S.VoxelLandHillsShapeDF(DF(D[0] * P.SeaRadius), DF(D[1] * P.SeaRadius), DF(D[2] * P.SeaRadius), F2, float3(0.0f, 0.0f, 0.0f), 0.0f, 0.0f, 500.0f, Footprint, true);
                 const double Gr[3] = { H.Gradient.x, H.Gradient.y, H.Gradient.z }, St[3] = { H.Steer.x, H.Steer.y, H.Steer.z };
                 if (k > 0)
                 {
@@ -1247,6 +1429,121 @@ int main(int argc, char** argv)
             const double B = (Now() - T0) / Dirs.size();
             printf("cost per land sample at footprint %.0f cm, one thread: %.2f us without gullies, %.2f us with (x%.2f)  [%g]\n", F, A * 1e6, B * 1e6, B / A, Sink * 1e-30);
         }
+    }
+    else if (Mode == "pcost")
+    {
+        // The peaks' cost on the CPU path: land samples where the peaks are on (amplitude above
+        // zero at the finest footprint), with and without them, at three footprints; and (built
+        // with -DVOXEL_HARNESS_COUNT_NOISE) the noise set's word loads per sample.
+        std::mt19937 Rng(17);
+        std::normal_distribution<double> G;
+        std::vector<std::array<double, 3>> Dirs;
+        int Tried = 0;
+        const size_t Want = getenv("PCOST_N") ? (size_t)atoi(getenv("PCOST_N")) : 20000;
+        // PCOST_PATCH (m): points within a patch that wide around the first peak point, as a mesh
+        // chunk samples them (memory access as coherent as in use), not all over the planet.
+        const double Patch = getenv("PCOST_PATCH") ? atof(getenv("PCOST_PATCH")) : 0.0;
+        double Centre[3] = {}, E1[3] = {}, E2[3] = {};
+        while (Dirs.size() < Want && Tried < 20000000)
+        {
+            Tried++;
+            double D[3] = { G(Rng), G(Rng), G(Rng) }; Normalize(D);
+            if (Patch > 0.0 && !Dirs.empty())
+            {
+                const double U = (std::uniform_real_distribution<double>(-0.5, 0.5)(Rng)) * Patch * 100.0 / P.SeaRadius;
+                const double V = (std::uniform_real_distribution<double>(-0.5, 0.5)(Rng)) * Patch * 100.0 / P.SeaRadius;
+                for (int a = 0; a < 3; a++) D[a] = Centre[a] + U * E1[a] + V * E2[a];
+                Normalize(D);
+            }
+            if (Terms(P, D, P.Finest).Peaks != 0.0)
+            {
+                if (Dirs.empty()) { for (int a = 0; a < 3; a++) Centre[a] = D[a]; Frame(Centre, E1, E2); }
+                Dirs.push_back({ D[0], D[1], D[2] });
+            }
+        }
+        printf("%zu points with peaks (of %d tried)\n", Dirs.size(), Tried);
+        if (getenv("PCOST_PROFILE"))
+        {
+            // One pass at the finest footprint, peaks on (PCOST_PROFILE=1) or off (0), for an
+            // instruction count: valgrind --tool=callgrind --toggle-collect='*PcostPass*'.
+            const bool bOn = atoi(getenv("PCOST_PROFILE")) != 0;
+            printf("profile pass %s: %g\n", bOn ? "with peaks" : "without", PcostPass(P, Dirs, bOn));
+            return 0;
+        }
+        for (double F : { P.Finest, 100.0 * 100, 1000.0 * 100 })
+        {
+            double Sink = 0;
+            double Best[2] = { 1e9, 1e9 };
+            for (int Rep = 0; Rep < 3; Rep++)
+                for (int k = 0; k < 2; k++)
+                {
+                    const double T0 = Now();
+                    for (auto& D : Dirs) Sink += Terms(P, D.data(), F, true, true, true, k == 1).Height;
+                    Best[k] = std::min(Best[k], (Now() - T0) / Dirs.size());
+                }
+            double Loads = 0, LoadsNormal = 0;
+#ifdef VOXEL_HARNESS_COUNT_NOISE
+            GNoiseLoads = 0;
+            for (auto& D : Dirs) Sink += Terms(P, D.data(), F).Height;
+            Loads = (double)GNoiseLoads / Dirs.size();
+            // The material's close-up normal and the cache writer: the point and two differenced
+            // evaluations a 25 cm step away (the GPU path's code).
+            std::vector<FVoxelOctave> Gpu;
+            SetGpuGlobals(P, Gpu);
+            GNoiseLoads = 0;
+            for (auto& D : Dirs)
+            {
+                const FVoxelLandHeight H0 = VoxelLandHeightDF(DF(D[0] * P.SeaRadius), DF(D[1] * P.SeaRadius), DF(D[2] * P.SeaRadius), (float)F, true);
+                const FVoxelLandDifferenced C1 = VoxelLandDifferencedDF(DF(D[0] * P.SeaRadius + 25.0), DF(D[1] * P.SeaRadius), DF(D[2] * P.SeaRadius), (float)F);
+                const FVoxelLandDifferenced C2 = VoxelLandDifferencedDF(DF(D[0] * P.SeaRadius), DF(D[1] * P.SeaRadius + 25.0), DF(D[2] * P.SeaRadius), (float)F);
+                Sink += C1.Gully + C2.Gully;
+            }
+            LoadsNormal = (double)GNoiseLoads / Dirs.size();
+#endif
+            printf("footprint %7.0f cm: %.2f us without peaks, %.2f us with (+%.2f us, x%.2f); noise word loads: %.0f a sample, %.0f with a differenced normal  [%g]\n",
+                F, Best[0] * 1e6, Best[1] * 1e6, (Best[1] - Best[0]) * 1e6, Best[1] / Best[0], Loads, LoadsNormal, Sink * 1e-30);
+        }
+    }
+    else if (Mode == "cgrad")
+    {
+        // The peaks' analytic gradient against central differences of PeakUnit (the real,
+        // spatially varying landform) at the centre's amplitude.
+        std::vector<FVoxelOctave> Gpu;
+        SetGpuGlobals(P, Gpu);
+        std::mt19937 Rng(41);
+        std::normal_distribution<double> G;
+        const double F = getenv("CG_F") ? atof(getenv("CG_F")) : 25.0;
+        const double StepM = 0.2;
+        std::vector<double> E, Rel, Ang;
+        int Tried = 0;
+        while (E.size() < 3000 && Tried < 5000000)
+        {
+            Tried++;
+            double D[3] = { G(Rng), G(Rng), G(Rng) }; Normalize(D);
+            auto At = [&](const double* Dir) { return VoxelLandHeightDF(DF(Dir[0] * P.SeaRadius), DF(Dir[1] * P.SeaRadius), DF(Dir[2] * P.SeaRadius), (float)F, true); };
+            const FVoxelLandHeight H0 = At(D);
+            if (!(H0.PeakAmplitudeM > 0.0f)) continue;
+            double E1[3], E2[3]; Frame(D, E1, E2);
+            double Err2 = 0, Ana2 = 0;
+            for (int k = 0; k < 2; k++)
+            {
+                const double* Ev = k == 0 ? E1 : E2;
+                double A[3], B[3];
+                for (int a = 0; a < 3; a++) { A[a] = D[a] + StepM * 100.0 / P.SeaRadius * Ev[a]; B[a] = D[a] - StepM * 100.0 / P.SeaRadius * Ev[a]; }
+                Normalize(A); Normalize(B);
+                const FVoxelLandHeight HA = At(A), HB = At(B);
+                const double Num = ((double)HA.PeakUnit - HB.PeakUnit) * H0.PeakAmplitudeM / (2 * StepM);
+                const double Ana = H0.PeakGradient.x * Ev[0] + H0.PeakGradient.y * Ev[1] + H0.PeakGradient.z * Ev[2];
+                Err2 += (Num - Ana) * (Num - Ana); Ana2 += Ana * Ana;
+            }
+            E.push_back(std::sqrt(Err2));
+            Rel.push_back(std::sqrt(Err2) / std::max(std::sqrt(Ana2), 0.02));
+            Ang.push_back(std::atan(std::sqrt(Err2)) * 57.2957795);
+        }
+        for (auto* V : { &E, &Rel, &Ang }) std::sort(V->begin(), V->end());
+        auto Q = [](const std::vector<double>& V, double q) { return V.empty() ? -1.0 : V[std::min((size_t)(q * V.size()), V.size() - 1)]; };
+        printf("peaks gradient vs FD with the real landform (F %.0f cm, n %zu): |err| m/m p50 %.5f p90 %.5f p99 %.5f max %.5f (deg p90 %.3f p99 %.3f max %.3f); relative p50 %.4f p90 %.4f p99 %.4f\n",
+            F, E.size(), Q(E, 0.5), Q(E, 0.9), Q(E, 0.99), Q(E, 1.0), Q(Ang, 0.9), Q(Ang, 0.99), Q(Ang, 1.0), Q(Rel, 0.5), Q(Rel, 0.9), Q(Rel, 0.99));
     }
     else if (Mode == "probe")
     {

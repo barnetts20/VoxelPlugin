@@ -144,6 +144,8 @@ struct FVoxelLandFaceSample
     float DVV;
     float Flow;
     float2 Form;
+    float CharacterDU;      // the landform's character's derivatives (per cell)
+    float CharacterDV;
     float Relief;
 };
 
@@ -169,6 +171,8 @@ VOXEL_FUNC FVoxelLandFaceSample VoxelLandFaceSampleAt(VOXEL_LAND_ARGS_DECL uint 
     Out.DVV = 0.0f;
     Out.Flow = 0.0f;
     Out.Form = float2(0.0f, 0.0f);
+    Out.CharacterDU = 0.0f;
+    Out.CharacterDV = 0.0f;
     Out.Relief = 0.0f;
     if (!bSlopes)
     {
@@ -215,7 +219,10 @@ VOXEL_FUNC FVoxelLandFaceSample VoxelLandFaceSampleAt(VOXEL_LAND_ARGS_DECL uint 
             const float2 F3 = VOXEL_LAND_FORM(Row + 3u);
             const float WB = VoxelLandWeightAt(WV, b);
             Out.Form.x += WB * (WU.W0 * F0.x + WU.W1 * F1.x + WU.W2 * F2.x + WU.W3 * F3.x);
-            Out.Form.y += WB * (WU.W0 * F0.y + WU.W1 * F1.y + WU.W2 * F2.y + WU.W3 * F3.y);
+            const float CharacterLine = WU.W0 * F0.y + WU.W1 * F1.y + WU.W2 * F2.y + WU.W3 * F3.y;
+            Out.Form.y += WB * CharacterLine;
+            Out.CharacterDU += WB * (DWU.W0 * F0.y + DWU.W1 * F1.y + DWU.W2 * F2.y + DWU.W3 * F3.y);
+            Out.CharacterDV += VoxelLandWeightAt(DWV, b) * CharacterLine;
             Out.Relief += WB * (WU.W0 * VOXEL_LAND_RELIEF(Row) + WU.W1 * VOXEL_LAND_RELIEF(Row + 1u)
                 + WU.W2 * VOXEL_LAND_RELIEF(Row + 2u) + WU.W3 * VOXEL_LAND_RELIEF(Row + 3u));
         }
@@ -278,6 +285,7 @@ struct FVoxelLandBakeSample
     float Turn;
     float Flow;
     float2 Form;
+    float3 CharacterGradient;   // the landform's character's (per m, a tangent vector; with bSlopes)
     float Relief;
 };
 
@@ -297,6 +305,7 @@ VOXEL_FUNC FVoxelLandBakeSample VoxelLandBakeSampleDF(VOXEL_LAND_ARGS_DECL float
     float Turn = 0.0f;
     float Flow = 0.0f;
     float2 Form = float2(0.0f, 0.0f);
+    float3 CharacterGradient = float3(0.0f, 0.0f, 0.0f);
     float Relief = 0.0f;
     for (uint Axis = 0u; Axis < 3u; Axis++)
     {
@@ -335,6 +344,9 @@ VOXEL_FUNC FVoxelLandBakeSample VoxelLandBakeSampleDF(VOXEL_LAND_ARGS_DECL float
             Flow += W * F.Flow;
             Form.x += W * F.Form.x;
             Form.y += W * F.Form.y;
+            const float CU = F.CharacterDU / LandCellM;
+            const float CV = F.CharacterDV / LandCellM;
+            CharacterGradient = CharacterGradient + (Frame.TU * (Frame.GUU * CU + Frame.GUV * CV) + Frame.TV * (Frame.GUV * CU + Frame.GVV * CV)) * W;
             Relief += W * F.Relief;
         }
     }
@@ -344,6 +356,7 @@ VOXEL_FUNC FVoxelLandBakeSample VoxelLandBakeSampleDF(VOXEL_LAND_ARGS_DECL float
     Out.Turn = WSum > 0.0f ? Turn / WSum : 0.0f;
     Out.Flow = WSum > 0.0f ? Flow / WSum : 0.0f;
     Out.Form = WSum > 0.0f ? float2(Form.x / WSum, Form.y / WSum) : float2(0.0f, 0.0f);
+    Out.CharacterGradient = WSum > 0.0f ? CharacterGradient / WSum : float3(0.0f, 0.0f, 0.0f);
     Out.Relief = WSum > 0.0f ? Relief / WSum : 0.0f;
     return Out;
 }

@@ -78,10 +78,40 @@ struct FVoxelDensityGPUData
     FVector2f LandHillFrequency = FVector2f::ZeroVector;   // cycles per cm, double-float
     uint32 LandHillOctaves = 0;
     uint32 LandHillSeed = 0;
-    TSharedPtr<const FVoxelLandNoiseSet, ESPMode::ThreadSafe> LandNoise;   // the peaks' set (null: no peaks)
-    float LandPeakStrength = 0.0f;       // VoxelLandPeaks.ush (0: none)
-    uint32 LandPeakOctaves = 0;
+    TSharedPtr<const FVoxelLandNoiseSet, ESPMode::ThreadSafe> LandNoise;   // the noise pack (null: no peaks and no hill set)
+    float LandPeakStrength = 0.0f;       // VoxelLandPeaks.ush (FVoxelDensityCPU's)
+    float LandPeakTexelsPerCell = 0.0f;  // 0: none
     uint32 LandPeakSeed = 0;
+    float LandPeakSpacingM = 0.0f;
+    float LandPeakReliefM = 0.0f;
+    float LandPeakReliefStart = 500.0f;   // T4b: the peaks' fade-in over the local relief (m)
+    float LandPeakReliefEnd = 1500.0f;
+    float LandPeakMeanR = 0.0f;
+    float LandPeakMeanG = 0.0f;
+    float LandPeakScaleR = 1.0f;
+    float LandPeakScaleG = 1.0f;
+    float LandPeakScaleB = 1.0f;
+    float LandPeakDetailTexelsPerCell = 0.0f;  // the peaks' detail tile (T3e; its chain: LandNoise's Detail*)
+    float LandPeakDetailMeanR = 0.0f;
+    float LandPeakDetailMeanG = 0.0f;
+    float LandPeakDetailScaleR = 0.0f;
+    float LandPeakDetailScaleG = 0.0f;
+    float LandPeakDetailFade = 0.0f;
+    // The hills' set (VoxelLandHillSet.ush, T4a; its chain: LandNoise's Hill*). 0 texels: none
+    // (the procedural hills, LandHillFrequency and LandHillOctaves).
+    float LandHillTexelsPerCell = 0.0f;
+    float LandHillScaleR = 1.0f;
+    float LandHillScaleG = 1.0f;
+    float LandHillScaleB = 1.0f;
+    float LandHillSpacingM = 0.0f;
+    float LandHillSwellTexelsPerCell = 0.0f;   // 0: no swells
+    float LandHillSwellM = 0.0f;
+    float LandHillSwellScaleG = 1.0f;
+    float LandHillDetailTexelsPerCell = 0.0f;  // 0: no detail
+    float LandHillDetailScaleR = 0.0f;
+    float LandHillDetailScaleG = 0.0f;
+    float LandHillDetailFade = 0.0f;
+    float LandHillFoothill = 0.0f;         // T4b: the hills' growth in the foothills
 };
 
 /** The edit store's edits and index for the GPU (VoxelEditSample.ush; the layout is

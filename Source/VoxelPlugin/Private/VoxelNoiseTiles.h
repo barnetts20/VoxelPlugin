@@ -1,4 +1,4 @@
-// VoxelNoiseTiles.h - Packed tiling noise sets (Design/NoiseTiles2D_Handoff.md and its Addendum 1):
+// VoxelNoiseTiles.h - Packed tiling noise sets (Design/NoiseTiles2D_Handoff.md, Addenda 1 and 2):
 // square, power-of-two textures of four independent noise patterns (RGBA, 16-bit unsigned
 // normalised), periodic in both axes, with a box-filtered mip chain. The land's per-sample layers
 // sample them with a cubic B-spline over 4 x 4 texels (VoxelLandNoise.ush), which gives each
@@ -11,9 +11,9 @@
 // units (VoxelLandNoise.ush maps between mips at the box filter's centres).
 //
 // Sets come from the noise generator's .vxnt files (ReadVxnt), or, without them, from the
-// plugin's own generator (PeaksDefinition, Generate): the same channel kinds, defined as in the
-// handoff (its hashing differs from the utility's, so its patterns do). Plain C++ without engine
-// types: the harnesses run the same reader and generator.
+// plugin's own stand-in (GeneratePeaksStandIn: the eroded peaks' layout, Addendum 2, without the
+// simulation). Generate makes the handoff's raw kinds (its hashing differs from the utility's).
+// Plain C++ without engine types: the harnesses run the same reader and generators.
 
 #pragma once
 
@@ -26,7 +26,7 @@
 
 namespace VoxelNoiseTiles
 {
-    /** Channel kinds (the handoff's section 3). */
+    /** Channel kinds (the handoff's section 3; Addendum 2's 7 to 9). */
     enum EKind : uint32_t
     {
         KindNone = 0,
@@ -36,6 +36,9 @@ namespace VoxelNoiseTiles
         KindCellularBorder = 4,
         KindCellularValue = 5,
         KindErodedFbm = 6,
+        KindErodedHeight = 7,       // a simulated heightfield, in mip-0 texel units
+        KindBlurred = 8,            // a channel blurred (Source)
+        KindFlowAccumulation = 9,   // log2 of a heightfield's contributing area (Source)
     };
 
     struct FChannel
@@ -81,7 +84,10 @@ namespace VoxelNoiseTiles
         bool IsValid() const { return N > 0 && Texels.size() == ChainTexels(N) * 4; }
     };
 
-    // --- Generation (double precision, integer hashing: the same bytes on every machine) ------
+    // --- Generation (double precision, integer hashing) -----------------------------------------
+    // The same bytes on every machine in practice (checked across compilers and FMA contraction),
+    // though cos, sin and exp aren't correctly rounded by every C runtime: a runtime that differs
+    // in their last bit could move a texel by one step.
 
     inline uint32_t Mix(uint32_t H)
     {
@@ -212,15 +218,14 @@ namespace VoxelNoiseTiles
         }
     }
 
+    inline void Finish(FSet& Set, std::vector<double> (&Level)[4]);
+
     /** Fills Set's texels and statistics from its channels' definitions. ParallelFor(Count,
      *  Body) runs Body(i) for i in 0 .. Count - 1 (in any order, on any threads). */
     template <typename TParallelFor>
     void Generate(FSet& Set, TParallelFor&& ParallelFor)
     {
         const uint32_t N = Set.N;
-        Set.Mips = 0;
-        for (uint32_t S = N; S > 0; S >>= 1) Set.Mips++;
-        Set.Texels.assign((size_t)ChainTexels(N) * 4, 0);
         // Mip 0 in double, per channel.
         std::vector<double> Level[4];
         for (int c = 0; c < 4; c++) Level[c].assign((size_t)N * N, 0.0);
@@ -234,6 +239,17 @@ namespace VoxelNoiseTiles
                     Level[c][(size_t)y * N + x] = Evaluate(C, (double)x * K, (double)y * K);
                 }
         });
+        Finish(Set, Level);
+    }
+
+    /** Quantises the four channels' mip 0 (Level, in double, N x N each: consumed) into Set's
+     *  texels with their box mip chain, and fills the decode ranges and statistics. */
+    inline void Finish(FSet& Set, std::vector<double> (&Level)[4])
+    {
+        const uint32_t N = Set.N;
+        Set.Mips = 0;
+        for (uint32_t S = N; S > 0; S >>= 1) Set.Mips++;
+        Set.Texels.assign((size_t)ChainTexels(N) * 4, 0);
         // The decode range and statistics of mip 0.
         for (int c = 0; c < 4; c++)
         {
@@ -328,45 +344,204 @@ namespace VoxelNoiseTiles
     template <typename TFunc>
     double MeanOf2(const FSet& Set, int ChannelA, int ChannelB, TFunc&& F) { return MeanOf2(Set, Set.Texels.data(), ChannelA, ChannelB, F); }
 
-    /** The `peaks` set (the handoff's section 6, at half its size: N = 1024, the same texels per
-     *  feature): R the cellular border distance (32 texels a cell), G a ridged multifractal, B a
-     *  smooth fBm, A the cellular value of R's cells. */
-    inline FSet PeaksDefinition(uint32_t Seed, uint32_t N = 1024)
+    /** A periodic Gaussian blur (sigma in texels) of an N x N field, rows then columns. */
+    template <typename TParallelFor>
+    std::vector<double> BlurPeriodic(const std::vector<double>& In, uint32_t N, double Sigma, TParallelFor&& ParallelFor)
+    {
+        const int32_t Radius = (int32_t)std::ceil(3.0 * Sigma);
+        std::vector<double> W((size_t)(2 * Radius + 1));
+        double Sum = 0.0;
+        for (int32_t k = -Radius; k <= Radius; k++) Sum += W[(size_t)(k + Radius)] = std::exp(-0.5 * (double)k * k / (Sigma * Sigma));
+        for (double& V : W) V /= Sum;
+        std::vector<double> Tmp((size_t)N * N), Out((size_t)N * N);
+        const int32_t P = (int32_t)N;
+        ParallelFor(P, [&](int32_t y) {
+            for (int32_t x = 0; x < P; x++)
+            {
+                double A = 0.0;
+                for (int32_t k = -Radius; k <= Radius; k++) A += W[(size_t)(k + Radius)] * In[(size_t)y * N + (size_t)Wrap(x + k, P)];
+                Tmp[(size_t)y * N + x] = A;
+            }
+        });
+        ParallelFor(P, [&](int32_t y) {
+            for (int32_t x = 0; x < P; x++)
+            {
+                double A = 0.0;
+                for (int32_t k = -Radius; k <= Radius; k++) A += W[(size_t)(k + Radius)] * Tmp[(size_t)Wrap(y + k, P) * N + x];
+                Out[(size_t)y * N + x] = A;
+            }
+        });
+        return Out;
+    }
+
+    /** The plugin's own `peaks` set, standing in for the eroded sets (Design/NoiseTiles2D_
+     *  Addendum2.md) in their layout, without a simulation: R hip-roof pyramids (cellular border
+     *  distance at a threshold slope, so planar faces and straight aretes, valleys on the cell
+     *  borders) of three octaves, each pyramid's height varied by its cell; G the same blurred over
+     *  an eighth of the massif spacing and lowered (rounded, gentler: soft rock); B R blurred over
+     *  a quarter of it (the steering); A no flow (a constant). Heights in mip-0 texels. Massif
+     *  spacing S = N / 16 texels. */
+    template <typename TParallelFor>
+    FSet GeneratePeaksStandIn(uint32_t Seed, uint32_t N, TParallelFor&& ParallelFor)
     {
         FSet Set;
         Set.Name = "peaks";
+        Set.LookTag = "generated stand-in: pyramids, no erosion";
         Set.Seed = Seed;
         Set.N = N;
-        const uint32_t Cells = std::max(N / 32u, 1u);
+        constexpr uint32_t Massifs = 16;
+        const double S = (double)N / Massifs;
+        constexpr double Slope = 0.84;          // the hard-rock threshold slope (40 degrees)
+        // The octaves' weights: the faces' slopes add up to about the threshold, and the relief
+        // to about half a spacing at it (as an eroded range's: valleys a spacing apart).
+        const double Weights[3] = { 0.6, 0.27, 0.12 };
+        std::vector<double> Level[4];
+        for (int c = 0; c < 4; c++) Level[c].assign((size_t)N * N, 0.0);
+        ParallelFor((int32_t)N, [&](int32_t y) {
+            for (uint32_t x = 0; x < N; x++)
+            {
+                double H = 0.0;
+                for (int o = 0; o < 3; o++)
+                {
+                    FChannel C;
+                    C.Kind = KindCellularBorder;
+                    C.Seed = Mix(Seed + 11u * (uint32_t)o + 1u);
+                    C.CellsPerTile = Massifs << o;
+                    C.Jitter = 0.85f;
+                    const double K = (double)C.CellsPerTile / (double)N;
+                    const double Border = Evaluate(C, (double)x * K, (double)y * K);
+                    C.Kind = KindCellularValue;
+                    const double Value = Evaluate(C, (double)x * K, (double)y * K);
+                    // Cell units to texels, at the threshold slope.
+                    H += Weights[o] * (0.6 + 0.8 * Value) * Border * (S / (double)(1 << o)) * Slope;
+                }
+                Level[0][(size_t)y * N + x] = H;
+            }
+        });
+        Level[1] = BlurPeriodic(Level[0], N, S / 8.0, ParallelFor);
+        for (double& V : Level[1]) V *= 0.7;
+        Level[2] = BlurPeriodic(Level[0], N, S / 4.0, ParallelFor);
         FChannel& R = Set.Channel[0];
-        R.Kind = KindCellularBorder; R.Seed = Mix(Seed + 1u); R.CellsPerTile = Cells; R.Jitter = 0.85f;
+        R.Kind = KindErodedHeight; R.Seed = Seed; R.CellsPerTile = Massifs;
         FChannel& G = Set.Channel[1];
-        G.Kind = KindRidged; G.Seed = Mix(Seed + 2u); G.CellsPerTile = std::max(Cells / 4u, 1u); G.Octaves = 4; G.Gain = 0.5f;
+        G = R;
         FChannel& B = Set.Channel[2];
-        B.Kind = KindFbm; B.Seed = Mix(Seed + 3u); B.CellsPerTile = std::max(Cells / 8u, 1u); B.Octaves = 3; B.Gain = 0.5f;
+        B.Kind = KindBlurred; B.Source = 0; B.CellsPerTile = 0;
         FChannel& A = Set.Channel[3];
-        A = R;
-        A.Kind = KindCellularValue;
-        A.Source = 0;
+        A.Kind = KindFlowAccumulation; A.Source = 0; A.CellsPerTile = 0;
+        Finish(Set, Level);
         return Set;
     }
 
-    /** Whether Set has the `peaks` layout VoxelLandPeaks.ush reads: R a cellular border, G a
-     *  ridged multifractal, A the cellular value of R's own sites (the same seed, cells and
-     *  jitter: constant over each pyramid; B is free), R's cells a power of two of 16 to 128
-     *  texels (the peaks' mip levels are tuned for 32 and shift with it). "" if so, else why not. */
+    /** The peaks' detail tile (VoxelLandPeaks.ush, Design/SurfaceLook.md T3e): the surface below
+     *  the peaks set's resolution, one more lookup at a finer scale. R hard rock: a ridged
+     *  multifractal (sharp crests and creases); G soft rock: an fbm (rounded), the same octaves'
+     *  noise, so the two blend by the landform's character as the peaks' R and G do. Each octave
+     *  domain warped by its own noise (the lattice's straight lines bend at every scale),
+     *  DetailCells coarsest cells a side (wavelength N / DetailCells texels), DetailOctaves
+     *  octaves halving. Periodic (every noise wraps at its lattice's period). Heights in mip-0 texels,
+     *  each channel scaled to its RMS slope (DetailSlopeR, DetailSlopeG: a texel unit gradient,
+     *  so 0.35 is 19 degrees), then within DetailRangeTexels of its mean (VoxelLand::PeakReach's
+     *  bound). B and A are unused (zero). */
+    constexpr uint32_t DetailCells = 16;
+    constexpr uint32_t DetailOctaves = 5;
+    constexpr double DetailSlopeR = 0.35;
+    constexpr double DetailSlopeG = 0.22;
+    constexpr double DetailRangeTexels = 12.0;
+
+    template <typename TParallelFor>
+    FSet GeneratePeakDetail(uint32_t Seed, uint32_t N, TParallelFor&& ParallelFor)
+    {
+        FSet Set;
+        Set.Name = "peak_detail";
+        Set.LookTag = "generated: ridged (R) and fbm (G), warped per octave";
+        Set.Seed = Seed;
+        Set.N = N;
+        // Each octave's own warp (two noises at half its frequency, up to about 0.7 of its cells: a
+        // gradient noise spans about +-0.7, scaled by 2 WarpCells): a ridged
+        // multifractal's creases follow its noise's zero lines, which run straight along the
+        // lattice; one coarse warp leaves the fine octaves' lines straight.
+        constexpr double WarpCells = 0.5;
+        std::vector<double> Level[4];
+        for (int c = 0; c < 4; c++) Level[c].assign((size_t)N * N, 0.0);
+        ParallelFor((int32_t)N, [&](int32_t y) {
+            for (uint32_t x = 0; x < N; x++)
+            {
+                double SumR = 0.0, SumG = 0.0, Norm = 0.0, Amp = 1.0, Weight = 1.0;
+                for (uint32_t o = 0; o < DetailOctaves; o++)
+                {
+                    const int32_t Period = (int32_t)(DetailCells << o);
+                    const double K = (double)Period / (double)N;
+                    const double X = (double)x * K, Y = (double)y * K;
+                    const uint32_t OS = Mix(Seed + 0x9e3779b9u * (o + 1u));
+                    const double WX = GradientNoise(0.5 * X, 0.5 * Y, Period / 2, OS ^ 0x1234567u);
+                    const double WY = GradientNoise(0.5 * X, 0.5 * Y, Period / 2, OS ^ 0x7654321u);
+                    const double Nz = GradientNoise(X + WarpCells * 2.0 * WX, Y + WarpCells * 2.0 * WY, Period, OS);
+                    // Musgrave's ridged multifractal (each octave weighted by the previous one's
+                    // ridge) and a plain fbm of the same octaves.
+                    const double Ridge = (1.0 - std::fabs(Nz)) * (1.0 - std::fabs(Nz));
+                    SumR += Amp * Ridge * Weight;
+                    SumG += Amp * Nz;
+                    Norm += Amp;
+                    Weight = std::min(std::max(Ridge, 0.0), 1.0);
+                    Amp *= 0.5;
+                }
+                Level[0][(size_t)y * N + x] = SumR / Norm;
+                Level[1][(size_t)y * N + x] = SumG / Norm;
+            }
+        });
+        FChannel R;
+        R.Kind = KindRidged; R.Seed = Seed; R.CellsPerTile = DetailCells; R.Octaves = DetailOctaves; R.Gain = 0.5f;
+        FChannel G = R;
+        G.Kind = KindFbm;
+        // To texel units: each channel's RMS slope (central differences, wrapped), then its
+        // spread about the mean bounded.
+        const double Target[2] = { DetailSlopeR, DetailSlopeG };
+        for (int c = 0; c < 2; c++)
+        {
+            std::vector<double>& L = Level[c];
+            double Sum2 = 0.0, Mean = 0.0;
+            for (uint32_t y = 0; y < N; y++)
+                for (uint32_t x = 0; x < N; x++)
+                {
+                    const double GX = 0.5 * (L[(size_t)y * N + (x + 1) % N] - L[(size_t)y * N + (x + N - 1) % N]);
+                    const double GY = 0.5 * (L[(size_t)((y + 1) % N) * N + x] - L[(size_t)((y + N - 1) % N) * N + x]);
+                    Sum2 += GX * GX + GY * GY;
+                    Mean += L[(size_t)y * N + x];
+                }
+            Mean /= (double)N * N;
+            double Scale = Target[c] / std::max(std::sqrt(Sum2 / ((double)N * N)), 1e-12);
+            double Spread = 0.0;
+            for (double V : L) Spread = std::max(Spread, std::fabs(V - Mean) * Scale);
+            if (Spread > DetailRangeTexels) Scale *= DetailRangeTexels / Spread;
+            for (double& V : L) V = (V - Mean) * Scale;
+        }
+        Set.Channel[0] = R;
+        Set.Channel[1] = G;
+        Set.Channel[2].Kind = KindNone;
+        Set.Channel[3].Kind = KindNone;
+        Finish(Set, Level);
+        return Set;
+    }
+
+    /** Whether Set has the `peaks` layout VoxelLandPeaks.ush reads (Design/NoiseTiles2D_
+     *  Addendum2.md): R and G eroded heights of one tile (the same massif count, dividing N), B a
+     *  blur of R, A R's flow accumulation; a massif spacing (N / cells) of 32 to 512 texels. ""
+     *  if so, else why not. */
     inline std::string CheckPeaks(const FSet& Set)
     {
         const FChannel& R = Set.Channel[0];
         const FChannel& G = Set.Channel[1];
+        const FChannel& B = Set.Channel[2];
         const FChannel& A = Set.Channel[3];
-        if (R.Kind != KindCellularBorder) return "R isn't cellular_border (kind " + std::to_string(R.Kind) + ")";
-        if (G.Kind != KindRidged) return "G isn't ridged (kind " + std::to_string(G.Kind) + ")";
-        if (A.Kind != KindCellularValue) return "A isn't cellular_value (kind " + std::to_string(A.Kind) + ")";
-        if (A.Source != 0 || A.Seed != R.Seed || A.CellsPerTile != R.CellsPerTile || A.Jitter != R.Jitter) return "A doesn't share R's sites";
+        if (R.Kind != KindErodedHeight || G.Kind != KindErodedHeight)
+            return "R and G aren't eroded heights (kinds " + std::to_string(R.Kind) + ", " + std::to_string(G.Kind) + "): an older peaks layout?";
+        if (B.Kind != KindBlurred || B.Source != 0) return "B isn't R blurred (kind " + std::to_string(B.Kind) + ")";
+        if (A.Kind != KindFlowAccumulation || A.Source != 0) return "A isn't R's flow accumulation (kind " + std::to_string(A.Kind) + ")";
         const uint32_t Cells = R.CellsPerTile;
-        if (Cells == 0u || (Cells & (Cells - 1u)) != 0u || Set.N % Cells != 0u || Set.N / Cells < 16u || Set.N / Cells > 128u)
-            return "R's " + std::to_string(Cells) + " cells don't give a power of two of 16 to 128 texels each";
+        if (G.CellsPerTile != Cells) return "R and G have different massif counts";
+        if (Cells == 0u || Set.N % Cells != 0u) return "R's massif count (" + std::to_string(Cells) + ") doesn't divide the size";
+        if (Set.N / Cells < 32u || Set.N / Cells > 512u) return "R's massif spacing (" + std::to_string(Set.N / Cells) + " texels) isn't within 32 .. 512";
         return std::string();
     }
 
@@ -462,7 +637,7 @@ namespace VoxelNoiseTiles
             C.Max = F32(P + 40);
             C.Mean = F32(P + 44);
             C.Std = F32(P + 48);
-            if (C.Kind > KindErodedFbm) return "channel " + std::to_string(c) + " has kind " + std::to_string(C.Kind);
+            if (C.Kind > KindFlowAccumulation) return "channel " + std::to_string(c) + " has kind " + std::to_string(C.Kind);
             if (!(C.Max > C.Min) || !std::isfinite(C.Min) || !std::isfinite(C.Max)) return "channel " + std::to_string(c) + " has no decode range";
         }
         Out = std::move(Set);

@@ -1,41 +1,69 @@
-// VoxelLandPeaks.ush - The peaks layer of the terrestrial generator (Design/SurfaceLook.md, T3):
-// summits, arêtes and faces on the bake's mountains, below its resolution, from two bake cells
-// down to the finest octave. The bake alone rounds every range off at its cells (1.5 km on a
-// 1,000 km planet, 10 km on Earth): its crests are smooth and its summits merge.
+// VoxelLandPeaks.ush - The peaks layer of the terrestrial generator (Design/SurfaceLook.md, T3,
+// reworked in T3d to the surface paradigm: one lookup of a baked set): summits, aretes, faces and
+// the valleys between them on the bake's mountains, below its resolution. The bake alone rounds
+// every range off at its cells (1.5 km on a 1,000 km planet, 10 km on Earth): its crests are
+// smooth and its summits merge.
 //
-// The shape: octaves of a packed noise set (VoxelLandNoise.ush, VoxelNoiseTiles.h `peaks`): its
-// cellular border distance (R: a hip-roof pyramid per cell, planar faces and straight ridges),
-// scaled per cell by its cellular value (A: summits of different heights), with its ridged
-// channel (G) on the faces. The landform's character picks sharp or rounded: rough (crystalline)
-// rock reads the set's finest mips, so its arêtes are a 32nd of a cell wide; smooth
-// (sedimentary) rock reads it three mips coarser, its summits and ridges rounded over a quarter
-// cell; the gain falls with it too. Zero-mean per octave at every mip (linear in the channels,
-// whose box-filtered mips keep their means: summits rise above the bake's crest, saddles cut
-// below it, and an octave the footprint leaves out moves the surface by its own small relief).
-// Each octave's lattice turns by its own angle (exactly, as the gullies'), so the set's period
-// doesn't repeat across octaves. Octave o's cell is two bake cells / 2^o.
+// The shape: one B-spline lookup (VoxelLandNoise.ush) of the `peaks` set
+// (Design/NoiseTiles2D_Addendum2.md): a periodic mountain tile eroded offline, so its peaks sit
+// at valley junctions, its faces at threshold slopes. Its channels:
+//   R  the eroded height, hard (crystalline) rock: steep, sharp aretes
+//   G  the same tile eroded as soft (sedimentary) rock: rounded summits and ridges
+//   B  R blurred (the gullies' steering: they run down it)
+//   A  R's flow accumulation (not read yet)
+// The landform's character blends R and G (they share their valleys and peaks). Heights are in
+// the set's mip-0 texels, so placing a texel at TexelM metres keeps the simulated slopes;
+// LandPeakStrength scales that. Zero-mean (each channel's mean over mip 0 is subtracted; box
+// mips keep it): summits rise above the bake's crest, valleys cut below it, and a coarse mip
+// (a coarse footprint) flattens towards zero.
 //
-// The amplitude: LandPeakStrength x the bake's local relief (VoxelLandRelief.h: the height range
-// within ~2 cells, so peaks scale with their range), on mountains only (relief from 250 m to
-// 900 m), on the crests and upper slopes (faded out as the drainage gathers: valleys keep the
+// The amplitude: the set's own relief (m) x LandPeakStrength, on mountains only (local relief
+// from LandPeakReliefStart to LandPeakReliefEnd, 500 to 1500 m by default), never more than the bake's local relief (smaller ranges get gentler
+// peaks), on the crests and upper slopes (faded out as the drainage gathers: valleys keep the
 // bake's floors), and inland.
 //
+// The detail (T3e): the set holds about a massif spacing's texels over 128, so its finest valleys
+// are hundreds of metres across and closer up it's smooth B-spline lumps. A second lookup, of
+// the detail tile appended to the set's chain (VoxelNoiseTiles::GeneratePeakDetail: hard rock a
+// ridged multifractal, soft rock an fbm, heights in its own texels) at its own finer placement
+// and turn, adds to the shape: the same character blend, the same amplitude (so it lives where
+// the peaks do), its height over the peaks' relief fixed on the CPU (LandPeakDetailScaleR/G) so
+// strength 1 keeps its own slopes. Band-limited by its own mip level (coarser than the set's
+// rule), faded out over the levels below LandPeakDetailFade (where its coarsest octave averages
+// away) and skipped beyond.
+//
 // The lattice: face-local like the gullies' (VoxelLandGully.ush): the set's texel coordinate is
-// the face's angle from its centre in cells times a power of two (an integer and a fraction:
-// exact at any radius); each face and octave picks one of the tile's 8 orientations and an
-// offset. Within 3 bake cells of a face edge the faces' patterns blend, and the gradient includes
-// the blend weights' own slope (it is exact everywhere).
+// the face's angle from its centre in cells (an integer and a fraction) times the set's texels
+// per cell, turned by one of 8 angles per face (exactly: VoxelDFTwoProd), and each face picks
+// one of the tile's 8 orientations and an offset. Within 3 bake cells of a face edge the faces'
+// lookups blend, and the gradient includes the blend weights' own slope.
 //
 // Shared subset (VoxelShaderCompat.h). Included by VoxelLandGully.ush (after VoxelLandSample.ush
 // and VoxelLandNoise.ush); its inputs, declared by the host:
 //
-//   float LandPeakStrength;      the peaks' height over the local relief (0: no peaks)
-//   uint LandPeakOctaves;        octaves from two bake cells down (at most VOXEL_LAND_PEAK_MAX_OCTAVES)
+//   float LandPeakStrength;       the height over the set's own (1: its simulated slopes; 0: none)
+//   float LandPeakTexelsPerCell;  the set's mip-0 texels per bake cell (0: no peaks)
 //   uint LandPeakSeed;
-//   uint LandNoiseCellShift;     log2 of the set's texels per R cell
-//   float LandPeakMeanShape;     the set's means over mip 0 (unit values): (0.6 + 0.8 A) R, and G
+//   float LandPeakSpacingM;       the set's massif spacing (m): the steering's wavelength
+//   float LandPeakReliefM;        the larger of R's and G's ranges (decode Max - Min) in metres
+//   float LandPeakReliefStart;    the local relief (m) over which they fade in (T4b: settings)
+//   float LandPeakReliefEnd;
+//   float LandPeakMeanR;          R's and G's means over mip 0 (unit values)
 //   float LandPeakMeanG;
-//   (and VoxelLandNoise.ush's: LandNoise, LandNoiseN, LandNoiseMips)
+//   float LandPeakScaleR;         R's, G's and B's ranges over the larger of R's and G's
+//   float LandPeakScaleG;
+//   float LandPeakScaleB;
+//   uint LandNoiseN, LandNoiseMips;  the set's chain (at the buffer's start; VoxelLandNoise.ush's
+//                                    LandNoise holds it)
+//   uint LandPeakDetailBase;         the detail tile's chain: its first texel in LandNoise,
+//   uint LandPeakDetailN;            size and mips
+//   uint LandPeakDetailMips;
+//   float LandPeakDetailTexelsPerCell;  its mip-0 texels per bake cell (0: no detail)
+//   float LandPeakDetailMeanR;       its R's and G's means over mip 0 (unit values)
+//   float LandPeakDetailMeanG;
+//   float LandPeakDetailScaleR;      its unit values to the shape's unit (strength x range x texel
+//   float LandPeakDetailScaleG;      over the peaks' relief)
+//   float LandPeakDetailFade;        the mip level by which it has faded out
 
 #ifndef VOXEL_LAND_PEAKS_USH
 #define VOXEL_LAND_PEAKS_USH
@@ -46,10 +74,8 @@
 #define VOXEL_LOOP [loop]
 #endif
 
-#define VOXEL_LAND_PEAK_MAX_OCTAVES 8u
-// The local relief (m) over which the peaks fade in: mountains, not plains.
-#define VOXEL_LAND_PEAK_RELIEF_START 250.0f
-#define VOXEL_LAND_PEAK_RELIEF_END 900.0f
+// The local relief (m) over which the peaks fade in (mountains, not plains) is
+// LandPeakReliefStart .. LandPeakReliefEnd since T4b (default 500 .. 1500; T3 used 250 .. 900).
 // The drainage (log2 m^2 above a cell's own area) over which they fade out: crests and upper
 // slopes keep them, valleys (from about 45 cells' drainage) keep the bake's floors.
 #define VOXEL_LAND_PEAK_CREST_START 1.5f
@@ -57,34 +83,21 @@
 // The bake height (m) over which they fade in from the coast.
 #define VOXEL_LAND_PEAK_COAST_START 2.0f
 #define VOXEL_LAND_PEAK_COAST_END 40.0f
-// A summit's height scale from its cell's value: 0.6 .. 1.4.
-#define VOXEL_LAND_PEAK_SUMMIT_LO 0.6f
-#define VOXEL_LAND_PEAK_SUMMIT_RANGE 0.8f
-// The ridged channel's weight on the faces.
-#define VOXEL_LAND_PEAK_RIDGED 0.25f
-// The gain per octave, from smooth to rough character.
-#define VOXEL_LAND_PEAK_GAIN_SMOOTH 0.3f
-#define VOXEL_LAND_PEAK_GAIN_ROUGH 0.42f
-// The coarsest mip level read, from smooth to rough character, for a set of 32 texels a cell
-// (VOXEL_LAND_PEAK_CELL_SHIFT; a set with more or fewer reads correspondingly finer or coarser
-// mips, so the same fraction of a cell): the set's creases (a texel wide at mip 0, a 32nd of a
-// cell) soften over 2^level texels, so smooth rock gets rounded summits and ridges, rough rock
-// sharp arêtes. The footprint raises it further (band-limiting).
-#define VOXEL_LAND_PEAK_CELL_SHIFT 5
-#define VOXEL_LAND_PEAK_LEVEL_SMOOTH 3.0f
-#define VOXEL_LAND_PEAK_LEVEL_ROUGH 1.25f
-// The gullies' steering reads the two coarsest octaves this many mips coarser (blurred over 8
-// texels, a quarter of a cell): smooth over the gullies' wavelengths, so their stripes neither
-// fold nor stop short at the arêtes.
-#define VOXEL_LAND_PEAK_STEER_BLUR 3.0f
 // The face blend band (bake cells), as the gullies'.
 #define VOXEL_LAND_PEAK_BAND_CELLS 3.0f
+// The detail's mip level against the footprint (0.5: texels about 1.4 footprints), and the levels
+// over which it fades out below LandPeakDetailFade (spread so no mesh level change takes much of
+// it at once: its RMS height 10 m at a 1 m footprint, 9 at 25 m, 4 at 50 m, 0.4 at 100 m, 0 from
+// 150 m). Plain defines: every host must use the same.
+#define VOXEL_LAND_PEAK_DETAIL_LEVEL_BIAS 0.5f
+#define VOXEL_LAND_PEAK_DETAIL_FADE_LEVELS 3.0f
 
-/** The peaks at a point: Unit the shape (zero-mean; Height = Unit x AmplitudeM), AmplitudeM (m),
- *  Gradient the shape's gradient times the amplitude (m/m, a tangent vector: the amplitude's own
- *  change left out, as the hills'), Steer the two coarsest octaves' gradient, blurred (the
- *  gullies run down that), Curve its local curvature (1/m: large at the arêtes and the valleys
- *  between peaks, where the steering turns) and Lambda the coarsest wavelength (m), for the
+/** The peaks at a point: Unit the shape (zero-mean, within -1 .. 1 over the larger of R's and
+ *  G's ranges, plus the detail's: VoxelLand::PeakReach; Height = Unit x AmplitudeM),
+ *  AmplitudeM (m), Gradient the shape's gradient times the amplitude (m/m, a tangent vector: the
+ *  amplitude's own change left out, as the hills'), Steer the blurred channel's gradient times
+ *  the amplitude (the gullies run down that), Curve its local curvature (1/m: large at the
+ *  aretes and the valleys, where the steering turns) and Lambda the massif spacing (m), for the
  *  gullies (VoxelLandGully.ush: they fade where their steering turns within their wavelength). */
 struct FVoxelLandPeaks
 {
@@ -96,56 +109,55 @@ struct FVoxelLandPeaks
     float Lambda;
 };
 
+/** Whether the planet has peaks (a set, a placement, a landform). */
+VOXEL_FUNC bool VoxelLandPeaksOn(VOXEL_LAND_ARGS_DECL float Dummy)
+{
+    return LandPeakStrength > 0.0f && LandPeakTexelsPerCell > 0.0f && LandNoiseN != 0u && LandHasForm != 0u;
+}
+
 /** The amplitude (m) from the local relief (m), the drainage (log2 m^2; used when LandHasFlow)
  *  and the bake height (m). */
 VOXEL_FUNC float VoxelLandPeakAmplitude(VOXEL_LAND_ARGS_DECL float Relief, float Flow, float Bake)
 {
-    float A = LandPeakStrength * Relief * smoothstep(VOXEL_LAND_PEAK_RELIEF_START, VOXEL_LAND_PEAK_RELIEF_END, Relief)
+    float A = LandPeakStrength * min(LandPeakReliefM, Relief) * smoothstep(LandPeakReliefStart, LandPeakReliefEnd, Relief)
         * smoothstep(VOXEL_LAND_PEAK_COAST_START, VOXEL_LAND_PEAK_COAST_END, Bake);
     if (LandHasFlow != 0u)
         A *= 1.0f - smoothstep(VOXEL_LAND_PEAK_CREST_START, VOXEL_LAND_PEAK_CREST_END, Flow - 2.0f * log2(LandCellM));
     return max(A, 0.0f);
 }
 
-/** 2^E exactly (E in -126..127). */
-VOXEL_FUNC float VoxelLandPeakPow2(int E)
-{
-    return asfloat(uint(127 + E) << 23u);
-}
-
-/** A face axis's coordinate in the set's texels at shift K (at least 4:
- *  VoxelNoiseTiles::CheckPeaks checks): the angle from the face centre in cells, (J + 0.5 - N / 2) + Frac, times 2^(K - 1)
- *  (as VoxelLandGullyCoordAt): an exact integer (a float holding it) and the fraction's part. */
+/** A face axis's coordinate in bake cells from the face centre, (J + 0.5 - N / 2) + Frac, as an
+ *  exact half-integer (a float holding it) and the fraction. */
 struct FVoxelLandPeakCoord
 {
     float Whole;
     float Part;
 };
 
-VOXEL_FUNC FVoxelLandPeakCoord VoxelLandPeakCoordAt(VOXEL_LAND_ARGS_DECL FVoxelLandAxis Axis, int K)
+VOXEL_FUNC FVoxelLandPeakCoord VoxelLandPeakCoordAt(VOXEL_LAND_ARGS_DECL FVoxelLandAxis Axis)
 {
     FVoxelLandPeakCoord Out;
-    Out.Whole = float(2 * Axis.Cell + 1 - int(LandN)) * VoxelLandPeakPow2(K - 2);
-    Out.Part = Axis.Frac * VoxelLandPeakPow2(K - 1);
+    Out.Whole = float(2 * Axis.Cell + 1 - int(LandN)) * 0.5f;
+    Out.Part = Axis.Frac;
     return Out;
 }
 
-/** An octave's lattice rotation (cos, sin of 0.37 + 1.13 o + 0.618 o^2), as literals so every host
- *  uses the same floats (they multiply large integers exactly: VoxelDFTwoProd). */
-VOXEL_FUNC float2 VoxelLandPeakRotation(uint Octave)
+/** A face's lattice rotation (cos, sin of 0.37 + 1.13 i + 0.618 i^2), as literals so every host
+ *  uses the same floats (they multiply large numbers exactly: VoxelDFTwoProd). */
+VOXEL_FUNC float2 VoxelLandPeakRotation(uint Index)
 {
-    if (Octave == 0u) return float2(0.932327330f, 0.361615419f);
-    if (Octave == 1u) return float2(-0.520301223f, 0.853982806f);
-    if (Octave == 2u) return float2(0.379828602f, -0.925056875f);
-    if (Octave == 3u) return float2(-0.994723022f, 0.102597110f);
-    if (Octave == 4u) return float2(-0.597863436f, 0.801597953f);
-    if (Octave == 5u) return float2(-0.867247880f, 0.497876555f);
-    if (Octave == 6u) return float2(-0.432379663f, -0.901691675f);
+    if (Index == 0u) return float2(0.932327330f, 0.361615419f);
+    if (Index == 1u) return float2(-0.520301223f, 0.853982806f);
+    if (Index == 2u) return float2(0.379828602f, -0.925056875f);
+    if (Index == 3u) return float2(-0.994723022f, 0.102597110f);
+    if (Index == 4u) return float2(-0.597863436f, 0.801597953f);
+    if (Index == 5u) return float2(-0.867247880f, 0.497876555f);
+    if (Index == 6u) return float2(-0.432379663f, -0.901691675f);
     return float2(0.650245965f, 0.759723723f);
 }
 
-/** The set's coordinate along one rotated axis (CosA, SinA the rotation's row): the exact integer
- *  parts' rotation (two products), the fraction parts', split into a cell and a fraction. */
+/** RU x CU + RV x CV (cells times texels per cell: texels) as an integer and a fraction: the
+ *  whole parts' products exact, so the texel is right at any distance from the face centre. */
 VOXEL_FUNC FVoxelLandNoiseAxis VoxelLandPeakRotated(FVoxelLandPeakCoord CU, FVoxelLandPeakCoord CV, float RU, float RV)
 {
     const float2 L = VoxelDFAdd(VoxelDFAdd(VoxelDFTwoProd(RU, CU.Whole), VoxelDFTwoProd(RV, CV.Whole)),
@@ -157,99 +169,117 @@ VOXEL_FUNC FVoxelLandNoiseAxis VoxelLandPeakRotated(FVoxelLandPeakCoord CU, FVox
     return Out;
 }
 
-/** One octave's shape (zero-mean) and its derivatives along the set's axes (per texel), and its
- *  curvature's norm (per texel squared), from the set's channels N. */
-struct FVoxelLandPeakShape
+/** A baked set's layer (T4a: the peaks' lookup made general, so the hills take it too): which
+ *  chain, its placement (mip-0 texels per bake cell; a texel is LandCellM over that), the seed
+ *  and salts of the faces' turns, orientations and offsets, R's and G's means and R's, G's and
+ *  B's scales (unit values to the layer's unit), the mip level against the footprint (texels
+ *  about 2^-LevelBias footprints), and the detail tile's (DetailTexelsPerCell 0: none). */
+struct FVoxelLandSetLayer
 {
-    float Value;
-    float DU;
-    float DV;
-    float Curve;
+    FVoxelLandNoiseSetRef Set;
+    float TexelsPerCell;
+    uint Seed;
+    uint Kind;              // the faces' hash: uint3(Face, Kind, Salt)
+    uint SaltA;
+    uint SaltB;
+    float MeanR;
+    float MeanG;
+    float ScaleR;
+    float ScaleG;
+    float ScaleB;
+    float LevelBias;
+    FVoxelLandNoiseSetRef DetailSet;
+    float DetailTexelsPerCell;
+    uint DetailKind;
+    float DetailMeanR;
+    float DetailMeanG;
+    float DetailScaleR;
+    float DetailScaleG;
+    float DetailFade;
 };
 
-VOXEL_FUNC FVoxelLandPeakShape VoxelLandPeakShapeOf(VOXEL_LAND_ARGS_DECL FVoxelLandNoise N)
-{
-    // The pyramid scaled by the summit's cell value, the ridged channel on the faces.
-    const float Summit = VOXEL_LAND_PEAK_SUMMIT_LO + VOXEL_LAND_PEAK_SUMMIT_RANGE * N.A;
-    FVoxelLandPeakShape Out;
-    Out.Value = Summit * N.R - LandPeakMeanShape + VOXEL_LAND_PEAK_RIDGED * (N.G - LandPeakMeanG);
-    Out.DU = Summit * N.RU + VOXEL_LAND_PEAK_SUMMIT_RANGE * N.AU * N.R + VOXEL_LAND_PEAK_RIDGED * N.GU;
-    Out.DV = Summit * N.RV + VOXEL_LAND_PEAK_SUMMIT_RANGE * N.AV * N.R + VOXEL_LAND_PEAK_RIDGED * N.GV;
-    // The curvature's norm (the summit scale's change left out).
-    Out.Curve = Summit * sqrt(N.RUU * N.RUU + 2.0f * N.RUV * N.RUV + N.RVV * N.RVV);
-    return Out;
-}
-
-/** One face's octave chain: the shape and its gradient and steering (covectors per m along the
- *  face's angles times the radius). */
+/** One face's lookup: the shape (over the larger range) and its gradient and steering (covectors per m
+ *  along the face's angles times the radius), and the steering's curvature (per m^2). */
 struct FVoxelLandPeakFace
 {
     float Unit;
+    float HardMinusSoft;    // the shape's derivative in the character
     float GU;
     float GV;
     float SU;
     float SV;
-    float Curve;   // the steering octaves' curvature (unit shape per m^2)
+    float Curve;
 };
 
-VOXEL_FUNC FVoxelLandPeakFace VoxelLandPeakFaceAt(VOXEL_LAND_ARGS_DECL uint Face, FVoxelLandAxis U, FVoxelLandAxis V, float Character, float Footprint,
-    bool bShape)
+VOXEL_FUNC FVoxelLandPeakFace VoxelLandSetFaceAt(VOXEL_LAND_ARGS_DECL FVoxelLandSetLayer L, uint Face, FVoxelLandAxis U, FVoxelLandAxis V, float Character,
+    float Footprint, bool bShape)
 {
-    FVoxelLandPeakFace Out;
-    Out.Unit = 0.0f;
-    Out.GU = 0.0f;
-    Out.GV = 0.0f;
-    Out.SU = 0.0f;
-    Out.SV = 0.0f;
-    Out.Curve = 0.0f;
-    // Without the shape, only the steering octaves (VoxelLandPeaksDF).
-    const uint Count = min(LandPeakOctaves, bShape ? VOXEL_LAND_PEAK_MAX_OCTAVES : 2u);
+    const float TexelM = LandCellM / L.TexelsPerCell;
+    const float InvTexel = 1.0f / TexelM;
+    const uint H = VoxelHash(uint3(Face, L.Kind, L.SaltA), L.Seed);
+    const uint H2 = VoxelHash(uint3(Face, L.Kind, L.SaltB), L.Seed);
+    // The face's coordinates in the set's texels, turned by the face's angle.
+    const FVoxelLandPeakCoord CU = VoxelLandPeakCoordAt(VOXEL_LAND_ARGS U);
+    const FVoxelLandPeakCoord CV = VoxelLandPeakCoordAt(VOXEL_LAND_ARGS V);
+    const float2 Rot = VoxelLandPeakRotation(H >> 29u);
+    const float RX = Rot.x * L.TexelsPerCell;
+    const float RY = Rot.y * L.TexelsPerCell;
+    const FVoxelLandNoiseAxis AU = VoxelLandPeakRotated(CU, CV, RX, -RY);
+    const FVoxelLandNoiseAxis AV = VoxelLandPeakRotated(CU, CV, RY, RX);
+    // The mip whose texels are about 2^-LevelBias footprints (the peaks: half).
+    const float Level = max(log2(max(Footprint, 1.0f) / (TexelM * 100.0f)) + L.LevelBias, 0.0f);
+    // Without the shape, only the steering channel (half the texels: its words alone).
+    const FVoxelLandNoise N = VoxelLandNoiseAt(VOXEL_LAND_ARGS L.Set, AU, AV, H & 7u, H >> 3u, H2, Level,
+        bShape ? VOXEL_LAND_NOISE_WANT_HESSIAN_B : (VOXEL_LAND_NOISE_WANT_ONLY_B | VOXEL_LAND_NOISE_WANT_HESSIAN_B));
+    // Hard rock (rough character) to soft (smooth), over the larger range.
     const float C = saturate(Character);
-    const float Gain = lerp(VOXEL_LAND_PEAK_GAIN_SMOOTH, VOXEL_LAND_PEAK_GAIN_ROUGH, C);
-    const int Shift = int(LandNoiseCellShift);
-    // The floor is for 32 texels a cell: the same blur in cells for any set. (The footprint's
-    // level and the steering's blur, relative to it, are in the set's own texels already.)
-    const float CellLevels = float(Shift - VOXEL_LAND_PEAK_CELL_SHIFT);
-    const float LevelMin = lerp(VOXEL_LAND_PEAK_LEVEL_SMOOTH, VOXEL_LAND_PEAK_LEVEL_ROUGH, C) + CellLevels;
-    float Amp = 1.0f;
-    VOXEL_LOOP
-    for (uint o = 0u; o < Count; o++)
+    const float Hard = (N.R - L.MeanR) * L.ScaleR;
+    const float Soft = (N.G - L.MeanG) * L.ScaleG;
+    const float DU = lerp(N.GU * L.ScaleG, N.RU * L.ScaleR, C);
+    const float DV = lerp(N.GV * L.ScaleG, N.RV * L.ScaleR, C);
+    FVoxelLandPeakFace Out;
+    Out.Unit = bShape ? lerp(Soft, Hard, C) : 0.0f;
+    Out.HardMinusSoft = bShape ? Hard - Soft : 0.0f;
+    // Back to the face's axes (the rotation's transpose), per m.
+    Out.GU = bShape ? (Rot.x * DU + Rot.y * DV) * InvTexel : 0.0f;
+    Out.GV = bShape ? (-Rot.y * DU + Rot.x * DV) * InvTexel : 0.0f;
+    const float BU = N.BU * L.ScaleB;
+    const float BV = N.BV * L.ScaleB;
+    Out.SU = (Rot.x * BU + Rot.y * BV) * InvTexel;
+    Out.SV = (-Rot.y * BU + Rot.x * BV) * InvTexel;
+    Out.Curve = sqrt(N.BUU * N.BUU + 2.0f * N.BUV * N.BUV + N.BVV * N.BVV) * L.ScaleB * (InvTexel * InvTexel);
+    if (bShape && L.DetailTexelsPerCell > 0.0f)
     {
-        const float Lambda = 2.0f * LandCellM * VoxelLandPeakPow2(-int(o));
-        const float Band = VoxelOctaveBandWeight(Lambda * 100.0f, Footprint);
-        if (Band <= 0.0f) break;
-        const float TexelM = Lambda * VoxelLandPeakPow2(-Shift);
-        // The face's coordinates in this octave's texels, turned by its angle (exactly).
-        const FVoxelLandPeakCoord CU = VoxelLandPeakCoordAt(VOXEL_LAND_ARGS U, int(o) + Shift);
-        const FVoxelLandPeakCoord CV = VoxelLandPeakCoordAt(VOXEL_LAND_ARGS V, int(o) + Shift);
-        const float2 Rot = VoxelLandPeakRotation(o);
-        const FVoxelLandNoiseAxis AU = VoxelLandPeakRotated(CU, CV, Rot.x, -Rot.y);
-        const FVoxelLandNoiseAxis AV = VoxelLandPeakRotated(CU, CV, Rot.y, Rot.x);
-        const uint H = VoxelHash(uint3(Face, o, 0x7065616bu), LandPeakSeed);
-        const uint H2 = VoxelHash(uint3(Face, o, 0x6b616570u), LandPeakSeed);
-        // The mip whose texels are about half the footprint, at least the character's.
-        const float Level = max(log2(max(Footprint, 1.0f) / (TexelM * 100.0f)) - 1.0f, LevelMin);
-        const float InvTexel = 1.0f / TexelM;
-        const float W = Amp * Band;
-        if (bShape)
+        // The detail: its own texel, mip level, turn, orientation and offset.
+        const float DetailTexelM = LandCellM / L.DetailTexelsPerCell;
+        // Coarser than the set's rule (texels about half the footprint): the tile is dense in
+        // octaves down to its finest, so half-footprint texels pass wavelengths the footprint
+        // can't hold (the cache's 64 m level: normal p99 15 deg with the set's rule, 3 with this).
+        const float DetailLevel = max(log2(max(Footprint, 1.0f) / (DetailTexelM * 100.0f)) + VOXEL_LAND_PEAK_DETAIL_LEVEL_BIAS, 0.0f);
+        const float Fade = 1.0f - smoothstep(L.DetailFade - VOXEL_LAND_PEAK_DETAIL_FADE_LEVELS, L.DetailFade, DetailLevel);
+        if (Fade > 0.0f)
         {
-            const FVoxelLandPeakShape Shape = VoxelLandPeakShapeOf(VOXEL_LAND_ARGS
-                VoxelLandNoiseAt(VOXEL_LAND_ARGS AU, AV, H & 7u, H >> 3u, H2, Level));
-            Out.Unit += W * Shape.Value;
-            // Back to the face's axes (the rotation's transpose).
-            Out.GU += W * (Rot.x * Shape.DU + Rot.y * Shape.DV) * InvTexel;
-            Out.GV += W * (-Rot.y * Shape.DU + Rot.x * Shape.DV) * InvTexel;
+            const uint HD = VoxelHash(uint3(Face, L.DetailKind, 0x64657461u), L.Seed);
+            const uint HD2 = VoxelHash(uint3(Face, L.DetailKind, 0x61746564u), L.Seed);
+            const float2 DRot = VoxelLandPeakRotation(HD >> 29u);
+            const float DRX = DRot.x * L.DetailTexelsPerCell;
+            const float DRY = DRot.y * L.DetailTexelsPerCell;
+            const FVoxelLandNoiseAxis DAU = VoxelLandPeakRotated(CU, CV, DRX, -DRY);
+            const FVoxelLandNoiseAxis DAV = VoxelLandPeakRotated(CU, CV, DRY, DRX);
+            // R and G alone (no steering: the gullies keep to the set's).
+            const FVoxelLandNoise D = VoxelLandNoiseAt(VOXEL_LAND_ARGS L.DetailSet, DAU, DAV, HD & 7u, HD >> 3u, HD2, DetailLevel, 0u);
+            const float SR = L.DetailScaleR * Fade;
+            const float SG = L.DetailScaleG * Fade;
+            const float DHard = (D.R - L.DetailMeanR) * SR;
+            const float DSoft = (D.G - L.DetailMeanG) * SG;
+            const float DDU = lerp(D.GU * SG, D.RU * SR, C);
+            const float DDV = lerp(D.GV * SG, D.RV * SR, C);
+            const float DInv = 1.0f / DetailTexelM;
+            Out.Unit += lerp(DSoft, DHard, C);
+            Out.HardMinusSoft += DHard - DSoft;
+            Out.GU += (DRot.x * DDU + DRot.y * DDV) * DInv;
+            Out.GV += (-DRot.y * DDU + DRot.x * DDV) * DInv;
         }
-        if (o <= 1u)
-        {
-            // The steering: the same octave blurred (VOXEL_LAND_PEAK_STEER_BLUR).
-            const FVoxelLandPeakShape Blur = VoxelLandPeakShapeOf(VOXEL_LAND_ARGS
-                VoxelLandNoiseAt(VOXEL_LAND_ARGS AU, AV, H & 7u, H >> 3u, H2, Level + VOXEL_LAND_PEAK_STEER_BLUR));
-            Out.SU += W * (Rot.x * Blur.DU + Rot.y * Blur.DV) * InvTexel;
-            Out.SV += W * (-Rot.y * Blur.DU + Rot.x * Blur.DV) * InvTexel;
-            Out.Curve += W * Blur.Curve * (InvTexel * InvTexel);
-        }
-        Amp *= Gain;
     }
     return Out;
 }
@@ -269,12 +299,7 @@ VOXEL_FUNC float3 VoxelLandFaceVector(FVoxelLandFaceFrame Frame, float CU, float
     return Frame.TU * (Frame.GUU * CU + Frame.GUV * CV) + Frame.TV * (Frame.GUV * CU + Frame.GVV * CV);
 }
 
-/** The peaks at the sea-level sphere point P (double-float, cm) with the bake's landform Form
- *  (its character shapes them), local relief Relief (m), drainage Flow (log2 m^2) and height Bake
- *  (m), band-limited to Footprint (cm). bShape (a constant) false gives only the amplitude, the
- *  steering and its curvature (Unit and Gradient zero): what the differenced terms need. */
-VOXEL_FUNC FVoxelLandPeaks VoxelLandPeaksShapeDF(VOXEL_LAND_ARGS_DECL float2 PX, float2 PY, float2 PZ, float2 Form, float Relief, float Flow, float Bake,
-    float Footprint, bool bShape)
+VOXEL_FUNC FVoxelLandPeaks VoxelLandPeaksNone()
 {
     FVoxelLandPeaks Out;
     Out.Unit = 0.0f;
@@ -283,11 +308,21 @@ VOXEL_FUNC FVoxelLandPeaks VoxelLandPeaksShapeDF(VOXEL_LAND_ARGS_DECL float2 PX,
     Out.Steer = float3(0.0f, 0.0f, 0.0f);
     Out.Curve = 0.0f;
     Out.Lambda = 0.0f;
-    if (LandPeakStrength <= 0.0f || LandPeakOctaves == 0u || LandNoiseN == 0u || LandHasForm == 0u) return Out;
-    Out.AmplitudeM = VoxelLandPeakAmplitude(VOXEL_LAND_ARGS Relief, Flow, Bake);
-    if (Out.AmplitudeM <= 0.0f) return Out;
-    Out.Lambda = 2.0f * LandCellM;
-    if (VoxelOctaveBandWeight(Out.Lambda * 100.0f, Footprint) <= 0.0f) return Out;
+    return Out;
+}
+
+/** A set layer at the sea-level sphere point P (double-float, cm) with amplitude AmplitudeM (m,
+ *  above 0) and the character (hard and soft rock blend by it; CharacterGradient its gradient,
+ *  per m, a tangent vector at P), band-limited to Footprint (cm): one lookup (two near a face
+ *  edge, where the faces' lookups blend and the gradient includes the weights' own slope).
+ *  bShape (a constant) false gives only the steering and its curvature (Unit and Gradient
+ *  zero), from the steering channel alone: what the differenced terms need. Lambda is Out's. */
+VOXEL_FUNC FVoxelLandPeaks VoxelLandSetLayerDF(VOXEL_LAND_ARGS_DECL FVoxelLandSetLayer L, float2 PX, float2 PY, float2 PZ, float Character,
+    float3 CharacterGradient, float AmplitudeM, float Lambda, float Footprint, bool bShape)
+{
+    FVoxelLandPeaks Out = VoxelLandPeaksNone();
+    Out.AmplitudeM = AmplitudeM;
+    Out.Lambda = Lambda;
 
     const float Band = 2.0f * VOXEL_LAND_PEAK_BAND_CELLS / float(LandN);
     // The face coordinate's change per m along the face's angles: 4 / (pi R), R = 2 N cell / pi.
@@ -298,6 +333,7 @@ VOXEL_FUNC FVoxelLandPeaks VoxelLandPeaksShapeDF(VOXEL_LAND_ARGS_DECL float2 PX,
     float3 WGrad = float3(0.0f, 0.0f, 0.0f);   // sum of grad W
     float3 SSum = float3(0.0f, 0.0f, 0.0f);
     float CSum = 0.0f;
+    float DSum = 0.0f;    // sum of W (hard - soft)
     VOXEL_LOOP
     for (uint Axis = 0u; Axis < 3u; Axis++)
     {
@@ -314,8 +350,8 @@ VOXEL_FUNC FVoxelLandPeaks VoxelLandPeaksShapeDF(VOXEL_LAND_ARGS_DECL float2 PX,
         const float RT = VoxelLandFaceRamp(T, Band);
         const float W = RS * RT;
         if (W <= 0.0f) continue;
-        const FVoxelLandPeakFace F = VoxelLandPeakFaceAt(VOXEL_LAND_ARGS Face, VoxelLandAxisAt(VOXEL_LAND_ARGS AU, S), VoxelLandAxisAt(VOXEL_LAND_ARGS AV, T),
-            Form.y, Footprint, bShape);
+        const FVoxelLandPeakFace F = VoxelLandSetFaceAt(VOXEL_LAND_ARGS L, Face, VoxelLandAxisAt(VOXEL_LAND_ARGS AU, S), VoxelLandAxisAt(VOXEL_LAND_ARGS AV, T),
+            Character, Footprint, bShape);
         const FVoxelLandFaceFrame Frame = VoxelLandFaceFrameAt(Face, AU.x, AV.x);
         const float WU = VoxelLandFaceRampSlope(S, Band) * RT * DSDX;
         const float WV = RS * VoxelLandFaceRampSlope(T, Band) * DSDX;
@@ -325,20 +361,73 @@ VOXEL_FUNC FVoxelLandPeaks VoxelLandPeaksShapeDF(VOXEL_LAND_ARGS_DECL float2 PX,
         WGrad = WGrad + VoxelLandFaceVector(Frame, WU, WV);
         SSum = SSum + VoxelLandFaceVector(Frame, W * F.SU, W * F.SV);
         CSum += W * F.Curve;
+        DSum += W * F.HardMinusSoft;
     }
     if (WSum <= 0.0f) return Out;
     const float Inv = 1.0f / WSum;
     Out.Unit = USum * Inv;
-    // grad (sum W U / sum W) = (sum (W grad U + U grad W) - Unit sum grad W) / sum W.
-    Out.Gradient = (GSum - WGrad * Out.Unit) * (Inv * Out.AmplitudeM);
+    // grad (sum W U / sum W) = (sum (W grad U + U grad W) - Unit sum grad W) / sum W, plus the
+    // character's change (inside 0 .. 1: VoxelLandSetFaceAt saturates it).
+    const float CharacterSlope = (Character > 0.0f && Character < 1.0f) ? DSum * Inv : 0.0f;
+    Out.Gradient = ((GSum - WGrad * Out.Unit) * Inv + CharacterGradient * CharacterSlope) * Out.AmplitudeM;
     Out.Steer = SSum * (Inv * Out.AmplitudeM);
     Out.Curve = CSum * (Inv * Out.AmplitudeM);
     return Out;
 }
 
-VOXEL_FUNC FVoxelLandPeaks VoxelLandPeaksDF(VOXEL_LAND_ARGS_DECL float2 PX, float2 PY, float2 PZ, float2 Form, float Relief, float Flow, float Bake, float Footprint)
+/** The peaks' layer (the set's chain at the buffer's start, the detail tile after it). */
+VOXEL_FUNC FVoxelLandSetLayer VoxelLandPeakLayer(VOXEL_LAND_ARGS_DECL float Dummy)
 {
-    return VoxelLandPeaksShapeDF(VOXEL_LAND_ARGS PX, PY, PZ, Form, Relief, Flow, Bake, Footprint, true);
+    FVoxelLandSetLayer L;
+    L.Set = VoxelLandNoiseSetOf(0u, LandNoiseN, LandNoiseMips);
+    L.TexelsPerCell = LandPeakTexelsPerCell;
+    L.Seed = LandPeakSeed;
+    L.Kind = 0u;
+    L.SaltA = 0x7065616bu;
+    L.SaltB = 0x6b616570u;
+    L.MeanR = LandPeakMeanR;
+    L.MeanG = LandPeakMeanG;
+    L.ScaleR = LandPeakScaleR;
+    L.ScaleG = LandPeakScaleG;
+    L.ScaleB = LandPeakScaleB;
+    L.LevelBias = -1.0f;
+    L.DetailSet = VoxelLandNoiseSetOf(LandPeakDetailBase, LandPeakDetailN, LandPeakDetailMips);
+    L.DetailTexelsPerCell = LandPeakDetailTexelsPerCell;
+    L.DetailKind = 1u;
+    L.DetailMeanR = LandPeakDetailMeanR;
+    L.DetailMeanG = LandPeakDetailMeanG;
+    L.DetailScaleR = LandPeakDetailScaleR;
+    L.DetailScaleG = LandPeakDetailScaleG;
+    L.DetailFade = LandPeakDetailFade;
+    return L;
+}
+
+/** The peaks at the sea-level sphere point P (double-float, cm) with the bake's landform Form
+ *  (its character shapes them), local relief Relief (m), drainage Flow (log2 m^2) and height Bake
+ *  (m), band-limited to Footprint (cm): one lookup of the set (two near a face edge).
+ *  CharacterGradient: the character's gradient (per m, a tangent vector at P), for the shape's
+ *  change with it (hard and soft rock blend by it). bShape (a constant) false gives only the
+ *  amplitude, the steering and its curvature (Unit and Gradient zero), from the steering channel
+ *  alone: what the differenced terms need. */
+VOXEL_FUNC FVoxelLandPeaks VoxelLandPeaksShapeDF(VOXEL_LAND_ARGS_DECL float2 PX, float2 PY, float2 PZ, float2 Form, float3 CharacterGradient, float Relief,
+    float Flow, float Bake, float Footprint, bool bShape)
+{
+    FVoxelLandPeaks Out = VoxelLandPeaksNone();
+    if (!VoxelLandPeaksOn(VOXEL_LAND_ARGS 0.0f)) return Out;
+    const float AmplitudeM = VoxelLandPeakAmplitude(VOXEL_LAND_ARGS Relief, Flow, Bake);
+    if (AmplitudeM <= 0.0f)
+    {
+        Out.AmplitudeM = AmplitudeM;
+        return Out;
+    }
+    return VoxelLandSetLayerDF(VOXEL_LAND_ARGS VoxelLandPeakLayer(VOXEL_LAND_ARGS 0.0f), PX, PY, PZ, Form.y, CharacterGradient, AmplitudeM,
+        LandPeakSpacingM, Footprint, bShape);
+}
+
+VOXEL_FUNC FVoxelLandPeaks VoxelLandPeaksDF(VOXEL_LAND_ARGS_DECL float2 PX, float2 PY, float2 PZ, float2 Form, float Relief, float Flow, float Bake,
+    float Footprint)
+{
+    return VoxelLandPeaksShapeDF(VOXEL_LAND_ARGS PX, PY, PZ, Form, float3(0.0f, 0.0f, 0.0f), Relief, Flow, Bake, Footprint, true);
 }
 
 #endif // VOXEL_LAND_PEAKS_USH

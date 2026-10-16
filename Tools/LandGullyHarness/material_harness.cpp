@@ -72,12 +72,41 @@ int main(int argc, char** argv)
     S[VOXEL_LAND_MC_HILL_OCTAVES] = (float)P.S.LandHillOctaves;
     PutU32(S, VOXEL_LAND_MC_HILL_SEED, P.S.LandHillSeed);
     S[VOXEL_LAND_MC_HAS_FORM] = (float)P.S.LandHasForm;
-    S[VOXEL_LAND_MC_PEAK_STRENGTH] = P.S.LandPeakStrength; S[VOXEL_LAND_MC_PEAK_OCTAVES] = (float)P.S.LandPeakOctaves;
+    S[VOXEL_LAND_MC_PEAK_STRENGTH] = P.S.LandPeakStrength; S[VOXEL_LAND_MC_PEAK_TEXELS_PER_CELL] = P.S.LandPeakTexelsPerCell;
     PutU32(S, VOXEL_LAND_MC_PEAK_SEED, P.S.LandPeakSeed);
     S[VOXEL_LAND_MC_NOISE_N] = (float)P.S.LandNoiseN; S[VOXEL_LAND_MC_NOISE_MIPS] = (float)P.S.LandNoiseMips;
-    S[VOXEL_LAND_MC_NOISE_CELL_SHIFT] = (float)P.S.LandNoiseCellShift;
+    S[VOXEL_LAND_MC_PEAK_SPACING_M] = P.S.LandPeakSpacingM; S[VOXEL_LAND_MC_PEAK_RELIEF_M] = P.S.LandPeakReliefM;
+    S[VOXEL_LAND_MC_PEAK_RELIEF_START] = P.S.LandPeakReliefStart; S[VOXEL_LAND_MC_PEAK_RELIEF_END] = P.S.LandPeakReliefEnd;
+    S[VOXEL_LAND_MC_PEAK_SCALE_R] = P.S.LandPeakScaleR; S[VOXEL_LAND_MC_PEAK_SCALE_G] = P.S.LandPeakScaleG; S[VOXEL_LAND_MC_PEAK_SCALE_B] = P.S.LandPeakScaleB;
     S[VOXEL_LAND_MC_NOISE_SHIFT] = (float)std::log2((double)P.NoiseSet.N);
-    S[VOXEL_LAND_MC_PEAK_MEAN_SHAPE] = P.S.LandPeakMeanShape; S[VOXEL_LAND_MC_PEAK_MEAN_G] = P.S.LandPeakMeanG;
+    S[VOXEL_LAND_MC_PEAK_MEAN_R] = P.S.LandPeakMeanR; S[VOXEL_LAND_MC_PEAK_MEAN_G] = P.S.LandPeakMeanG;
+    if (P.S.LandPeakDetailTexelsPerCell > 0.0f)
+    {
+        PutU32(S, VOXEL_LAND_MC_PEAK_DETAIL_BASE, P.S.LandPeakDetailBase);
+        S[VOXEL_LAND_MC_PEAK_DETAIL_N] = (float)P.S.LandPeakDetailN; S[VOXEL_LAND_MC_PEAK_DETAIL_MIPS] = (float)P.S.LandPeakDetailMips;
+        S[VOXEL_LAND_MC_PEAK_DETAIL_TEXELS_PER_CELL] = P.S.LandPeakDetailTexelsPerCell;
+        S[VOXEL_LAND_MC_PEAK_DETAIL_MEAN_R] = P.S.LandPeakDetailMeanR; S[VOXEL_LAND_MC_PEAK_DETAIL_MEAN_G] = P.S.LandPeakDetailMeanG;
+        S[VOXEL_LAND_MC_PEAK_DETAIL_SCALE_R] = P.S.LandPeakDetailScaleR; S[VOXEL_LAND_MC_PEAK_DETAIL_SCALE_G] = P.S.LandPeakDetailScaleG;
+        S[VOXEL_LAND_MC_PEAK_DETAIL_FADE] = P.S.LandPeakDetailFade;
+    }
+    // The detail tile's chain and means, whoever reads it; the hills' set (T4a): as
+    // VoxelLandMaterial::BuildConstantTexels.
+    PutU32(S, VOXEL_LAND_MC_PEAK_DETAIL_BASE, P.S.LandPeakDetailBase);
+    S[VOXEL_LAND_MC_PEAK_DETAIL_N] = (float)P.S.LandPeakDetailN; S[VOXEL_LAND_MC_PEAK_DETAIL_MIPS] = (float)P.S.LandPeakDetailMips;
+    S[VOXEL_LAND_MC_PEAK_DETAIL_MEAN_R] = P.S.LandPeakDetailMeanR; S[VOXEL_LAND_MC_PEAK_DETAIL_MEAN_G] = P.S.LandPeakDetailMeanG;
+    if (P.S.LandHillTexelsPerCell > 0.0f)
+    {
+        PutU32(S, VOXEL_LAND_MC_HILL_BASE, P.S.LandHillBase);
+        S[VOXEL_LAND_MC_HILL_N] = (float)P.S.LandHillN; S[VOXEL_LAND_MC_HILL_MIPS] = (float)P.S.LandHillMips;
+        S[VOXEL_LAND_MC_HILL_TEXELS_PER_CELL] = P.S.LandHillTexelsPerCell;
+        S[VOXEL_LAND_MC_HILL_SCALE_R] = P.S.LandHillScaleR; S[VOXEL_LAND_MC_HILL_SCALE_G] = P.S.LandHillScaleG; S[VOXEL_LAND_MC_HILL_SCALE_B] = P.S.LandHillScaleB;
+        S[VOXEL_LAND_MC_HILL_SPACING_M] = P.S.LandHillSpacingM;
+        S[VOXEL_LAND_MC_HILL_SWELL_TEXELS_PER_CELL] = P.S.LandHillSwellTexelsPerCell; S[VOXEL_LAND_MC_HILL_SWELL_M] = P.S.LandHillSwellM;
+        S[VOXEL_LAND_MC_HILL_SWELL_SCALE_G] = P.S.LandHillSwellScaleG; S[VOXEL_LAND_MC_HILL_FOOTHILL] = P.S.LandHillFoothill;
+        S[VOXEL_LAND_MC_HILL_DETAIL_TEXELS_PER_CELL] = P.S.LandHillDetailTexelsPerCell;
+        S[VOXEL_LAND_MC_HILL_DETAIL_SCALE_R] = P.S.LandHillDetailScaleR; S[VOXEL_LAND_MC_HILL_DETAIL_SCALE_G] = P.S.LandHillDetailScaleG;
+        S[VOXEL_LAND_MC_HILL_DETAIL_FADE] = P.S.LandHillDetailFade;
+    }
     // The noise texture (MakeNoiseTexture: the words' rows, RGBA16 unsigned normalised; a load
     // gives q / 65535).
     std::vector<float> NoiseTex(P.NoiseWords.size() * 2);
@@ -96,7 +125,7 @@ int main(int argc, char** argv)
     }
     FMaterialTextures Tex;
     Tex.Height = HeightTex.data(); Tex.Fields = FieldTex.data(); Tex.Constants = Const.data(); Tex.Side = Side; Tex.Rows = Rows;
-    Tex.Noise = NoiseTex.data(); Tex.NoiseN = (int)P.NoiseSet.N; Tex.NoiseRows = (int)P.NoiseRows;
+    Tex.Noise = NoiseTex.data(); Tex.NoiseN = (int)P.NoiseSet.N; Tex.NoiseRows = (int)(P.NoiseWords.size() / (2 * (size_t)P.NoiseSet.N));
 
     // Decode checks: every attribute and lake level, every octave field.
     int AttrBad = 0, WaterBad = 0, Lakes = 0;

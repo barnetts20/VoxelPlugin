@@ -168,7 +168,9 @@ int main(int argc, char** argv)
             double D[3] = { G2(R2), G2(R2), G2(R2) }; Normalize(D);
             const FVoxelLandHeight H = VoxelLandHeightDF(DF(D[0] * P.SeaRadius), DF(D[1] * P.SeaRadius), DF(D[2] * P.SeaRadius), 100.0f, true);
             const double Sl = std::sqrt(H.BakeGradient.x * H.BakeGradient.x + H.BakeGradient.y * H.BakeGradient.y + H.BakeGradient.z * H.BakeGradient.z);
-            if (H.Bake > 300 && Sl > BestSlope) { BestSlope = Sl; for (int a = 0; a < 3; a++) Camera[a] = D[a]; }
+            // CACHE_SPOT=hills: the hilliest instead (the hills' amplitude, T4a).
+            const double Score = getenv("CACHE_SPOT") && std::string(getenv("CACHE_SPOT")) == "hills" ? (double)H.HillAmplitudeM * 0.001 : Sl;
+            if (H.Bake > 300 && Score > BestSlope) { BestSlope = Score; for (int a = 0; a < 3; a++) Camera[a] = D[a]; }
         }
         double E[3] = { 0.9, 0.2, -0.1 };
         const double Dot = E[0] * Camera[0] + E[1] * Camera[1] + E[2] * Camera[2];
@@ -176,7 +178,7 @@ int main(int argc, char** argv)
         Normalize(E);
         const double Angle = 6.0 * M_PI / 180.0;
         for (int a = 0; a < 3; a++) Anchor[a] = Camera[a] * std::cos(Angle) + E[a] * std::sin(Angle);
-        printf("test spot: bake slope %.2f (%.0f deg)\n", BestSlope, std::atan(BestSlope) * 57.3);
+        printf("test spot: %s %.2f\n", getenv("CACHE_SPOT") ? "hill amplitude (km)" : "bake slope", BestSlope);
     }
     const int Rows = (VoxelLandCachePlan::TilesFor(Levels) + VOXEL_LAND_CACHE_COLUMNS - 1) / VOXEL_LAND_CACHE_COLUMNS;
     // Level 8 in the spare tile (as after a re-centring): the sampler reads each level's tile

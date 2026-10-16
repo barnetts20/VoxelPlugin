@@ -231,9 +231,9 @@ private:
      *  planet shows the old surface until then. */
     TSharedPtr<const FVoxelLandBake, ESPMode::ThreadSafe> LandBake;
 
-    /** The peaks' noise set for the current settings, once ready (TickLandBake): held so it is
-     *  there when the density takes it (VoxelLand::TryGetPeakNoise). */
-    TSharedPtr<const FVoxelLandNoiseSet, ESPMode::ThreadSafe> PeakNoise;
+    /** The noise pack (the peaks' and the hills' sets) for the current settings, once ready
+     *  (TickLandBake): held so it is there when the density takes it (VoxelLand::TryGetLandNoise). */
+    TSharedPtr<const FVoxelLandNoiseSet, ESPMode::ThreadSafe> LandNoise;
 
     /** Terrestrial: advances the bake for the current settings and radius; true once LandBake
      *  is it. */

@@ -29,8 +29,8 @@ void FVoxelPluginModule::StartupModule()
 
 void FVoxelPluginModule::ShutdownModule()
 {
-	// The peaks' shared noise sets (VoxelLandBake.cpp), if the engine's pre-exit didn't drop them.
-	VoxelLand::ReleasePeakNoise();
+	// The shared noise packs (VoxelLandBake.cpp), if the engine's pre-exit didn't drop them.
+	VoxelLand::ReleaseLandNoise();
 }
 
 #undef LOCTEXT_NAMESPACE
