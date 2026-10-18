@@ -4,6 +4,8 @@
 #include "VoxelDensityGPU.h"
 #include "VoxelGPUCommon.h"
 #include "VoxelLandRelief.h"
+#include "VoxelLandRivers.h"
+#include "VoxelLandRiverBuild.h"
 #include "VoxelNoiseTiles.h"
 #include "VoxelPlugin.h"
 #include "VoxelShaderCompat.h"
@@ -60,8 +62,8 @@ static TAutoConsoleVariable<int32> CVarVoxelLandForceCpu(
     ECVF_Default);
 
 static TAutoConsoleVariable<int32> CVarVoxelLandBakeCellsPerFrame(
-    TEXT("voxel.Land.BakeCellsPerFrame"), 1 << 20,
-    TEXT("Bake cells the GPU evaluates per frame (the plate model costs a few microseconds per cell on the CPU, far less on the GPU)."),
+    TEXT("voxel.Land.BakeCellsPerFrame"), 1 << 23,
+    TEXT("Bake cells the GPU evaluates per frame (the plate model costs a few microseconds per cell on the CPU, far less on the GPU). The default does a 6 x 1024^2 bake's plate pass in two frames; lower it to spread a bake over more, shorter frames."),
     ECVF_Default);
 
 static TAutoConsoleVariable<int32> CVarVoxelLandErosion(
@@ -70,13 +72,18 @@ static TAutoConsoleVariable<int32> CVarVoxelLandErosion(
     ECVF_Default);
 
 static TAutoConsoleVariable<int32> CVarVoxelLandSolveStepCells(
-    TEXT("voxel.Land.SolveStepCells"), 1 << 22,
-    TEXT("The erosion solve's budget per frame: solved cells x steps (about 70 passes over the mountain cells per step)."),
+    TEXT("voxel.Land.SolveStepCells"), 1 << 25,
+    TEXT("The erosion solve's budget per frame: solved cells x steps (about 70 passes over the mountain cells per step; at most 16 steps a frame). The default does about 13 steps a frame at 6 x 1024^2; lower it for shorter frames during a bake."),
     ECVF_Default);
 
 static TAutoConsoleVariable<int32> CVarVoxelLandSolveIterationCells(
     TEXT("voxel.Land.SolveIterationCells"), 1 << 26,
-    TEXT("The fills', drainage's and lake labels' budget per frame: cells x iterations (one cheap pass each), until they converge."),
+    TEXT("The fills', drainage spread's and lake labels' budget per frame: cells x iterations (one cheap pass each), until they converge."),
+    ECVF_Default);
+
+static TAutoConsoleVariable<int32> CVarVoxelLandSolveRouteAhead(
+    TEXT("voxel.Land.SolveRouteAhead"), 1,
+    TEXT("1: after the erosion solve, record the whole routing (lake levels, fill, drainage, lake labels, output) in one frame with fixed pass counts, checked when the fields come back (routing again by loops if a loop hadn't settled). 0: by loops, each waiting for its readback (several frames each)."),
     ECVF_Default);
 
 static TAutoConsoleVariable<int32> CVarVoxelDebugLand(
@@ -288,6 +295,7 @@ namespace VoxelLandBakeDetail
         Bake->Height.SetNumUninitialized(NumCells);
         Bake->Attr.SetNumUninitialized(NumCells);
         Bake->Form.SetNumUninitialized(NumCells);
+        Bake->Province.SetNumUninitialized(NumCells);
         constexpr int32 Chunk = 4096;
         const int32 NumCellChunks = FMath::DivideAndRoundUp(NumCells, Chunk);
         ParallelFor(NumCellChunks, [&](int32 c)
@@ -306,12 +314,14 @@ namespace VoxelLandBakeDetail
                     Bake->Height[Index] = E.Base + E.Up - E.Down;
                     Bake->Attr[Index] = (uint16)P.VoxelLandPackAttr(E.Crust, E.Class);
                     Bake->Form[Index] = (uint16)P.VoxelLandPackForm(P.VoxelLandFormAt(Dir, E));
+                    Bake->Province[Index] = (uint8)P.VoxelLandPackProvince(P.VoxelLandProvinceAt(Dir, E));
                 }
                 if (Progress) Progress->fetch_add(Chunk, std::memory_order_relaxed);
             }, EParallelForFlags::BackgroundPriority);
         if (Cancelled()) return nullptr;
         Bake->UpdateRange();
         Bake->BuildRelief();
+        Bake->BuildProvinceStats();
         // Checked here, on the worker (a scan of every cell).
         if (!VoxelLandCache::IsUsable(*Bake)) return nullptr;
         return Bake;
@@ -343,16 +353,23 @@ uint32 FVoxelTerrestrialSettings::GetBakeHash() const
 uint32 FVoxelTerrestrialSettings::GetSettingsHash() const
 {
     uint32 H = GetBakeHash();
-    for (const double V : { BakeWarp, DetailAmplitude, DetailWavelength, DetailSlopeDamping,
+    for (const double V : { BakeWarp, DetailAmplitude, DetailWavelength,
         GullyStrength, GullyFinestWavelength, GullyFlowGain, GullyDetailScale, HillRelief, HillWavelength, HillFinestWavelength,
         PeakHeightScale, PeakSpacing, PeakDetailStrength, PeakDetailWavelength, HillHeightScale, HillSpacing, HillSwellHeight,
-        HillSwellScale, HillDetailStrength, HillDetailWavelength, HillFoothillGrowth, PeakReliefFadeStart, PeakReliefFadeEnd })
+        HillSwellScale, HillDetailStrength, HillDetailWavelength, HillFoothillGrowth, PeakReliefFadeStart, PeakReliefFadeEnd,
+        StrataHeightScale, StrataSpacing, StrataCoverage, StrataSwitchWidth, StrataFlatShare, StrataDetailStrength, StrataDetailWavelength,
+        RiverMinArea, RiverWidthScale, ValleyWidthScale, RiverDepthScale, FloodplainScale, LakeShoreBand, RiverMeander, RiverFalls })
         H = HashCombine(H, ::GetTypeHash(V));
+    H = HashCombine(H, ::GetTypeHash(bCarveRivers));
     // FString's hash is found by argument-dependent lookup only (not at global scope).
     const FString NoiseSetName = PeakNoiseSet.TrimStartAndEnd();
     H = HashCombine(H, GetTypeHash(NoiseSetName));
     const FString HillSetName = HillNoiseSet.TrimStartAndEnd();
     H = HashCombine(H, GetTypeHash(HillSetName));
+    const FString StrataSetName = StrataNoiseSet.TrimStartAndEnd();
+    H = HashCombine(H, GetTypeHash(StrataSetName));
+    const FString DetailSetName = DetailNoiseSet.TrimStartAndEnd();
+    H = HashCombine(H, GetTypeHash(DetailSetName));
     return H;
 }
 
@@ -367,13 +384,16 @@ FVoxelLandBake::FVoxelLandBake()
 
 FVoxelLandBake::~FVoxelLandBake()
 {
-    // The GPU copy is released on the render thread, which made it.
-    if (GPU.IsValid())
+    // The GPU copy (and a river build under way) are released on the render thread, which made
+    // them.
+    if (GPU.IsValid() || RiverJob.IsValid())
     {
         TSharedPtr<FVoxelLandBakeGPU, ESPMode::ThreadSafe> Resource = MoveTemp(GPU);
-        ENQUEUE_RENDER_COMMAND(VoxelLandReleaseBake)([Resource](FRHICommandListImmediate&) mutable
+        TSharedPtr<FVoxelLandRiverJob, ESPMode::ThreadSafe> Job = MoveTemp(RiverJob);
+        ENQUEUE_RENDER_COMMAND(VoxelLandReleaseBake)([Resource, Job](FRHICommandListImmediate&) mutable
             {
                 Resource.Reset();
+                Job.Reset();
             });
     }
 }
@@ -419,6 +439,35 @@ void FVoxelLandBake::BuildRelief()
     MaxRelief = VoxelLandRelief::Decode(Max);
 }
 
+void FVoxelLandBake::BuildProvinceStats()
+{
+    ProvinceLand.Init(0u, ProvinceLevels);
+    if (Province.Num() != NumCells() || Height.Num() != NumCells()) return;
+    for (int32 i = 0; i < Province.Num(); i++)
+        if (Height[i] > 0.0f)
+            ProvinceLand[FMath::Min((int32)Province[i], ProvinceLevels - 1)]++;
+}
+
+float FVoxelLandBake::ProvinceThreshold(double Coverage) const
+{
+    if (!(Coverage > 0.0) || ProvinceLand.Num() != ProvinceLevels) return 2.0f;
+    uint64 Total = 0;
+    for (const uint32 C : ProvinceLand) Total += C;
+    if (Total == 0) return 2.0f;
+    // From the top level down: level q's cells spread over [q - 1/2, q + 1/2] / (levels - 1).
+    const double Wanted = FMath::Min(Coverage, 1.0) * (double)Total;
+    double Above = 0.0;
+    const double Step = 1.0 / (double)(ProvinceLevels - 1);
+    for (int32 q = ProvinceLevels - 1; q >= 0; q--)
+    {
+        const double Count = (double)ProvinceLand[q];
+        if (Above + Count >= Wanted && Count > 0.0)
+            return (float)(((double)q + 0.5 - (Wanted - Above) / Count) * Step);
+        Above += Count;
+    }
+    return (float)(-0.5 * Step);
+}
+
 // ---------------------------------------------------------------------------------------------
 // The peaks' noise set
 // ---------------------------------------------------------------------------------------------
@@ -426,6 +475,33 @@ void FVoxelLandBake::BuildRelief()
 FVoxelLandNoiseSet::FVoxelLandNoiseSet()
     : GPU(MakeShared<FVoxelLandNoiseGPU, ESPMode::ThreadSafe>())
 {
+}
+
+FVoxelLandRiverSet::FVoxelLandRiverSet() = default;
+
+FVoxelLandRiverSet::~FVoxelLandRiverSet()
+{
+    if (GPU.IsValid())
+    {
+        TSharedPtr<FVoxelLandRiverGPU, ESPMode::ThreadSafe> Resource = MoveTemp(GPU);
+        ENQUEUE_RENDER_COMMAND(VoxelLandReleaseRivers)([Resource](FRHICommandListImmediate&) mutable
+            {
+                Resource.Reset();
+            });
+    }
+}
+
+uint32 VoxelLand::RiverKey(const FVoxelTerrestrialSettings& Settings)
+{
+    uint32 H = 0x52495652u;
+    for (const double V : { Settings.RiverMinArea, Settings.RiverWidthScale, Settings.ValleyWidthScale })
+        H = HashCombine(H, ::GetTypeHash(V));
+    return H;
+}
+
+double VoxelLand::RiverReachM(const FVoxelTerrestrialSettings& Settings, float Log2Area)
+{
+    return VoxelLandRivers::ReachScale * VoxelLandRivers::ValleyHalfWidthM(VoxelLandRivers::BeltM(Log2Area), FMath::Max(Settings.ValleyWidthScale, 0.1));
 }
 
 FVoxelLandNoiseSet::~FVoxelLandNoiseSet()
@@ -447,10 +523,10 @@ namespace VoxelLandNoiseDetail
     // The generated set's seed: one set for every planet (each planet offsets and turns it by its
     // own seed, VoxelLandPeaks.ush).
     constexpr uint32 PeakSetSeed = 0x7065616bu;
-    // The peaks' detail tile (T3e): likewise one for every planet, appended to every pack (the
-    // hills' set reads it too, T4a).
-    constexpr uint32 PeakDetailSeed = 0x64657461u;
-    constexpr uint32 PeakDetailN = 1024;
+    // The generated detail set (N1: the stand-in when the folder has no `detail*` sets),
+    // likewise one for every planet.
+    constexpr uint32 DetailSetSeed = 0x64657461u;
+    constexpr uint32 DetailStandInN = 1024;
     // The rows a pack may take (the material's texture holds them: a fixed limit, not this
     // RHI's, so every machine agrees on what the geometry has).
     constexpr uint64 MaxRows = 16384;
@@ -478,36 +554,11 @@ namespace VoxelLandNoiseDetail
     bool bDirectoryKnown = false;
     TArray<FString> AuthoredPeaks;
     TArray<FString> AuthoredHills;
+    TArray<FString> AuthoredStrata;
+    TArray<FString> AuthoredDetail;
     bool bListed = false;
     bool bExitHooked = false;
     bool bClosed = false;         // ReleaseLandNoise ran (the engine is exiting)
-
-    /** The peaks' detail tile (VoxelNoiseTiles::GeneratePeakDetail), made the first time a pack
-     *  is (MakeLock held) and kept for the session: 1 to 2 s of worker time on one thread, less
-     *  on several; 11 MB, and as much again in each pack's words (and their GPU copies). Made
-     *  even if every planet turns the detail off (a pack is shared across planets). Null if it
-     *  came out malformed (the detail is then off). */
-    const VoxelNoiseTiles::FSet* DetailLocked()
-    {
-        static TUniquePtr<VoxelNoiseTiles::FSet> Detail;
-        static bool bMade = false;
-        if (bMade) return Detail.Get();
-        bMade = true;
-        const double Start = FPlatformTime::Seconds();
-        VoxelNoiseTiles::FSet Set = VoxelNoiseTiles::GeneratePeakDetail(PeakDetailSeed, PeakDetailN, [](int32 Count, auto&& Body)
-            {
-                ParallelFor(Count, [&Body](int32 i) { Body(i); }, EParallelForFlags::BackgroundPriority);
-            });
-        if (!Set.IsValid() || Set.Channel[0].CellsPerTile == 0 || Set.N % Set.Channel[0].CellsPerTile != 0)
-        {
-            UE_LOG(LogVoxelPlugin, Error, TEXT("[VoxelLand] The peaks' detail tile came out malformed; the detail is off."));
-            return nullptr;
-        }
-        Detail = MakeUnique<VoxelNoiseTiles::FSet>(MoveTemp(Set));
-        UE_LOG(LogVoxelPlugin, Log, TEXT("[VoxelLand] Generated the peaks' detail tile (%u^2, %u mips) in %.2f s."), Detail->N, Detail->Mips,
-            FPlatformTime::Seconds() - Start);
-        return Detail.Get();
-    }
 
     /** Appends a chain (Texels: ChainTexels(N) texels, 4 x u16 each) to Out's words from a whole
      *  row; its first texel, or ~0 if the rows would pass MaxRows (MakeLock held). */
@@ -524,34 +575,9 @@ namespace VoxelLandNoiseDetail
         return Base;
     }
 
-    /** Appends the detail tile's chain to Out's words (MakeLock held). */
-    void AppendDetailLocked(FVoxelLandNoiseSet& Out)
-    {
-        const VoxelNoiseTiles::FSet* Detail = DetailLocked();
-        if (!Detail) return;
-        const uint32 Base = AppendChainLocked(Out, Detail->Texels.data(), Detail->N);
-        if (Base == ~0u)
-        {
-            UE_LOG(LogVoxelPlugin, Warning, TEXT("[VoxelLand] The noise pack %s can't take the detail tile in a texture's rows; its peaks and hills have no detail."),
-                *Out.Name);
-            return;
-        }
-        Out.DetailBase = Base;
-        Out.DetailN = Detail->N;
-        Out.DetailMips = Detail->Mips;
-        Out.DetailSpacingTexels = Detail->N / Detail->Channel[0].CellsPerTile;
-        auto Unit = [Detail](int Channel, double V) {
-            const VoxelNoiseTiles::FChannel& C = Detail->Channel[Channel];
-            return (V - (double)C.Min) / FMath::Max((double)C.Max - (double)C.Min, 1e-12);
-        };
-        Out.DetailMeanR = (float)VoxelNoiseTiles::MeanOf(*Detail, 0, [&](double V) { return Unit(0, V); });
-        Out.DetailMeanG = (float)VoxelNoiseTiles::MeanOf(*Detail, 1, [&](double V) { return Unit(1, V); });
-        Out.DetailRangeR = Detail->Channel[0].Max - Detail->Channel[0].Min;
-        Out.DetailRangeG = Detail->Channel[1].Max - Detail->Channel[1].Min;
-    }
-
     /** A set as read or generated: its checked header (CheckPeaks: the eroded layout, R and G
-     *  heights, B blurred, A flow, which the hills' sets share) and its chain's texels. */
+     *  heights, B blurred, A flow, which the hills' and strata's sets share; CheckDetail: the
+     *  detail sets') and its chain's texels. */
     struct FRead
     {
         VoxelNoiseTiles::FSet Header;
@@ -582,9 +608,35 @@ namespace VoxelLandNoiseDetail
         return true;
     }
 
-    /** An authored set from NoiseSetDirectory()/Name.vxnt: the header checked, then the texels
-     *  read straight into the words. False (and Error) if it can't be used. */
-    bool Read(const FString& Name, FRead& Out, FString& Error)
+    /** The plugin's own detail set (N1: VoxelNoiseTiles::GenerateDetailStandIn), in the authored
+     *  detail sets' layout: when the folder has none, or the one picked can't be used. */
+    bool GenerateDetail(FRead& Out)
+    {
+        const double Start = FPlatformTime::Seconds();
+        VoxelNoiseTiles::FSet Set = VoxelNoiseTiles::GenerateDetailStandIn(DetailSetSeed, DetailStandInN, [](int32 Count, auto&& Body)
+            {
+                ParallelFor(Count, [&Body](int32 i) { Body(i); }, EParallelForFlags::BackgroundPriority);
+            });
+        Set.Name = TCHAR_TO_UTF8(VoxelLand::GeneratedNoiseName);
+        const std::string Error = VoxelNoiseTiles::CheckDetail(Set);
+        if (!Error.empty() || !Set.IsValid())
+        {
+            UE_LOG(LogVoxelPlugin, Error, TEXT("[VoxelLand] The generated detail set is malformed (%s); the detail is off."), UTF8_TO_TCHAR(Error.c_str()));
+            return false;
+        }
+        Out.Texels.SetNumUninitialized((int32)(2 * VoxelNoiseTiles::ChainTexels(Set.N)));
+        FMemory::Memcpy(Out.Texels.GetData(), Set.Texels.data(), Set.Texels.size() * sizeof(uint16));
+        Set.Texels.clear();
+        Out.Header = MoveTemp(Set);
+        UE_LOG(LogVoxelPlugin, Log, TEXT("[VoxelLand] Generated the detail set (%u^2, %u mips) in %.2f s."), Out.Header.N, Out.Header.Mips,
+            FPlatformTime::Seconds() - Start);
+        return true;
+    }
+
+    /** An authored set from NoiseSetDirectory()/Name.vxnt: the header checked (bDetail:
+     *  CheckDetail, else CheckPeaks), then the texels read straight into the words. False (and
+     *  Error) if it can't be used. */
+    bool Read(const FString& Name, FRead& Out, FString& Error, bool bDetail = false)
     {
         const double Start = FPlatformTime::Seconds();
         const FString Folder = VoxelLand::NoiseSetDirectory();
@@ -613,7 +665,7 @@ namespace VoxelLandNoiseDetail
         uint64_t DataOffset = 0;
         std::string Why = VoxelNoiseTiles::ReadVxntHeader(Header.GetData(), (size_t)Header.Num(), (uint64_t)FileSize, Set, DataOffset);
         if (Why.empty())
-            Why = VoxelNoiseTiles::CheckPeaks(Set);
+            Why = bDetail ? VoxelNoiseTiles::CheckDetail(Set) : VoxelNoiseTiles::CheckPeaks(Set);
         if (!Why.empty() || File->IsError())
         {
             Error = FString::Printf(TEXT("%s: %s"), *Path, Why.empty() ? TEXT("unreadable") : UTF8_TO_TCHAR(Why.c_str()));
@@ -642,16 +694,21 @@ namespace VoxelLandNoiseDetail
         return (V - (double)C.Min) / FMath::Max((double)C.Max - (double)C.Min, 1e-12);
     }
 
-    /** Makes the pack Key ("Peaks|Hills"; MakeLock held): the peaks' set from texel 0 (read, or
-     *  generated: also when the file can't be used), the detail tile, the hills' set (left out
-     *  when it can't be used: the procedural hills then). Null if it holds nothing. */
+    /** Makes the pack Key ("Peaks|Hills|Strata|Detail"; MakeLock held): the peaks' set from
+     *  texel 0 (read, or generated: also when the file can't be used), the detail set (N1: read,
+     *  or generated likewise), the hills' set (left out when it can't be used: the procedural
+     *  hills then), the strata's (T4c; left out when it can't be used, or without the hills'
+     *  set). Null if it holds nothing. */
     TSharedPtr<const FVoxelLandNoiseSet, ESPMode::ThreadSafe> MakePackLocked(const FString& Key)
     {
-        FString PeakName, HillName;
-        if (!Key.Split(TEXT("|"), &PeakName, &HillName))
-            PeakName = Key;
-        FRead Peaks, Hills;
-        bool bPeaks = false, bHills = false;
+        TArray<FString> Parts;
+        Key.ParseIntoArray(Parts, TEXT("|"), false);
+        const FString PeakName = Parts.Num() > 0 ? Parts[0] : FString();
+        const FString HillName = Parts.Num() > 1 ? Parts[1] : FString();
+        const FString StrataName = Parts.Num() > 2 ? Parts[2] : FString();
+        const FString DetailName = Parts.Num() > 3 ? Parts[3] : FString();
+        FRead Peaks, Hills, Strata, Detail;
+        bool bPeaks = false, bHills = false, bStrata = false, bDetail = false;
         if (!PeakName.IsEmpty())
         {
             FString Error;
@@ -670,12 +727,33 @@ namespace VoxelLandNoiseDetail
             if (!bHills)
                 UE_LOG(LogVoxelPlugin, Error, TEXT("[VoxelLand] The hills' noise set %s can't be used (%s); the procedural hills stand in."), *HillName, *Error);
         }
-        if (!bPeaks && !bHills) return nullptr;
+        if (!StrataName.IsEmpty() && bHills)
+        {
+            FString Error;
+            bStrata = Read(StrataName, Strata, Error);
+            if (!bStrata)
+                UE_LOG(LogVoxelPlugin, Error, TEXT("[VoxelLand] The strata's noise set %s can't be used (%s); the hills cover the sedimentary provinces too."), *StrataName, *Error);
+        }
+        FString DetailRead = DetailName;
+        if (!DetailName.IsEmpty())
+        {
+            FString Error;
+            bDetail = DetailName != VoxelLand::GeneratedNoiseName && Read(DetailName, Detail, Error, true);
+            if (!bDetail)
+            {
+                if (DetailName != VoxelLand::GeneratedNoiseName)
+                    UE_LOG(LogVoxelPlugin, Error, TEXT("[VoxelLand] The detail noise set %s can't be used (%s); the generated set stands in."), *DetailName, *Error);
+                DetailRead = VoxelLand::GeneratedNoiseName;
+                bDetail = GenerateDetail(Detail);
+            }
+        }
+        if (!bPeaks && !bHills && !bDetail) return nullptr;
         const TSharedPtr<FVoxelLandNoiseSet, ESPMode::ThreadSafe> Out = MakeShared<FVoxelLandNoiseSet, ESPMode::ThreadSafe>();
         Out->Name = Key;
-        // The rows' width: the widest chain's (a small peaks set beside a large hills set would
-        // otherwise take far more rows).
-        Out->RowN = FMath::Max(bPeaks ? Peaks.Header.N : 0u, bHills ? Hills.Header.N : 0u);
+        // The rows' width: the widest chain's (a small set beside a large one would otherwise
+        // take far more rows).
+        Out->RowN = FMath::Max(FMath::Max3(bPeaks ? Peaks.Header.N : 0u, bHills ? Hills.Header.N : 0u, bStrata ? Strata.Header.N : 0u),
+            bDetail ? Detail.Header.N : 0u);
         if (bPeaks)
         {
             const VoxelNoiseTiles::FSet& Set = Peaks.Header;
@@ -693,8 +771,38 @@ namespace VoxelLandNoiseDetail
             Out->RangeB = Set.Channel[2].Max - Set.Channel[2].Min;
             Peaks.Texels.Empty();
         }
-        // The hills' set before the detail when there are no peaks (the rows' width is its).
-        auto AppendHills = [&]()
+        if (bDetail)
+        {
+            const VoxelNoiseTiles::FSet& Set = Detail.Header;
+            const uint32 Base = AppendChainLocked(*Out, Detail.Texels.GetData(), Set.N);
+            if (Base == ~0u)
+            {
+                UE_LOG(LogVoxelPlugin, Warning, TEXT("[VoxelLand] The noise pack %s can't take the detail set %s in a texture's rows; no detail."),
+                    *Key, *DetailRead);
+            }
+            else
+            {
+                // Its statistics from mip 0 (a few hundredths of a second for a 2048 set).
+                const VoxelNoiseTiles::FDetailStats Stats = VoxelNoiseTiles::DetailStatsOf(Set, (const uint16*)Detail.Texels.GetData());
+                Out->DetailName = DetailRead;
+                Out->DetailBase = Base;
+                Out->DetailN = Set.N;
+                Out->DetailMips = Set.Mips;
+                Out->DetailSpacingTexels = Set.N / Set.Channel[0].CellsPerTile;
+                Out->DetailMeanHard = (float)Stats.MeanHard;
+                Out->DetailMeanSoft = (float)Stats.MeanSoft;
+                Out->DetailRangeHard = (float)Stats.RangeHard;
+                Out->DetailRangeSoft = (float)Stats.RangeSoft;
+                Out->DetailMeanA = (float)Stats.MeanA;
+                Out->DetailStdA = (float)Stats.StdA;
+                Out->DetailScaleGain = (float)Stats.ScaleGain;
+                Out->DetailBoundA = (float)Stats.BoundA;
+                UE_LOG(LogVoxelPlugin, Log, TEXT("[VoxelLand] Detail set %s: hard rock (G) %.2f texels, soft rock (R) %.2f texels; the detail layer's bound %.2f."),
+                    *DetailRead, Stats.RangeHard, Stats.RangeSoft, Stats.BoundA);
+            }
+            Detail.Texels.Empty();
+        }
+        if (bHills)
         {
             const VoxelNoiseTiles::FSet& Set = Hills.Header;
             const uint32 Base = AppendChainLocked(*Out, Hills.Texels.GetData(), Set.N);
@@ -702,21 +810,47 @@ namespace VoxelLandNoiseDetail
             {
                 UE_LOG(LogVoxelPlugin, Warning, TEXT("[VoxelLand] The noise pack %s can't take the hills' set %s in a texture's rows; the procedural hills stand in."),
                     *Key, *HillName);
-                return;
             }
-            Out->HillName = HillName;
-            Out->HillBase = Base;
-            Out->HillN = Set.N;
-            Out->HillMips = Set.Mips;
-            Out->HillSpacingTexels = Set.N / Set.Channel[0].CellsPerTile;
-            Out->HillRangeR = Set.Channel[0].Max - Set.Channel[0].Min;
-            Out->HillRangeG = Set.Channel[1].Max - Set.Channel[1].Min;
-            Out->HillRangeB = Set.Channel[2].Max - Set.Channel[2].Min;
+            else
+            {
+                Out->HillName = HillName;
+                Out->HillBase = Base;
+                Out->HillN = Set.N;
+                Out->HillMips = Set.Mips;
+                Out->HillSpacingTexels = Set.N / Set.Channel[0].CellsPerTile;
+                Out->HillRangeR = Set.Channel[0].Max - Set.Channel[0].Min;
+                Out->HillRangeG = Set.Channel[1].Max - Set.Channel[1].Min;
+                Out->HillRangeB = Set.Channel[2].Max - Set.Channel[2].Min;
+                // R's and G's means (unit values), for the face blend (N1b).
+                Out->HillMeanR = (float)VoxelNoiseTiles::MeanOf(Set, (const uint16*)Hills.Texels.GetData(), 0, [&](double V) { return UnitOf(Set, 0, V); });
+                Out->HillMeanG = (float)VoxelNoiseTiles::MeanOf(Set, (const uint16*)Hills.Texels.GetData(), 1, [&](double V) { return UnitOf(Set, 1, V); });
+            }
             Hills.Texels.Empty();
-        };
-        if (bHills && !bPeaks) AppendHills();
-        AppendDetailLocked(*Out);
-        if (bHills && bPeaks) AppendHills();
+        }
+        if (bStrata && Out->HillN > 0)
+        {
+            const VoxelNoiseTiles::FSet& Set = Strata.Header;
+            const uint32 Base = AppendChainLocked(*Out, Strata.Texels.GetData(), Set.N);
+            if (Base == ~0u)
+            {
+                UE_LOG(LogVoxelPlugin, Warning, TEXT("[VoxelLand] The noise pack %s can't take the strata's set %s in a texture's rows; the hills cover the sedimentary provinces too."),
+                    *Key, *StrataName);
+            }
+            else
+            {
+                Out->StrataName = StrataName;
+                Out->StrataBase = Base;
+                Out->StrataN = Set.N;
+                Out->StrataMips = Set.Mips;
+                Out->StrataSpacingTexels = Set.N / Set.Channel[0].CellsPerTile;
+                Out->StrataRangeR = Set.Channel[0].Max - Set.Channel[0].Min;
+                Out->StrataRangeG = Set.Channel[1].Max - Set.Channel[1].Min;
+                Out->StrataRangeB = Set.Channel[2].Max - Set.Channel[2].Min;
+                Out->StrataMeanR = (float)VoxelNoiseTiles::MeanOf(Set, (const uint16*)Strata.Texels.GetData(), 0, [&](double V) { return UnitOf(Set, 0, V); });
+                Out->StrataMeanG = (float)VoxelNoiseTiles::MeanOf(Set, (const uint16*)Strata.Texels.GetData(), 1, [&](double V) { return UnitOf(Set, 1, V); });
+            }
+            Strata.Texels.Empty();
+        }
         return Out;
     }
 
@@ -772,18 +906,21 @@ namespace VoxelLandNoiseDetail
         return Name;
     }
 
-    /** Lists the folder's usable peaks* and hills* sets (Lock held, Directory known; once a
-     *  session): their headers read and checked, so a file that can't be used doesn't take a
-     *  share of the planets. A few small reads, on the game thread the first time a planet asks. */
+    /** Lists the folder's usable peaks*, hills*, strata* and detail* sets (Lock held, Directory
+     *  known; once a session): their headers read and checked, so a file that can't be used
+     *  doesn't take a share of the planets. A few small reads, on the game thread the first time
+     *  a planet asks. */
     void ListLocked()
     {
         if (bListed) return;
         bListed = true;
         const FString Folder = Directory;
-        for (int32 Kind = 0; Kind < 2; Kind++)
+        const TCHAR* Patterns[4] = { TEXT("peaks*.vxnt"), TEXT("hills*.vxnt"), TEXT("strata*.vxnt"), TEXT("detail*.vxnt") };
+        TArray<FString>* Lists[4] = { &AuthoredPeaks, &AuthoredHills, &AuthoredStrata, &AuthoredDetail };
+        for (int32 Kind = 0; Kind < 4; Kind++)
         {
-            const TCHAR* Pattern = Kind == 0 ? TEXT("peaks*.vxnt") : TEXT("hills*.vxnt");
-            TArray<FString>& List = Kind == 0 ? AuthoredPeaks : AuthoredHills;
+            const TCHAR* Pattern = Patterns[Kind];
+            TArray<FString>& List = *Lists[Kind];
             TArray<FString> Files;
             if (!Folder.IsEmpty())
                 IFileManager::Get().FindFiles(Files, *FPaths::Combine(Folder, Pattern), true, false);
@@ -800,16 +937,18 @@ namespace VoxelLandNoiseDetail
                 uint64_t DataOffset = 0;
                 std::string Why = Header.Num() > 0 && !Reader->IsError()
                     ? VoxelNoiseTiles::ReadVxntHeader(Header.GetData(), (size_t)Header.Num(), (uint64_t)Size, Set, DataOffset) : std::string("unreadable");
-                if (Why.empty()) Why = VoxelNoiseTiles::CheckPeaks(Set);
+                if (Why.empty()) Why = Kind == 3 ? VoxelNoiseTiles::CheckDetail(Set) : VoxelNoiseTiles::CheckPeaks(Set);
                 if (Why.empty())
                     List.Add(FPaths::GetBaseFilename(File));
                 else
                     UE_LOG(LogVoxelPlugin, Warning, TEXT("[VoxelLand] %s isn't a usable set (%s); left out."), *Path, UTF8_TO_TCHAR(Why.c_str()));
             }
         }
-        UE_LOG(LogVoxelPlugin, Log, TEXT("[VoxelLand] Noise sets in %s: peaks %s; hills %s."), *Folder,
+        UE_LOG(LogVoxelPlugin, Log, TEXT("[VoxelLand] Noise sets in %s: peaks %s; hills %s; strata %s; detail %s."), *Folder,
             AuthoredPeaks.Num() > 0 ? *FString::Join(AuthoredPeaks, TEXT(", ")) : TEXT("none (the generated set stands in)"),
-            AuthoredHills.Num() > 0 ? *FString::Join(AuthoredHills, TEXT(", ")) : TEXT("none (the procedural hills stand in)"));
+            AuthoredHills.Num() > 0 ? *FString::Join(AuthoredHills, TEXT(", ")) : TEXT("none (the procedural hills stand in)"),
+            AuthoredStrata.Num() > 0 ? *FString::Join(AuthoredStrata, TEXT(", ")) : TEXT("none (the hills cover the sedimentary provinces)"),
+            AuthoredDetail.Num() > 0 ? *FString::Join(AuthoredDetail, TEXT(", ")) : TEXT("none (the generated set stands in)"));
     }
 
     /** One of Names by the seed, rendezvous-hashed (the name with the highest hash of the seed and
@@ -870,12 +1009,55 @@ FString VoxelLand::HillNoiseNameFor(const FVoxelTerrestrialSettings& Settings)
     return Best ? *Best : FString();
 }
 
+FString VoxelLand::StrataNoiseNameFor(const FVoxelTerrestrialSettings& Settings)
+{
+    using namespace VoxelLandNoiseDetail;
+    if (Settings.StrataHeightScale <= 0.0 || Settings.StrataCoverage <= 0.0) return FString();
+    if (Settings.StrataNoiseSet.TrimStartAndEnd().Equals(TEXT("none"), ESearchCase::IgnoreCase)) return FString();
+    // They ride the hill set's layer.
+    if (HillNoiseNameFor(Settings).IsEmpty()) return FString();
+    const FString Chosen = CleanName(Settings.StrataNoiseSet, TEXT("StrataNoiseSet"));
+    if (!Chosen.IsEmpty()) return Chosen;
+    NoiseSetDirectory();
+    FScopeLock ScopeLock(&Lock);
+    ListLocked();
+    const FString* Best = PickBySeed(AuthoredStrata, Settings.Seed, 0x73747261u);
+    return Best ? *Best : FString();
+}
+
+FString VoxelLand::DetailNoiseNameFor(const FVoxelTerrestrialSettings& Settings)
+{
+    using namespace VoxelLandNoiseDetail;
+    if (Settings.DetailNoiseSet.TrimStartAndEnd().Equals(TEXT("none"), ESearchCase::IgnoreCase)) return FString();
+    // Read by the detail layer, and by the peaks', hills' and strata's detail.
+    const bool bRead = Settings.DetailAmplitude > 0.0
+        || (Settings.PeakDetailStrength > 0.0 && !PeakNoiseNameFor(Settings).IsEmpty())
+        || (Settings.HillDetailStrength > 0.0 && !HillNoiseNameFor(Settings).IsEmpty())
+        || (Settings.StrataDetailStrength > 0.0 && !StrataNoiseNameFor(Settings).IsEmpty());
+    if (!bRead) return FString();
+    const FString Chosen = CleanName(Settings.DetailNoiseSet, TEXT("DetailNoiseSet"));
+    if (!Chosen.IsEmpty()) return Chosen;
+    NoiseSetDirectory();
+    FScopeLock ScopeLock(&Lock);
+    ListLocked();
+    // Name it in DetailNoiseSet to keep a planet's set whatever the folder holds.
+    const FString* Best = PickBySeed(AuthoredDetail, Settings.Seed, 0x64657461u);
+    return Best ? *Best : FString(GeneratedNoiseName);
+}
+
+double VoxelLand::DetailLayerWavelength(const FVoxelTerrestrialSettings& Settings)
+{
+    return FMath::Max(Settings.DetailWavelength, 100.0);
+}
+
 FString VoxelLand::LandNoiseNameFor(const FVoxelTerrestrialSettings& Settings)
 {
     const FString Peaks = PeakNoiseNameFor(Settings);
     const FString Hills = HillNoiseNameFor(Settings);
-    if (Peaks.IsEmpty() && Hills.IsEmpty()) return FString();
-    return Peaks + TEXT("|") + Hills;
+    const FString Strata = StrataNoiseNameFor(Settings);
+    const FString Detail = DetailNoiseNameFor(Settings);
+    if (Peaks.IsEmpty() && Hills.IsEmpty() && Detail.IsEmpty()) return FString();
+    return Peaks + TEXT("|") + Hills + TEXT("|") + Strata + TEXT("|") + Detail;
 }
 
 TSharedPtr<const FVoxelLandNoiseSet, ESPMode::ThreadSafe> VoxelLand::GetLandNoise(const FString& Key)
@@ -1035,6 +1217,24 @@ float VoxelLand::HillTexelsPerCell(const FVoxelTerrestrialSettings& Settings, co
     return (float)(CellArc(Bake.SeaRadius, Bake.N) * 0.01 / TexelM);
 }
 
+float VoxelLand::StrataTexelsPerCell(const FVoxelTerrestrialSettings& Settings, const FVoxelLandBake& Bake, const FVoxelLandNoiseSet& Set)
+{
+    if (Settings.StrataHeightScale <= 0.0 || Settings.StrataCoverage <= 0.0 || Set.StrataN == 0 || Set.StrataSpacingTexels == 0) return 0.0f;
+    if (HillTexelsPerCell(Settings, Bake, Set) <= 0.0f) return 0.0f;
+    const double TexelM = FMath::Max(Settings.StrataSpacing, HillMinSpacing) / (double)Set.StrataSpacingTexels;
+    return (float)(CellArc(Bake.SeaRadius, Bake.N) * 0.01 / TexelM);
+}
+
+double VoxelLand::StrataSetReliefCap(const FVoxelTerrestrialSettings& Settings)
+{
+    return FMath::Max(Settings.StrataHeightScale, 0.0) * 0.5 * FMath::Max(Settings.StrataSpacing, HillMinSpacing);
+}
+
+double VoxelLand::StrataDetailWavelength(const FVoxelTerrestrialSettings& Settings)
+{
+    return FMath::Clamp(Settings.StrataDetailWavelength, 16.0, 0.25 * FMath::Max(Settings.StrataSpacing, HillMinSpacing));
+}
+
 double VoxelLand::HillSetReliefCap(const FVoxelTerrestrialSettings& Settings)
 {
     return FMath::Max(Settings.HillHeightScale, 0.0) * 0.5 * FMath::Max(Settings.HillSpacing, HillMinSpacing);
@@ -1045,22 +1245,27 @@ double VoxelLand::HillDetailWavelength(const FVoxelTerrestrialSettings& Settings
     return FMath::Clamp(Settings.HillDetailWavelength, 16.0, 0.25 * FMath::Max(Settings.HillSpacing, HillMinSpacing));
 }
 
-double VoxelLand::PeakReach(const FVoxelTerrestrialSettings& Settings, const FVoxelLandBake& Bake, bool bUp)
+double VoxelLand::PeakReach(const FVoxelTerrestrialSettings& Settings, const FVoxelLandBake& Bake, const FVoxelLandNoiseSet* Noise, bool bUp)
 {
-    // The amplitude is at most the strength times the largest local relief, the shape within
-    // -1 .. 1 (over the larger of R's and G's ranges, each channel's mean within its range; the
-    // blends and the B-splines are convex). The detail adds its unit times the same amplitude,
-    // at most strength x DetailRangeTexels texels (the tile's bound about its mean) at its
-    // texel (VoxelLandPeaks.ush: its scale is that over the peaks' relief, the amplitude at most
-    // the height scale times that relief).
+    // The amplitude is at most the strength times the smaller of the bake's largest local relief
+    // and the set's own relief (VoxelLandPeakAmplitude), one face's shape within -1 .. 1 (over the
+    // larger of R's and G's ranges, each channel's mean within its range; the B-splines are
+    // convex). The detail adds its unit times the same amplitude, at most strength x
+    // DetailRangeWaves of its wavelength (the detail set's bound about its means,
+    // VoxelNoiseTiles::DetailStatsOf; VoxelLandPeaks.ush: its scale is that over the peaks'
+    // relief, the amplitude at most the height scale times that relief). The face blend keeps the
+    // variance about the zero mean: FaceBlendBound times that either way (N1b).
     if (Settings.PeakHeightScale <= 0.0) return 0.0;
-    double Reach = FMath::Max(Settings.PeakHeightScale, 0.0) * (double)Bake.MaxRelief;
-    if (Settings.PeakDetailStrength > 0.0)
+    double Relief = (double)Bake.MaxRelief;
+    if (Noise && Noise->N > 0 && Noise->SpacingTexels > 0)
     {
-        const double DetailTexelM = PeakDetailWavelength(Settings) * (double)VoxelNoiseTiles::DetailCells / (double)VoxelLandNoiseDetail::PeakDetailN;
-        Reach += Settings.PeakHeightScale * Settings.PeakDetailStrength * VoxelNoiseTiles::DetailRangeTexels * DetailTexelM;
+        const double TexelM = FMath::Max(Settings.PeakSpacing, PeakMinSpacing) / (double)Noise->SpacingTexels;
+        Relief = FMath::Min(Relief, FMath::Max3((double)Noise->RangeR, (double)Noise->RangeG, 1e-6) * TexelM);
     }
-    return Reach * 100.0;
+    double Reach = FMath::Max(Settings.PeakHeightScale, 0.0) * Relief;
+    if (Settings.PeakDetailStrength > 0.0)
+        Reach += Settings.PeakHeightScale * Settings.PeakDetailStrength * VoxelNoiseTiles::DetailRangeWaves * PeakDetailWavelength(Settings);
+    return 1.01 * FaceBlendBound * Reach * 100.0;
 }
 
 double VoxelLand::GullyReach(const FVoxelTerrestrialSettings& Settings, const FVoxelLandBake& Bake)
@@ -1083,41 +1288,56 @@ void VoxelLand::ShapeFor(const FVoxelTerrestrialSettings& Settings, const FVoxel
     double& OutPlanetRadius, double& OutNoiseAmplitude)
 {
     // The B-spline and the face blend are convex combinations of the cells, so the bake's
-    // range holds; the detail reaches at most about 2.4 times its amplitude (MakeLayer's
-    // normalisation), the gullies GullyReach either way, the hills HillMaxUnit times their
-    // relief (up; down by less), the peaks PeakReach up (and down from the land's lowest, sea
-    // level), and a metre of margin either side.
-    const double DetailReach = 2.5 * FMath::Max(Settings.DetailAmplitude, 0.0) * 100.0;
+    // range holds; the detail layer reaches at most its set's bound times its amplitude (N1:
+    // VoxelNoiseTiles::DetailStatsOf, a percent over; 2.5 without the pack's detail set), the
+    // gullies GullyReach either way, the hills HillMaxUnit times their relief (up; down by
+    // less), the peaks PeakReach up (and down from the land's lowest, sea level), and a metre of
+    // margin either side.
+    const double DetailUnit = Noise && Noise->DetailN > 0 ? 1.01 * (double)Noise->DetailBoundA : 0.0;
+    const double DetailReach = DetailUnit * FMath::Max(Settings.DetailAmplitude, 0.0) * 100.0;
     // The procedural hills (m): up, and down by less (bounded the same).
     double HillUp = HillMaxUnit * FMath::Max(Settings.HillRelief, 0.0);
     double HillDown = HillUp;
     if (Noise && HillTexelsPerCell(Settings, Bake, *Noise) > 0.0f)
     {
-        // The hill set (T4a, VoxelLandHillSet.ush; the density's numbers): its unit within 0 .. 1
-        // from its base network up (over the larger of R's and G's ranges) times its relief,
-        // capped (HillSetReliefCap); the swells' height on top; the detail (DetailRangeTexels at
-        // its texel, either way, as PeakReach) scaled by the same relief. Up only, but for the
-        // detail. A percent of margin for the density's float arithmetic.
+        // The hill set (T4a, VoxelLandHillSet.ush; the density's numbers): one face's unit within
+        // 0 .. 1 from its base network up (over the larger of R's and G's ranges) times its
+        // relief, capped (HillSetReliefCap); the swells' height on top; the detail
+        // (DetailRangeWaves of its wavelength, either way, as PeakReach) scaled by the same
+        // relief. The face blend keeps the variance about the mean M (N1b): up to K = sqrt 3
+        // times one face's unit, and down to K (-detail) - (K - 1) M, M at most 1. A percent of
+        // margin for the density's float arithmetic.
         const double TexelM = FMath::Max(Settings.HillSpacing, HillMinSpacing) / (double)Noise->HillSpacingTexels;
         const double ReliefM = FMath::Max3((double)Noise->HillRangeR, (double)Noise->HillRangeG, 1e-6) * TexelM;
         const double Relief = FMath::Min(FMath::Max(Settings.HillHeightScale, 0.0) * ReliefM, HillSetReliefCap(Settings));
         double Detail = 0.0;
         if (Settings.HillDetailStrength > 0.0 && Noise->DetailN > 0 && Noise->DetailSpacingTexels > 0)
-        {
-            const double DetailTexelM = HillDetailWavelength(Settings) / (double)Noise->DetailSpacingTexels;
-            Detail = Settings.HillDetailStrength * VoxelNoiseTiles::DetailRangeTexels * DetailTexelM * Relief / ReliefM;
-        }
+            Detail = Settings.HillDetailStrength * VoxelNoiseTiles::DetailRangeWaves * HillDetailWavelength(Settings) * Relief / ReliefM;
         // The foothill growth (T4b) multiplies the hills and swells by (1 - P)(1 + G 4P(1 - P)),
         // which peaks above 1 (about 1.32 at G = 1); 1 + G bounds it.
         const double Growth = 1.0 + FMath::Clamp(Settings.HillFoothillGrowth, 0.0, 2.0);
-        HillUp = 1.01 * Growth * (Relief + FMath::Max(Settings.HillSwellHeight, 0.0) + Detail);
-        HillDown = 1.01 * Growth * Detail;
+        const double Swell = FMath::Max(Settings.HillSwellHeight, 0.0);
+        HillUp = 1.01 * Growth * FaceBlendBound * (Relief + Swell + Detail);
+        HillDown = 1.01 * Growth * (FaceBlendBound * Detail + (FaceBlendBound - 1.0) * (Relief + Swell));
+        if (StrataTexelsPerCell(Settings, Bake, *Noise) > 0.0f)
+        {
+            // The strata (T4c): the same bound from their own set. They share the layer with the
+            // hills by S and 1 - S, so the larger of the two bounds holds.
+            const double STexelM = FMath::Max(Settings.StrataSpacing, HillMinSpacing) / (double)Noise->StrataSpacingTexels;
+            const double SReliefM = FMath::Max3((double)Noise->StrataRangeR, (double)Noise->StrataRangeG, 1e-6) * STexelM;
+            const double SRelief = FMath::Min(FMath::Max(Settings.StrataHeightScale, 0.0) * SReliefM, StrataSetReliefCap(Settings));
+            double SDetail = 0.0;
+            if (Settings.StrataDetailStrength > 0.0 && Noise->DetailN > 0 && Noise->DetailSpacingTexels > 0)
+                SDetail = Settings.StrataDetailStrength * VoxelNoiseTiles::DetailRangeWaves * StrataDetailWavelength(Settings) * SRelief / SReliefM;
+            HillUp = FMath::Max(HillUp, 1.01 * FaceBlendBound * (SRelief + SDetail));
+            HillDown = FMath::Max(HillDown, 1.01 * (FaceBlendBound * SDetail + (FaceBlendBound - 1.0) * SRelief));
+        }
     }
     // (Summed in the order T3 did, so a planet without a hill set keeps its shape exactly.)
     const double ReachDown = DetailReach + GullyReach(Settings, Bake) + HillDown * 100.0 + 100.0;
     const double ReachUp = DetailReach + GullyReach(Settings, Bake) + HillUp * 100.0 + 100.0;
-    const double Low = FMath::Min((double)Bake.MinHeight * 100.0, -PeakReach(Settings, Bake, false)) - ReachDown;
-    const double High = (double)Bake.MaxHeight * 100.0 + PeakReach(Settings, Bake, true) + ReachUp;
+    const double Low = FMath::Min((double)Bake.MinHeight * 100.0, -PeakReach(Settings, Bake, Noise, false)) - ReachDown;
+    const double High = (double)Bake.MaxHeight * 100.0 + PeakReach(Settings, Bake, Noise, true) + ReachUp;
     OutPlanetRadius = FMath::Max(Bake.SeaRadius + Low, 1.0);
     OutNoiseAmplitude = FMath::Max(High - Low, 1.0);
 }
@@ -1146,12 +1366,12 @@ namespace VoxelLandCache
         float ReliefFactor = 1.0f;
     };
 
-    /** The raw (uncompressed) size of a bake's data: heights, attributes, landform, then for an
+    /** The raw (uncompressed) size of a bake's data: heights, attributes, landform, province, then for an
      *  eroded bake the drainage and the lake levels, then the lakes. */
     int64 RawBytes(int64 NumCells, bool bEroded, int64 NumLakes)
     {
-        return NumCells * (int64)(sizeof(float) + 2 * sizeof(uint16))
-            + (bEroded ? NumCells * (int64)(sizeof(uint16) + sizeof(float)) : 0)
+        return NumCells * (int64)(sizeof(float) + 2 * sizeof(uint16) + sizeof(uint8))
+            + (bEroded ? NumCells * (int64)(sizeof(uint16) + sizeof(float) + sizeof(int32)) : 0)
             + NumLakes * (int64)sizeof(FVoxelLandLake);
     }
 
@@ -1161,8 +1381,9 @@ namespace VoxelLandCache
     /** A bake fit to keep or use: finite heights and a range. */
     bool IsUsable(const FVoxelLandBake& Bake)
     {
-        if (Bake.Height.Num() != Bake.NumCells() || Bake.Attr.Num() != Bake.NumCells() || Bake.Form.Num() != Bake.NumCells()) return false;
-        if (Bake.bEroded && (Bake.Flow.Num() != Bake.NumCells() || Bake.Water.Num() != Bake.NumCells())) return false;
+        if (Bake.Height.Num() != Bake.NumCells() || Bake.Attr.Num() != Bake.NumCells() || Bake.Form.Num() != Bake.NumCells()
+            || Bake.Province.Num() != Bake.NumCells()) return false;
+        if (Bake.bEroded && (Bake.Flow.Num() != Bake.NumCells() || Bake.Water.Num() != Bake.NumCells() || Bake.Receiver.Num() != Bake.NumCells())) return false;
         if (!(Bake.MinHeight <= Bake.MaxHeight)) return false;
         for (const float H : Bake.Height)
         {
@@ -1209,10 +1430,17 @@ namespace VoxelLandCache
         Append(Bake.Height.GetData(), NumCells * sizeof(float));
         Append(Bake.Attr.GetData(), NumCells * sizeof(uint16));
         Append(Bake.Form.GetData(), NumCells * sizeof(uint16));
+        Append(Bake.Province.GetData(), NumCells * sizeof(uint8));
         if (Bake.bEroded)
         {
             Append(Bake.Flow.GetData(), NumCells * sizeof(uint16));
             Append(Bake.Water.GetData(), NumCells * sizeof(float));
+            // The receivers as differences from their cells (0: none), mostly a few small values.
+            TArray<int32> Delta;
+            Delta.SetNumUninitialized((int32)NumCells);
+            for (int32 i = 0; i < (int32)NumCells; i++)
+                Delta[i] = Bake.Receiver[i] == ~0u ? 0 : (int32)(Bake.Receiver[i] - (uint32)i);
+            Append(Delta.GetData(), NumCells * sizeof(int32));
         }
         Append(Bake.Lakes.GetData(), (int64)Bake.Lakes.Num() * sizeof(FVoxelLandLake));
 
@@ -1303,21 +1531,32 @@ namespace VoxelLandCache
         Bake->Height.SetNumUninitialized((int32)NumCells);
         Bake->Attr.SetNumUninitialized((int32)NumCells);
         Bake->Form.SetNumUninitialized((int32)NumCells);
+        Bake->Province.SetNumUninitialized((int32)NumCells);
         Take(Bake->Height.GetData(), NumCells * sizeof(float));
         Take(Bake->Attr.GetData(), NumCells * sizeof(uint16));
         Take(Bake->Form.GetData(), NumCells * sizeof(uint16));
+        Take(Bake->Province.GetData(), NumCells * sizeof(uint8));
         if (Bake->bEroded)
         {
             Bake->Flow.SetNumUninitialized((int32)NumCells);
             Bake->Water.SetNumUninitialized((int32)NumCells);
             Take(Bake->Flow.GetData(), NumCells * sizeof(uint16));
             Take(Bake->Water.GetData(), NumCells * sizeof(float));
+            Bake->Receiver.SetNumUninitialized((int32)NumCells);
+            Take(Bake->Receiver.GetData(), NumCells * sizeof(int32));
+            for (int32 i = 0; i < (int32)NumCells; i++)
+            {
+                const int32 Delta = (int32)Bake->Receiver[i];
+                Bake->Receiver[i] = Delta == 0 ? ~0u : (uint32)(i + Delta);
+                if (Bake->Receiver[i] >= (uint32)NumCells) Bake->Receiver[i] = ~0u;
+            }
         }
         Bake->Lakes.SetNumUninitialized(Header.LakeCount);
         Take(Bake->Lakes.GetData(), (int64)Header.LakeCount * sizeof(FVoxelLandLake));
         Bake->BuildTanTable();
         Bake->UpdateRange();
         Bake->BuildRelief();
+        Bake->BuildProvinceStats();
         if (!IsUsable(*Bake))
         {
             UE_LOG(LogVoxelPlugin, Warning, TEXT("[VoxelLand] Cache file %s holds an invalid bake; baking again."), *Path);
@@ -1500,8 +1739,14 @@ namespace VoxelLandBakeDetail
         S.Hillslope = (float)FMath::Clamp(Settings.HillslopeSteepness, 0.25, 8.0);
         S.ChannelCharacter = (float)FMath::Clamp(Settings.ChannelCharacterInfluence, 0.0, 1.0);
         S.bErode = VoxelLand::IsErosionEnabled();
+        // R1b: the rivers, built on the GPU right after the routing.
+        S.bRivers = Settings.RiverMinArea > 0.0;
+        S.RiverMinAreaKm2 = (float)Settings.RiverMinArea;
+        S.RiverWidthScale = (float)FMath::Max(Settings.RiverWidthScale, 0.1);
+        S.RiverValleyScale = (float)FMath::Max(Settings.ValleyWidthScale, 0.1);
         S.StepCellsPerFrame = FMath::Max(CVarVoxelLandSolveStepCells.GetValueOnGameThread(), 1 << 16);
         S.IterationCellsPerFrame = FMath::Max(CVarVoxelLandSolveIterationCells.GetValueOnGameThread(), 1 << 18);
+        S.bRouteAhead = CVarVoxelLandSolveRouteAhead.GetValueOnGameThread() != 0;
         S.TanTable = TanTable;
         return S;
     }
@@ -1679,7 +1924,7 @@ namespace VoxelLandBakeDetail
         {
             const VoxelLandSolve::FResult& R = Job.Solve->Result;
             const int32 NumCells = Job.NumCells();
-            const bool bOk = R.Height.Num() == NumCells && R.Attr.Num() == NumCells && R.Flow.Num() == NumCells && R.Water.Num() == NumCells
+            const bool bOk = R.Height.Num() == NumCells && R.Attr.Num() == NumCells && R.FlowHalves.Num() == (NumCells + 1) / 2 && R.Water.Num() == NumCells
                 && R.Form.Num() == NumCells;
             Job.ReleaseBuffers();
             Job.Status.store(bOk ? 1 : -1, std::memory_order_release);
@@ -1690,6 +1935,14 @@ namespace VoxelLandBakeDetail
 // ---------------------------------------------------------------------------------------------
 // FVoxelLandBaker
 // ---------------------------------------------------------------------------------------------
+
+namespace VoxelLandBakeDetail
+{
+    // The rivers (below).
+    TSharedPtr<FVoxelLandRiverSet, ESPMode::ThreadSafe> MakeRiverSet(VoxelLandRiverBuild::FResult&& R, uint32 Key, uint32 BakeKey, double MinAreaKm2,
+        int32 Builds, double Seconds);
+    void ReleaseOnRenderThread(TRefCountPtr<FRDGPooledBuffer>& A, TRefCountPtr<FRDGPooledBuffer>& B);
+}
 
 /** Progress of a CPU bake (cells done), shared with its task, and its cancel flag (set when
  *  the baker is dropped). */
@@ -1706,7 +1959,7 @@ FVoxelLandBaker::FVoxelLandBaker(const FVoxelTerrestrialSettings& InSettings, do
     , Key(VoxelLand::BakeKey(InSettings, InSeaRadius))
     , N(VoxelLand::BakeResolutionFor(InSettings))
 {
-    // The noise pack (the peaks' and the hills' sets), read or generated meanwhile (the density
+    // The noise pack (the peaks', detail, hills' and strata's sets), read or generated meanwhile (the density
     // takes it once the bake is ready; an empty key, none needed, does nothing).
     VoxelLand::PrewarmLandNoise(VoxelLand::LandNoiseNameFor(InSettings));
 }
@@ -1766,6 +2019,7 @@ void FVoxelLandBaker::Tick()
             const double InSeaRadius = SeaRadius;
             Pending = Async(EAsyncExecution::ThreadPool, [InKey, InCheck, InN, InSeaRadius]()
                 {
+                    // (Its rivers are built on the GPU once it's loaded: VoxelLand::TickRivers.)
                     return VoxelLandCache::Load(InKey, InCheck, InN, InSeaRadius);
                 });
             State = EState::LoadingCache;
@@ -1863,24 +2117,55 @@ void FVoxelLandBaker::Tick()
         Bake->SolveResidual = R->Residual;
         Bake->ReliefFactor = R->Factor;
         ReleaseJob(Job);
-        Pending = Async(EAsyncExecution::ThreadPool, [Bake, R]() -> TSharedPtr<FVoxelLandBake, ESPMode::ThreadSafe>
+        // The fields the density samples stay on the GPU as the solve left them (the bake's GPU
+        // copy takes them; nothing to upload again).
+        ENQUEUE_RENDER_COMMAND(VoxelLandKeepBakeFields)([GPU = Bake->GPU, Height = MoveTemp(R->GPUHeight), Water = MoveTemp(R->GPUWater),
+            Flow = MoveTemp(R->GPUFlow), Tan = MoveTemp(R->GPUTan)](FRHICommandListImmediate&) mutable
+            {
+                if (!GPU.IsValid() || !Height.IsValid() || !Tan.IsValid()) return;
+                GPU->Height = MoveTemp(Height);
+                GPU->TanTable = MoveTemp(Tan);
+                GPU->Water = MoveTemp(Water);
+                GPU->Flow = MoveTemp(Flow);
+            });
+        // The rivers, built on the GPU after the routing (R1b); none tried (the shaders weren't
+        // ready) leaves them to VoxelLand::TickRivers, a failed build is none.
+        TSharedPtr<FVoxelLandRiverSet, ESPMode::ThreadSafe> Rivers;
+        if (R->bRivers)
+            Rivers = MakeRiverSet(MoveTemp(R->Rivers), VoxelLand::RiverKey(Settings), Key, Settings.RiverMinArea, R->RiverBuilds, 0.0);
+        else if (R->RiverBuilds > 0)
+        {
+            Rivers = MakeShared<FVoxelLandRiverSet, ESPMode::ThreadSafe>();
+            Rivers->Key = VoxelLand::RiverKey(Settings);
+        }
+        ReleaseOnRenderThread(R->Rivers.GPUTiles, R->Rivers.GPUData);
+        Pending = Async(EAsyncExecution::ThreadPool, [Bake, R, Rivers]() -> TSharedPtr<FVoxelLandBake, ESPMode::ThreadSafe>
             {
                 const int32 Num = R->Height.Num();
+                if (R->FlowHalves.Num() != (Num + 1) / 2) return nullptr;
                 Bake->Height = MoveTemp(R->Height);
                 Bake->Water = MoveTemp(R->Water);
                 Bake->Lakes = MoveTemp(R->Lakes);
+                Bake->Receiver = MoveTemp(R->Receiver);
                 Bake->Attr.SetNumUninitialized(Num);
                 Bake->Flow.SetNumUninitialized(Num);
                 Bake->Form.SetNumUninitialized(Num);
+                Bake->Province.SetNumUninitialized(Num);
                 for (int32 i = 0; i < Num; i++)
                 {
                     Bake->Attr[i] = (uint16)R->Attr[i];
+                    // The landform in the low half, the province from bit 16 (VoxelLandBake.usf).
                     Bake->Form[i] = (uint16)R->Form[i];
-                    if (!FMath::IsFinite(R->Flow[i])) return nullptr;
-                    Bake->Flow[i] = FFloat16(R->Flow[i]);
+                    Bake->Province[i] = (uint8)FMath::Min(R->Form[i] >> 16, 63u);
+                    // The drainage as the GPU rounded it (its halves are the density's too).
+                    const uint16 Half = (uint16)(R->FlowHalves[i >> 1] >> ((i & 1) * 16));
+                    if ((Half & 0x7c00u) == 0x7c00u) return nullptr;
+                    Bake->Flow[i].Encoded = Half;
                 }
                 Bake->UpdateRange();
                 Bake->BuildRelief();
+                Bake->BuildProvinceStats();
+                Bake->Rivers = Rivers;
                 return VoxelLandCache::IsUsable(*Bake) ? Bake : nullptr;
             });
         State = EState::GpuAssembling;
@@ -2012,6 +2297,280 @@ namespace VoxelLandBakeDetail
     }
 }
 
+// ---------------------------------------------------------------------------------------------
+// The rivers (R1b: built on the GPU)
+// ---------------------------------------------------------------------------------------------
+
+/** A river build for a loaded bake or new river settings: recorded on the render thread on the
+ *  bake's GPU copy (uploaded first if the density hasn't yet) and the receivers, read back, and
+ *  recorded again with larger buffers if the first sizes were short. */
+struct FVoxelLandRiverJob
+{
+    uint32 Key = 0;
+    VoxelLandRiverBuild::FSettings Settings;
+    TWeakPtr<const FVoxelLandBake, ESPMode::ThreadSafe> Bake;   // its CPU fields, for the first record (weak: the bake owns the job)
+    TSharedPtr<FVoxelLandBakeGPU, ESPMode::ThreadSafe> BakeGPU;
+    TRefCountPtr<FRDGPooledBuffer> Rec;
+    VoxelLandRiverBuild::FPending Pending;
+    int32 Builds = 0;
+    int32 WaitFrames = 0;
+    double StartSeconds = 0.0;
+    std::atomic<int32> Status{ 0 };   // 0 running, 1 done (Result), -1 failed
+    VoxelLandRiverBuild::FResult Result;
+};
+
+namespace VoxelLandBakeDetail
+{
+    /** Render thread. The bake's fields the density and the rivers read, on the GPU (uploaded
+     *  once; a fresh bake's come from its solve): the heights and the tan table, the drainage
+     *  (when the bake has it), and with bWater the lake levels. */
+    void UploadFields(FRDGBuilder& GraphBuilder, const FVoxelLandBake& Bake, FVoxelLandBakeGPU& Resource, bool bWater)
+    {
+        if (!Resource.Height.IsValid() || !Resource.TanTable.IsValid())
+        {
+            Resource.Height = GraphBuilder.ConvertToExternalBuffer(
+                VoxelGPUCommon::UploadStructuredBuffer(GraphBuilder, TEXT("Voxel.LandHeight"), MakeArrayView(Bake.Height)));
+            Resource.TanTable = GraphBuilder.ConvertToExternalBuffer(
+                VoxelGPUCommon::UploadStructuredBuffer(GraphBuilder, TEXT("Voxel.LandTanTable"), MakeArrayView(Bake.TanTable)));
+        }
+        if (Bake.Flow.Num() == Bake.NumCells() && !Resource.Flow.IsValid())
+        {
+            const TArray<uint32> Packed = PackHalves(Bake.Flow.Num(), [&Bake](int32 i) { return (uint32)Bake.Flow[i].Encoded; });
+            Resource.Flow = GraphBuilder.ConvertToExternalBuffer(
+                VoxelGPUCommon::UploadStructuredBuffer(GraphBuilder, TEXT("Voxel.LandFlow"), MakeConstArrayView(Packed)));
+        }
+        if (bWater && Bake.Water.Num() == Bake.NumCells() && !Resource.Water.IsValid())
+        {
+            Resource.Water = GraphBuilder.ConvertToExternalBuffer(
+                VoxelGPUCommon::UploadStructuredBuffer(GraphBuilder, TEXT("Voxel.LandWater"), MakeArrayView(Bake.Water)));
+        }
+    }
+
+    /** GPU buffers dropped where they were made. */
+    void ReleaseOnRenderThread(TRefCountPtr<FRDGPooledBuffer>& A, TRefCountPtr<FRDGPooledBuffer>& B)
+    {
+        if (!A.IsValid() && !B.IsValid()) return;
+        ENQUEUE_RENDER_COMMAND(VoxelLandReleaseRiverBuffers)([A = MoveTemp(A), B = MoveTemp(B)](FRHICommandListImmediate&) mutable
+            {
+                A.SafeRelease();
+                B.SafeRelease();
+            });
+    }
+
+    void ReleaseRiverJob(TSharedPtr<FVoxelLandRiverJob, ESPMode::ThreadSafe>& Job)
+    {
+        if (!Job.IsValid()) return;
+        TSharedPtr<FVoxelLandRiverJob, ESPMode::ThreadSafe> Dropped = MoveTemp(Job);
+        ENQUEUE_RENDER_COMMAND(VoxelLandReleaseRiverJob)([Dropped](FRHICommandListImmediate&) mutable
+            {
+                Dropped.Reset();
+            });
+    }
+
+    /** The river set from a build read back (its GPU tables taken over), or one standing for none
+     *  (TilesPerFace 0) when it didn't fit or its data is past the material's exact floats. */
+    TSharedPtr<FVoxelLandRiverSet, ESPMode::ThreadSafe> MakeRiverSet(VoxelLandRiverBuild::FResult&& R, uint32 Key, uint32 BakeKey, double MinAreaKm2,
+        int32 Builds, double Seconds)
+    {
+        using namespace VoxelLandRiverBuild;
+        const TSharedPtr<FVoxelLandRiverSet, ESPMode::ThreadSafe> Set = MakeShared<FVoxelLandRiverSet, ESPMode::ThreadSafe>();
+        Set->Key = Key;
+        Set->Builds = Builds;
+        Set->BuildSeconds = Seconds;
+        // The material holds the tables as floats: exact below 2^24 (64 MB of data).
+        if (!R.bFits || R.TilesPerFace <= 0 || R.Data.Num() >= (1 << 24) || R.Tiles.Num() == 0)
+        {
+            if (R.bFits)
+                UE_LOG(LogVoxelPlugin, Warning, TEXT("[VoxelLand] Bake %08x's rivers have too much data (%d floats); no rivers. Raise RiverMinArea."), BakeKey, R.Data.Num());
+            ReleaseOnRenderThread(R.GPUTiles, R.GPUData);
+            return Set;
+        }
+        const uint32* C = R.Counts;
+        Set->TilesPerFace = R.TilesPerFace;
+        Set->Tiles = MoveTemp(R.Tiles);
+        Set->Data = MoveTemp(R.Data);
+        Set->RiverCells = (int32)C[CountRiverCells];
+        Set->Segments = (int32)C[CountSegments];
+        Set->Chains = (int32)C[CountChains];
+        Set->Sources = (int32)C[CountSources];
+        Set->Confluences = (int32)C[CountConfluences];
+        Set->Mouths = (int32)C[CountMouths];
+        Set->LakeInlets = (int32)C[CountInlets];
+        Set->LakeOutlets = (int32)C[CountOutlets];
+        Set->Entries = C[CountEntries];
+        Set->Overflow = C[CountDropped];
+        Set->MaxInTile = C[CountMaxInTile];
+        Set->LengthKm = (double)C[CountLengthDam] * 1.0e-2;
+        Set->GPU = MakeShared<FVoxelLandRiverGPU, ESPMode::ThreadSafe>();
+        Set->GPU->Tiles = MoveTemp(R.GPUTiles);
+        Set->GPU->Data = MoveTemp(R.GPUData);
+        UE_LOG(LogVoxelPlugin, Log, TEXT("[VoxelLand] Rivers of bake %08x from %.0f km^2 (GPU, %d build%s%s): %d river cells, %d segments in %d chains (%.0f km), %d mouths, %d lake inlets, %d outlets; %u tile entries (at most %u in a tile), %.1f MB."),
+            BakeKey, MinAreaKm2, Builds, Builds == 1 ? TEXT("") : TEXT("s"), Seconds > 0.0 ? *FString::Printf(TEXT(", %.3f s"), Seconds) : TEXT(""),
+            Set->RiverCells, Set->Segments, Set->Chains, Set->LengthKm, Set->Mouths, Set->LakeInlets, Set->LakeOutlets, Set->Entries, Set->MaxInTile,
+            (double)(Set->Data.Num() + Set->Tiles.Num()) * 4e-6);
+        if (Set->Overflow > 0)
+            UE_LOG(LogVoxelPlugin, Warning, TEXT("[VoxelLand] The rivers overflow their tiles by %u entries (the smallest dropped there; at most %d a tile). Raise RiverMinArea or lower ValleyWidthScale."),
+                Set->Overflow, VoxelLandRiverBuild::MaxPerTile);
+        return Set;
+    }
+
+    /** Render thread: records the build on the bake's GPU fields and the receivers. */
+    void RecordRiverJob(FRDGBuilder& GraphBuilder, FVoxelLandRiverJob& Job, const VoxelLandRiverBuild::FCaps& Caps)
+    {
+        FVoxelLandBakeGPU& G = *Job.BakeGPU;
+        VoxelLandRiverBuild::FInputs In;
+        In.Tan = GraphBuilder.RegisterExternalBuffer(G.TanTable);
+        In.Height = GraphBuilder.RegisterExternalBuffer(G.Height);
+        In.Water = GraphBuilder.RegisterExternalBuffer(G.Water);
+        In.Flow = GraphBuilder.RegisterExternalBuffer(G.Flow);
+        In.Rec = GraphBuilder.RegisterExternalBuffer(Job.Rec);
+        const VoxelLandRiverBuild::FOutputs Out = VoxelLandRiverBuild::AddPasses(GraphBuilder, In, Job.Settings, Caps);
+        Job.Pending.Enqueue(GraphBuilder, Out, Job.Settings, Caps);
+        Job.Builds++;
+    }
+
+    /** Render thread, once a frame while the job runs. */
+    void TickRiverJob(FRHICommandListImmediate& RHICmdList, FVoxelLandRiverJob& Job)
+    {
+        if (Job.Status.load(std::memory_order_acquire) != 0) return;
+        if (!VoxelLandRiverBuild::AreShadersReady())
+        {
+            // Still compiling (e.g. after recompileshaders), or not on this platform.
+            if (++Job.WaitFrames > 300)
+                Job.Status.store(-1, std::memory_order_release);
+            return;
+        }
+        if (Job.Builds > 0 && !Job.Pending.IsReady()) return;
+        const TSharedPtr<const FVoxelLandBake, ESPMode::ThreadSafe> Bake = Job.Builds == 0 ? Job.Bake.Pin() : nullptr;
+        if (Job.Builds == 0 && (!Bake.IsValid() || !Job.BakeGPU.IsValid()))
+        {
+            Job.Status.store(-1, std::memory_order_release);
+            return;
+        }
+        FRDGBuilder GraphBuilder(RHICmdList);
+        if (Job.Builds == 0)
+        {
+            UploadFields(GraphBuilder, *Bake, *Job.BakeGPU, true);
+            Job.Rec = GraphBuilder.ConvertToExternalBuffer(VoxelGPUCommon::UploadStructuredBuffer(GraphBuilder, TEXT("Voxel.LandRiverReceivers"), MakeArrayView(Bake->Receiver)));
+            RecordRiverJob(GraphBuilder, Job, VoxelLandRiverBuild::EstimateCaps(Job.Settings));
+        }
+        else
+        {
+            VoxelLandRiverBuild::FResult R;
+            if (!Job.Pending.Read(R))
+            {
+                Job.Rec.SafeRelease();
+                Job.Status.store(-1, std::memory_order_release);
+            }
+            else if (R.bFits)
+            {
+                Job.Result = MoveTemp(R);
+                Job.Rec.SafeRelease();
+                Job.Status.store(1, std::memory_order_release);
+            }
+            else if (R.Counts[VoxelLandRiverBuild::CountErrors] != 0 || Job.Builds >= VoxelLandRiverBuild::MaxBuilds)
+            {
+                Job.Rec.SafeRelease();
+                Job.Status.store(-1, std::memory_order_release);
+            }
+            else
+            {
+                RecordRiverJob(GraphBuilder, Job, R.Needed);
+            }
+        }
+        GraphBuilder.Execute();
+    }
+
+    bool HasRiverInputs(const FVoxelLandBake& Bake)
+    {
+        const int32 Cells = Bake.NumCells();
+        return Bake.Receiver.Num() == Cells && Bake.Height.Num() == Cells && Bake.Water.Num() == Cells && Bake.Flow.Num() == Cells
+            && Bake.TanTable.Num() == Bake.Side();
+    }
+}
+
+TSharedPtr<const FVoxelLandRiverSet, ESPMode::ThreadSafe> VoxelLand::GetRivers(const FVoxelLandBake& Bake, const FVoxelTerrestrialSettings& Settings)
+{
+    if (!(Settings.RiverMinArea > 0.0) || !VoxelLandBakeDetail::HasRiverInputs(Bake)) return nullptr;
+    const uint32 Key = RiverKey(Settings);
+    FScopeLock ScopeLock(&Bake.RiverLock);
+    // (A set without tiles stands for none.)
+    return Bake.Rivers.IsValid() && Bake.Rivers->Key == Key && Bake.Rivers->TilesPerFace > 0 ? Bake.Rivers : nullptr;
+}
+
+bool VoxelLand::TickRivers(const TSharedPtr<const FVoxelLandBake, ESPMode::ThreadSafe>& BakePtr, const FVoxelTerrestrialSettings& Settings)
+{
+    using namespace VoxelLandBakeDetail;
+    check(IsInGameThread());
+    if (!BakePtr.IsValid()) return true;
+    const FVoxelLandBake& Bake = *BakePtr;
+    if (!(Settings.RiverMinArea > 0.0) || !HasRiverInputs(Bake)) return true;
+    const uint32 Key = RiverKey(Settings);
+    FScopeLock ScopeLock(&Bake.RiverLock);
+    if (Bake.Rivers.IsValid() && Bake.Rivers->Key == Key)
+    {
+        ReleaseRiverJob(Bake.RiverJob);
+        return true;
+    }
+    if (Bake.RiverJob.IsValid() && Bake.RiverJob->Key != Key)
+        ReleaseRiverJob(Bake.RiverJob);
+    if (!Bake.RiverJob.IsValid())
+    {
+        if (!FApp::CanEverRender() || !GIsRHIInitialized || GMaxRHIFeatureLevel < ERHIFeatureLevel::SM5)
+        {
+            // No renderer (a dedicated server), or no compute shaders for it: no rivers.
+            const TSharedPtr<FVoxelLandRiverSet, ESPMode::ThreadSafe> None = MakeShared<FVoxelLandRiverSet, ESPMode::ThreadSafe>();
+            None->Key = Key;
+            Bake.Rivers = None;
+            return true;
+        }
+        const TSharedPtr<FVoxelLandRiverJob, ESPMode::ThreadSafe> Job = MakeShared<FVoxelLandRiverJob, ESPMode::ThreadSafe>();
+        Job->Key = Key;
+        Job->Settings.N = Bake.N;
+        Job->Settings.Pad = FVoxelLandBake::Pad;
+        Job->Settings.RadiusM = (float)(Bake.SeaRadius * 0.01);
+        Job->Settings.MinAreaKm2 = (float)Settings.RiverMinArea;
+        Job->Settings.WidthScale = (float)FMath::Max(Settings.RiverWidthScale, 0.1);
+        Job->Settings.ValleyScale = (float)FMath::Max(Settings.ValleyWidthScale, 0.1);
+        uint64 Land = 0;
+        for (const uint32 Count : Bake.ProvinceLand) Land += Count;
+        Job->Settings.LandCells = (uint32)FMath::Min<uint64>(Land, MAX_uint32);
+        Job->Bake = BakePtr;
+        Job->BakeGPU = Bake.GPU;
+        Job->StartSeconds = FPlatformTime::Seconds();
+        Bake.RiverJob = Job;
+        ENQUEUE_RENDER_COMMAND(VoxelLandRiverStart)([Job](FRHICommandListImmediate& RHICmdList)
+            {
+                TickRiverJob(RHICmdList, *Job);
+            });
+        return false;
+    }
+    // (No local copy of the job: the render thread must drop its last reference.)
+    FVoxelLandRiverJob& Job = *Bake.RiverJob;
+    const int32 Status = Job.Status.load(std::memory_order_acquire);
+    if (Status == 0)
+    {
+        ENQUEUE_RENDER_COMMAND(VoxelLandRiverTick)([InJob = Bake.RiverJob](FRHICommandListImmediate& RHICmdList)
+            {
+                TickRiverJob(RHICmdList, *InJob);
+            });
+        return false;
+    }
+    if (Status > 0)
+    {
+        Bake.Rivers = MakeRiverSet(MoveTemp(Job.Result), Key, Bake.Key, Settings.RiverMinArea, Job.Builds, FPlatformTime::Seconds() - Job.StartSeconds);
+    }
+    else
+    {
+        UE_LOG(LogVoxelPlugin, Warning, TEXT("[VoxelLand] The rivers of bake %08x couldn't be built on the GPU (after %d builds); no rivers."), Bake.Key, Job.Builds);
+        const TSharedPtr<FVoxelLandRiverSet, ESPMode::ThreadSafe> None = MakeShared<FVoxelLandRiverSet, ESPMode::ThreadSafe>();
+        None->Key = Key;
+        Bake.Rivers = None;
+    }
+    ReleaseRiverJob(Bake.RiverJob);
+    return true;
+}
+
 FVoxelLandShaderParameters VoxelLandGPU::GetParameters(FRDGBuilder& GraphBuilder, const FVoxelDensityGPUData& Density)
 {
     FVoxelLandShaderParameters Parameters;
@@ -2049,14 +2608,14 @@ FVoxelLandShaderParameters VoxelLandGPU::GetParameters(FRDGBuilder& GraphBuilder
     Parameters.LandPeakScaleB = 1.0f;
     Parameters.LandNoiseN = 0;
     Parameters.LandNoiseMips = 0;
-    Parameters.LandPeakDetailBase = 0;
-    Parameters.LandPeakDetailN = 0;
-    Parameters.LandPeakDetailMips = 0;
+    Parameters.LandDetailBase = 0;
+    Parameters.LandDetailN = 0;
+    Parameters.LandDetailMips = 0;
     Parameters.LandPeakDetailTexelsPerCell = 0.0f;
-    Parameters.LandPeakDetailMeanR = 0.0f;
-    Parameters.LandPeakDetailMeanG = 0.0f;
-    Parameters.LandPeakDetailScaleR = 0.0f;
-    Parameters.LandPeakDetailScaleG = 0.0f;
+    Parameters.LandDetailMeanHard = 0.0f;
+    Parameters.LandDetailMeanSoft = 0.0f;
+    Parameters.LandPeakDetailScaleHard = 0.0f;
+    Parameters.LandPeakDetailScaleSoft = 0.0f;
     Parameters.LandPeakDetailFade = 0.0f;
     Parameters.LandHillTexelsPerCell = 0.0f;
     Parameters.LandHillBase = 0;
@@ -2065,35 +2624,64 @@ FVoxelLandShaderParameters VoxelLandGPU::GetParameters(FRDGBuilder& GraphBuilder
     Parameters.LandHillScaleR = 1.0f;
     Parameters.LandHillScaleG = 1.0f;
     Parameters.LandHillScaleB = 1.0f;
+    Parameters.LandHillMeanR = 0.0f;
+    Parameters.LandHillMeanG = 0.0f;
     Parameters.LandHillSpacingM = 0.0f;
     Parameters.LandHillSwellTexelsPerCell = 0.0f;
     Parameters.LandHillSwellM = 0.0f;
     Parameters.LandHillSwellScaleG = 1.0f;
     Parameters.LandHillDetailTexelsPerCell = 0.0f;
-    Parameters.LandHillDetailScaleR = 0.0f;
-    Parameters.LandHillDetailScaleG = 0.0f;
+    Parameters.LandHillDetailScaleHard = 0.0f;
+    Parameters.LandHillDetailScaleSoft = 0.0f;
     Parameters.LandHillDetailFade = 0.0f;
     Parameters.LandHillFoothill = 0.0f;
+    Parameters.LandStrataTexelsPerCell = 0.0f;
+    Parameters.LandStrataBase = 0;
+    Parameters.LandStrataN = 0;
+    Parameters.LandStrataMips = 0;
+    Parameters.LandStrataScaleR = 1.0f;
+    Parameters.LandStrataScaleG = 1.0f;
+    Parameters.LandStrataScaleB = 1.0f;
+    Parameters.LandStrataMeanR = 0.0f;
+    Parameters.LandStrataMeanG = 0.0f;
+    Parameters.LandStrataSpacingM = 0.0f;
+    Parameters.LandStrataRelief = 0.0f;
+    Parameters.LandStrataFlat = 0.0f;
+    Parameters.LandStrataThreshold = 2.0f;
+    Parameters.LandStrataWidth = 0.05f;
+    Parameters.LandStrataSeed = 0;
+    Parameters.LandStrataDetailTexelsPerCell = 0.0f;
+    Parameters.LandStrataDetailScaleHard = 0.0f;
+    Parameters.LandStrataDetailScaleSoft = 0.0f;
+    Parameters.LandStrataDetailFade = 0.0f;
+    Parameters.LandRiverTilesPerFace = 0;
+    Parameters.LandRiverRadiusM = 1.0f;
+    Parameters.LandRiverWidthScale = 1.0f;
+    Parameters.LandRiverValleyScale = 1.0f;
+    Parameters.LandHasWater = 0;
+    Parameters.LandRiverCarve = 0.0f;
+    Parameters.LandRiverDepthScale = 1.0f;
+    Parameters.LandRiverFloodplainScale = 1.0f;
+    Parameters.LandRiverMinLog2Area = 0.0f;
+    Parameters.LandLakeShoreBand = 0.0f;
+    Parameters.LandRiverMeander = 0.0f;
+    Parameters.LandRiverFalls = 0.0f;
+    Parameters.LandDetailTexelsPerCell = 0.0f;
+    Parameters.LandDetailScales = 0;
+    Parameters.LandDetailMeanA = 0.0f;
+    Parameters.LandDetailScaleA = 0.0f;
+    Parameters.LandDetailScaleGain = 0.0f;
+    Parameters.LandDetailFade = 0.0f;
+    Parameters.LandDetailSeed = 0;
 
     const FVoxelLandBake* Bake = Density.LandMode != 0 ? Density.Land.Get() : nullptr;
     if (Bake && Bake->GPU.IsValid() && Bake->Height.Num() == Bake->NumCells() && Bake->TanTable.Num() == Bake->Side())
     {
         FVoxelLandBakeGPU& Resource = *Bake->GPU;
-        if (!Resource.Height.IsValid() || !Resource.TanTable.IsValid())
-        {
-            Resource.Height = GraphBuilder.ConvertToExternalBuffer(
-                VoxelGPUCommon::UploadStructuredBuffer(GraphBuilder, TEXT("Voxel.LandHeight"), MakeArrayView(Bake->Height)));
-            Resource.TanTable = GraphBuilder.ConvertToExternalBuffer(
-                VoxelGPUCommon::UploadStructuredBuffer(GraphBuilder, TEXT("Voxel.LandTanTable"), MakeArrayView(Bake->TanTable)));
-        }
-        // The drainage steers the gullies' strength (and shows in the drainage view).
+        // The heights and the drainage (the drainage steers the gullies' strength, and shows in
+        // the drainage view): a fresh bake's from its solve, else uploaded once.
         const bool bHasFlow = Bake->Flow.Num() == Bake->NumCells();
-        if (bHasFlow && !Resource.Flow.IsValid())
-        {
-            const TArray<uint32> Packed = VoxelLandBakeDetail::PackHalves(Bake->Flow.Num(), [Bake](int32 i) { return (uint32)Bake->Flow[i].Encoded; });
-            Resource.Flow = GraphBuilder.ConvertToExternalBuffer(
-                VoxelGPUCommon::UploadStructuredBuffer(GraphBuilder, TEXT("Voxel.LandFlow"), MakeConstArrayView(Packed)));
-        }
+        VoxelLandBakeDetail::UploadFields(GraphBuilder, *Bake, Resource, false);
         // The landform shapes the hills and the peaks; the local relief scales the peaks.
         const bool bHasForm = Bake->Form.Num() == Bake->NumCells() && Bake->Relief.Num() == Bake->NumCells();
         if (bHasForm && !Resource.Form.IsValid())
@@ -2112,12 +2700,72 @@ FVoxelLandShaderParameters VoxelLandGPU::GetParameters(FRDGBuilder& GraphBuilder
             Resource.Relief = GraphBuilder.ConvertToExternalBuffer(
                 VoxelGPUCommon::UploadStructuredBuffer(GraphBuilder, TEXT("Voxel.LandRelief"), MakeConstArrayView(Packed)));
         }
+        if (bHasForm && !Resource.Province.IsValid())
+        {
+            // The province (T4c), as the relief (zeros if the bake has none).
+            TArray<uint32> Packed;
+            Packed.SetNumZeroed((Bake->NumCells() + 3) / 4);
+            if (Bake->Province.Num() == Bake->NumCells())
+                for (int32 i = 0; i < Bake->Province.Num(); i++)
+                    Packed[i >> 2] |= (uint32)FMath::Min(Bake->Province[i], (uint8)63) << ((i & 3) * 8);
+            Resource.Province = GraphBuilder.ConvertToExternalBuffer(
+                VoxelGPUCommon::UploadStructuredBuffer(GraphBuilder, TEXT("Voxel.LandProvince"), MakeConstArrayView(Packed)));
+        }
         Parameters.LandForm = bHasForm ? GraphBuilder.CreateSRV(GraphBuilder.RegisterExternalBuffer(Resource.Form))
             : GraphBuilder.CreateSRV(VoxelGPUCommon::UploadStructuredBuffer<uint32>(GraphBuilder, TEXT("Voxel.LandFormNone"), TConstArrayView<uint32>()));
         Parameters.LandRelief = bHasForm ? GraphBuilder.CreateSRV(GraphBuilder.RegisterExternalBuffer(Resource.Relief))
             : GraphBuilder.CreateSRV(VoxelGPUCommon::UploadStructuredBuffer<uint32>(GraphBuilder, TEXT("Voxel.LandReliefNone"), TConstArrayView<uint32>()));
-        // The noise pack: the peaks' and the hills' sets (shared by the planets that use it:
-        // uploaded once).
+        Parameters.LandProvince = bHasForm ? GraphBuilder.CreateSRV(GraphBuilder.RegisterExternalBuffer(Resource.Province))
+            : GraphBuilder.CreateSRV(VoxelGPUCommon::UploadStructuredBuffer<uint32>(GraphBuilder, TEXT("Voxel.LandProvinceNone"), TConstArrayView<uint32>()));
+        // The rivers (R1): the GPU build's own tables (R1b), else uploaded once per river set
+        // (shared by the planet's densities).
+        const FVoxelLandRiverSet* Rivers = Density.LandRivers.Get();
+        if (Rivers && Rivers->GPU.IsValid() && Rivers->TilesPerFace > 0 && Rivers->Tiles.Num() > 0 && Rivers->Data.Num() > 0)
+        {
+            FVoxelLandRiverGPU& RG = *Rivers->GPU;
+            if (!RG.Tiles.IsValid() || !RG.Data.IsValid())
+            {
+                RG.Tiles = GraphBuilder.ConvertToExternalBuffer(VoxelGPUCommon::UploadStructuredBuffer(GraphBuilder, TEXT("Voxel.LandRiverTiles"), MakeConstArrayView(Rivers->Tiles)));
+                RG.Data = GraphBuilder.ConvertToExternalBuffer(VoxelGPUCommon::UploadStructuredBuffer(GraphBuilder, TEXT("Voxel.LandRiverData"), MakeConstArrayView(Rivers->Data)));
+            }
+            Parameters.LandRiverTiles = GraphBuilder.CreateSRV(GraphBuilder.RegisterExternalBuffer(RG.Tiles));
+            Parameters.LandRiverData = GraphBuilder.CreateSRV(GraphBuilder.RegisterExternalBuffer(RG.Data));
+            Parameters.LandRiverTilesPerFace = Density.LandRiverTilesPerFace;
+            Parameters.LandRiverRadiusM = Density.LandRiverRadiusM;
+            Parameters.LandRiverWidthScale = Density.LandRiverWidthScale;
+            Parameters.LandRiverValleyScale = Density.LandRiverValleyScale;
+        }
+        else
+        {
+            Parameters.LandRiverTiles = GraphBuilder.CreateSRV(VoxelGPUCommon::UploadStructuredBuffer<uint32>(GraphBuilder, TEXT("Voxel.LandRiverTilesNone"), TConstArrayView<uint32>()));
+            Parameters.LandRiverData = GraphBuilder.CreateSRV(VoxelGPUCommon::UploadStructuredBuffer<float>(GraphBuilder, TEXT("Voxel.LandRiverDataNone"), TConstArrayView<float>()));
+        }
+        // R2: the rivers' and lakes' carve. The lake levels are bound whenever the bake has them
+        // (a fresh bake's from its solve, else uploaded once): the carve reads them when
+        // LandHasWater, the hydrology's debug views whenever they show.
+        Parameters.LandRiverCarve = Density.LandRiverCarve;
+        Parameters.LandRiverDepthScale = Density.LandRiverDepthScale;
+        Parameters.LandRiverFloodplainScale = Density.LandRiverFloodplainScale;
+        Parameters.LandRiverMinLog2Area = Density.LandRiverMinLog2Area;
+        Parameters.LandLakeShoreBand = Density.LandLakeShoreBand;
+        Parameters.LandRiverMeander = Density.LandRiverMeander;
+        Parameters.LandRiverFalls = Density.LandRiverFalls;
+        const bool bWater = Bake->Water.Num() == Bake->NumCells();
+        if (bWater)
+            VoxelLandBakeDetail::UploadFields(GraphBuilder, *Bake, Resource, true);
+        bool bWaterBound = false;
+        if (bWater && Resource.Water.IsValid())
+        {
+            Parameters.LandWater = GraphBuilder.CreateSRV(GraphBuilder.RegisterExternalBuffer(Resource.Water));
+            bWaterBound = true;
+        }
+        else
+        {
+            Parameters.LandWater = GraphBuilder.CreateSRV(VoxelGPUCommon::UploadStructuredBuffer<float>(GraphBuilder, TEXT("Voxel.LandWaterNone"), TConstArrayView<float>()));
+        }
+        Parameters.LandHasWater = bWaterBound && Density.LandHasWater != 0 ? 1u : 0u;
+        // The noise pack: the peaks', detail, hills' and strata's sets (shared by the planets that
+        // use it: uploaded once).
         const FVoxelLandNoiseSet* Noise = Density.LandNoise.Get();
         const bool bHasNoise = Noise && Noise->GPU.IsValid() && Noise->IsComplete();
         if (bHasNoise && !Noise->GPU->Words.IsValid())
@@ -2143,17 +2791,29 @@ FVoxelLandShaderParameters VoxelLandGPU::GetParameters(FRDGBuilder& GraphBuilder
             Parameters.LandPeakScaleB = Density.LandPeakScaleB;
             Parameters.LandNoiseN = Noise->N;
             Parameters.LandNoiseMips = Noise->Mips;
-            // The detail tile's chain and means, whoever reads it (the peaks, the hills' set).
-            Parameters.LandPeakDetailBase = Noise->DetailBase;
-            Parameters.LandPeakDetailN = Noise->DetailN;
-            Parameters.LandPeakDetailMips = Noise->DetailMips;
-            Parameters.LandPeakDetailMeanR = Density.LandPeakDetailMeanR;
-            Parameters.LandPeakDetailMeanG = Density.LandPeakDetailMeanG;
+            // The detail set's chain and means, whoever reads it (the detail layer, the peaks, the
+            // hills' and the strata's sets).
+            Parameters.LandDetailBase = Noise->DetailBase;
+            Parameters.LandDetailN = Noise->DetailN;
+            Parameters.LandDetailMips = Noise->DetailMips;
+            Parameters.LandDetailMeanHard = Density.LandDetailMeanHard;
+            Parameters.LandDetailMeanSoft = Density.LandDetailMeanSoft;
+            // N1: the detail layer.
+            if (Density.LandDetailTexelsPerCell > 0.0f && Noise->DetailN > 0)
+            {
+                Parameters.LandDetailTexelsPerCell = Density.LandDetailTexelsPerCell;
+                Parameters.LandDetailScales = Density.LandDetailScales;
+                Parameters.LandDetailMeanA = Density.LandDetailMeanA;
+                Parameters.LandDetailScaleA = Density.LandDetailScaleA;
+                Parameters.LandDetailScaleGain = Density.LandDetailScaleGain;
+                Parameters.LandDetailFade = Density.LandDetailFade;
+                Parameters.LandDetailSeed = Density.LandDetailSeed;
+            }
             if (Density.LandPeakDetailTexelsPerCell > 0.0f && Noise->DetailN > 0)
             {
                 Parameters.LandPeakDetailTexelsPerCell = Density.LandPeakDetailTexelsPerCell;
-                Parameters.LandPeakDetailScaleR = Density.LandPeakDetailScaleR;
-                Parameters.LandPeakDetailScaleG = Density.LandPeakDetailScaleG;
+                Parameters.LandPeakDetailScaleHard = Density.LandPeakDetailScaleHard;
+                Parameters.LandPeakDetailScaleSoft = Density.LandPeakDetailScaleSoft;
                 Parameters.LandPeakDetailFade = Density.LandPeakDetailFade;
             }
             // The hills' set (T4a).
@@ -2166,15 +2826,39 @@ FVoxelLandShaderParameters VoxelLandGPU::GetParameters(FRDGBuilder& GraphBuilder
                 Parameters.LandHillScaleR = Density.LandHillScaleR;
                 Parameters.LandHillScaleG = Density.LandHillScaleG;
                 Parameters.LandHillScaleB = Density.LandHillScaleB;
+                Parameters.LandHillMeanR = Density.LandHillMeanR;
+                Parameters.LandHillMeanG = Density.LandHillMeanG;
                 Parameters.LandHillSpacingM = Density.LandHillSpacingM;
                 Parameters.LandHillSwellTexelsPerCell = Density.LandHillSwellTexelsPerCell;
                 Parameters.LandHillSwellM = Density.LandHillSwellM;
                 Parameters.LandHillSwellScaleG = Density.LandHillSwellScaleG;
                 Parameters.LandHillDetailTexelsPerCell = Density.LandHillDetailTexelsPerCell;
-                Parameters.LandHillDetailScaleR = Density.LandHillDetailScaleR;
-                Parameters.LandHillDetailScaleG = Density.LandHillDetailScaleG;
+                Parameters.LandHillDetailScaleHard = Density.LandHillDetailScaleHard;
+                Parameters.LandHillDetailScaleSoft = Density.LandHillDetailScaleSoft;
                 Parameters.LandHillDetailFade = Density.LandHillDetailFade;
                 Parameters.LandHillFoothill = Density.LandHillFoothill;
+                if (Density.LandStrataTexelsPerCell > 0.0f && Noise->StrataN > 0)
+                {
+                    Parameters.LandStrataTexelsPerCell = Density.LandStrataTexelsPerCell;
+                    Parameters.LandStrataBase = Noise->StrataBase;
+                    Parameters.LandStrataN = Noise->StrataN;
+                    Parameters.LandStrataMips = Noise->StrataMips;
+                    Parameters.LandStrataScaleR = Density.LandStrataScaleR;
+                    Parameters.LandStrataScaleG = Density.LandStrataScaleG;
+                    Parameters.LandStrataScaleB = Density.LandStrataScaleB;
+                    Parameters.LandStrataMeanR = Density.LandStrataMeanR;
+                    Parameters.LandStrataMeanG = Density.LandStrataMeanG;
+                    Parameters.LandStrataSpacingM = Density.LandStrataSpacingM;
+                    Parameters.LandStrataRelief = Density.LandStrataRelief;
+                    Parameters.LandStrataFlat = Density.LandStrataFlat;
+                    Parameters.LandStrataThreshold = Density.LandStrataThreshold;
+                    Parameters.LandStrataWidth = Density.LandStrataWidth;
+                    Parameters.LandStrataSeed = Density.LandStrataSeed;
+                    Parameters.LandStrataDetailTexelsPerCell = Density.LandStrataDetailTexelsPerCell;
+                    Parameters.LandStrataDetailScaleHard = Density.LandStrataDetailScaleHard;
+                    Parameters.LandStrataDetailScaleSoft = Density.LandStrataDetailScaleSoft;
+                    Parameters.LandStrataDetailFade = Density.LandStrataDetailFade;
+                }
             }
         }
         Parameters.LandHasForm = bHasForm ? 1u : 0u;
@@ -2212,7 +2896,11 @@ FVoxelLandShaderParameters VoxelLandGPU::GetParameters(FRDGBuilder& GraphBuilder
     Parameters.LandFlow = GraphBuilder.CreateSRV(VoxelGPUCommon::UploadStructuredBuffer<uint32>(GraphBuilder, TEXT("Voxel.LandFlowNone"), TConstArrayView<uint32>()));
     Parameters.LandForm = GraphBuilder.CreateSRV(VoxelGPUCommon::UploadStructuredBuffer<uint32>(GraphBuilder, TEXT("Voxel.LandFormNone"), TConstArrayView<uint32>()));
     Parameters.LandRelief = GraphBuilder.CreateSRV(VoxelGPUCommon::UploadStructuredBuffer<uint32>(GraphBuilder, TEXT("Voxel.LandReliefNone"), TConstArrayView<uint32>()));
+    Parameters.LandProvince = GraphBuilder.CreateSRV(VoxelGPUCommon::UploadStructuredBuffer<uint32>(GraphBuilder, TEXT("Voxel.LandProvinceNone"), TConstArrayView<uint32>()));
+    Parameters.LandRiverTiles = GraphBuilder.CreateSRV(VoxelGPUCommon::UploadStructuredBuffer<uint32>(GraphBuilder, TEXT("Voxel.LandRiverTilesNone"), TConstArrayView<uint32>()));
+    Parameters.LandRiverData = GraphBuilder.CreateSRV(VoxelGPUCommon::UploadStructuredBuffer<float>(GraphBuilder, TEXT("Voxel.LandRiverDataNone"), TConstArrayView<float>()));
     Parameters.LandNoise = GraphBuilder.CreateSRV(VoxelGPUCommon::UploadStructuredBuffer<uint32>(GraphBuilder, TEXT("Voxel.LandNoiseNone"), TConstArrayView<uint32>()));
+    Parameters.LandWater = GraphBuilder.CreateSRV(VoxelGPUCommon::UploadStructuredBuffer<float>(GraphBuilder, TEXT("Voxel.LandWaterNone"), TConstArrayView<float>()));
     return Parameters;
 }
 
@@ -2266,30 +2954,17 @@ FVoxelLandDebugParameters VoxelLandGPU::GetDebugParameters(FRDGBuilder& GraphBui
         {
             Parameters.LandPlates = GraphBuilder.CreateSRV(VoxelGPUCommon::UploadStructuredBuffer<float>(GraphBuilder, TEXT("Voxel.LandPlatesNone"), TConstArrayView<float>()));
         }
-        // The lake levels, for the views that show the hydrology, when the bake has them (the
-        // drainage is the density's, VoxelLandGPU::GetParameters).
+        // The views that show the hydrology, when the bake has it (the drainage and, from R2,
+        // the lake levels are the density's: VoxelLandGPU::GetParameters binds them).
         // VOXEL_LAND_VIEW_FLOW, _LAKES, _WATER, _TERRAIN_WATER.
         const bool bHydro = (Mode == 9 || Mode == 10 || Mode == 12 || Mode == 13) && Bake->Flow.Num() == Bake->NumCells() && Bake->Water.Num() == Bake->NumCells();
-        if (bHydro && !Resource.Water.IsValid())
-        {
-            Resource.Water = GraphBuilder.ConvertToExternalBuffer(
-                VoxelGPUCommon::UploadStructuredBuffer(GraphBuilder, TEXT("Voxel.LandWater"), MakeArrayView(Bake->Water)));
-        }
         if (bHydro)
-        {
-            Parameters.LandWater = GraphBuilder.CreateSRV(GraphBuilder.RegisterExternalBuffer(Resource.Water));
             Parameters.LandDebugHasHydro = 1;
-        }
-        else
-        {
-            Parameters.LandWater = GraphBuilder.CreateSRV(VoxelGPUCommon::UploadStructuredBuffer<float>(GraphBuilder, TEXT("Voxel.LandWaterNone"), TConstArrayView<float>()));
-        }
         return Parameters;
     }
 
     // No view, or the noise surface: one-element stand-ins (the bake views show "none").
     Parameters.LandAttr = GraphBuilder.CreateSRV(VoxelGPUCommon::UploadStructuredBuffer<uint32>(GraphBuilder, TEXT("Voxel.LandAttrNone"), TConstArrayView<uint32>()));
     Parameters.LandPlates = GraphBuilder.CreateSRV(VoxelGPUCommon::UploadStructuredBuffer<float>(GraphBuilder, TEXT("Voxel.LandPlatesNone"), TConstArrayView<float>()));
-    Parameters.LandWater = GraphBuilder.CreateSRV(VoxelGPUCommon::UploadStructuredBuffer<float>(GraphBuilder, TEXT("Voxel.LandWaterNone"), TConstArrayView<float>()));
     return Parameters;
 }

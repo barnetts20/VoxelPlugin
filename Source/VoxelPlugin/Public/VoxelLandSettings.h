@@ -213,27 +213,43 @@ struct VOXELPLUGIN_API FVoxelTerrestrialSettings
 
     // --- Sample: per-sample layers (no rebake) ---
 
-    /** Sampling warp of the bake, in bake cells: hides the grid's straight lines. */
+    /** Sampling warp of the bake, in bake cells: hides the grid's straight lines. Over about 1
+     *  the warp folds (1.5 folded 2% of the land and squeezed 28% to under half its width), and
+     *  what's carved in the bake's frame, the rivers' valleys and channels, squeezes with it into
+     *  slots and cliffs. */
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrestrial|Sample", meta = (ClampMin = "0.0", ClampMax = "4.0"))
-    double BakeWarp = 1.5;
+    double BakeWarp = 1.0;
 
-    /** Slope-damped fBm detail on top of the bake: amplitude (m), its longest wavelength (m),
-     *  and how strongly accumulated slope suppresses finer octaves. A quarter as strong under
-     *  the sea, and scaled by GullyDetailScale on land while there are gullies. */
+    /** The detail layer on top of the bake (N1: the planet's detail set, DetailNoiseSet): its
+     *  eroded (slope-damped) fbm channel at up to four scales of four octaves, from
+     *  DetailWavelength (m) down to the finest cell. DetailAmplitude (m) as before: the coarsest
+     *  scale's standard deviation is 0.4 of it. A quarter as strong under the sea, and scaled by
+     *  GullyDetailScale on land while there are gullies. */
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrestrial|Sample", meta = (ClampMin = "0.0", UIMax = "1000"))
     double DetailAmplitude = 250.0;
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrestrial|Sample", meta = (ClampMin = "100.0", UIMin = "1000", UIMax = "100000"))
     double DetailWavelength = 20000.0;
 
+    /** Unused since N1: the detail set's eroded channel carries its own damping (each variant
+     *  its own: detail_a k 1, detail_b 0.5, detail_c 2). Kept so saved planets load. */
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrestrial|Sample", meta = (ClampMin = "0.0", UIMax = "4.0"))
     double DetailSlopeDamping = 1.0;
 
+    /** The detail set (N1): a file name in the plugin's NoiseSets folder without .vxnt (e.g.
+     *  detail_b), empty to pick one of the folder's detail* sets by the seed, "none" for no detail
+     *  at all (the detail layer and the peaks', hills' and strata's detail). Without any (or if it
+     *  can't be read: the log says why) the plugin's own generated set. Its G (ridged) and R
+     *  (fbm) are the layers' hard and soft rock detail, its A (eroded fbm) the detail layer. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrestrial|Sample")
+    FString DetailNoiseSet;
+
     /** Gullies cut down the slopes below the bake's resolution (a stateless erosion filter,
      *  from two bake cells down to GullyFinestWavelength): depth per unit of wavelength and
-     *  slope. 0 turns them off. */
+     *  slope. 0 turns them off: the default since N1b (the eroded sets and the detail sets carry
+     *  the hillsides now; 0.22 was the default before). */
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrestrial|Sample", meta = (ClampMin = "0.0", ClampMax = "1.0", UIMax = "0.5"))
-    double GullyStrength = 0.22;
+    double GullyStrength = 0.0;
 
     /** The finest gully wavelength (m); finer octaves are left out (and coarse levels leave out
      *  the ones they can't show). */
@@ -298,7 +314,7 @@ struct VOXELPLUGIN_API FVoxelTerrestrialSettings
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrestrial|Sample", meta = (ClampMin = "1.5", ClampMax = "8.0"))
     double HillSwellScale = 3.0;
 
-    /** The hill set's detail (as PeakDetailStrength: the peaks' detail tile at the hills' own
+    /** The hill set's detail (as PeakDetailStrength: the detail set at the hills' own
      *  placement and amplitude). 0 turns it off. */
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrestrial|Sample", meta = (ClampMin = "0.0", UIMax = "2.0"))
     double HillDetailStrength = 0.5;
@@ -314,6 +330,101 @@ struct VOXELPLUGIN_API FVoxelTerrestrialSettings
      *  smoother band along range fronts). */
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrestrial|Sample", meta = (ClampMin = "0.0", ClampMax = "2.0"))
     double HillFoothillGrowth = 1.0;
+
+    /** The strata set (Design/NonMountainLand.md, T4c): stepped sedimentary land (mesas, buttes,
+     *  benches and cliff bands; badlands where the drainage is dense) that replaces the hills in
+     *  the bake's sedimentary provinces (platforms and basins away from the ranges, from the
+     *  plate model). A file name in the plugin's NoiseSets folder without .vxnt (e.g. strata_a),
+     *  empty to pick one of the folder's strata* sets by the seed, or "none". Rides the hill
+     *  set's layer: none without a hill set. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrestrial|Sample")
+    FString StrataNoiseSet;
+
+    /** The strata set's height over its own relief at its placement (StrataSpacing), in hill
+     *  country (StrataFlatShare of it on the flats): 1 keeps the simulated slopes. Never more than
+     *  half StrataSpacing. 0 turns the strata off. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrestrial|Sample", meta = (ClampMin = "0.0", UIMax = "2.0"))
+    double StrataHeightScale = 1.0;
+
+    /** The distance between the strata set's main canyons' groups (m): its spacing is placed at
+     *  this. Its relief, and so the mesas' height, scales with it. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrestrial|Sample", meta = (ClampMin = "500.0", UIMin = "1000", UIMax = "12000"))
+    double StrataSpacing = 4000.0;
+
+    /** The share of the land in strata country: the province's threshold is picked so this much
+     *  of the land lies above it (the sedimentary provinces first). 0 turns the strata off. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrestrial|Sample", meta = (ClampMin = "0.0", ClampMax = "1.0"))
+    double StrataCoverage = 0.3;
+
+    /** The switch from hills to strata: the province's half-width (0..1 units) over which they
+     *  blend. Narrow: a brief mix (the province changes over hundreds of kilometres, so 0.05 is
+     *  some tens of kilometres). */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrestrial|Sample", meta = (ClampMin = "0.005", ClampMax = "0.5"))
+    double StrataSwitchWidth = 0.05;
+
+    /** The strata's height on the flats (hilliness 0) over hill country's: plateaus and low
+     *  benches on the plains, full mesas in hill country. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrestrial|Sample", meta = (ClampMin = "0.0", ClampMax = "1.0"))
+    double StrataFlatShare = 0.35;
+
+    /** The strata set's detail (as HillDetailStrength): texture on the benches and plateau tops.
+     *  Much more rounds the cliff bands off. 0 turns it off. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrestrial|Sample", meta = (ClampMin = "0.0", UIMax = "2.0"))
+    double StrataDetailStrength = 0.5;
+
+    /** Its coarsest wavelength (m); kept within a quarter of StrataSpacing in code. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrestrial|Sample", meta = (ClampMin = "16.0", UIMin = "50", UIMax = "2000"))
+    double StrataDetailWavelength = 400.0;
+
+    /** Rivers (Design/RiversLakes.md, R1): the smallest drainage area (km^2) that carries a
+     *  river. The network is the bake's own drainage, made into lines when the bake is ready
+     *  (no rebake to change it). 0 turns the rivers off. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrestrial|Rivers", meta = (ClampMin = "0.0", UIMin = "20", UIMax = "5000"))
+    double RiverMinArea = 200.0;
+
+    /** The channels' width over the default: 2.35 m x (drainage, km^2)^0.4, 20 m at 200 km^2,
+     *  235 m at 100,000 km^2, 1 km at 3 million (R3; the floodplains and valleys don't change
+     *  with it). */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrestrial|Rivers", meta = (ClampMin = "0.1", UIMax = "4.0"))
+    double RiverWidthScale = 1.0;
+
+    /** The valleys' half-width over the default: 400 m + 15 belts (the belt is 2.5 m x
+     *  sqrt(drainage, km^2): 35 m at 200 km^2, 790 m at 100,000 km^2). */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrestrial|Rivers", meta = (ClampMin = "0.1", UIMax = "4.0"))
+    double ValleyWidthScale = 1.0;
+
+    /** Carve the rivers into the surface (Design/RiversLakes.md, R2): every layer is pulled down
+     *  into each river's valley and a channel is cut below its floor. Off: the rivers are only
+     *  data (the debug views, the water query). */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrestrial|Rivers")
+    bool bCarveRivers = true;
+
+    /** The channels' depth over the default: 1.05 m x (drainage, km^2)^0.2, 3 m at 200 km^2,
+     *  10 m at 100,000 km^2 (rivers deepen slower than they widen). */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrestrial|Rivers", meta = (ClampMin = "0.0", UIMax = "4.0"))
+    double RiverDepthScale = 1.0;
+
+    /** The floodplains' half-width over the default: 6 channel widths beside the channel on
+     *  gentle reaches (under 0.2% of grade), narrowing to the banks by 2%. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrestrial|Rivers", meta = (ClampMin = "0.0", UIMax = "4.0"))
+    double FloodplainScale = 1.0;
+
+    /** The band (m) about a kept lake's level where its shore is eased into a bench at the
+     *  waterline (twice it each way). 0: no bench. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrestrial|Rivers", meta = (ClampMin = "0.0", UIMax = "20.0"))
+    double LakeShoreBand = 3.0;
+
+    /** The meanders' swing over the default (R3): up to 2.5 channel widths either side, a cycle
+     *  every 11 widths, on reaches gentler than 0.6% and inside the floodplain. 0: the channels
+     *  follow the lines. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrestrial|Rivers", meta = (ClampMin = "0.0", UIMax = "2.0"))
+    double RiverMeander = 1.0;
+
+    /** The waterfalls at knickpoints over the default (R3): a reach falling over 2.5 times faster
+     *  than the reaches either side of it (and over 1.5% of grade) gathers up to 70% of its drop
+     *  into a fall with a plunge pool below. 0: the bed falls evenly. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrestrial|Rivers", meta = (ClampMin = "0.0", ClampMax = "1.4"))
+    double RiverFalls = 1.0;
 
     /** Peaks on the bake's mountains (Design/SurfaceLook.md T3, T3d): summits, arêtes, faces and
      *  the valleys between them below the bake's resolution, from an eroded noise set
@@ -349,15 +460,16 @@ struct VOXELPLUGIN_API FVoxelTerrestrialSettings
     FString PeakNoiseSet;
 
     /** The peaks' detail (Design/SurfaceLook.md T3e): a second, finer lookup over the peaks for
-     *  the surface below the set's resolution (its finest valleys are hundreds of metres across):
-     *  rocky creases where the character is rough, rounded ground where it is smooth. Its height
-     *  over its own: 1 keeps the tile's slopes (about 19 degrees RMS in hard rock, 12 in soft). It
-     *  lives where the peaks do, scaled with them. 0 turns it off. */
+     *  the surface below the set's resolution (its finest valleys are hundreds of metres across),
+     *  of the planet's detail set (DetailNoiseSet): rocky creases (its ridged G) where the
+     *  character is rough, rounded ground (its fbm R) where it is smooth. Its height over its
+     *  own: 1 keeps the set's slopes as the plugin scales them (19 degrees RMS in hard rock, 12 in
+     *  soft). It lives where the peaks do, scaled with them. 0 turns it off. */
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrestrial|Sample", meta = (ClampMin = "0.0", UIMax = "2.0"))
     double PeakDetailStrength = 1.0;
 
-    /** The detail's coarsest wavelength (m); its finest is a sixteenth of it. Kept within a
-     *  quarter of PeakSpacing in code. */
+    /** The detail's coarsest wavelength (m); its finest is an eighth of it (the detail sets'
+     *  four octaves). Kept within a quarter of PeakSpacing in code. */
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrestrial|Sample", meta = (ClampMin = "16.0", UIMin = "50", UIMax = "2000"))
     double PeakDetailWavelength = 400.0;
 

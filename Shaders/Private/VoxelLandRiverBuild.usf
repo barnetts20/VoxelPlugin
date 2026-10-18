@@ -1,0 +1,183 @@
+// VoxelLandRiverBuild.usf - The rivers' GPU build (VoxelLandRiverBuild.cpp records it). The work
+// is VoxelLandRiverBuild.ush; this file declares its inputs and the entry points, and adds the
+// GPU-only scan (an exclusive prefix sum in place, in order, with its total in RiverCounts).
+
+#include "/Engine/Public/Platform.ush"
+#include "/Plugin/VoxelPlugin/Private/VoxelDensityCore.ush"
+#include "/Plugin/VoxelPlugin/Private/VoxelDF64.ush"
+#include "/Plugin/VoxelPlugin/Private/VoxelCubeSphere.ush"
+
+uint RiverN;
+uint RiverPad;
+float RiverRadiusM;
+StructuredBuffer<float2> RiverTan;
+StructuredBuffer<float> RiverHeight;
+StructuredBuffer<float> RiverWater;
+StructuredBuffer<uint> RiverFlow;
+StructuredBuffer<uint> RiverRec;
+float RiverMinLog2;
+float RiverWidthScale;
+float RiverValleyScale;
+float RiverReachScale;
+float RiverMarginCells;
+float RiverSimplifyCells;
+float RiverSimplifyFloorM;
+float RiverSimplifyFloorShare;
+float RiverSimplifyLog2Area;
+uint RiverTilesPerFace;
+uint RiverNodeCap;
+uint RiverSegCap;
+uint RiverCandCap;
+uint RiverDataCap;
+RWStructuredBuffer<uint> RiverCounts;
+RWStructuredBuffer<uint> RiverCellFlags;
+RWStructuredBuffer<uint> RiverCellNode;
+RWStructuredBuffer<uint> NodeCell;
+RWStructuredBuffer<uint> NodeDown;
+RWStructuredBuffer<uint> NodePred;
+RWStructuredBuffer<uint> NodeUp;
+RWStructuredBuffer<uint> NodeKind;
+RWStructuredBuffer<uint> NodeFloor;
+RWStructuredBuffer<uint> NodeArea;
+RWStructuredBuffer<uint> NodeSeg;
+RWStructuredBuffer<float> NodePos;
+RWStructuredBuffer<float> NodePosOut;
+RWStructuredBuffer<uint> NodeJumpIn;
+RWStructuredBuffer<uint> NodeJumpOut;
+RWStructuredBuffer<float> NodeSIn;
+RWStructuredBuffer<float> NodeSOut;
+RWStructuredBuffer<float> NodeEndIn;
+RWStructuredBuffer<float> NodeEndOut;
+RWStructuredBuffer<uint> NodeIdxIn;
+RWStructuredBuffer<uint> NodeIdxOut;
+RWStructuredBuffer<uint> SegNode;
+RWStructuredBuffer<uint> SegEnd;
+RWStructuredBuffer<uint> TileStart;
+RWStructuredBuffer<uint> TileFill;
+RWStructuredBuffer<uint> TileBlock;
+RWStructuredBuffer<uint> TileCand;
+RWStructuredBuffer<uint> RiverTiles;
+RWStructuredBuffer<float> RiverData;
+
+// GPU-only: dispatch and the scan.
+uint GroupsX;
+uint ScanCount;                          // elements
+uint ScanGroups;                         // groups of 64
+uint ScanTotalSlot;                      // where the total goes in RiverCounts
+RWStructuredBuffer<uint> ScanData;       // counts in, exclusive offsets out
+RWStructuredBuffer<uint> ScanGroupSums;  // per group of 64: its sum, then its first offset
+
+#include "/Plugin/VoxelPlugin/Private/VoxelLandRiverBuild.ush"
+
+uint ThreadIndex(uint3 GroupId, uint GroupThread)
+{
+    return (GroupId.y * GroupsX + GroupId.x) * 64u + GroupThread;
+}
+
+uint GroupIndex(uint3 GroupId)
+{
+    return GroupId.y * GroupsX + GroupId.x;
+}
+
+// --- The scan: ScanSumCS, ScanTopCS, ScanApplyCS ---------------------------------------------
+
+groupshared uint ScanLocal[64];
+
+[numthreads(64, 1, 1)]
+void ScanSumCS(uint3 GroupId : SV_GroupID, uint GroupThread : SV_GroupIndex)
+{
+    const uint I = ThreadIndex(GroupId, GroupThread);
+    ScanLocal[GroupThread] = I < ScanCount ? ScanData[I] : 0u;
+    GroupMemoryBarrierWithGroupSync();
+    if (GroupThread != 0u || GroupIndex(GroupId) >= ScanGroups) return;
+    uint Sum = 0u;
+    for (uint k = 0u; k < 64u; k++)
+        Sum += ScanLocal[k];
+    ScanGroupSums[GroupIndex(GroupId)] = Sum;
+}
+
+groupshared uint ScanTop[1024];
+
+// One group: the group sums become each group's first offset, in order; the total to RiverCounts.
+[numthreads(1024, 1, 1)]
+void ScanTopCS(uint GroupThread : SV_GroupIndex)
+{
+    const uint PerThread = (ScanGroups + 1023u) / 1024u;
+    const uint First = GroupThread * PerThread;
+    const uint Last = min(First + PerThread, ScanGroups);
+    uint Sum = 0u;
+    for (uint g = First; g < Last; g++)
+        Sum += ScanGroupSums[g];
+    ScanTop[GroupThread] = Sum;
+    GroupMemoryBarrierWithGroupSync();
+    if (GroupThread == 0u)
+    {
+        uint Running = 0u;
+        for (uint t = 0u; t < 1024u; t++)
+        {
+            const uint S = ScanTop[t];
+            ScanTop[t] = Running;
+            Running += S;
+        }
+        RiverCounts[ScanTotalSlot] = Running;
+    }
+    GroupMemoryBarrierWithGroupSync();
+    uint Running = ScanTop[GroupThread];
+    for (uint h = First; h < Last; h++)
+    {
+        const uint Count = ScanGroupSums[h];
+        ScanGroupSums[h] = Running;
+        Running += Count;
+    }
+}
+
+[numthreads(64, 1, 1)]
+void ScanApplyCS(uint3 GroupId : SV_GroupID, uint GroupThread : SV_GroupIndex)
+{
+    const uint I = ThreadIndex(GroupId, GroupThread);
+    const uint Count = I < ScanCount ? ScanData[I] : 0u;
+    ScanLocal[GroupThread] = Count;
+    GroupMemoryBarrierWithGroupSync();
+    if (I >= ScanCount) return;
+    uint Offset = ScanGroupSums[GroupIndex(GroupId)];
+    for (uint k = 0u; k < GroupThread; k++)
+        Offset += ScanLocal[k];
+    ScanData[I] = Offset;
+}
+
+// --- The passes ------------------------------------------------------------------------------
+
+#define VOXEL_RIVER_ENTRY(Name, Function) \
+    [numthreads(64, 1, 1)] \
+    void Name(uint3 GroupId : SV_GroupID, uint GroupThread : SV_GroupIndex) \
+    { \
+        Function(ThreadIndex(GroupId, GroupThread)); \
+    }
+
+VOXEL_RIVER_ENTRY(SeedCS, VoxelRiverSeedPass)
+VOXEL_RIVER_ENTRY(ClosureCS, VoxelRiverClosurePass)
+VOXEL_RIVER_ENTRY(RolesCS, VoxelRiverRolesPass)
+VOXEL_RIVER_ENTRY(NodeCountCS, VoxelRiverNodeCountPass)
+VOXEL_RIVER_ENTRY(NodeInitCS, VoxelRiverNodeInitPass)
+VOXEL_RIVER_ENTRY(NodeLinkCS, VoxelRiverNodeLinkPass)
+VOXEL_RIVER_ENTRY(SmoothCS, VoxelRiverSmoothPass)
+VOXEL_RIVER_ENTRY(FloorInitCS, VoxelRiverFloorInitPass)
+VOXEL_RIVER_ENTRY(FloorPushCS, VoxelRiverFloorPushPass)
+VOXEL_RIVER_ENTRY(JumpCS, VoxelRiverJumpPass)
+VOXEL_RIVER_ENTRY(ChainInitCS, VoxelRiverChainInitPass)
+VOXEL_RIVER_ENTRY(ChainJumpCS, VoxelRiverChainJumpPass)
+VOXEL_RIVER_ENTRY(EndInitCS, VoxelRiverEndInitPass)
+VOXEL_RIVER_ENTRY(EndJumpCS, VoxelRiverEndJumpPass)
+VOXEL_RIVER_ENTRY(JumpCheckCS, VoxelRiverJumpCheckPass)
+VOXEL_RIVER_ENTRY(TrunkClearCS, VoxelRiverTrunkClearPass)
+VOXEL_RIVER_ENTRY(TrunkAreaCS, VoxelRiverTrunkAreaPass)
+VOXEL_RIVER_ENTRY(TrunkMainCS, VoxelRiverTrunkMainPass)
+VOXEL_RIVER_ENTRY(TrunkInitCS, VoxelRiverTrunkInitPass)
+VOXEL_RIVER_ENTRY(TrunkJumpCS, VoxelRiverTrunkJumpPass)
+VOXEL_RIVER_ENTRY(TrunkCheckCS, VoxelRiverTrunkCheckPass)
+VOXEL_RIVER_ENTRY(SegCountCS, VoxelRiverSegCountPass)
+VOXEL_RIVER_ENTRY(SegmentCS, VoxelRiverSegmentPass)
+VOXEL_RIVER_ENTRY(CoverCountCS, VoxelRiverCoverCountPass)
+VOXEL_RIVER_ENTRY(CoverFillCS, VoxelRiverCoverFillPass)
+VOXEL_RIVER_ENTRY(TileSortCS, VoxelRiverTileSortPass)
+VOXEL_RIVER_ENTRY(TileWriteCS, VoxelRiverTileWritePass)

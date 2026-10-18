@@ -120,8 +120,8 @@ namespace VoxelLandMaterialDetail
 
     /** The rows of the noise pack's words the material's texture takes on this RHI: all of them,
      *  or as many whole chains from the start as fit (the material then shades without the
-     *  rest: the hills' set, then the detail tile; the registry's limit, the same on every
-     *  machine, decides what the geometry has); 0 if not even the first fits. */
+     *  rest: the strata's set, the hills', then the detail set; the registry's limit, the same on
+     *  every machine, decides what the geometry has); 0 if not even the first fits. */
     uint32 NoiseRowsFor(const FVoxelLandNoiseSet* Noise)
     {
         const uint32 Max = (uint32)GetMax2DTextureDimension();
@@ -130,7 +130,8 @@ namespace VoxelLandMaterialDetail
         uint32 Best = 0;
         for (const uint32 End : { Noise->N > 0 ? ChainEndRow(*Noise, 0u, Noise->N) : 0u,
                  Noise->DetailN > 0 ? ChainEndRow(*Noise, Noise->DetailBase, Noise->DetailN) : 0u,
-                 Noise->HillN > 0 ? ChainEndRow(*Noise, Noise->HillBase, Noise->HillN) : 0u })
+                 Noise->HillN > 0 ? ChainEndRow(*Noise, Noise->HillBase, Noise->HillN) : 0u,
+                 Noise->StrataN > 0 ? ChainEndRow(*Noise, Noise->StrataBase, Noise->StrataN) : 0u })
             if (End <= Max) Best = FMath::Max(Best, End);
         return Best;
     }
@@ -148,7 +149,7 @@ namespace VoxelLandMaterialDetail
         return Noise && N > 0 && ChainEndRow(*Noise, Base, N) <= NoiseRowsFor(Noise);
     }
 
-    /** Whether the detail tile goes into the material. */
+    /** Whether the detail set goes into the material. */
     bool NoiseDetailFits(const FVoxelLandNoiseSet* Noise)
     {
         return Noise && NoiseChainFits(Noise, Noise->DetailBase, Noise->DetailN);
@@ -160,10 +161,11 @@ void VoxelLandMaterial::BuildFieldTexels(const FVoxelLandBake& Bake, TArray<FFlo
     const int32 NumCells = Bake.NumCells();
     // The fields: drainage, the lake's level above the cell's own height (small, so the half
     // keeps it to centimetres in shallow lakes where an absolute level would round to metres),
-    // the attributes' two parts.
+    // the attributes' two parts (the province with the second).
     const bool bFlow = Bake.Flow.Num() == NumCells;
     const bool bWater = Bake.Water.Num() == NumCells && Bake.Height.Num() == NumCells;
     const bool bAttr = Bake.Attr.Num() == NumCells;
+    const bool bProvince = Bake.Province.Num() == NumCells;
     Out.SetNumUninitialized(NumCells);
     constexpr int32 Chunk = 1 << 16;
     ParallelFor((NumCells + Chunk - 1) / Chunk, [&](int32 c)
@@ -179,7 +181,10 @@ void VoxelLandMaterial::BuildFieldTexels(const FVoxelLandBake& Bake, TArray<FFlo
                     : VOXEL_LAND_MATERIAL_NO_LAKE);
                 const uint32 Attr = bAttr ? (uint32)Bake.Attr[i] : 0u;
                 T.B = FFloat16((float)(Attr & 0xffu));
-                T.A = FFloat16((float)(Attr >> 8));
+                // The attributes' high bits (class, sea-connected, lake: 5) and the province (6,
+                // T4c) above them: at most 2047, exact in a half.
+                const uint32 Province = bProvince ? FMath::Min((uint32)Bake.Province[i], 63u) : 0u;
+                T.A = FFloat16((float)(((Attr >> 8) & 31u) | (Province << 5)));
             }
         });
 }
@@ -213,7 +218,30 @@ void VoxelLandMaterial::BuildConstantTexels(const FVoxelDensityGPUData& Density,
     const int32 OctaveTexels = Density.Octaves.Num() * VOXEL_LAND_MATERIAL_OCTAVE_TEXELS;
     const int32 PlateBase = OctaveBase + OctaveTexels;
     const int32 PlateCount = Bake.Plates.Num() / 8;
-    const int32 Texels = PlateBase + PlateCount * 2;
+    // The rivers' tables (R1), four values a texel, when the texture's rows can hold them.
+    const FVoxelLandRiverSet* Rivers = Density.LandRivers.Get();
+    const int32 RiverTileBase = PlateBase + PlateCount * 2;
+    int32 RiverTileTexels = 0, RiverDataTexels = 0;
+    if (Rivers && Density.LandRiverTilesPerFace > 0)
+    {
+        RiverTileTexels = (Rivers->Tiles.Num() + 3) / 4;
+        RiverDataTexels = (Rivers->Data.Num() + 3) / 4;
+        const int64 Rows = ((int64)RiverTileBase + RiverTileTexels + RiverDataTexels + VOXEL_LAND_MATERIAL_CONST_WIDTH - 1) / VOXEL_LAND_MATERIAL_CONST_WIDTH;
+        // The tables' texel offsets and the tiles' block starts are stored as floats: kept
+        // below 2^24 with every scalar after them.
+        const int64 LastScalar = 4 * ((int64)RiverTileBase + RiverTileTexels + RiverDataTexels);
+        if (Rows > (int64)GetMax2DTextureDimension() || LastScalar > (int64)(1 << 24))
+        {
+            UE_LOG(LogVoxelPlugin, Warning, TEXT("[VoxelLand] The rivers' tables (%d rows) don't fit the material's constants texture on this RHI; the material shades without them."),
+                (int32)Rows);
+            Rivers = nullptr;
+            RiverTileTexels = RiverDataTexels = 0;
+        }
+    }
+    else
+        Rivers = nullptr;
+    const int32 RiverDataBase = RiverTileBase + RiverTileTexels;
+    const int32 Texels = RiverDataBase + RiverDataTexels;
     OutRows = (Texels + VOXEL_LAND_MATERIAL_CONST_WIDTH - 1) / VOXEL_LAND_MATERIAL_CONST_WIDTH;
     Out.Init(FVector4f(0.0f, 0.0f, 0.0f, 0.0f), OutRows * VOXEL_LAND_MATERIAL_CONST_WIDTH);
     float* const S = &Out[0].X;
@@ -248,9 +276,35 @@ void VoxelLandMaterial::BuildConstantTexels(const FVoxelDensityGPUData& Density,
     S[VOXEL_LAND_MC_PLATE_COUNT] = (float)PlateCount;
     PutU32(S, VOXEL_LAND_MC_PLATE_SEED, Bake.PlateSeed);
     S[VOXEL_LAND_MC_HAS_HYDRO] = bFlow && bWater ? 1.0f : 0.0f;
+    // R2: the rivers' and lakes' carve (VoxelLandCarve.ush; the lake levels from the field
+    // texture, a lake's depth over the cell in half precision: a few centimetres off the
+    // density's at the shore band). The switch as the density's, rivers or not: the lakes'
+    // carve reads it too (no rivers is RIVER_TILES_PER_FACE 0).
+    S[VOXEL_LAND_MC_RIVER_CARVE] = Density.LandRiverCarve;
+    S[VOXEL_LAND_MC_RIVER_DEPTH_SCALE] = Density.LandRiverDepthScale;
+    S[VOXEL_LAND_MC_RIVER_FLOODPLAIN_SCALE] = Density.LandRiverFloodplainScale;
+    S[VOXEL_LAND_MC_RIVER_MIN_LOG2_AREA] = Density.LandRiverMinLog2Area;
+    S[VOXEL_LAND_MC_LAKE_SHORE_BAND] = Density.LandLakeShoreBand;
+    S[VOXEL_LAND_MC_RIVER_MEANDER] = Density.LandRiverMeander;
+    S[VOXEL_LAND_MC_RIVER_FALLS] = Density.LandRiverFalls;
+    S[VOXEL_LAND_MC_HAS_WATER] = bWater && Density.LandHasWater != 0 ? 1.0f : 0.0f;
     S[VOXEL_LAND_MC_TAN_BASE] = (float)TanBase;
     S[VOXEL_LAND_MC_OCTAVE_BASE] = (float)OctaveBase;
     S[VOXEL_LAND_MC_PLATE_BASE] = (float)PlateBase;
+    if (Rivers)
+    {
+        S[VOXEL_LAND_MC_RIVER_TILES_PER_FACE] = (float)Density.LandRiverTilesPerFace;
+        S[VOXEL_LAND_MC_RIVER_RADIUS_M] = Density.LandRiverRadiusM;
+        S[VOXEL_LAND_MC_RIVER_WIDTH_SCALE] = Density.LandRiverWidthScale;
+        S[VOXEL_LAND_MC_RIVER_VALLEY_SCALE] = Density.LandRiverValleyScale;
+        S[VOXEL_LAND_MC_RIVER_TILE_TEXEL] = (float)RiverTileBase;
+        S[VOXEL_LAND_MC_RIVER_DATA_TEXEL] = (float)RiverDataBase;
+        // Integers below 2^24 are exact as floats: the tiles' block starts (checked above with
+        // every scalar index).
+        for (int32 i = 0; i < Rivers->Tiles.Num(); i++)
+            S[4 * RiverTileBase + i] = (float)Rivers->Tiles[i];
+        FMemory::Memcpy(S + 4 * RiverDataBase, Rivers->Data.GetData(), Rivers->Data.Num() * sizeof(float));
+    }
     S[VOXEL_LAND_MC_SIDE] = (float)Bake.Side();
     S[VOXEL_LAND_MC_PLATE_RADIUS_M] = Bake.PlateRadiusM;
     S[VOXEL_LAND_MC_PLATE_WIDTH_SCALE] = Bake.PlateWidthScale;
@@ -260,9 +314,9 @@ void VoxelLandMaterial::BuildConstantTexels(const FVoxelDensityGPUData& Density,
     S[VOXEL_LAND_MC_HILL_OCTAVES] = (float)Density.LandHillOctaves;
     PutU32(S, VOXEL_LAND_MC_HILL_SEED, Density.LandHillSeed);
     S[VOXEL_LAND_MC_HAS_FORM] = bForm ? 1.0f : 0.0f;
-    // The noise pack (VoxelLandNoise.ush): the peaks, the detail tile, the hills' set; each off
-    // without its chain in the texture. The hills' set's relief without it would be the
-    // procedural hills at the set's height: none then.
+    // The noise pack (VoxelLandNoise.ush): the peaks, the detail set, the hills' and the
+    // strata's sets; each off without its chain in the texture. The hills' set's relief without
+    // it would be the procedural hills at the set's height: none then.
     if (Density.LandHillTexelsPerCell > 0.0f && !(Density.LandNoise.IsValid() && NoiseChainFits(Density.LandNoise.Get(), Density.LandNoise->HillBase, Density.LandNoise->HillN)))
         S[VOXEL_LAND_MC_HILL_RELIEF] = 0.0f;
     const FVoxelLandNoiseSet* Pack = NoiseFits(Density.LandNoise.Get()) ? Density.LandNoise.Get() : nullptr;
@@ -271,11 +325,19 @@ void VoxelLandMaterial::BuildConstantTexels(const FVoxelDensityGPUData& Density,
         S[VOXEL_LAND_MC_NOISE_SHIFT] = (float)FMath::FloorLog2(Pack->RowN);
         if (NoiseDetailFits(Pack))
         {
-            PutU32(S, VOXEL_LAND_MC_PEAK_DETAIL_BASE, Pack->DetailBase);
-            S[VOXEL_LAND_MC_PEAK_DETAIL_N] = (float)Pack->DetailN;
-            S[VOXEL_LAND_MC_PEAK_DETAIL_MIPS] = (float)Pack->DetailMips;
-            S[VOXEL_LAND_MC_PEAK_DETAIL_MEAN_R] = Density.LandPeakDetailMeanR;
-            S[VOXEL_LAND_MC_PEAK_DETAIL_MEAN_G] = Density.LandPeakDetailMeanG;
+            PutU32(S, VOXEL_LAND_MC_DETAIL_BASE, Pack->DetailBase);
+            S[VOXEL_LAND_MC_DETAIL_N] = (float)Pack->DetailN;
+            S[VOXEL_LAND_MC_DETAIL_MIPS] = (float)Pack->DetailMips;
+            S[VOXEL_LAND_MC_DETAIL_MEAN_HARD] = Density.LandDetailMeanHard;
+            S[VOXEL_LAND_MC_DETAIL_MEAN_SOFT] = Density.LandDetailMeanSoft;
+            // N1: the detail layer (VoxelLandDetail.ush).
+            S[VOXEL_LAND_MC_DETAIL_TEXELS_PER_CELL] = Density.LandDetailTexelsPerCell;
+            S[VOXEL_LAND_MC_DETAIL_SCALES] = (float)Density.LandDetailScales;
+            S[VOXEL_LAND_MC_DETAIL_MEAN_A] = Density.LandDetailMeanA;
+            S[VOXEL_LAND_MC_DETAIL_SCALE_A] = Density.LandDetailScaleA;
+            S[VOXEL_LAND_MC_DETAIL_SCALE_GAIN] = Density.LandDetailScaleGain;
+            S[VOXEL_LAND_MC_DETAIL_FADE] = Density.LandDetailFade;
+            PutU32(S, VOXEL_LAND_MC_DETAIL_SEED, Density.LandDetailSeed);
         }
         if (Density.LandHillTexelsPerCell > 0.0f && NoiseChainFits(Pack, Pack->HillBase, Pack->HillN))
         {
@@ -286,6 +348,8 @@ void VoxelLandMaterial::BuildConstantTexels(const FVoxelDensityGPUData& Density,
             S[VOXEL_LAND_MC_HILL_SCALE_R] = Density.LandHillScaleR;
             S[VOXEL_LAND_MC_HILL_SCALE_G] = Density.LandHillScaleG;
             S[VOXEL_LAND_MC_HILL_SCALE_B] = Density.LandHillScaleB;
+            S[VOXEL_LAND_MC_HILL_MEAN_R] = Density.LandHillMeanR;
+            S[VOXEL_LAND_MC_HILL_MEAN_G] = Density.LandHillMeanG;
             S[VOXEL_LAND_MC_HILL_SPACING_M] = Density.LandHillSpacingM;
             S[VOXEL_LAND_MC_HILL_SWELL_TEXELS_PER_CELL] = Density.LandHillSwellTexelsPerCell;
             S[VOXEL_LAND_MC_HILL_SWELL_M] = Density.LandHillSwellM;
@@ -294,9 +358,35 @@ void VoxelLandMaterial::BuildConstantTexels(const FVoxelDensityGPUData& Density,
             if (NoiseDetailFits(Pack))
             {
                 S[VOXEL_LAND_MC_HILL_DETAIL_TEXELS_PER_CELL] = Density.LandHillDetailTexelsPerCell;
-                S[VOXEL_LAND_MC_HILL_DETAIL_SCALE_R] = Density.LandHillDetailScaleR;
-                S[VOXEL_LAND_MC_HILL_DETAIL_SCALE_G] = Density.LandHillDetailScaleG;
+                S[VOXEL_LAND_MC_HILL_DETAIL_SCALE_HARD] = Density.LandHillDetailScaleHard;
+                S[VOXEL_LAND_MC_HILL_DETAIL_SCALE_SOFT] = Density.LandHillDetailScaleSoft;
                 S[VOXEL_LAND_MC_HILL_DETAIL_FADE] = Density.LandHillDetailFade;
+            }
+            if (Density.LandStrataTexelsPerCell > 0.0f && NoiseChainFits(Pack, Pack->StrataBase, Pack->StrataN))
+            {
+                // The strata (T4c), in the hill set's layer.
+                PutU32(S, VOXEL_LAND_MC_STRATA_BASE, Pack->StrataBase);
+                S[VOXEL_LAND_MC_STRATA_N] = (float)Pack->StrataN;
+                S[VOXEL_LAND_MC_STRATA_MIPS] = (float)Pack->StrataMips;
+                S[VOXEL_LAND_MC_STRATA_TEXELS_PER_CELL] = Density.LandStrataTexelsPerCell;
+                S[VOXEL_LAND_MC_STRATA_SCALE_R] = Density.LandStrataScaleR;
+                S[VOXEL_LAND_MC_STRATA_SCALE_G] = Density.LandStrataScaleG;
+                S[VOXEL_LAND_MC_STRATA_SCALE_B] = Density.LandStrataScaleB;
+                S[VOXEL_LAND_MC_STRATA_MEAN_R] = Density.LandStrataMeanR;
+                S[VOXEL_LAND_MC_STRATA_MEAN_G] = Density.LandStrataMeanG;
+                S[VOXEL_LAND_MC_STRATA_SPACING_M] = Density.LandStrataSpacingM;
+                S[VOXEL_LAND_MC_STRATA_RELIEF] = Density.LandStrataRelief;
+                S[VOXEL_LAND_MC_STRATA_FLAT] = Density.LandStrataFlat;
+                S[VOXEL_LAND_MC_STRATA_THRESHOLD] = Density.LandStrataThreshold;
+                S[VOXEL_LAND_MC_STRATA_WIDTH] = Density.LandStrataWidth;
+                PutU32(S, VOXEL_LAND_MC_STRATA_SEED, Density.LandStrataSeed);
+                if (NoiseDetailFits(Pack))
+                {
+                    S[VOXEL_LAND_MC_STRATA_DETAIL_TEXELS_PER_CELL] = Density.LandStrataDetailTexelsPerCell;
+                    S[VOXEL_LAND_MC_STRATA_DETAIL_SCALE_HARD] = Density.LandStrataDetailScaleHard;
+                    S[VOXEL_LAND_MC_STRATA_DETAIL_SCALE_SOFT] = Density.LandStrataDetailScaleSoft;
+                    S[VOXEL_LAND_MC_STRATA_DETAIL_FADE] = Density.LandStrataDetailFade;
+                }
             }
         }
     }
@@ -316,12 +406,12 @@ void VoxelLandMaterial::BuildConstantTexels(const FVoxelDensityGPUData& Density,
         S[VOXEL_LAND_MC_PEAK_SCALE_R] = Density.LandPeakScaleR;
         S[VOXEL_LAND_MC_PEAK_SCALE_G] = Density.LandPeakScaleG;
         S[VOXEL_LAND_MC_PEAK_SCALE_B] = Density.LandPeakScaleB;
-        // The detail tile, in the same texture after the set's chain (T3e).
+        // The peaks' detail: the detail set, in the same texture (T3e).
         if (Density.LandPeakDetailTexelsPerCell > 0.0f && NoiseDetailFits(Noise))
         {
             S[VOXEL_LAND_MC_PEAK_DETAIL_TEXELS_PER_CELL] = Density.LandPeakDetailTexelsPerCell;
-            S[VOXEL_LAND_MC_PEAK_DETAIL_SCALE_R] = Density.LandPeakDetailScaleR;
-            S[VOXEL_LAND_MC_PEAK_DETAIL_SCALE_G] = Density.LandPeakDetailScaleG;
+            S[VOXEL_LAND_MC_PEAK_DETAIL_SCALE_HARD] = Density.LandPeakDetailScaleHard;
+            S[VOXEL_LAND_MC_PEAK_DETAIL_SCALE_SOFT] = Density.LandPeakDetailScaleSoft;
             S[VOXEL_LAND_MC_PEAK_DETAIL_FADE] = Density.LandPeakDetailFade;
         }
     }

@@ -12,6 +12,9 @@ StructuredBuffer<float2> LandTanTable;
 StructuredBuffer<uint> LandFlow;        // f16 log2 m^2, two cells per word (when LandHasFlow)
 StructuredBuffer<uint> LandForm;        // the landform, two cells per word (when LandHasForm)
 StructuredBuffer<uint> LandRelief;      // the local relief, four cells per word (when LandHasForm)
+StructuredBuffer<uint> LandProvince;    // T4c: the province, four cells per word (when LandHasForm)
+StructuredBuffer<uint> LandRiverTiles;  // R1: the rivers' tiles (VoxelLandRivers.ush, VoxelLandRiverLayout.ush)
+StructuredBuffer<float> LandRiverData;  // R1: their segments and tile blocks
 StructuredBuffer<uint> LandNoise;       // the peaks' noise set (VoxelLandNoise.ush), two words a texel
 uint LandN;
 uint LandPad;
@@ -21,7 +24,7 @@ float LandCellM;                        // a bake cell's arc at the face centre 
 uint LandWarpOctaves;                   // per warp component, after the detail octaves
 float LandWarpInvNorm;
 float LandWarpAmplitude;                // cm
-float LandDetailAmplitude;              // cm
+float LandDetailAmplitude;              // cm (the detail layer's: VoxelLandDetail.ush)
 float2 LandHeightOffset;                // cm (double-float): sea-level heights to heights above PlanetRadius
 float LandGullyStrength;                // VoxelLandGully.ush (0: no gullies)
 uint LandGullyOctaves;
@@ -46,14 +49,14 @@ float LandPeakScaleG;
 float LandPeakScaleB;
 uint LandNoiseN;                        // VoxelLandNoise.ush: the peaks' set (0: none)
 uint LandNoiseMips;
-uint LandPeakDetailBase;                // the peaks' detail tile (VoxelLandPeaks.ush, T3e)
-uint LandPeakDetailN;
-uint LandPeakDetailMips;
+uint LandDetailBase;                // the detail set (N1: VoxelLandDetail.ush; the layers' detail, VoxelLandPeaks.ush)
+uint LandDetailN;
+uint LandDetailMips;
 float LandPeakDetailTexelsPerCell;      // 0: no detail
-float LandPeakDetailMeanR;
-float LandPeakDetailMeanG;
-float LandPeakDetailScaleR;
-float LandPeakDetailScaleG;
+float LandDetailMeanHard;
+float LandDetailMeanSoft;
+float LandPeakDetailScaleHard;
+float LandPeakDetailScaleSoft;
 float LandPeakDetailFade;
 float LandHillTexelsPerCell;            // VoxelLandHillSet.ush (T4a; 0: no set, the procedural hills)
 uint LandHillBase;
@@ -62,14 +65,55 @@ uint LandHillMips;
 float LandHillScaleR;
 float LandHillScaleG;
 float LandHillScaleB;
+float LandHillMeanR;                    // N1b: R's and G's means (unit), for the face blend
+float LandHillMeanG;
 float LandHillSpacingM;
 float LandHillSwellTexelsPerCell;       // 0: no swells
 float LandHillSwellM;
 float LandHillSwellScaleG;
 float LandHillDetailTexelsPerCell;      // 0: no detail
-float LandHillDetailScaleR;
-float LandHillDetailScaleG;
+float LandHillDetailScaleHard;
+float LandHillDetailScaleSoft;
 float LandHillDetailFade;
 float LandHillFoothill;                 // T4b: the hill set's growth in the foothills
+float LandStrataTexelsPerCell;          // VoxelLandHillSet.ush (T4c; 0: no strata)
+uint LandStrataBase;
+uint LandStrataN;
+uint LandStrataMips;
+float LandStrataScaleR;
+float LandStrataScaleG;
+float LandStrataScaleB;
+float LandStrataMeanR;                  // N1b
+float LandStrataMeanG;
+float LandStrataSpacingM;
+float LandStrataRelief;
+float LandStrataFlat;
+float LandStrataThreshold;
+float LandStrataWidth;
+uint LandStrataSeed;
+float LandStrataDetailTexelsPerCell;    // 0: no detail
+float LandStrataDetailScaleHard;
+float LandStrataDetailScaleSoft;
+float LandStrataDetailFade;
+uint LandRiverTilesPerFace;             // VoxelLandRivers.ush (R1; 0: no rivers)
+float LandRiverRadiusM;
+float LandRiverWidthScale;
+float LandRiverValleyScale;
+StructuredBuffer<float> LandWater;      // R2: the kept lakes' levels per cell (VoxelLandCarve.ush; the debug views' too)
+uint LandHasWater;                      // 1 when LandWater is the bake's
+float LandRiverCarve;                   // R2 (VoxelLandCarve.ush): 0 rivers not carved
+float LandRiverDepthScale;
+float LandRiverFloodplainScale;
+float LandRiverMinLog2Area;
+float LandLakeShoreBand;
+float LandRiverMeander;
+float LandRiverFalls;
+float LandDetailTexelsPerCell;          // N1: the detail layer from the detail set (VoxelLandDetail.ush; 0: none)
+uint LandDetailScales;
+float LandDetailMeanA;
+float LandDetailScaleA;
+float LandDetailScaleGain;
+float LandDetailFade;
+uint LandDetailSeed;
 
 #endif // VOXEL_LAND_PARAMETERS_USH

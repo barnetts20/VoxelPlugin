@@ -11,8 +11,9 @@
 // units (VoxelLandNoise.ush maps between mips at the box filter's centres).
 //
 // Sets come from the noise generator's .vxnt files (ReadVxnt), or, without them, from the
-// plugin's own stand-in (GeneratePeaksStandIn: the eroded peaks' layout, Addendum 2, without the
-// simulation). Generate makes the handoff's raw kinds (its hashing differs from the utility's).
+// plugin's own stand-ins (GeneratePeaksStandIn: the eroded peaks' layout, Addendum 2, without the
+// simulation; GenerateDetailStandIn: the detail sets' layout, the handoff's section 6). Generate
+// makes the handoff's raw kinds (its hashing differs from the utility's).
 // Plain C++ without engine types: the harnesses run the same reader and generators.
 
 #pragma once
@@ -47,6 +48,7 @@ namespace VoxelNoiseTiles
         uint32_t Seed = 0;
         uint32_t CellsPerTile = 1;   // the coarsest lattice's cells along a side (a power of two)
         uint32_t Octaves = 1;
+        float Lacunarity = 2.0f;
         float Gain = 0.5f;
         float Jitter = 0.0f;
         float ErosionK = 0.0f;       // eroded_fbm's damping
@@ -131,6 +133,40 @@ namespace VoxelNoiseTiles
         return N0 + V * (N1 - N0);
     }
 
+    /** GradientNoise and its derivatives along X and Y (per lattice cell). */
+    inline double GradientNoiseD(double X, double Y, int32_t Period, uint32_t Seed, double& OutDX, double& OutDY)
+    {
+        const double FX0 = std::floor(X);
+        const double FY0 = std::floor(Y);
+        const int32_t IX = (int32_t)FX0;
+        const int32_t IY = (int32_t)FY0;
+        const double FX = X - FX0;
+        const double FY = Y - FY0;
+        double GX[2][2], GY[2][2], C[2][2];
+        for (int32_t j = 0; j < 2; j++)
+            for (int32_t i = 0; i < 2; i++)
+            {
+                const uint32_t H = Hash3((uint32_t)Wrap(IX + i, Period), (uint32_t)Wrap(IY + j, Period), Seed);
+                const double A = (double)(H >> 8) * (6.283185307179586 / 16777216.0);
+                GX[j][i] = std::cos(A);
+                GY[j][i] = std::sin(A);
+                C[j][i] = GX[j][i] * (FX - i) + GY[j][i] * (FY - j);
+            }
+        const double U = FX * FX * FX * (FX * (FX * 6.0 - 15.0) + 10.0);
+        const double V = FY * FY * FY * (FY * (FY * 6.0 - 15.0) + 10.0);
+        const double DU = 30.0 * FX * FX * (FX - 1.0) * (FX - 1.0);
+        const double DV = 30.0 * FY * FY * (FY - 1.0) * (FY - 1.0);
+        const double N0 = C[0][0] + U * (C[0][1] - C[0][0]);
+        const double N1 = C[1][0] + U * (C[1][1] - C[1][0]);
+        const double N0X = GX[0][0] + U * (GX[0][1] - GX[0][0]) + DU * (C[0][1] - C[0][0]);
+        const double N1X = GX[1][0] + U * (GX[1][1] - GX[1][0]) + DU * (C[1][1] - C[1][0]);
+        const double N0Y = GY[0][0] + U * (GY[0][1] - GY[0][0]);
+        const double N1Y = GY[1][0] + U * (GY[1][1] - GY[1][0]);
+        OutDX = N0X + V * (N1X - N0X);
+        OutDY = N0Y + V * (N1Y - N0Y) + DV * (N1 - N0);
+        return N0 + V * (N1 - N0);
+    }
+
     /** A channel's value at P in its coarsest cells (P ranges over 0 .. CellsPerTile). */
     inline double Evaluate(const FChannel& C, double X, double Y)
     {
@@ -145,6 +181,24 @@ namespace VoxelNoiseTiles
             {
                 const double N = GradientNoise(X * F, Y * F, Period * (int32_t)F, C.Seed + o * 0x9e3779b9u);
                 Sum += Amp * (C.Kind == KindBillow ? std::fabs(N) : N);
+                Norm += Amp;
+                Amp *= C.Gain;
+                F *= 2.0;
+            }
+            return Sum / Norm;
+        }
+        case KindErodedFbm:
+        {
+            // Slope-damped fbm (Inigo Quilez's): each octave over 1 + k |the octaves' gradients
+            // so far|^2, the gradients in each octave's own cells.
+            double Sum = 0.0, Norm = 0.0, Amp = 1.0, F = 1.0, DX = 0.0, DY = 0.0;
+            for (uint32_t o = 0; o < C.Octaves; o++)
+            {
+                double NX = 0.0, NY = 0.0;
+                const double N = GradientNoiseD(X * F, Y * F, Period * (int32_t)F, C.Seed + o * 0x9e3779b9u, NX, NY);
+                DX += NX;
+                DY += NY;
+                Sum += Amp * N / (1.0 + (double)C.ErosionK * (DX * DX + DY * DY));
                 Norm += Amp;
                 Amp *= C.Gain;
                 F *= 2.0;
@@ -433,95 +487,144 @@ namespace VoxelNoiseTiles
         return Set;
     }
 
-    /** The peaks' detail tile (VoxelLandPeaks.ush, Design/SurfaceLook.md T3e): the surface below
-     *  the peaks set's resolution, one more lookup at a finer scale. R hard rock: a ridged
-     *  multifractal (sharp crests and creases); G soft rock: an fbm (rounded), the same octaves'
-     *  noise, so the two blend by the landform's character as the peaks' R and G do. Each octave
-     *  domain warped by its own noise (the lattice's straight lines bend at every scale),
-     *  DetailCells coarsest cells a side (wavelength N / DetailCells texels), DetailOctaves
-     *  octaves halving. Periodic (every noise wraps at its lattice's period). Heights in mip-0 texels,
-     *  each channel scaled to its RMS slope (DetailSlopeR, DetailSlopeG: a texel unit gradient,
-     *  so 0.35 is 19 degrees), then within DetailRangeTexels of its mean (VoxelLand::PeakReach's
-     *  bound). B and A are unused (zero). */
+    /** The detail sets' layout (Design/NoiseTiles2D_Handoff.md section 6; the land's detail,
+     *  N1: VoxelLandDetail.ush, and the layers' detail, VoxelLandPeaks.ush): R an fbm (soft rock's
+     *  detail), G a ridged multifractal (hard rock's), B a billow (unused), A an eroded fbm (the
+     *  detail layer), each DetailCells coarsest cells a side, DetailOctaves octaves, gain 0.5.
+     *  Unitless: the plugin scales R and G to texel heights at an RMS slope (DetailSlopeSoft,
+     *  DetailSlopeHard: a texel unit gradient, so 0.35 is 19 degrees), then within
+     *  DetailRangeWaves of a coarsest wavelength of their mean (VoxelLand::PeakReach's bound);
+     *  A to the detail layer's unit by its standard deviation (DetailStatsOf). */
     constexpr uint32_t DetailCells = 16;
-    constexpr uint32_t DetailOctaves = 5;
-    constexpr double DetailSlopeR = 0.35;
-    constexpr double DetailSlopeG = 0.22;
-    constexpr double DetailRangeTexels = 12.0;
+    constexpr uint32_t DetailOctaves = 4;
+    constexpr double DetailSlopeHard = 0.35;
+    constexpr double DetailSlopeSoft = 0.22;
+    constexpr double DetailRangeWaves = 0.1875;
+    // The detail layer's unit: A over its standard deviation times this (the procedural fBm's
+    // normalisation before N1). Its scales are 2^DetailOctaves apart in wavelength, each A's gain
+    // to the power DetailOctaves lower (continuing the set's own spectrum); the face blend keeps
+    // the variance (over the root of the weights' squares), so at a cube corner the three faces'
+    // lookups can sum to sqrt(3) of one's bound.
+    constexpr double DetailLayerSigma = 0.4;
+    constexpr double DetailBlendBound = 1.7320508075688772;
 
+    /** The plugin's own detail set in the detail sets' layout, standing in when the NoiseSets
+     *  folder has none (a different hashing from the utility's, but the same kinds). */
     template <typename TParallelFor>
-    FSet GeneratePeakDetail(uint32_t Seed, uint32_t N, TParallelFor&& ParallelFor)
+    FSet GenerateDetailStandIn(uint32_t Seed, uint32_t N, TParallelFor&& ParallelFor)
     {
         FSet Set;
-        Set.Name = "peak_detail";
-        Set.LookTag = "generated: ridged (R) and fbm (G), warped per octave";
+        Set.Name = "detail";
+        Set.LookTag = "generated stand-in: fbm, ridged, billow, eroded fbm";
         Set.Seed = Seed;
         Set.N = N;
-        // Each octave's own warp (two noises at half its frequency, up to about 0.7 of its cells: a
-        // gradient noise spans about +-0.7, scaled by 2 WarpCells): a ridged
-        // multifractal's creases follow its noise's zero lines, which run straight along the
-        // lattice; one coarse warp leaves the fine octaves' lines straight.
-        constexpr double WarpCells = 0.5;
-        std::vector<double> Level[4];
-        for (int c = 0; c < 4; c++) Level[c].assign((size_t)N * N, 0.0);
-        ParallelFor((int32_t)N, [&](int32_t y) {
-            for (uint32_t x = 0; x < N; x++)
-            {
-                double SumR = 0.0, SumG = 0.0, Norm = 0.0, Amp = 1.0, Weight = 1.0;
-                for (uint32_t o = 0; o < DetailOctaves; o++)
-                {
-                    const int32_t Period = (int32_t)(DetailCells << o);
-                    const double K = (double)Period / (double)N;
-                    const double X = (double)x * K, Y = (double)y * K;
-                    const uint32_t OS = Mix(Seed + 0x9e3779b9u * (o + 1u));
-                    const double WX = GradientNoise(0.5 * X, 0.5 * Y, Period / 2, OS ^ 0x1234567u);
-                    const double WY = GradientNoise(0.5 * X, 0.5 * Y, Period / 2, OS ^ 0x7654321u);
-                    const double Nz = GradientNoise(X + WarpCells * 2.0 * WX, Y + WarpCells * 2.0 * WY, Period, OS);
-                    // Musgrave's ridged multifractal (each octave weighted by the previous one's
-                    // ridge) and a plain fbm of the same octaves.
-                    const double Ridge = (1.0 - std::fabs(Nz)) * (1.0 - std::fabs(Nz));
-                    SumR += Amp * Ridge * Weight;
-                    SumG += Amp * Nz;
-                    Norm += Amp;
-                    Weight = std::min(std::max(Ridge, 0.0), 1.0);
-                    Amp *= 0.5;
-                }
-                Level[0][(size_t)y * N + x] = SumR / Norm;
-                Level[1][(size_t)y * N + x] = SumG / Norm;
-            }
-        });
-        FChannel R;
-        R.Kind = KindRidged; R.Seed = Seed; R.CellsPerTile = DetailCells; R.Octaves = DetailOctaves; R.Gain = 0.5f;
-        FChannel G = R;
-        G.Kind = KindFbm;
-        // To texel units: each channel's RMS slope (central differences, wrapped), then its
-        // spread about the mean bounded.
-        const double Target[2] = { DetailSlopeR, DetailSlopeG };
+        const uint32_t Kinds[4] = { KindFbm, KindRidged, KindBillow, KindErodedFbm };
+        for (int c = 0; c < 4; c++)
+        {
+            FChannel& C = Set.Channel[c];
+            C.Kind = Kinds[c];
+            C.Seed = Mix(Seed + 0x9e3779b9u * (uint32_t)(c + 1));
+            C.CellsPerTile = DetailCells;
+            C.Octaves = DetailOctaves;
+            C.Gain = 0.5f;
+            C.ErosionK = Kinds[c] == KindErodedFbm ? 1.0f : 0.0f;
+        }
+        Generate(Set, ParallelFor);
+        return Set;
+    }
+
+    /** Whether Set has the detail sets' layout: R an fbm, G a ridged multifractal, A an eroded fbm
+     *  (B isn't read), at one coarsest lattice dividing N, its wavelength (N / cells) 16 to 512
+     *  texels, each DetailOctaves octaves at lacunarity 2 (the detail layer's scales continue each
+     *  other on that), A's gain within 0.3 .. 0.7. "" if so, else why not. */
+    inline std::string CheckDetail(const FSet& Set)
+    {
+        const FChannel& R = Set.Channel[0];
+        const FChannel& G = Set.Channel[1];
+        const FChannel& A = Set.Channel[3];
+        if (R.Kind != KindFbm || G.Kind != KindRidged || A.Kind != KindErodedFbm)
+            return "R, G and A aren't fbm, ridged and eroded fbm (kinds " + std::to_string(R.Kind) + ", " + std::to_string(G.Kind) + ", "
+                + std::to_string(A.Kind) + "): not a detail set?";
+        const uint32_t Cells = R.CellsPerTile;
+        if (G.CellsPerTile != Cells || A.CellsPerTile != Cells) return "R, G and A have different cell counts";
+        if (Cells == 0u || Set.N % Cells != 0u) return "the cell count (" + std::to_string(Cells) + ") doesn't divide the size";
+        if (Set.N / Cells < 16u || Set.N / Cells > 512u) return "the coarsest wavelength (" + std::to_string(Set.N / Cells) + " texels) isn't within 16 .. 512";
+        for (const FChannel* C : { &R, &G, &A })
+        {
+            if (C->Octaves != DetailOctaves) return "a channel has " + std::to_string(C->Octaves) + " octaves (" + std::to_string(DetailOctaves) + " expected)";
+            if (std::fabs(C->Lacunarity - 2.0f) > 1e-3f) return "a channel's lacunarity is " + std::to_string(C->Lacunarity) + " (2 expected)";
+        }
+        if (!(A.Gain >= 0.3f && A.Gain <= 0.7f)) return "A's gain " + std::to_string(A.Gain) + " isn't within 0.3 .. 0.7";
+        return std::string();
+    }
+
+    /** What the plugin places and normalises a detail set with (CheckDetail's layout): hard
+     *  rock's (G) and soft rock's (R) means (unit values) and ranges (Max - Min in texel heights:
+     *  scaled to DetailSlopeHard and DetailSlopeSoft RMS slopes over mip 0, by central
+     *  differences, and within DetailRangeWaves of a wavelength of their means); A's mean and
+     *  standard deviation (unit values), the detail layer's gain from one scale to the next (A's
+     *  gain to the power DetailOctaves) and its bound (its largest |unit|). */
+    struct FDetailStats
+    {
+        double MeanHard = 0.0;
+        double MeanSoft = 0.0;
+        double RangeHard = 0.0;
+        double RangeSoft = 0.0;
+        double MeanA = 0.0;
+        double StdA = 0.0;
+        double ScaleGain = 0.0;
+        double BoundA = 0.0;
+    };
+
+    inline FDetailStats DetailStatsOf(const FSet& Set, const uint16_t* Texels)
+    {
+        FDetailStats Out;
+        const uint32_t N = Set.N;
+        const size_t Count = (size_t)N * N;
+        const double Spacing = (double)(N / std::max(Set.Channel[0].CellsPerTile, 1u));
         for (int c = 0; c < 2; c++)
         {
-            std::vector<double>& L = Level[c];
-            double Sum2 = 0.0, Mean = 0.0;
+            const FChannel& C = Set.Channel[c];
+            const double Span = (double)C.Max - (double)C.Min;
+            auto At = [&](uint32_t x, uint32_t y) { return (double)Texels[((size_t)y * N + x) * 4 + c] / 65535.0; };
+            double Sum = 0.0, Sum2 = 0.0, Lo = 1.0, Hi = 0.0;
             for (uint32_t y = 0; y < N; y++)
                 for (uint32_t x = 0; x < N; x++)
                 {
-                    const double GX = 0.5 * (L[(size_t)y * N + (x + 1) % N] - L[(size_t)y * N + (x + N - 1) % N]);
-                    const double GY = 0.5 * (L[(size_t)((y + 1) % N) * N + x] - L[(size_t)((y + N - 1) % N) * N + x]);
+                    const double U = At(x, y);
+                    const double GX = 0.5 * (At((x + 1) % N, y) - At((x + N - 1) % N, y));
+                    const double GY = 0.5 * (At(x, (y + 1) % N) - At(x, (y + N - 1) % N));
+                    Sum += U;
                     Sum2 += GX * GX + GY * GY;
-                    Mean += L[(size_t)y * N + x];
+                    Lo = std::min(Lo, U);
+                    Hi = std::max(Hi, U);
                 }
-            Mean /= (double)N * N;
-            double Scale = Target[c] / std::max(std::sqrt(Sum2 / ((double)N * N)), 1e-12);
-            double Spread = 0.0;
-            for (double V : L) Spread = std::max(Spread, std::fabs(V - Mean) * Scale);
-            if (Spread > DetailRangeTexels) Scale *= DetailRangeTexels / Spread;
-            for (double& V : L) V = (V - Mean) * Scale;
+            const double Mean = Sum / (double)Count;
+            // In decoded units, then to texel heights.
+            const double Rms = std::sqrt(Sum2 / (double)Count) * Span;
+            const double Spread = std::max(Mean - Lo, Hi - Mean) * Span;
+            double Scale = (c == 1 ? DetailSlopeHard : DetailSlopeSoft) / std::max(Rms, 1e-12);
+            if (Spread * Scale > DetailRangeWaves * Spacing) Scale = DetailRangeWaves * Spacing / std::max(Spread, 1e-12);
+            (c == 1 ? Out.MeanHard : Out.MeanSoft) = Mean;
+            (c == 1 ? Out.RangeHard : Out.RangeSoft) = Span * Scale;
         }
-        Set.Channel[0] = R;
-        Set.Channel[1] = G;
-        Set.Channel[2].Kind = KindNone;
-        Set.Channel[3].Kind = KindNone;
-        Finish(Set, Level);
-        return Set;
+        double Sum = 0.0, Sum2 = 0.0, Lo = 1.0, Hi = 0.0;
+        for (size_t i = 0; i < Count; i++)
+        {
+            const double U = (double)Texels[i * 4 + 3] / 65535.0;
+            Sum += U;
+            Sum2 += U * U;
+            Lo = std::min(Lo, U);
+            Hi = std::max(Hi, U);
+        }
+        Out.MeanA = Sum / (double)Count;
+        Out.StdA = std::sqrt(std::max(Sum2 / (double)Count - Out.MeanA * Out.MeanA, 0.0));
+        Out.ScaleGain = std::pow((double)Set.Channel[3].Gain, (double)DetailOctaves);
+        // The B-splines are convex (each scale within the texels' range about the mean), the
+        // scales' gains a geometric series, the face blend at most DetailBlendBound.
+        Out.BoundA = Out.StdA > 0.0 && Out.ScaleGain < 1.0
+            ? DetailLayerSigma * std::max(Out.MeanA - Lo, Hi - Out.MeanA) / Out.StdA / (1.0 - Out.ScaleGain) * DetailBlendBound : 0.0;
+        return Out;
     }
 
     /** Whether Set has the `peaks` layout VoxelLandPeaks.ush reads (Design/NoiseTiles2D_
@@ -629,6 +732,7 @@ namespace VoxelNoiseTiles
             C.Seed = U32(P + 4);
             C.CellsPerTile = U32(P + 8);
             C.Octaves = U32(P + 12);
+            C.Lacunarity = F32(P + 16);
             C.Gain = F32(P + 20);
             C.Jitter = F32(P + 24);
             C.ErosionK = F32(P + 28);

@@ -6,7 +6,7 @@
 // Shared subset (VoxelShaderCompat.h; land inputs through VoxelLandAccess.ush). Include after
 // VoxelLandSample.ush, VoxelLandGully.ush, VoxelLandPlates.ush and VoxelLandDebugPalette.ush.
 // Reads the bake's attributes (VOXEL_LAND_ATTR) and lake levels (VOXEL_LAND_WATER) only for the
-// views that show them.
+// views that show them (the rivers' view shows the lakes too, R3).
 
 #ifndef VOXEL_LAND_DEBUG_COLOR_USH
 #define VOXEL_LAND_DEBUG_COLOR_USH
@@ -86,6 +86,52 @@ VOXEL_FUNC float3 VoxelLandDebugColor(VOXEL_LAND_ARGS_DECL FVoxelLandDebugInput 
         if (LandHillRelief <= 0.0f || (LandHillOctaves == 0u && !(LandHillTexelsPerCell > 0.0f)) || LandHasForm == 0u) return VoxelLandViewNone();
         return VoxelLandViewHills(In.Hills / LandHillRelief);
     }
+    if (In.Mode == VOXEL_LAND_VIEW_RIVERS)
+    {
+        // The nearest river at the bake's (warped) point: its channel (the carved channel's water
+        // where it's wider than three footprints, else the line at least a footprint and a half
+        // either side, so it shows from orbit), and its valley's half-width.
+        if (LandRiverTilesPerFace == 0u) return VoxelLandViewNone();
+        const float3 Ground = VoxelLandViewHeight(In.Elevation, In.CellM);
+        const float Scale = LandRiverRadiusM * 100.0f;
+        // The kept lakes in the lakes view's colours, as the water query finds them: the carved
+        // lake's weight past half and its level over the shown surface (R2's carve), else the
+        // bake cell's level when the lakes aren't carved.
+        if (In.Elevation > 0.0f)
+        {
+            if (LandHasWater != 0u)
+            {
+                const FVoxelLandLake Lake = VoxelLandLakeAt(VOXEL_LAND_ARGS float2(In.Warped.x * LandRiverRadiusM, 0.0f), float2(In.Warped.y * LandRiverRadiusM, 0.0f),
+                    float2(In.Warped.z * LandRiverRadiusM, 0.0f), false);
+                if (Lake.Weight >= 0.5f && Lake.Level > In.Elevation) return VoxelLandViewLake(Lake.Level - In.Elevation, true, false);
+            }
+            else if (In.bHydro)
+            {
+                const float Level = VOXEL_LAND_WATER(VoxelLandDebugIndex(VOXEL_LAND_ARGS VoxelLandDebugCellOf(VOXEL_LAND_ARGS In.Warped)));
+                if (Level > -1.0e30f && In.Elevation < Level) return VoxelLandViewLake(Level - In.Elevation, true, false);
+            }
+        }
+        const FVoxelLandRiver R = VoxelLandRiverAtDF(VOXEL_LAND_ARGS float2(In.Warped.x * Scale, 0.0f), float2(In.Warped.y * Scale, 0.0f),
+            float2(In.Warped.z * Scale, 0.0f));
+        if (!R.bFound || In.Elevation <= 0.0f) return Ground;
+        const float Width = VoxelLandRiverWidth(VOXEL_LAND_ARGS R.Log2Area);
+        float Channel = 0.0f;
+        if (0.5f * Width > 1.5f * In.CellM && LandRiverCarve > 0.0f)
+        {
+            // Resolved: the carved channel's water, as the water query finds it (meanders, falls).
+            const FVoxelLandCarve Carve = VoxelLandRiverCarveDF(VOXEL_LAND_ARGS float2(In.Warped.x * Scale, 0.0f), float2(In.Warped.y * Scale, 0.0f),
+                float2(In.Warped.z * Scale, 0.0f), In.Elevation, 0.0f, float3(0.0f, 0.0f, 0.0f), In.CellM * 100.0f, false);
+            Channel = Carve.WaterKind == VOXEL_LAND_WATER_RIVER && Carve.WaterLevel > In.Elevation ? 1.0f : 0.0f;
+        }
+        else
+        {
+            // Too narrow to show: the line, at least a footprint and a half either side.
+            const float Half = max(0.5f * Width, 1.5f * In.CellM);
+            Channel = 1.0f - smoothstep(Half - 0.5f * In.CellM, Half + 0.5f * In.CellM, R.Distance);
+        }
+        const float Valley = 1.0f - smoothstep(0.0f, VoxelLandRiverValleyHalfWidth(VOXEL_LAND_ARGS VoxelLandRiverBelt(R.Log2Area)), R.Distance);
+        return VoxelLandViewRiver(Ground, Channel, Valley, R.Log2Area);
+    }
     if (In.Mode == VOXEL_LAND_VIEW_PEAKS || In.Mode == VOXEL_LAND_VIEW_PEAK_AREA)
     {
         if (!VoxelLandPeaksOn(VOXEL_LAND_ARGS 0.0f)) return VoxelLandViewNone();
@@ -106,6 +152,14 @@ VOXEL_FUNC float3 VoxelLandDebugColor(VOXEL_LAND_ARGS_DECL FVoxelLandDebugInput 
         if (LandHasForm == 0u) return VoxelLandViewNone();
         const float2 Form = VOXEL_LAND_FORM(Index);
         return VoxelLandViewLandform(Form.x, Form.y, In.Elevation <= 0.0f);
+    }
+    if (In.Mode == VOXEL_LAND_VIEW_STRATA)
+    {
+        // The province at the cell, and the strata's share there (none without strata: the
+        // province alone, in grey).
+        if (LandHasForm == 0u) return VoxelLandViewNone();
+        const float Province = VOXEL_LAND_PROVINCE(Index);
+        return VoxelLandViewStrata(Province, VoxelLandStrataShare(VOXEL_LAND_ARGS Province), In.Elevation <= 0.0f);
     }
     if (In.Mode == VOXEL_LAND_VIEW_FLOW)
     {

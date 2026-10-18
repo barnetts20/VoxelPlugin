@@ -66,7 +66,9 @@ TAutoConsoleVariable<int32> CVarVoxelDebugLandView(
     TEXT(" 15: the hills layer (white none, green to brown over HillRelief)\n")
     TEXT(" 16: the peaks layer (blue valleys, red summits, over their local relief)\n")
     TEXT(" 17: the peaks' relief (white none, green to brown, dark at 3 km: mountain crests)\n")
-    TEXT("2 to 6 and 8 to 17 need a terrestrial planet, 9, 10, 12 and 13 a GPU bake (magenta otherwise)."),
+    TEXT(" 18: the sedimentary province (grey, lighter sedimentary) and where the strata replace the hills (orange)\n")
+    TEXT(" 19: the rivers (blue channels, darker for larger rivers, a pale wash over their valleys) over the elevation\n")
+    TEXT("2 to 6 and 8 to 19 need a terrestrial planet, 9, 10, 12, 13 and 19 a GPU bake (magenta otherwise)."),
     ECVF_Default);
 
 static TAutoConsoleVariable<int32> CVarVoxelBrickPerf(
@@ -544,7 +546,8 @@ namespace VoxelBrickTerrainDetail
         using namespace VoxelShader;
         static const TCHAR* Names[VOXEL_LAND_VIEW_COUNT] = { TEXT("off"), TEXT("elevation"), TEXT("bake height"), TEXT("detail layer"),
             TEXT("crust"), TEXT("boundary class"), TEXT("plates"), TEXT("slope"), TEXT("bake cells"), TEXT("drainage"), TEXT("lakes"), TEXT("gullies"),
-            TEXT("lakes and rivers"), TEXT("elevation, lakes and rivers"), TEXT("landform"), TEXT("hills"), TEXT("peaks"), TEXT("peak amplitude") };
+            TEXT("lakes and rivers"), TEXT("elevation, lakes and rivers"), TEXT("landform"), TEXT("hills"), TEXT("peaks"), TEXT("peak amplitude"),
+            TEXT("strata province"), TEXT("rivers") };
         TArray<FLegendLine> Lines;
         Lines.Add({ FString::Printf(TEXT("voxel.Debug.LandView %d: %s (0 hides it; %s)"), View, Names[View],
             bPerPixel
@@ -688,6 +691,27 @@ namespace VoxelBrickTerrainDetail
             Add(TEXT("3 km"), VoxelLandViewPeakArea(3000.0f));
             Add(TEXT("magenta: no peaks (PeakHeightScale 0, or no landform)"), VoxelLandViewNone());
             break;
+        case VOXEL_LAND_VIEW_STRATA:
+            Add(TEXT("crystalline (province 0)"), VoxelLandViewStrata(0.0f, 0.0f, false));
+            Add(TEXT("province 0.5"), VoxelLandViewStrata(0.5f, 0.0f, false));
+            Add(TEXT("sedimentary (province 1), hills"), VoxelLandViewStrata(1.0f, 0.0f, false));
+            Add(TEXT("strata half in (the switch)"), VoxelLandViewStrata(0.5f, 0.5f, false));
+            Add(TEXT("strata (StrataCoverage of the land)"), VoxelLandViewStrata(0.7f, 1.0f, false));
+            Add(TEXT("sea"), VoxelLandViewStrata(0.0f, 0.0f, true));
+            Add(TEXT("magenta: the bake has no landform"), VoxelLandViewNone());
+            break;
+        case VOXEL_LAND_VIEW_RIVERS:
+        {
+            const float3 Ground = VoxelLandViewHeight(300.0f, 1.0e9f);
+            Add(TEXT("a river of 200 km^2 (the smallest at the default RiverMinArea)"), VoxelLandViewRiver(Ground, 1.0f, 1.0f, 27.6f));
+            Add(TEXT("10,000 km^2"), VoxelLandViewRiver(Ground, 1.0f, 1.0f, 33.2f));
+            Add(TEXT("100,000 km^2 and more"), VoxelLandViewRiver(Ground, 1.0f, 1.0f, 36.6f));
+            Add(TEXT("its valley (ValleyWidthScale)"), VoxelLandViewRiver(Ground, 0.0f, 1.0f, 27.6f));
+            Add(TEXT("a kept lake, shallow to 100 m (the lakes view's colours)"), VoxelLandViewLake(20.0f, true, false));
+            Add(TEXT("land (the elevation's colours)"), Ground);
+            Add(TEXT("magenta: no rivers (a CPU bake, or RiverMinArea 0)"), VoxelLandViewNone());
+            break;
+        }
         default:
             break;
         }

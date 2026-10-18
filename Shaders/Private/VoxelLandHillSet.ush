@@ -1,6 +1,8 @@
 // VoxelLandHillSet.ush - The hills from a baked set (Design/NonMountainLand.md, T4a): the hills
 // layer made the way the peaks are since T3d, one lookup of an eroded tile instead of octaves
-// of noise. Without a set the procedural hills (VoxelLandHills.ush, T2) stand in.
+// of noise. Without a set the procedural hills (VoxelLandHills.ush, T2) stand in. Since T4c the
+// strata set (mesas, cuestas, badlands) replaces the hills in the bake's sedimentary provinces,
+// in the same layer (below).
 //
 // The set (`hills`, Design/NoiseTiles2D_Addendum3.md): a periodic tile of hill country eroded
 // offline, diffusion carrying the look, its base level one connected valley network at the
@@ -29,12 +31,28 @@
 //            spacing, its own turn): broad, long rises on the rolling plains, LandHillSwellM at
 //            rolling hilliness (0.25 to 0.4), a quarter of it on the flats, gone in hill
 //            country, faded as the hills.
-// The layer reports one amplitude (their sum) and the unit that gives the sum: its gradient at a
-// fixed amplitude is exact; the hosts that difference the amplitude (the cache, the material)
-// take U grad(A_h + A_s) for U_h grad A_h + U_s grad A_s, off only where both fade at once.
+// The layer reports one amplitude (their sum, with the strata's below) and the unit that gives
+// the sum: its gradient at a fixed amplitude is exact; the hosts that difference the amplitude
+// (the cache, the material) take U grad(A_h + A_s + A_t) for U_h grad A_h + U_s grad A_s +
+// U_t grad A_t, off only where they fade at once (and within the hills-strata switch, where
+// the province changes over tens of kilometres: negligible).
 //
-// The detail (T3e's tile, appended once to the noise buffer): as the peaks', at its own
-// placement (LandHillDetailTexelsPerCell) and scale (LandHillDetailScaleR/G over the hills'
+// The strata (T4c): a second set (`strata`, Design/NoiseTiles2D_Addendum3.md section 2), built
+// as the hills' (from its base network up), at its own spacing:
+//   R  caprock country: mesas, buttes, benches on the hard beds, cliff bands
+//   G  the same tile, soft beds dominant: badlands
+// It replaces the hills by the bake's province (VoxelLandPlates.ush VoxelLandProvinceAt): its
+// share S is a smoothstep of the province over LandStrataThreshold +- LandStrataWidth (the
+// threshold the C++ picks for a share of the land), and the hills and swells keep 1 - S. So
+// the switch is brief, both partial within it. Its amplitude is LandStrataRelief x (from
+// LandStrataFlat on the flats to 1 in hill country) x S, faded as the hills (the coast, the
+// bake's rivers) and out where the peaks come in (no foothill growth: the hills' alone). Its
+// R and G blend the other way round from the hills': the dense-drainage side (character 1,
+// T3h) reads G, the badlands; the sparse side R, the mesas. Strata need the hill set (they
+// ride its layer: LandStrataTexelsPerCell is 0 without one).
+//
+// The detail (the pack's detail set, N1): as the peaks', at its own
+// placement (LandHillDetailTexelsPerCell) and scale (LandHillDetailScaleHard and Soft over the hills'
 // relief), the same character blend.
 //
 // Shared subset (VoxelShaderCompat.h). Included by VoxelLandGully.ush after VoxelLandHills.ush and
@@ -46,16 +64,30 @@
 //   uint LandHillBase, LandHillN, LandHillMips;   the set's chain in LandNoise
 //   float LandHillScaleR, LandHillScaleG, LandHillScaleB;   R's, G's and B's ranges over the
 //                                    larger of R's and G's (unit values to the hills' unit)
+//   float LandHillMeanR, LandHillMeanG;   R's and G's means over mip 0 (unit values: the face
+//                                    blend keeps the variance about them, N1b)
 //   float LandHillSpacingM;          the hills' spacing (m): the steering's wavelength
 //   float LandHillSwellTexelsPerCell;   the swells' placement (0: none)
 //   float LandHillSwellM;            their height (m) at rolling hilliness
 //   float LandHillSwellScaleG;       G's unit values to the swells' unit (G's range to 1)
 //   float LandHillDetailTexelsPerCell;  the detail's placement (0: none)
-//   float LandHillDetailScaleR, LandHillDetailScaleG;  its unit values to the hills' unit
+//   float LandHillDetailScaleHard, LandHillDetailScaleSoft;  its unit values to the hills' unit
 //   float LandHillDetailFade;        the mip level by which it has faded out
 //   float LandHillFoothill;          T4b: how much the hills grow in the foothills before the
-//                                    peaks take over (VoxelLandHillSetFade)
-//   (and the detail tile's chain and means: LandPeakDetailBase, N, Mips, MeanR, MeanG)
+//                                    peaks take over (VoxelLandHillsShapeDF)
+//   float LandStrataTexelsPerCell;   T4c: the strata set's placement (0: none)
+//   uint LandStrataBase, LandStrataN, LandStrataMips;   its chain in LandNoise
+//   float LandStrataScaleR, LandStrataScaleG, LandStrataScaleB;   as the hills'
+//   float LandStrataMeanR, LandStrataMeanG;   as the hills'
+//   float LandStrataSpacingM;        its spacing (m): the steering's wavelength
+//   float LandStrataRelief;          m: its relief times the strength
+//   float LandStrataFlat;            its share of that on the flats (hilliness 0)
+//   float LandStrataThreshold, LandStrataWidth;   the province switch (a threshold above 1:
+//                                    none)
+//   uint LandStrataSeed;
+//   float LandStrataDetailTexelsPerCell, LandStrataDetailScaleHard, LandStrataDetailScaleSoft,
+//         LandStrataDetailFade;      its detail, as the hills'
+//   (and the detail set's chain and means: LandDetailBase, N, Mips, MeanHard, MeanSoft; N1)
 
 #ifndef VOXEL_LAND_HILL_SET_USH
 #define VOXEL_LAND_HILL_SET_USH
@@ -76,16 +108,16 @@
 #define VOXEL_LAND_HILL_SET_CHANNEL_START 5.0f
 #define VOXEL_LAND_HILL_SET_CHANNEL_END 9.0f
 
-/** Whether the planet has hills: the set, or the procedural octaves. */
+/** Whether the planet has hills: the set, or the procedural octaves (with the set, maybe
+ *  strata too). */
 VOXEL_FUNC bool VoxelLandHillsOn(VOXEL_LAND_ARGS_DECL float Dummy)
 {
     return LandHillRelief > 0.0f && LandHasForm != 0u && (LandHillTexelsPerCell > 0.0f || LandHillOctaves != 0u);
 }
 
-/** The fades every hill amplitude shares (0 .. 1): the coast, the bake's river corridors (from
- *  the drainage, log2 m^2, when LandHasFlow), and where the peaks take over (their relief fade-in
- *  on the local relief Relief, m, when the planet has peaks). */
-VOXEL_FUNC float VoxelLandHillSetFade(VOXEL_LAND_ARGS_DECL float Relief, float Flow, float Bake)
+/** The fades every set's amplitude shares (0 .. 1): the coast and the bake's river corridors
+ *  (from the drainage, log2 m^2, when LandHasFlow). */
+VOXEL_FUNC float VoxelLandSetBaseFade(VOXEL_LAND_ARGS_DECL float Flow, float Bake)
 {
     float Fade = smoothstep(VOXEL_LAND_HILL_COAST_START, VOXEL_LAND_HILL_COAST_END, Bake);
     if (LandHasFlow != 0u)
@@ -93,17 +125,30 @@ VOXEL_FUNC float VoxelLandHillSetFade(VOXEL_LAND_ARGS_DECL float Relief, float F
         const float Above = Flow - 2.0f * log2(LandCellM);
         Fade *= 1.0f - smoothstep(VOXEL_LAND_HILL_SET_CHANNEL_START, VOXEL_LAND_HILL_SET_CHANNEL_END, Above);
     }
-    if (VoxelLandPeaksOn(VOXEL_LAND_ARGS 0.0f))
-    {
-        // The foothills (T4b): the hills hand over to the peaks as the peaks fade in (P), but
-        // grow first, (1 - P)(1 + B 4 P (1 - P)): full height where the peaks are half in, a
-        // third more where they are a fifth in. Without the growth the hills went faster than
-        // the peaks came (the peaks' height is the local relief times P), a smooth band along
-        // every range front.
-        const float P = smoothstep(LandPeakReliefStart, LandPeakReliefEnd, Relief);
-        Fade *= (1.0f - P) * (1.0f + LandHillFoothill * 4.0f * P * (1.0f - P));
-    }
     return Fade;
+}
+
+/** The peaks' fade-in on the local relief Relief (m): 0 without peaks. */
+VOXEL_FUNC float VoxelLandPeakShare(VOXEL_LAND_ARGS_DECL float Relief)
+{
+    return VoxelLandPeaksOn(VOXEL_LAND_ARGS 0.0f) ? smoothstep(LandPeakReliefStart, LandPeakReliefEnd, Relief) : 0.0f;
+}
+
+/** The strata's share of the hill layer at the bake's province (0..1, T4c): 0 without strata. */
+VOXEL_FUNC float VoxelLandStrataShare(VOXEL_LAND_ARGS_DECL float Province)
+{
+    if (!(LandStrataTexelsPerCell > 0.0f) || !(LandStrataRelief > 0.0f)) return 0.0f;
+    const float W = max(LandStrataWidth, 1.0e-3f);
+    return smoothstep(LandStrataThreshold - W, LandStrataThreshold + W, Province);
+}
+
+/** VoxelLandStrataShare's slope in the province. */
+VOXEL_FUNC float VoxelLandStrataShareSlope(VOXEL_LAND_ARGS_DECL float Province)
+{
+    if (!(LandStrataTexelsPerCell > 0.0f) || !(LandStrataRelief > 0.0f)) return 0.0f;
+    const float W = max(LandStrataWidth, 1.0e-3f);
+    const float T = saturate((Province - (LandStrataThreshold - W)) / (2.0f * W));
+    return 6.0f * T * (1.0f - T) / (2.0f * W);
 }
 
 /** The swells' amplitude over LandHillSwellM at a hilliness. */
@@ -124,21 +169,24 @@ VOXEL_FUNC FVoxelLandSetLayer VoxelLandHillLayer(VOXEL_LAND_ARGS_DECL float Dumm
     L.Kind = 2u;
     L.SaltA = 0x68696c6cu;
     L.SaltB = 0x6c6c6968u;
-    // From the base network up (0 there: not zero-mean).
+    // From the base network up (0 there: not zero-mean). The face blend keeps the variance about
+    // the channels' means (N1b).
     L.MeanR = 0.0f;
     L.MeanG = 0.0f;
     L.ScaleR = LandHillScaleR;
     L.ScaleG = LandHillScaleG;
     L.ScaleB = LandHillScaleB;
+    L.BlendMeanR = LandHillMeanR;
+    L.BlendMeanG = LandHillMeanG;
     // As the peaks: texels about half the footprint.
     L.LevelBias = -1.0f;
-    L.DetailSet = VoxelLandNoiseSetOf(LandPeakDetailBase, LandPeakDetailN, LandPeakDetailMips);
+    L.DetailSet = VoxelLandNoiseSetOf(LandDetailBase, LandDetailN, LandDetailMips);
     L.DetailTexelsPerCell = LandHillDetailTexelsPerCell;
     L.DetailKind = 3u;
-    L.DetailMeanR = LandPeakDetailMeanR;
-    L.DetailMeanG = LandPeakDetailMeanG;
-    L.DetailScaleR = LandHillDetailScaleR;
-    L.DetailScaleG = LandHillDetailScaleG;
+    L.DetailMeanHard = LandDetailMeanHard;
+    L.DetailMeanSoft = LandDetailMeanSoft;
+    L.DetailScaleHard = LandHillDetailScaleHard;
+    L.DetailScaleSoft = LandHillDetailScaleSoft;
     L.DetailFade = LandHillDetailFade;
     return L;
 }
@@ -158,17 +206,42 @@ VOXEL_FUNC FVoxelLandSetLayer VoxelLandSwellLayer(VOXEL_LAND_ARGS_DECL float Dum
     return L;
 }
 
+/** The strata's layer (T4c; in the noise buffer at LandStrataBase): as the hills', its own
+ *  set, placement, turns and detail. */
+VOXEL_FUNC FVoxelLandSetLayer VoxelLandStrataLayer(VOXEL_LAND_ARGS_DECL float Dummy)
+{
+    FVoxelLandSetLayer L = VoxelLandHillLayer(VOXEL_LAND_ARGS 0.0f);
+    L.Set = VoxelLandNoiseSetOf(LandStrataBase, LandStrataN, LandStrataMips);
+    L.TexelsPerCell = LandStrataTexelsPerCell;
+    L.Seed = LandStrataSeed;
+    L.Kind = 5u;
+    L.SaltA = 0x73747261u;
+    L.SaltB = 0x61727473u;
+    L.ScaleR = LandStrataScaleR;
+    L.ScaleG = LandStrataScaleG;
+    L.ScaleB = LandStrataScaleB;
+    L.BlendMeanR = LandStrataMeanR;
+    L.BlendMeanG = LandStrataMeanG;
+    L.DetailTexelsPerCell = LandStrataDetailTexelsPerCell;
+    L.DetailKind = 6u;
+    L.DetailScaleHard = LandStrataDetailScaleHard;
+    L.DetailScaleSoft = LandStrataDetailScaleSoft;
+    L.DetailFade = LandStrataDetailFade;
+    return L;
+}
+
 /** The hills at the sea-level sphere point P (double-float, cm) with the landform Form
  *  (hilliness, character; CharacterGradient the character's gradient per m, a tangent vector
- *  at P), the bake's local relief Relief (m), drainage Flow (log2 m^2) and height Bake (m),
- *  band-limited to Footprint (cm): the set's layers, or the procedural hills without a set.
- *  bShape (a constant) false: the set's amplitude, steering and curvature only (as the
- *  peaks'). */
+ *  at P), the bake's local relief Relief (m), province Province (0..1, T4c), drainage Flow
+ *  (log2 m^2) and height Bake (m), band-limited to Footprint (cm): the set's layers (the hills,
+ *  the swells and the strata), or the procedural hills without a set. bShape (a constant)
+ *  false: the sets' amplitude, steering and curvature only (as the peaks'). */
 VOXEL_FUNC FVoxelLandHills VoxelLandHillsShapeDF(VOXEL_LAND_ARGS_DECL float2 PX, float2 PY, float2 PZ, float2 Form, float3 CharacterGradient,
-    float Relief, float Flow, float Bake, float Footprint, bool bShape)
+    float Relief, float Province, float Flow, float Bake, float Footprint, bool bShape)
 {
     if (!(LandHillTexelsPerCell > 0.0f))
         return VoxelLandHillsDF(VOXEL_LAND_ARGS PX, PY, PZ, Form, Flow, Bake, Footprint);
+    // (Strata ride the hill set's layer: without a set there are none.)
     FVoxelLandHills Out;
     Out.Unit = 0.0f;
     Out.AmplitudeM = 0.0f;
@@ -177,11 +250,20 @@ VOXEL_FUNC FVoxelLandHills VoxelLandHillsShapeDF(VOXEL_LAND_ARGS_DECL float2 PX,
     Out.Curve = 0.0f;
     Out.Lambda = 0.0f;
     if (!VoxelLandHillsOn(VOXEL_LAND_ARGS 0.0f)) return Out;
-    const float Fade = VoxelLandHillSetFade(VOXEL_LAND_ARGS Relief, Flow, Bake);
-    if (Fade <= 0.0f) return Out;
+    const float Base = VoxelLandSetBaseFade(VOXEL_LAND_ARGS Flow, Bake);
+    if (Base <= 0.0f) return Out;
+    const float P = VoxelLandPeakShare(VOXEL_LAND_ARGS Relief);
+    // The strata's share (T4c): the hills and swells keep the rest. The foothills (T4b): the
+    // hills hand over to the peaks as the peaks fade in (P), but grow first,
+    // (1 - P)(1 + B 4 P (1 - P)): full height where the peaks are half in, a third more where
+    // they are a fifth in (without it the hills went faster than the peaks came: a smooth band
+    // along every range front).
+    const float S = VoxelLandStrataShare(VOXEL_LAND_ARGS Province);
+    const float Fade = Base * (1.0f - P) * (1.0f + LandHillFoothill * 4.0f * P * (1.0f - P)) * (1.0f - S);
     const float AH = LandHillRelief * saturate(Form.x) * Fade;
     const float AS = LandHillSwellTexelsPerCell > 0.0f ? LandHillSwellM * VoxelLandSwellShare(Form.x) * Fade : 0.0f;
-    Out.AmplitudeM = AH + AS;
+    const float AT = S > 0.0f ? LandStrataRelief * lerp(LandStrataFlat, 1.0f, saturate(Form.x)) * Base * (1.0f - P) * S : 0.0f;
+    Out.AmplitudeM = AH + AS + AT;
     if (Out.AmplitudeM <= 0.0f) return Out;
     float Sum = 0.0f;
     float3 Grad = float3(0.0f, 0.0f, 0.0f);
@@ -195,13 +277,26 @@ VOXEL_FUNC FVoxelLandHills VoxelLandHillsShapeDF(VOXEL_LAND_ARGS_DECL float2 PX,
         Out.Curve = H.Curve;
         Out.Lambda = H.Lambda;
     }
+    if (AT > 0.0f)
+    {
+        // The strata: R (mesas) on the sparse-drainage side, G (badlands) on the dense: the
+        // character reversed. The steering and curvature add (each is its own amplitude's);
+        // the wavelength is the amplitudes' mean.
+        const FVoxelLandPeaks T = VoxelLandSetLayerDF(VOXEL_LAND_ARGS VoxelLandStrataLayer(VOXEL_LAND_ARGS 0.0f), PX, PY, PZ, 1.0f - Form.y,
+            -CharacterGradient, AT, LandStrataSpacingM, Footprint, bShape);
+        Sum += T.Unit * AT;
+        Grad = Grad + T.Gradient;
+        Out.Steer = Out.Steer + T.Steer;
+        Out.Curve += T.Curve;
+        Out.Lambda = (AH * Out.Lambda + AT * T.Lambda) / (AH + AT);
+    }
     if (AS > 0.0f && bShape)
     {
-        // The swells are too broad to steer the gullies (and the steering is the hills' alone).
-        const FVoxelLandPeaks S = VoxelLandSetLayerDF(VOXEL_LAND_ARGS VoxelLandSwellLayer(VOXEL_LAND_ARGS 0.0f), PX, PY, PZ, 0.0f, float3(0.0f, 0.0f, 0.0f), AS,
+        // The swells are too broad to steer the gullies (the hills and strata steer).
+        const FVoxelLandPeaks Sw = VoxelLandSetLayerDF(VOXEL_LAND_ARGS VoxelLandSwellLayer(VOXEL_LAND_ARGS 0.0f), PX, PY, PZ, 0.0f, float3(0.0f, 0.0f, 0.0f), AS,
             0.0f, Footprint, true);
-        Sum += S.Unit * AS;
-        Grad = Grad + S.Gradient;
+        Sum += Sw.Unit * AS;
+        Grad = Grad + Sw.Gradient;
     }
     Out.Unit = Sum / Out.AmplitudeM;
     Out.Gradient = Grad;

@@ -11,7 +11,7 @@
 // texels it averages: u_m = (u_0 + 0.5) / 2^m - 0.5. A fractional level blends two mips near the
 // middle of the step (VOXEL_LAND_NOISE_BLEND_WIDTH) and reads one elsewhere.
 //
-// One buffer can hold several chains (the peaks' set, then its detail tile: VoxelLandPeaks.ush):
+// One buffer can hold several chains (the peaks' set, the detail set, the hills' and the strata's):
 // a lookup names its chain by an FVoxelLandNoiseSetRef (its first texel, size and mip count).
 //
 // Shared subset (VoxelShaderCompat.h). Include after VoxelLandSample.ush (the B-spline weights),
@@ -36,12 +36,14 @@ VOXEL_FUNC float2 VoxelLandUnpackNoise(uint W)
 #define VOXEL_LAND_NOISE_UNIT (1.0f / 65535.0f)
 
 /** What VoxelLandNoiseMip and VoxelLandNoiseAt compute besides R and G and their gradients (a
- *  constant at every call: what's left out costs nothing). */
+ *  constant at every call: what's left out costs nothing). ONLY_B and ONLY_A read one word a
+ *  texel (BA) and leave R and G out. */
 #define VOXEL_LAND_NOISE_WANT_B 1u              // the B channel and its gradient
 #define VOXEL_LAND_NOISE_WANT_HESSIAN_R 2u      // R's second derivatives
 #define VOXEL_LAND_NOISE_WANT_HESSIAN_B 4u      // B's second derivatives (B implied)
 #define VOXEL_LAND_NOISE_WANT_ONLY_B 8u         // B alone: R, G and A are left out (zero), their texels not read
 #define VOXEL_LAND_NOISE_WANT_A 16u             // the A channel and its gradient
+#define VOXEL_LAND_NOISE_WANT_ONLY_A 32u        // A alone: R, G and B are left out (zero), the RG words not read (N1: the detail layer)
 
 /** The share of a mip level step over which two mips blend (VoxelLandNoiseAt), in (0, 1]:
  *  outside it a lookup reads one mip. Narrower is cheaper, but the shape then changes faster
@@ -121,11 +123,14 @@ VOXEL_FUNC FVoxelLandNoise VoxelLandNoiseZero()
  *  the Hessian are zero without them). */
 VOXEL_FUNC FVoxelLandNoise VoxelLandNoiseMip(VOXEL_LAND_ARGS_DECL FVoxelLandNoiseSetRef Set, int X, float FX, int Y, float FY, uint Mip, uint Want)
 {
-    const bool bHessianB = (Want & VOXEL_LAND_NOISE_WANT_HESSIAN_B) != 0u;
-    const bool bB = (Want & (VOXEL_LAND_NOISE_WANT_B | VOXEL_LAND_NOISE_WANT_ONLY_B)) != 0u || bHessianB;
-    const bool bOnlyB = (Want & VOXEL_LAND_NOISE_WANT_ONLY_B) != 0u;
-    const bool bHessian = (Want & VOXEL_LAND_NOISE_WANT_HESSIAN_R) != 0u && !bOnlyB;
-    const bool bA = (Want & VOXEL_LAND_NOISE_WANT_A) != 0u && !bOnlyB;
+    const bool bOnlyA = (Want & VOXEL_LAND_NOISE_WANT_ONLY_A) != 0u;
+    const bool bHessianB = (Want & VOXEL_LAND_NOISE_WANT_HESSIAN_B) != 0u && !bOnlyA;
+    const bool bB = ((Want & (VOXEL_LAND_NOISE_WANT_B | VOXEL_LAND_NOISE_WANT_ONLY_B)) != 0u || bHessianB) && !bOnlyA;
+    const bool bOnlyB = (Want & VOXEL_LAND_NOISE_WANT_ONLY_B) != 0u && !bOnlyA;
+    // R and G (and R's Hessian) unless only B or only A is asked for.
+    const bool bRG = !bOnlyB && !bOnlyA;
+    const bool bHessian = (Want & VOXEL_LAND_NOISE_WANT_HESSIAN_R) != 0u && bRG;
+    const bool bA = ((Want & VOXEL_LAND_NOISE_WANT_A) != 0u && !bOnlyB) || bOnlyA;
     const uint Size = Set.N >> Mip;
     const uint Mask = Size - 1u;
     const uint Base = VoxelLandNoiseMipBase(Set, Size);
@@ -161,7 +166,15 @@ VOXEL_FUNC FVoxelLandNoise VoxelLandNoiseMip(VOXEL_LAND_ARGS_DECL FVoxelLandNois
         // Along X: value weights (L), slope weights (S).
         float LR = 0.0f;
         float SR = 0.0f;
-        if (!bOnlyB)
+        if (bA)
+        {
+            const float LA = WX.W0 * BA0.y + WX.W1 * BA1.y + WX.W2 * BA2.y + WX.W3 * BA3.y;
+            const float SA = DX.W0 * BA0.y + DX.W1 * BA1.y + DX.W2 * BA2.y + DX.W3 * BA3.y;
+            N.A += WJ * LA;
+            N.AU += WJ * SA;
+            N.AV += DJ * LA;
+        }
+        if (bRG)
         {
             const float2 RG0 = VOXEL_LAND_NOISE_RG(Row + C0);
             const float2 RG1 = VOXEL_LAND_NOISE_RG(Row + C1);
@@ -174,14 +187,6 @@ VOXEL_FUNC FVoxelLandNoise VoxelLandNoiseMip(VOXEL_LAND_ARGS_DECL FVoxelLandNois
             N.R += WJ * LR; N.G += WJ * LG;
             N.RU += WJ * SR; N.GU += WJ * SG;
             N.RV += DJ * LR; N.GV += DJ * LG;
-            if (bA)
-            {
-                const float LA = WX.W0 * BA0.y + WX.W1 * BA1.y + WX.W2 * BA2.y + WX.W3 * BA3.y;
-                const float SA = DX.W0 * BA0.y + DX.W1 * BA1.y + DX.W2 * BA2.y + DX.W3 * BA3.y;
-                N.A += WJ * LA;
-                N.AU += WJ * SA;
-                N.AV += DJ * LA;
-            }
             if (bHessian)
             {
                 // Along X, curvature weights (R).

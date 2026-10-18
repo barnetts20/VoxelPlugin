@@ -81,6 +81,13 @@ FMaterialHeight MaterialLandHeight(const FMaterialTextures& T, const float X[2],
     O.HillGradient[0] = L.HillGradient.x; O.HillGradient[1] = L.HillGradient.y; O.HillGradient[2] = L.HillGradient.z;
     O.Peaks = L.Peaks; O.PeakUnit = L.PeakUnit; O.PeakAmplitudeM = L.PeakAmplitudeM;
     O.PeakGradient[0] = L.PeakGradient.x; O.PeakGradient[1] = L.PeakGradient.y; O.PeakGradient[2] = L.PeakGradient.z;
+    O.Carve = L.Carve; O.CarveScale = L.CarveScale;
+    O.CarveGradient[0] = L.CarveGradient.x; O.CarveGradient[1] = L.CarveGradient.y; O.CarveGradient[2] = L.CarveGradient.z;
+    {
+        // The lake's weight there (through the warp, as the chain finds it).
+        const FVoxelLandWarp W = VoxelLandWarpDF(H, F, C, N, float2(X[0], X[1]), float2(Y[0], Y[1]), float2(Z[0], Z[1]));
+        O.LakeWeight = VoxelLandLakeAt(H, F, C, N, W.QX, W.QY, W.QZ, false).Weight;
+    }
     return O;
 }
 
@@ -93,6 +100,13 @@ void MaterialOctave(const FMaterialTextures& T, uint32_t I, void* Out)
     const FVoxelOctave O = VoxelLandMaterialOctave(C, I);
     static_assert(sizeof(FVoxelOctave) == 80, "FVoxelOctave layout");
     std::memcpy(Out, &O, 80);
+}
+
+FMaterialRiver MaterialRiver(const FMaterialTextures& T, const float X[2], const float Y[2], const float Z[2])
+{
+    Texture2D H, F, C, N; Textures(T, H, F, C, N);
+    const FVoxelLandRiver R = VoxelLandRiverAtDF(H, F, C, N, float2(X[0], X[1]), float2(Y[0], Y[1]), float2(Z[0], Z[1]));
+    return { R.bFound, R.Distance, R.Signed, R.Floor, R.Log2Area, R.S, R.Segment };
 }
 
 void MaterialDebugColor(const FMaterialTextures& T, uint32_t Mode, const FMaterialHeight& L, float CellM, float Out[3])

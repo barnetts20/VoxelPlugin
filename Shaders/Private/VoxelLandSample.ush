@@ -25,14 +25,17 @@
 //                                            two cells per word (read when LandHasForm)
 //   StructuredBuffer<uint> LandRelief;       the local relief (VOXEL_LAND_RELIEF), four cells per
 //                                            word (read when LandHasForm)
+//   StructuredBuffer<uint> LandProvince;     the province (VOXEL_LAND_PROVINCE, T4c), four cells per
+//                                            word (read when LandHasForm)
 //   uint LandN;
 //   uint LandPad;                            at least 4
 //   uint LandHasFlow;                        1 when the bake has the drainage (eroded)
 //   uint LandHasForm;                        1 when the bake has the landform and the relief
 //   float LandCellM;                         a cell's arc at the face centre (m)
+//   float LandStrataTexelsPerCell;           T4c: the province is read only when above 0
 //
 // With the height, VoxelLandBakeSampleDF gives the surface gradient (m/m, a tangent vector),
-// the drainage, the landform and the local relief, all from the same B-spline, for the hillside
+// the drainage, the landform, the local relief and the province, all from the same B-spline, for the hillside
 // layers (VoxelLandHills.ush, VoxelLandPeaks.ush, VoxelLandGully.ush).
 
 #ifndef VOXEL_LAND_SAMPLE_USH
@@ -133,7 +136,8 @@ VOXEL_FUNC float VoxelLandFlowAt(VOXEL_LAND_ARGS_DECL uint Index)
 
 /** One face's spline at the point: the height (m), its first and second derivatives along the
  *  face's U and V (m per cell, m per cell^2), the drainage (log2 m^2; 0 without it), the
- *  landform (hilliness, character; 0 without it) and the local relief (m; 0 without it). */
+ *  landform (hilliness, character; 0 without it), the local relief (m; 0 without it) and the
+ *  province (0..1, T4c; 0 without it). */
 struct FVoxelLandFaceSample
 {
     float Height;
@@ -147,6 +151,9 @@ struct FVoxelLandFaceSample
     float CharacterDU;      // the landform's character's derivatives (per cell)
     float CharacterDV;
     float Relief;
+    float Province;
+    float ProvinceDU;       // the province's derivatives (per cell; R3: the canyons' share)
+    float ProvinceDV;
 };
 
 /** One face's spline at the point's segments along U and V. bSlopes adds the derivatives, the
@@ -174,6 +181,9 @@ VOXEL_FUNC FVoxelLandFaceSample VoxelLandFaceSampleAt(VOXEL_LAND_ARGS_DECL uint 
     Out.CharacterDU = 0.0f;
     Out.CharacterDV = 0.0f;
     Out.Relief = 0.0f;
+    Out.Province = 0.0f;
+    Out.ProvinceDU = 0.0f;
+    Out.ProvinceDV = 0.0f;
     if (!bSlopes)
     {
         for (uint b = 0u; b < 4u; b++)
@@ -225,6 +235,18 @@ VOXEL_FUNC FVoxelLandFaceSample VoxelLandFaceSampleAt(VOXEL_LAND_ARGS_DECL uint 
             Out.CharacterDV += VoxelLandWeightAt(DWV, b) * CharacterLine;
             Out.Relief += WB * (WU.W0 * VOXEL_LAND_RELIEF(Row) + WU.W1 * VOXEL_LAND_RELIEF(Row + 1u)
                 + WU.W2 * VOXEL_LAND_RELIEF(Row + 2u) + WU.W3 * VOXEL_LAND_RELIEF(Row + 3u));
+            // Only the strata read it (LandStrataTexelsPerCell: VoxelLandHillSet.ush).
+            if (LandStrataTexelsPerCell > 0.0f)
+            {
+                const float P0 = VOXEL_LAND_PROVINCE(Row);
+                const float P1 = VOXEL_LAND_PROVINCE(Row + 1u);
+                const float P2 = VOXEL_LAND_PROVINCE(Row + 2u);
+                const float P3 = VOXEL_LAND_PROVINCE(Row + 3u);
+                const float ProvinceLine = WU.W0 * P0 + WU.W1 * P1 + WU.W2 * P2 + WU.W3 * P3;
+                Out.Province += WB * ProvinceLine;
+                Out.ProvinceDU += WB * (DWU.W0 * P0 + DWU.W1 * P1 + DWU.W2 * P2 + DWU.W3 * P3);
+                Out.ProvinceDV += VoxelLandWeightAt(DWV, b) * ProvinceLine;
+            }
         }
     }
     Out.Height += Ref;
@@ -277,7 +299,8 @@ VOXEL_FUNC float2 VoxelLandPick(float2 X, float2 Y, float2 Z, uint Axis)
  *  tangent vector; zero unless asked for), how fast the gradient's direction turns along the
  *  surface (rad/m: |Hessian x the gradient turned a right angle| / |gradient|^2, in the face's
  *  metres; large at valley floors and crests), the drainage (log2 m^2; 0 without it), the
- *  landform (hilliness, character; 0 without it) and the local relief (m; 0 without it). */
+ *  landform (hilliness, character; 0 without it), the local relief (m; 0 without it) and the
+ *  province (0..1, T4c; 0 without it). */
 struct FVoxelLandBakeSample
 {
     float Height;
@@ -287,6 +310,8 @@ struct FVoxelLandBakeSample
     float2 Form;
     float3 CharacterGradient;   // the landform's character's (per m, a tangent vector; with bSlopes)
     float Relief;
+    float Province;             // T4c: the sedimentary province (0..1; with bSlopes)
+    float3 ProvinceGradient;    // its gradient (per m, a tangent vector; with bSlopes and strata)
 };
 
 /** The bake in the direction of the double-float point P (any length): each face on P's side
@@ -307,6 +332,8 @@ VOXEL_FUNC FVoxelLandBakeSample VoxelLandBakeSampleDF(VOXEL_LAND_ARGS_DECL float
     float2 Form = float2(0.0f, 0.0f);
     float3 CharacterGradient = float3(0.0f, 0.0f, 0.0f);
     float Relief = 0.0f;
+    float Province = 0.0f;
+    float3 ProvinceGradient = float3(0.0f, 0.0f, 0.0f);
     for (uint Axis = 0u; Axis < 3u; Axis++)
     {
         const float2 PN = VoxelLandPick(PX, PY, PZ, Axis);
@@ -348,6 +375,10 @@ VOXEL_FUNC FVoxelLandBakeSample VoxelLandBakeSampleDF(VOXEL_LAND_ARGS_DECL float
             const float CV = F.CharacterDV / LandCellM;
             CharacterGradient = CharacterGradient + (Frame.TU * (Frame.GUU * CU + Frame.GUV * CV) + Frame.TV * (Frame.GUV * CU + Frame.GVV * CV)) * W;
             Relief += W * F.Relief;
+            Province += W * F.Province;
+            const float PU = F.ProvinceDU / LandCellM;
+            const float PV = F.ProvinceDV / LandCellM;
+            ProvinceGradient = ProvinceGradient + (Frame.TU * (Frame.GUU * PU + Frame.GUV * PV) + Frame.TV * (Frame.GUV * PU + Frame.GVV * PV)) * W;
         }
     }
     FVoxelLandBakeSample Out;
@@ -358,6 +389,8 @@ VOXEL_FUNC FVoxelLandBakeSample VoxelLandBakeSampleDF(VOXEL_LAND_ARGS_DECL float
     Out.Form = WSum > 0.0f ? float2(Form.x / WSum, Form.y / WSum) : float2(0.0f, 0.0f);
     Out.CharacterGradient = WSum > 0.0f ? CharacterGradient / WSum : float3(0.0f, 0.0f, 0.0f);
     Out.Relief = WSum > 0.0f ? Relief / WSum : 0.0f;
+    Out.Province = WSum > 0.0f ? Province / WSum : 0.0f;
+    Out.ProvinceGradient = WSum > 0.0f ? ProvinceGradient / WSum : float3(0.0f, 0.0f, 0.0f);
     return Out;
 }
 

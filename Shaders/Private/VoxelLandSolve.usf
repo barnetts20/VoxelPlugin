@@ -83,6 +83,9 @@ RWStructuredBuffer<uint> JumpYOut;
 RWStructuredBuffer<uint> JumpP;
 RWStructuredBuffer<uint> JumpPOut;
 RWStructuredBuffer<uint> SolveFlags;     // [0] something changed, [1] error bits
+RWStructuredBuffer<uint> AccHi;          // S1: the exact accumulation's high words
+RWStructuredBuffer<uint> AccHiOut;
+float SolveAccUnit;
 
 // Lakes and outputs.
 RWStructuredBuffer<uint> LakeArea;
@@ -91,10 +94,11 @@ RWStructuredBuffer<uint> LakeOutlet;
 RWStructuredBuffer<uint> LakeCount;
 RWStructuredBuffer<uint> LakeList;
 RWStructuredBuffer<float> OutHeight;
-RWStructuredBuffer<float> OutFlow;
+RWStructuredBuffer<uint> OutFlow;         // halves, two cells a word
 RWStructuredBuffer<float> OutWater;
 RWStructuredBuffer<uint> OutAttr;
 RWStructuredBuffer<uint> OutForm;
+RWStructuredBuffer<uint> OutRec;
 
 // GPU-only: dispatch, compaction, the steps' state, the histograms.
 uint GroupsX;
@@ -181,10 +185,10 @@ void ScanCS(uint GroupThread : SV_GroupIndex)
     }
     GroupMemoryBarrierWithGroupSync();
     uint Running = ScanSums[GroupThread];
-    for (uint g = First; g < Last; g++)
+    for (uint h = First; h < Last; h++)
     {
-        const uint Count = GroupCounts[g];
-        GroupCounts[g] = Running;
+        const uint Count = GroupCounts[h];
+        GroupCounts[h] = Running;
         Running += Count;
     }
 }
@@ -234,10 +238,91 @@ void ResetCS()
     }
 }
 
-[numthreads(64, 1, 1)]
-void FillInPlaceCS(uint3 GroupId : SV_GroupID, uint GroupThread : SV_GroupIndex)
+// --- The fill, by tiles (S1) ----------------------------------------------------------------
+//
+// Planchon-Darboux from above (VoxelSolveFillInPlacePass's update), a tile of a face a group:
+// each pass loads its tile's levels into groupshared memory and iterates them there with the
+// neighbours outside the tile held at their levels as the pass found them, then writes them
+// back. A level travels across a whole tile in one pass instead of a cell, so a fill that
+// needed one pass per cell of its longest path needs one per tile of it. The same least surface
+// whatever the order (a fixed point reached from above), so the result is reproducible.
+// SolveFlags[0] is set when a cell changed. PassMode 1: with the descent (SolveEps), else none
+// (the lake levels).
+
+#define VOXEL_SOLVE_FILL_TILE 16u
+#define VOXEL_SOLVE_FILL_LOCAL 24u     // iterations a pass (a fixed count: no exit on a shared value around the barriers)
+#define VOXEL_SOLVE_FILL_OUTSIDE 0xffffu
+
+groupshared float FillTileW[VOXEL_SOLVE_FILL_TILE * VOXEL_SOLVE_FILL_TILE];
+
+[numthreads(16, 16, 1)]
+void FillTiledCS(uint3 GroupId : SV_GroupID, uint3 GroupThreadId : SV_GroupThreadID, uint GroupThread : SV_GroupIndex)
 {
-    VoxelSolveFillInPlacePass(ThreadIndex(GroupId, GroupThread), NumSlots, PassMode == 1u ? SolveEps : 0.0f);
+    const uint TilesPerFace = (SolveN + VOXEL_SOLVE_FILL_TILE - 1u) / VOXEL_SOLVE_FILL_TILE;
+    const uint Tile = GroupIndex(GroupId);
+    // A group past the last tile runs the barriers with nothing to do (no return before them).
+    const bool bTile = Tile < 6u * TilesPerFace * TilesPerFace;
+    const float Eps = PassMode == 1u ? SolveEps : 0.0f;
+    const uint Face = Tile / (TilesPerFace * TilesPerFace);
+    const uint Rest = Tile - Face * TilesPerFace * TilesPerFace;
+    const uint TJ = Rest / TilesPerFace;
+    const uint TI = Rest - TJ * TilesPerFace;
+    const int I = int(TI * VOXEL_SOLVE_FILL_TILE + GroupThreadId.x);
+    const int J = int(TJ * VOXEL_SOLVE_FILL_TILE + GroupThreadId.y);
+    const bool bCell = bTile && I < int(SolveN) && J < int(SolveN);
+    const uint Cell = bCell ? VoxelSolveEncode(Face, I, J) : 0u;
+    const bool bSlot = bCell && SolveSlot[Cell] != VOXEL_SOLVE_NONE;
+    const float W0 = bCell ? SolveW[Cell] : VOXEL_SOLVE_INF;
+    const float H = bSlot ? SolveH[Cell] : 0.0f;
+    FillTileW[GroupThread] = W0;
+    // The neighbours: in the tile (their groupshared index), or outside (their level now); and
+    // the descent from each.
+    uint Local[8];
+    float Outside[8];
+    float Descent[8];
+    const bool bRandom = VoxelSolveRandomFill(Eps);
+    const float Factor = bSlot ? VoxelSolveFillFactor(Cell, Eps) : 0.0f;
+    for (uint c = 0u; c < 8u; c++)
+    {
+        Local[c] = VOXEL_SOLVE_FILL_OUTSIDE;
+        Outside[c] = VOXEL_SOLVE_INF;
+        Descent[c] = bRandom ? VoxelSolveFillDescent(Factor, c) : Eps;
+        if (!bSlot) continue;
+        const uint N = VoxelSolveNeighbour(Cell, c);
+        if (N == VOXEL_SOLVE_NONE) continue;
+        const FVoxelSolveCell P = VoxelSolveDecode(N);
+        const int LI = P.I - int(TI * VOXEL_SOLVE_FILL_TILE);
+        const int LJ = P.J - int(TJ * VOXEL_SOLVE_FILL_TILE);
+        if (P.Face == Face && LI >= 0 && LJ >= 0 && LI < int(VOXEL_SOLVE_FILL_TILE) && LJ < int(VOXEL_SOLVE_FILL_TILE))
+            Local[c] = uint(LJ) * VOXEL_SOLVE_FILL_TILE + uint(LI);
+        else
+            Outside[c] = SolveW[N];
+    }
+    float W = W0;
+    GroupMemoryBarrierWithGroupSync();
+    for (uint k = 0u; k < VOXEL_SOLVE_FILL_LOCAL; k++)
+    {
+        float Lowest = VOXEL_SOLVE_INF;
+        for (uint c2 = 0u; c2 < 8u; c2++)
+        {
+            // (Both sides of ?: may be evaluated: the index stays in the tile.)
+            const float WN = Local[c2] != VOXEL_SOLVE_FILL_OUTSIDE ? FillTileW[min(Local[c2], VOXEL_SOLVE_FILL_TILE * VOXEL_SOLVE_FILL_TILE - 1u)] : Outside[c2];
+            Lowest = min(Lowest, WN + Descent[c2]);
+        }
+        GroupMemoryBarrierWithGroupSync();
+        const float Candidate = max(H, Lowest);
+        if (bSlot && Candidate < W)
+        {
+            W = Candidate;
+            FillTileW[GroupThread] = W;
+        }
+        GroupMemoryBarrierWithGroupSync();
+    }
+    if (bSlot && W < W0)
+    {
+        SolveW[Cell] = W;
+        InterlockedOr(SolveFlags[0], 1u);
+    }
 }
 
 [numthreads(64, 1, 1)]
@@ -275,9 +360,33 @@ void AccumulateJacobiCS(uint3 GroupId : SV_GroupID, uint GroupThread : SV_GroupI
 }
 
 [numthreads(64, 1, 1)]
-void AccumulateInPlaceCS(uint3 GroupId : SV_GroupID, uint GroupThread : SV_GroupIndex)
+void RouteTreeInitCS(uint3 GroupId : SV_GroupID, uint GroupThread : SV_GroupIndex)
 {
-    VoxelSolveAccumulateInPlacePass(ThreadIndex(GroupId, GroupThread), NumSlots);
+    VoxelSolveRouteTreeInitPass(ThreadIndex(GroupId, GroupThread), NumSlots, PassMode == 1u ? SolveEps : 0.0f);
+}
+
+[numthreads(64, 1, 1)]
+void AccJumpInitCS(uint3 GroupId : SV_GroupID, uint GroupThread : SV_GroupIndex)
+{
+    VoxelSolveAccJumpInitPass(ThreadIndex(GroupId, GroupThread), NumSlots, PassMode);
+}
+
+[numthreads(64, 1, 1)]
+void AccJumpCopyCS(uint3 GroupId : SV_GroupID, uint GroupThread : SV_GroupIndex)
+{
+    VoxelSolveAccJumpCopyPass(ThreadIndex(GroupId, GroupThread), NumSlots);
+}
+
+[numthreads(64, 1, 1)]
+void AccJumpAddCS(uint3 GroupId : SV_GroupID, uint GroupThread : SV_GroupIndex)
+{
+    VoxelSolveAccJumpAddPass(ThreadIndex(GroupId, GroupThread), NumSlots);
+}
+
+[numthreads(64, 1, 1)]
+void AccJumpFinishCS(uint3 GroupId : SV_GroupID, uint GroupThread : SV_GroupIndex)
+{
+    VoxelSolveAccJumpFinishPass(ThreadIndex(GroupId, GroupThread), NumSlots, PassMode);
 }
 
 [numthreads(64, 1, 1)]

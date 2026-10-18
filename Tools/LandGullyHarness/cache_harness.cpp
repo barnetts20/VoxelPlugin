@@ -106,7 +106,7 @@ int main(int argc, char** argv)
     const int N = argc > 2 ? atoi(argv[2]) : 1024;
     const double RadiusM = argc > 3 ? atof(argv[3]) : 1.0e6;
     FPlanet P;
-    Load(P, Tag, N, RadiusM, 30.0, 0.22);
+    Load(P, Tag, N, RadiusM, 30.0, HarnessGullyStrength());
     std::vector<FVoxelOctave> Gpu;
     SetGpuGlobals(P, Gpu);
     const double S = P.SeaRadius;

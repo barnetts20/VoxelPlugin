@@ -111,6 +111,7 @@ namespace VoxelShader
     inline uint max(uint a, uint b) { return a > b ? a : b; }
     inline int clamp(int v, int lo, int hi) { return v < lo ? lo : (v > hi ? hi : v); }
     inline float log2(float a) { return std::log2(a); }
+    inline float exp2(float a) { return std::exp2(a); }
     inline float pow(float a, float b) { return std::pow(a, b); }
     /** HLSL's f16tof32: the IEEE half in the low 16 bits as a float (exact). */
     inline float f16tof32(uint h)
@@ -123,6 +124,34 @@ namespace VoxelShader
         else if (Exponent == 31u) Value = Mantissa != 0u ? NAN : INFINITY;
         else Value = std::ldexp((float)(Mantissa | 0x400u), (int)Exponent - 25);
         return Sign != 0u ? -Value : Value;
+    }
+
+    /** HLSL's f32tof16: the nearest IEEE half (ties to even; overflow to infinity, NaN kept),
+     *  in the low 16 bits. */
+    inline uint f32tof16(float f)
+    {
+        uint x;
+        std::memcpy(&x, &f, 4);
+        const uint Sign = (x >> 16) & 0x8000u;
+        const uint Abs = x & 0x7fffffffu;
+        if (Abs >= 0x7f800000u) return Sign | 0x7c00u | (Abs > 0x7f800000u ? 0x200u : 0u);
+        if (Abs >= 0x477ff000u) return Sign | 0x7c00u;          // rounds past the largest half
+        if (Abs < 0x38800000u)
+        {
+            // A subnormal half (or zero): the value in units of 2^-24, rounded to even.
+            if (Abs < 0x33000000u) return Sign;
+            const uint Exponent = Abs >> 23;
+            const uint Mantissa = (Abs & 0x7fffffu) | 0x800000u;
+            const uint Shift = 126u - Exponent;                 // 14 .. 24
+            const uint Half = Mantissa >> Shift;
+            const uint Rest = Mantissa & ((1u << Shift) - 1u);
+            const uint Mid = 1u << (Shift - 1u);
+            return Sign | (Half + ((Rest > Mid || (Rest == Mid && (Half & 1u))) ? 1u : 0u));
+        }
+        const uint Rebased = Abs - 0x38000000u;                 // the exponent rebased to the half's
+        const uint Half = Rebased >> 13;
+        const uint Rest = Rebased & 0x1fffu;
+        return Sign | (Half + ((Rest > 0x1000u || (Rest == 0x1000u && (Half & 1u))) ? 1u : 0u));
     }
 
 #if defined(__cpp_lib_atomic_ref)
@@ -141,6 +170,10 @@ namespace VoxelShader
     inline void InterlockedOr(uint& Dest, uint Value)
     {
         std::atomic_ref<uint>(Dest).fetch_or(Value);
+    }
+    inline void InterlockedOr(uint& Dest, uint Value, uint& Original)
+    {
+        Original = std::atomic_ref<uint>(Dest).fetch_or(Value);
     }
     inline void InterlockedAdd(uint& Dest, uint Value)
     {

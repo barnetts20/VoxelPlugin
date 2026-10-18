@@ -82,6 +82,9 @@ BEGIN_SHADER_PARAMETER_STRUCT(FVoxelLandSolveParameters, )
     SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint>, JumpP)
     SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint>, JumpPOut)
     SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint>, SolveFlags)
+    SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint>, AccHi)
+    SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint>, AccHiOut)
+    SHADER_PARAMETER(float, SolveAccUnit)
     // Lakes and outputs (the last frame; stand-ins before).
     SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint>, LakeArea)
     SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint>, LakeDepth)
@@ -89,10 +92,11 @@ BEGIN_SHADER_PARAMETER_STRUCT(FVoxelLandSolveParameters, )
     SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint>, LakeCount)
     SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint>, LakeList)
     SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<float>, OutHeight)
-    SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<float>, OutFlow)
+    SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint>, OutFlow)
     SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<float>, OutWater)
     SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint>, OutAttr)
     SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint>, OutForm)
+    SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint>, OutRec)
     // Dispatch, compaction, the steps' state, the histograms.
     SHADER_PARAMETER(uint32, GroupsX)
     SHADER_PARAMETER(uint32, NumSlots)
@@ -136,13 +140,17 @@ END_SHADER_PARAMETER_STRUCT()
     X(FVoxelSolveScatterCS, "ScatterCS") \
     X(FVoxelSolveInitCS, "InitCS") \
     X(FVoxelSolveResetCS, "ResetCS") \
-    X(FVoxelSolveFillInPlaceCS, "FillInPlaceCS") \
+    X(FVoxelSolveFillTiledCS, "FillTiledCS") \
     X(FVoxelSolveFillJacobiCS, "FillJacobiCS") \
     X(FVoxelSolveFillCopyCS, "FillCopyCS") \
     X(FVoxelSolveUndrainedCS, "UndrainedCS") \
     X(FVoxelSolveReceiversCS, "ReceiversCS") \
     X(FVoxelSolveAccumulateJacobiCS, "AccumulateJacobiCS") \
-    X(FVoxelSolveAccumulateInPlaceCS, "AccumulateInPlaceCS") \
+    X(FVoxelSolveRouteTreeInitCS, "RouteTreeInitCS") \
+    X(FVoxelSolveAccJumpInitCS, "AccJumpInitCS") \
+    X(FVoxelSolveAccJumpCopyCS, "AccJumpCopyCS") \
+    X(FVoxelSolveAccJumpAddCS, "AccJumpAddCS") \
+    X(FVoxelSolveAccJumpFinishCS, "AccJumpFinishCS") \
     X(FVoxelSolveSpreadInitCS, "SpreadInitCS") \
     X(FVoxelSolveSpreadCS, "SpreadCS") \
     X(FVoxelSolveTreeFillInitCS, "TreeFillInitCS") \
@@ -190,6 +198,16 @@ namespace VoxelLandSolveDetail
     constexpr int32 MinIterationsPerFrame = 2;
     constexpr int32 MaxIterationsPerFrame = 512;
     constexpr int32 MaxStepsPerFrame = 16;
+    // S1: the routing recorded ahead in one frame, each loop a fixed number of passes, checked
+    // when the fields come back (a loop that hadn't settled routes again by loops). Measured
+    // need at 512 cells a face (the harness's passes double-buffered, which bound the GPU's in
+    // place): the fills from the tree fill 2-3 tiled passes (13-18 where some land is outside the
+    // solve and starts from INF: then N / 8, at most AheadFillPassesMax), the hillslopes'
+    // spread 37, the labels 16-53.
+    constexpr int32 AheadFillPasses = 8;
+    constexpr int32 AheadFillPassesMax = 64;
+    constexpr int32 AheadSpreadPasses = 128;
+    constexpr int32 AheadLabelPasses = 256;
 
     static_assert(JumpRounds % 2 == 0 && AccumulateIterations % 2 == 0, "the double buffers must swap back each step");
 
@@ -268,11 +286,11 @@ struct VoxelLandSolve::FJob::FImpl
         Steps,          // the solve's steps (until the GPU says done)
         OutletsWait,    // the normalisation's histograms
         Fill0,          // the routing's lake levels
-        Fill1,          // the routing's fill
-        Accumulate,     // the routing's drainage
-        Spread,         // the drainage field's spread (T1b)
+        Fill1,          // the routing's fill (then its drainage, exact in fixed passes: S1)
+        Spread,         // the drainage field's spread over the hillslopes (T1b; the channels in fixed passes)
         Labels,         // lake labels
-        OutputWait,     // the fields
+        OutputWait,     // the fields (and the rivers' tables)
+        RiverWait,      // the rivers' tables built again with the sizes they asked for
         Done
     };
 
@@ -286,6 +304,12 @@ struct VoxelLandSolve::FJob::FImpl
     int32 AParity = 0;
     int32 LoopIterations = 0;
     int32 StepsDispatched = 0;
+    bool bSolved = false;          // the solve ran (its receivers start the routing's fills: S1)
+    uint32 SolvedSlots = 0;        // the solve's domain (S1: land outside it starts the fills from INF)
+    bool bRouteByLoops = false;    // the routing recorded ahead didn't settle: by loops
+    TArray<VLS::FReadback> Checks; // the routing ahead's loops' flags (S1)
+    VLS::FReadback PreRouting;     // the flags before it (the errors so far)
+    uint32 ErrorsBeforeRouting = 0;
     float Factor = 1.0f;
     float Knee = 1.0e30f;
     float Top = 1.0e30f;
@@ -294,11 +318,20 @@ struct VoxelLandSolve::FJob::FImpl
     double PhaseStart = 0.0;
     int32 PhaseFrames = 0;
     TArray<VLS::FReadback> Pending;
+    VoxelLandRiverBuild::FPending Rivers;
+    VoxelLandRiverBuild::FSettings RiverSettings;
+    int32 RiverBuilds = 0;
+    // The last frame's fields, kept for the density and a river build that runs again.
+    TRefCountPtr<FRDGPooledBuffer> KeptHeight, KeptWater, KeptFlow, KeptRec;
 
     // Pooled buffers kept between frames (render thread).
     TRefCountPtr<FRDGPooledBuffer> Tan, H, W, Water, Rec, Slot, Label, Cell, GroupCounts, Counts, Flags, State, Partials, Log, Histogram;
     TRefCountPtr<FRDGPooledBuffer> U, Erodibility, ChannelFactor, Area, Dist, H0, WOut;
-    TRefCountPtr<FRDGPooledBuffer> A[2], X[2], Y[2], P[2];
+    TRefCountPtr<FRDGPooledBuffer> A[2], X[2], Y[2], P[2], Hi[2];
+    // S1: the heights and the solve's receivers as the routing ahead found them (it changes
+    // both: the lakes not kept are filled into the heights, the receivers become the
+    // routing's), for routing again by loops from the same start.
+    TRefCountPtr<FRDGPooledBuffer> KeptH, KeptSolveRec;
 
     /** This frame's view of the buffers. */
     struct FFrame
@@ -307,14 +340,14 @@ struct VoxelLandSolve::FJob::FImpl
         FRDGBufferRef Tan = nullptr, H = nullptr, W = nullptr, Water = nullptr, Rec = nullptr, Slot = nullptr, Label = nullptr, Cell = nullptr;
         FRDGBufferRef GroupCounts = nullptr, Counts = nullptr, Flags = nullptr, State = nullptr, Partials = nullptr, Log = nullptr, Histogram = nullptr;
         FRDGBufferRef U = nullptr, Erodibility = nullptr, ChannelFactor = nullptr, Area = nullptr, Dist = nullptr, H0 = nullptr, WOut = nullptr;
-        FRDGBufferRef A[2] = {}, X[2] = {}, Y[2] = {}, P[2] = {};
+        FRDGBufferRef A[2] = {}, X[2] = {}, Y[2] = {}, P[2] = {}, Hi[2] = {};
         // The last frame's lake and output buffers (else stand-ins).
         FRDGBufferRef LakeArea = nullptr, LakeDepth = nullptr, LakeOutlet = nullptr, LakeCount = nullptr, LakeList = nullptr;
-        FRDGBufferRef OutHeight = nullptr, OutFlow = nullptr, OutWater = nullptr, OutAttr = nullptr, OutForm = nullptr;
+        FRDGBufferRef OutHeight = nullptr, OutFlow = nullptr, OutWater = nullptr, OutAttr = nullptr, OutForm = nullptr, OutRec = nullptr;
         /** Every pass's parameters with this frame's views (BuildBase), and the views of the
          *  double buffers, which the passes pick by parity. */
         FVoxelLandSolveParameters Base;
-        FRDGBufferUAVRef AUav[2] = {}, XUav[2] = {}, YUav[2] = {}, PUav[2] = {};
+        FRDGBufferUAVRef AUav[2] = {}, XUav[2] = {}, YUav[2] = {}, PUav[2] = {}, HiUav[2] = {};
     };
 
     explicit FImpl(FSettings InSettings)
@@ -400,6 +433,7 @@ struct VoxelLandSolve::FJob::FImpl
             F.X[i] = Get(GraphBuilder, X[i], 4, SlotCount, TEXT("Voxel.LandSolveJumpX"));
             F.Y[i] = Get(GraphBuilder, Y[i], 4, SlotCount, TEXT("Voxel.LandSolveJumpY"));
             F.P[i] = Get(GraphBuilder, P[i], 4, SlotCount, TEXT("Voxel.LandSolveJumpP"));
+            F.Hi[i] = Get(GraphBuilder, Hi[i], 4, SlotCount, TEXT("Voxel.LandSolveAccHi"));
         }
         BuildBase(GraphBuilder, F);
     }
@@ -452,6 +486,8 @@ struct VoxelLandSolve::FJob::FImpl
         Params.SolveChannelOctaves = (uint32)FMath::Clamp(S.ChannelOctaves, 1, 6);
         Params.SolveHillslope = S.Hillslope;
         Params.SolveChannelCharacter = S.ChannelCharacter;
+        // S1: the exact accumulation's unit, a 4096th of a cell at a face's centre.
+        Params.SolveAccUnit = FMath::Square(UE_PI * 0.5f * S.RadiusM / (float)FMath::Max(S.N, 1)) / 4096.0f;
         Params.SolveH = GraphBuilder.CreateUAV(F.H);
         Params.SolveW = GraphBuilder.CreateUAV(F.W);
         Params.SolveWater = GraphBuilder.CreateUAV(F.Water);
@@ -472,6 +508,7 @@ struct VoxelLandSolve::FJob::FImpl
             F.XUav[i] = GraphBuilder.CreateUAV(F.X[i]);
             F.YUav[i] = GraphBuilder.CreateUAV(F.Y[i]);
             F.PUav[i] = GraphBuilder.CreateUAV(F.P[i]);
+            F.HiUav[i] = GraphBuilder.CreateUAV(F.Hi[i]);
         }
         Params.SolveFlags = GraphBuilder.CreateUAV(F.Flags);
         auto OrStandIn = [&GraphBuilder](FRDGBufferRef Buffer, const TCHAR* Name)
@@ -488,6 +525,7 @@ struct VoxelLandSolve::FJob::FImpl
         Params.OutWater = OrStandIn(F.OutWater, TEXT("Voxel.LandSolveNoOutWater"));
         Params.OutAttr = OrStandIn(F.OutAttr, TEXT("Voxel.LandSolveNoOutAttr"));
         Params.OutForm = OrStandIn(F.OutForm, TEXT("Voxel.LandSolveNoOutForm"));
+        Params.OutRec = OrStandIn(F.OutRec, TEXT("Voxel.LandSolveNoOutRec"));
         Params.NumScanGroups = NumScanGroups;
         Params.SolveMaxSteps = (uint32)FMath::Max(S.MaxSteps, 1);
         Params.SolveMinSteps = (uint32)FMath::Max(S.MinSteps, 1);
@@ -517,6 +555,8 @@ struct VoxelLandSolve::FJob::FImpl
         Params.JumpYOut = F.YUav[1 - JumpParity];
         Params.JumpP = F.PUav[JumpParity];
         Params.JumpPOut = F.PUav[1 - JumpParity];
+        Params.AccHi = F.HiUav[JumpParity];
+        Params.AccHiOut = F.HiUav[1 - JumpParity];
         const uint32 NumGroups = FMath::Max(FMath::DivideAndRoundUp(Threads, 64u), 1u);
         Params.GroupsX = FMath::Min(NumGroups, 32768u);
         Params.NumSlots = NumSlots;
@@ -540,6 +580,22 @@ struct VoxelLandSolve::FJob::FImpl
         FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("VoxelLand %s", Name), Shader, Parameters, Groups);
     }
 
+    /** Records one tiled pass (VoxelSolveFillTiledCS): a group of 16 x 16 threads per tile of a
+     *  face (VOXEL_SOLVE_FILL_TILE). */
+    template<typename TShader>
+    void PassTiles(FRDGBuilder& GraphBuilder, const FFrame& F, const TCHAR* Name, uint32 PassMode = 0)
+    {
+        const uint32 TilesPerFace = (uint32)FMath::DivideAndRoundUp(S.N, 16);
+        const uint32 Tiles = 6u * TilesPerFace * TilesPerFace;
+        FVoxelLandSolveParameters* Parameters = GraphBuilder.AllocParameters<FVoxelLandSolveParameters>();
+        *Parameters = MakeParameters(F, 1);
+        Parameters->GroupsX = FMath::Min(Tiles, 32768u);
+        Parameters->PassMode = PassMode;
+        const FIntVector Groups((int32)Parameters->GroupsX, (int32)FMath::DivideAndRoundUp(Tiles, Parameters->GroupsX), 1);
+        TShaderMapRef<TShader> Shader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
+        FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("VoxelLand %s", Name), Shader, Parameters, Groups);
+    }
+
     /** One group (the scan, the residual, the reset). */
     template<typename TShader>
     void Single(FRDGBuilder& GraphBuilder, const FFrame& F, const TCHAR* Name, uint32 PassMode = 0)
@@ -555,7 +611,7 @@ struct VoxelLandSolve::FJob::FImpl
     {
         const double Now = FPlatformTime::Seconds();
         static const TCHAR* Names[] = { TEXT("start"), TEXT("count"), TEXT("initial fill"), TEXT("steps"), TEXT("normalisation"),
-            TEXT("lake levels"), TEXT("routing fill"), TEXT("drainage"), TEXT("drainage spread"), TEXT("lake labels"), TEXT("output"), TEXT("done") };
+            TEXT("lake levels"), TEXT("routing fill"), TEXT("drainage spread"), TEXT("lake labels"), TEXT("output"), TEXT("rivers again"), TEXT("done") };
         OutResult.PhaseLog.Add(FString::Printf(TEXT("%s %d frames %.2f s"), Names[(int32)Phase], PhaseFrames, Now - PhaseStart));
         Phase = InPhase;
         PhaseStart = Now;
@@ -577,8 +633,9 @@ struct VoxelLandSolve::FJob::FImpl
 
     /** A loop iterated to its fixed point: K passes this frame (the last one counted), unless
      *  enough are in flight; true once a readback says nothing changed (or one failed:
-     *  bOutFailed). */
-    template<typename TShader>
+     *  bOutFailed). bTiled: the fill by tiles (PassTiles; a pass covers every cell, not only
+     *  the slots, and iterates in the tile: about two slot passes' cost, so half as many a frame). */
+    template<typename TShader, bool bTiled = false>
     bool Loop(FRDGBuilder& GraphBuilder, const FFrame& F, const TCHAR* Name, uint32 PassMode, bool& bOutFailed)
     {
         while (Pending.Num() > 0 && Pending[0].IsReady())
@@ -606,16 +663,230 @@ struct VoxelLandSolve::FJob::FImpl
             return true;
         }
         if (Pending.Num() >= VLS::MaxPending) return false;
-        const int32 K = (int32)FMath::Clamp<int64>(S.IterationCellsPerFrame / FMath::Max<int64>(NumSlots, 1), VLS::MinIterationsPerFrame, VLS::MaxIterationsPerFrame);
+        int32 K = (int32)FMath::Clamp<int64>(S.IterationCellsPerFrame / FMath::Max<int64>(NumSlots, 1), VLS::MinIterationsPerFrame, VLS::MaxIterationsPerFrame);
+        if (bTiled)
+            K = FMath::Clamp(K / 2, VLS::MinIterationsPerFrame, 64);
         for (int32 k = 0; k < K; k++)
         {
             if (k == K - 1)
                 Single<FVoxelSolveResetCS>(GraphBuilder, F, TEXT("reset flag"));
-            Pass<TShader>(GraphBuilder, F, NumSlots, Name, PassMode);
+            if (bTiled)
+                PassTiles<TShader>(GraphBuilder, F, Name, PassMode);
+            else
+                Pass<TShader>(GraphBuilder, F, NumSlots, Name, PassMode);
         }
         LoopIterations += K;
         Pending.Add(VLS::Enqueue(GraphBuilder, F.Flags, 8, TEXT("Voxel.LandSolveFlagsReadback")));
         return false;
+    }
+
+    /** R1b: records the rivers' build on this frame's fields (the routing's label and slot
+     *  buffers as its per-cell scratch: free after the output pass), with its readbacks. */
+    void RecordRivers(FRDGBuilder& GraphBuilder, const FFrame& F, FRDGBufferRef InHeight, FRDGBufferRef InWater, FRDGBufferRef InFlow, FRDGBufferRef InRec,
+        const VoxelLandRiverBuild::FCaps& Caps)
+    {
+        VoxelLandRiverBuild::FInputs In;
+        In.Tan = F.Tan;
+        In.Height = InHeight;
+        In.Water = InWater;
+        In.Flow = InFlow;
+        In.Rec = InRec;
+        In.CellFlags = F.Label;
+        In.CellNode = F.Cell;
+        const VoxelLandRiverBuild::FOutputs Out = VoxelLandRiverBuild::AddPasses(GraphBuilder, In, RiverSettings, Caps);
+        Rivers.Enqueue(GraphBuilder, Out, RiverSettings, Caps);
+        RiverBuilds++;
+    }
+
+    /** A ready river build: into the result when it fit (true), else recorded again with the sizes
+     *  its counts asked for (false: wait); a failed or repeatedly short build leaves no rivers. */
+    bool FinishRivers(FRDGBuilder& GraphBuilder, const FFrame& F, FResult& OutResult)
+    {
+        VoxelLandRiverBuild::FResult R;
+        if (!Rivers.Read(R))
+        {
+            UE_LOG(LogVoxelPlugin, Warning, TEXT("[VoxelLand] The rivers' readback failed; no rivers."));
+            return true;
+        }
+        if (R.bFits)
+        {
+            OutResult.Rivers = MoveTemp(R);
+            OutResult.bRivers = true;
+            OutResult.RiverBuilds = RiverBuilds;
+            return true;
+        }
+        if (!VoxelLandRiverBuild::AreShadersReady())
+        {
+            // (Recompiled meanwhile: VoxelLand::TickRivers builds them once the bake is ready.)
+            OutResult.RiverBuilds = 0;
+            return true;
+        }
+        if (R.Counts[VoxelLandRiverBuild::CountErrors] != 0 || RiverBuilds >= VoxelLandRiverBuild::MaxBuilds || !KeptHeight.IsValid())
+        {
+            UE_LOG(LogVoxelPlugin, Warning, TEXT("[VoxelLand] The rivers' build failed (errors 0x%x after %d builds); no rivers."),
+                R.Counts[VoxelLandRiverBuild::CountErrors], RiverBuilds);
+            return true;
+        }
+        RecordRivers(GraphBuilder, F, GraphBuilder.RegisterExternalBuffer(KeptHeight), GraphBuilder.RegisterExternalBuffer(KeptWater),
+            GraphBuilder.RegisterExternalBuffer(KeptFlow), GraphBuilder.RegisterExternalBuffer(KeptRec), R.Needed);
+        return false;
+    }
+
+    /** The GPU fields into the result (the bake's GPU copy takes them). */
+    void Finish(FResult& OutResult)
+    {
+        OutResult.GPUHeight = KeptHeight;
+        OutResult.GPUWater = KeptWater;
+        OutResult.GPUFlow = KeptFlow;
+        OutResult.GPUTan = Tan;
+    }
+
+    /** Whether the routing's fills start from the solve's last receivers (S1; the routing
+     *  ahead's fallback puts them back first). */
+    bool UseTreeStart() const { return bSolved; }
+
+    /** S1: Count passes of a loop with no wait (the flag reset before the last one), and its
+     *  flags read back into Checks: nothing changed in the last pass, the loop had settled. */
+    template<typename TShader, bool bTiled = false>
+    void Fixed(FRDGBuilder& GraphBuilder, const FFrame& F, const TCHAR* Name, uint32 PassMode, int32 Count)
+    {
+        for (int32 k = 0; k < Count; k++)
+        {
+            if (k == Count - 1)
+                Single<FVoxelSolveResetCS>(GraphBuilder, F, TEXT("reset flag"));
+            if (bTiled)
+                PassTiles<TShader>(GraphBuilder, F, Name, PassMode);
+            else
+                Pass<TShader>(GraphBuilder, F, NumSlots, Name, PassMode);
+        }
+        Checks.Add(VLS::Enqueue(GraphBuilder, F.Flags, 8, TEXT("Voxel.LandSolveCheckReadback")));
+    }
+
+    /** S1: the whole routing in this frame, from the land's slot count: the fills from the
+     *  solve's receivers, the drainage, its spread, the labels, then the output (RecordOutput).
+     *  Each loop is a fixed number of passes; OutputWait checks they had settled. */
+    void RecordRoutingAhead(FRDGBuilder& GraphBuilder, FFrame& F, FResult& OutResult)
+    {
+        Checks.Reset();
+        // The errors so far, the heights and the solve's receivers, for a fallback.
+        ErrorsBeforeRouting = Errors;
+        PreRouting = VLS::Enqueue(GraphBuilder, F.Flags, 8, TEXT("Voxel.LandSolveCheckReadback"));
+        AddCopyBufferPass(GraphBuilder, Get(GraphBuilder, KeptH, 4, NumCells, TEXT("Voxel.LandSolveKeptH")), F.H);
+        AddCopyBufferPass(GraphBuilder, Get(GraphBuilder, KeptSolveRec, 4, NumCells, TEXT("Voxel.LandSolveKeptRec")), F.Rec);
+        // Land outside the solve has no receivers to start from: its fills run from INF, more
+        // passes the more there is (a few cells at the coasts with the default model, 4 at 1,024
+        // cells a face; 5% of the land with the L2 model, 13-18 passes at 512). A heuristic:
+        // solved cells now under the sea hide some, and a fill short of passes falls back to
+        // the loops.
+        const uint32 Outside = NumSlots > SolvedSlots ? NumSlots - SolvedSlots : 0u;
+        const int32 FillPasses = Outside == 0u ? VLS::AheadFillPasses
+            : (uint64)Outside * 64u < (uint64)NumSlots ? 2 * VLS::AheadFillPasses
+            : FMath::Clamp(S.N / 8, VLS::AheadFillPasses, VLS::AheadFillPassesMax);
+        Pass<FVoxelSolveRouteInitCS>(GraphBuilder, F, NumCells, TEXT("route init"), 2u);
+        RouteTreeFill(GraphBuilder, F, 0);
+        Fixed<FVoxelSolveFillTiledCS, true>(GraphBuilder, F, TEXT("lake levels"), 0, FillPasses);
+        Pass<FVoxelSolveRouteInitCS>(GraphBuilder, F, NumCells, TEXT("route init"), 3u);
+        RouteTreeFill(GraphBuilder, F, 1);
+        Fixed<FVoxelSolveFillTiledCS, true>(GraphBuilder, F, TEXT("routing fill"), 1, FillPasses);
+        Pass<FVoxelSolveReceiversCS>(GraphBuilder, F, NumSlots, TEXT("receivers"), 0);
+        AccumulateByJumps(GraphBuilder, F, 0);
+        if (S.SpreadCells > 0.0f)
+        {
+            Pass<FVoxelSolveSpreadInitCS>(GraphBuilder, F, NumSlots, TEXT("drainage spread init"));
+            Fixed<FVoxelSolveSpreadCS>(GraphBuilder, F, TEXT("drainage spread"), 0, VLS::AheadSpreadPasses);
+            AccumulateByJumps(GraphBuilder, F, 1);
+        }
+        Pass<FVoxelSolveLabelInitCS>(GraphBuilder, F, NumSlots, TEXT("lake labels"));
+        Fixed<FVoxelSolveLabelCS>(GraphBuilder, F, TEXT("lake labels"), 0, VLS::AheadLabelPasses);
+        RecordOutput(GraphBuilder, F, OutResult);
+    }
+
+    /** The lakes, the fields and the rivers from the settled routing, with their readbacks
+     *  (OutputWait reads them). */
+    void RecordOutput(FRDGBuilder& GraphBuilder, FFrame& F, FResult& OutResult)
+    {
+        F.LakeArea = Transient(GraphBuilder, 4, NumCells, TEXT("Voxel.LandSolveLakeArea"));
+        F.LakeDepth = Transient(GraphBuilder, 4, NumCells, TEXT("Voxel.LandSolveLakeDepth"));
+        F.LakeOutlet = Transient(GraphBuilder, 4, NumCells, TEXT("Voxel.LandSolveLakeOutlet"));
+        F.LakeCount = Transient(GraphBuilder, 4, 1, TEXT("Voxel.LandSolveLakeCount"));
+        F.LakeList = Transient(GraphBuilder, 4, 4 * VLS::MaxLakes, TEXT("Voxel.LandSolveLakeList"));
+        F.OutHeight = Transient(GraphBuilder, 4, NumCells, TEXT("Voxel.LandSolveOutHeight"));
+        F.OutFlow = Transient(GraphBuilder, 4, (NumCells + 1) / 2, TEXT("Voxel.LandSolveOutFlow"));
+        F.OutWater = Transient(GraphBuilder, 4, NumCells, TEXT("Voxel.LandSolveOutWater"));
+        F.OutAttr = Transient(GraphBuilder, 4, NumCells, TEXT("Voxel.LandSolveOutAttr"));
+        F.OutForm = Transient(GraphBuilder, 4, NumCells, TEXT("Voxel.LandSolveOutForm"));
+        F.OutRec = Transient(GraphBuilder, 4, NumCells, TEXT("Voxel.LandSolveOutRec"));
+        BuildBase(GraphBuilder, F);
+        AddClearUAVPass(GraphBuilder, GraphBuilder.CreateUAV(F.LakeArea), 0u);
+        AddClearUAVPass(GraphBuilder, GraphBuilder.CreateUAV(F.LakeDepth), 0u);
+        AddClearUAVPass(GraphBuilder, GraphBuilder.CreateUAV(F.LakeOutlet), VLS::None);
+        AddClearUAVPass(GraphBuilder, GraphBuilder.CreateUAV(F.LakeCount), 0u);
+        AddClearUAVPass(GraphBuilder, GraphBuilder.CreateUAV(F.LakeList), 0u);
+        AddClearUAVPass(GraphBuilder, GraphBuilder.CreateUAV(F.OutFlow), 0u);
+        Pass<FVoxelSolveLakeStatsCS>(GraphBuilder, F, NumSlots, TEXT("lake stats"));
+        Pass<FVoxelSolveLakeFinishCS>(GraphBuilder, F, NumSlots, TEXT("lakes"));
+        Pass<FVoxelSolveOutputCS>(GraphBuilder, F, NumCells, TEXT("output"));
+        // R1b: the rivers, on the fields just made (read back with them). They use the label
+        // and slot buffers as scratch: nothing over the slots runs after them.
+        RiverBuilds = 0;
+        if (S.bRivers && VoxelLandRiverBuild::AreShadersReady())
+        {
+            RiverSettings.N = S.N;
+            RiverSettings.Pad = S.Pad;
+            RiverSettings.RadiusM = S.RadiusM;
+            RiverSettings.MinAreaKm2 = S.RiverMinAreaKm2;
+            RiverSettings.WidthScale = S.RiverWidthScale;
+            RiverSettings.ValleyScale = S.RiverValleyScale;
+            RiverSettings.LandCells = NumSlots;
+            RecordRivers(GraphBuilder, F, F.OutHeight, F.OutWater, F.OutFlow, F.OutRec, VoxelLandRiverBuild::EstimateCaps(RiverSettings));
+        }
+        // The fields the density samples stay on the GPU (and the receivers, for a river
+        // build that has to run again).
+        KeptHeight = GraphBuilder.ConvertToExternalBuffer(F.OutHeight);
+        KeptWater = GraphBuilder.ConvertToExternalBuffer(F.OutWater);
+        KeptFlow = GraphBuilder.ConvertToExternalBuffer(F.OutFlow);
+        KeptRec = GraphBuilder.ConvertToExternalBuffer(F.OutRec);
+        const uint32 Bytes = NumCells * 4;
+        Pending.Reset();
+        Pending.Add(VLS::Enqueue(GraphBuilder, F.OutHeight, Bytes, TEXT("Voxel.LandSolveHeightReadback")));
+        Pending.Add(VLS::Enqueue(GraphBuilder, F.OutFlow, (NumCells + 1) / 2 * 4, TEXT("Voxel.LandSolveFlowReadback")));
+        Pending.Add(VLS::Enqueue(GraphBuilder, F.OutWater, Bytes, TEXT("Voxel.LandSolveWaterReadback")));
+        Pending.Add(VLS::Enqueue(GraphBuilder, F.OutAttr, Bytes, TEXT("Voxel.LandSolveAttrReadback")));
+        Pending.Add(VLS::Enqueue(GraphBuilder, F.LakeCount, 4, TEXT("Voxel.LandSolveLakeCountReadback")));
+        Pending.Add(VLS::Enqueue(GraphBuilder, F.LakeList, 16 * VLS::MaxLakes, TEXT("Voxel.LandSolveLakesReadback")));
+        Pending.Add(VLS::Enqueue(GraphBuilder, F.Flags, 8, TEXT("Voxel.LandSolveFlagsReadback")));
+        // The plate pass's landform, its character following the drainage density (T3h).
+        Pending.Add(VLS::Enqueue(GraphBuilder, F.OutForm, Bytes, TEXT("Voxel.LandSolveFormReadback")));
+        // The final routing's receivers (the rivers, R1).
+        Pending.Add(VLS::Enqueue(GraphBuilder, F.OutRec, Bytes, TEXT("Voxel.LandSolveRecReadback")));
+        SetPhase(EPhase::OutputWait, OutResult);
+    }
+
+    /** S1: the routing fill's start from the solve's last receivers (VoxelSolveRouteTreeInitPass;
+     *  PassMode 1 with the descent). */
+    void RouteTreeFill(FRDGBuilder& GraphBuilder, const FFrame& F, uint32 PassMode)
+    {
+        Pass<FVoxelSolveRouteTreeInitCS>(GraphBuilder, F, NumSlots, TEXT("routing tree fill"), PassMode);
+        for (int32 r = 0; r < VLS::JumpRounds; r++)
+        {
+            Pass<FVoxelSolveTreeFillJumpCS>(GraphBuilder, F, NumSlots, TEXT("routing tree fill jump"), 0, 0);
+            JumpParity ^= 1;
+        }
+        Pass<FVoxelSolveTreeFillFinishCS>(GraphBuilder, F, NumSlots, TEXT("routing tree fill finish"), 0, 0);
+    }
+
+    /** S1: an exact accumulation over the receivers in fixed passes (VoxelSolveAccJumpInitPass:
+     *  Mode 0 the D8 drainage, 1 the spread's channels). */
+    void AccumulateByJumps(FRDGBuilder& GraphBuilder, const FFrame& F, uint32 Mode)
+    {
+        Pass<FVoxelSolveAccJumpInitCS>(GraphBuilder, F, NumSlots, TEXT("drainage init"), Mode);
+        for (int32 r = 0; r < VLS::JumpRounds; r++)
+        {
+            Pass<FVoxelSolveAccJumpCopyCS>(GraphBuilder, F, NumSlots, TEXT("drainage copy"));
+            Pass<FVoxelSolveAccJumpAddCS>(GraphBuilder, F, NumSlots, TEXT("drainage jump"));
+            JumpParity ^= 1;
+        }
+        Pass<FVoxelSolveAccJumpFinishCS>(GraphBuilder, F, NumSlots, TEXT("drainage finish"), Mode);
     }
 
     /** One step of the solve, skipped on the GPU once it is done. */
@@ -664,9 +935,13 @@ struct VoxelLandSolve::FJob::FImpl
     void Release()
     {
         for (TRefCountPtr<FRDGPooledBuffer>* B : { &Tan, &H, &W, &Water, &Rec, &Slot, &Label, &Cell, &GroupCounts, &Counts, &Flags, &State, &Partials, &Log,
-            &Histogram, &U, &Erodibility, &ChannelFactor, &Area, &Dist, &H0, &WOut, &A[0], &A[1], &X[0], &X[1], &Y[0], &Y[1], &P[0], &P[1] })
+            &Histogram, &U, &Erodibility, &ChannelFactor, &Area, &Dist, &H0, &WOut, &A[0], &A[1], &X[0], &X[1], &Y[0], &Y[1], &P[0], &P[1], &Hi[0], &Hi[1],
+            &KeptH, &KeptSolveRec, &KeptHeight, &KeptWater, &KeptFlow, &KeptRec })
             B->SafeRelease();
         Pending.Reset();
+        Checks.Reset();
+        PreRouting = VLS::FReadback();
+        Rivers.Reset();
     }
 };
 
@@ -736,6 +1011,7 @@ void VoxelLandSolve::FJob::Tick(FRHICommandListImmediate& RHICmdList, const FPla
             if (I.CountDomain == 0)
             {
                 Result.SolvedCells = (int32)I.NumSlots;
+                I.SolvedSlots = I.NumSlots;
                 if (I.NumSlots == 0)
                 {
                     // No mountains: the static heights.
@@ -744,19 +1020,30 @@ void VoxelLandSolve::FJob::Tick(FRHICommandListImmediate& RHICmdList, const FPla
                     break;
                 }
                 I.Pass<FVoxelSolveInitCS>(GraphBuilder, F, I.NumCells, TEXT("init"));
+                I.bSolved = true;
                 I.SetPhase(EPhase::InitFill, Result);
             }
             else
             {
                 Result.LandCells = (int32)I.NumSlots;
-                I.Pass<FVoxelSolveRouteInitCS>(GraphBuilder, F, I.NumCells, TEXT("route init"), 0);
+                if (I.UseTreeStart() && I.NumSlots > 0 && S.bRouteAhead && !I.bRouteByLoops)
+                {
+                    // S1: the whole routing now, checked when the fields come back.
+                    I.RecordRoutingAhead(GraphBuilder, F, Result);
+                    Progress.store(0.95f, std::memory_order_relaxed);
+                    break;
+                }
+                // After a solve, the lake levels start from its last receivers' tree fill.
+                I.Pass<FVoxelSolveRouteInitCS>(GraphBuilder, F, I.NumCells, TEXT("route init"), I.UseTreeStart() ? 2u : 0u);
+                if (I.UseTreeStart() && I.NumSlots > 0)
+                    I.RouteTreeFill(GraphBuilder, F, 0);
                 I.SetPhase(EPhase::Fill0, Result);
             }
             break;
         }
         case EPhase::InitFill:
         {
-            if (!I.Loop<FVoxelSolveFillInPlaceCS>(GraphBuilder, F, TEXT("initial fill"), 1, bFailed)) break;
+            if (!I.Loop<FVoxelSolveFillTiledCS, true>(GraphBuilder, F, TEXT("initial fill"), 1, bFailed)) break;
             if (bFailed) break;
             I.Pass<FVoxelSolveUndrainedCS>(GraphBuilder, F, I.NumSlots, TEXT("undrained"));
             I.Pass<FVoxelSolveReceiversCS>(GraphBuilder, F, I.NumSlots, TEXT("receivers"), 1);
@@ -878,28 +1165,26 @@ void VoxelLandSolve::FJob::Tick(FRHICommandListImmediate& RHICmdList, const FPla
         }
         case EPhase::Fill0:
         {
-            if (I.NumSlots > 0 && !I.Loop<FVoxelSolveFillInPlaceCS>(GraphBuilder, F, TEXT("lake levels"), 0, bFailed)) break;
+            if (I.NumSlots > 0 && !I.Loop<FVoxelSolveFillTiledCS, true>(GraphBuilder, F, TEXT("lake levels"), 0, bFailed)) break;
             if (bFailed) break;
-            I.Pass<FVoxelSolveRouteInitCS>(GraphBuilder, F, I.NumCells, TEXT("route init"), 1);
+            I.Pass<FVoxelSolveRouteInitCS>(GraphBuilder, F, I.NumCells, TEXT("route init"), I.UseTreeStart() ? 3u : 1u);
+            if (I.UseTreeStart() && I.NumSlots > 0)
+                I.RouteTreeFill(GraphBuilder, F, 1);
             I.SetPhase(EPhase::Fill1, Result);
             Progress.store(0.88f, std::memory_order_relaxed);
             break;
         }
         case EPhase::Fill1:
         {
-            if (I.NumSlots > 0 && !I.Loop<FVoxelSolveFillInPlaceCS>(GraphBuilder, F, TEXT("routing fill"), 1, bFailed)) break;
+            if (I.NumSlots > 0 && !I.Loop<FVoxelSolveFillTiledCS, true>(GraphBuilder, F, TEXT("routing fill"), 1, bFailed)) break;
             if (bFailed) break;
             I.Pass<FVoxelSolveReceiversCS>(GraphBuilder, F, I.NumSlots, TEXT("receivers"), 0);
-            I.SetPhase(EPhase::Accumulate, Result);
-            Progress.store(0.91f, std::memory_order_relaxed);
-            break;
-        }
-        case EPhase::Accumulate:
-        {
-            if (I.NumSlots > 0 && !I.Loop<FVoxelSolveAccumulateInPlaceCS>(GraphBuilder, F, TEXT("drainage"), 0, bFailed)) break;
-            if (bFailed) break;
+            // S1: the drainage, exact in fixed passes (it was iterated to convergence: about a
+            // pass per cell of the longest path).
+            if (I.NumSlots > 0)
+                I.AccumulateByJumps(GraphBuilder, F, 0);
             // The drainage field's spread over the hillslopes (VoxelSolveSpreadPass), from the
-            // D8 areas just converged; the solve and the lakes keep D8.
+            // D8 areas; the solve and the lakes keep D8.
             if (S.SpreadCells > 0.0f && I.NumSlots > 0)
             {
                 I.Pass<FVoxelSolveSpreadInitCS>(GraphBuilder, F, I.NumSlots, TEXT("drainage spread init"));
@@ -916,6 +1201,9 @@ void VoxelLandSolve::FJob::Tick(FRHICommandListImmediate& RHICmdList, const FPla
         {
             if (!I.Loop<FVoxelSolveSpreadCS>(GraphBuilder, F, TEXT("drainage spread"), 0, bFailed)) break;
             if (bFailed) break;
+            // S1: the hillslopes converged (a few dozen passes); the channels sum them down the
+            // tree in fixed passes.
+            I.AccumulateByJumps(GraphBuilder, F, 1);
             I.Pass<FVoxelSolveLabelInitCS>(GraphBuilder, F, I.NumSlots, TEXT("lake labels"));
             I.SetPhase(EPhase::Labels, Result);
             Progress.store(0.94f, std::memory_order_relaxed);
@@ -926,51 +1214,73 @@ void VoxelLandSolve::FJob::Tick(FRHICommandListImmediate& RHICmdList, const FPla
             if (I.NumSlots > 0 && !I.Loop<FVoxelSolveLabelCS>(GraphBuilder, F, TEXT("lake labels"), 0, bFailed)) break;
             if (bFailed) break;
             // Lakes, then the fields; read back once.
-            F.LakeArea = FImpl::Transient(GraphBuilder, 4, I.NumCells, TEXT("Voxel.LandSolveLakeArea"));
-            F.LakeDepth = FImpl::Transient(GraphBuilder, 4, I.NumCells, TEXT("Voxel.LandSolveLakeDepth"));
-            F.LakeOutlet = FImpl::Transient(GraphBuilder, 4, I.NumCells, TEXT("Voxel.LandSolveLakeOutlet"));
-            F.LakeCount = FImpl::Transient(GraphBuilder, 4, 1, TEXT("Voxel.LandSolveLakeCount"));
-            F.LakeList = FImpl::Transient(GraphBuilder, 4, 4 * VLS::MaxLakes, TEXT("Voxel.LandSolveLakeList"));
-            F.OutHeight = FImpl::Transient(GraphBuilder, 4, I.NumCells, TEXT("Voxel.LandSolveOutHeight"));
-            F.OutFlow = FImpl::Transient(GraphBuilder, 4, I.NumCells, TEXT("Voxel.LandSolveOutFlow"));
-            F.OutWater = FImpl::Transient(GraphBuilder, 4, I.NumCells, TEXT("Voxel.LandSolveOutWater"));
-            F.OutAttr = FImpl::Transient(GraphBuilder, 4, I.NumCells, TEXT("Voxel.LandSolveOutAttr"));
-            F.OutForm = FImpl::Transient(GraphBuilder, 4, I.NumCells, TEXT("Voxel.LandSolveOutForm"));
-            I.BuildBase(GraphBuilder, F);
-            AddClearUAVPass(GraphBuilder, GraphBuilder.CreateUAV(F.LakeArea), 0u);
-            AddClearUAVPass(GraphBuilder, GraphBuilder.CreateUAV(F.LakeDepth), 0u);
-            AddClearUAVPass(GraphBuilder, GraphBuilder.CreateUAV(F.LakeOutlet), VLS::None);
-            AddClearUAVPass(GraphBuilder, GraphBuilder.CreateUAV(F.LakeCount), 0u);
-            AddClearUAVPass(GraphBuilder, GraphBuilder.CreateUAV(F.LakeList), 0u);
-            I.Pass<FVoxelSolveLakeStatsCS>(GraphBuilder, F, I.NumSlots, TEXT("lake stats"));
-            I.Pass<FVoxelSolveLakeFinishCS>(GraphBuilder, F, I.NumSlots, TEXT("lakes"));
-            I.Pass<FVoxelSolveOutputCS>(GraphBuilder, F, I.NumCells, TEXT("output"));
-            const uint32 Bytes = I.NumCells * 4;
-            I.Pending.Reset();
-            I.Pending.Add(VLS::Enqueue(GraphBuilder, F.OutHeight, Bytes, TEXT("Voxel.LandSolveHeightReadback")));
-            I.Pending.Add(VLS::Enqueue(GraphBuilder, F.OutFlow, Bytes, TEXT("Voxel.LandSolveFlowReadback")));
-            I.Pending.Add(VLS::Enqueue(GraphBuilder, F.OutWater, Bytes, TEXT("Voxel.LandSolveWaterReadback")));
-            I.Pending.Add(VLS::Enqueue(GraphBuilder, F.OutAttr, Bytes, TEXT("Voxel.LandSolveAttrReadback")));
-            I.Pending.Add(VLS::Enqueue(GraphBuilder, F.LakeCount, 4, TEXT("Voxel.LandSolveLakeCountReadback")));
-            I.Pending.Add(VLS::Enqueue(GraphBuilder, F.LakeList, 16 * VLS::MaxLakes, TEXT("Voxel.LandSolveLakesReadback")));
-            I.Pending.Add(VLS::Enqueue(GraphBuilder, F.Flags, 8, TEXT("Voxel.LandSolveFlagsReadback")));
-            // The plate pass's landform, its character following the drainage density (T3h).
-            I.Pending.Add(VLS::Enqueue(GraphBuilder, F.OutForm, Bytes, TEXT("Voxel.LandSolveFormReadback")));
-            I.SetPhase(EPhase::OutputWait, Result);
+            I.RecordOutput(GraphBuilder, F, Result);
             Progress.store(0.97f, std::memory_order_relaxed);
             break;
         }
         case EPhase::OutputWait:
         {
-            bool bReady = I.Pending.Num() == 8;
+            bool bReady = I.Pending.Num() == 9 && (!I.Rivers.IsValid() || I.Rivers.IsReady());
             for (const VLS::FReadback& R : I.Pending)
                 bReady &= R.IsReady();
+            for (const VLS::FReadback& R : I.Checks)
+                bReady &= R.IsReady();
+            if (I.Checks.Num() > 0)
+                bReady &= I.PreRouting.IsReady();
             if (!bReady) break;
-            TArray<float> Heights, Flows, Waters;
-            TArray<uint32> Attrs, LakeCount, LakeWords, FlagWords, Forms;
+            if (I.Checks.Num() > 0)
+            {
+                // S1: the routing recorded ahead: every loop had settled, or it routes again by
+                // loops (from INF: the routing replaced the solve's receivers).
+                FString Unsettled;
+                static const TCHAR* CheckNames[] = { TEXT("lake levels"), TEXT("routing fill"), TEXT("drainage spread"), TEXT("lake labels") };
+                const bool bSpread = I.Checks.Num() == 4;
+                TArray<uint32> PreWords;
+                if (!VLS::Read(I.PreRouting, PreWords) || PreWords.Num() < 2)
+                {
+                    bFailed = true;
+                    break;
+                }
+                for (int32 k = 0; k < I.Checks.Num(); k++)
+                {
+                    TArray<uint32> Words;
+                    if (!VLS::Read(I.Checks[k], Words) || Words.Num() < 2)
+                    {
+                        bFailed = true;
+                        break;
+                    }
+                    if (Words[0] != 0u)
+                        Unsettled += FString(Unsettled.IsEmpty() ? TEXT("") : TEXT(", ")) + CheckNames[(!bSpread && k == 2) ? 3 : k];
+                }
+                I.Checks.Reset();
+                if (bFailed) break;
+                if (!Unsettled.IsEmpty())
+                {
+                    UE_LOG(LogVoxelPlugin, Log, TEXT("[VoxelLand] The routing recorded ahead hadn't settled (%s); routing again by loops."), *Unsettled);
+                    I.Pending.Reset();
+                    I.Rivers.Reset();
+                    I.KeptHeight.SafeRelease();
+                    I.KeptWater.SafeRelease();
+                    I.KeptFlow.SafeRelease();
+                    I.KeptRec.SafeRelease();
+                    I.bRouteByLoops = true;
+                    // Back to the state the routing started from: the heights (the lakes not
+                    // kept were filled into them), the solve's receivers, the errors so far
+                    // (the unsettled attempt's are dropped, with the flags).
+                    AddCopyBufferPass(GraphBuilder, F.H, GraphBuilder.RegisterExternalBuffer(I.KeptH));
+                    AddCopyBufferPass(GraphBuilder, F.Rec, GraphBuilder.RegisterExternalBuffer(I.KeptSolveRec));
+                    I.Errors = I.ErrorsBeforeRouting | PreWords[1];
+                    I.Single<FVoxelSolveResetCS>(GraphBuilder, F, TEXT("reset"), 1);
+                    // The rivers used the slot buffer as scratch: count the land again.
+                    I.CountDomainSlots(GraphBuilder, F, 1, Result);
+                    break;
+                }
+            }
+            TArray<float> Heights, Waters;
+            TArray<uint32> Flows, Attrs, LakeCount, LakeWords, FlagWords, Forms, Recs;
             if (!VLS::Read(I.Pending[0], Heights) || !VLS::Read(I.Pending[1], Flows) || !VLS::Read(I.Pending[2], Waters) || !VLS::Read(I.Pending[3], Attrs)
                 || !VLS::Read(I.Pending[4], LakeCount) || !VLS::Read(I.Pending[5], LakeWords) || !VLS::Read(I.Pending[6], FlagWords)
-                || !VLS::Read(I.Pending[7], Forms))
+                || !VLS::Read(I.Pending[7], Forms) || !VLS::Read(I.Pending[8], Recs))
             {
                 bFailed = true;
                 break;
@@ -981,8 +1291,9 @@ void VoxelLandSolve::FJob::Tick(FRHICommandListImmediate& RHICmdList, const FPla
             Result.Height = MoveTemp(Heights);
             Result.Water = MoveTemp(Waters);
             Result.Attr = MoveTemp(Attrs);
-            Result.Flow = MoveTemp(Flows);
+            Result.FlowHalves = MoveTemp(Flows);
             Result.Form = MoveTemp(Forms);
+            Result.Receiver = MoveTemp(Recs);
             Result.LakesFound = (int32)LakeCount[0];
             const int32 Kept = FMath::Min<int32>(Result.LakesFound, (int32)VLS::MaxLakes);
             const double CellAreaKm2 = 1.0e-2;   // the list's area unit (1e4 m^2) in km^2
@@ -1002,6 +1313,23 @@ void VoxelLandSolve::FJob::Tick(FRHICommandListImmediate& RHICmdList, const FPla
                 UE_LOG(LogVoxelPlugin, Warning, TEXT("[VoxelLand] %d lakes found, %d kept in the list (the rest are still water in the bake)."), Result.LakesFound, Kept);
             }
             Result.Errors = I.Errors;
+            if (I.Rivers.IsValid() && !I.FinishRivers(GraphBuilder, F, Result))
+            {
+                I.SetPhase(EPhase::RiverWait, Result);
+                break;
+            }
+            I.Finish(Result);
+            I.SetPhase(EPhase::Done, Result);
+            I.Release();
+            Progress.store(1.0f, std::memory_order_relaxed);
+            bFinished = true;
+            break;
+        }
+        case EPhase::RiverWait:
+        {
+            if (!I.Rivers.IsReady()) break;
+            if (!I.FinishRivers(GraphBuilder, F, Result)) break;
+            I.Finish(Result);
             I.SetPhase(EPhase::Done, Result);
             I.Release();
             Progress.store(1.0f, std::memory_order_relaxed);

@@ -61,7 +61,7 @@
 //                                               mass on it, rivers cut at most SolveIncision below
 //   float SolveUndulation;                      model 1: the static surface's rolling ground on
 //                                               land (m, coarsest octave; T1b)
-//   StructuredBuffer<uint> BakeForm;            the landform (VoxelLandPlates.ush), one cell a word
+//   StructuredBuffer<uint> BakeForm;            the landform (VoxelLandPlates.ush) | the province << 16, one cell a word
 //   float SolveLandformErosion;                 T2: how much the hilliness H scales the plains
 //                                               relief and the rolling ground (x lerp(1,
 //                                               0.3 + 1.75 H, e))
@@ -87,6 +87,9 @@
 //   RWStructuredBuffer<float> SlotAc;           per slot: the channel heads' area factor,
 //                                               2^(SolveChannelVariation x n3) (1 when off)
 //   float SolveChannelCharacter;                T3h: the character's pull (the output pass)
+//   RWStructuredBuffer<uint> AccHi, AccHiOut;   S1: the exact accumulation's high words (per slot,
+//                                               double-buffered with JumpY's low words)
+//   float SolveAccUnit;                         S1: its unit (m^2; a 4096th of a cell)
 
 #ifndef VOXEL_LAND_SOLVE_USH
 #define VOXEL_LAND_SOLVE_USH
@@ -196,7 +199,12 @@ VOXEL_FUNC uint VoxelSolveCellOf(float3 Dir)
 }
 
 /** Neighbour C (0..7: di, dj over -1..1 with dj outer, (0, 0) left out) of an interior cell,
- *  or VOXEL_SOLVE_NONE. */
+ *  or VOXEL_SOLVE_NONE (off a cube corner). Across a face's edge, the cell of the face beyond
+ *  that holds the point on the edge level with the step's cell along it: the coordinate along a
+ *  shared edge is the same angle on both faces, so the neighbours across are the edge row of the
+ *  other face, in step with this one's, and the links are symmetric. (S1: the cell holding the
+ *  apron cell's centre, as before, lands near half-cell ties toward the corners: 96 one-way links
+ *  at 1,024 cells a face, and a gathering pass, such as the drainage's, lost what came over one.) */
 VOXEL_FUNC uint VoxelSolveNeighbour(uint Cell, uint C)
 {
     const uint K = C < 4u ? C : C + 1u;
@@ -209,8 +217,22 @@ VOXEL_FUNC uint VoxelSolveNeighbour(uint Cell, uint C)
     const bool bOutJ = J < 0 || J >= int(SolveN);
     if (!bOutI && !bOutJ) return VoxelSolveEncode(P.Face, I, J);
     if (bOutI && bOutJ) return VOXEL_SOLVE_NONE;
-    const uint M = VoxelSolveCellOf(VoxelSolveDirection(P.Face, I, J));
-    return M == Cell ? VOXEL_SOLVE_NONE : M;
+    // The face beyond: the apron cell's centre lies half a cell past the edge.
+    const uint Face = VoxelSolveLocate(VoxelSolveDirection(P.Face, I, J)).Face;
+    // The point on the edge (the edge's tan is 1), in this face's frame; the other face's
+    // coordinates of it are ratios of its components (no need to normalise).
+    const float A = bOutI ? (I < 0 ? -1.0f : 1.0f) : SolveTan[uint(I + int(SolvePad))].x;
+    const float B = bOutJ ? (J < 0 ? -1.0f : 1.0f) : SolveTan[uint(J + int(SolvePad))].x;
+    const float3 Dir = VoxelCubeAxisVector(VoxelCubeNormalAxis(P.Face)) * VoxelCubeNormalSign(P.Face)
+        + VoxelCubeAxisVector(VoxelCubeUAxis(P.Face)) * A + VoxelCubeAxisVector(VoxelCubeVAxis(P.Face)) * B;
+    const float Den = abs(VoxelCubeComponent(Dir, VoxelCubeNormalAxis(Face)));
+    const float S = atan(VoxelCubeComponent(Dir, VoxelCubeUAxis(Face)) / Den) * VOXEL_SOLVE_INV_QUARTER_PI;
+    const float T = atan(VoxelCubeComponent(Dir, VoxelCubeVAxis(Face)) / Den) * VOXEL_SOLVE_INV_QUARTER_PI;
+    // Across the edge the coordinate is the edge's (-0.5 or N - 0.5: the edge row once clamped),
+    // along it a cell centre's (a whole number to float error).
+    const int I2 = clamp(int(floor((S + 1.0f) * 0.5f * float(SolveN))), 0, int(SolveN) - 1);
+    const int J2 = clamp(int(floor((T + 1.0f) * 0.5f * float(SolveN))), 0, int(SolveN) - 1);
+    return VoxelSolveEncode(Face, I2, J2);
 }
 
 /** Distance between two cells' centres on the sphere (m): the chord, exact to 1e-7 between
@@ -363,7 +385,8 @@ VOXEL_FUNC uint VoxelSolveFormOf(uint Cell)
     if (N == 0.0f) return Form;
     const float C = float((Form >> 8u) & 0xffu) * (1.0f / 255.0f);
     const float Pulled = lerp(C, N > 0.0f ? 0.0f : 1.0f, saturate(SolveChannelCharacter) * abs(N));
-    return (Form & 0xffu) | (uint(saturate(Pulled) * 255.0f + 0.5f) << 8u);
+    // The low byte (the hilliness) and the high half (the province, T4c) kept.
+    return (Form & 0xffff00ffu) | (uint(saturate(Pulled) * 255.0f + 0.5f) << 8u);
 }
 
 /** The incision's ramp: 0 below half the cell's channel-head area, a smoothstep to 1 at it. */
@@ -1089,7 +1112,9 @@ VOXEL_FUNC void VoxelSolveSettlePass(uint Slot, uint NumSlots)
 
 /** Every cell, once SolveSlot and SlotCell are set for the routing domain: land cells start
  *  with no water level and their own area; the sea is fixed at 0. Bit 0 of Mode: the second
- *  fill (with descent), which keeps the first's lake levels in SolveWater. */
+ *  fill (with descent), which keeps the first's lake levels in SolveWater. Bit 1: the receivers
+ *  stay (the solve's last step's: VoxelSolveRouteTreeInitPass starts the fills from them, S1);
+ *  else every cell starts as its own. */
 VOXEL_FUNC void VoxelSolveRouteInitPass(uint Cell, uint Mode)
 {
     if (Cell >= VoxelSolveNumCells()) return;
@@ -1102,7 +1127,8 @@ VOXEL_FUNC void VoxelSolveRouteInitPass(uint Cell, uint Mode)
             SolveW[Cell] = VOXEL_SOLVE_INF;
         return;
     }
-    SolveRec[Cell] = Cell;
+    if ((Mode & 2u) == 0u)
+        SolveRec[Cell] = Cell;
     SolveLabel[Cell] = VOXEL_SOLVE_NONE;
     if (!bInterior)
     {
@@ -1117,6 +1143,47 @@ VOXEL_FUNC void VoxelSolveRouteInitPass(uint Cell, uint Mode)
     SolveW[Cell] = VOXEL_SOLVE_INF;
     SlotArea[Slot] = VoxelSolveCellArea(Cell);
     SlotA[Slot] = SlotArea[Slot];
+}
+
+/** S1: the routing fills' start, an upper bound from the solve's last receivers (still in
+ *  SolveRec: VoxelSolveRouteInitPass with bit 1). Along them, W = max(h, W_r + the descent): a
+ *  surface that drains by construction, so it lies above the least one, and the fill
+ *  (Planchon-Darboux from above, VoxelSolveFillTiled) lowers it to that in a few passes where
+ *  the tree was the best way out, which is nearly everywhere. (With a descent, the jumps add the
+ *  descents in another order than the fill does, so a start can round an ulp under the fill's
+ *  level; the fill then keeps it: a surface that still drains by its descents, reproduced
+ *  whatever the passes' order, an ulp off the fill from infinity. Without, it is exact.) From no
+ *  start (infinity) the
+ *  levels had to arrive from the coast, a thousand passes inland. A cell without a receiver
+ *  there (not solved, or the routing's no-receiver case) starts at infinity, and so does
+ *  everything draining through it. As a record for VoxelSolveTreeFillJumpPass, then
+ *  VoxelSolveTreeFillFinishPass writes the levels. */
+VOXEL_FUNC void VoxelSolveRouteTreeInitPass(uint Slot, uint NumSlots, float Eps)
+{
+    if (Slot >= NumSlots) return;
+    const uint Cell = SlotCell[Slot];
+    const uint Rec = SolveRec[Cell];
+    const float H = SolveH[Cell];
+    JumpY[Slot] = 0u;
+    JumpP[Slot] = VOXEL_SOLVE_NONE;
+    if (Rec == Cell || Rec >= VoxelSolveNumCells())
+    {
+        JumpX[Slot] = VOXEL_SOLVE_INF;
+        return;
+    }
+    const uint Next = SolveSlot[Rec];
+    if (Next == VOXEL_SOLVE_NONE)
+    {
+        const float WR = SolveW[Rec];
+        JumpX[Slot] = WR < 0.5f * VOXEL_SOLVE_INF ? max(H, WR + VoxelSolveFillDescentTo(Cell, Rec, Eps)) : VOXEL_SOLVE_INF;
+        return;
+    }
+    JumpX[Slot] = H;
+    // The descent as VoxelSolveTreeFillJumpPass reads it (it decodes with SolveEps): a float's
+    // bits with the random fill, else a count of SolveEps steps, none without a descent (0 reads
+    // as no descent either way).
+    JumpY[Slot] = VoxelSolveRandomFill(Eps) ? asuint(VoxelSolveFillDescentTo(Cell, Rec, Eps)) : (Eps > 0.0f ? 1u : 0u);
+    JumpP[Slot] = Next;
 }
 
 /** A land cell below its lake level (the first fill, without descent) starts a lake label. */
@@ -1210,11 +1277,15 @@ VOXEL_FUNC void VoxelSolveSpreadInitPass(uint Slot, uint NumSlots)
     SlotDist[Slot] = Sum > 0.0f ? 1.0f / Sum : 0.0f;
 }
 
-/** The spread areas in place, until nothing changes (from the slots' own areas, they only
- *  grow toward the fixed point on the routing's acyclic fill, in neighbour order). */
-VOXEL_FUNC void VoxelSolveSpreadPass(uint Slot, uint NumSlots)
+/** The spread's inflow into a slot: its own area and its spreading neighbours' shares; with
+ *  bChannels (a hillslope's, VoxelSolveSpreadPass), its channel donors too, which send all to
+ *  their receiver. S1: a channel's spread total comes after the hillslopes' (by the jumps), so
+ *  a hillslope takes a channel donor's D8 total, final by then. A receiver drains more than its
+ *  donor, so this needs a hillslope below a channel, which the threshold's scaling with the
+ *  cell's own area allows only for SolveSpreadCells near 1 / the neighbours' area change (some
+ *  hundreds of cells); then it keeps the water, close enough. */
+VOXEL_FUNC float VoxelSolveSpreadSum(uint Slot, bool bChannels)
 {
-    if (Slot >= NumSlots) return;
     const uint Cell = SlotCell[Slot];
     float A = SlotArea[Slot];
     for (uint c = 0u; c < 8u; c++)
@@ -1226,9 +1297,23 @@ VOXEL_FUNC void VoxelSolveSpreadPass(uint Slot, uint NumSlots)
         const float Norm = SlotDist[S];
         if (Norm > 0.0f)
             A += SlotAOut[S] * (VoxelSolveSpreadWeight(N, SolveW[N], Cell) * Norm);
-        else if (SolveRec[N] == Cell)
-            A += SlotAOut[S];
+        else if (bChannels && SolveRec[N] == Cell)
+            A += SlotA[S];
     }
+    return A;
+}
+
+/** The spread areas in place, until nothing changes (from the slots' own areas, they only
+ *  grow toward the fixed point on the routing's acyclic fill, in neighbour order). S1: the
+ *  spreading (hillslope) slots only: nothing flows into them from a channel, and their paths are
+ *  short (a few dozen cells: the spread stops where the D8 drainage passes SolveSpreadCells), so
+ *  this converges in tens of passes where the whole field took one per cell of its longest path;
+ *  the channels then sum by pointer jumping (VoxelSolveAccJumpInitPass, Mode 1). */
+VOXEL_FUNC void VoxelSolveSpreadPass(uint Slot, uint NumSlots)
+{
+    if (Slot >= NumSlots) return;
+    if (!(SlotDist[Slot] > 0.0f)) return;
+    const float A = VoxelSolveSpreadSum(Slot, true);
     if (A != SlotAOut[Slot])
     {
         SlotAOut[Slot] = A;
@@ -1252,6 +1337,83 @@ VOXEL_FUNC float VoxelSolveFlowOf(uint Cell)
     return log2(max(A, 1.0f));
 }
 
+// --- Exact accumulation by pointer jumping (S1) -------------------------------------------
+//
+// A tree's upstream sums in 20 rounds of fixed passes, where the in-place iteration took one
+// pass per cell of the longest path (a thousand at 1024 cells a face). Round k adds each slot's
+// sum over the 2^k nodes above it (its window) into the node 2^k below it: the windows of the
+// nodes exactly 2^k above a node tile its next 2^k, so after the rounds every node holds its
+// whole upstream. The sums are integers (a 4096th of a cell, 64 bits as two words with the
+// carry counted from the low word's atomic add), so the result doesn't depend on the order the
+// GPU adds them in. Per slot: JumpY (low) and AccHi (high) with their Out halves, JumpP the
+// jump; the solve job swaps them between rounds as the other jumps'.
+
+/** A slot's start: Mode 0, its own area over the receiver tree (the routing's D8 drainage);
+ *  Mode 1, the spread's channel slots, their inflow (own area and the hillslopes' shares; their
+ *  channel donors come with the sums), over the channels' tree, the spreading slots standing
+ *  aside (no channel drains into one: a channel's receiver drains more than it does). */
+VOXEL_FUNC void VoxelSolveAccJumpInitPass(uint Slot, uint NumSlots, uint Mode)
+{
+    if (Slot >= NumSlots) return;
+    const uint Cell = SlotCell[Slot];
+    const uint Rec = SolveRec[Cell];
+    uint Next = Rec == Cell ? VOXEL_SOLVE_NONE : SolveSlot[Rec];
+    float V = SlotArea[Slot];
+    if (Mode == 1u)
+    {
+        if (SlotDist[Slot] > 0.0f)
+        {
+            V = 0.0f;
+            Next = VOXEL_SOLVE_NONE;
+        }
+        else
+        {
+            V = VoxelSolveSpreadSum(Slot, false);
+        }
+    }
+    JumpY[Slot] = uint(min(V / SolveAccUnit + 0.5f, 4.2e9f));
+    AccHi[Slot] = 0u;
+    JumpP[Slot] = Next;
+}
+
+/** A round's copy: the sums as they are, and the jumps doubled. */
+VOXEL_FUNC void VoxelSolveAccJumpCopyPass(uint Slot, uint NumSlots)
+{
+    if (Slot >= NumSlots) return;
+    JumpYOut[Slot] = JumpY[Slot];
+    AccHiOut[Slot] = AccHi[Slot];
+    const uint P = JumpP[Slot];
+    JumpPOut[Slot] = P != VOXEL_SOLVE_NONE ? JumpP[P] : VOXEL_SOLVE_NONE;
+}
+
+/** A round's adds (after the copy): each slot's window into the node its jump reaches. */
+VOXEL_FUNC void VoxelSolveAccJumpAddPass(uint Slot, uint NumSlots)
+{
+    if (Slot >= NumSlots) return;
+    const uint P = JumpP[Slot];
+    if (P == VOXEL_SOLVE_NONE) return;
+    const uint Lo = JumpY[Slot];
+    uint Before = 0u;
+    InterlockedAdd(JumpYOut[P], Lo, Before);
+    const uint Hi = AccHi[Slot] + (Before + Lo < Before ? 1u : 0u);
+    if (Hi != 0u)
+        InterlockedAdd(AccHiOut[P], Hi);
+}
+
+/** The sums back to m^2: Mode 0 the D8 drainage (SlotA), Mode 1 the channel slots' spread
+ *  drainage (SlotAOut; the spreading slots keep theirs). */
+VOXEL_FUNC void VoxelSolveAccJumpFinishPass(uint Slot, uint NumSlots, uint Mode)
+{
+    if (Slot >= NumSlots) return;
+    if (JumpP[Slot] != VOXEL_SOLVE_NONE)
+        InterlockedOr(SolveFlags[1], VOXEL_SOLVE_ERROR_JUMP);
+    const float V = (float(JumpY[Slot]) + float(AccHi[Slot]) * 4294967296.0f) * SolveAccUnit;
+    if (Mode == 0u)
+        SlotA[Slot] = V;
+    else if (!(SlotDist[Slot] > 0.0f))
+        SlotAOut[Slot] = V;
+}
+
 // --- Lakes and outputs (the routing's last frame) -----------------------------------------
 //
 //   RWStructuredBuffer<uint> LakeArea, LakeDepth, LakeOutlet;   per label cell: area (units of
@@ -1261,7 +1423,10 @@ VOXEL_FUNC float VoxelSolveFlowOf(uint Cell)
 //                                               level bits, outlet, area units), unordered
 //   uint SolveMaxLakes;
 //   StructuredBuffer<uint> BakeAttr;            the plate model's attributes
-//   RWStructuredBuffer<float> OutHeight, OutFlow, OutWater;  RWStructuredBuffer<uint> OutAttr, OutForm;
+//   RWStructuredBuffer<float> OutHeight, OutWater;  RWStructuredBuffer<uint> OutAttr, OutForm, OutRec;
+//   RWStructuredBuffer<uint> OutFlow;           the drainage as halves, two cells a word (cleared
+//                                               first; R1b: the bake keeps halves, and the rivers'
+//                                               build and the density read these words as they are)
 //   float SolveChannelCharacter;                T3h: how far the drainage density pulls the
 //                                               landform's character (VoxelSolveFormOf)
 
@@ -1356,11 +1521,16 @@ VOXEL_FUNC void VoxelSolveOutputPass(uint Cell)
         Water = VoxelSolveWaterOf(VoxelSolveCellOf(VoxelSolveDirection(C.Face, C.I, C.J)));
     }
     OutHeight[Cell] = Height;
-    OutFlow[Cell] = Flow;
+    InterlockedOr(OutFlow[Cell >> 1u], (f32tof16(Flow) & 0xffffu) << ((Cell & 1u) * 16u));
     OutWater[Cell] = Water;
     OutAttr[Cell] = (BakeAttr[Cell] & ~VOXEL_SOLVE_LAKE_BIT) | (Water > -0.5f * VOXEL_SOLVE_INF ? VOXEL_SOLVE_LAKE_BIT : 0u);
     // Every cell at its own direction (the noise is on the sphere, so the aprons agree).
     OutForm[Cell] = VoxelSolveFormOf(Cell);
+    // The final routing's receiver (R1, Design/RiversLakes.md: the rivers follow it): for the
+    // routed (land) cells, none elsewhere and in the aprons.
+    // (A cell without a lower neighbour keeps itself as its receiver in the routing, with the
+    // error flag: none here.)
+    OutRec[Cell] = VoxelSolveIsInterior(C) && SolveSlot[Cell] != VOXEL_SOLVE_NONE && SolveRec[Cell] != Cell ? SolveRec[Cell] : VOXEL_SOLVE_NONE;
 }
 
 #endif // VOXEL_LAND_SOLVE_USH

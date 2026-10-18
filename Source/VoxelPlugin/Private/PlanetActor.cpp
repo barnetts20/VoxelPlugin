@@ -216,7 +216,7 @@ bool APlanetActor::TickLandBake()
 {
     const double SeaRadius = GetActorScale3D().GetMax();
     const uint32 Key = VoxelLand::BakeKey(TerrestrialSettings, SeaRadius);
-    // The shared noise pack (the peaks' and the hills' sets): the density takes it when it is
+    // The shared noise pack (the peaks', detail, hills' and strata's sets): the density takes it when it is
     // built, so it is read or generated in the background first (the game thread never waits
     // for it), and held here from then on (it can't go before the density takes it).
     auto NoiseReady = [this]()
@@ -226,11 +226,18 @@ bool APlanetActor::TickLandBake()
         VoxelLand::PrewarmLandNoise(Name);
         return false;
     };
+    // The rivers for the settings (R1b): a fresh bake comes with them; a loaded one, or new river
+    // settings, build them on the GPU first (a few frames).
+    auto RiversReady = [this]()
+    {
+        return VoxelLand::TickRivers(LandBake, TerrestrialSettings);
+    };
     if (LandBake.IsValid() && LandBake->Key == Key && LandBake->N == VoxelLand::BakeResolutionFor(TerrestrialSettings))
     {
         // Only the per-sample settings changed: the bake is reused.
         LandBaker.Reset();
-        return NoiseReady();
+        const bool bRivers = RiversReady();
+        return NoiseReady() && bRivers;
     }
     if (!LandBaker.IsValid() || LandBaker->GetKey() != Key)
         LandBaker = MakeShared<FVoxelLandBaker>(TerrestrialSettings, SeaRadius);
@@ -239,7 +246,9 @@ bool APlanetActor::TickLandBake()
         return false;
     LandBake = LandBaker->GetResult();
     LandBaker.Reset();
-    return LandBake.IsValid() && NoiseReady();
+    if (!LandBake.IsValid()) return false;
+    const bool bRivers = RiversReady();
+    return NoiseReady() && bRivers;
 }
 
 float APlanetActor::GetBakeProgress() const
@@ -491,6 +500,49 @@ double APlanetActor::ComputeOceanRadius(double PlanetRadius, double NoiseAmplitu
     return FMath::Max(1.0, PlanetRadius + SeaLevel * NoiseAmplitude);
 }
 
+FVoxelWaterSample APlanetActor::GetWaterAt(const FVector& WorldLocation) const
+{
+    FVoxelWaterSample Out;
+    if (!SharedCompositor.IsValid()) return Out;
+    const TSharedPtr<const FVoxelDensityCPU> Density = SharedCompositor->GetBaseDensity();
+    if (!Density.IsValid()) return Out;
+    // The planet's frame (no scale: the density's positions are cm from the centre).
+    const FTransform Frame(GetActorRotation(), GetActorLocation());
+    const FVector Local = Frame.InverseTransformPositionNoScale(WorldLocation);
+    const double Radius = Local.Size();
+    if (Radius < 1.0) return Out;
+    Out = Density->WaterAt(Local);
+    double SeaRadius = 0.0;
+    if (Density->GetLandBake().IsValid())
+    {
+        SeaRadius = Density->GetLandBake()->SeaRadius;
+    }
+    else
+    {
+        // The noise surface: its ground came above the planet radius; the sea is the planet's.
+        SeaRadius = ComputeOceanRadius(Density->GetPlanetRadius(), Density->GetNoiseAmplitude());
+        const float Ground = (float)((Density->GetPlanetRadius() + (double)Out.GroundHeight * 100.0 - SeaRadius) * 0.01);
+        Out.GroundHeight = Ground;
+        Out.SurfaceHeight = Ground;
+        if (Ground < 0.0f)
+        {
+            Out.Kind = EVoxelWaterKind::Sea;
+            Out.SurfaceHeight = 0.0f;
+            Out.Depth = -Ground;
+        }
+    }
+    if (Out.Kind == EVoxelWaterKind::Sea && !bEnableOcean)
+    {
+        // No ocean drawn: no sea to be in.
+        Out.Kind = EVoxelWaterKind::None;
+        Out.SurfaceHeight = Out.GroundHeight;
+        Out.Depth = 0.0f;
+    }
+    Out.PointDepth = (float)((SeaRadius + (double)Out.SurfaceHeight * 100.0 - Radius) * 0.01);
+    Out.FlowVelocity = Frame.TransformVectorNoScale(Out.FlowVelocity);
+    return Out;
+}
+
 // ---------------------------------------------------------------------------
 // Pooling: dormancy + reconfigure (IPooledActor, proxy-carried)
 // ---------------------------------------------------------------------------
@@ -583,17 +635,25 @@ namespace PlanetActorLandExport
             Bytes.SetNumUninitialized(Bake->Attr.Num() * sizeof(uint16));
             FMemory::Memcpy(Bytes.GetData(), Bake->Attr.GetData(), Bytes.Num());
             FFileHelper::SaveArrayToFile(Bytes, *(Base + TEXT("_attr.u16")));
-            // The landform (VoxelLandPackForm: hilliness low byte, character high), a u32 per
-            // cell as the harnesses read it (Tag_form.u32).
+            // The landform (VoxelLandPackForm: hilliness low byte, character high) and the
+            // province from bit 16 (T4c), a u32 per cell as the harnesses read it (Tag_form.u32).
             if (Bake->Form.Num() == Bake->Height.Num())
             {
                 TArray<uint32> Form;
                 Form.SetNumUninitialized(Bake->Form.Num());
+                const bool bProvince = Bake->Province.Num() == Bake->Form.Num();
                 for (int32 i = 0; i < Form.Num(); i++)
-                    Form[i] = Bake->Form[i];
+                    Form[i] = (uint32)Bake->Form[i] | (bProvince ? (uint32)Bake->Province[i] << 16 : 0u);
                 Bytes.SetNumUninitialized(Form.Num() * sizeof(uint32));
                 FMemory::Memcpy(Bytes.GetData(), Form.GetData(), Bytes.Num());
                 FFileHelper::SaveArrayToFile(Bytes, *(Base + TEXT("_form.u32")));
+            }
+            // The final routing's receivers (R1: the rivers), a u32 per cell (~0 none), when eroded.
+            if (Bake->Receiver.Num() == Bake->Height.Num())
+            {
+                Bytes.SetNumUninitialized(Bake->Receiver.Num() * sizeof(uint32));
+                FMemory::Memcpy(Bytes.GetData(), Bake->Receiver.GetData(), Bytes.Num());
+                FFileHelper::SaveArrayToFile(Bytes, *(Base + TEXT("_rec.u32")));
             }
             // The drainage (log2 m^2) and the lake levels, as f32, when the bake is eroded.
             if (Bake->Flow.Num() == Bake->Height.Num() && Bake->Water.Num() == Bake->Height.Num())
@@ -628,6 +688,6 @@ namespace PlanetActorLandExport
 
     FAutoConsoleCommandWithWorldAndArgs Command(
         TEXT("voxel.Land.ExportBake"),
-        TEXT("Writes every terrestrial planet's bake (heights f32, attributes u16, the landform u32, drainage and lake levels f32 when eroded, a json header with the lakes) to Saved/VoxelLand/Export_* (Tools/LandView/view_bake.py renders them)."),
+        TEXT("Writes every terrestrial planet's bake (heights f32, attributes u16, the landform and province u32, the receivers u32, drainage and lake levels f32 when eroded, a json header with the lakes) to Saved/VoxelLand/Export_* (Tools/LandView/view_bake.py renders them)."),
         FConsoleCommandWithWorldAndArgsDelegate::CreateStatic(&Run));
 }

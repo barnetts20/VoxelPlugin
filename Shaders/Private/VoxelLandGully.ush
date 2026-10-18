@@ -25,7 +25,8 @@
 // near edges pay twice (three times at corners).
 //
 // The drainage raises the gullies from the ridges (a cell's own area) to the valley sides
-// (GullyFlowGain); river corridors (stage L3) will fade them out.
+// (GullyFlowGain); the rivers' valleys take them out with the rest of the surface
+// (VoxelLandCarve.ush, R2).
 //
 // Shared subset (VoxelShaderCompat.h): the CPU density includes it in the same struct as
 // VoxelLandSample.ush. Include after VoxelLandSample.ush, and after declaring:
@@ -44,6 +45,9 @@
 #include "VoxelLandNoise.ush"
 #include "VoxelLandPeaks.ush"
 #include "VoxelLandHillSet.ush"
+#include "VoxelLandDetail.ush"
+#include "VoxelLandRivers.ush"
+#include "VoxelLandCarve.ush"
 
 #ifndef VOXEL_LOOP
 #define VOXEL_LOOP [loop]
@@ -449,10 +453,53 @@ struct FVoxelLandSurface
     float3 PeakSteer;        // FVoxelLandPeaks::Steer
     float Gully;
     float GullyScale;        // FVoxelLandGully::Scale
-    float DetailScale;
+    float DetailScale;       // with the rivers' and the lakes' fades (R2)
     float Flow;              // the bake's drainage (log2 m^2; 0 without it or unless asked)
     float3 BakeGradient;     // m/m, tangent at P, through the warp (zero unless asked or gullies)
+    float Strata;            // R3: the strata's share at the point (VoxelLandStrataShare; the canyons')
+    float3 StrataGradient;   // its gradient (per m, tangent at the warped Q: the carve's frame, warped with its own)
+    // R2 (VoxelLandCarve.ush): the rivers and lakes carved into the sum of the terms above (the
+    // hills already faded under a lake: Hills, HillAmplitudeM and HillGradient include it).
+    float Carve;             // m: added to Bake + Hills + Peaks + Gully
+    float CarveScale;        // d (that sum carved) / d (that sum): scales the terms' gradients
+    float3 CarveGradient;    // m/m, tangent at P: the carve's own (bGradients)
+    FVoxelLandCarve River;   // the rivers' carve (its water, for the queries)
+    FVoxelLandLake Lake;     // the kept lake at the point
 };
+
+/** R2: the lakes and the rivers carved into the surface terms (VoxelLandCarve.ush), at the
+ *  warped point Q: under a lake the hills fade with the depth, then the shore's bench, then the
+ *  rivers' valleys and channels; the detail's scale takes their fades. Normal is P's direction
+ *  (unit); DWX, DWY, DWZ the warp's Jacobian (VoxelLandWarpedGradient). bGradients (a constant)
+ *  adds CarveScale and CarveGradient. */
+VOXEL_FUNC FVoxelLandSurface VoxelLandCarveSurface(VOXEL_LAND_ARGS_DECL FVoxelLandSurface In, float2 QX, float2 QY, float2 QZ,
+    float3 DWX, float3 DWY, float3 DWZ, float3 Normal, float Footprint, bool bGradients)
+{
+    FVoxelLandSurface Out = In;
+    Out.Lake = VoxelLandLakeAt(VOXEL_LAND_ARGS QX, QY, QZ, bGradients);
+    if (Out.Lake.Weight > 0.0f)
+    {
+        // The hills' share by the depth below the level of the bake and the gullies: no hills in
+        // it (no loop), and no peaks (the differenced terms leave their shapes out:
+        // VoxelLandDifferencedDF must find the same share).
+        const float Share = VoxelLandLakeHillShare(VOXEL_LAND_ARGS Out.Lake, In.Bake + In.Gully);
+        Out.Hills = In.Hills * Share;
+        Out.HillAmplitudeM = In.HillAmplitudeM * Share;
+        Out.HillGradient = In.HillGradient * Share;
+    }
+    const float S = Out.Bake + Out.Hills + Out.Peaks + Out.Gully;
+    const FVoxelLandShore Shore = VoxelLandLakeShore(VOXEL_LAND_ARGS Out.Lake, S, bGradients);
+    Out.River = VoxelLandRiverCarveDF(VOXEL_LAND_ARGS QX, QY, QZ, Shore.Height, In.Strata, In.StrataGradient, Footprint, bGradients);
+    Out.Carve = Out.River.Height - S;
+    Out.DetailScale = In.DetailScale * Shore.DetailKeep * Out.River.DetailKeep;
+    if (bGradients)
+    {
+        // The rivers' carve of the lakes' (the chain rule: its slope scales the lakes' own gradient).
+        Out.CarveScale = Shore.Scale * Out.River.Scale;
+        Out.CarveGradient = VoxelLandWarpedGradient(Out.River.Gradient + Shore.Gradient * Out.River.Scale, DWX, DWY, DWZ, Normal);
+    }
+    return Out;
+}
 
 /** bGradients (a constant: dropped when false) asks for the bake's gradient and the drainage
  *  even without gullies or hills (the material's normal). bPeakShape (a constant) false leaves
@@ -478,19 +525,29 @@ VOXEL_FUNC FVoxelLandSurface VoxelLandSurfaceTermsDF(VOXEL_LAND_ARGS_DECL float2
     Out.DetailScale = 1.0f;
     Out.Flow = 0.0f;
     Out.BakeGradient = float3(0.0f, 0.0f, 0.0f);
+    Out.Strata = 0.0f;
+    Out.StrataGradient = float3(0.0f, 0.0f, 0.0f);
+    Out.Carve = 0.0f;
+    Out.CarveScale = 1.0f;
+    Out.CarveGradient = float3(0.0f, 0.0f, 0.0f);
+    Out.River = VoxelLandCarveNone(0.0f);
+    Out.Lake = VoxelLandLakeNone();
     const bool bGullies = LandGullyStrength > 0.0f && LandGullyOctaves != 0u;
     const bool bHills = VoxelLandHillsOn(VOXEL_LAND_ARGS 0.0f);
     const bool bPeaks = VoxelLandPeaksOn(VOXEL_LAND_ARGS 0.0f);
     if (!bGullies && !bHills && !bPeaks && !bGradients)
     {
         Out.Bake = VoxelLandBakeSampleDF(VOXEL_LAND_ARGS QX, QY, QZ, false).Height;
-        return Out;
+        return VoxelLandCarveSurface(VOXEL_LAND_ARGS Out, QX, QY, QZ, DWX, DWY, DWZ, normalize(float3(PX.x, PY.x, PZ.x)), Footprint, false);
     }
     const FVoxelLandBakeSample Bake = VoxelLandBakeSampleDF(VOXEL_LAND_ARGS QX, QY, QZ, true);
     Out.Bake = Bake.Height;
     Out.Flow = Bake.Flow;
     const float3 Normal = normalize(float3(PX.x, PY.x, PZ.x));
     Out.BakeGradient = VoxelLandWarpedGradient(Bake.Gradient, DWX, DWY, DWZ, Normal);
+    Out.Strata = VoxelLandStrataShare(VOXEL_LAND_ARGS Bake.Province);
+    if (Out.Strata > 0.0f && Out.Strata < 1.0f)
+        Out.StrataGradient = Bake.ProvinceGradient * VoxelLandStrataShareSlope(VOXEL_LAND_ARGS Bake.Province);
     float HillCurve = 0.0f;
     float HillLambda = 0.0f;
     if (bHills)
@@ -498,7 +555,7 @@ VOXEL_FUNC FVoxelLandSurface VoxelLandSurfaceTermsDF(VOXEL_LAND_ARGS_DECL float2
         // On the sampled point P (the bake's fields at the warped Q). The set's R and G blend by
         // the character, as the peaks' (T4a; the procedural hills ignore the gradient).
         const float3 HillCharacterGradient = VoxelLandWarpedGradient(Bake.CharacterGradient, DWX, DWY, DWZ, Normal);
-        const FVoxelLandHills Hills = VoxelLandHillsShapeDF(VOXEL_LAND_ARGS PX, PY, PZ, Bake.Form, HillCharacterGradient, Bake.Relief, Bake.Flow,
+        const FVoxelLandHills Hills = VoxelLandHillsShapeDF(VOXEL_LAND_ARGS PX, PY, PZ, Bake.Form, HillCharacterGradient, Bake.Relief, Bake.Province, Bake.Flow,
             Bake.Height, Footprint, bPeakShape);
         Out.HillUnit = Hills.Unit;
         Out.HillAmplitudeM = Hills.AmplitudeM;
@@ -524,7 +581,11 @@ VOXEL_FUNC FVoxelLandSurface VoxelLandSurfaceTermsDF(VOXEL_LAND_ARGS_DECL float2
         PeakCurve = Peaks.Curve;
         PeakLambda = Peaks.Lambda;
     }
-    if (!bGullies) return Out;
+    // The carve's own gradients aren't wanted by the differenced terms (bPeakShape false), only
+    // its fades (VoxelLandDifferencedDF): the second shape per river and the lakes' slopes are
+    // left out there.
+    const bool bCarveGradients = bGradients && bPeakShape;
+    if (!bGullies) return VoxelLandCarveSurface(VOXEL_LAND_ARGS Out, QX, QY, QZ, DWX, DWY, DWZ, Normal, Footprint, bCarveGradients);
     // The gullies run down the bake, and their octaves finer than the hills (the peaks) down the
     // hills' steering (the procedural hills' two coarsest octaves, or a hill set's blurred
     // channel; the peaks' steering channel) too, fading where those curve (VoxelLandGullyHillShare).
@@ -533,7 +594,7 @@ VOXEL_FUNC FVoxelLandSurface VoxelLandSurfaceTermsDF(VOXEL_LAND_ARGS_DECL float2
     Out.Gully = G.Height;
     Out.GullyScale = G.Scale;
     Out.DetailScale = VoxelLandDetailScale(VOXEL_LAND_ARGS Bake.Height);
-    return Out;
+    return VoxelLandCarveSurface(VOXEL_LAND_ARGS Out, QX, QY, QZ, DWX, DWY, DWZ, Normal, Footprint, bCarveGradients);
 }
 
 VOXEL_FUNC FVoxelLandSurface VoxelLandSurfaceDF(VOXEL_LAND_ARGS_DECL float2 PX, float2 PY, float2 PZ, float2 QX, float2 QY, float2 QZ,

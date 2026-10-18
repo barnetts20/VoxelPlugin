@@ -136,6 +136,18 @@ public:
      *  setting changed, e.g. the terrain's TargetPrecision). */
     void RequestRebuild() { bPendingInitialize = true; }
 
+    /** The water at a world point (Design/RiversLakes.md 3.6, R2): the sea, a kept lake or a
+     *  river's channel over the ground along the planet's radius through the point, its
+     *  surface, the ground, the depth, how deep the point lies under the surface, and a river's
+     *  current. From the same shared code as the carving (VoxelLandCarve.ush), so it agrees with
+     *  the terrain to the centimetre; edits are not taken into account (the water stays where
+     *  it was: a dug hole fills only if it's below). Game thread (it reads the planet's
+     *  compositor, which a rebuild replaces, and its transform); None before the planet is
+     *  built. A node with execution pins: each call runs the land chain at the point (tens of
+     *  microseconds), so read its fields from one call. */
+    UFUNCTION(BlueprintCallable, BlueprintPure = false, Category = "Planet|Water")
+    FVoxelWaterSample GetWaterAt(const FVector& WorldLocation) const;
+
     /** New ocean settings at run time: stored on the planet and forwarded to its ocean, which
      *  applies only what changed. */
     UFUNCTION(BlueprintCallable, Category = "Planet|Ocean")
@@ -231,7 +243,7 @@ private:
      *  planet shows the old surface until then. */
     TSharedPtr<const FVoxelLandBake, ESPMode::ThreadSafe> LandBake;
 
-    /** The noise pack (the peaks' and the hills' sets) for the current settings, once ready
+    /** The noise pack (the peaks', detail, hills' and strata's sets) for the current settings, once ready
      *  (TickLandBake): held so it is there when the density takes it (VoxelLand::TryGetLandNoise). */
     TSharedPtr<const FVoxelLandNoiseSet, ESPMode::ThreadSafe> LandNoise;
 

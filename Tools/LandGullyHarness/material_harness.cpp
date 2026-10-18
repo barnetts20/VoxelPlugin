@@ -22,7 +22,7 @@ int main(int argc, char** argv)
     const int N = argc > 2 ? atoi(argv[2]) : 1024;
     const double RadiusM = argc > 3 ? atof(argv[3]) : 1.0e6;
     FPlanet P;
-    Load(P, Tag, N, RadiusM, 30.0, 0.22);
+    Load(P, Tag, N, RadiusM, 30.0, HarnessGullyStrength());
     std::vector<FVoxelOctave> Gpu;
     SetGpuGlobals(P, Gpu);
     auto W = ReadFile(Tag + "_water.f32");
@@ -43,11 +43,14 @@ int main(int argc, char** argv)
         const float L = Water[i];
         FieldTex[4 * (size_t)i + 1] = HalfToFloat(ToHalf(L > -1.0e30f ? std::clamp(L - P.Height[i], VOXEL_LAND_MATERIAL_NO_LAKE + 1000.0f, 65000.0f) : VOXEL_LAND_MATERIAL_NO_LAKE));
         FieldTex[4 * (size_t)i + 2] = (float)(Attr[i] & 0xffu);
-        FieldTex[4 * (size_t)i + 3] = (float)(Attr[i] >> 8);
+        FieldTex[4 * (size_t)i + 3] = (float)(((Attr[i] >> 8) & 31u) | ((uint32_t)P.Province[i] << 5));   // T4c: the province above the attributes' high bits
     }
     const int TanBase = VOXEL_LAND_MC_TEXELS, TanTexels = ((int)P.Tan.size() + 1) / 2;
     const int OctaveBase = TanBase + TanTexels, PlateBase = OctaveBase + (int)Gpu.size() * VOXEL_LAND_MATERIAL_OCTAVE_TEXELS;
-    const int Texels = PlateBase, Rows = (Texels + VOXEL_LAND_MATERIAL_CONST_WIDTH - 1) / VOXEL_LAND_MATERIAL_CONST_WIDTH;
+    // R1: the rivers' tables after the plates (VoxelLandMaterial::BuildConstantTexels).
+    const int RiverTileBase = PlateBase, RiverTileTexels = ((int)P.Rivers.Tiles.size() + 3) / 4;
+    const int RiverDataBase = RiverTileBase + RiverTileTexels, RiverDataTexels = ((int)P.Rivers.Data.size() + 3) / 4;
+    const int Texels = RiverDataBase + RiverDataTexels, Rows = (Texels + VOXEL_LAND_MATERIAL_CONST_WIDTH - 1) / VOXEL_LAND_MATERIAL_CONST_WIDTH;
     std::vector<float> Const(4 * (size_t)Rows * VOXEL_LAND_MATERIAL_CONST_WIDTH, 0.0f);
     float* S = Const.data();
     auto PutU32 = [](float* D, int I, uint32_t V) { D[I] = (float)(V & 0xffffu); D[I + 1] = (float)(V >> 16); };
@@ -64,9 +67,24 @@ int main(int argc, char** argv)
     S[VOXEL_LAND_MC_RIDGE_GAIN] = VoxelShader::RidgeGain; S[VOXEL_LAND_MC_SLOPE_DAMPING] = VoxelShader::SlopeDamping;
     S[VOXEL_LAND_MC_CONTINENT_OCTAVES] = 0; S[VOXEL_LAND_MC_MOUNTAIN_OCTAVES] = 0; S[VOXEL_LAND_MC_DETAIL_OCTAVES] = (float)VoxelShader::DetailOctaves;
     S[VOXEL_LAND_MC_LAND_MODE] = 1; S[VOXEL_LAND_MC_PLATE_COUNT] = 0; S[VOXEL_LAND_MC_HAS_HYDRO] = 1;
+    // R2: the carve (as VoxelLandMaterial::BuildConstantTexels from the density's).
+    S[VOXEL_LAND_MC_RIVER_DEPTH_SCALE] = P.S.LandRiverDepthScale; S[VOXEL_LAND_MC_RIVER_FLOODPLAIN_SCALE] = P.S.LandRiverFloodplainScale;
+    S[VOXEL_LAND_MC_RIVER_MIN_LOG2_AREA] = P.S.LandRiverMinLog2Area; S[VOXEL_LAND_MC_LAKE_SHORE_BAND] = P.S.LandLakeShoreBand;
+    S[VOXEL_LAND_MC_RIVER_MEANDER] = P.S.LandRiverMeander; S[VOXEL_LAND_MC_RIVER_FALLS] = P.S.LandRiverFalls;
+    S[VOXEL_LAND_MC_HAS_WATER] = (float)P.S.LandHasWater;
     S[VOXEL_LAND_MC_TAN_BASE] = (float)TanBase; S[VOXEL_LAND_MC_OCTAVE_BASE] = (float)OctaveBase; S[VOXEL_LAND_MC_PLATE_BASE] = (float)PlateBase;
     S[VOXEL_LAND_MC_PLATE_RADIUS_M] = (float)RadiusM; S[VOXEL_LAND_MC_PLATE_WIDTH_SCALE] = 1.0f;
     S[VOXEL_LAND_MC_SIDE] = (float)Side;
+    if (P.S.LandRiverTilesPerFace > 0)
+    {
+        S[VOXEL_LAND_MC_RIVER_TILES_PER_FACE] = (float)P.S.LandRiverTilesPerFace;
+        S[VOXEL_LAND_MC_RIVER_RADIUS_M] = P.S.LandRiverRadiusM;
+        S[VOXEL_LAND_MC_RIVER_WIDTH_SCALE] = P.S.LandRiverWidthScale; S[VOXEL_LAND_MC_RIVER_VALLEY_SCALE] = P.S.LandRiverValleyScale;
+        S[VOXEL_LAND_MC_RIVER_TILE_TEXEL] = (float)RiverTileBase; S[VOXEL_LAND_MC_RIVER_DATA_TEXEL] = (float)RiverDataBase;
+        S[VOXEL_LAND_MC_RIVER_CARVE] = P.S.LandRiverCarve;
+        for (size_t i = 0; i < P.Rivers.Tiles.size(); i++) S[4 * (size_t)RiverTileBase + i] = (float)P.Rivers.Tiles[i];
+        std::memcpy(S + 4 * (size_t)RiverDataBase, P.Rivers.Data.data(), P.Rivers.Data.size() * sizeof(float));
+    }
     S[VOXEL_LAND_MC_HILL_RELIEF] = P.S.LandHillRelief;
     S[VOXEL_LAND_MC_HILL_FREQUENCY] = P.S.LandHillFrequency.x; S[VOXEL_LAND_MC_HILL_FREQUENCY + 1] = P.S.LandHillFrequency.y;
     S[VOXEL_LAND_MC_HILL_OCTAVES] = (float)P.S.LandHillOctaves;
@@ -82,30 +100,49 @@ int main(int argc, char** argv)
     S[VOXEL_LAND_MC_PEAK_MEAN_R] = P.S.LandPeakMeanR; S[VOXEL_LAND_MC_PEAK_MEAN_G] = P.S.LandPeakMeanG;
     if (P.S.LandPeakDetailTexelsPerCell > 0.0f)
     {
-        PutU32(S, VOXEL_LAND_MC_PEAK_DETAIL_BASE, P.S.LandPeakDetailBase);
-        S[VOXEL_LAND_MC_PEAK_DETAIL_N] = (float)P.S.LandPeakDetailN; S[VOXEL_LAND_MC_PEAK_DETAIL_MIPS] = (float)P.S.LandPeakDetailMips;
+        PutU32(S, VOXEL_LAND_MC_DETAIL_BASE, P.S.LandDetailBase);
+        S[VOXEL_LAND_MC_DETAIL_N] = (float)P.S.LandDetailN; S[VOXEL_LAND_MC_DETAIL_MIPS] = (float)P.S.LandDetailMips;
         S[VOXEL_LAND_MC_PEAK_DETAIL_TEXELS_PER_CELL] = P.S.LandPeakDetailTexelsPerCell;
-        S[VOXEL_LAND_MC_PEAK_DETAIL_MEAN_R] = P.S.LandPeakDetailMeanR; S[VOXEL_LAND_MC_PEAK_DETAIL_MEAN_G] = P.S.LandPeakDetailMeanG;
-        S[VOXEL_LAND_MC_PEAK_DETAIL_SCALE_R] = P.S.LandPeakDetailScaleR; S[VOXEL_LAND_MC_PEAK_DETAIL_SCALE_G] = P.S.LandPeakDetailScaleG;
+        S[VOXEL_LAND_MC_DETAIL_MEAN_HARD] = P.S.LandDetailMeanHard; S[VOXEL_LAND_MC_DETAIL_MEAN_SOFT] = P.S.LandDetailMeanSoft;
+        S[VOXEL_LAND_MC_PEAK_DETAIL_SCALE_HARD] = P.S.LandPeakDetailScaleHard; S[VOXEL_LAND_MC_PEAK_DETAIL_SCALE_SOFT] = P.S.LandPeakDetailScaleSoft;
         S[VOXEL_LAND_MC_PEAK_DETAIL_FADE] = P.S.LandPeakDetailFade;
     }
-    // The detail tile's chain and means, whoever reads it; the hills' set (T4a): as
-    // VoxelLandMaterial::BuildConstantTexels.
-    PutU32(S, VOXEL_LAND_MC_PEAK_DETAIL_BASE, P.S.LandPeakDetailBase);
-    S[VOXEL_LAND_MC_PEAK_DETAIL_N] = (float)P.S.LandPeakDetailN; S[VOXEL_LAND_MC_PEAK_DETAIL_MIPS] = (float)P.S.LandPeakDetailMips;
-    S[VOXEL_LAND_MC_PEAK_DETAIL_MEAN_R] = P.S.LandPeakDetailMeanR; S[VOXEL_LAND_MC_PEAK_DETAIL_MEAN_G] = P.S.LandPeakDetailMeanG;
+    // The detail set's chain and means, whoever reads it, and the detail layer (N1); the hills'
+    // set (T4a): as VoxelLandMaterial::BuildConstantTexels.
+    PutU32(S, VOXEL_LAND_MC_DETAIL_BASE, P.S.LandDetailBase);
+    S[VOXEL_LAND_MC_DETAIL_N] = (float)P.S.LandDetailN; S[VOXEL_LAND_MC_DETAIL_MIPS] = (float)P.S.LandDetailMips;
+    S[VOXEL_LAND_MC_DETAIL_MEAN_HARD] = P.S.LandDetailMeanHard; S[VOXEL_LAND_MC_DETAIL_MEAN_SOFT] = P.S.LandDetailMeanSoft;
+    S[VOXEL_LAND_MC_DETAIL_TEXELS_PER_CELL] = P.S.LandDetailTexelsPerCell; S[VOXEL_LAND_MC_DETAIL_SCALES] = (float)P.S.LandDetailScales;
+    S[VOXEL_LAND_MC_DETAIL_MEAN_A] = P.S.LandDetailMeanA; S[VOXEL_LAND_MC_DETAIL_SCALE_A] = P.S.LandDetailScaleA; S[VOXEL_LAND_MC_DETAIL_SCALE_GAIN] = P.S.LandDetailScaleGain;
+    S[VOXEL_LAND_MC_DETAIL_FADE] = P.S.LandDetailFade; PutU32(S, VOXEL_LAND_MC_DETAIL_SEED, P.S.LandDetailSeed);
     if (P.S.LandHillTexelsPerCell > 0.0f)
     {
         PutU32(S, VOXEL_LAND_MC_HILL_BASE, P.S.LandHillBase);
         S[VOXEL_LAND_MC_HILL_N] = (float)P.S.LandHillN; S[VOXEL_LAND_MC_HILL_MIPS] = (float)P.S.LandHillMips;
         S[VOXEL_LAND_MC_HILL_TEXELS_PER_CELL] = P.S.LandHillTexelsPerCell;
         S[VOXEL_LAND_MC_HILL_SCALE_R] = P.S.LandHillScaleR; S[VOXEL_LAND_MC_HILL_SCALE_G] = P.S.LandHillScaleG; S[VOXEL_LAND_MC_HILL_SCALE_B] = P.S.LandHillScaleB;
+        S[VOXEL_LAND_MC_HILL_MEAN_R] = P.S.LandHillMeanR; S[VOXEL_LAND_MC_HILL_MEAN_G] = P.S.LandHillMeanG;
         S[VOXEL_LAND_MC_HILL_SPACING_M] = P.S.LandHillSpacingM;
         S[VOXEL_LAND_MC_HILL_SWELL_TEXELS_PER_CELL] = P.S.LandHillSwellTexelsPerCell; S[VOXEL_LAND_MC_HILL_SWELL_M] = P.S.LandHillSwellM;
         S[VOXEL_LAND_MC_HILL_SWELL_SCALE_G] = P.S.LandHillSwellScaleG; S[VOXEL_LAND_MC_HILL_FOOTHILL] = P.S.LandHillFoothill;
         S[VOXEL_LAND_MC_HILL_DETAIL_TEXELS_PER_CELL] = P.S.LandHillDetailTexelsPerCell;
-        S[VOXEL_LAND_MC_HILL_DETAIL_SCALE_R] = P.S.LandHillDetailScaleR; S[VOXEL_LAND_MC_HILL_DETAIL_SCALE_G] = P.S.LandHillDetailScaleG;
+        S[VOXEL_LAND_MC_HILL_DETAIL_SCALE_HARD] = P.S.LandHillDetailScaleHard; S[VOXEL_LAND_MC_HILL_DETAIL_SCALE_SOFT] = P.S.LandHillDetailScaleSoft;
         S[VOXEL_LAND_MC_HILL_DETAIL_FADE] = P.S.LandHillDetailFade;
+        if (P.S.LandStrataTexelsPerCell > 0.0f)
+        {
+            // T4c: the strata (VoxelLandMaterial::BuildConstantTexels).
+            PutU32(S, VOXEL_LAND_MC_STRATA_BASE, P.S.LandStrataBase);
+            S[VOXEL_LAND_MC_STRATA_N] = (float)P.S.LandStrataN; S[VOXEL_LAND_MC_STRATA_MIPS] = (float)P.S.LandStrataMips;
+            S[VOXEL_LAND_MC_STRATA_TEXELS_PER_CELL] = P.S.LandStrataTexelsPerCell;
+            S[VOXEL_LAND_MC_STRATA_SCALE_R] = P.S.LandStrataScaleR; S[VOXEL_LAND_MC_STRATA_SCALE_G] = P.S.LandStrataScaleG; S[VOXEL_LAND_MC_STRATA_SCALE_B] = P.S.LandStrataScaleB;
+            S[VOXEL_LAND_MC_STRATA_MEAN_R] = P.S.LandStrataMeanR; S[VOXEL_LAND_MC_STRATA_MEAN_G] = P.S.LandStrataMeanG;
+            S[VOXEL_LAND_MC_STRATA_SPACING_M] = P.S.LandStrataSpacingM; S[VOXEL_LAND_MC_STRATA_RELIEF] = P.S.LandStrataRelief;
+            S[VOXEL_LAND_MC_STRATA_FLAT] = P.S.LandStrataFlat; S[VOXEL_LAND_MC_STRATA_THRESHOLD] = P.S.LandStrataThreshold;
+            S[VOXEL_LAND_MC_STRATA_WIDTH] = P.S.LandStrataWidth; PutU32(S, VOXEL_LAND_MC_STRATA_SEED, P.S.LandStrataSeed);
+            S[VOXEL_LAND_MC_STRATA_DETAIL_TEXELS_PER_CELL] = P.S.LandStrataDetailTexelsPerCell;
+            S[VOXEL_LAND_MC_STRATA_DETAIL_SCALE_HARD] = P.S.LandStrataDetailScaleHard; S[VOXEL_LAND_MC_STRATA_DETAIL_SCALE_SOFT] = P.S.LandStrataDetailScaleSoft;
+            S[VOXEL_LAND_MC_STRATA_DETAIL_FADE] = P.S.LandStrataDetailFade;
+        }
     }
     // The noise texture (MakeNoiseTexture: the words' rows, RGBA16 unsigned normalised; a load
     // gives q / 65535).
@@ -157,7 +194,8 @@ int main(int argc, char** argv)
     // The full land chain through both accessors.
     std::mt19937 Rng(31);
     std::normal_distribution<double> G;
-    int Mismatch = 0, Count = 0, ColorBad = 0, HeightChanged = 0, HillPoints = 0, PeakPoints = 0;
+    int Mismatch = 0, Count = 0, ColorBad = 0, HeightChanged = 0, HillPoints = 0, PeakPoints = 0, CarvePoints = 0, LakePoints = 0, LakeDiffer = 0;
+    double LakeWorst = 0.0;
     for (int i = 0; i < 20000; i++)
     {
         double D[3] = { G(Rng), G(Rng), G(Rng) }; Normalize(D);
@@ -166,7 +204,9 @@ int main(int argc, char** argv)
         const VoxelShader::FVoxelLandHeight A = VoxelShader::VoxelLandHeightDF(X, Y, Z, F, true);
         const float XA[2] = { X.x, X.y }, YA[2] = { Y.x, Y.y }, ZA[2] = { Z.x, Z.y };
         const FMaterialHeight B = MaterialLandHeight(Tex, XA, YA, ZA, F, true);
-        const bool bSame = A.Height.x == B.Height[0] && A.Height.y == B.Height[1] && A.Bake == B.Bake && A.Gully == B.Gully && A.Detail == B.Detail
+        const bool bSameCarve = A.Carve == B.Carve && A.CarveScale == B.CarveScale && A.CarveGradient.x == B.CarveGradient[0]
+            && A.CarveGradient.y == B.CarveGradient[1] && A.CarveGradient.z == B.CarveGradient[2];
+        const bool bSame = bSameCarve && A.Height.x == B.Height[0] && A.Height.y == B.Height[1] && A.Bake == B.Bake && A.Gully == B.Gully && A.Detail == B.Detail
             && A.Flow == B.Flow && A.GullyScale == B.GullyScale && A.DetailScale == B.DetailScale
             && A.BakeGradient.x == B.BakeGradient[0] && A.BakeGradient.y == B.BakeGradient[1] && A.BakeGradient.z == B.BakeGradient[2]
             && A.Warped.x == B.Warped[0] && A.Warped.y == B.Warped[1] && A.Warped.z == B.Warped[2]
@@ -179,22 +219,60 @@ int main(int argc, char** argv)
         // The exact detail path (bGradient) leaves the height as the density's own path has it.
         const VoxelShader::FVoxelLandHeight A0 = VoxelShader::VoxelLandHeightDF(X, Y, Z, F, false);
         HeightChanged += A0.Height.x != A.Height.x || A0.Height.y != A.Height.y || A0.Detail != A.Detail;
-        if (!bSame && Mismatch < 5)
-            printf("  differs at %d: height %.9g/%.9g vs %.9g/%.9g, bake %.9g vs %.9g, gully %.9g vs %.9g, detail %.9g vs %.9g\n", i,
-                A.Height.x, A.Height.y, B.Height[0], B.Height[1], A.Bake, B.Bake, A.Gully, B.Gully, A.Detail, B.Detail);
-        Mismatch += !bSame;
+        // R2: under a lake's weight the material's depths are its field texture's halves: those
+        // points differ by centimetres (counted apart).
+        if (!bSame && B.LakeWeight > 0.0f)
+        {
+            LakeDiffer++;
+            const double DH = std::fabs(((double)A.Height.x - B.Height[0]) + ((double)A.Height.y - B.Height[1])) * 0.01;
+            LakeWorst = std::max(LakeWorst, DH);
+        }
+        else
+        {
+            if (!bSame && Mismatch < 5)
+                printf("  differs at %d: height %.9g/%.9g vs %.9g/%.9g, bake %.9g vs %.9g, gully %.9g vs %.9g, detail %.9g vs %.9g, carve %.9g vs %.9g\n", i,
+                    A.Height.x, A.Height.y, B.Height[0], B.Height[1], A.Bake, B.Bake, A.Gully, B.Gully, A.Detail, B.Detail, A.Carve, B.Carve);
+            Mismatch += !bSame;
+        }
+        CarvePoints += A.Carve != 0.0f;
+        LakePoints += B.LakeWeight > 0.0f;
         HillPoints += A.Hills != 0.0f;
         PeakPoints += A.Peaks != 0.0f;
         Count++;
         // Every debug view's colour is finite and in range.
-        for (uint32_t Mode = 1; Mode < 18u; Mode++)   // every view (VOXEL_LAND_VIEW_COUNT)
+        for (uint32_t Mode = 1; Mode < 20u; Mode++)   // every view (VOXEL_LAND_VIEW_COUNT)
         {
             float C[3];
             MaterialDebugColor(Tex, Mode, B, F * 0.01f, C);
             for (float V : C) ColorBad += !(std::isfinite(V) && V >= 0.0f && V <= 1.001f);
         }
     }
-    printf("land chain through the material's accessors against the global shaders': %d of %d points differ in any bit (%d with hills, %d with peaks); %d debug colours out of range; height with the exact detail gradient against without: %d differ\n", Mismatch, Count, HillPoints, PeakPoints, ColorBad, HeightChanged);
+    printf("land chain through the material's accessors against the global shaders': %d of %d points differ in any bit (%d with hills, %d with peaks, %d carved); %d debug colours out of range; height with the exact detail gradient against without: %d differ\n", Mismatch, Count, HillPoints, PeakPoints, CarvePoints, ColorBad, HeightChanged);
+    printf("  under a lake's weight (%d points): %d differ, by at most %.4f m\n", LakePoints, LakeDiffer, LakeWorst);
+
+    // R1: the rivers' lookup through the material's accessors against the global shaders', at
+    // points around the network's nodes (bit for bit).
+    if (P.S.LandRiverTilesPerFace > 0 && P.Rivers.NumNodes > 0)
+    {
+        std::mt19937 RRng(3);
+        std::uniform_real_distribution<double> U01(-1.0, 1.0);
+        int RCount = 0, RFound = 0, RDiffer = 0;
+        for (int i = 0; i < 20000; i++)
+        {
+            const size_t n = (size_t)((U01(RRng) * 0.5 + 0.5) * (P.Rivers.NumNodes - 1));
+            double D[3]; for (int a = 0; a < 3; a++) D[a] = P.Rivers.NodePos[4 * n + a] + U01(RRng) * 4000.0 / RadiusM;
+            const double L = std::sqrt(D[0] * D[0] + D[1] * D[1] + D[2] * D[2]);
+            float X[2], Y[2], Z[2];
+            const float2 DX = DF(D[0] / L * P.SeaRadius), DY = DF(D[1] / L * P.SeaRadius), DZ = DF(D[2] / L * P.SeaRadius);
+            X[0] = DX.x; X[1] = DX.y; Y[0] = DY.x; Y[1] = DY.y; Z[0] = DZ.x; Z[1] = DZ.y;
+            const FMaterialRiver M = MaterialRiver(Tex, X, Y, Z);
+            const auto G = VoxelShader::VoxelLandRiverAtDF(DX, DY, DZ);
+            RCount++; RFound += G.bFound;
+            RDiffer += M.bFound != G.bFound || M.Distance != G.Distance || M.Signed != G.Signed || M.Floor != G.Floor || M.Log2Area != G.Log2Area
+                || M.S != G.S || M.Segment != G.Segment;
+        }
+        printf("rivers through the material's accessors against the global shaders': %d of %d points differ in any bit (%d near a river)\n", RDiffer, RCount, RFound);
+    }
 
     // The pixel's planet-frame position from the view (VoxelLandFramePoint), against doubles:
     // planets anywhere within 10^9 cm of the world origin, rotated, cameras near their surface.

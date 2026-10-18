@@ -17,7 +17,10 @@
 //   4. the land is routed on the final heights: lake levels (a fill without descent), the
 //      routing fill, receivers, exact drainage, lake labels; lakes past the size settings are
 //      kept, smaller depressions filled;
-//   5. the fields (aprons from the neighbouring faces) and the lake list are read back once.
+//   5. the fields (aprons from the neighbouring faces) and the lake list are read back once;
+//   6. with rivers on, the rivers' tables are built in the same frame on the routing's own buffers
+//      (VoxelLandRiverBuild.h, R1b) and read back with the fields; the heights, the drainage and
+//      the lake levels stay on the GPU for the density (FResult's GPU buffers).
 // The work is VoxelLandSolve.ush / .usf. Every pass is order-independent, so the same GPU
 // reproduces a bake bit for bit. Private: it pulls in the render graph.
 
@@ -26,6 +29,7 @@
 #include "CoreMinimal.h"
 #include "RenderGraphResources.h"
 #include "VoxelLandBake.h"
+#include "VoxelLandRiverBuild.h"
 #include <atomic>
 
 class FRHICommandListImmediate;
@@ -80,8 +84,16 @@ namespace VoxelLandSolve
         // T3h: how far the drainage density pulls the landform's character (0 off).
         float ChannelCharacter = 0.0f;
         bool bErode = true;
-        int64 StepCellsPerFrame = 1 << 22;        // slot-steps a frame
-        int64 IterationCellsPerFrame = 1 << 26;   // slot-iterations a frame (the fills, drainage, labels)
+        // R1b: the rivers' build after the routing (Design/RiversLakes.md; VoxelLandRiverBuild.h).
+        bool bRivers = false;
+        float RiverMinAreaKm2 = 200.0f;
+        float RiverWidthScale = 1.0f;
+        float RiverValleyScale = 1.0f;
+        int64 StepCellsPerFrame = 1 << 25;        // slot-steps a frame
+        int64 IterationCellsPerFrame = 1 << 26;   // slot-iterations a frame (the fills, the spread, labels)
+        // S1: the routing recorded in one frame with fixed pass counts, checked at the output's
+        // readback (voxel.Land.SolveRouteAhead).
+        bool bRouteAhead = true;
         TArray<FVector2f> TanTable;      // the bake's (FVoxelLandBake::TanTable)
     };
 
@@ -92,7 +104,7 @@ namespace VoxelLandSolve
         TRefCountPtr<FRDGPooledBuffer> Up;
         TRefCountPtr<FRDGPooledBuffer> Crust;
         TRefCountPtr<FRDGPooledBuffer> Attr;
-        TRefCountPtr<FRDGPooledBuffer> Form;     // the landform, one cell a word (VoxelLandPackForm)
+        TRefCountPtr<FRDGPooledBuffer> Form;     // the landform, one cell a word (VoxelLandPackForm; the province << 16)
     };
 
     /** The bake's fields after the solve, on the padded grid, as read back (the baker narrows
@@ -101,9 +113,10 @@ namespace VoxelLandSolve
     {
         TArray<float> Height;
         TArray<uint32> Attr;             // FVoxelLandBake::Attr in the low 16 bits
-        TArray<uint32> Form;             // FVoxelLandBake::Form in the low 16 bits (the plate pass's; the character after T3h)
-        TArray<float> Flow;              // log2 m^2
+        TArray<uint32> Form;             // FVoxelLandBake::Form in the low 16 bits (the plate pass's; the character after T3h), the province (T4c) from bit 16
+        TArray<uint32> FlowHalves;       // log2 m^2 as halves, two cells a word (FVoxelLandBake::Flow's bits)
         TArray<float> Water;
+        TArray<uint32> Receiver;         // R1: the final routing's receiver per cell (~0 off the land, in the aprons)
         TArray<FVoxelLandLake> Lakes;
         int32 SolvedCells = 0;
         int32 LandCells = 0;
@@ -116,6 +129,13 @@ namespace VoxelLandSolve
         uint32 Errors = 0;               // VOXEL_SOLVE_ERROR_* bits
         int32 LakesFound = 0;            // kept lakes, before the list's cap
         TArray<FString> PhaseLog;        // per phase: frames and seconds (voxel.Debug.Land)
+        /** R1b: the rivers' tables (when FSettings::bRivers; bRivers false if the build failed). */
+        bool bRivers = false;
+        VoxelLandRiverBuild::FResult Rivers;
+        int32 RiverBuilds = 0;           // 1, or more when the first sizes didn't fit
+        /** The fields on the GPU, as read back (render thread resources: the baker hands them to
+         *  the bake's GPU copy, so the density doesn't upload them again). */
+        TRefCountPtr<FRDGPooledBuffer> GPUHeight, GPUWater, GPUFlow, GPUTan;
     };
 
     /** Render thread. One bake's solve. */

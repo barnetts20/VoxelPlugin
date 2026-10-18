@@ -33,7 +33,9 @@
 #define VOXEL_LAND_VIEW_HILLS 15u      // the hills layer over HillRelief (T2)
 #define VOXEL_LAND_VIEW_PEAKS 16u      // the peaks layer, signed, over its amplitude (T3)
 #define VOXEL_LAND_VIEW_PEAK_AREA 17u  // the peaks' amplitude: where they rise and how high (T3)
-#define VOXEL_LAND_VIEW_COUNT 18u      // at most 32: the material packs the view in 5 bits
+#define VOXEL_LAND_VIEW_STRATA 18u     // the sedimentary province, and where the strata replace the hills (T4c)
+#define VOXEL_LAND_VIEW_RIVERS 19u     // the rivers' channels and valleys over the elevation (R1)
+#define VOXEL_LAND_VIEW_COUNT 20u      // at most 32: the material packs the view in 5 bits
 
 VOXEL_FUNC float3 VoxelLandViewRgb(float R, float G, float B)
 {
@@ -210,6 +212,26 @@ VOXEL_FUNC float3 VoxelLandViewLandform(float Hilliness, float Character, bool b
     const float3 Hill = VoxelLandViewMix(VoxelLandViewRgb(40.0f, 120.0f, 60.0f), VoxelLandViewRgb(140.0f, 80.0f, 40.0f), Character);
     if (Hilliness < 0.4f) return VoxelLandViewMix(Flat, Rolling, Hilliness / 0.4f);
     return VoxelLandViewMix(Rolling, Hill, (Hilliness - 0.4f) / 0.6f);
+}
+
+/** The sedimentary province (0..1: grey, darker crystalline, lighter sedimentary) and the
+ *  strata's share of the hill layer (0..1: orange over it, T4c). */
+VOXEL_FUNC float3 VoxelLandViewStrata(float Province, float Share, bool bSea)
+{
+    if (bSea) return VoxelLandViewRgb(70.0f, 75.0f, 90.0f);
+    const float3 Ground = VoxelLandViewMix(VoxelLandViewRgb(90.0f, 95.0f, 100.0f), VoxelLandViewRgb(215.0f, 215.0f, 205.0f), saturate(Province));
+    return VoxelLandViewMix(Ground, VoxelLandViewRgb(230.0f, 120.0f, 40.0f), saturate(Share) * 0.85f);
+}
+
+/** The rivers over a ground colour: the channel (Channel 0..1, its antialiased cover) blue,
+ *  darker for larger drainage (Log2Area, m^2: 200 km^2 to 100,000 km^2), and the valley
+ *  (Valley 0..1) a pale wash (R1). */
+VOXEL_FUNC float3 VoxelLandViewRiver(float3 Ground, float Channel, float Valley, float Log2Area)
+{
+    const float Size = saturate((Log2Area - 27.6f) / 9.0f);
+    const float3 Water = VoxelLandViewMix(VoxelLandViewRgb(70.0f, 140.0f, 255.0f), VoxelLandViewRgb(10.0f, 40.0f, 160.0f), Size);
+    const float3 Washed = VoxelLandViewMix(Ground, VoxelLandViewRgb(200.0f, 225.0f, 255.0f), 0.35f * saturate(Valley));
+    return VoxelLandViewMix(Washed, Water, saturate(Channel));
 }
 
 /** The hills over their relief (0..1.5): white none, green to brown up. */

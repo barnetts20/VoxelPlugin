@@ -1,0 +1,189 @@
+// VoxelLandDetail.ush - The land's detail layer (N1, Design/SurfaceLook.md): the surface's
+// finest relief everywhere, from LandDetailAmplitude's wavelength (DetailWavelength, 20 km by
+// default) down to the finest cell. Until N1 a procedural slope-damped fBm on the sphere; now
+// lookups of the pack's detail set (a `detail*` set, picked per planet like the others, or the
+// generated stand-in in the same layout: Design/NoiseTiles2D_Handoff.md section 6): its A
+// channel, an eroded (slope-damped) fbm of four octaves, gain 0.5.
+//
+// The scales: LandDetailScales lookups of A, each four octaves, the first with its coarsest
+// octave at DetailWavelength (LandDetailTexelsPerCell), each next one 16 times finer and
+// LandDetailScaleGain lower (A's own gain to the fourth: 1/16 for gain 0.5), so they continue
+// the set's spectrum: up to four scales, sixteen octaves (20 km down to 0.6 m by default). Each
+// scale's unit is A's value about its mean over its standard deviation times 0.4
+// (LandDetailMeanA, LandDetailScaleA: the old fBm's normalisation, so DetailAmplitude means what
+// it did), the scale's gain on top. Each has its own turn, orientation and offset per face (not
+// lined up with the other scales).
+//
+// Band limit: each scale by its own mip level (texels about 1.4 footprints, the peaks' detail's
+// rule: the octaves are dense down to the finest), faded out over the three levels below
+// LandDetailFade (where its coarsest octave averages away) and skipped beyond, finer scales
+// first. Its gradient is exact (the B-spline's) at a fixed footprint, as the fBm's was.
+//
+// The lattice: the peaks' (VoxelLandPeaks.ush), at the sea-level sphere point (not warped: the
+// detail has no reason to follow the bake's warp). The face blend: within 3 bake cells of a face
+// edge the faces' lookups blend by the peaks' weights, but over the root of the weights' squares
+// rather than their sum: the faces' fields are independent, so that keeps the detail's variance
+// across the band (a plain weighted mean would weaken it by up to 30% along every cube edge).
+//
+// Shared subset (VoxelShaderCompat.h). Included by VoxelLandGully.ush after VoxelLandPeaks.ush
+// (its lattice) and VoxelLandNoise.ush; its inputs, declared by the host:
+//
+//   uint LandDetailBase, LandDetailN, LandDetailMips;   the detail set's chain (VoxelLandPeaks.ush)
+//   float LandDetailTexelsPerCell;  the first scale's mip-0 texels per bake cell (0: no detail)
+//   uint LandDetailScales;          1 .. VOXEL_LAND_DETAIL_MAX_SCALES
+//   float LandDetailMeanA;          A's mean over mip 0 (unit)
+//   float LandDetailScaleA;         unit values to the layer's unit: 0.4 over A's standard deviation
+//   float LandDetailScaleGain;      one scale's height over the previous one's (A's gain^4)
+//   float LandDetailFade;           the mip level by which a scale has faded out
+//   uint LandDetailSeed;
+//
+// VOXEL_LAND_DETAIL_ON (a host's define, true by default): the material's cost switch leaves the
+// layer out with it.
+
+#ifndef VOXEL_LAND_DETAIL_USH
+#define VOXEL_LAND_DETAIL_USH
+
+#include "VoxelLandAccess.ush"
+
+#ifndef VOXEL_LOOP
+#define VOXEL_LOOP [loop]
+#endif
+
+#ifndef VOXEL_LAND_DETAIL_ON
+#define VOXEL_LAND_DETAIL_ON true
+#endif
+
+// The most scales (VoxelLand::DetailMaxScales on the CPU: keep equal), and the step between
+// them: four octaves at lacunarity 2.
+#define VOXEL_LAND_DETAIL_MAX_SCALES 4u
+#define VOXEL_LAND_DETAIL_SCALE_STEP 16.0f
+// The mip level against the footprint and the levels of the fade-out: the peaks' detail's
+// (VOXEL_LAND_PEAK_DETAIL_LEVEL_BIAS, _FADE_LEVELS).
+#define VOXEL_LAND_DETAIL_LEVEL_BIAS 0.5f
+#define VOXEL_LAND_DETAIL_FADE_LEVELS 3.0f
+
+/** The detail at a point: Unit (Detail = Unit x the amplitude) and its gradient (per m, a tangent
+ *  vector at the point; zero without bGradient). */
+struct FVoxelLandDetail
+{
+    float Unit;
+    float3 Gradient;
+};
+
+/** One face's scales: the unit and its covector (per m along the face's angles times the radius). */
+struct FVoxelLandDetailFace
+{
+    float Unit;
+    float GU;
+    float GV;
+};
+
+VOXEL_FUNC bool VoxelLandDetailOn(VOXEL_LAND_ARGS_DECL float Dummy)
+{
+    return LandDetailTexelsPerCell > 0.0f && LandDetailN != 0u && LandDetailScales != 0u;
+}
+
+VOXEL_FUNC FVoxelLandDetailFace VoxelLandDetailFaceAt(VOXEL_LAND_ARGS_DECL uint Face, FVoxelLandAxis U, FVoxelLandAxis V, float Footprint, bool bGradient)
+{
+    FVoxelLandDetailFace Out;
+    Out.Unit = 0.0f;
+    Out.GU = 0.0f;
+    Out.GV = 0.0f;
+    const FVoxelLandNoiseSetRef Set = VoxelLandNoiseSetOf(LandDetailBase, LandDetailN, LandDetailMips);
+    const FVoxelLandPeakCoord CU = VoxelLandPeakCoordAt(VOXEL_LAND_ARGS U);
+    const FVoxelLandPeakCoord CV = VoxelLandPeakCoordAt(VOXEL_LAND_ARGS V);
+    // Each scale's texels per cell (exact powers of 16 apart) and gain.
+    float TexelsPerCell = LandDetailTexelsPerCell;
+    float Gain = LandDetailScaleA;
+    const uint Scales = min(LandDetailScales, VOXEL_LAND_DETAIL_MAX_SCALES);
+    VOXEL_LOOP
+    for (uint k = 0u; k < Scales; k++)
+    {
+        const float TexelM = LandCellM / TexelsPerCell;
+        const float Level = max(log2(max(Footprint, 1.0f) / (TexelM * 100.0f)) + VOXEL_LAND_DETAIL_LEVEL_BIAS, 0.0f);
+        const float Fade = 1.0f - smoothstep(LandDetailFade - VOXEL_LAND_DETAIL_FADE_LEVELS, LandDetailFade, Level);
+        // The finer scales fade sooner: none of them is left.
+        if (Fade <= 0.0f) break;
+        const uint H = VoxelHash(uint3(Face, 16u + k, 0x64746c61u), LandDetailSeed);
+        const uint H2 = VoxelHash(uint3(Face, 16u + k, 0x616c7464u), LandDetailSeed);
+        const float2 Rot = VoxelLandPeakRotation(H >> 29u);
+        const float RX = Rot.x * TexelsPerCell;
+        const float RY = Rot.y * TexelsPerCell;
+        const FVoxelLandNoiseAxis AU = VoxelLandPeakRotated(CU, CV, RX, -RY);
+        const FVoxelLandNoiseAxis AV = VoxelLandPeakRotated(CU, CV, RY, RX);
+        // A alone: one word a texel.
+        const FVoxelLandNoise N = VoxelLandNoiseAt(VOXEL_LAND_ARGS Set, AU, AV, H & 7u, H >> 3u, H2, Level, VOXEL_LAND_NOISE_WANT_ONLY_A);
+        const float S = Gain * Fade;
+        Out.Unit += (N.A - LandDetailMeanA) * S;
+        if (bGradient)
+        {
+            // Per m, back to the face's axes (the rotation's transpose).
+            const float K = S / TexelM;
+            const float DU = N.AU * K;
+            const float DV = N.AV * K;
+            Out.GU += Rot.x * DU + Rot.y * DV;
+            Out.GV += -Rot.y * DU + Rot.x * DV;
+        }
+        TexelsPerCell *= VOXEL_LAND_DETAIL_SCALE_STEP;
+        Gain *= LandDetailScaleGain;
+    }
+    return Out;
+}
+
+/** The detail at the sea-level sphere point P (double-float, cm), band-limited to Footprint (cm):
+ *  one face's scales (two or three faces' near an edge, sum W U over sqrt(sum W^2), the gradient
+ *  with the weights' own slope). bGradient (a constant): the gradient too. */
+VOXEL_FUNC FVoxelLandDetail VoxelLandDetailDF(VOXEL_LAND_ARGS_DECL float2 PX, float2 PY, float2 PZ, float Footprint, bool bGradient)
+{
+    FVoxelLandDetail Out;
+    Out.Unit = 0.0f;
+    Out.Gradient = float3(0.0f, 0.0f, 0.0f);
+    if (!(VOXEL_LAND_DETAIL_ON) || !VoxelLandDetailOn(VOXEL_LAND_ARGS 0.0f)) return Out;
+
+    const float Band = 2.0f * VOXEL_LAND_PEAK_BAND_CELLS / float(LandN);
+    // The face coordinate's change per m along the face's angles (VoxelLandSetLayerDF).
+    const float DSDX = 2.0f / (float(LandN) * LandCellM);
+    float W2Sum = 0.0f;                        // sum of W^2
+    float USum = 0.0f;                         // sum of W U
+    float3 GSum = float3(0.0f, 0.0f, 0.0f);    // sum of W grad U + U grad W
+    float3 WGrad = float3(0.0f, 0.0f, 0.0f);   // sum of W grad W
+    VOXEL_LOOP
+    for (uint Axis = 0u; Axis < 3u; Axis++)
+    {
+        const float2 PN = VoxelLandPick(PX, PY, PZ, Axis);
+        if (PN.x == 0.0f) continue;
+        const bool bNegative = PN.x < 0.0f;
+        const uint Face = Axis * 2u + (bNegative ? 1u : 0u);
+        const float2 Den = bNegative ? float2(-PN.x, -PN.y) : PN;
+        const float2 AU = VoxelDFDiv(VoxelLandPick(PX, PY, PZ, VoxelCubeUAxis(Face)), Den);
+        const float2 AV = VoxelDFDiv(VoxelLandPick(PX, PY, PZ, VoxelCubeVAxis(Face)), Den);
+        const float S = atan(AU.x) * VOXEL_LAND_INV_QUARTER_PI;
+        const float T = atan(AV.x) * VOXEL_LAND_INV_QUARTER_PI;
+        const float RS = VoxelLandFaceRamp(S, Band);
+        const float RT = VoxelLandFaceRamp(T, Band);
+        const float W = RS * RT;
+        if (W <= 0.0f) continue;
+        const FVoxelLandDetailFace F = VoxelLandDetailFaceAt(VOXEL_LAND_ARGS Face, VoxelLandAxisAt(VOXEL_LAND_ARGS AU, S), VoxelLandAxisAt(VOXEL_LAND_ARGS AV, T),
+            Footprint, bGradient);
+        USum += W * F.Unit;
+        W2Sum += W * W;
+        if (bGradient)
+        {
+            const FVoxelLandFaceFrame Frame = VoxelLandFaceFrameAt(Face, AU.x, AV.x);
+            const float WU = VoxelLandFaceRampSlope(S, Band) * RT * DSDX;
+            const float WV = RS * VoxelLandFaceRampSlope(T, Band) * DSDX;
+            GSum = GSum + VoxelLandFaceVector(Frame, W * F.GU + F.Unit * WU, W * F.GV + F.Unit * WV);
+            WGrad = WGrad + VoxelLandFaceVector(Frame, W * WU, W * WV);
+        }
+    }
+    if (W2Sum <= 0.0f) return Out;
+    // Unit = sum W U / Q, Q = sqrt(sum W^2): its gradient (sum (W grad U + U grad W) - Unit
+    // sum W grad W / Q) / Q.
+    const float Inv = 1.0f / sqrt(W2Sum);
+    Out.Unit = USum * Inv;
+    if (bGradient)
+        Out.Gradient = (GSum - WGrad * (Out.Unit * Inv)) * Inv;
+    return Out;
+}
+
+#endif // VOXEL_LAND_DETAIL_USH

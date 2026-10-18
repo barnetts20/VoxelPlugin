@@ -22,15 +22,16 @@
 // peaks), on the crests and upper slopes (faded out as the drainage gathers: valleys keep the
 // bake's floors), and inland.
 //
-// The detail (T3e): the set holds about a massif spacing's texels over 128, so its finest valleys
-// are hundreds of metres across and closer up it's smooth B-spline lumps. A second lookup, of
-// the detail tile appended to the set's chain (VoxelNoiseTiles::GeneratePeakDetail: hard rock a
-// ridged multifractal, soft rock an fbm, heights in its own texels) at its own finer placement
-// and turn, adds to the shape: the same character blend, the same amplitude (so it lives where
-// the peaks do), its height over the peaks' relief fixed on the CPU (LandPeakDetailScaleR/G) so
-// strength 1 keeps its own slopes. Band-limited by its own mip level (coarser than the set's
-// rule), faded out over the levels below LandPeakDetailFade (where its coarsest octave averages
-// away) and skipped beyond.
+// The detail (T3e; N1: the planet's detail set): the set holds about a massif spacing's texels
+// over 128, so its finest valleys are hundreds of metres across and closer up it's smooth
+// B-spline lumps. A second lookup, of the pack's detail set (a `detail*` set, or the generated
+// stand-in in its layout: Design/NoiseTiles2D_Handoff.md section 6; hard rock its G, a ridged
+// multifractal, soft rock its R, an fbm, each scaled on the CPU to texel heights at a fixed RMS
+// slope) at its own finer placement and turn, adds to the shape: the same character blend, the
+// same amplitude (so it lives where the peaks do), its height over the peaks' relief fixed on
+// the CPU (LandPeakDetailScaleHard, Soft) so strength 1 keeps its own slopes. Band-limited by
+// its own mip level (coarser than the set's rule), faded out over the levels below
+// LandPeakDetailFade (where its coarsest octave averages away) and skipped beyond.
 //
 // The lattice: face-local like the gullies' (VoxelLandGully.ush): the set's texel coordinate is
 // the face's angle from its centre in cells (an integer and a fraction) times the set's texels
@@ -55,15 +56,17 @@
 //   float LandPeakScaleB;
 //   uint LandNoiseN, LandNoiseMips;  the set's chain (at the buffer's start; VoxelLandNoise.ush's
 //                                    LandNoise holds it)
-//   uint LandPeakDetailBase;         the detail tile's chain: its first texel in LandNoise,
-//   uint LandPeakDetailN;            size and mips
-//   uint LandPeakDetailMips;
+//   uint LandDetailBase;             the detail set's chain: its first texel in LandNoise,
+//   uint LandDetailN;                size and mips
+//   uint LandDetailMips;
 //   float LandPeakDetailTexelsPerCell;  its mip-0 texels per bake cell (0: no detail)
-//   float LandPeakDetailMeanR;       its R's and G's means over mip 0 (unit values)
-//   float LandPeakDetailMeanG;
-//   float LandPeakDetailScaleR;      its unit values to the shape's unit (strength x range x texel
-//   float LandPeakDetailScaleG;      over the peaks' relief)
+//   float LandDetailMeanHard;        its G's (hard rock) and R's (soft rock) means over mip 0
+//   float LandDetailMeanSoft;        (unit values)
+//   float LandPeakDetailScaleHard;   their unit values to the shape's unit (strength x range x
+//   float LandPeakDetailScaleSoft;   texel over the peaks' relief)
 //   float LandPeakDetailFade;        the mip level by which it has faded out
+//   float LandGullyStrength; uint LandGullyOctaves;   whether the gullies read the steering
+//                                    (VoxelLandGully.ush's; without them it isn't looked up)
 
 #ifndef VOXEL_LAND_PEAKS_USH
 #define VOXEL_LAND_PEAKS_USH
@@ -87,8 +90,9 @@
 #define VOXEL_LAND_PEAK_BAND_CELLS 3.0f
 // The detail's mip level against the footprint (0.5: texels about 1.4 footprints), and the levels
 // over which it fades out below LandPeakDetailFade (spread so no mesh level change takes much of
-// it at once: its RMS height 10 m at a 1 m footprint, 9 at 25 m, 4 at 50 m, 0.4 at 100 m, 0 from
-// 150 m). Plain defines: every host must use the same.
+// it at once; T3e's 1024 tile at 400 m: its RMS height 10 m at a 1 m footprint, 9 at 25 m, 4 at
+// 50 m, 0.4 at 100 m, 0 from 150 m; a 2048 set's fade level is one higher, its texels half the
+// size, so the same in metres). Plain defines: every host must use the same.
 #define VOXEL_LAND_PEAK_DETAIL_LEVEL_BIAS 0.5f
 #define VOXEL_LAND_PEAK_DETAIL_FADE_LEVELS 3.0f
 
@@ -172,8 +176,10 @@ VOXEL_FUNC FVoxelLandNoiseAxis VoxelLandPeakRotated(FVoxelLandPeakCoord CU, FVox
 /** A baked set's layer (T4a: the peaks' lookup made general, so the hills take it too): which
  *  chain, its placement (mip-0 texels per bake cell; a texel is LandCellM over that), the seed
  *  and salts of the faces' turns, orientations and offsets, R's and G's means and R's, G's and
- *  B's scales (unit values to the layer's unit), the mip level against the footprint (texels
- *  about 2^-LevelBias footprints), and the detail tile's (DetailTexelsPerCell 0: none). */
+ *  B's scales (unit values to the layer's unit), R's and G's means over mip 0 for the face blend
+ *  (BlendMeanR, BlendMeanG: unit values; as MeanR and MeanG for a zero-mean layer, the peaks'),
+ *  the mip level against the footprint (texels about 2^-LevelBias footprints), and the detail
+ *  set's (DetailTexelsPerCell 0: none; its means and scales hard rock's, G, and soft rock's, R). */
 struct FVoxelLandSetLayer
 {
     FVoxelLandNoiseSetRef Set;
@@ -187,16 +193,25 @@ struct FVoxelLandSetLayer
     float ScaleR;
     float ScaleG;
     float ScaleB;
+    float BlendMeanR;
+    float BlendMeanG;
     float LevelBias;
     FVoxelLandNoiseSetRef DetailSet;
     float DetailTexelsPerCell;
     uint DetailKind;
-    float DetailMeanR;
-    float DetailMeanG;
-    float DetailScaleR;
-    float DetailScaleG;
+    float DetailMeanHard;
+    float DetailMeanSoft;
+    float DetailScaleHard;
+    float DetailScaleSoft;
     float DetailFade;
 };
+
+/** Whether the set layers' steering is read: the gullies' only (N1b: without them the layers
+ *  skip their steering channel). */
+VOXEL_FUNC bool VoxelLandSetSteers(VOXEL_LAND_ARGS_DECL float Dummy)
+{
+    return LandGullyStrength > 0.0f && LandGullyOctaves != 0u;
+}
 
 /** One face's lookup: the shape (over the larger range) and its gradient and steering (covectors per m
  *  along the face's angles times the radius), and the steering's curvature (per m^2). */
@@ -228,9 +243,11 @@ VOXEL_FUNC FVoxelLandPeakFace VoxelLandSetFaceAt(VOXEL_LAND_ARGS_DECL FVoxelLand
     const FVoxelLandNoiseAxis AV = VoxelLandPeakRotated(CU, CV, RY, RX);
     // The mip whose texels are about 2^-LevelBias footprints (the peaks: half).
     const float Level = max(log2(max(Footprint, 1.0f) / (TexelM * 100.0f)) + L.LevelBias, 0.0f);
-    // Without the shape, only the steering channel (half the texels: its words alone).
+    // Without the shape, only the steering channel (half the texels: its words alone); without
+    // the gullies (the steering's only reader), R and G alone (N1b: half the loads).
+    const bool bSteer = VoxelLandSetSteers(VOXEL_LAND_ARGS 0.0f);
     const FVoxelLandNoise N = VoxelLandNoiseAt(VOXEL_LAND_ARGS L.Set, AU, AV, H & 7u, H >> 3u, H2, Level,
-        bShape ? VOXEL_LAND_NOISE_WANT_HESSIAN_B : (VOXEL_LAND_NOISE_WANT_ONLY_B | VOXEL_LAND_NOISE_WANT_HESSIAN_B));
+        bShape ? (bSteer ? VOXEL_LAND_NOISE_WANT_HESSIAN_B : 0u) : (VOXEL_LAND_NOISE_WANT_ONLY_B | VOXEL_LAND_NOISE_WANT_HESSIAN_B));
     // Hard rock (rough character) to soft (smooth), over the larger range.
     const float C = saturate(Character);
     const float Hard = (N.R - L.MeanR) * L.ScaleR;
@@ -252,9 +269,10 @@ VOXEL_FUNC FVoxelLandPeakFace VoxelLandSetFaceAt(VOXEL_LAND_ARGS_DECL FVoxelLand
     {
         // The detail: its own texel, mip level, turn, orientation and offset.
         const float DetailTexelM = LandCellM / L.DetailTexelsPerCell;
-        // Coarser than the set's rule (texels about half the footprint): the tile is dense in
-        // octaves down to its finest, so half-footprint texels pass wavelengths the footprint
-        // can't hold (the cache's 64 m level: normal p99 15 deg with the set's rule, 3 with this).
+        // Coarser than the set's rule (texels about half the footprint): the detail set is dense
+        // in octaves down to its finest, so half-footprint texels pass wavelengths the footprint
+        // can't hold (T3e's tile at the cache's 64 m level: normal p99 15 deg with the set's
+        // rule, 3 with this).
         const float DetailLevel = max(log2(max(Footprint, 1.0f) / (DetailTexelM * 100.0f)) + VOXEL_LAND_PEAK_DETAIL_LEVEL_BIAS, 0.0f);
         const float Fade = 1.0f - smoothstep(L.DetailFade - VOXEL_LAND_PEAK_DETAIL_FADE_LEVELS, L.DetailFade, DetailLevel);
         if (Fade > 0.0f)
@@ -266,14 +284,15 @@ VOXEL_FUNC FVoxelLandPeakFace VoxelLandSetFaceAt(VOXEL_LAND_ARGS_DECL FVoxelLand
             const float DRY = DRot.y * L.DetailTexelsPerCell;
             const FVoxelLandNoiseAxis DAU = VoxelLandPeakRotated(CU, CV, DRX, -DRY);
             const FVoxelLandNoiseAxis DAV = VoxelLandPeakRotated(CU, CV, DRY, DRX);
-            // R and G alone (no steering: the gullies keep to the set's).
+            // R and G alone (no steering: the gullies keep to the set's): hard rock the set's G
+            // (ridged), soft rock its R (fbm).
             const FVoxelLandNoise D = VoxelLandNoiseAt(VOXEL_LAND_ARGS L.DetailSet, DAU, DAV, HD & 7u, HD >> 3u, HD2, DetailLevel, 0u);
-            const float SR = L.DetailScaleR * Fade;
-            const float SG = L.DetailScaleG * Fade;
-            const float DHard = (D.R - L.DetailMeanR) * SR;
-            const float DSoft = (D.G - L.DetailMeanG) * SG;
-            const float DDU = lerp(D.GU * SG, D.RU * SR, C);
-            const float DDV = lerp(D.GV * SG, D.RV * SR, C);
+            const float SH = L.DetailScaleHard * Fade;
+            const float SS = L.DetailScaleSoft * Fade;
+            const float DHard = (D.G - L.DetailMeanHard) * SH;
+            const float DSoft = (D.R - L.DetailMeanSoft) * SS;
+            const float DDU = lerp(D.RU * SS, D.GU * SH, C);
+            const float DDV = lerp(D.RV * SS, D.GV * SH, C);
             const float DInv = 1.0f / DetailTexelM;
             Out.Unit += lerp(DSoft, DHard, C);
             Out.HardMinusSoft += DHard - DSoft;
@@ -313,24 +332,37 @@ VOXEL_FUNC FVoxelLandPeaks VoxelLandPeaksNone()
 
 /** A set layer at the sea-level sphere point P (double-float, cm) with amplitude AmplitudeM (m,
  *  above 0) and the character (hard and soft rock blend by it; CharacterGradient its gradient,
- *  per m, a tangent vector at P), band-limited to Footprint (cm): one lookup (two near a face
- *  edge, where the faces' lookups blend and the gradient includes the weights' own slope).
+ *  per m, a tangent vector at P), band-limited to Footprint (cm): one lookup (two or three near a
+ *  face edge, where the faces' lookups blend and the gradient includes the weights' own slope).
  *  bShape (a constant) false gives only the steering and its curvature (Unit and Gradient
- *  zero), from the steering channel alone: what the differenced terms need. Lambda is Out's. */
+ *  zero), from the steering channel alone: what the differenced terms need. Lambda is Out's.
+ *
+ *  The face blend (N1b) keeps the variance: the faces' tiles are independent, so their weighted
+ *  mean would flatten the layer by up to 30% along every cube edge (the seams seen since T3d).
+ *  The faces' units blend about the layer's mean M (its channels' means, BlendMeanR and G,
+ *  through the character's blend: 0 for the zero-mean peaks) over the root of the weights'
+ *  squares: Unit = M + sum W (U - M) / sqrt(sum W^2). One face (W 1) gives its own unit exactly.
+ *  Near an edge the unit can reach sqrt(2) (at a corner sqrt(3)) of one face's range about M,
+ *  where both faces' tiles are extreme together (VoxelLand::ShapeFor's bounds take it); the
+ *  steering blends the same way, the curvature (a magnitude) as a weighted mean. */
 VOXEL_FUNC FVoxelLandPeaks VoxelLandSetLayerDF(VOXEL_LAND_ARGS_DECL FVoxelLandSetLayer L, float2 PX, float2 PY, float2 PZ, float Character,
     float3 CharacterGradient, float AmplitudeM, float Lambda, float Footprint, bool bShape)
 {
     FVoxelLandPeaks Out = VoxelLandPeaksNone();
     Out.AmplitudeM = AmplitudeM;
     Out.Lambda = Lambda;
+    // Neither the shape nor the steering wanted: the amplitude alone.
+    if (!bShape && !VoxelLandSetSteers(VOXEL_LAND_ARGS 0.0f)) return Out;
 
     const float Band = 2.0f * VOXEL_LAND_PEAK_BAND_CELLS / float(LandN);
     // The face coordinate's change per m along the face's angles: 4 / (pi R), R = 2 N cell / pi.
     const float DSDX = 2.0f / (float(LandN) * LandCellM);
     float WSum = 0.0f;
+    float W2Sum = 0.0f;   // sum of W^2
     float USum = 0.0f;
     float3 GSum = float3(0.0f, 0.0f, 0.0f);    // sum of W grad U + U grad W
     float3 WGrad = float3(0.0f, 0.0f, 0.0f);   // sum of grad W
+    float3 WWGrad = float3(0.0f, 0.0f, 0.0f);  // sum of W grad W
     float3 SSum = float3(0.0f, 0.0f, 0.0f);
     float CSum = 0.0f;
     float DSum = 0.0f;    // sum of W (hard - soft)
@@ -357,25 +389,39 @@ VOXEL_FUNC FVoxelLandPeaks VoxelLandSetLayerDF(VOXEL_LAND_ARGS_DECL FVoxelLandSe
         const float WV = RS * VoxelLandFaceRampSlope(T, Band) * DSDX;
         USum += W * F.Unit;
         WSum += W;
+        W2Sum += W * W;
         GSum = GSum + VoxelLandFaceVector(Frame, W * F.GU + F.Unit * WU, W * F.GV + F.Unit * WV);
         WGrad = WGrad + VoxelLandFaceVector(Frame, WU, WV);
+        WWGrad = WWGrad + VoxelLandFaceVector(Frame, W * WU, W * WV);
         SSum = SSum + VoxelLandFaceVector(Frame, W * F.SU, W * F.SV);
         CSum += W * F.Curve;
         DSum += W * F.HardMinusSoft;
     }
     if (WSum <= 0.0f) return Out;
-    const float Inv = 1.0f / WSum;
-    Out.Unit = USum * Inv;
-    // grad (sum W U / sum W) = (sum (W grad U + U grad W) - Unit sum grad W) / sum W, plus the
-    // character's change (inside 0 .. 1: VoxelLandSetFaceAt saturates it).
-    const float CharacterSlope = (Character > 0.0f && Character < 1.0f) ? DSum * Inv : 0.0f;
-    Out.Gradient = ((GSum - WGrad * Out.Unit) * Inv + CharacterGradient * CharacterSlope) * Out.AmplitudeM;
-    Out.Steer = SSum * (Inv * Out.AmplitudeM);
-    Out.Curve = CSum * (Inv * Out.AmplitudeM);
+    // Q = sqrt(sum W^2), K = sum W / Q (1 on one face).
+    const float InvQ = 1.0f / sqrt(W2Sum);
+    const float InvQ3 = InvQ * InvQ * InvQ;
+    const float K = WSum * InvQ;
+    // The layer's mean through the character's blend (inside 0 .. 1: VoxelLandSetFaceAt
+    // saturates it), and its change in the character.
+    const float C = saturate(Character);
+    const float MeanHard = (L.BlendMeanR - L.MeanR) * L.ScaleR;
+    const float MeanSoft = (L.BlendMeanG - L.MeanG) * L.ScaleG;
+    const float M = bShape ? lerp(MeanSoft, MeanHard, C) : 0.0f;
+    // Unit = M (1 - K) + sum W U / Q; its gradient: - M grad K + grad (sum W U) / Q - sum W U
+    // grad Q / Q^2, with grad K = sum grad W / Q - sum W sum W grad W / Q^3 and grad Q = sum W
+    // grad W / Q; plus the character's change, (MeanHard - MeanSoft)(1 - K) + sum W (hard - soft)
+    // / Q.
+    Out.Unit = M * (1.0f - K) + USum * InvQ;
+    const float CharacterSlope = (Character > 0.0f && Character < 1.0f) ? (MeanHard - MeanSoft) * (1.0f - K) + DSum * InvQ : 0.0f;
+    const float3 KGrad = WGrad * InvQ - WWGrad * (WSum * InvQ3);
+    Out.Gradient = ((GSum * InvQ - WWGrad * (USum * InvQ3)) - KGrad * M + CharacterGradient * CharacterSlope) * Out.AmplitudeM;
+    Out.Steer = SSum * (InvQ * Out.AmplitudeM);
+    Out.Curve = CSum * (Out.AmplitudeM / WSum);
     return Out;
 }
 
-/** The peaks' layer (the set's chain at the buffer's start, the detail tile after it). */
+/** The peaks' layer (the set's chain at the buffer's start; the pack's detail set). */
 VOXEL_FUNC FVoxelLandSetLayer VoxelLandPeakLayer(VOXEL_LAND_ARGS_DECL float Dummy)
 {
     FVoxelLandSetLayer L;
@@ -390,14 +436,17 @@ VOXEL_FUNC FVoxelLandSetLayer VoxelLandPeakLayer(VOXEL_LAND_ARGS_DECL float Dumm
     L.ScaleR = LandPeakScaleR;
     L.ScaleG = LandPeakScaleG;
     L.ScaleB = LandPeakScaleB;
+    // Zero-mean: the blend's mean is 0.
+    L.BlendMeanR = LandPeakMeanR;
+    L.BlendMeanG = LandPeakMeanG;
     L.LevelBias = -1.0f;
-    L.DetailSet = VoxelLandNoiseSetOf(LandPeakDetailBase, LandPeakDetailN, LandPeakDetailMips);
+    L.DetailSet = VoxelLandNoiseSetOf(LandDetailBase, LandDetailN, LandDetailMips);
     L.DetailTexelsPerCell = LandPeakDetailTexelsPerCell;
     L.DetailKind = 1u;
-    L.DetailMeanR = LandPeakDetailMeanR;
-    L.DetailMeanG = LandPeakDetailMeanG;
-    L.DetailScaleR = LandPeakDetailScaleR;
-    L.DetailScaleG = LandPeakDetailScaleG;
+    L.DetailMeanHard = LandDetailMeanHard;
+    L.DetailMeanSoft = LandDetailMeanSoft;
+    L.DetailScaleHard = LandPeakDetailScaleHard;
+    L.DetailScaleSoft = LandPeakDetailScaleSoft;
     L.DetailFade = LandPeakDetailFade;
     return L;
 }

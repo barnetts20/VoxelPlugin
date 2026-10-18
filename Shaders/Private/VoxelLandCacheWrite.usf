@@ -30,12 +30,11 @@ float2 DetailWeight;
 float RidgeGain;
 float SlopeDamping;
 
-// The debug inputs (VoxelLandGPU.h FVoxelLandDebugParameters): the bake's attributes, lake
-// levels and plates, for the fields.
+// The debug inputs (VoxelLandGPU.h FVoxelLandDebugParameters): the bake's attributes and
+// plates, for the fields (the lake levels are the density's: VoxelLandParameters.ush).
 uint LandDebugMode;
 StructuredBuffer<uint> LandAttr;
 float2 LandDebugSeaRadius;
-StructuredBuffer<float> LandWater;
 uint LandDebugHasHydro;
 uint LandDebugHasAttr;
 StructuredBuffer<float> LandPlates;

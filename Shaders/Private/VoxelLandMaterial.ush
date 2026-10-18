@@ -18,7 +18,7 @@
 //   Fields        x the drainage (log2 m^2), y the crust (0 oceanic..1 continental), z the boundary
 //                 class (0..6; +8 under a kept lake), w the kept lake's depth above the analytic
 //                 surface (m, 0 where there is none);
-//   Terms         x the bake (m), y the hillsides: hills, peaks and gullies (m), z the detail (m), w the pixel's height above
+//   Terms         x the bake (m), y the hillsides: hills, peaks, gullies and the rivers' and lakes' carve (m), z the detail (m), w the pixel's height above
 //                 the analytic surface (m: the mesh's error, or an edit);
 //   DebugMask     1 where the node shows a debug view (lerp the base colour to the return value),
 //                 else 0 (no view, or the node off: the vertex colours then carry the views).
@@ -149,7 +149,7 @@ FVoxelLandPixel VoxelLandPixel(VOXEL_LAND_ARGS_DECL float2 PX, float2 PY, float2
     const float3 Up = normalize(float3(PX.x, PY.x, PZ.x));
     Out.Up = Up;
     // Every derivative is taken (uniform control flow); the mode picks.
-    const float Rest = H.Gully + H.Detail + H.Hills + H.Peaks;
+    const float Rest = H.Gully + H.Detail + H.Hills + H.Peaks + H.Carve;
     const float RestX = VOXEL_LAND_DDX(Rest);
     const float RestY = VOXEL_LAND_DDY(Rest);
     const float GullyX = VOXEL_LAND_DDX(H.Gully);
@@ -162,6 +162,8 @@ FVoxelLandPixel VoxelLandPixel(VOXEL_LAND_ARGS_DECL float2 PX, float2 PY, float2
     const float PeakAmplitudeY = VOXEL_LAND_DDY(H.PeakAmplitudeM);
     float DRx = 0.0f;
     float DRy = 0.0f;
+    // R2: the rivers' and lakes' carve scales every term but the detail (CarveScale) and adds
+    // its own gradient (mode 1 takes it with the rest's screen-space change).
     float3 Exact = H.BakeGradient;
     if (NormalMode == 1u)
     {
@@ -170,12 +172,16 @@ FVoxelLandPixel VoxelLandPixel(VOXEL_LAND_ARGS_DECL float2 PX, float2 PY, float2
     }
     else if (NormalMode != 3u)
     {
-        Exact = Exact + H.HillGradient + H.PeakGradient + (H.DetailGradient - Up * dot(H.DetailGradient, Up));
+        Exact = (Exact + H.HillGradient + H.PeakGradient) * H.CarveScale + H.CarveGradient + (H.DetailGradient - Up * dot(H.DetailGradient, Up));
         if (NormalMode == 0u)
         {
-            DRx = GullyX + H.DetailUnit * AmplitudeX + H.HillUnit * HillAmplitudeX + H.PeakUnit * PeakAmplitudeX;
-            DRy = GullyY + H.DetailUnit * AmplitudeY + H.HillUnit * HillAmplitudeY + H.PeakUnit * PeakAmplitudeY;
+            DRx = (GullyX + H.HillUnit * HillAmplitudeX + H.PeakUnit * PeakAmplitudeX) * H.CarveScale + H.DetailUnit * AmplitudeX;
+            DRy = (GullyY + H.HillUnit * HillAmplitudeY + H.PeakUnit * PeakAmplitudeY) * H.CarveScale + H.DetailUnit * AmplitudeY;
         }
+    }
+    else
+    {
+        Exact = Exact * H.CarveScale + H.CarveGradient;
     }
     const float3 Tx = (DdxLocal - Up * dot(DdxLocal, Up)) * 0.01f;
     const float3 Ty = (DdyLocal - Up * dot(DdyLocal, Up)) * 0.01f;
@@ -217,10 +223,10 @@ FVoxelLandPixel VoxelLandPixel(VOXEL_LAND_ARGS_DECL float2 PX, float2 PY, float2
             VoxelDFAdd(LPZ, float2(T2.z * VOXEL_LAND_FIXED_STEP, 0.0f)), Footprint);
         // m per m: the step is in cm.
         const float Inv = 100.0f / VOXEL_LAND_FIXED_STEP;
-        const float D1 = ((C1.Gully - C0.Gully) + H.DetailUnit * (C1.DetailAmplitudeM - C0.DetailAmplitudeM)
-            + H.HillUnit * (C1.HillAmplitudeM - C0.HillAmplitudeM) + H.PeakUnit * (C1.PeakAmplitudeM - C0.PeakAmplitudeM)) * Inv;
-        const float D2 = ((C2.Gully - C0.Gully) + H.DetailUnit * (C2.DetailAmplitudeM - C0.DetailAmplitudeM)
-            + H.HillUnit * (C2.HillAmplitudeM - C0.HillAmplitudeM) + H.PeakUnit * (C2.PeakAmplitudeM - C0.PeakAmplitudeM)) * Inv;
+        const float D1 = (((C1.Gully - C0.Gully) + H.HillUnit * (C1.HillAmplitudeM - C0.HillAmplitudeM) + H.PeakUnit * (C1.PeakAmplitudeM - C0.PeakAmplitudeM)) * H.CarveScale
+            + H.DetailUnit * (C1.DetailAmplitudeM - C0.DetailAmplitudeM)) * Inv;
+        const float D2 = (((C2.Gully - C0.Gully) + H.HillUnit * (C2.HillAmplitudeM - C0.HillAmplitudeM) + H.PeakUnit * (C2.PeakAmplitudeM - C0.PeakAmplitudeM)) * H.CarveScale
+            + H.DetailUnit * (C2.DetailAmplitudeM - C0.DetailAmplitudeM)) * Inv;
         ScreenPart = lerp(ScreenPart, T1 * D1 + T2 * D2, FixedBlend);
     }
     Gradient = Gradient + ScreenPart;
@@ -233,7 +239,7 @@ FVoxelLandPixel VoxelLandPixel(VOXEL_LAND_ARGS_DECL float2 PX, float2 PY, float2
     const float Level = VOXEL_LAND_WATER(Index);
     const float LakeDepth = Level > -1.0e30f ? max(Level - Out.Height, 0.0f) : 0.0f;
     Out.Fields = float4(H.Flow, float(Attr & 0xffu) / 255.0f, float((Attr >> 8u) & 7u) + ((Attr & 0x1000u) != 0u ? 8.0f : 0.0f), LakeDepth);
-    Out.Terms = float4(H.Bake, H.Hills + H.Peaks + H.Gully, H.Detail, Out.Offset);
+    Out.Terms = float4(H.Bake, H.Hills + H.Peaks + H.Gully + H.Carve, H.Detail, Out.Offset);
     return Out;
 }
 

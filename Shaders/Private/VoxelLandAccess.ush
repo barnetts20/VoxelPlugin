@@ -68,6 +68,28 @@ VOXEL_FUNC float VoxelLandDecodeRelief(uint Q)
 #define VOXEL_LAND_RELIEF(I) VoxelLandDecodeRelief((LandRelief[(I) >> 2u] >> (((I) & 3u) * 8u)) & 0xffu)
 #endif
 
+/** A cell's sedimentary province (FVoxelLandBake::Province, VoxelLandPlates.ush
+ *  VoxelLandPackProvince: 0 .. 63) as 0..1. */
+VOXEL_FUNC float VoxelLandUnpackProvince(uint Q)
+{
+    return float(Q) * (1.0f / 63.0f);
+}
+
+/** The bake's province (0..1, T4c) at cell I: four cells per word, the lowest index in the low
+ *  byte (read when LandHasForm: the bakes that have the landform have it too). */
+#ifndef VOXEL_LAND_PROVINCE
+#define VOXEL_LAND_PROVINCE(I) VoxelLandUnpackProvince((LandProvince[(I) >> 2u] >> (((I) & 3u) * 8u)) & 0xffu)
+#endif
+
+/** The rivers' tables (VoxelLandRivers.ush, VoxelLandRiverLayout.ush): tile I's block start,
+ *  and float I of the segments and the tile blocks. */
+#ifndef VOXEL_LAND_RIVER_TILE
+#define VOXEL_LAND_RIVER_TILE(I) LandRiverTiles[I]
+#endif
+#ifndef VOXEL_LAND_RIVER_DATA
+#define VOXEL_LAND_RIVER_DATA(I) LandRiverData[I]
+#endif
+
 /** The bake's attributes (FVoxelLandBake::Attr) at cell I: two cells per word, low half first
  *  (the debug views' buffer). */
 #ifndef VOXEL_LAND_ATTR

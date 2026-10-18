@@ -1,0 +1,44 @@
+// VoxelLandRiverLayout.ush - The rivers' table layout (Design/RiversLakes.md, R1b), shared by the
+// GPU build (VoxelLandRiverBuild.ush) and the per-sample lookup (VoxelLandRivers.ush). Keep equal
+// to VoxelLandRiverBuild.h (TileCells, MaxPerTile, SegFloats).
+//
+// LandRiverTiles: one word per tile (TilesPerFace^2 x 6, face by face, rows of tiles along the
+// face's V axis) and one more: tile t's block is LandRiverData[Tiles[t] .. Tiles[t + 1]), empty
+// when they're equal. LandRiverData (floats):
+//   segments  from 0:                 14 per segment: floor0, floor1, log2 area0, log2 area1
+//                                     (m^2), s0 (m along its chain), length (m), the chain's
+//                                     length (m), flags (and above them, N1b, the trunk's key:
+//                                     VOXEL_LAND_RIVER_TRUNK_*); R3: the turns at its start and end
+//                                     (rad, + to the left downstream; 0 at a chain's ends), the
+//                                     grades of the segments above and below it in its chain
+//                                     (its own at the chain's ends), the meanders' phase at its
+//                                     start (cycles, the fraction) and over it (cycles)
+//   tile blocks after them:           the tile's frame (12: c.xyz, 0, t1.xyz, 0, t2.xyz, 0; its
+//                                     centre's direction and two tangents), then 7 per entry:
+//                                     x0, y0, dx, dy, 1 / (dx^2 + dy^2), the corridor's reach^2
+//                                     (m^2), segment; the ends in the frame's gnomonic plane
+//                                     (m: x = R (p . t1) / (p . c)), the larger rivers first
+
+#ifndef VOXEL_LAND_RIVER_LAYOUT_USH
+#define VOXEL_LAND_RIVER_LAYOUT_USH
+
+#define VOXEL_LAND_RIVER_TILE_CELLS 8
+#define VOXEL_LAND_RIVER_MAX_PER_TILE 128u
+#define VOXEL_LAND_RIVER_FRAME_FLOATS 12u
+#define VOXEL_LAND_RIVER_ENTRY_FLOATS 7u
+#define VOXEL_LAND_RIVER_SEG_FLOATS 14u
+
+// Segment flags (the segment's last float, exact).
+#define VOXEL_LAND_RIVER_FLAG_MOUTH 1u          // ends at the sea
+#define VOXEL_LAND_RIVER_FLAG_LAKE_INLET 2u     // ends in a lake
+#define VOXEL_LAND_RIVER_FLAG_LAKE_OUTLET 4u    // starts at a lake's outlet
+#define VOXEL_LAND_RIVER_FLAG_SOURCE 8u         // starts at a source
+#define VOXEL_LAND_RIVER_FLAG_MASK 15u
+// N1b: the trunk's key in the flags' float above them: the node index of the source at the top of
+// the segment's line of main donors (a river through its confluences), its low 20 bits (with the
+// flags, 24 bits: exact in a float). Two trunks sharing the bits carve as one (a sharp minimum
+// where their valleys meet): harmless, and rare.
+#define VOXEL_LAND_RIVER_TRUNK_SHIFT 4u
+#define VOXEL_LAND_RIVER_TRUNK_MASK 0xfffffu
+
+#endif // VOXEL_LAND_RIVER_LAYOUT_USH

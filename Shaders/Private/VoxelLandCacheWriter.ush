@@ -1,7 +1,8 @@
 // VoxelLandCacheWriter.ush - What the land surface cache holds at a point (VoxelLandCache.ush):
 // the density's land chain (VoxelLandHeightDF) band-limited to Footprint, its height about sea
 // level, and its gradient: the bake's, the detail's, the hills' and the peaks' exact gradients,
-// plus the gullies' (and the detail's, the hills' and the peaks' amplitudes') forward difference over Step (cm). For the compute writer
+// plus the gullies' (and the detail's, the hills' and the peaks' amplitudes') forward difference over Step (cm),
+// all but the detail's through the rivers' and lakes' carve (its slope, and its own gradient: R2). For the compute writer
 // (VoxelLandCacheWrite.usf) and the harness.
 //
 // Shared subset (VoxelShaderCompat.h). Include after VoxelDensitySample.ush.
@@ -29,14 +30,16 @@ VOXEL_FUNC FVoxelLandCacheSurface VoxelLandCacheSurfaceAt(VOXEL_LAND_ARGS_DECL f
     const FVoxelLandDifferenced C2 = VoxelLandDifferencedDF(VOXEL_LAND_ARGS
         VoxelDFAdd(PX, float2(T2.x * Step, 0.0f)), VoxelDFAdd(PY, float2(T2.y * Step, 0.0f)), VoxelDFAdd(PZ, float2(T2.z * Step, 0.0f)), Footprint);
     const float Inv = 100.0f / Step;
-    const float D1 = ((C1.Gully - H.Gully) + H.DetailUnit * (C1.DetailAmplitudeM - H.DetailAmplitudeM)
-        + H.HillUnit * (C1.HillAmplitudeM - H.HillAmplitudeM) + H.PeakUnit * (C1.PeakAmplitudeM - H.PeakAmplitudeM)) * Inv;
-    const float D2 = ((C2.Gully - H.Gully) + H.DetailUnit * (C2.DetailAmplitudeM - H.DetailAmplitudeM)
-        + H.HillUnit * (C2.HillAmplitudeM - H.HillAmplitudeM) + H.PeakUnit * (C2.PeakAmplitudeM - H.PeakAmplitudeM)) * Inv;
+    // The carved terms (R2: scaled by the carve's slope) and the detail's amplitude apart.
+    const float D1 = ((C1.Gully - H.Gully) + H.HillUnit * (C1.HillAmplitudeM - H.HillAmplitudeM) + H.PeakUnit * (C1.PeakAmplitudeM - H.PeakAmplitudeM)) * Inv;
+    const float D2 = ((C2.Gully - H.Gully) + H.HillUnit * (C2.HillAmplitudeM - H.HillAmplitudeM) + H.PeakUnit * (C2.PeakAmplitudeM - H.PeakAmplitudeM)) * Inv;
+    const float E1 = H.DetailUnit * (C1.DetailAmplitudeM - H.DetailAmplitudeM) * Inv;
+    const float E2 = H.DetailUnit * (C2.DetailAmplitudeM - H.DetailAmplitudeM) * Inv;
 
     FVoxelLandCacheSurface Out;
     Out.Height = (AboveBase.x + AboveBase.y) * 0.01f;
-    Out.Gradient = H.BakeGradient + H.HillGradient + H.PeakGradient + (H.DetailGradient - Up * dot(H.DetailGradient, Up)) + T1 * D1 + T2 * D2;
+    Out.Gradient = (H.BakeGradient + H.HillGradient + H.PeakGradient + T1 * D1 + T2 * D2) * H.CarveScale + H.CarveGradient
+        + (H.DetailGradient - Up * dot(H.DetailGradient, Up)) + T1 * E1 + T2 * E2;
     Out.Flow = H.Flow;
     Out.Warped = H.Warped;
     return Out;

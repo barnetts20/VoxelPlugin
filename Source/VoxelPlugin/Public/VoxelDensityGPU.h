@@ -9,6 +9,7 @@
 class FSparseEditStore;
 struct FVoxelLandBake;
 struct FVoxelLandNoiseSet;
+struct FVoxelLandRiverSet;
 
 /** A double as the shaders take it (VoxelDF64.ush): the nearest float and the remainder. */
 inline FVector2f VoxelDoubleFloat(double V)
@@ -78,7 +79,7 @@ struct FVoxelDensityGPUData
     FVector2f LandHillFrequency = FVector2f::ZeroVector;   // cycles per cm, double-float
     uint32 LandHillOctaves = 0;
     uint32 LandHillSeed = 0;
-    TSharedPtr<const FVoxelLandNoiseSet, ESPMode::ThreadSafe> LandNoise;   // the noise pack (null: no peaks and no hill set)
+    TSharedPtr<const FVoxelLandNoiseSet, ESPMode::ThreadSafe> LandNoise;   // the noise pack (null: no peaks, hill set or detail set)
     float LandPeakStrength = 0.0f;       // VoxelLandPeaks.ush (FVoxelDensityCPU's)
     float LandPeakTexelsPerCell = 0.0f;  // 0: none
     uint32 LandPeakSeed = 0;
@@ -91,11 +92,11 @@ struct FVoxelDensityGPUData
     float LandPeakScaleR = 1.0f;
     float LandPeakScaleG = 1.0f;
     float LandPeakScaleB = 1.0f;
-    float LandPeakDetailTexelsPerCell = 0.0f;  // the peaks' detail tile (T3e; its chain: LandNoise's Detail*)
-    float LandPeakDetailMeanR = 0.0f;
-    float LandPeakDetailMeanG = 0.0f;
-    float LandPeakDetailScaleR = 0.0f;
-    float LandPeakDetailScaleG = 0.0f;
+    float LandPeakDetailTexelsPerCell = 0.0f;  // the peaks' detail (T3e; the detail set's chain: LandNoise's Detail*)
+    float LandDetailMeanHard = 0.0f;
+    float LandDetailMeanSoft = 0.0f;
+    float LandPeakDetailScaleHard = 0.0f;
+    float LandPeakDetailScaleSoft = 0.0f;
     float LandPeakDetailFade = 0.0f;
     // The hills' set (VoxelLandHillSet.ush, T4a; its chain: LandNoise's Hill*). 0 texels: none
     // (the procedural hills, LandHillFrequency and LandHillOctaves).
@@ -103,15 +104,55 @@ struct FVoxelDensityGPUData
     float LandHillScaleR = 1.0f;
     float LandHillScaleG = 1.0f;
     float LandHillScaleB = 1.0f;
+    float LandHillMeanR = 0.0f;       // N1b: R's and G's means (unit), for the face blend
+    float LandHillMeanG = 0.0f;
     float LandHillSpacingM = 0.0f;
     float LandHillSwellTexelsPerCell = 0.0f;   // 0: no swells
     float LandHillSwellM = 0.0f;
     float LandHillSwellScaleG = 1.0f;
     float LandHillDetailTexelsPerCell = 0.0f;  // 0: no detail
-    float LandHillDetailScaleR = 0.0f;
-    float LandHillDetailScaleG = 0.0f;
+    float LandHillDetailScaleHard = 0.0f;
+    float LandHillDetailScaleSoft = 0.0f;
     float LandHillDetailFade = 0.0f;
     float LandHillFoothill = 0.0f;         // T4b: the hills' growth in the foothills
+    float LandStrataTexelsPerCell = 0.0f;      // T4c: the strata set's placement (0: none)
+    float LandStrataScaleR = 1.0f;
+    float LandStrataScaleG = 1.0f;
+    float LandStrataScaleB = 1.0f;
+    float LandStrataMeanR = 0.0f;
+    float LandStrataMeanG = 0.0f;
+    float LandStrataSpacingM = 0.0f;
+    float LandStrataRelief = 0.0f;             // m: the set's relief times the strength, capped
+    float LandStrataFlat = 0.0f;               // its share on the flats
+    float LandStrataThreshold = 2.0f;          // the province switch (above 1: none)
+    float LandStrataWidth = 0.05f;
+    uint32 LandStrataSeed = 0;
+    float LandStrataDetailTexelsPerCell = 0.0f;   // 0: no detail
+    float LandStrataDetailScaleHard = 0.0f;
+    float LandStrataDetailScaleSoft = 0.0f;
+    float LandStrataDetailFade = 0.0f;
+    TSharedPtr<const FVoxelLandRiverSet, ESPMode::ThreadSafe> LandRivers;   // R1: the rivers (null: none)
+    uint32 LandRiverTilesPerFace = 0;          // R1: the rivers (0: none)
+    float LandRiverRadiusM = 1.0f;
+    float LandRiverWidthScale = 1.0f;
+    float LandRiverValleyScale = 1.0f;
+    // R2: the rivers' and lakes' carve (VoxelLandCarve.ush; FVoxelDensityCPU's).
+    float LandRiverCarve = 0.0f;
+    float LandRiverDepthScale = 1.0f;
+    float LandRiverFloodplainScale = 1.0f;
+    float LandRiverMinLog2Area = 0.0f;
+    float LandLakeShoreBand = 0.0f;
+    float LandRiverMeander = 0.0f;
+    float LandRiverFalls = 0.0f;
+    uint32 LandHasWater = 0;               // 1: the bake's lake levels are bound (LandWater)
+    // N1: the detail layer from the pack's detail set (VoxelLandDetail.ush; FVoxelDensityCPU's).
+    float LandDetailTexelsPerCell = 0.0f;
+    uint32 LandDetailScales = 0;
+    float LandDetailMeanA = 0.0f;
+    float LandDetailScaleA = 0.0f;
+    float LandDetailScaleGain = 0.0f;
+    float LandDetailFade = 0.0f;
+    uint32 LandDetailSeed = 0;
 };
 
 /** The edit store's edits and index for the GPU (VoxelEditSample.ush; the layout is

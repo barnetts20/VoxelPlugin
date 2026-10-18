@@ -21,6 +21,9 @@ namespace VoxelShader
         const uint* LandFlow = nullptr;
         const uint* LandForm = nullptr;
         const uint* LandRelief = nullptr;
+        const uint* LandProvince = nullptr;
+        const uint* LandRiverTiles = nullptr;
+        const float* LandRiverData = nullptr;
         const uint* LandNoise = nullptr;
         uint LandN = 1;
         uint LandPad = 0;
@@ -50,14 +53,14 @@ namespace VoxelShader
         float LandPeakScaleB = 1.0f;
         uint LandNoiseN = 0;
         uint LandNoiseMips = 0;
-        uint LandPeakDetailBase = 0;
-        uint LandPeakDetailN = 0;
-        uint LandPeakDetailMips = 0;
+        uint LandDetailBase = 0;
+        uint LandDetailN = 0;
+        uint LandDetailMips = 0;
         float LandPeakDetailTexelsPerCell = 0.0f;
-        float LandPeakDetailMeanR = 0.0f;
-        float LandPeakDetailMeanG = 0.0f;
-        float LandPeakDetailScaleR = 0.0f;
-        float LandPeakDetailScaleG = 0.0f;
+        float LandDetailMeanHard = 0.0f;
+        float LandDetailMeanSoft = 0.0f;
+        float LandPeakDetailScaleHard = 0.0f;
+        float LandPeakDetailScaleSoft = 0.0f;
         float LandPeakDetailFade = 0.0f;
         float LandHillTexelsPerCell = 0.0f;
         uint LandHillBase = 0;
@@ -66,15 +69,56 @@ namespace VoxelShader
         float LandHillScaleR = 1.0f;
         float LandHillScaleG = 1.0f;
         float LandHillScaleB = 1.0f;
+        float LandHillMeanR = 0.0f;
+        float LandHillMeanG = 0.0f;
         float LandHillSpacingM = 0.0f;
         float LandHillSwellTexelsPerCell = 0.0f;
         float LandHillSwellM = 0.0f;
         float LandHillSwellScaleG = 1.0f;
         float LandHillDetailTexelsPerCell = 0.0f;
-        float LandHillDetailScaleR = 0.0f;
-        float LandHillDetailScaleG = 0.0f;
+        float LandHillDetailScaleHard = 0.0f;
+        float LandHillDetailScaleSoft = 0.0f;
         float LandHillDetailFade = 0.0f;
         float LandHillFoothill = 0.0f;
+        float LandStrataTexelsPerCell = 0.0f;
+        uint LandStrataBase = 0;
+        uint LandStrataN = 0;
+        uint LandStrataMips = 0;
+        float LandStrataScaleR = 1.0f;
+        float LandStrataScaleG = 1.0f;
+        float LandStrataScaleB = 1.0f;
+        float LandStrataMeanR = 0.0f;
+        float LandStrataMeanG = 0.0f;
+        float LandStrataSpacingM = 0.0f;
+        float LandStrataRelief = 0.0f;
+        float LandStrataFlat = 0.0f;
+        float LandStrataThreshold = 2.0f;
+        float LandStrataWidth = 0.05f;
+        uint LandStrataSeed = 0;
+        float LandStrataDetailTexelsPerCell = 0.0f;
+        float LandStrataDetailScaleHard = 0.0f;
+        float LandStrataDetailScaleSoft = 0.0f;
+        float LandStrataDetailFade = 0.0f;
+        uint LandRiverTilesPerFace = 0;
+        float LandRiverRadiusM = 1.0f;
+        float LandRiverWidthScale = 1.0f;
+        float LandRiverValleyScale = 1.0f;
+        const float* LandWater = nullptr;
+        uint LandHasWater = 0;
+        float LandRiverCarve = 0.0f;
+        float LandRiverDepthScale = 1.0f;
+        float LandRiverFloodplainScale = 1.0f;
+        float LandRiverMinLog2Area = 0.0f;
+        float LandLakeShoreBand = 0.0f;
+        float LandRiverMeander = 0.0f;
+        float LandRiverFalls = 0.0f;
+        float LandDetailTexelsPerCell = 0.0f;
+        uint LandDetailScales = 0;
+        float LandDetailMeanA = 0.0f;
+        float LandDetailScaleA = 0.0f;
+        float LandDetailScaleGain = 0.0f;
+        float LandDetailFade = 0.0f;
+        uint LandDetailSeed = 0;
 
 #include "VoxelLandSample.ush"
 #include "VoxelLandGully.ush"
@@ -90,6 +134,8 @@ namespace
     constexpr uint32 SaltLandGully = 0x21u;
     constexpr uint32 SaltLandHill = 0x31u;
     constexpr uint32 SaltLandPeak = 0x41u;
+    constexpr uint32 SaltLandStrata = 0x51u;
+    constexpr uint32 SaltLandDetail = 0x61u;
 
     /** The sampling warp of the land bake: three octaves of fBm per component, its longest
      *  wavelength six bake cells. */
@@ -170,22 +216,17 @@ FVoxelDensityCPU::FVoxelDensityCPU(const FVoxelTerrestrialSettings& InLand, TSha
     LandSampleRadius = FMath::Max(LandBake->SeaRadius, 1.0);
     const double SampleRadius = LandSampleRadius;
 
-    // The detail layer through the noise surface's machinery (no continents or mountains):
-    // octaves from DetailWavelength down to the finest cell, slope-damped, gain 0.5.
+    // The noise surface's layers are empty (N1: the detail layer is the detail set's,
+    // VoxelLandDetail.ush, below); the octave table holds only the warp's.
     Settings = FVoxelSurfaceSettings();
     Settings.Seed = InLand.Seed;
     Settings.Lacunarity = 2.0;
     Settings.ContinentOctaves = 0;
     Settings.MountainOctaves = 0;
-    const double DetailWavelength = FMath::Max(InLand.DetailWavelength, 1.0) * 100.0;
-    Settings.DetailWavelength = DetailWavelength / SampleRadius;
-    Settings.DetailGain = 0.5;
-    Settings.DetailSlopeDamping = FMath::Max(InLand.DetailSlopeDamping, 0.0);
-    const double Finest = FMath::Max(MinFootprint, 1.0);
-    Settings.DetailOctaves = FMath::Clamp(FMath::CeilToInt(FMath::Log2(DetailWavelength / Finest)) + 1, 1, 24);
+    Settings.DetailOctaves = 0;
     Continent = MakeLayer(VoxelShader::VoxelLayerPlain, 1.0, SampleRadius, 2.0, 0.5, 0, VoxelShader::VoxelHashSeed(Seed, SaltContinent));
     Mountain = MakeLayer(VoxelShader::VoxelLayerRidged, 1.0, SampleRadius, 2.0, 0.5, 0, VoxelShader::VoxelHashSeed(Seed, SaltMountain));
-    Detail = MakeLayer(VoxelShader::VoxelLayerDamped, Settings.DetailWavelength, SampleRadius, 2.0, Settings.DetailGain, Settings.DetailOctaves, VoxelShader::VoxelHashSeed(Seed, SaltDetail));
+    Detail = MakeLayer(VoxelShader::VoxelLayerDamped, 1.0, SampleRadius, 2.0, 0.5, 0, VoxelShader::VoxelHashSeed(Seed, SaltDetail));
 
     const double Cell = VoxelLand::CellArc(LandBake->SeaRadius, LandBake->N);
     const double WarpFraction = LandWarpWavelengthCells * Cell / SampleRadius;
@@ -240,17 +281,52 @@ FVoxelDensityCPU::FVoxelDensityCPU(const FVoxelTerrestrialSettings& InLand, TSha
         LandReliefPacked.SetNumZeroed((LandBake->Relief.Num() + 3) / 4);
         for (int32 i = 0; i < LandBake->Relief.Num(); i++)
             LandReliefPacked[i >> 2] |= (uint32)LandBake->Relief[i] << ((i & 3) * 8);
+        // The province (T4c), packed as the relief: zeros if the bake has none.
+        LandProvincePacked.SetNumZeroed(LandReliefPacked.Num());
+        if (LandBake->Province.Num() == LandBake->NumCells())
+            for (int32 i = 0; i < LandBake->Province.Num(); i++)
+                LandProvincePacked[i >> 2] |= (uint32)FMath::Min(LandBake->Province[i], (uint8)63) << ((i & 3) * 8);
     }
-    // The noise pack: the peaks' set, the detail tile, the hills' set (T4a).
-    if (LandFormPacked.Num() > 0 && LandReliefPacked.Num() > 0)
-        LandNoise = VoxelLand::GetLandNoise(VoxelLand::LandNoiseNameFor(InLand));
-    if (LandNoise.IsValid() && LandPeakStrength > 0.0f && LandNoise->N > 0)
+    // The noise pack: the peaks' set, the detail set, the hills' set (T4a), the strata's (T4c).
+    // The layers on the landform need the landform; the detail layer (N1) doesn't.
+    const bool bHasForm = LandFormPacked.Num() > 0 && LandReliefPacked.Num() > 0;
+    LandNoise = VoxelLand::GetLandNoise(VoxelLand::LandNoiseNameFor(InLand));
+    if (LandNoise.IsValid() && bHasForm && LandPeakStrength > 0.0f && LandNoise->N > 0)
         LandPeakTexelsPerCell = VoxelLand::PeakTexelsPerCell(InLand, *LandBake, *LandNoise);
     if (LandNoise.IsValid() && LandNoise->DetailN > 0)
     {
-        // The detail tile's means, whoever reads it (the peaks, the hills' set).
-        LandPeakDetailMeanR = LandNoise->DetailMeanR;
-        LandPeakDetailMeanG = LandNoise->DetailMeanG;
+        // The detail set's means, whoever reads it (the peaks, the hills' and the strata's sets).
+        LandDetailMeanHard = LandNoise->DetailMeanHard;
+        LandDetailMeanSoft = LandNoise->DetailMeanSoft;
+    }
+    // N1: the detail layer (VoxelLandDetail.ush): scales of the set's A channel, four octaves
+    // each, the first's coarsest at DetailWavelength, from there down to the finest cell (at most
+    // DetailMaxScales), and no finer than the lattice's range holds (VoxelLandPeakRotated: the
+    // turned texel coordinates, at most sqrt 2 times the face's half-width and blend band in
+    // texels, under 2^30).
+    LandDetailSeed = VoxelShader::VoxelHashSeed(Seed, SaltLandDetail);
+    if (LandNoise.IsValid() && LandNoise->DetailN > 0 && LandNoise->DetailSpacingTexels > 0 && LandDetailAmplitude > 0.0 && LandNoise->DetailStdA > 0.0f)
+    {
+        const FVoxelLandNoiseSet& Set = *LandNoise;
+        const double WavelengthM = VoxelLand::DetailLayerWavelength(InLand);
+        const double TexelM = WavelengthM / (double)Set.DetailSpacingTexels;
+        LandDetailTexelsPerCell = (float)((double)LandCellM / TexelM);
+        // Octaves from the wavelength to the finest cell, four a scale.
+        const double Finest = FMath::Max(MinFootprint, 1.0) * 0.01;
+        const int32 Octaves = FMath::Max(FMath::CeilToInt(FMath::Log2(WavelengthM / Finest)) + 1, 1);
+        int32 Scales = FMath::Clamp((Octaves + 3) / 4, 1, VoxelLand::DetailMaxScales);
+        const double FaceTexels = UE_SQRT_2 * (0.5 * (double)LandBake->N + 4.0);
+        while (Scales > 1 && (double)LandDetailTexelsPerCell * FMath::Pow(16.0, (double)(Scales - 1)) * FaceTexels >= 1073741824.0)
+            Scales--;
+        LandDetailScales = (uint32)Scales;
+        LandDetailMeanA = Set.DetailMeanA;
+        // A's unit over its standard deviation times 0.4 (the old fBm's normalisation).
+        LandDetailScaleA = 0.4f / Set.DetailStdA;
+        // One scale to the next: A's gain to the fourth (its octaves' spectrum continued).
+        LandDetailScaleGain = Set.DetailScaleGain;
+        LandDetailFade = (float)FMath::FloorLog2(Set.DetailSpacingTexels) - 1.0f;
+        UE_LOG(LogVoxelPlugin, Log, TEXT("[VoxelLand] Detail %s: %d scales from %.0f m (finest octave %.2f m), %.0f m amplitude."),
+            *Set.DetailName, Scales, WavelengthM, WavelengthM / FMath::Pow(16.0, (double)(Scales - 1)) / 8.0, LandDetailAmplitude * 0.01);
     }
     if (LandPeakTexelsPerCell > 0.0f)
     {
@@ -265,7 +341,7 @@ FVoxelDensityCPU::FVoxelDensityCPU(const FVoxelTerrestrialSettings& InLand, TSha
         LandPeakScaleR = Set.RangeR / Range;
         LandPeakScaleG = Set.RangeG / Range;
         LandPeakScaleB = Set.RangeB / Range;
-        // The detail tile (T3e): its own texel; its heights (texels) over the peaks' relief, so
+        // The detail set (T3e, N1): its own texel; its heights (texels) over the peaks' relief, so
         // strength 1 keeps its slopes; faded out by the mip level where its coarsest octave
         // (DetailSpacingTexels) has two texels.
         LandPeakDetailTexelsPerCell = VoxelLand::PeakDetailTexelsPerCell(InLand, *LandBake, Set);
@@ -273,8 +349,8 @@ FVoxelDensityCPU::FVoxelDensityCPU(const FVoxelTerrestrialSettings& InLand, TSha
         {
             const float DetailTexelM = LandCellM / LandPeakDetailTexelsPerCell;
             const float Strength = (float)InLand.PeakDetailStrength;
-            LandPeakDetailScaleR = Strength * Set.DetailRangeR * DetailTexelM / LandPeakReliefM;
-            LandPeakDetailScaleG = Strength * Set.DetailRangeG * DetailTexelM / LandPeakReliefM;
+            LandPeakDetailScaleHard = Strength * Set.DetailRangeHard * DetailTexelM / LandPeakReliefM;
+            LandPeakDetailScaleSoft = Strength * Set.DetailRangeSoft * DetailTexelM / LandPeakReliefM;
             LandPeakDetailFade = (float)FMath::FloorLog2(Set.DetailSpacingTexels) - 1.0f;
         }
     }
@@ -287,7 +363,7 @@ FVoxelDensityCPU::FVoxelDensityCPU(const FVoxelTerrestrialSettings& InLand, TSha
     // The hills from the pack's set (VoxelLandHillSet.ush, T4a): placed at the hill spacing, from
     // its base network up; LandHillRelief becomes the set's relief (m) times the height scale,
     // capped (HillSetReliefCap). Else the procedural hills above.
-    if (LandNoise.IsValid() && LandHillRelief > 0.0f && LandNoise->HillN > 0)
+    if (LandNoise.IsValid() && bHasForm && LandHillRelief > 0.0f && LandNoise->HillN > 0)
         LandHillTexelsPerCell = VoxelLand::HillTexelsPerCell(InLand, *LandBake, *LandNoise);
     if (LandHillTexelsPerCell > 0.0f)
     {
@@ -306,6 +382,8 @@ FVoxelDensityCPU::FVoxelDensityCPU(const FVoxelTerrestrialSettings& InLand, TSha
         LandHillScaleR = Set.HillRangeR / Range;
         LandHillScaleG = Set.HillRangeG / Range;
         LandHillScaleB = Set.HillRangeB / Range;
+        LandHillMeanR = Set.HillMeanR;
+        LandHillMeanG = Set.HillMeanG;
         if (InLand.HillSwellHeight > 0.0)
         {
             LandHillSwellTexelsPerCell = LandHillTexelsPerCell / (float)FMath::Clamp(InLand.HillSwellScale, 1.5, 8.0);
@@ -313,7 +391,7 @@ FVoxelDensityCPU::FVoxelDensityCPU(const FVoxelTerrestrialSettings& InLand, TSha
             // G's whole range is the swells' unit.
             LandHillSwellScaleG = 1.0f;
         }
-        // The detail tile, as the peaks': its heights (texels) over the set's relief, so strength 1
+        // The detail set, as the peaks': its heights (texels) over the set's relief, so strength 1
         // keeps its slopes where the hills keep theirs.
         if (InLand.HillDetailStrength > 0.0 && Set.DetailN > 0 && Set.DetailSpacingTexels > 0)
         {
@@ -321,13 +399,79 @@ FVoxelDensityCPU::FVoxelDensityCPU(const FVoxelTerrestrialSettings& InLand, TSha
             LandHillDetailTexelsPerCell = (float)(LandCellM / DetailTexelM);
             const float DetailTexelMF = LandCellM / LandHillDetailTexelsPerCell;
             const float Strength = (float)InLand.HillDetailStrength;
-            LandHillDetailScaleR = Strength * Set.DetailRangeR * DetailTexelMF / ReliefM;
-            LandHillDetailScaleG = Strength * Set.DetailRangeG * DetailTexelMF / ReliefM;
+            LandHillDetailScaleHard = Strength * Set.DetailRangeHard * DetailTexelMF / ReliefM;
+            LandHillDetailScaleSoft = Strength * Set.DetailRangeSoft * DetailTexelMF / ReliefM;
             LandHillDetailFade = (float)FMath::FloorLog2(Set.DetailSpacingTexels) - 1.0f;
         }
     }
-    if (LandPeakTexelsPerCell <= 0.0f && LandHillTexelsPerCell <= 0.0f)
+    // The strata (VoxelLandHillSet.ush, T4c): the pack's strata set, placed at the strata spacing,
+    // where the province is above the threshold for StrataCoverage of the land; in the hill
+    // set's layer (none without it).
+    LandStrataSeed = VoxelShader::VoxelHashSeed(Seed, SaltLandStrata);
+    if (LandHillTexelsPerCell > 0.0f && LandNoise->StrataN > 0)
+        LandStrataTexelsPerCell = VoxelLand::StrataTexelsPerCell(InLand, *LandBake, *LandNoise);
+    if (LandStrataTexelsPerCell > 0.0f)
+    {
+        const FVoxelLandNoiseSet& Set = *LandNoise;
+        const float TexelM = LandCellM / LandStrataTexelsPerCell;
+        const float Range = FMath::Max3(Set.StrataRangeR, Set.StrataRangeG, 1e-6f);
+        const float ReliefM = Range * TexelM;
+        const float Wanted = (float)InLand.StrataHeightScale * ReliefM;
+        const float Cap = (float)VoxelLand::StrataSetReliefCap(InLand);
+        if (Wanted > Cap)
+            UE_LOG(LogVoxelPlugin, Warning, TEXT("[VoxelLand] The strata set %s's relief (%.0f m at StrataHeightScale %.2f) is over half StrataSpacing; capped at %.0f m."),
+                *Set.StrataName, Wanted, InLand.StrataHeightScale, Cap);
+        LandStrataRelief = FMath::Min(Wanted, Cap);
+        LandStrataSpacingM = (float)FMath::Max(InLand.StrataSpacing, VoxelLand::HillMinSpacing);
+        LandStrataScaleR = Set.StrataRangeR / Range;
+        LandStrataScaleG = Set.StrataRangeG / Range;
+        LandStrataScaleB = Set.StrataRangeB / Range;
+        LandStrataMeanR = Set.StrataMeanR;
+        LandStrataMeanG = Set.StrataMeanG;
+        LandStrataFlat = (float)FMath::Clamp(InLand.StrataFlatShare, 0.0, 1.0);
+        LandStrataWidth = (float)FMath::Clamp(InLand.StrataSwitchWidth, 0.005, 0.5);
+        // At least the switch's half-width above 0: the shields and belt cores (province 0)
+        // keep the hills whatever the coverage.
+        LandStrataThreshold = FMath::Max(LandBake->ProvinceThreshold(InLand.StrataCoverage), LandStrataWidth);
+        if (InLand.StrataDetailStrength > 0.0 && Set.DetailN > 0 && Set.DetailSpacingTexels > 0)
+        {
+            const double DetailTexelM = VoxelLand::StrataDetailWavelength(InLand) / (double)Set.DetailSpacingTexels;
+            LandStrataDetailTexelsPerCell = (float)(LandCellM / DetailTexelM);
+            const float DetailTexelMF = LandCellM / LandStrataDetailTexelsPerCell;
+            const float Strength = (float)InLand.StrataDetailStrength;
+            LandStrataDetailScaleHard = Strength * Set.DetailRangeHard * DetailTexelMF / ReliefM;
+            LandStrataDetailScaleSoft = Strength * Set.DetailRangeSoft * DetailTexelMF / ReliefM;
+            LandStrataDetailFade = (float)FMath::FloorLog2(Set.DetailSpacingTexels) - 1.0f;
+        }
+        UE_LOG(LogVoxelPlugin, Log, TEXT("[VoxelLand] Strata %s: %.0f m relief at %.0f m spacing over %.0f%% of the land (province above %.3f)."),
+            *Set.StrataName, LandStrataRelief, LandStrataSpacingM, 100.0 * FMath::Clamp(InLand.StrataCoverage, 0.0, 1.0), LandStrataThreshold);
+    }
+    if (LandPeakTexelsPerCell <= 0.0f && LandHillTexelsPerCell <= 0.0f && LandDetailTexelsPerCell <= 0.0f)
         LandNoise.Reset();
+
+    // The rivers (VoxelLandRivers.ush, R1): made on the GPU with the bake, or by VoxelLand::TickRivers
+    // before the planet builds (null until then).
+    LandRivers = VoxelLand::GetRivers(*LandBake, InLand);
+    if (LandRivers.IsValid() && LandRivers->TilesPerFace > 0)
+    {
+        LandRiverTilesPerFace = (uint32)LandRivers->TilesPerFace;
+        LandRiverRadiusM = (float)(LandBake->SeaRadius * 0.01);
+        LandRiverWidthScale = (float)FMath::Max(InLand.RiverWidthScale, 0.1);
+        LandRiverValleyScale = (float)FMath::Max(InLand.ValleyWidthScale, 0.1);
+    }
+    else
+        LandRivers.Reset();
+
+    // R2: the rivers' and lakes' carve (VoxelLandCarve.ush). The lakes need the bake's levels.
+    LandRiverCarve = InLand.bCarveRivers ? 1.0f : 0.0f;
+    LandRiverDepthScale = (float)FMath::Max(InLand.RiverDepthScale, 0.0);
+    LandRiverFloodplainScale = (float)FMath::Max(InLand.FloodplainScale, 0.0);
+    LandRiverMinLog2Area = InLand.RiverMinArea > 0.0 ? (float)FMath::Log2(InLand.RiverMinArea * 1.0e6) : 0.0f;
+    LandLakeShoreBand = InLand.bCarveRivers ? (float)FMath::Max(InLand.LakeShoreBand, 0.0) : 0.0f;
+    // R3: the meanders and the knickpoints' falls.
+    LandRiverMeander = (float)FMath::Max(InLand.RiverMeander, 0.0);
+    LandRiverFalls = (float)FMath::Clamp(InLand.RiverFalls, 0.0, 1.4);
+    LandHasWater = InLand.bCarveRivers && LandBake->Water.Num() == LandBake->NumCells() ? 1u : 0u;
 }
 
 FVoxelDensityCPU::FLayer FVoxelDensityCPU::MakeLayer(uint32 Kind, double WavelengthFraction, double InPlanetRadius, double InLacunarity, double InGain, int32 InOctaves, uint32 InSeed)
@@ -467,6 +611,11 @@ double FVoxelDensityCPU::HeightAt(const FVector& Dir, double Footprint) const
 
 double FVoxelDensityCPU::LandHeightAt(const FVector& SurfacePoint, double Footprint) const
 {
+    return LandSurfaceAt(SurfacePoint, Footprint, nullptr);
+}
+
+double FVoxelDensityCPU::LandSurfaceAt(const FVector& SurfacePoint, double Footprint, FVoxelWaterSample* OutWater) const
+{
     using namespace VoxelShader;
 
     // The bake through the sampling warp (every octave: the warp doesn't change with the
@@ -496,15 +645,42 @@ double FVoxelDensityCPU::LandHeightAt(const FVector& SurfacePoint, double Footpr
     Sampler.LandHillOctaves = LandHillOctaves;
     Sampler.LandHillSeed = LandHillSeed;
     Sampler.LandRelief = LandReliefPacked.GetData();
+    Sampler.LandProvince = LandProvincePacked.GetData();
+    if (LandRivers.IsValid())
+    {
+        Sampler.LandRiverTiles = LandRivers->Tiles.GetData();
+        Sampler.LandRiverData = LandRivers->Data.GetData();
+        Sampler.LandRiverTilesPerFace = LandRiverTilesPerFace;
+        Sampler.LandRiverRadiusM = LandRiverRadiusM;
+        Sampler.LandRiverWidthScale = LandRiverWidthScale;
+        Sampler.LandRiverValleyScale = LandRiverValleyScale;
+    }
+    // R2: the carve (the lakes with the bake's levels).
+    Sampler.LandRiverCarve = LandRiverCarve;
+    Sampler.LandRiverDepthScale = LandRiverDepthScale;
+    Sampler.LandRiverFloodplainScale = LandRiverFloodplainScale;
+    Sampler.LandRiverMinLog2Area = LandRiverMinLog2Area;
+    Sampler.LandLakeShoreBand = LandLakeShoreBand;
+    Sampler.LandRiverMeander = LandRiverMeander;
+    Sampler.LandRiverFalls = LandRiverFalls;
+    Sampler.LandHasWater = LandHasWater;
+    Sampler.LandDetailSeed = LandDetailSeed;
+    Sampler.LandWater = LandHasWater != 0u ? LandBake->Water.GetData() : nullptr;
     if (LandNoise.IsValid())
     {
         Sampler.LandNoise = LandNoise->Words.GetData();
-        // The detail tile's chain and means, whoever reads it.
-        Sampler.LandPeakDetailBase = LandNoise->DetailBase;
-        Sampler.LandPeakDetailN = LandNoise->DetailN;
-        Sampler.LandPeakDetailMips = LandNoise->DetailMips;
-        Sampler.LandPeakDetailMeanR = LandPeakDetailMeanR;
-        Sampler.LandPeakDetailMeanG = LandPeakDetailMeanG;
+        // The detail set's chain and means, whoever reads it.
+        Sampler.LandDetailBase = LandNoise->DetailBase;
+        Sampler.LandDetailN = LandNoise->DetailN;
+        Sampler.LandDetailMips = LandNoise->DetailMips;
+        Sampler.LandDetailMeanHard = LandDetailMeanHard;
+        Sampler.LandDetailMeanSoft = LandDetailMeanSoft;
+        Sampler.LandDetailTexelsPerCell = LandDetailTexelsPerCell;
+        Sampler.LandDetailScales = LandDetailScales;
+        Sampler.LandDetailMeanA = LandDetailMeanA;
+        Sampler.LandDetailScaleA = LandDetailScaleA;
+        Sampler.LandDetailScaleGain = LandDetailScaleGain;
+        Sampler.LandDetailFade = LandDetailFade;
         Sampler.LandHillTexelsPerCell = LandHillTexelsPerCell;
         Sampler.LandHillBase = LandNoise->HillBase;
         Sampler.LandHillN = LandNoise->HillN;
@@ -512,15 +688,36 @@ double FVoxelDensityCPU::LandHeightAt(const FVector& SurfacePoint, double Footpr
         Sampler.LandHillScaleR = LandHillScaleR;
         Sampler.LandHillScaleG = LandHillScaleG;
         Sampler.LandHillScaleB = LandHillScaleB;
+        Sampler.LandHillMeanR = LandHillMeanR;
+        Sampler.LandHillMeanG = LandHillMeanG;
         Sampler.LandHillSpacingM = LandHillSpacingM;
         Sampler.LandHillSwellTexelsPerCell = LandHillSwellTexelsPerCell;
         Sampler.LandHillSwellM = LandHillSwellM;
         Sampler.LandHillSwellScaleG = LandHillSwellScaleG;
         Sampler.LandHillDetailTexelsPerCell = LandHillDetailTexelsPerCell;
-        Sampler.LandHillDetailScaleR = LandHillDetailScaleR;
-        Sampler.LandHillDetailScaleG = LandHillDetailScaleG;
+        Sampler.LandHillDetailScaleHard = LandHillDetailScaleHard;
+        Sampler.LandHillDetailScaleSoft = LandHillDetailScaleSoft;
         Sampler.LandHillDetailFade = LandHillDetailFade;
         Sampler.LandHillFoothill = LandHillFoothill;
+        Sampler.LandStrataTexelsPerCell = LandStrataTexelsPerCell;
+        Sampler.LandStrataBase = LandNoise->StrataBase;
+        Sampler.LandStrataN = LandNoise->StrataN;
+        Sampler.LandStrataMips = LandNoise->StrataMips;
+        Sampler.LandStrataScaleR = LandStrataScaleR;
+        Sampler.LandStrataScaleG = LandStrataScaleG;
+        Sampler.LandStrataScaleB = LandStrataScaleB;
+        Sampler.LandStrataMeanR = LandStrataMeanR;
+        Sampler.LandStrataMeanG = LandStrataMeanG;
+        Sampler.LandStrataSpacingM = LandStrataSpacingM;
+        Sampler.LandStrataRelief = LandStrataRelief;
+        Sampler.LandStrataFlat = LandStrataFlat;
+        Sampler.LandStrataThreshold = LandStrataThreshold;
+        Sampler.LandStrataWidth = LandStrataWidth;
+        Sampler.LandStrataSeed = LandStrataSeed;
+        Sampler.LandStrataDetailTexelsPerCell = LandStrataDetailTexelsPerCell;
+        Sampler.LandStrataDetailScaleHard = LandStrataDetailScaleHard;
+        Sampler.LandStrataDetailScaleSoft = LandStrataDetailScaleSoft;
+        Sampler.LandStrataDetailFade = LandStrataDetailFade;
         Sampler.LandNoiseN = LandNoise->N;
         Sampler.LandNoiseMips = LandNoise->Mips;
         Sampler.LandPeakStrength = LandPeakStrength;
@@ -538,8 +735,8 @@ double FVoxelDensityCPU::LandHeightAt(const FVector& SurfacePoint, double Footpr
         if (LandPeakDetailTexelsPerCell > 0.0f)
         {
             Sampler.LandPeakDetailTexelsPerCell = LandPeakDetailTexelsPerCell;
-            Sampler.LandPeakDetailScaleR = LandPeakDetailScaleR;
-            Sampler.LandPeakDetailScaleG = LandPeakDetailScaleG;
+            Sampler.LandPeakDetailScaleHard = LandPeakDetailScaleHard;
+            Sampler.LandPeakDetailScaleSoft = LandPeakDetailScaleSoft;
             Sampler.LandPeakDetailFade = LandPeakDetailFade;
         }
     }
@@ -557,13 +754,64 @@ double FVoxelDensityCPU::LandHeightAt(const FVector& SurfacePoint, double Footpr
         ToDoubleFloat(SurfacePoint.X), ToDoubleFloat(SurfacePoint.Y), ToDoubleFloat(SurfacePoint.Z),
         ToDoubleFloat(Q.X), ToDoubleFloat(Q.Y), ToDoubleFloat(Q.Z), ToFloat3(DW[0]), ToFloat3(DW[1]), ToFloat3(DW[2]), (float)Footprint, false);
 
-    // Detail, a quarter as strong under the sea and scaled by GullyDetailScale on land while
-    // there are gullies (VoxelDensitySample.ush in float the same way).
+    // Detail (VoxelLandDetail.ush), a quarter as strong under the sea and scaled by
+    // GullyDetailScale on land while there are gullies (VoxelDensitySample.ush the same way).
     const float DetailWeight = lerp(0.25f, 1.0f, smoothstep(-50.0f, 50.0f, Land.Bake));
-    const double D = EvaluateLayer(Detail, SurfacePoint, Footprint);
+    const double D = (double)Sampler.VoxelLandDetailDF(ToDoubleFloat(SurfacePoint.X), ToDoubleFloat(SurfacePoint.Y), ToDoubleFloat(SurfacePoint.Z),
+        (float)Footprint, false).Unit;
     const double Height = (double)Land.Bake * 100.0 + LandHeightOffset + D * (double)((float)LandDetailAmplitude * DetailWeight * Land.DetailScale)
-        + (double)Land.Hills * 100.0 + (double)Land.Peaks * 100.0 + (double)Land.Gully * 100.0;
-    return FMath::Clamp(Height, 0.0, NoiseAmplitude);
+        + (double)Land.Hills * 100.0 + (double)Land.Peaks * 100.0 + (double)Land.Gully * 100.0 + (double)Land.Carve * 100.0;
+    const double Clamped = FMath::Clamp(Height, 0.0, NoiseAmplitude);
+    if (OutWater)
+    {
+        // R2 (Design/RiversLakes.md 3.6): a kept lake over the ground, else a river's water line
+        // in its channel, else the sea below sea level.
+        FVoxelWaterSample& W = *OutWater;
+        W = FVoxelWaterSample();
+        const float Ground = (float)((Clamped - LandHeightOffset) * 0.01);
+        W.GroundHeight = Ground;
+        W.SurfaceHeight = Ground;
+        if (Land.Lake.Weight >= 0.5f && Land.Lake.Level > Ground)
+        {
+            W.Kind = EVoxelWaterKind::Lake;
+            W.SurfaceHeight = Land.Lake.Level;
+        }
+        else if (Land.River.WaterKind == VOXEL_LAND_WATER_RIVER && Land.River.WaterLevel > Ground)
+        {
+            W.Kind = EVoxelWaterKind::River;
+            W.SurfaceHeight = Land.River.WaterLevel;
+            // Manning's mean speed, R^(2/3) S^(1/2) / n: n 0.035 (a natural channel), more on steep
+            // reaches by Jarrett's 0.39 S^0.38 R^-0.16 (boulders and steps); the hydraulic radius
+            // about the water's depth in a wide channel. Within 0.05 .. 5 m/s.
+            const double Radius = FMath::Max((double)VOXEL_LAND_RIVER_WATER_SHARE * Land.River.ChannelDepth, 0.1);
+            const double Slope = FMath::Max((double)Land.River.Grade, 1.0e-4);
+            const double Roughness = FMath::Max(0.035, 0.39 * FMath::Pow(Slope, 0.38) * FMath::Pow(Radius, -0.16));
+            const double Speed = FMath::Clamp(FMath::Pow(Radius, 2.0 / 3.0) * FMath::Sqrt(Slope) / Roughness, 0.05, 5.0);
+            W.FlowVelocity = FVector(Land.River.FlowDirection.x, Land.River.FlowDirection.y, Land.River.FlowDirection.z) * (Speed * 100.0);
+        }
+        else if (Ground < 0.0f)
+        {
+            W.Kind = EVoxelWaterKind::Sea;
+            W.SurfaceHeight = 0.0f;
+        }
+        W.Depth = FMath::Max(W.SurfaceHeight - W.GroundHeight, 0.0f);
+    }
+    return Clamped;
+}
+
+FVoxelWaterSample FVoxelDensityCPU::WaterAt(const FVector& Direction) const
+{
+    FVoxelWaterSample Out;
+    const double Len = Direction.Size();
+    if (Len < 1.0e-6) return Out;
+    if (!LandBake.IsValid())
+    {
+        // The noise surface: the ground above the planet radius (the planet knows its sea).
+        Out.GroundHeight = Out.SurfaceHeight = (float)(HeightAt(Direction, MinFootprint) * 0.01);
+        return Out;
+    }
+    LandSurfaceAt(Direction * (LandSampleRadius / Len), MinFootprint, &Out);
+    return Out;
 }
 
 float FVoxelDensityCPU::SampleOne(const FVector& Position, double Footprint) const
@@ -670,24 +918,62 @@ void FVoxelDensityCPU::BuildGPUData(FVoxelDensityGPUData& Out) const
         Out.LandPeakScaleG = LandPeakScaleG;
         Out.LandPeakScaleB = LandPeakScaleB;
         Out.LandPeakDetailTexelsPerCell = LandPeakDetailTexelsPerCell;
-        Out.LandPeakDetailMeanR = LandPeakDetailMeanR;
-        Out.LandPeakDetailMeanG = LandPeakDetailMeanG;
-        Out.LandPeakDetailScaleR = LandPeakDetailScaleR;
-        Out.LandPeakDetailScaleG = LandPeakDetailScaleG;
+        Out.LandDetailMeanHard = LandDetailMeanHard;
+        Out.LandDetailMeanSoft = LandDetailMeanSoft;
+        Out.LandPeakDetailScaleHard = LandPeakDetailScaleHard;
+        Out.LandPeakDetailScaleSoft = LandPeakDetailScaleSoft;
         Out.LandPeakDetailFade = LandPeakDetailFade;
         Out.LandHillTexelsPerCell = LandHillTexelsPerCell;
         Out.LandHillScaleR = LandHillScaleR;
         Out.LandHillScaleG = LandHillScaleG;
         Out.LandHillScaleB = LandHillScaleB;
+        Out.LandHillMeanR = LandHillMeanR;
+        Out.LandHillMeanG = LandHillMeanG;
         Out.LandHillSpacingM = LandHillSpacingM;
         Out.LandHillSwellTexelsPerCell = LandHillSwellTexelsPerCell;
         Out.LandHillSwellM = LandHillSwellM;
         Out.LandHillSwellScaleG = LandHillSwellScaleG;
         Out.LandHillDetailTexelsPerCell = LandHillDetailTexelsPerCell;
-        Out.LandHillDetailScaleR = LandHillDetailScaleR;
-        Out.LandHillDetailScaleG = LandHillDetailScaleG;
+        Out.LandHillDetailScaleHard = LandHillDetailScaleHard;
+        Out.LandHillDetailScaleSoft = LandHillDetailScaleSoft;
         Out.LandHillDetailFade = LandHillDetailFade;
         Out.LandHillFoothill = LandHillFoothill;
+        Out.LandStrataTexelsPerCell = LandStrataTexelsPerCell;
+        Out.LandStrataScaleR = LandStrataScaleR;
+        Out.LandStrataScaleG = LandStrataScaleG;
+        Out.LandStrataScaleB = LandStrataScaleB;
+        Out.LandStrataMeanR = LandStrataMeanR;
+        Out.LandStrataMeanG = LandStrataMeanG;
+        Out.LandStrataSpacingM = LandStrataSpacingM;
+        Out.LandStrataRelief = LandStrataRelief;
+        Out.LandStrataFlat = LandStrataFlat;
+        Out.LandStrataThreshold = LandStrataThreshold;
+        Out.LandStrataWidth = LandStrataWidth;
+        Out.LandStrataSeed = LandStrataSeed;
+        Out.LandStrataDetailTexelsPerCell = LandStrataDetailTexelsPerCell;
+        Out.LandStrataDetailScaleHard = LandStrataDetailScaleHard;
+        Out.LandStrataDetailScaleSoft = LandStrataDetailScaleSoft;
+        Out.LandStrataDetailFade = LandStrataDetailFade;
+        Out.LandRivers = LandRivers;
+        Out.LandRiverTilesPerFace = LandRiverTilesPerFace;
+        Out.LandRiverRadiusM = LandRiverRadiusM;
+        Out.LandRiverWidthScale = LandRiverWidthScale;
+        Out.LandRiverValleyScale = LandRiverValleyScale;
+        Out.LandRiverCarve = LandRiverCarve;
+        Out.LandRiverDepthScale = LandRiverDepthScale;
+        Out.LandRiverFloodplainScale = LandRiverFloodplainScale;
+        Out.LandRiverMinLog2Area = LandRiverMinLog2Area;
+        Out.LandLakeShoreBand = LandLakeShoreBand;
+        Out.LandRiverMeander = LandRiverMeander;
+        Out.LandRiverFalls = LandRiverFalls;
+        Out.LandHasWater = LandHasWater;
+        Out.LandDetailTexelsPerCell = LandDetailTexelsPerCell;
+        Out.LandDetailScales = LandDetailScales;
+        Out.LandDetailMeanA = LandDetailMeanA;
+        Out.LandDetailScaleA = LandDetailScaleA;
+        Out.LandDetailScaleGain = LandDetailScaleGain;
+        Out.LandDetailFade = LandDetailFade;
+        Out.LandDetailSeed = LandDetailSeed;
     }
 
     // The GPU converts lattice coordinates to int32 before wrapping; the CPU wraps through

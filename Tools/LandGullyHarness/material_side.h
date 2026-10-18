@@ -22,6 +22,8 @@ struct FMaterialHeight
     float DetailGradient[3], DetailUnit, DetailAmplitudeM;
     float Hills, HillUnit, HillAmplitudeM, HillGradient[3];
     float Peaks, PeakUnit, PeakAmplitudeM, PeakGradient[3];
+    float Carve, CarveScale, CarveGradient[3];   // R2
+    float LakeWeight;                            // R2: the lake's weight at the point (the material's half-precision depths differ there)
 };
 
 FMaterialHeight MaterialLandHeight(const FMaterialTextures& T, const float X[2], const float Y[2], const float Z[2], float Footprint, bool bGradient);
@@ -33,5 +35,10 @@ void MaterialOctave(const FMaterialTextures& T, uint32_t I, void* Out);
 void MaterialFramePoint(const float TranslatedWorld[3], const float PreViewHigh[3], const float PreViewLow[3], const float OriginHigh[3],
     const float OriginLow[3], const float AxisX[3], const float AxisY[3], const float AxisZ[3], const float AxisXLow[3],
     const float AxisYLow[3], const float AxisZLow[3], double Out[3]);
+/** The nearest river (VoxelLandRiverAtDF through the material's accessors): found, distance,
+ *  signed distance, floor, log2 area, s, segment. */
+struct FMaterialRiver { bool bFound; float Distance, Signed, Floor, Log2Area, S; uint32_t Segment; };
+FMaterialRiver MaterialRiver(const FMaterialTextures& T, const float X[2], const float Y[2], const float Z[2]);
+
 /** View Mode's colour (sRGB) at the surface H (the debug input as VoxelLandMaterial.ush builds it). */
 void MaterialDebugColor(const FMaterialTextures& T, uint32_t Mode, const FMaterialHeight& H, float CellM, float Out[3]);

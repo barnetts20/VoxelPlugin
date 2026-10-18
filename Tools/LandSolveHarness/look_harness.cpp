@@ -72,11 +72,15 @@ namespace VoxelShader
         uint SolveChannelOctaves = 3u;
         float SolveChannelCharacter = 0.0f;
         uint* OutForm = nullptr;
+        uint* OutRec = nullptr;
         float* SlotAc = nullptr;
         uint* LakeArea = nullptr; uint* LakeDepth = nullptr; uint* LakeOutlet = nullptr;
         uint* LakeCount = nullptr; uint* LakeList = nullptr;
         uint SolveMaxLakes = 65536;
-        float* OutHeight = nullptr; float* OutFlow = nullptr; float* OutWater = nullptr; uint* OutAttr = nullptr;
+        float* OutHeight = nullptr; uint* OutFlow = nullptr; float* OutWater = nullptr; uint* OutAttr = nullptr;
+        float* OutFlowFloat = nullptr;   // the harness's: OutFlow decoded (not the shader's)
+        uint* AccHi = nullptr; uint* AccHiOut = nullptr;   // S1: the exact accumulation's high words
+        float SolveAccUnit = 1.0f;
 #include "VoxelLandSolve.ush"
     };
 }
@@ -176,7 +180,7 @@ static void BakePlates(FPlateBake& B, uint32_t Seed, int K, float LandFraction, 
         B.Up[Idx] = E.Up;
         B.Crust[Idx] = E.Crust;
         B.Attr[Idx] = P.VoxelLandPackAttr(E.Crust, E.Class);
-        B.Form[Idx] = P.VoxelLandPackForm(P.VoxelLandFormAt(D, E));
+        B.Form[Idx] = P.VoxelLandPackForm(P.VoxelLandFormAt(D, E)) | (P.VoxelLandPackProvince(P.VoxelLandProvinceAt(D, E)) << 16u);   // T4c: the province from bit 16
     });
     B.Tan.resize(S);
     for (int i = 0; i < S; i++)
@@ -187,8 +191,10 @@ static void BakePlates(FPlateBake& B, uint32_t Seed, int K, float LandFraction, 
 struct FSolveBuffers
 {
     std::vector<float> H, W, Water, U, K, Ac, Area, Dist, H0, A, AOut, WOut, X, XOut;
-    std::vector<uint> Rec, Slot, Label, Cell, Y, YOut, P, POut, Flags, LArea, LDepth, LOutlet, LCount, LList, OAttr, OForm;
+    std::vector<uint> Rec, Slot, Label, Cell, Y, YOut, P, POut, Flags, LArea, LDepth, LOutlet, LCount, LList, OAttr, OForm, ORec;
     std::vector<float> OHeight, OFlow, OWater;
+    std::vector<uint> OFlowHalf;   // the output pass's halves (OFlow decodes them)
+    std::vector<uint> Hi, HiOut;    // S1
 
     void Bind(FSolve& S, int Cells)
     {
@@ -196,7 +202,7 @@ struct FSolveBuffers
         auto Uz = [](std::vector<uint>& V, int n) { V.assign(n, 0u); };
         Fz(H, Cells); Fz(W, Cells); Fz(Water, Cells); Uz(Rec, Cells); Uz(Slot, Cells); Uz(Label, Cells);
         for (auto* V : { &U, &K, &Ac, &Area, &Dist, &H0, &A, &AOut, &WOut, &X, &XOut, &OHeight, &OFlow, &OWater }) Fz(*V, Cells);
-        for (auto* V : { &Cell, &Y, &YOut, &P, &POut, &LArea, &LDepth, &LOutlet, &OAttr, &OForm }) Uz(*V, Cells);
+        for (auto* V : { &Cell, &Y, &YOut, &P, &POut, &LArea, &LDepth, &LOutlet, &OAttr, &OForm, &ORec }) Uz(*V, Cells);
         Uz(Flags, 4); Uz(LCount, 1); Uz(LList, 65536 * 4);
         S.SolveH = H.data(); S.SolveW = W.data(); S.SolveWater = Water.data();
         S.SolveRec = Rec.data(); S.SolveSlot = Slot.data(); S.SolveLabel = Label.data();
@@ -205,7 +211,11 @@ struct FSolveBuffers
         S.JumpX = X.data(); S.JumpXOut = XOut.data(); S.JumpY = Y.data(); S.JumpYOut = YOut.data(); S.JumpP = P.data(); S.JumpPOut = POut.data();
         S.SolveFlags = Flags.data();
         S.LakeArea = LArea.data(); S.LakeDepth = LDepth.data(); S.LakeOutlet = LOutlet.data(); S.LakeCount = LCount.data(); S.LakeList = LList.data();
-        S.OutHeight = OHeight.data(); S.OutFlow = OFlow.data(); S.OutWater = OWater.data(); S.OutAttr = OAttr.data(); S.OutForm = OForm.data();
+        OFlowHalf.assign((Cells + 1) / 2, 0u);
+        Hi.assign(Cells, 0u); HiOut.assign(Cells, 0u);
+        S.AccHi = Hi.data(); S.AccHiOut = HiOut.data();
+        S.OutFlowFloat = OFlow.data();
+        S.OutHeight = OHeight.data(); S.OutFlow = OFlowHalf.data(); S.OutWater = OWater.data(); S.OutAttr = OAttr.data(); S.OutForm = OForm.data(); S.OutRec = ORec.data();
     }
 };
 
@@ -235,6 +245,8 @@ template<typename F> static int UntilConverged(FSolve& S, F Pass, int Cap)
     }
     return -1;
 }
+
+#include "solve_s1_cpu.h"
 
 struct FRunOptions
 {
@@ -383,8 +395,8 @@ static FRunResult Run(FSolve& S, const FRunOptions& O, bool bLog)
     if (O.bReference) ReferenceFill(S, M, S.SolveEps);
     else
     {
-        const int Its = UntilConverged(S, [&]() { for (uint s = 0; s < M; s++) S.VoxelSolveFillInPlacePass(s, M, S.SolveEps); }, 100000);
-        if (bLog) printf("  initial fill: %d sweeps\n", Its);
+        const int Its = FillTiled(S, S.SolveEps);
+        if (bLog) printf("  initial fill: %d tiled passes\n", Its);
     }
     for (uint s = 0; s < M; s++) S.VoxelSolveUndrainedPass(s, M);
     ParallelFor(M, [&](int s) { S.VoxelSolveReceiversPass(s, M, true); });
@@ -479,20 +491,27 @@ static FRunResult Run(FSolve& S, const FRunOptions& O, bool bLog)
         ParallelFor(M, [&](int s) { S.VoxelSolveTreeFillFinishPass(s, M); });
         ParallelFor(M, [&](int s) { S.VoxelSolveSettlePass(s, M); });
     }
-    // Routing.
+    // Routing, as the GPU job (S1): the fills from the tree fill along the solve's last
+    // receivers, by tiles; the drainage by jumps; the spread on the hillslopes, then the channels.
     const uint L = Compact(S, 1);
     Res.Land = L;
-    for (uint c = 0; c < Cells; c++) S.VoxelSolveRouteInitPass(c, 0u);
-    const int It0 = UntilConverged(S, [&]() { for (uint s = 0; s < L; s++) S.VoxelSolveFillInPlacePass(s, L, 0.0f); }, 100000);
-    for (uint c = 0; c < Cells; c++) S.VoxelSolveRouteInitPass(c, 1u);
-    const int It1 = UntilConverged(S, [&]() { for (uint s = 0; s < L; s++) S.VoxelSolveFillInPlacePass(s, L, S.SolveEps); }, 100000);
+    const bool bTree = M > 0;
+    S.SolveAccUnit = (float)std::pow(0.5 * 3.14159265358979 * S.SolveRadiusM / S.SolveN, 2.0) / 4096.0f;
+    for (uint c = 0; c < Cells; c++) S.VoxelSolveRouteInitPass(c, bTree ? 2u : 0u);
+    if (bTree) RouteTreeFill(S, L, 0.0f, O.R);
+    const int It0 = FillTiled(S, 0.0f);
+    for (uint c = 0; c < Cells; c++) S.VoxelSolveRouteInitPass(c, bTree ? 3u : 1u);
+    if (bTree) RouteTreeFill(S, L, S.SolveEps, O.R);
+    const int It1 = FillTiled(S, S.SolveEps);
     ParallelFor(L, [&](int s) { S.VoxelSolveReceiversPass(s, L, false); });
-    const int It2 = UntilConverged(S, [&]() { for (uint s = 0; s < L; s++) S.VoxelSolveAccumulateInPlacePass(s, L); }, 100000);
+    AccumulateByJumps(S, L, 0u, O.R);
+    const int It2 = O.R;
     int ItSpread = 0;
     if (S.SolveSpreadCells > 0.0f)
     {
         ParallelFor(L, [&](int s) { S.VoxelSolveSpreadInitPass(s, L); });
         ItSpread = UntilConverged(S, [&]() { for (uint s = 0; s < L; s++) S.VoxelSolveSpreadPass(s, L); }, 100000);
+        AccumulateByJumps(S, L, 1u, O.R);
     }
     ParallelFor(L, [&](int s) { S.VoxelSolveLabelInitPass(s, L); });
     const int It3 = UntilConverged(S, [&]() { for (uint s = 0; s < L; s++) S.VoxelSolveLabelPass(s, L); }, 100000);
@@ -500,11 +519,13 @@ static FRunResult Run(FSolve& S, const FRunOptions& O, bool bLog)
     S.LakeCount[0] = 0;
     for (uint s = 0; s < L; s++) S.VoxelSolveLakeStatsPass(s, L);
     for (uint s = 0; s < L; s++) S.VoxelSolveLakeFinishPass(s, L);
+    std::fill(S.OutFlow, S.OutFlow + (Cells + 1) / 2, 0u);
     ParallelFor(Cells, [&](int c) { S.VoxelSolveOutputPass(c); });
+    for (int c = 0; c < (int)Cells; c++) S.OutFlowFloat[c] = f16tof32((S.OutFlow[c >> 1] >> ((c & 1) * 16)) & 0xffffu);
     Res.Lakes = (int)S.LakeCount[0];
     Res.Errors = S.SolveFlags[1];
     Res.Seconds = Now() - T0;
-    if (bLog) printf("  routing sweeps: lakes fill %d, fill %d, accumulation %d, spread %d, labels %d\n", It0, It1, It2, ItSpread, It3);
+    if (bLog) printf("  routing passes: lakes fill %d (tiled), fill %d (tiled), accumulation %d rounds, spread %d, labels %d\n", It0, It1, It2, ItSpread, It3);
     return Res;
 }
 

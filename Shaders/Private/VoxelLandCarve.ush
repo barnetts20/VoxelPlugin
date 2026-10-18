@@ -1,0 +1,1118 @@
+// VoxelLandCarve.ush - Rivers and lakes carved into the land surface (Design/RiversLakes.md 3.1,
+// 3.5; stage R2). The last landform layer before the detail: the whole surface so far (the bake,
+// the hills and strata, the peaks, the gullies) is pulled down into each river's valley and a
+// channel is cut below its floor; a kept lake's bed is brought below its level, the hills fade
+// with its depth, and its shore is eased into a bench at the waterline.
+//
+// A river (VoxelLandRivers.ush's tables, made with the bake: VoxelLandRiverBuild.ush) gives, at
+// the nearest point of a segment: its floor F (the bake's, monotone downstream; the bake's
+// B-spline stands a median 170 m above it on the test planet), its drainage A and so its width w
+// (2.5 sqrt(A km^2) m), depth D (1.05 A^0.2 m: 3 m at 200 km^2, 10 m at 100,000 km^2),
+// floodplain half-width P (1.5 w / 2 plus FloodplainScale x 6 w on gentle reaches, under 0.2% of
+// grade, narrowing to the bank by 2%) and valley half-width W (400 m + 15 w). At distance d:
+//   - the valley: the surface's height over the floor scaled by the profile, s - pull(d) sp(s - F)
+//     (pull 1 on the floodplain, easing to 0 at W by smoothstep; sp a smooth positive part: what
+//     is below the floor stays), but no higher than its walls allow: F + slope sp(d - P) / pull,
+//     the wall's slope 0.25 on gentle reaches to 0.7 on steep ones (over the pull's profile, so
+//     the cap never binds at the valley's edge). The scaled relief makes concave valley sides in hill
+//     country; the cap keeps mountains (land far above the floor) from becoming cliffs. Where the
+//     wall meets the land it is rounded over half its rise there.
+//   - the channel: s'' = s' - bank(d) sp(s' - B(d)), B = F - D bed(d), bed 1 over the middle 60%
+//     of the half-width easing to 0 at the bank (d = w / 2), bank 1 to the bank easing to 0 at
+//     1.5 x w / 2 (inside the floodplain, where s' is the floor).
+// Every segment whose corridor reaches the point carves, and the lowest result wins: a minimum of
+// continuous surfaces, so confluences and bends join without a seam, and since a segment's carve
+// is nothing beyond its valley (W, inside the reach the tiles list it to), the result doesn't
+// depend on the tile (VoxelLandRivers.ush).
+//
+// The rivers fade in from RiverMinArea (to 1.41 x it, half a doubling of the drainage: no channel
+// head cut into a hillside), and by the footprint (VoxelOctaveBandWeight): the channel over its
+// width, the valley over W, so a coarse mesh keeps the valley and drops a channel it can't hold.
+// The fades are linear in the valley's depth (s + fade (valley(s) - s)): the wall's cap over the
+// profile would cut nearly the whole valley at a small fade.
+//
+// Lakes (the bake's levels, per cell): their weight at the point is the bilinear share of lake
+// cells around it (smoothstep weights, so it's C1; the cells and fractions from the point's
+// double-float position), the level and the depth their lake cells' weighted means. The bed:
+// s - weight sp(s - (level - depth x smoothstep(0.5, 1, weight))) (the bake's B-spline and the
+// hills stand above a small lake's floor, which would leave it dry). The hills fade toward 15% of
+// themselves with the depth of the bake and the gullies below the level (2 x the shore band to
+// 40 m: shelves keep their relief, floors are smooth); the peaks stay. Within 2 x LakeShoreBand of
+// the level the surface is eased toward it, s - L -> (s - L) smoothstep(|s - L| / 2 band): a bench
+// at the waterline.
+//
+// The detail layer, added after, fades in the valley (1 - pull) and under a lake's weight.
+//
+// The gradient: the carve is a function of the surface s and the point, so its gradient is
+// Scale x (the surface's gradient) + its own (Gradient, a tangent vector at the warped point):
+// the distance's, the floor's and the drainage's along the segment (the last by a second
+// evaluation a 64th of a doubling larger), the lake's weight's, level's and depth's.
+//
+// Shared subset (VoxelShaderCompat.h). Included by VoxelLandGully.ush. Inputs (besides the
+// rivers' and the bake's: VoxelLandParameters.ush):
+//   StructuredBuffer<float> LandWater;   the kept lakes' levels per cell (m; below -1e30: none)
+//   uint LandHasWater;                   1 when LandWater is the bake's (and the lakes are carved)
+//   float LandRiverCarve;                0: nothing carved (1 on)
+//   float LandRiverDepthScale;           RiverDepthScale
+//   float LandRiverFloodplainScale;      FloodplainScale
+//   float LandRiverMinLog2Area;          log2 of RiverMinArea (m^2): the rivers' fade-in
+//   float LandLakeShoreBand;             LakeShoreBand (m; 0: no bench)
+
+#ifndef VOXEL_LAND_CARVE_USH
+#define VOXEL_LAND_CARVE_USH
+
+#include "VoxelLandRivers.ush"
+
+#define VOXEL_LAND_CARVE_SOFT 0.5f              // m: the smooth positive part's half-width
+#define VOXEL_LAND_LAKE_HILL_KEEP 0.15f         // the hills' share left on a deep lake floor
+#define VOXEL_LAND_LAKE_HILL_DEPTH 40.0f        // m: where they are down to it
+#define VOXEL_LAND_RIVER_WATER_SHARE 0.8f       // the channel's water depth over its depth (bankfull less a freeboard)
+#define VOXEL_LAND_VALLEY_SLOPE_LOW 0.25f       // the valley walls' slope on gentle reaches (14 degrees)
+#define VOXEL_LAND_VALLEY_SLOPE_HIGH 0.7f       // on steep ones, from 3% of grade (35 degrees)
+#define VOXEL_LAND_VALLEY_FOOT 50.0f            // m: the wall's foot rounded over this
+#define VOXEL_LAND_VALLEY_ROUND 0.5f            // the wall's meeting with the land rounded over this share of its rise
+#define VOXEL_LAND_VALLEY_MIN_PULL 1.0e-3f      // the wall's divisor's least (beyond it the wall is out of reach)
+#define VOXEL_LAND_RIVER_ALONG_STEP 0.5f        // m: the gradient's step along a segment (either way)
+#define VOXEL_LAND_RIVER_STRATA_STEP 0.0009765625f  // the gradient's step in the strata's share (either way)
+#define VOXEL_LAND_FALL_SHARE 0.7f              // a knickpoint's share of its segment's drop in its fall (R3)
+#define VOXEL_LAND_FALL_MAX 80.0f               // m: a fall's greatest height
+#define VOXEL_LAND_MEANDER_WAVES 11.0f          // channel widths a meander's cycle (the build's: VoxelRiverMeanderWavelength)
+#define VOXEL_LAND_MEANDER_AMPLITUDE 2.5f       // channel widths: the meanders' largest swing either side
+#define VOXEL_LAND_LEVEE 0.3f                   // channel depths: a lowland river's natural levees' height
+#define VOXEL_LAND_CANYON_SLOPE 0.9f            // a canyon wall's mean slope (42 degrees: the steps' bands steeper, benches flatter)
+#define VOXEL_LAND_CANYON_STEPS 0.6f            // the steps' share of a canyon wall's rise (the rest even)
+#define VOXEL_LAND_CANYON_TREAD 0.3f            // the treads' share of a canyon step (risers at most about 2 in 1)
+#define VOXEL_LAND_CANYON_PLAIN 0.3f            // a canyon's floor over the floodplain's
+#define VOXEL_LAND_CANYON_TAKE 0.85f            // how much less of the land a canyon scales (its walls do the cutting)
+#define VOXEL_LAND_RIVER_SOURCE_FADE 0.5f       // log2 of the drainage: the rivers' fade-in from RiverMinArea (to 1.41 x it)
+#ifndef VOXEL_LAND_VALLEY_MEET_ROUND
+#define VOXEL_LAND_VALLEY_MEET_ROUND 1.0f       // N1b: where two rivers' valley walls meet, the crease rounded over this share of their mean cut (times the place up the walls; at most 2)
+#endif
+#define VOXEL_LAND_VALLEY_MEET_SOFT 0.05f       // the place up the walls: the entries' places weighted by exp(-V / this) (1 - V)^2 (a soft least)
+
+/** A channel's depth (m) for a log2 drainage area (m^2): RiverDepthScale x 1.05 A^0.2 (km^2). */
+VOXEL_FUNC float VoxelLandRiverDepth(VOXEL_LAND_ARGS_DECL float Log2Area)
+{
+    // A^0.2 in km^2: exp2(0.2 (log2 A - log2 1e6)).
+    return LandRiverDepthScale * 1.05f * exp2(0.2f * Log2Area - 3.98631371f);
+}
+
+/** max(X, 0) with its corner rounded over +-K: C1. */
+VOXEL_FUNC float VoxelLandSoftPositive(float X, float K)
+{
+    return X >= K ? X : (X <= -K ? 0.0f : (X + K) * (X + K) / (4.0f * K));
+}
+
+VOXEL_FUNC float VoxelLandSoftPositiveSlope(float X, float K)
+{
+    return X >= K ? 1.0f : (X <= -K ? 0.0f : (X + K) / (2.0f * K));
+}
+
+/** Its slope in K. */
+VOXEL_FUNC float VoxelLandSoftPositiveSoftness(float X, float K)
+{
+    if (X >= K || X <= -K) return 0.0f;
+    const float R = (X + K) / (2.0f * K);
+    return R * (1.0f - R);
+}
+
+/** smoothstep's slope in X. */
+VOXEL_FUNC float VoxelLandSmoothSlope(float A, float B, float X)
+{
+    const float T = saturate((X - A) / (B - A));
+    return 6.0f * T * (1.0f - T) / (B - A);
+}
+
+// --- Lakes -----------------------------------------------------------------------------------
+
+struct FVoxelLandLake
+{
+    float Weight;       // 0..1: the share of lake cells around the point
+    float Level;        // m: the lake cells' mean level (one lake's: its level; between two, a ramp)
+    float Depth;        // m: the lake cells' mean depth under their levels (the bake's)
+    float3 WeightGrad;  // per m, tangent at the point (with bGradients)
+    float3 LevelGrad;   // m per m
+    float3 DepthGrad;
+};
+
+VOXEL_FUNC FVoxelLandLake VoxelLandLakeNone()
+{
+    FVoxelLandLake Out;
+    Out.Weight = 0.0f;
+    Out.Level = 0.0f;
+    Out.Depth = 0.0f;
+    Out.WeightGrad = float3(0.0f, 0.0f, 0.0f);
+    Out.LevelGrad = float3(0.0f, 0.0f, 0.0f);
+    Out.DepthGrad = float3(0.0f, 0.0f, 0.0f);
+    return Out;
+}
+
+/** The bake cell (its index in the padded fields) a lake's weights read for face cell (I, J):
+ *  the cell itself inside the face; one cell beyond an edge, the next face's edge-row cell in
+ *  step along the shared edge (the coordinate along it is the same angle on both faces, so the
+ *  faces read the same cells at their edge, and no step: VoxelSolveNeighbour's rule); beyond a
+ *  corner, the face's corner cell. (The apron's own cells hold the levels of the cells holding
+ *  their centres and heights interpolated there, which differ a little from the cells' own.) */
+VOXEL_FUNC uint VoxelLandLakeCellIndex(VOXEL_LAND_ARGS_DECL uint Face, int I, int J)
+{
+    const int N = int(LandN);
+    const uint Side = LandN + 2u * LandPad;
+    const bool bOutI = I < 0 || I >= N;
+    const bool bOutJ = J < 0 || J >= N;
+    uint F2 = Face;
+    int I2 = clamp(I, 0, N - 1);
+    int J2 = clamp(J, 0, N - 1);
+    if (bOutI != bOutJ)
+    {
+        // The point on the shared edge level with the cell, a quarter of a cell past it.
+        const float Along = VoxelCubeCellCentre(bOutI ? J : I, LandN);
+        const float Past = ((bOutI ? I : J) < 0 ? -1.0f : 1.0f) * (1.0f + 0.5f / float(N));
+        const float3 Dir = bOutI ? VoxelCubeDirection(Face, Past, Along) : VoxelCubeDirection(Face, Along, Past);
+        const float AX = abs(Dir.x);
+        const float AY = abs(Dir.y);
+        const float AZ = abs(Dir.z);
+        const uint Axis = (AX >= AY && AX >= AZ) ? 0u : (AY >= AZ ? 1u : 2u);
+        const float NC = VoxelCubeComponent(Dir, Axis);
+        F2 = Axis * 2u + (NC < 0.0f ? 1u : 0u);
+        const float InvN = 1.0f / abs(NC);
+        // Face coordinates there (4 / pi atan), to cells (cell K covers -1 + 2 K / N .. + 2 / N).
+        const float S = atan(VoxelCubeComponent(Dir, VoxelCubeUAxis(F2)) * InvN) * 1.27323954473516269f;
+        const float T = atan(VoxelCubeComponent(Dir, VoxelCubeVAxis(F2)) * InvN) * 1.27323954473516269f;
+        I2 = clamp(int(floor((S + 1.0f) * 0.5f * float(N))), 0, N - 1);
+        J2 = clamp(int(floor((T + 1.0f) * 0.5f * float(N))), 0, N - 1);
+    }
+    return F2 * Side * Side + uint(J2 + int(LandPad)) * Side + uint(I2 + int(LandPad));
+}
+
+/** The kept lakes at the point Q (double-float, any length): the four cells around it on its
+ *  face (the face of the largest component; the cells clamped to the face), weighted by
+ *  smoothstep of the fractions;
+ *  the level and the depth their lake cells' weighted means (a lake's cells share its level, so
+ *  only where two lakes' cells meet does the level ramp between theirs). bGradients (a
+ *  constant) adds the gradients. */
+VOXEL_FUNC FVoxelLandLake VoxelLandLakeAt(VOXEL_LAND_ARGS_DECL float2 QX, float2 QY, float2 QZ, bool bGradients)
+{
+    FVoxelLandLake Out = VoxelLandLakeNone();
+    if (LandHasWater == 0u) return Out;
+    // The face of the largest component; the point's cells and fractions along its axes from
+    // the double-float tan of its angles (VoxelLandAxisAt: exact to 1e-7 of a cell, so the
+    // weights, which can scale a pull of hundreds of metres, don't step with a float position).
+    const float AX = abs(QX.x);
+    const float AY = abs(QY.x);
+    const float AZ = abs(QZ.x);
+    const uint Axis = (AX >= AY && AX >= AZ) ? 0u : (AY >= AZ ? 1u : 2u);
+    const float2 PN = VoxelLandPick(QX, QY, QZ, Axis);
+    const uint Face = Axis * 2u + (PN.x < 0.0f ? 1u : 0u);
+    const float2 Den = PN.x < 0.0f ? float2(-PN.x, -PN.y) : PN;
+    const float2 AU = VoxelDFDiv(VoxelLandPick(QX, QY, QZ, VoxelCubeUAxis(Face)), Den);
+    const float2 AV = VoxelDFDiv(VoxelLandPick(QX, QY, QZ, VoxelCubeVAxis(Face)), Den);
+    const float TA = AU.x;
+    const float TB = AV.x;
+    const FVoxelLandAxis XU = VoxelLandAxisAt(VOXEL_LAND_ARGS AU, atan(TA) * 1.27323954473516269f);
+    const FVoxelLandAxis XV = VoxelLandAxisAt(VOXEL_LAND_ARGS AV, atan(TB) * 1.27323954473516269f);
+    const float N = float(LandN);
+    const float FracX = saturate(XU.Frac);
+    const float FracY = saturate(XV.Frac);
+    const float WX = smoothstep(0.0f, 1.0f, FracX);
+    const float WY = smoothstep(0.0f, 1.0f, FracY);
+    const float DWX = VoxelLandSmoothSlope(0.0f, 1.0f, FracX);   // per cell
+    const float DWY = VoxelLandSmoothSlope(0.0f, 1.0f, FracY);
+    const int I0 = XU.Cell;
+    const int J0 = XV.Cell;
+    float LevelSum = 0.0f;
+    float DepthSum = 0.0f;
+    float GWX = 0.0f, GWY = 0.0f, GSX = 0.0f, GSY = 0.0f, GLX = 0.0f, GLY = 0.0f;   // the weight's and the sums' slopes per cell
+    for (uint k = 0u; k < 4u; k++)
+    {
+        const uint DI = k & 1u;
+        const uint DJ = k >> 1u;
+        // One cell past a face's edge: the next face's cell there (VoxelLandLakeCellIndex), so
+        // both faces read the same cells at their shared edge.
+        const int I = clamp(I0 + int(DI), -1, int(LandN));
+        const int J = clamp(J0 + int(DJ), -1, int(LandN));
+        const float CU = DI == 1u ? WX : 1.0f - WX;
+        const float CV = DJ == 1u ? WY : 1.0f - WY;
+        const float W = CU * CV;
+        const uint Index = VoxelLandLakeCellIndex(VOXEL_LAND_ARGS Face, I, J);
+        const float Level = VOXEL_LAND_WATER(Index);
+        if (Level > -1.0e30f)
+        {
+            const float CellDepth = max(Level - VOXEL_LAND_HEIGHT(Index), 0.0f);
+            Out.Weight += W;
+            DepthSum += W * CellDepth;
+            LevelSum += W * Level;
+            if (bGradients)
+            {
+                const float WU = (DI == 1u ? DWX : -DWX) * CV;
+                const float WV = CU * (DJ == 1u ? DWY : -DWY);
+                GWX += WU;
+                GWY += WV;
+                GSX += WU * CellDepth;
+                GSY += WV * CellDepth;
+                GLX += WU * Level;
+                GLY += WV * Level;
+            }
+        }
+    }
+    const float Weight = max(Out.Weight, 1.0e-6f);
+    Out.Depth = DepthSum / Weight;
+    Out.Level = LevelSum / Weight;
+    if (bGradients && Out.Weight > 0.0f)
+    {
+        // Per cell to per radian of the face's angles (X = (4 angle / pi + 1) N / 2 - 1/2), to a
+        // tangent vector through the face's frame, per m on the sea sphere (LandCellM x N x 2 / pi).
+        const float PerRadian = N * 0.636619772f;
+        const float InvRadius = 1.0f / (LandCellM * N * 0.636619772f);
+        const FVoxelLandFaceFrame Frame = VoxelLandFaceFrameAt(Face, TA, TB);
+        const float WU = GWX * PerRadian;
+        const float WV = GWY * PerRadian;
+        Out.WeightGrad = (Frame.TU * (Frame.GUU * WU + Frame.GUV * WV) + Frame.TV * (Frame.GUV * WU + Frame.GVV * WV)) * InvRadius;
+        // The mean depth's: (sum' w - sum w') / w^2.
+        const float DU = (GSX - Out.Depth * GWX) / Weight * PerRadian;
+        const float DV = (GSY - Out.Depth * GWY) / Weight * PerRadian;
+        Out.DepthGrad = (Frame.TU * (Frame.GUU * DU + Frame.GUV * DV) + Frame.TV * (Frame.GUV * DU + Frame.GVV * DV)) * InvRadius;
+        const float LU = (GLX - Out.Level * GWX) / Weight * PerRadian;
+        const float LV = (GLY - Out.Level * GWY) / Weight * PerRadian;
+        Out.LevelGrad = (Frame.TU * (Frame.GUU * LU + Frame.GUV * LV) + Frame.TV * (Frame.GUV * LU + Frame.GVV * LV)) * InvRadius;
+    }
+    return Out;
+}
+
+/** The hills' share left at a point under a lake's weight, with the surface without the hills
+ *  (Base, m) Depth below its level. */
+VOXEL_FUNC float VoxelLandLakeHillShare(VOXEL_LAND_ARGS_DECL FVoxelLandLake Lake, float Base)
+{
+    if (Lake.Weight <= 0.0f) return 1.0f;
+    const float Start = 2.0f * max(LandLakeShoreBand, 1.0f);
+    const float Keep = lerp(1.0f, VOXEL_LAND_LAKE_HILL_KEEP, smoothstep(Start, max(VOXEL_LAND_LAKE_HILL_DEPTH, Start + 1.0f), Lake.Level - Base));
+    return 1.0f - Lake.Weight * (1.0f - Keep);
+}
+
+// --- Rivers ----------------------------------------------------------------------------------
+
+/** What the carve leaves at a point. */
+struct FVoxelLandCarve
+{
+    float Height;          // m: the carved surface
+    float Scale;           // d Height / d (the surface before it)
+    float3 Gradient;       // m/m: its own gradient at the warped point (tangent there)
+    float DetailKeep;      // 0..1: the detail layer's share (the valleys', the waterline's)
+    // The water (R2's query; the ocean pass will draw it).
+    uint WaterKind;        // VOXEL_LAND_WATER_* where the point lies under the river's or the lake's water line
+    float WaterLevel;      // m: that water line (a river's at the nearest point, a lake's level)
+    float3 FlowDirection;  // a river's downstream direction at the warped point (tangent; zero else)
+    float Grade;           // the river's bed slope (m/m)
+    float ChannelDepth;    // m: its channel's depth (D)
+    float Distance;        // m: to the river's line (3e38 without one)
+};
+
+#define VOXEL_LAND_WATER_NONE 0u
+#define VOXEL_LAND_WATER_SEA 1u
+#define VOXEL_LAND_WATER_LAKE 2u
+#define VOXEL_LAND_WATER_RIVER 3u
+
+/** A segment's record (VoxelLandRiverLayout.ush) and what follows from it: its grade, its
+ *  knickpoint (a step in the bed where it falls much faster than the segments either side of it,
+ *  a share of its drop gathered into a fall at LipU, LipHalf either way in its parameter) and its
+ *  hash. */
+struct FVoxelLandRiverSeg
+{
+    float F0;
+    float F1;
+    float A0;
+    float A1;
+    float S0;
+    float Length;
+    float ChainLength;
+    float Turn0;
+    float Turn1;
+    float GradeAbove;
+    float GradeBelow;
+    float Phase0;
+    float PhaseSpan;
+    float Grade;        // its own (the floor's mean slope)
+    float FallShare;    // 0..1: the share of its drop in its fall
+    float LipU;
+    float LipHalf;
+    uint Hash;
+    uint StairKey;      // the chain's (a canyon's benches the same along it)
+    uint Trunk;         // N1b: the river's key through its confluences (VOXEL_LAND_RIVER_TRUNK_*)
+};
+
+/** A small integer hash (the meanders' wobble, the falls' places). */
+VOXEL_FUNC uint VoxelLandRiverHash(uint X)
+{
+    X ^= X >> 16u;
+    X *= 0x7feb352du;
+    X ^= X >> 15u;
+    X *= 0x846ca68bu;
+    X ^= X >> 16u;
+    return X;
+}
+
+VOXEL_FUNC float VoxelLandRiverUnit(uint X)
+{
+    return float(VoxelLandRiverHash(X) & 0xffffu) * (1.0f / 65535.0f);
+}
+
+VOXEL_FUNC FVoxelLandRiverSeg VoxelLandRiverSegAt(VOXEL_LAND_ARGS_DECL uint Seg)
+{
+    const uint SB = Seg * VOXEL_LAND_RIVER_SEG_FLOATS;
+    FVoxelLandRiverSeg R;
+    R.F0 = VOXEL_LAND_RIVER_DATA(SB);
+    R.F1 = VOXEL_LAND_RIVER_DATA(SB + 1u);
+    R.A0 = VOXEL_LAND_RIVER_DATA(SB + 2u);
+    R.A1 = VOXEL_LAND_RIVER_DATA(SB + 3u);
+    R.S0 = VOXEL_LAND_RIVER_DATA(SB + 4u);
+    R.Length = max(VOXEL_LAND_RIVER_DATA(SB + 5u), 1.0f);
+    R.ChainLength = VOXEL_LAND_RIVER_DATA(SB + 6u);
+    R.Turn0 = VOXEL_LAND_RIVER_DATA(SB + 8u);
+    R.Turn1 = VOXEL_LAND_RIVER_DATA(SB + 9u);
+    R.GradeAbove = VOXEL_LAND_RIVER_DATA(SB + 10u);
+    R.GradeBelow = VOXEL_LAND_RIVER_DATA(SB + 11u);
+    R.Phase0 = VOXEL_LAND_RIVER_DATA(SB + 12u);
+    R.PhaseSpan = VOXEL_LAND_RIVER_DATA(SB + 13u);
+    R.Trunk = uint(VOXEL_LAND_RIVER_DATA(SB + 7u)) >> VOXEL_LAND_RIVER_TRUNK_SHIFT;
+    R.Grade = max(R.F0 - R.F1, 0.0f) / R.Length;
+    // Its hash from its chain's length and its place (the same for a segment whatever the
+    // tables' order).
+    R.Hash = VoxelLandRiverHash(uint(R.ChainLength) * 747796405u + uint(R.S0));
+    R.StairKey = VoxelLandRiverHash(uint(R.ChainLength) ^ 0x5bd1e995u);
+    // A knickpoint: over 1.5% of grade and over 2.5 times the steeper of its neighbours' (fully
+    // at 3% and 4 times). Its fall takes up to 70% of its drop (at most 80 m), at 35 .. 65% of
+    // its length, a quarter of the channel's width (at least 4 m) either way and at least 0.4 of
+    // its height: steep (under 2 in 1, 63 degrees), not a wall.
+    const float Neighbours = max(max(R.GradeAbove, R.GradeBelow), 0.002f);
+    // The fall at most VOXEL_LAND_FALL_MAX high (the rest of the drop stays even).
+    const float Share = VOXEL_LAND_FALL_SHARE * LandRiverFalls * smoothstep(0.015f, 0.03f, R.Grade) * smoothstep(2.5f, 4.0f, R.Grade / Neighbours);
+    const float Drop = max(R.F0 - R.F1, 0.0f);
+    R.FallShare = Drop > 0.0f ? min(Share, VOXEL_LAND_FALL_MAX / Drop) : 0.0f;
+    const float Width = VoxelLandRiverWidth(VOXEL_LAND_ARGS max(R.A0, R.A1));
+    R.LipHalf = clamp(max(max(0.25f * Width, 4.0f), 0.4f * R.FallShare * max(R.F0 - R.F1, 0.0f)) / R.Length, 5.0e-4f, 0.1f);
+    // (Its pool, to 5 half-widths below the lip, inside the segment.)
+    R.LipU = max(min(0.35f + 0.3f * VoxelLandRiverUnit(R.Hash), 1.0f - 5.0f * R.LipHalf), R.LipHalf);
+    return R;
+}
+
+/** A segment at parameter U (any: beyond its ends the floor and drainage run on): the floor (its
+ *  fall included), the drainage, the grade the profiles use (the floor's mean slope without the
+ *  fall, eased toward its neighbours' over each half so it's continuous at the joints), the
+ *  plunge pool's extra depth below the fall (m), and the floor's slope there (m/m, the fall's
+ *  included: the water's). */
+struct FVoxelLandRiverPlace
+{
+    float Floor;
+    float Log2Area;
+    float Grade;
+    float Pool;
+    float FloorSlope;
+};
+
+VOXEL_FUNC FVoxelLandRiverPlace VoxelLandRiverPlaceAt(VOXEL_LAND_ARGS_DECL FVoxelLandRiverSeg R, float U)
+{
+    FVoxelLandRiverPlace P;
+    const float Drop = R.F0 - R.F1;
+    const float Lip = smoothstep(R.LipU - R.LipHalf, R.LipU + R.LipHalf, U);
+    P.Floor = R.F0 - Drop * ((1.0f - R.FallShare) * U + R.FallShare * Lip);
+    P.FloorSlope = Drop * ((1.0f - R.FallShare) + R.FallShare * VoxelLandSmoothSlope(R.LipU - R.LipHalf, R.LipU + R.LipHalf, U)) / R.Length;
+    P.Log2Area = lerp(R.A0, R.A1, U);
+    // At the joints the mean of the two segments' grades (their whole drops: both sides agree),
+    // toward the middle this one's without its fall.
+    const float Own = R.Grade * (1.0f - R.FallShare);
+    const float T = saturate(U);
+    P.Grade = T < 0.5f ? lerp(0.5f * (R.GradeAbove + R.Grade), Own, 2.0f * T) : lerp(Own, 0.5f * (R.Grade + R.GradeBelow), 2.0f * T - 1.0f);
+    // The pool: as deep as a fifth of the fall (at most twice the channel's depth), just below it.
+    const float PoolT = (U - (R.LipU + R.LipHalf)) / (4.0f * R.LipHalf);
+    P.Pool = R.FallShare > 0.0f
+        ? min(0.2f * R.FallShare * Drop, 2.0f * VoxelLandRiverDepth(VOXEL_LAND_ARGS P.Log2Area)) * smoothstep(0.0f, 0.5f, PoolT) * (1.0f - smoothstep(0.5f, 1.0f, PoolT))
+        : 0.0f;
+    return P;
+}
+
+/** How much of a canyon a river cuts: the strata's share where it incises (over 0.4% of grade,
+ *  none under 0.08%: a lowland river in the strata keeps its floodplain). */
+VOXEL_FUNC float VoxelLandRiverCanyon(float Strata, float Grade)
+{
+    return Strata * smoothstep(0.0008f, 0.004f, Grade);
+}
+
+/** The floodplain's half-width (m): 0.75 belts plus FloodplainScale x 6 belts on gentle reaches
+ *  (under 0.2% of grade), narrowing to the 0.75 by 2%; at most 0.8 of the valley, at least 1.5
+ *  channel half-widths; in a canyon (VoxelLandRiverCanyon) 30% of it, at most 3 half-widths. */
+VOXEL_FUNC float VoxelLandRiverPlain(VOXEL_LAND_ARGS_DECL float Belt, float Half, float Valley, float Grade, float Strata)
+{
+    const float Plain = clamp(0.75f * Belt + LandRiverFloodplainScale * 6.0f * Belt * (1.0f - smoothstep(0.002f, 0.02f, Grade)),
+        1.5f * Half, max(0.8f * Valley, 1.5f * Half));
+    return lerp(Plain, max(1.5f * Half, min(VOXEL_LAND_CANYON_PLAIN * Plain, 3.0f * Half)), VoxelLandRiverCanyon(Strata, Grade));
+}
+
+/** The meandering channel's centre at a segment's parameter U (P: the place there), in the
+ *  tile's plane: its offset from the line's point (m, the plane's: the sphere's over Stretch,
+ *  the metric across the segment) and the centreline's derivative in U (m a unit of U), with the
+ *  downstream direction (unit).
+ *
+ *  The meander: offset along the segment's left normal turned toward each joint's bisector
+ *  (half the turn there), so a joint's two segments put the centre at the same place; 2.5
+ *  channel widths at most (RiverMeander), inside 70% of the floodplain beyond the banks, none on
+ *  reaches steeper than 0.6% (fully from 0.1%), fading in over 1.5 wavelengths from each end of
+ *  its chain; the wave: the chain's phase (the build's: 11 widths a cycle) and its second
+ *  harmonic (a skew), its amplitude wobbling by a value noise over 4 wavelengths of the chain. */
+struct FVoxelLandRiverCentre
+{
+    float2 Offset;
+    float2 Tangent;
+    float2 Direction;
+    float Amplitude;    // m: the meander's swing there (0: the centre on the line)
+};
+
+VOXEL_FUNC FVoxelLandRiverCentre VoxelLandRiverCentreAt(VOXEL_LAND_ARGS_DECL FVoxelLandRiverSeg R, FVoxelLandRiverPlace P, float U,
+    float DX, float DY, float Hand, float Stretch, float Strata)
+{
+    FVoxelLandRiverCentre Out;
+    const float InvLen = 1.0f / max(sqrt(DX * DX + DY * DY), 1.0e-6f);
+    const float AX = DX * InvLen;
+    const float AY = DY * InvLen;
+    Out.Offset = float2(0.0f, 0.0f);
+    Out.Tangent = float2(DX, DY);
+    Out.Direction = float2(AX, AY);
+    Out.Amplitude = 0.0f;
+    // (Steep reaches first: most of them, no meander.)
+    const float Gentle = 1.0f - smoothstep(0.001f, 0.006f, P.Grade);
+    if (!(LandRiverMeander > 0.0f) || !(Gentle > 0.0f)) return Out;
+    const float Width = VoxelLandRiverWidth(VOXEL_LAND_ARGS P.Log2Area);
+    const float Half = 0.5f * Width;
+    const float Belt = VoxelLandRiverBelt(P.Log2Area);
+    const float Plain = VoxelLandRiverPlain(VOXEL_LAND_ARGS Belt, Half, VoxelLandRiverValleyHalfWidth(VOXEL_LAND_ARGS Belt), P.Grade, Strata);
+    const float Lambda = VOXEL_LAND_MEANDER_WAVES * Width;
+    const float S = R.S0 + U * R.Length;
+    const float Ends = smoothstep(0.0f, 1.5f * Lambda, S) * smoothstep(0.0f, 1.5f * Lambda, R.ChainLength - S);
+    const float Amp = LandRiverMeander * Gentle * Ends * min(VOXEL_LAND_MEANDER_AMPLITUDE * Width, 0.7f * max(Plain - 1.5f * Half, 0.0f));
+    if (!(Amp > 0.0f)) return Out;
+    Out.Amplitude = Amp;
+    // The wobble: value noise over the chain's place in 4-wavelength cells (the chain's key, not
+    // the segment's: the same on both sides of a joint).
+    const float X = S / (4.0f * Lambda);
+    const float XC = floor(X);
+    const float XF = X - XC;
+    const uint Key = VoxelLandRiverHash(uint(R.ChainLength) ^ 0x9e3779b9u);
+    const float N0 = VoxelLandRiverUnit(Key + uint(max(XC, 0.0f)));
+    const float N1 = VoxelLandRiverUnit(Key + uint(max(XC, 0.0f)) + 1u);
+    const float Wobble = 0.55f + 0.45f * lerp(N0, N1, smoothstep(0.0f, 1.0f, XF));
+    const float Angle = 6.28318531f * (R.Phase0 + U * R.PhaseSpan);
+    const float Wave = (sin(Angle) + 0.3f * sin(2.0f * Angle + 1.0f)) * (1.0f / 1.25f);
+    const float WaveSlope = (cos(Angle) + 0.6f * cos(2.0f * Angle + 1.0f)) * (6.28318531f / 1.25f) * R.PhaseSpan;   // per unit of U
+    const float M = Amp * Wobble * Wave / max(Stretch, 1.0e-3f);
+    const float MU = Amp * Wobble * WaveSlope / max(Stretch, 1.0e-3f);
+    // The left normal in the plane (Hand: + when the plane's axes turn as the up does), turned
+    // toward the joints' bisectors (by - half the turn at the start, + half at the end).
+    const float LX = -AY * Hand;
+    const float LY = AX * Hand;
+    const float Phi = lerp(-0.5f * R.Turn0, 0.5f * R.Turn1, U);
+    const float PhiU = 0.5f * (R.Turn0 + R.Turn1);
+    const float CP = cos(Phi);
+    const float SPhi = sin(Phi);
+    const float NX = CP * LX - SPhi * AX;
+    const float NY = CP * LY - SPhi * AY;
+    // d normal / dU: Phi' times the normal turned a right angle further.
+    const float NUX = -PhiU * (SPhi * LX + CP * AX);
+    const float NUY = -PhiU * (SPhi * LY + CP * AY);
+    Out.Offset = float2(M * NX, M * NY);
+    Out.Tangent = float2(DX + MU * NX + M * NUX, DY + MU * NY + M * NUY);
+    const float TL = sqrt(Out.Tangent.x * Out.Tangent.x + Out.Tangent.y * Out.Tangent.y);
+    if (TL > 1.0e-6f) Out.Direction = float2(Out.Tangent.x / TL, Out.Tangent.y / TL);
+    return Out;
+}
+
+/** A plane offset (VX, VY) from the point (X, Y) (m) on the sphere: the metric halfway along
+ *  (VoxelLandRiverAtDF's). */
+VOXEL_FUNC float VoxelLandRiverMetricLength(float X, float Y, float VX, float VY, float InvR)
+{
+    const float MX = X + 0.5f * VX;
+    const float MY = Y + 0.5f * VY;
+    const float Rho2 = (MX * MX + MY * MY) * (InvR * InvR);
+    const float PQ = (MX * VX + MY * VY) * InvR;
+    const float Metric = ((1.0f + Rho2) * (VX * VX + VY * VY) - PQ * PQ) / ((1.0f + Rho2) * (1.0f + Rho2));
+    return sqrt(max(Metric, 0.0f));
+}
+
+/** The point's distance (m, on the sphere) to a segment's meandering centreline, and the unit
+ *  direction (the plane's) from the nearest centre point to the point (the distance's gradient
+ *  there) and the flow there: Gauss-Newton on the parameter from the line's nearest (U0), three
+ *  steps, within the segment (so its ends are round). (EX, EY): the point from the segment's
+ *  start; (X, Y) the point. */
+struct FVoxelLandRiverChannel
+{
+    float Distance;
+    float2 Away;
+    float2 Direction;
+    float U;
+};
+
+VOXEL_FUNC FVoxelLandRiverChannel VoxelLandRiverChannelAt(VOXEL_LAND_ARGS_DECL FVoxelLandRiverSeg R, float U0, float X, float Y, float EX, float EY,
+    float DX, float DY, float Hand, float Stretch, float InvR, float Strata)
+{
+    float U = U0;
+    FVoxelLandRiverCentre C = VoxelLandRiverCentreAt(VOXEL_LAND_ARGS R, VoxelLandRiverPlaceAt(VOXEL_LAND_ARGS R, U), U, DX, DY, Hand, Stretch, Strata);
+    // (No search where the centre is on the line: steep reaches, the chains' ends.)
+    if (C.Amplitude > 0.0f)
+    {
+        for (int Step = 0; Step < 3; Step++)
+        {
+            const float VX = EX - DX * U - C.Offset.x;
+            const float VY = EY - DY * U - C.Offset.y;
+            const float T2 = C.Tangent.x * C.Tangent.x + C.Tangent.y * C.Tangent.y;
+            U = saturate(U + (VX * C.Tangent.x + VY * C.Tangent.y) / max(T2, 1.0e-6f));
+            C = VoxelLandRiverCentreAt(VOXEL_LAND_ARGS R, VoxelLandRiverPlaceAt(VOXEL_LAND_ARGS R, U), U, DX, DY, Hand, Stretch, Strata);
+        }
+    }
+    const float VX = EX - DX * U - C.Offset.x;
+    const float VY = EY - DY * U - C.Offset.y;
+    FVoxelLandRiverChannel Out;
+    // The metric's length of the offset from the centre point to the point.
+    Out.Distance = VoxelLandRiverMetricLength(X, Y, -VX, -VY, InvR);
+    const float VL = sqrt(VX * VX + VY * VY);
+    Out.Away = VL > 1.0e-6f ? float2(VX / VL, VY / VL) : float2(0.0f, 0.0f);
+    Out.Direction = C.Direction;
+    Out.U = U;
+    return Out;
+}
+
+/** A canyon wall's steps: a rise R (m) on stairs of Step (m), flat treads (TREAD of each step,
+ *  give or take 0.05 by the step: benches of uneven width) and steep risers; x: the stepped rise,
+ *  y: its slope in R. Key: the river's (so a wall's benches differ from the next valley's). */
+VOXEL_FUNC float2 VoxelLandCanyonStair(float R, float Step, uint Key)
+{
+    const float X = R / Step;
+    const float N = floor(X);
+    const float F = X - N;
+    const float Tread = VOXEL_LAND_CANYON_TREAD + 0.1f * (VoxelLandRiverUnit(Key + uint(max(N, 0.0f))) - 0.5f);
+    return float2(Step * (N + smoothstep(Tread, 1.0f, F)), VoxelLandSmoothSlope(Tread, 1.0f, F));
+}
+
+/** One river segment's carve of the surface S1 at distance D (m) from its line and Dc from its
+ *  channel's centre, where its floor is Floor, its drainage Log2Area, its grade Grade and its
+ *  plunge pool Pool (FVoxelLandRiverPlace), in a canyon by the strata's share Strata.
+ *  bGradients (a constant) adds the slopes in S1, D and Dc. */
+struct FVoxelLandRiverShape
+{
+    float Height;      // the carved surface
+    float Pull;        // the valley's pull (0..1)
+    float Cut;         // the channel's depth (m, band-limited; with a plunge pool's)
+    float Water;       // the channel's depth without the pool (m, band-limited): the water line's
+    float Bed;         // the bed's share of it at Dc (0..1)
+    float Half;        // the channel's half-width (m)
+    float Scale;       // d Height / d S1
+    float DD;          // d Height / d D
+    float DDc;         // d Height / d Dc
+    float V;           // the place up the valley's wall: 0 on the floodplain, 1 at the valley's edge
+    float DV;          // d V / d D
+};
+
+VOXEL_FUNC FVoxelLandRiverShape VoxelLandRiverShape(VOXEL_LAND_ARGS_DECL float S1, float D, float Dc, float Floor, float Log2Area, float Grade, float Pool,
+    float Strata, uint StairKey, float Footprint, bool bGradients)
+{
+    const float Width = VoxelLandRiverWidth(VOXEL_LAND_ARGS Log2Area);
+    const float Half = 0.5f * Width;
+    const float Belt = VoxelLandRiverBelt(Log2Area);
+    const float Valley = VoxelLandRiverValleyHalfWidth(VOXEL_LAND_ARGS Belt);
+    const float Depth = VoxelLandRiverDepth(VOXEL_LAND_ARGS Log2Area);
+    const float Plain = VoxelLandRiverPlain(VOXEL_LAND_ARGS Belt, Half, Valley, Grade, Strata);
+    // The fade-in from RiverMinArea, and the band limits (the valley over its width, the
+    // channel over its own).
+    const float Source = LandRiverMinLog2Area > 0.0f ? smoothstep(LandRiverMinLog2Area, LandRiverMinLog2Area + VOXEL_LAND_RIVER_SOURCE_FADE, Log2Area) : 1.0f;
+    const float ValleyBand = VoxelOctaveBandWeight(200.0f * Valley, Footprint) * Source * LandRiverCarve;
+    const float ChannelBand = VoxelOctaveBandWeight(200.0f * Width, Footprint) * Source * LandRiverCarve;
+    // The valley at full strength: the surface's height over the floor scaled by the profile
+    // (all of it taken on the floodplain, none at the valley's edge), but no higher than the
+    // walls allow: a rise at the wall's slope from the floodplain's edge, over the profile (so
+    // it never binds at the valley's edge: where the land stands high over the floor, the
+    // mountains, the scaled relief alone would make cliffs of the walls).
+    // A canyon (the strata's share where the river incises: VoxelLandRiverCanyon): steeper
+    // walls in steps (treads and risers of a fifth of the strata's relief), a sharper foot and
+    // rim, and the scaled share mostly left to the walls, so the plateau stands to the rim.
+    const float Canyon = VoxelLandRiverCanyon(Strata, Grade);
+    const float WallSlope = lerp(lerp(VOXEL_LAND_VALLEY_SLOPE_LOW, VOXEL_LAND_VALLEY_SLOPE_HIGH, smoothstep(0.002f, 0.03f, Grade)), VOXEL_LAND_CANYON_SLOPE, Canyon);
+    const float Foot = VOXEL_LAND_VALLEY_FOOT * (1.0f - 0.8f * Canyon);
+    const float Out1 = D - Plain;
+    const float RiseBase = WallSlope * VoxelLandSoftPositive(Out1, Foot);
+    const float2 Stair = VoxelLandCanyonStair(RiseBase, clamp(0.2f * LandStrataRelief, 20.0f, 150.0f), StairKey);
+    // (The steps at 60%: benches and steeper bands, no walls.)
+    const float Steps = VOXEL_LAND_CANYON_STEPS * Canyon;
+    const float Rise = lerp(RiseBase, Stair.x, Steps);
+    const float V = smoothstep(Plain, Valley, D);
+    const float Prof = 1.0f - V;
+    const float ProfC = max(Prof, VOXEL_LAND_VALLEY_MIN_PULL);
+    const float Take = 1.0f - VOXEL_LAND_CANYON_TAKE * Canyon;
+    const float ProfK = Prof * Take;
+    const float E = S1 - Floor;
+    const float SP = VoxelLandSoftPositive(E, VOXEL_LAND_CARVE_SOFT);
+    const float Wall = Floor + Rise / ProfC;
+    // The wall meets the scaled land in a curve as wide as half its rise there (sharp only at
+    // the floodplain's edge, where the rise is nothing; sharper in a canyon).
+    const float Round = VOXEL_LAND_VALLEY_ROUND * (1.0f - 0.8f * Canyon);
+    const float Soft = VOXEL_LAND_CARVE_SOFT + Round * Rise;
+    const float XW = Wall - (S1 - ProfK * SP);
+    const float SW = VoxelLandSoftPositive(XW, Soft);
+    // The full valley less the surface: (Wall - SW) - S1, from the scaled land (exactly it where
+    // the wall is out of reach: XW >= Soft, and the wall far up, where Wall - SW would round at
+    // its size).
+    const float Valleyed = (XW - SW) - ProfK * SP;
+    // Faded linearly (the source, the band limit, the switch): the wall over the profile would
+    // otherwise still cut nearly the whole valley at a small fade.
+    const float Pull = ValleyBand * Prof;
+    const float S1P = S1 + ValleyBand * Valleyed;
+    // The channel, about the meandering centre (Dc), its plunge pools deeper: flat-bedded where
+    // it's wide for its depth, a V where it isn't (its banks spanning at least 2.5 cuts, so 1 in
+    // 2.5 on average and 1 in 1.7 at smoothstep's steepest; a deep one wider than its width), and
+    // cut at most its own depth below the valley's surface (where
+    // the valley isn't down to its floor, in the fade-in and at coarse footprints, a channel to
+    // the bed would be a slot as deep as the land left above it).
+    const float Cut = (Depth + Pool) * ChannelBand;
+    // (The bank spans at least 2.5 cuts: inward to 0.6 of the half-width, then outward.)
+    const float BedIn = min(0.6f * Half, max(Half - 2.5f * Cut, 0.0f));
+    const float BedOut = max(Half, BedIn + 2.5f * Cut);
+    const float BankOut = BedOut + 0.5f * Half;
+    const float Bed = 1.0f - smoothstep(BedIn, BedOut, Dc);
+    const float Bank = ChannelBand * (1.0f - smoothstep(BedOut, BankOut, Dc));
+    const float B = Floor - Cut * Bed;
+    const float SCRaw = VoxelLandSoftPositive(S1P - B, VOXEL_LAND_CARVE_SOFT);
+    const float CapA = Cut * Bed + VOXEL_LAND_CARVE_SOFT;
+    const float SC = SCRaw - VoxelLandSoftPositive(SCRaw - CapA, VOXEL_LAND_CARVE_SOFT);
+    // The natural levees: on a lowland river's floodplain (the surface within two channel
+    // depths of the floor), a rise of 0.3 depths at the bank falling away over 4 widths.
+    const float LeveeIn = smoothstep(BedOut, BankOut, Dc);
+    const float LeveeOut = 1.0f - smoothstep(BankOut, BankOut + 4.0f * Width, Dc);
+    const float LeveeH = VOXEL_LAND_LEVEE * Depth * ChannelBand * (1.0f - smoothstep(0.001f, 0.006f, Grade)) * (1.0f - Canyon);
+    const float NearBand = max(2.0f * Depth, 1.0e-3f);   // (RiverDepthScale 0: no equal edges)
+    const float Near = 1.0f - smoothstep(0.0f, NearBand, S1P - Floor);
+    const float Levee = LeveeH * LeveeIn * LeveeOut * Near;
+    const float S2 = S1P - Bank * SC + Levee;
+    FVoxelLandRiverShape Out;
+    Out.Height = S2;
+    Out.Pull = Pull;
+    Out.Cut = Cut;
+    Out.Water = Depth * ChannelBand;
+    Out.Bed = Bed;
+    Out.Half = Half;
+    Out.Scale = 1.0f;
+    Out.DD = 0.0f;
+    Out.DDc = 0.0f;
+    Out.V = V;
+    Out.DV = VoxelLandSmoothSlope(Plain, Valley, D);
+    if (bGradients)
+    {
+        const float SPS = VoxelLandSoftPositiveSlope(E, VOXEL_LAND_CARVE_SOFT);
+        const float SWS = VoxelLandSoftPositiveSlope(XW, Soft);
+        const float SCRawS = VoxelLandSoftPositiveSlope(S1P - B, VOXEL_LAND_CARVE_SOFT);
+        const float CapS = VoxelLandSoftPositiveSlope(SCRaw - CapA, VOXEL_LAND_CARVE_SOFT);   // the cap's share
+        const float SCS = (1.0f - CapS) * SCRawS;   // d SC / d S1P
+        // The scaled land's slopes in the surface and the distance.
+        const float DProf_DD = -VoxelLandSmoothSlope(Plain, Valley, D);
+        const float DScaled_DS = 1.0f - ProfK * SPS;
+        const float DScaled_DD = -Take * DProf_DD * SP;
+        // The wall's (its rise over the profile, the profile only while above its floor).
+        const float DRiseBase_DD = WallSlope * VoxelLandSoftPositiveSlope(Out1, Foot);
+        const float DRise_DD = DRiseBase_DD * ((1.0f - Steps) + Steps * Stair.y);
+        const float DProfC_DD = Prof > VOXEL_LAND_VALLEY_MIN_PULL ? DProf_DD : 0.0f;
+        const float DWall_DD = DRise_DD / ProfC - Rise * DProfC_DD / (ProfC * ProfC);
+        // The full valley = Wall - sp(Wall - Scaled, Soft), Soft growing with the rise.
+        // (In this order: where the wall is out of reach SWS is 1 and its slope, huge where the
+        // profile is small, drops out exactly.)
+        const float DFull_DD = (1.0f - SWS) * DWall_DD + SWS * DScaled_DD - VoxelLandSoftPositiveSoftness(XW, Soft) * Round * DRise_DD;
+        const float DFull_DS = SWS * DScaled_DS;
+        // S1P = S1 + fade (Full - S1).
+        const float DS1P_DD = ValleyBand * DFull_DD;
+        const float A1 = (1.0f - ValleyBand) + ValleyBand * DFull_DS;
+        // The levee's slope in S1P (its fade off the floor).
+        const float DLevee_DS1P = -LeveeH * LeveeIn * LeveeOut * VoxelLandSmoothSlope(0.0f, NearBand, S1P - Floor);
+        const float A2 = 1.0f - Bank * SCS + DLevee_DS1P;
+        Out.Scale = A1 * A2;
+        Out.DD = A2 * DS1P_DD;
+        // The channel's and the levee's, in the channel's distance.
+        // d B / d Dc and d CapA / d Dc = -it; SC = SCRaw - sp(SCRaw - CapA): d SC / d Dc =
+        // -DB_DDc (SCS + CapS).
+        const float DB_DDc = Cut * VoxelLandSmoothSlope(BedIn, BedOut, Dc);
+        const float DBank_DDc = -ChannelBand * VoxelLandSmoothSlope(BedOut, BankOut, Dc);
+        const float DLevee_DDc = LeveeH * Near * (VoxelLandSmoothSlope(BedOut, BankOut, Dc) * LeveeOut - LeveeIn * VoxelLandSmoothSlope(BankOut, BankOut + 4.0f * Width, Dc));
+        Out.DDc = -DBank_DDc * SC + Bank * (SCS + CapS) * DB_DDc + DLevee_DDc;
+    }
+    return Out;
+}
+
+/** No carve: the surface S1 as it is. */
+VOXEL_FUNC FVoxelLandCarve VoxelLandCarveNone(float S1)
+{
+    FVoxelLandCarve Out;
+    Out.Height = S1;
+    Out.Scale = 1.0f;
+    Out.Gradient = float3(0.0f, 0.0f, 0.0f);
+    Out.DetailKeep = 1.0f;
+    Out.WaterKind = VOXEL_LAND_WATER_NONE;
+    Out.WaterLevel = 0.0f;
+    Out.FlowDirection = float3(0.0f, 0.0f, 0.0f);
+    Out.Grade = 0.0f;
+    Out.ChannelDepth = 0.0f;
+    Out.Distance = 3.0e38f;
+    return Out;
+}
+
+/** A tile entry's segment at the point (X, Y) in the tile's plane (m): its parameter, the
+ *  point's offset from the line's point there, and the distance on the sphere (the plane's
+ *  metric halfway along: VoxelLandRiverAtDF) with the metric's stretch across the segment (the
+ *  channel's offsets are measured with it). */
+struct FVoxelLandRiverNear
+{
+    float U;
+    float PX;
+    float PY;
+    float D;
+    float Stretch;
+};
+
+VOXEL_FUNC FVoxelLandRiverNear VoxelLandRiverNearAt(float X, float Y, float EX, float EY, float DX, float DY, float InvD2, float InvR)
+{
+    FVoxelLandRiverNear N;
+    N.U = saturate((EX * DX + EY * DY) * InvD2);
+    N.PX = EX - DX * N.U;
+    N.PY = EY - DY * N.U;
+    const float QPX = -N.PX;
+    const float QPY = -N.PY;
+    const float MX = X + 0.5f * QPX;
+    const float MY = Y + 0.5f * QPY;
+    const float Rho2 = (MX * MX + MY * MY) * (InvR * InvR);
+    const float PQ = (MX * QPX + MY * QPY) * InvR;
+    const float Metric = ((1.0f + Rho2) * (QPX * QPX + QPY * QPY) - PQ * PQ) / ((1.0f + Rho2) * (1.0f + Rho2));
+    N.D = sqrt(max(Metric, 0.0f));
+    // Across the segment: the metric along its normal (unit) at the same middle.
+    const float L2 = max(DX * DX + DY * DY, 1.0e-12f);
+    const float PN = (-MX * DY + MY * DX) * InvR * (1.0f / sqrt(L2));
+    N.Stretch = sqrt(max(((1.0f + Rho2) - PN * PN) / ((1.0f + Rho2) * (1.0f + Rho2)), 0.0f));
+    return N;
+}
+
+/** An entry's slopes at the point: the carve's in the surface (Scale) and its own (Gradient,
+ *  tangent at the point): its analytic slopes in the distances (to the line and to the channel's
+ *  centre, each at the segment's parameter held), then along the segment by a central difference
+ *  in the parameter (the floor, its fall and pool, the drainage, the eased grade, the meander:
+ *  everything that moves along it) and, in the strata's switch, in their share. */
+struct FVoxelLandRiverSlopes
+{
+    float Scale;
+    float3 Gradient;
+};
+
+VOXEL_FUNC FVoxelLandRiverSlopes VoxelLandRiverEntrySlopes(VOXEL_LAND_ARGS_DECL uint At, float X, float Y, float3 T1, float3 T2, float3 Up, float Hand,
+    float InvR, float S1, float Strata, float3 StrataGrad, float Footprint)
+{
+    const float EX = X - VOXEL_LAND_RIVER_DATA(At);
+    const float EY = Y - VOXEL_LAND_RIVER_DATA(At + 1u);
+    const float DX = VOXEL_LAND_RIVER_DATA(At + 2u);
+    const float DY = VOXEL_LAND_RIVER_DATA(At + 3u);
+    const float InvD2 = VOXEL_LAND_RIVER_DATA(At + 4u);
+    const FVoxelLandRiverNear N = VoxelLandRiverNearAt(X, Y, EX, EY, DX, DY, InvD2, InvR);
+    const FVoxelLandRiverSeg R = VoxelLandRiverSegAt(VOXEL_LAND_ARGS uint(VOXEL_LAND_RIVER_DATA(At + 6u)));
+    const FVoxelLandRiverPlace P = VoxelLandRiverPlaceAt(VOXEL_LAND_ARGS R, N.U);
+    const FVoxelLandRiverChannel Ch = VoxelLandRiverChannelAt(VOXEL_LAND_ARGS R, N.U, X, Y, EX, EY, DX, DY, Hand, N.Stretch, InvR, Strata);
+    const float Dc = Ch.Distance;
+    const FVoxelLandRiverShape Shape = VoxelLandRiverShape(VOXEL_LAND_ARGS S1, N.D, Dc, P.Floor, P.Log2Area, P.Grade, P.Pool, Strata,
+        R.StairKey, Footprint, true);
+    FVoxelLandRiverSlopes Out;
+    Out.Scale = Shape.Scale;
+    // The directions at the point (the plane's taken to the tangent plane: their stretch is
+    // the metric's, under 1e-3 over a tile): away from the line, downstream, and away from
+    // the channel's nearest centre point (the distances' gradients, at their nearest points).
+    const float3 Away = T1 * N.PX + T2 * N.PY;
+    const float3 AwayT = Away - Up * dot(Away, Up);
+    const float AwayLen = length(AwayT);
+    const float3 AwayDir = AwayLen > 1.0e-6f ? AwayT * (1.0f / AwayLen) : float3(0.0f, 0.0f, 0.0f);
+    const float3 Along = T1 * DX + T2 * DY;
+    const float3 AlongT = Along - Up * dot(Along, Up);
+    const float AlongLen = length(AlongT);
+    const float3 AlongDir = AlongLen > 1.0e-20f ? AlongT * (1.0f / AlongLen) : float3(0.0f, 0.0f, 0.0f);
+    const float3 Off = T1 * Ch.Away.x + T2 * Ch.Away.y;
+    const float3 OffT = Off - Up * dot(Off, Up);
+    const float OffLen = length(OffT);
+    const float3 OffDir = OffLen > 1.0e-6f ? OffT * (1.0f / OffLen) : float3(0.0f, 0.0f, 0.0f);
+    float3 Gradient = AwayDir * Shape.DD + OffDir * Shape.DDc;
+    // Along: a central difference in the line's parameter (half a metre either way), the
+    // distances held (their slopes there are nothing: the nearest points). Not beyond the
+    // ends, where the parameter stays.
+    if (N.U > 0.0f && N.U < 1.0f)
+    {
+        const float Step = VOXEL_LAND_RIVER_ALONG_STEP / R.Length;
+        const FVoxelLandRiverPlace Pa = VoxelLandRiverPlaceAt(VOXEL_LAND_ARGS R, N.U + Step);
+        const FVoxelLandRiverPlace Pb = VoxelLandRiverPlaceAt(VOXEL_LAND_ARGS R, N.U - Step);
+        const float Ha = VoxelLandRiverShape(VOXEL_LAND_ARGS S1, N.D, Dc, Pa.Floor, Pa.Log2Area, Pa.Grade, Pa.Pool, Strata, R.StairKey, Footprint, false).Height;
+        const float Hb = VoxelLandRiverShape(VOXEL_LAND_ARGS S1, N.D, Dc, Pb.Floor, Pb.Log2Area, Pb.Grade, Pb.Pool, Strata, R.StairKey, Footprint, false).Height;
+        Gradient = Gradient + AlongDir * ((Ha - Hb) / (2.0f * VOXEL_LAND_RIVER_ALONG_STEP));
+    }
+    // The strata's share (a central difference, small: the canyon's steps move with it).
+    if (Strata > 0.0f && Strata < 1.0f)
+    {
+        const float Dk = min(VOXEL_LAND_RIVER_STRATA_STEP, 0.5f * min(Strata, 1.0f - Strata));
+        const FVoxelLandRiverChannel Ca = VoxelLandRiverChannelAt(VOXEL_LAND_ARGS R, N.U, X, Y, EX, EY, DX, DY, Hand, N.Stretch, InvR, Strata + Dk);
+        const FVoxelLandRiverChannel Cb = VoxelLandRiverChannelAt(VOXEL_LAND_ARGS R, N.U, X, Y, EX, EY, DX, DY, Hand, N.Stretch, InvR, Strata - Dk);
+        const float Ha = VoxelLandRiverShape(VOXEL_LAND_ARGS S1, N.D, Ca.Distance, P.Floor, P.Log2Area, P.Grade, P.Pool, Strata + Dk, R.StairKey, Footprint, false).Height;
+        const float Hb = VoxelLandRiverShape(VOXEL_LAND_ARGS S1, N.D, Cb.Distance, P.Floor, P.Log2Area, P.Grade, P.Pool, Strata - Dk, R.StairKey, Footprint, false).Height;
+        Gradient = Gradient + StrataGrad * ((Ha - Hb) / (2.0f * Dk));
+    }
+    Out.Gradient = Gradient;
+    return Out;
+}
+
+/** The rivers' carve of the surface S1 (m) at the warped point Q (double-float, any length),
+ *  sampled at Footprint (cm), in a canyon by the strata's share Strata (its gradient
+ *  StrataGrad, tangent at the point). bGradients (a constant) adds Scale and Gradient
+ *  (VoxelLandRiverEntrySlopes).
+ *
+ *  Every entry's segment carves. Within one river the lowest wins: a river is its trunk (the
+ *  source at the top of its line of main donors: VOXEL_LAND_RIVER_TRUNK_*), so the main stem's
+ *  segments on either side of a confluence count as one river, as consecutive segments do (their
+ *  surfaces coincide at their joints, and the stem's valley goes on through the confluence).
+ *  Between two rivers, the lowest river's result H1 and the lowest of the other rivers' H2 meet
+ *  in a smooth minimum (N1b): where two valleys' walls cross (a tributary's and the stem's, or
+ *  two neighbouring valleys'), the crease is rounded over k = VOXEL_LAND_VALLEY_MEET_ROUND x their mean cut
+ *  below the surface (S1 - (H1 + H2) / 2) x the place up the walls (V: 0 on a floodplain or in
+ *  a channel, 1 at a valley's edge; over the entries, a soft least: their V weighted by
+ *  exp(-V / VOXEL_LAND_VALLEY_MEET_SOFT) (1 - V)^2). So nothing is rounded on the floors and
+ *  channels (a confluence joins as before) or at a valley's edge (no cut). k is smooth across
+ *  the crease (H1 + H2 is the same whichever chain is lowest; the soft least has no corner where
+ *  two entries' places cross, and an entry at a valley's edge weighs nothing, so one coming into
+ *  reach changes nothing), and none of it depends on the entries' order. Where a second
+ *  river starts to carve, its gap to the first is the whole cut, beyond k (r at most 2): nothing
+ *  changes there. */
+VOXEL_FUNC FVoxelLandCarve VoxelLandRiverCarveDF(VOXEL_LAND_ARGS_DECL float2 QX, float2 QY, float2 QZ, float S1, float Strata, float3 StrataGrad,
+    float Footprint, bool bGradients)
+{
+    FVoxelLandCarve Out = VoxelLandCarveNone(S1);
+    if (LandRiverTilesPerFace == 0u || LandRiverCarve <= 0.0f) return Out;
+    const uint Tile = VoxelLandRiverTileOf(VOXEL_LAND_ARGS normalize(float3(QX.x, QY.x, QZ.x)));
+    const uint F = VOXEL_LAND_RIVER_TILE(Tile);
+    const uint End = VOXEL_LAND_RIVER_TILE(Tile + 1u);
+    if (F >= End) return Out;
+    // The point in the tile's plane (as VoxelLandRiverAtDF).
+    const float3 C = float3(VOXEL_LAND_RIVER_DATA(F), VOXEL_LAND_RIVER_DATA(F + 1u), VOXEL_LAND_RIVER_DATA(F + 2u));
+    const float3 T1 = float3(VOXEL_LAND_RIVER_DATA(F + 4u), VOXEL_LAND_RIVER_DATA(F + 5u), VOXEL_LAND_RIVER_DATA(F + 6u));
+    const float3 T2 = float3(VOXEL_LAND_RIVER_DATA(F + 8u), VOXEL_LAND_RIVER_DATA(F + 9u), VOXEL_LAND_RIVER_DATA(F + 10u));
+    const float2 DC = VoxelLandRiverDot(QX, QY, QZ, C);
+    const float X = VoxelDFDiv(VoxelLandRiverDot(QX, QY, QZ, T1), DC).x * LandRiverRadiusM;
+    const float Y = VoxelDFDiv(VoxelLandRiverDot(QX, QY, QZ, T2), DC).x * LandRiverRadiusM;
+    const float InvR = 1.0f / LandRiverRadiusM;
+    const float3 Up = normalize(float3(QX.x, QY.x, QZ.x));
+    // The plane's turning sense: + where turning from T1 to T2 turns as the up does (the
+    // builder's turns are about the up).
+    const float Hand = dot(cross(T1, T2), C) < 0.0f ? -1.0f : 1.0f;
+    const uint First = F + VOXEL_LAND_RIVER_FRAME_FLOATS;
+    float BestDepth = 3.0e38f;   // the best water's channel (the deepest cut's river)
+    // The lowest chain's result (its key, entry and place up the wall), and the lowest of the
+    // other chains' (the surface itself where none carves).
+    float H1 = S1;
+    float H2 = S1;
+    uint Chain1 = 0u;
+    bool bChain1 = false;
+    uint BestAt = 0xffffffffu;
+    uint SecondAt = 0xffffffffu;
+    // The place up the walls' soft least: the entries' sums of w, of w V and (bGradients) of
+    // w grad V, w' V grad V and w' grad V; w = exp(-V / soft) (1 - V)^2 (w' its slope in V: an
+    // entry at a valley's edge weighs nothing, and comes into reach without a step).
+    float VW = 0.0f;
+    float VA = 0.0f;
+    float3 VGA = float3(0.0f, 0.0f, 0.0f);
+    float3 VGB = float3(0.0f, 0.0f, 0.0f);
+    float3 VGD = float3(0.0f, 0.0f, 0.0f);
+    VOXEL_LOOP
+    for (uint At = First; At < End; At += VOXEL_LAND_RIVER_ENTRY_FLOATS)
+    {
+        const float EX = X - VOXEL_LAND_RIVER_DATA(At);
+        const float EY = Y - VOXEL_LAND_RIVER_DATA(At + 1u);
+        const float DX = VOXEL_LAND_RIVER_DATA(At + 2u);
+        const float DY = VOXEL_LAND_RIVER_DATA(At + 3u);
+        const float InvD2 = VOXEL_LAND_RIVER_DATA(At + 4u);
+        {
+            const float U0 = saturate((EX * DX + EY * DY) * InvD2);
+            const float PX0 = EX - DX * U0;
+            const float PY0 = EY - DY * U0;
+            if (PX0 * PX0 + PY0 * PY0 > VOXEL_LAND_RIVER_DATA(At + 5u)) continue;
+        }
+        const FVoxelLandRiverNear N = VoxelLandRiverNearAt(X, Y, EX, EY, DX, DY, InvD2, InvR);
+        const FVoxelLandRiverSeg R = VoxelLandRiverSegAt(VOXEL_LAND_ARGS uint(VOXEL_LAND_RIVER_DATA(At + 6u)));
+        const FVoxelLandRiverPlace P = VoxelLandRiverPlaceAt(VOXEL_LAND_ARGS R, N.U);
+        const FVoxelLandRiverChannel Ch = VoxelLandRiverChannelAt(VOXEL_LAND_ARGS R, N.U, X, Y, EX, EY, DX, DY, Hand, N.Stretch, InvR, Strata);
+        const float Dc = Ch.Distance;
+        const FVoxelLandRiverShape Shape = VoxelLandRiverShape(VOXEL_LAND_ARGS S1, N.D, Dc, P.Floor, P.Log2Area, P.Grade, P.Pool, Strata,
+            R.StairKey, Footprint, false);
+        Out.DetailKeep = min(Out.DetailKeep, 1.0f - Shape.Pull);
+        const float Level = P.Floor - (1.0f - VOXEL_LAND_RIVER_WATER_SHARE) * Shape.Water;
+        // (Not under the ground: where the valley isn't down, the channel is only cut its depth
+        // into it, and its water line, set from the floor, is below.)
+        if (Dc < Shape.Half && Shape.Cut * Shape.Bed > 0.0f && Level > Shape.Height)
+        {
+            // The river's water line at the channel's nearest point: the deepest cut wins where
+            // channels meet.
+            if (Out.WaterKind != VOXEL_LAND_WATER_RIVER || Shape.Cut * Shape.Bed > BestDepth)
+            {
+                BestDepth = Shape.Cut * Shape.Bed;
+                Out.WaterKind = VOXEL_LAND_WATER_RIVER;
+                Out.WaterLevel = Level;
+                const float3 Along = T1 * Ch.Direction.x + T2 * Ch.Direction.y;
+                const float3 AlongT = Along - Up * dot(Along, Up);
+                Out.FlowDirection = AlongT * (1.0f / max(length(AlongT), 1.0e-20f));
+                Out.Grade = max(P.FloorSlope, 0.0f);
+                Out.ChannelDepth = Shape.Water;
+            }
+        }
+        Out.Distance = min(Out.Distance, N.D);
+        if (Shape.V < 1.0f)
+        {
+            const float E = exp2(Shape.V * (-1.44269504f / VOXEL_LAND_VALLEY_MEET_SOFT));
+            const float Rest = 1.0f - Shape.V;
+            const float W = E * Rest * Rest;
+            VW += W;
+            VA += W * Shape.V;
+            if (bGradients && Shape.DV != 0.0f)
+            {
+                // V's gradient: its slope in the distance, away from the line (left out: its change
+                // along the segment, with the valley's slowly changing width, and in the strata's
+                // share, through a canyon's narrower floor).
+                const float3 Away = T1 * N.PX + T2 * N.PY;
+                const float3 AwayT = Away - Up * dot(Away, Up);
+                const float AwayLen = length(AwayT);
+                const float3 VGrad = AwayLen > 1.0e-6f ? AwayT * (Shape.DV / AwayLen) : float3(0.0f, 0.0f, 0.0f);
+                const float WSlope = -E * Rest * (Rest * (1.0f / VOXEL_LAND_VALLEY_MEET_SOFT) + 2.0f);
+                VGA = VGA + VGrad * W;
+                VGB = VGB + VGrad * (WSlope * Shape.V);
+                VGD = VGD + VGrad * WSlope;
+            }
+        }
+        // The river's key: its trunk's (the same along it through its confluences, where the
+        // main stem's valley goes on: only a tributary's meets it in the smooth minimum).
+        const uint Chain = R.Trunk;
+        if (bChain1 && Chain == Chain1)
+        {
+            if (Shape.Height < H1)
+            {
+                H1 = Shape.Height;
+                BestAt = At;
+            }
+        }
+        else if (Shape.Height < H1)
+        {
+            // A new lowest chain: the old one's becomes the other chains' lowest (everything seen
+            // so far was at least it).
+            H2 = H1;
+            SecondAt = BestAt;
+            H1 = Shape.Height;
+            BestAt = At;
+            Chain1 = Chain;
+            bChain1 = true;
+        }
+        else if (Shape.Height < H2)
+        {
+            H2 = Shape.Height;
+            SecondAt = At;
+        }
+    }
+    // The two chains' smooth minimum (min - h^2 k / 4, h = max(k - (H2 - H1), 0) / k, H2 >= H1):
+    // k from the mean cut below the surface times the place up the walls.
+    const bool bSecond = SecondAt != 0xffffffffu && BestAt != 0xffffffffu;
+    const float VSoft = VW > 0.0f ? VA / VW : 1.0f;
+    const float Cut = max(S1 - 0.5f * (H1 + H2), 0.0f);
+    const float K = bSecond ? VOXEL_LAND_VALLEY_MEET_ROUND * Cut * VSoft : 0.0f;
+    const float Gap = H2 - H1;
+    const float Hm = K > 0.0f ? max(K - Gap, 0.0f) / K : 0.0f;
+    Out.Height = H1 - Hm * Hm * K * 0.25f;
+    if (bGradients && BestAt != 0xffffffffu)
+    {
+        // The two chains' slopes (one entry's evaluation in the loop, so it's inlined once). The
+        // smooth minimum's slopes: (1 - h/2) in H1, h/2 in H2, -h (2 - h) / 4 in k; k = r Cut V:
+        // its slope in S1 r V (1 - (Scale1 + Scale2) / 2), its own gradient
+        // r (-V (Gradient1 + Gradient2) / 2 + Cut grad V), the soft least's gradient
+        // (sum (w + w' (V - VSoft)) grad V) / sum w. Without the rounding (h 0) the first alone.
+        const float W1 = 1.0f - 0.5f * Hm;
+        const float W2 = 0.5f * Hm;
+        const float WKR = -Hm * (2.0f - Hm) * 0.25f * VOXEL_LAND_VALLEY_MEET_ROUND;
+        const float Shared = -0.5f * WKR * VSoft;   // each chain's share through k
+        Out.Scale = WKR * VSoft;
+        Out.Gradient = float3(0.0f, 0.0f, 0.0f);
+        if (Hm > 0.0f && VW > 0.0f)
+            Out.Gradient = (VGA + VGB - VGD * VSoft) * (WKR * Cut / VW);
+        const uint Count = Hm > 0.0f ? 2u : 1u;
+        VOXEL_LOOP
+        for (uint k = 0u; k < Count; k++)
+        {
+            const FVoxelLandRiverSlopes L = VoxelLandRiverEntrySlopes(VOXEL_LAND_ARGS k == 0u ? BestAt : SecondAt, X, Y, T1, T2, Up, Hand, InvR, S1,
+                Strata, StrataGrad, Footprint);
+            const float W = (k == 0u ? W1 : W2) + Shared;
+            Out.Scale += W * L.Scale;
+            Out.Gradient = Out.Gradient + L.Gradient * W;
+        }
+    }
+    return Out;
+}
+
+/** A kept lake carved into the surface S (m): its bed, then its shore. The bed: under the lake's
+ *  weight the surface comes down to the level less the lake cells' mean depth (the bake's: the
+ *  B-spline and the hills stand far above a small lake's floor), the depth fading in from the
+ *  shore (weight 0.5) to the lake's middle (1). The shore: within 2 x LakeShoreBand of the
+ *  level the surface eases toward it, s - L -> (s - L) smoothstep(|s - L| / 2 band), a bench at
+ *  the waterline. The height, its slope in S, its own gradient (tangent at the point, with
+ *  bGradients) and the detail's share. */
+struct FVoxelLandShore
+{
+    float Height;
+    float Scale;
+    float3 Gradient;
+    float DetailKeep;
+};
+
+VOXEL_FUNC FVoxelLandShore VoxelLandLakeShore(VOXEL_LAND_ARGS_DECL FVoxelLandLake Lake, float S, bool bGradients)
+{
+    FVoxelLandShore Out;
+    Out.Height = S;
+    Out.Scale = 1.0f;
+    Out.Gradient = float3(0.0f, 0.0f, 0.0f);
+    Out.DetailKeep = 1.0f;
+    if (Lake.Weight <= 0.0f || LandRiverCarve <= 0.0f) return Out;
+    const float W = Lake.Weight;
+    // The detail fades under the lake's weight (by the weight alone: VoxelLandDifferencedDF,
+    // which differences its amplitude, leaves the peaks' shapes out of the surface).
+    Out.DetailKeep = 1.0f - W;
+    // The bed.
+    const float In = smoothstep(0.5f, 1.0f, W);
+    const float Target = Lake.Level - Lake.Depth * In;
+    const float E = S - Target;
+    const float SP = VoxelLandSoftPositive(E, VOXEL_LAND_CARVE_SOFT);
+    const float Bed = S - W * SP;
+    // The shore's bench.
+    float Height = Bed;
+    float BenchScale = 1.0f;
+    float X = Bed - Lake.Level;
+    float G = X;
+    float GS = 1.0f;
+    if (LandLakeShoreBand > 0.0f)
+    {
+        const float Band = 2.0f * LandLakeShoreBand;
+        const float T = saturate(abs(X) / Band);
+        const float Ease = T * T * (3.0f - 2.0f * T);
+        G = X * Ease;
+        GS = Ease + T * 6.0f * T * (1.0f - T);   // dG / dX
+        Height = Bed + W * (G - X);
+        BenchScale = 1.0f + W * (GS - 1.0f);
+
+    }
+    Out.Height = Height;
+    if (bGradients)
+    {
+        const float SPS = VoxelLandSoftPositiveSlope(E, VOXEL_LAND_CARVE_SOFT);
+        Out.Scale = BenchScale * (1.0f - W * SPS);
+        // The bed's own: -sp grad W + W sp' grad Target, grad Target = grad Level - (In grad
+        // Depth + Depth In' grad W).
+        const float3 TargetGrad = Lake.LevelGrad - (Lake.DepthGrad * In + Lake.WeightGrad * (Lake.Depth * VoxelLandSmoothSlope(0.5f, 1.0f, W)));
+        const float3 BedGrad = Lake.WeightGrad * -SP + TargetGrad * (W * SPS);
+        // The bench's: its slope in the bed, (G - X) grad W, and W (1 - G') grad Level.
+        Out.Gradient = BedGrad * BenchScale + Lake.WeightGrad * (G - X) + Lake.LevelGrad * (W * (1.0f - GS));
+    }
+    return Out;
+}
+
+#endif // VOXEL_LAND_CARVE_USH

@@ -131,6 +131,23 @@ struct FParams
     int SoftMode = 1;             // 1 derived from R (shared drainage), 0 a separate run (legacy)
     int SoftSteps = 100;          // steps of the derivation
 
+    // Layered rock (strata, Design/NoiseTiles2D_Addendum3.md section 2). StrataBeds > 0 turns it
+    // on: the rock at a cell is the bed at its original elevation z0 = H - (the uplift it has had)
+    // + the tilt field, so beds stay horizontal (or tilted) wherever erosion exposes them. Every
+    // bed is StrataBeds thick (texels at S = 64, x s), jittered by StrataJitter; its top
+    // StrataHardShare (R; StrataHardShareG for G, centred in R's, so G's ledges sit in R's
+    // benches) is hard: K x StrataHardK and the threshold slope StrataHardSc (the soft beds keep
+    // ScHard in R, ScSoft in G). The hardness eases over StrataEdge texels (x s) at a bed's edges.
+    double StrataBeds = 0.0;
+    double StrataHardShare = 0.35;
+    double StrataHardShareG = 0.12;
+    double StrataJitter = 0.35;
+    double StrataHardK = 0.2;
+    double StrataHardSc = 1.5;    // 56 deg
+    double StrataEdge = 0.15;
+    double StrataTilt = 0.0;      // the tilt field's amplitude (texels at S = 64, x s): a periodic fbm at
+    double StrataTiltMassifs = 2.0;   // this many massifs' wavelength (cuestas where the beds dip)
+
     bool Set(const char* Key, const char* Value)
     {
         const double V = atof(Value);
@@ -145,6 +162,9 @@ struct FParams
             { "KappaSoft", &KappaSoft, nullptr }, { "ChannelArea", &ChannelArea, nullptr }, { "KScaleExponent", &KScaleExponent, nullptr }, { "KappaHard", &KappaHard, nullptr }, { "KSoft", &KSoft, nullptr },
             { "N", nullptr, &N }, { "Massifs", nullptr, &Massifs }, { "Steps", nullptr, &Steps }, { "RandomFill", nullptr, &RandomFill },
             { "Hillslope", nullptr, &Hillslope }, { "FlowBiasSigned", nullptr, &FlowBiasSigned }, { "SoftMode", nullptr, &SoftMode }, { "SoftSteps", nullptr, &SoftSteps },
+            { "StrataBeds", &StrataBeds, nullptr }, { "StrataHardShare", &StrataHardShare, nullptr }, { "StrataHardShareG", &StrataHardShareG, nullptr },
+            { "StrataJitter", &StrataJitter, nullptr }, { "StrataHardK", &StrataHardK, nullptr }, { "StrataHardSc", &StrataHardSc, nullptr },
+            { "StrataEdge", &StrataEdge, nullptr }, { "StrataTilt", &StrataTilt, nullptr }, { "StrataTiltMassifs", &StrataTiltMassifs, nullptr },
         };
         if (!strcmp(Key, "Seed")) { Seed = (uint32_t)strtoul(Value, nullptr, 10); return true; }
         if (!strcmp(Key, "preset"))
@@ -162,18 +182,20 @@ struct FParams
 
     std::string Json() const
     {
-        char B[2048];
+        char B[3072];
         snprintf(B, sizeof(B),
             "{\"N\": %d, \"Seed\": %u, \"Massifs\": %d, \"Base\": \"%s\", \"BaseOctaves\": %d, \"BaseShare\": %g, \"UpliftScale\": %g, "
             "\"InitialHeight\": %g, \"BaseWidth\": %g, \"BaseWarp\": %g, \"Steps\": %d, \"Dt\": %g, \"K\": %g, \"ChannelArea\": %g, \"KappaHard\": %g, "
             "\"m\": 0.5, \"n\": 1, \"Jitter\": %g, \"RouteNoise\": %g, \"RandomFill\": %d, \"Eps\": %g, \"UpliftVariation\": %g, "
             "\"ErodibilityVariation\": %g, \"ThresholdVariation\": %g, \"Roughness\": %g, \"Hillslope\": \"%s\", \"SpreadCells\": %g, "
             "\"ScHard\": %g, \"ScSoft\": %g, \"KappaSoft\": %g, \"KSoft\": %g, \"SoftMode\": \"%s\", \"SoftSteps\": %d, "
-            "\"BlurSigma\": %g, \"Routing\": \"%s\"}",
+            "\"BlurSigma\": %g, \"Routing\": \"%s\", \"StrataBeds\": %g, \"StrataHardShare\": %g, \"StrataHardShareG\": %g, \"StrataJitter\": %g, "
+            "\"StrataHardK\": %g, \"StrataHardSc\": %g, \"StrataEdge\": %g, \"StrataTilt\": %g, \"StrataTiltMassifs\": %g}",
             N, Seed, Massifs, BaseMode == 2 ? "network" : (BaseMode ? "perlin" : "voronoi"), BaseOctaves, BaseShare, UpliftScale, InitialHeight, BaseWidth, BaseWarp, Steps, Dt, K, ChannelArea, KappaHard, Jitter, RouteNoise, RandomFill, Eps, UpliftVariation,
             ErodibilityVariation, ThresholdVariation, Roughness, Hillslope == 2 ? "eikonal (axial + diagonal)" : Hillslope == 1 ? "eikonal (axial)" : "chamfer", SpreadCells, ScHard, ScSoft,
             KappaSoft, KSoft, SoftMode ? "derived" : "separate", SoftSteps, (double)N / Massifs / 4.0,
-            Jitter > 0 || RouteNoise > 0 ? "D8 on a jittered graph, randomised receivers" : "D8 steepest descent");
+            Jitter > 0 || RouteNoise > 0 ? "D8 on a jittered graph, randomised receivers" : "D8 steepest descent",
+            StrataBeds, StrataHardShare, StrataHardShareG, StrataJitter, StrataHardK, StrataHardSc, StrataEdge, StrataTilt, StrataTiltMassifs);
         return B;
     }
 };
@@ -214,6 +236,66 @@ static std::vector<double> FbmField(int N, uint32_t Seed, uint32_t CellsPerTile,
 
 // --- The simulation ------------------------------------------------------------------------------
 
+/** The layered column (FParams::StrataBeds): each bed's hard share at its top, by original
+ *  elevation, as a table at a fine step. Beds' thicknesses and hard shares are jittered by a
+ *  hash of the bed's index, so not every step is alike. */
+struct FStrata
+{
+    double Lo = 0, Step = 0.01;
+    std::vector<float> Hard;              // hardness 0..1 at Lo + k Step
+    std::vector<double> Tops;             // the hard beds' tops (texels): for the report
+
+    /** The column over original elevations MinZ .. MaxZ (texels): from the deepest rock the
+     *  uplift can expose to the starting surface's top. */
+    void Build(const FParams& P, double Scale, double HardShare, double MinZ, double MaxZ)
+    {
+        const double L = std::max(P.StrataBeds * Scale, 0.05);   // a few table steps at least
+        const double Edge = std::max(P.StrataEdge * Scale, 1e-3);
+        Lo = MinZ - 4.0 * L - std::fabs(P.StrataTilt) * Scale * 2.0;
+        const double Hi = MaxZ + 4.0 * L + std::fabs(P.StrataTilt) * Scale * 2.0;
+        // The beds' bounds from Lo up; each hard band at its bed's top, its thickness R's share
+        // (the band's centre fixed by R's, so G's thinner bands sit inside R's).
+        std::vector<std::pair<double, double>> Bands;
+        double Z = Lo;
+        for (uint32_t k = 0; Z < Hi; k++)
+        {
+            const double Thick = L * std::max(1.0 + P.StrataJitter * Uniform(k, 0x62656473u, P.Seed), 0.1);
+            const double Share = std::clamp(P.StrataHardShare * (1.0 + P.StrataJitter * Uniform(k, 0x68617264u, P.Seed)), 0.05, 0.9);
+            const double Top = Z + Thick, Centre = Top - 0.5 * Share * Thick;
+            const double Half = 0.5 * Thick * std::clamp(Share * HardShare / std::max(P.StrataHardShare, 1e-6), 0.0, 0.95);
+            Bands.push_back({ Centre - Half, Centre + Half });
+            if (Centre + Half > MinZ && Centre + Half < MaxZ) Tops.push_back(Centre + Half);
+            Z = Top;
+        }
+        const size_t Count = (size_t)std::ceil((Hi - Lo) / Step) + 1;
+        Hard.assign(Count, 0.0f);
+        size_t b = 0;
+        for (size_t k = 0; k < Count; k++)
+        {
+            const double z = Lo + k * Step;
+            while (b + 1 < Bands.size() && Bands[b].second + Edge < z) b++;
+            double h = 0;
+            for (size_t c = b; c < Bands.size() && Bands[c].first - Edge <= z; c++)
+            {
+                // Smooth edges: in over [first - Edge, first + Edge], out over [second - Edge, second + Edge].
+                const double In = std::clamp((z - (Bands[c].first - Edge)) / (2.0 * Edge), 0.0, 1.0);
+                const double Out = std::clamp(((Bands[c].second + Edge) - z) / (2.0 * Edge), 0.0, 1.0);
+                const double t = std::min(In, Out);
+                h = std::max(h, t * t * (3.0 - 2.0 * t));
+            }
+            Hard[k] = (float)h;
+        }
+    }
+
+    double At(double z) const
+    {
+        if (Hard.empty()) return 0.0;
+        const double f = std::clamp((z - Lo) / Step, 0.0, (double)(Hard.size() - 1));
+        const size_t k = std::min((size_t)f, Hard.size() - 2);
+        return Hard[k] + (Hard[k + 1] - Hard[k]) * (f - k);
+    }
+};
+
 struct FSim
 {
     const FParams& P;
@@ -224,6 +306,13 @@ struct FSim
     std::vector<uint8_t> Base;
     std::vector<int32_t> Recv, Order;    // Order: the fill's pop order (increasing W; topological)
     std::vector<double> Area, Dist;
+
+    // Layered rock (null: uniform): the uplift each cell has had, the tilt field, the soft beds'
+    // threshold slopes (the run's own), and the per-step threshold slopes.
+    const FStrata* Strata = nullptr;
+    std::vector<double> Lift, Tilt, ScBase, ScNow;
+
+    double Hardness(size_t i) const { return Strata ? Strata->At(H[i] - Lift[i] + Tilt[i]) : 0.0; }
 
     double ChannelArea = 0;              // P.ChannelArea scaled to the tile (texels, x s^2)
     double KTile = 0;                    // P.K scaled to the tile (x s^KScaleExponent)
@@ -355,6 +444,7 @@ struct FSim
             const int r = Recv[i];
             if (r == i || Base[i]) continue;
             double F = KTile * KScale * KField[i] * P.Dt * std::sqrt(Area[i]) / Dist[i];
+            if (Strata) F *= 1.0 + (P.StrataHardK - 1.0) * Hardness(i);
             if (ChannelArea > 0)
             {
                 const double T = std::clamp((Area[i] - 0.5 * ChannelArea) / (0.5 * ChannelArea), 0.0, 1.0);
@@ -459,14 +549,21 @@ struct FSim
     double Step(double KScale, double Kappa, const std::vector<double>& Sc)
     {
         const std::vector<double> Before = H;
-        for (size_t i = 0; i < H.size(); i++) if (!Base[i]) H[i] += U[i] * P.Dt;
+        for (size_t i = 0; i < H.size(); i++) if (!Base[i]) { H[i] += U[i] * P.Dt; if (Strata) Lift[i] += U[i] * P.Dt; }
         Fill();
         H = W;
         Receivers();
         Accumulate();
         Incise(KScale);
         Diffuse(Kappa);
-        Threshold(Sc);
+        if (Strata)
+        {
+            ScNow.resize(H.size());
+            for (size_t i = 0; i < H.size(); i++) ScNow[i] = Sc[i] + (P.StrataHardSc - Sc[i]) * Hardness(i);
+            Threshold(ScNow);
+        }
+        else
+            Threshold(Sc);
         double Change = 0;
         for (size_t i = 0; i < H.size(); i++) Change = std::max(Change, std::fabs(H[i] - Before[i]));
         return Change;
@@ -963,9 +1060,36 @@ int main(int argc, char** argv)
         }
     };
 
+    // Layered rock: the column by original elevation, from the deepest rock the uplift can bring
+    // up to the starting surface's top, and the tilt field.
+    FStrata StrataR, StrataG;
+    std::vector<double> Tilt(NN, 0.0);
+    double LiftMax = 0;
+    if (P.StrataBeds > 0)
+    {
+        double UMax = 0, HMax = 0;
+        for (size_t i = 0; i < NN; i++) { UMax = std::max(UMax, U[i]); HMax = std::max(HMax, H0[i]); }
+        LiftMax = UMax * P.Dt * (P.Steps + (P.SoftMode == 1 ? P.SoftSteps : 0));
+        if (P.StrataTilt != 0)
+        {
+            const std::vector<double> T = FbmField(N, P.Seed + 15u, std::max(1u, (uint32_t)std::lround(P.Massifs / std::max(P.StrataTiltMassifs, 0.125))), 2);
+            for (size_t i = 0; i < NN; i++) Tilt[i] = P.StrataTilt * Scale * T[i];
+        }
+        StrataR.Build(P, Scale, P.StrataHardShare, -LiftMax, HMax);
+        StrataG.Build(P, Scale, P.StrataHardShareG, -LiftMax, HMax);
+        printf("  strata: %zu hard beds over original elevations %.1f .. %.1f texels (bed %.2f texels)\n", StrataR.Tops.size(), -LiftMax, HMax, P.StrataBeds * Scale);
+    }
+    auto UseStrata = [&](FSim& Sim, const FStrata& Column, const std::vector<double>& Lift) {
+        if (P.StrataBeds <= 0) return;
+        Sim.Strata = &Column;
+        Sim.Lift = Lift;
+        Sim.Tilt = Tilt;
+    };
+
     // Hard rock (R).
     FSim Hard(P);
     Hard.Init(Base, U, KField, H0);
+    UseStrata(Hard, StrataR, std::vector<double>(NN, 0.0));
     Run(Hard, P.Steps, 1.0, P.KappaHard * Scale * Scale, ScHard, "hard");
     // The routing of the final surface; R is its fill (W >= H): diffusion can leave shallow pits
     // on channel floors, and a set has no closed depressions off the outlets.
@@ -987,11 +1111,13 @@ int main(int argc, char** argv)
     if (P.SoftMode == 1)
     {
         Soft.Init(Base, U, KField, R);
+        UseStrata(Soft, StrataG, Hard.Lift);
         Run(Soft, P.SoftSteps, P.KSoft, P.KappaSoft * Scale * Scale, ScSoft, "soft");
     }
     else
     {
         Soft.Init(Base, U, KField, H0);
+        UseStrata(Soft, StrataG, std::vector<double>(NN, 0.0));
         Run(Soft, P.Steps, 1.0, P.KappaSoft * Scale * Scale, ScSoft, "soft");
     }
     Soft.Route();
@@ -1045,6 +1171,51 @@ int main(int argc, char** argv)
     printf("R/G: height correlation %.3f, aspect agreement %.3f; pits filled: R %zu (deepest %.4f), G %zu (deepest %.4f) texels; %.0f s\n",
         Corr, Aspect, PitsR, DeepR, PitsG, DeepG, Secs);
 
+    // Layered rock's report (Addendum 3 section 3): the hard beds' tops (original elevation, and
+    // where they sit in R: plus the mean uplift), a histogram of R's heights (the benches show as
+    // peaks) and a side view of one row.
+    std::string StrataJson;
+    if (P.StrataBeds > 0)
+    {
+        double LiftMean = 0;
+        for (size_t i = 0; i < NN; i++) LiftMean += Hard.Lift[i];
+        LiftMean /= (double)NN;
+        double RMax = 0;
+        for (double h : R) RMax = std::max(RMax, h);
+        constexpr int Bins = 128;
+        std::vector<size_t> Hist(Bins, 0);
+        for (double h : R) Hist[std::clamp((int)(h / std::max(RMax, 1e-9) * Bins), 0, Bins - 1)]++;
+        std::string J = " \"strata\": {\"bed_tops_original\": [";
+        char B[64];
+        for (size_t k = 0; k < StrataR.Tops.size(); k++) { snprintf(B, sizeof(B), "%s%.2f", k ? ", " : "", StrataR.Tops[k]); J += B; }
+        snprintf(B, sizeof(B), "], \"lift_mean\": %.3f, \"r_max\": %.3f, ", LiftMean, RMax);
+        J += B;
+        J += "\"r_height_histogram\": [";
+        for (int b = 0; b < Bins; b++) { snprintf(B, sizeof(B), "%s%zu", b ? ", " : "", Hist[b]); J += B; }
+        J += "]},\n";
+        StrataJson = J;
+        // The side view: row N/2's R (white) and G (grey) profiles, heights to the image's height.
+        const int Hgt = 256;
+        std::vector<uint8_t> Px((size_t)N * Hgt, 0);
+        for (int x = 0; x < N; x++)
+            for (int Pass = 0; Pass < 2; Pass++)
+            {
+                const double h = (Pass == 0 ? R : G)[(size_t)(N / 2) * N + x];
+                const int Top = Hgt - 1 - std::clamp((int)(h / std::max(RMax, 1e-9) * (Hgt - 8)), 0, Hgt - 1);
+                for (int y = Top; y < Hgt; y++) Px[(size_t)y * N + x] = Pass == 0 ? 230 : 110;
+            }
+        WritePgm(Stem + "_side.pgm", N, Hgt, Px);
+        // R and G as raw floats (texels), for outside previews.
+        for (int c = 0; c < 2; c++)
+            if (FILE* F = fopen((Stem + (c ? "_G.f32" : "_R.f32")).c_str(), "wb"))
+            {
+                std::vector<float> V(NN);
+                for (size_t i = 0; i < NN; i++) V[i] = (float)(c ? G : R)[i];
+                fwrite(V.data(), 4, NN, F);
+                fclose(F);
+            }
+    }
+
     WriteShade(Stem + "_R.pgm", Hard, R);
     WriteShade(Stem + "_G.pgm", Hard, G);
     WriteShade(Stem + "_R2x2.pgm", Hard, R, 2);
@@ -1066,9 +1237,9 @@ int main(int argc, char** argv)
         for (double u : U) UMax = std::max(UMax, u);
         fprintf(F, "{\"params\": %s,\n \"used\": {\"scale\": %.4f, \"uplift_max\": %.4f, \"kappa_hard\": %.4f, \"kappa_soft\": %.4f, \"K\": %.4f, \"blur_sigma\": %.3f},\n"
             " \"R\": %s,\n \"G\": %s,\n \"rg_correlation\": %.4f, \"rg_aspect\": %.4f,\n"
-            " \"pits_filled\": {\"R\": %zu, \"R_deepest\": %.5f, \"G\": %zu, \"G_deepest\": %.5f}, \"seconds\": %.1f}\n",
+            " \"pits_filled\": {\"R\": %zu, \"R_deepest\": %.5f, \"G\": %zu, \"G_deepest\": %.5f},%s \"seconds\": %.1f}\n",
             P.Json().c_str(), Scale, UMax, P.KappaHard * Scale * Scale, P.KappaSoft * Scale * Scale, Hard.KTile, S / 4.0,
-            MJ(MR).c_str(), MJ(MG).c_str(), Corr, Aspect, PitsR, DeepR, PitsG, DeepG, Secs);
+            MJ(MR).c_str(), MJ(MG).c_str(), Corr, Aspect, PitsR, DeepR, PitsG, DeepG, StrataJson.c_str(), Secs);
         fclose(F);
     }
     const std::string Why = CheckPeaks(Set);

@@ -43,7 +43,7 @@ RWStructuredBuffer<float> OutHeight;
 RWStructuredBuffer<uint> OutAttr;
 RWStructuredBuffer<float> OutUp;         // the boundary uplift and the crust, for the solve
 RWStructuredBuffer<float> OutCrust;      // (VoxelLandSolve.usf)
-RWStructuredBuffer<uint> OutForm;        // the landform (VoxelLandPackForm), one cell a word
+RWStructuredBuffer<uint> OutForm;        // the landform (VoxelLandPackForm) | the province << 16, one cell a word
 
 #include "/Plugin/VoxelPlugin/Private/VoxelLandPlates.ush"
 
@@ -121,5 +121,6 @@ void FieldsCS(uint3 GroupId : SV_GroupID, uint GroupThread : SV_GroupIndex)
     OutAttr[Index] = VoxelLandPackAttr(E.Crust, E.Class);
     OutUp[Index] = E.Up;
     OutCrust[Index] = E.Crust;
-    OutForm[Index] = VoxelLandPackForm(VoxelLandFormAt(P, E));
+    // The landform in the low half; the province (T4c) from bit 16 (the solve keeps it).
+    OutForm[Index] = VoxelLandPackForm(VoxelLandFormAt(P, E)) | (VoxelLandPackProvince(VoxelLandProvinceAt(P, E)) << 16u);
 }

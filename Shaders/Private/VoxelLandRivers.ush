@@ -1,0 +1,198 @@
+// VoxelLandRivers.ush - The bake's rivers at a sample (Design/RiversLakes.md, R1): the nearest
+// segment of the network (made on the GPU with the bake: VoxelLandRiverBuild.ush, R1b) whose
+// corridor holds the sample, with its floor, drainage and place along its chain. R1 shows them
+// (debug view 19); R2 carves them.
+//
+// Only corridors count: a tile lists every segment whose corridor reaches it, so the river a
+// sample finds doesn't depend on its tile (a nearer river whose corridor ends short of the
+// sample may be listed in one tile and not the next). None outside every corridor. (The
+// corridor test is in the tile's plane: tiles agree on it to about 1e-5 of the reach, and only
+// while their lists are under the cap.)
+//
+// A tile is VOXEL_LAND_RIVER_TILE_CELLS square bake cells of a face; its block lists the
+// segments whose corridor reaches it, with their ends in the tile's gnomonic plane (metres:
+// x = R (p . t1) / (p . c), c the tile's centre, t1 and t2 its tangents; VoxelLandRiverLayout.ush).
+// The sample is projected the same way from its double-float position, so the distances are
+// exact to a centimetre or two at any radius; the nearest offset goes through the plane's metric
+// halfway along it, so a segment's distance is the same, to a millimetre, from either side of a
+// tile or face edge.
+//
+// Shared subset (VoxelShaderCompat.h). Include after VoxelDF64.ush and VoxelCubeSphere.ush; the
+// host declares (VoxelLandParameters.ush), beside the bake's:
+//
+//   StructuredBuffer<uint> LandRiverTiles;   each tile's block start (tiles + 1; VOXEL_LAND_RIVER_TILE)
+//   StructuredBuffer<float> LandRiverData;   the segments, then the tile blocks (VOXEL_LAND_RIVER_DATA)
+//   uint LandRiverTilesPerFace;              0: no rivers
+//   float LandRiverRadiusM;                  the sea-level radius (m) the entries are projected with
+//   float LandRiverWidthScale;               the channels' width scale (RiverWidthScale)
+//   float LandRiverValleyScale;              the valleys' (ValleyWidthScale)
+
+#ifndef VOXEL_LAND_RIVERS_USH
+#define VOXEL_LAND_RIVERS_USH
+
+#include "VoxelLandAccess.ush"
+
+#ifndef VOXEL_LOOP
+#define VOXEL_LOOP [loop]
+#endif
+
+#include "VoxelLandRiverLayout.ush"
+
+/** The nearest river at a point. */
+struct FVoxelLandRiver
+{
+    bool bFound;
+    float Distance;      // m to the segment
+    float Signed;        // m, positive on the left looking downstream (beyond the ends: unsigned)
+    float T;             // 0 .. 1 along the segment
+    float Floor;         // m: the valley floor there (the bake's, monotone downstream)
+    float Log2Area;      // log2 of the drainage area (m^2)
+    float S;             // m along its chain from the chain's start
+    float ChainLength;   // m
+    float Length;        // the segment's (m)
+    uint Flags;          // VOXEL_LAND_RIVER_FLAG_*
+    uint Segment;
+};
+
+VOXEL_FUNC FVoxelLandRiver VoxelLandRiverNone()
+{
+    FVoxelLandRiver Out;
+    Out.bFound = false;
+    Out.Distance = 3.0e38f;
+    Out.Signed = 0.0f;
+    Out.T = 0.0f;
+    Out.Floor = 0.0f;
+    Out.Log2Area = 0.0f;
+    Out.S = 0.0f;
+    Out.ChainLength = 0.0f;
+    Out.Length = 0.0f;
+    Out.Flags = 0u;
+    Out.Segment = 0u;
+    return Out;
+}
+
+/** A channel's width (m) for a log2 drainage area (m^2): RiverWidthScale x 2.35 (km^2)^0.4, 20 m
+ *  at 200 km^2, 235 m at 100,000 km^2 (VoxelLandRivers::WidthM). */
+VOXEL_FUNC float VoxelLandRiverWidth(VOXEL_LAND_ARGS_DECL float Log2Area)
+{
+    return LandRiverWidthScale * 2.35f * exp2(0.4f * Log2Area - 7.97262743f);
+}
+
+/** The belt (m) the floodplain and the valley are measured in: 2.5 sqrt(km^2), whatever the
+ *  channel's width (VoxelLandRivers::BeltM). */
+VOXEL_FUNC float VoxelLandRiverBelt(float Log2Area)
+{
+    return 2.5f * sqrt(exp2(Log2Area) * 1.0e-6f);
+}
+
+/** The valley's half-width (m) for a belt: ValleyWidthScale x (400 m + 15 belts)
+ *  (VoxelLandRivers::ValleyHalfWidthM). */
+VOXEL_FUNC float VoxelLandRiverValleyHalfWidth(VOXEL_LAND_ARGS_DECL float Belt)
+{
+    return LandRiverValleyScale * (400.0f + 15.0f * Belt);
+}
+
+/** The tile holding a direction (unit, float): the face by the largest component, its cell by
+ *  the equal-angle coordinates (VoxelLandRiverBuild.ush's coverage uses the same cells). */
+VOXEL_FUNC uint VoxelLandRiverTileOf(VOXEL_LAND_ARGS_DECL float3 D)
+{
+    const float AX = abs(D.x);
+    const float AY = abs(D.y);
+    const float AZ = abs(D.z);
+    const uint Axis = (AX >= AY && AX >= AZ) ? 0u : (AY >= AZ ? 1u : 2u);
+    const float PN = VoxelCubeComponent(D, Axis);
+    const uint Face = Axis * 2u + (PN < 0.0f ? 1u : 0u);
+    const float Den = max(abs(PN), 1.0e-20f);
+    const float S = atan(VoxelCubeComponent(D, VoxelCubeUAxis(Face)) / Den) * 1.27323954473516269f;
+    const float T = atan(VoxelCubeComponent(D, VoxelCubeVAxis(Face)) / Den) * 1.27323954473516269f;
+    const int N = int(LandN);
+    const int I = clamp(int(floor((S + 1.0f) * 0.5f * float(N))), 0, N - 1);
+    const int J = clamp(int(floor((T + 1.0f) * 0.5f * float(N))), 0, N - 1);
+    const uint Tiles = LandRiverTilesPerFace;
+    return Face * Tiles * Tiles + uint(J / VOXEL_LAND_RIVER_TILE_CELLS) * Tiles + uint(I / VOXEL_LAND_RIVER_TILE_CELLS);
+}
+
+/** The double-float dot of a point and a float vector. */
+VOXEL_FUNC float2 VoxelLandRiverDot(float2 PX, float2 PY, float2 PZ, float3 V)
+{
+    return VoxelDFAdd(VoxelDFAdd(VoxelDFMulFloat(PX, V.x), VoxelDFMulFloat(PY, V.y)), VoxelDFMulFloat(PZ, V.z));
+}
+
+/** The nearest river whose corridor holds the point P (double-float, any length: its direction
+ *  counts). */
+VOXEL_FUNC FVoxelLandRiver VoxelLandRiverAtDF(VOXEL_LAND_ARGS_DECL float2 PX, float2 PY, float2 PZ)
+{
+    FVoxelLandRiver Out = VoxelLandRiverNone();
+    if (LandRiverTilesPerFace == 0u) return Out;
+    const uint Tile = VoxelLandRiverTileOf(VOXEL_LAND_ARGS normalize(float3(PX.x, PY.x, PZ.x)));
+    const uint F = VOXEL_LAND_RIVER_TILE(Tile);
+    const uint End = VOXEL_LAND_RIVER_TILE(Tile + 1u);
+    if (F >= End) return Out;
+    // The point in the tile's plane (m; the block starts with the frame).
+    const float3 C = float3(VOXEL_LAND_RIVER_DATA(F), VOXEL_LAND_RIVER_DATA(F + 1u), VOXEL_LAND_RIVER_DATA(F + 2u));
+    const float3 T1 = float3(VOXEL_LAND_RIVER_DATA(F + 4u), VOXEL_LAND_RIVER_DATA(F + 5u), VOXEL_LAND_RIVER_DATA(F + 6u));
+    const float3 T2 = float3(VOXEL_LAND_RIVER_DATA(F + 8u), VOXEL_LAND_RIVER_DATA(F + 9u), VOXEL_LAND_RIVER_DATA(F + 10u));
+    const float2 DC = VoxelLandRiverDot(PX, PY, PZ, C);
+    const float X = VoxelDFDiv(VoxelLandRiverDot(PX, PY, PZ, T1), DC).x * LandRiverRadiusM;
+    const float Y = VoxelDFDiv(VoxelLandRiverDot(PX, PY, PZ, T2), DC).x * LandRiverRadiusM;
+    // The nearest entry inside its corridor (the first of equals: the list is largest first).
+    const uint First = F + VOXEL_LAND_RIVER_FRAME_FLOATS;
+    float Best = 3.0e38f;
+    uint BestEntry = First;
+    float BestT = 0.0f;
+    VOXEL_LOOP
+    for (uint At = First; At < End; At += VOXEL_LAND_RIVER_ENTRY_FLOATS)
+    {
+        const float EX = X - VOXEL_LAND_RIVER_DATA(At);
+        const float EY = Y - VOXEL_LAND_RIVER_DATA(At + 1u);
+        const float DX = VOXEL_LAND_RIVER_DATA(At + 2u);
+        const float DY = VOXEL_LAND_RIVER_DATA(At + 3u);
+        const float U = saturate((EX * DX + EY * DY) * VOXEL_LAND_RIVER_DATA(At + 4u));
+        const float QX = EX - DX * U;
+        const float QY = EY - DY * U;
+        const float D2 = QX * QX + QY * QY;
+        if (D2 < Best && D2 <= VOXEL_LAND_RIVER_DATA(At + 5u))
+        {
+            Best = D2;
+            BestEntry = At;
+            BestT = U;
+        }
+    }
+    if (!(Best < 3.0e38f)) return Out;
+    const uint B = BestEntry;
+    const float EX = X - VOXEL_LAND_RIVER_DATA(B);
+    const float EY = Y - VOXEL_LAND_RIVER_DATA(B + 1u);
+    const float DX = VOXEL_LAND_RIVER_DATA(B + 2u);
+    const float DY = VOXEL_LAND_RIVER_DATA(B + 3u);
+    const uint Seg = uint(VOXEL_LAND_RIVER_DATA(B + 6u));
+    const uint SB = Seg * VOXEL_LAND_RIVER_SEG_FLOATS;
+    Out.bFound = true;
+    // The distance on the sphere: the plane's offset to the nearest point through the gnomonic
+    // metric halfway along it (the plane stretches distances by up to 1 / cos^2 of the angle
+    // from the tile's centre, differently in each tile; the midpoint's metric makes the length
+    // exact to second order in the distance over the radius: centimetres at a few km).
+    const float QX = DX * BestT - EX;
+    const float QY = DY * BestT - EY;
+    const float InvR = 1.0f / LandRiverRadiusM;
+    const float MX = X + 0.5f * QX;
+    const float MY = Y + 0.5f * QY;
+    const float Rho2 = (MX * MX + MY * MY) * (InvR * InvR);
+    const float PQ = (MX * QX + MY * QY) * InvR;
+    const float Metric = ((1.0f + Rho2) * (QX * QX + QY * QY) - PQ * PQ) / ((1.0f + Rho2) * (1.0f + Rho2));
+    const float Plane = sqrt(Best);
+    Out.Distance = sqrt(max(Metric, 0.0f));
+    Out.T = BestT;
+    // The side: the cross product of the segment's direction and the offset, within its span.
+    const float Len = sqrt(DX * DX + DY * DY);
+    Out.Signed = BestT > 0.0f && BestT < 1.0f && Len > 0.0f && Plane > 0.0f ? (DX * EY - DY * EX) / Len * (Out.Distance / Plane) : Out.Distance;
+    Out.Floor = lerp(VOXEL_LAND_RIVER_DATA(SB), VOXEL_LAND_RIVER_DATA(SB + 1u), BestT);
+    Out.Log2Area = lerp(VOXEL_LAND_RIVER_DATA(SB + 2u), VOXEL_LAND_RIVER_DATA(SB + 3u), BestT);
+    Out.Length = VOXEL_LAND_RIVER_DATA(SB + 5u);
+    Out.S = VOXEL_LAND_RIVER_DATA(SB + 4u) + BestT * Out.Length;
+    Out.ChainLength = VOXEL_LAND_RIVER_DATA(SB + 6u);
+    Out.Flags = uint(VOXEL_LAND_RIVER_DATA(SB + 7u)) & VOXEL_LAND_RIVER_FLAG_MASK;
+    Out.Segment = Seg;
+    return Out;
+}
+
+#endif // VOXEL_LAND_RIVERS_USH

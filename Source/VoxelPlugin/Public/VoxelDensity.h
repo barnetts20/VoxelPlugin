@@ -11,6 +11,7 @@
 struct FVoxelDensityGPUData;
 struct FVoxelLandBake;
 struct FVoxelLandNoiseSet;
+struct FVoxelLandRiverSet;
 struct FVoxelTerrestrialSettings;
 
 /** Shape of the planet's surface heightfield. Wavelengths are fractions of the planet radius,
@@ -90,6 +91,49 @@ struct VOXELPLUGIN_API FVoxelSurfaceSettings
     uint32 GetSettingsHash() const;
 };
 
+/** What GetWaterAt finds (R2, Design/RiversLakes.md 3.6). */
+UENUM(BlueprintType)
+enum class EVoxelWaterKind : uint8
+{
+    None,
+    Sea,
+    Lake,
+    River
+};
+
+/** The water at a point of a planet (APlanetActor::GetWaterAt). Heights are metres above the
+ *  planet's sea level, along the planet's radius through the point. */
+USTRUCT(BlueprintType)
+struct VOXELPLUGIN_API FVoxelWaterSample
+{
+    GENERATED_BODY()
+
+    /** The water over the ground there (None: dry ground). */
+    UPROPERTY(BlueprintReadOnly, Category = "Water")
+    EVoxelWaterKind Kind = EVoxelWaterKind::None;
+
+    /** The water's surface (m above sea level); the ground's where there is none. */
+    UPROPERTY(BlueprintReadOnly, Category = "Water")
+    float SurfaceHeight = 0.0f;
+
+    /** The ground's height (m above sea level), without edits. */
+    UPROPERTY(BlueprintReadOnly, Category = "Water")
+    float GroundHeight = 0.0f;
+
+    /** The water's depth there (m: surface less ground; 0 without water). */
+    UPROPERTY(BlueprintReadOnly, Category = "Water")
+    float Depth = 0.0f;
+
+    /** How far the queried point lies below the water's surface (m; negative above it). */
+    UPROPERTY(BlueprintReadOnly, Category = "Water")
+    float PointDepth = 0.0f;
+
+    /** A river's current (cm/s, world): downstream, faster on steeper and deeper reaches. Zero
+     *  in lakes and the sea (tides and currents are later work). */
+    UPROPERTY(BlueprintReadOnly, Category = "Water")
+    FVector FlowVelocity = FVector::ZeroVector;
+};
+
 /** CPU evaluation of the planet's density: surface heightfield, cave slot and their
  *  composition, from VoxelDensityCore.ush. Positions are double and each noise octave is
  *  evaluated on an integer lattice split in double, so results are precise at any radius.
@@ -102,7 +146,7 @@ public:
     FVoxelDensityCPU(const FVoxelSurfaceSettings& InSettings, double InPlanetRadius, double InNoiseAmplitude, double InMinFootprint = 0.0);
 
     /** The terrestrial generator: Bake's heights (sampled through a warp, VoxelLandSample.ush)
-     *  plus the gullies (VoxelLandGully.ush) and slope-damped detail. InPlanetRadius is the base radius and InNoiseAmplitude the
+     *  plus the gullies (VoxelLandGully.ush) and the detail layer (VoxelLandDetail.ush, N1). InPlanetRadius is the base radius and InNoiseAmplitude the
      *  height range above it that hold every height (VoxelLand::ShapeFor), so the contract of
      *  HeightAt and the lattice sizing are the noise surface's. */
     FVoxelDensityCPU(const FVoxelTerrestrialSettings& InLand, TSharedPtr<const FVoxelLandBake, ESPMode::ThreadSafe> InBake,
@@ -127,6 +171,14 @@ public:
 
     /** The peaks' noise set (VoxelLandPeaks.ush; null without peaks). */
     const TSharedPtr<const FVoxelLandNoiseSet, ESPMode::ThreadSafe>& GetLandNoise() const { return LandNoise; }
+
+    /** R2: the water at Direction from the planet's centre (any length; planet frame), from the
+     *  same shared code as the carving (VoxelLandCarve.ush), at the finest footprint: the sea
+     *  where the ground is below sea level, a kept lake's level, a river's water line in its
+     *  channel. FlowVelocity is in the planet frame (cm/s); PointDepth is left 0 (the planet's
+     *  query fills it in). The noise surface: None, with the ground's height above the planet
+     *  radius (its sea level is the planet's: APlanetActor::GetWaterAt). */
+    FVoxelWaterSample WaterAt(const FVector& Direction) const;
 
 private:
     /** One octave, fixed at construction; both backends read these. With a lacunarity of 2,
@@ -161,6 +213,8 @@ private:
     /** HeightAt for the terrestrial generator, from the surface point on the sea-level sphere
      *  (the bake's SeaRadius; VoxelDensitySample.ush samples the same sphere). */
     double LandHeightAt(const FVector& SurfacePoint, double Footprint) const;
+    /** The same, and with OutWater the water there (WaterAt). */
+    double LandSurfaceAt(const FVector& SurfacePoint, double Footprint, FVoxelWaterSample* OutWater) const;
 
     FVoxelSurfaceSettings Settings;
     double PlanetRadius = 1.0;
@@ -174,7 +228,7 @@ private:
     TSharedPtr<const FVoxelLandBake, ESPMode::ThreadSafe> LandBake;
     FLayer LandWarp[3];                 // the sampling warp's components (no band limit)
     double LandHeightOffset = 0.0;      // cm: the bake's sea-level heights to heights above PlanetRadius
-    double LandDetailAmplitude = 0.0;   // cm
+    double LandDetailAmplitude = 0.0;   // cm: the detail layer's (VoxelLandDetail.ush, N1)
     double LandWarpAmplitude = 0.0;     // cm
     double LandSampleRadius = 1.0;      // cm: the sea-level sphere the warp and detail are sampled on
     float LandCellM = 1.0f;             // the bake cell's arc at the face centre (m)
@@ -187,7 +241,7 @@ private:
     double LandHillFrequency = 0.0;     // cycles per cm (the finest octave's)
     uint32 LandHillOctaves = 0;
     uint32 LandHillSeed = 0;
-    TSharedPtr<const FVoxelLandNoiseSet, ESPMode::ThreadSafe> LandNoise;   // the noise pack: the peaks' and the hills' sets (null: neither)
+    TSharedPtr<const FVoxelLandNoiseSet, ESPMode::ThreadSafe> LandNoise;   // the noise pack: the peaks', detail, hills' and strata's sets (null: none used)
     // VoxelLandPeaks.ush's inputs: the set's placement and normalisation (the shader's header).
     float LandPeakStrength = 0.0f;
     float LandPeakTexelsPerCell = 0.0f; // 0: no peaks
@@ -201,12 +255,13 @@ private:
     float LandPeakScaleR = 1.0f;
     float LandPeakScaleG = 1.0f;
     float LandPeakScaleB = 1.0f;
-    // The peaks' detail tile (VoxelLandPeaks.ush, T3e; its chain follows the set's in LandNoise).
+    // The peaks' detail (VoxelLandPeaks.ush, T3e): the pack's detail set (N1; LandNoise's Detail*),
+    // hard rock its G, soft rock its R, with those channels' means.
     float LandPeakDetailTexelsPerCell = 0.0f;  // 0: no detail
-    float LandPeakDetailMeanR = 0.0f;
-    float LandPeakDetailMeanG = 0.0f;
-    float LandPeakDetailScaleR = 0.0f;
-    float LandPeakDetailScaleG = 0.0f;
+    float LandDetailMeanHard = 0.0f;
+    float LandDetailMeanSoft = 0.0f;
+    float LandPeakDetailScaleHard = 0.0f;
+    float LandPeakDetailScaleSoft = 0.0f;
     float LandPeakDetailFade = 0.0f;
     // The hills' set (VoxelLandHillSet.ush, T4a; its chain: LandNoise's Hill*). 0 texels: none
     // (the procedural hills, LandHillFrequency and LandHillOctaves).
@@ -214,16 +269,59 @@ private:
     float LandHillScaleR = 1.0f;
     float LandHillScaleG = 1.0f;
     float LandHillScaleB = 1.0f;
+    float LandHillMeanR = 0.0f;       // N1b: R's and G's means (unit), for the face blend
+    float LandHillMeanG = 0.0f;
     float LandHillSpacingM = 0.0f;
     float LandHillSwellTexelsPerCell = 0.0f;   // 0: no swells
     float LandHillSwellM = 0.0f;
     float LandHillSwellScaleG = 1.0f;
     float LandHillDetailTexelsPerCell = 0.0f;  // 0: no detail
-    float LandHillDetailScaleR = 0.0f;
-    float LandHillDetailScaleG = 0.0f;
+    float LandHillDetailScaleHard = 0.0f;
+    float LandHillDetailScaleSoft = 0.0f;
     float LandHillDetailFade = 0.0f;
     float LandHillFoothill = 0.0f;         // T4b: the hills' growth in the foothills
+    float LandStrataTexelsPerCell = 0.0f;      // T4c: the strata set's placement (0: none)
+    float LandStrataScaleR = 1.0f;
+    float LandStrataScaleG = 1.0f;
+    float LandStrataScaleB = 1.0f;
+    float LandStrataMeanR = 0.0f;
+    float LandStrataMeanG = 0.0f;
+    float LandStrataSpacingM = 0.0f;
+    float LandStrataRelief = 0.0f;             // m: the set's relief times the strength, capped
+    float LandStrataFlat = 0.0f;               // its share on the flats
+    float LandStrataThreshold = 2.0f;          // the province switch (above 1: none)
+    float LandStrataWidth = 0.05f;
+    uint32 LandStrataSeed = 0;
+    float LandStrataDetailTexelsPerCell = 0.0f;   // 0: no detail
+    float LandStrataDetailScaleHard = 0.0f;
+    float LandStrataDetailScaleSoft = 0.0f;
+    float LandStrataDetailFade = 0.0f;
     TArray<uint32> LandReliefPacked;    // the bake's local relief, four cells per word (empty: none)
+    TArray<uint32> LandProvincePacked;  // T4c: the bake's province, four cells per word (as the relief's)
+    TSharedPtr<const FVoxelLandRiverSet, ESPMode::ThreadSafe> LandRivers;   // R1: the rivers (null: none)
+    uint32 LandRiverTilesPerFace = 0;          // R1: the rivers (0: none)
+    float LandRiverRadiusM = 1.0f;
+    float LandRiverWidthScale = 1.0f;
+    float LandRiverValleyScale = 1.0f;
+    // R2: the rivers' and lakes' carve (VoxelLandCarve.ush).
+    float LandRiverCarve = 0.0f;               // 0: not carved
+    float LandRiverDepthScale = 1.0f;
+    float LandRiverFloodplainScale = 1.0f;
+    float LandRiverMinLog2Area = 0.0f;
+    float LandLakeShoreBand = 0.0f;
+    float LandRiverMeander = 0.0f;      // R3: RiverMeander (the meanders' swing)
+    float LandRiverFalls = 0.0f;        // R3: RiverFalls (the knickpoints' falls)
+    uint32 LandHasWater = 0;                   // 1: the bake's lake levels (its Water) are read
+    // N1: the detail layer from the pack's detail set (VoxelLandDetail.ush): its A channel at
+    // LandDetailScales scales, 16 times apart.
+    float LandDetailTexelsPerCell = 0.0f;      // the first scale's (0: no detail)
+    uint32 LandDetailScales = 0;
+    float LandDetailMeanA = 0.0f;
+    float LandDetailScaleA = 0.0f;
+    float LandDetailScaleGain = 0.0f;
+    float LandDetailFade = 0.0f;
+    uint32 LandDetailSeed = 0;
+
     TArray<uint32> LandFlowPacked;      // the bake's drainage, two f16 cells per word (empty: none)
     TArray<uint32> LandFormPacked;      // the bake's landform, two cells per word (empty: none)
 };

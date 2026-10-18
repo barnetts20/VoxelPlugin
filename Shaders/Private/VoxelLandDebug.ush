@@ -15,7 +15,7 @@
 //   StructuredBuffer<uint> LandAttr;     the bake's attributes, two cells per word (low half
 //                                        first), in the bake's cell order
 //   float2 LandDebugSeaRadius;           cm, double-float; 0: the density's sea level
-//   StructuredBuffer<float> LandWater;   the bake's lake levels (m)
+//   StructuredBuffer<float> LandWater;   the bake's lake levels (m; the density's, VoxelLandParameters.ush, from R2)
 //   uint LandDebugHasHydro;              1 when the bake has them (eroded)
 
 #ifndef VOXEL_LAND_DEBUG_USH

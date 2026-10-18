@@ -37,6 +37,7 @@
 #define VOXEL_LAND_SALT_CRUST 0x5c3u
 #define VOXEL_LAND_SALT_TEXTURE 0x7e5u
 #define VOXEL_LAND_SALT_FORM 0x9a7u
+#define VOXEL_LAND_SALT_PROVINCE 0xb39u
 // The landform field (VoxelLandFormAt): hill country comes in provinces of about this size
 // (m, Earth widths; the noise's thresholds put a fifth to a quarter of the plains in hill
 // country, and a quarter to a half flat, more on larger planets' wide interiors), its
@@ -49,6 +50,17 @@
 #define VOXEL_LAND_FORM_FRONT_HI 300.0f
 #define VOXEL_LAND_FORM_RANGE_LO 400.0f
 #define VOXEL_LAND_FORM_RANGE_HI 1500.0f
+// The sedimentary province (VoxelLandProvinceAt, T4c): each plate's cover (a hash: platforms
+// against shields, mostly one or the other), varied by a noise of about this size (m, Earth
+// widths), and none in the cores of the belts: gone over this much boundary uplift (m, Earth
+// heights). Not less: uplifted plateaus are classic strata country (the Colorado Plateau stands
+// about 2 km up), and the sample side hands the ranges to the peaks by their relief anyway.
+#define VOXEL_LAND_PROVINCE_M 1000000.0f
+#define VOXEL_LAND_PROVINCE_PLATE 0.55f
+#define VOXEL_LAND_PROVINCE_BELT_LO 1500.0f
+#define VOXEL_LAND_PROVINCE_BELT_HI 3500.0f
+// Stored in 6 bits (the material's field texture has no more room: VoxelLandMaterialLayout.ush).
+#define VOXEL_LAND_PROVINCE_LEVELS 63.0f
 
 // --- Noise -------------------------------------------------------------------------------
 
@@ -154,6 +166,15 @@ VOXEL_FUNC uint VoxelLandNearestPlate(VOXEL_LAND_ARGS_DECL float3 W)
 VOXEL_FUNC float VoxelLandRawCrust(VOXEL_LAND_ARGS_DECL float3 P, uint Plate)
 {
     return 0.45f * VoxelLandPlateBias(VOXEL_LAND_ARGS Plate) + VoxelLandFbm(P, 1.6f, 5u, LandSeed + VOXEL_LAND_SALT_CRUST);
+}
+
+/** A plate's sedimentary cover, 0 (a shield: crystalline basement at the surface) .. 1 (a
+ *  platform or basin: flat-lying sedimentary rock), from a hash of the plate and the seed; most
+ *  plates lean one way (smoothstep of a uniform value). */
+VOXEL_FUNC float VoxelLandPlateCover(VOXEL_LAND_ARGS_DECL uint Plate)
+{
+    const float U = float(VoxelHash(uint3(Plate, 0u, 0u), LandSeed + VOXEL_LAND_SALT_PROVINCE) >> 8u) * (1.0f / 16777216.0f);
+    return smoothstep(0.2f, 0.8f, U);
 }
 
 /** Continental fraction 0..1 of direction P as plate Plate's crust. */
@@ -353,6 +374,7 @@ struct FVoxelLandElevation
     float Up;      // boundary uplift (m)
     float Down;    // boundary depression (m)
     float Crust;   // continental fraction 0..1
+    float Cover;   // the plates' sedimentary cover (VoxelLandPlateCover), blended as the crust
     uint Class;    // dominant boundary class of the nearest plate
     uint Plate;    // nearest plate
 };
@@ -391,6 +413,7 @@ VOXEL_FUNC FVoxelLandElevation VoxelLandElevationAt(VOXEL_LAND_ARGS_DECL float3 
     float Outline = 0.0f;
     float Up = 0.0f;
     float Down = 0.0f;
+    float Cover = 0.0f;
     uint Class = 0u;
     for (uint r = 0u; r < 3u && r < LandPlateCount; r++)
     {
@@ -404,6 +427,7 @@ VOXEL_FUNC FVoxelLandElevation VoxelLandElevationAt(VOXEL_LAND_ARGS_DECL float3 
         Outline += Weight * Parts.Outline;
         Up += Weight * Parts.Up;
         Down += Weight * Parts.Down;
+        Cover += Weight * VoxelLandPlateCover(VOXEL_LAND_ARGS K);
         if (r == 0u)
             Class = Parts.Class;
         WSum += Weight;
@@ -418,12 +442,14 @@ VOXEL_FUNC FVoxelLandElevation VoxelLandElevationAt(VOXEL_LAND_ARGS_DECL float3 
         Outline = Parts.Outline;
         Up = Parts.Up;
         Down = Parts.Down;
+        Cover = VoxelLandPlateCover(VOXEL_LAND_ARGS K0);
         Class = Parts.Class;
         WSum = 1.0f;
     }
     Out.Crust = Crust / WSum;
     Out.Up = Up / WSum;
     Out.Down = Down / WSum;
+    Out.Cover = Cover / WSum;
     Out.Class = Class;
     Out.Plate = K0;
     // Low-relief continental texture, and abyssal hills (weaker), blended across the coast.
@@ -459,6 +485,31 @@ VOXEL_FUNC float2 VoxelLandFormAt(VOXEL_LAND_ARGS_DECL float3 P, FVoxelLandEleva
     const float Character = saturate(0.5f + 2.0f * VoxelLandFbm(P, LandRadiusM / (VOXEL_LAND_FORM_CHARACTER_M * Width), 3u,
         LandSeed + VOXEL_LAND_SALT_FORM + 1u) + 0.3f * Front + 0.3f * Mountain);
     return float2(Hilliness, Character);
+}
+
+/** The sedimentary province at direction P (unit) whose plate fields are E (Design/NonMountainLand.md,
+ *  T4c): 0 crystalline .. 1 flat-lying sedimentary rock, where the strata set (mesas, cuestas,
+ *  badlands) replaces the hills (VoxelLandHillSet.ush; the sample side picks the share of the
+ *  land by a threshold on this). Platforms and basins away from the active belts:
+ *   - each plate's cover (a shield or a platform), blended across the plates as the crust;
+ *   - a noise of about a thousand kilometres, so a plate's interior varies;
+ *   - none in the belts' cores (boundary uplift from 1.5 to 3.5 km at Earth heights), where
+ *     the great ranges are (lower belts keep it: the sample side hands their relief to the
+ *     peaks by the local relief).
+ *  The sea's cells get a value too (the sample side fades every layer out at the coast). */
+VOXEL_FUNC float VoxelLandProvinceAt(VOXEL_LAND_ARGS_DECL float3 P, FVoxelLandElevation E)
+{
+    const float Width = max(LandWidthScale, 0.01f);
+    const float Noise = saturate(0.5f + VoxelLandFbm(P, LandRadiusM / (VOXEL_LAND_PROVINCE_M * Width), 3u, LandSeed + VOXEL_LAND_SALT_PROVINCE));
+    const float Cover = VOXEL_LAND_PROVINCE_PLATE * E.Cover + (1.0f - VOXEL_LAND_PROVINCE_PLATE) * Noise;
+    const float Relief = max(LandReliefScale, 0.01f);
+    return Cover * (1.0f - smoothstep(VOXEL_LAND_PROVINCE_BELT_LO * Relief, VOXEL_LAND_PROVINCE_BELT_HI * Relief, E.Up));
+}
+
+/** Packs a province (FVoxelLandBake::Province: 0 .. 63; VoxelLandUnpackProvince reads it). */
+VOXEL_FUNC uint VoxelLandPackProvince(float Province)
+{
+    return uint(saturate(Province) * VOXEL_LAND_PROVINCE_LEVELS + 0.5f);
 }
 
 /** Packs a landform (FVoxelLandBake::Form: the hilliness in the low byte, the character in the

@@ -18,6 +18,10 @@
 //          for an authored set; every mode reads it)
 //   pcost  the peaks' CPU cost and (built with -DVOXEL_HARNESS_COUNT_NOISE) noise loads a sample
 //   cgrad  the peaks' gradient against differences with the real (varying) landform
+//   dgrad  the detail layer's gradient (N1: VoxelLandDetailDF) against differences
+//   dcost  the detail layer's CPU cost against the procedural fBm it replaced (and noise loads)
+//   seam   the set layers' face blend near cube edges and corners (N1b): variance, range, gradients
+// The detail set: DETAIL_SET=file.vxnt (an authored detail set), else the generated stand-in.
 // Environment overrides for looks: GULLY_DETAIL, DETAIL_AMP (m), VIEWS, WIDTH (m), SUFFIX.
 #include "VoxelShaderCompat.h"
 #include <array>
@@ -54,6 +58,9 @@ namespace VoxelShader
     const uint* LandFlow = nullptr;
     const uint* LandForm = nullptr;
     const uint* LandRelief = nullptr;
+    const uint* LandProvince = nullptr;
+    const uint* LandRiverTiles = nullptr;
+    const float* LandRiverData = nullptr;
     const uint* LandNoise = nullptr;
     uint LandN = 0, LandPad = 4, LandHasFlow = 0, LandHasForm = 0, LandWarpOctaves = 3;
     float LandHillRelief = 0.0f;
@@ -62,13 +69,24 @@ namespace VoxelShader
     float LandPeakStrength = 0.0f, LandPeakTexelsPerCell = 0.0f, LandPeakSpacingM = 0.0f, LandPeakReliefM = 0.0f, LandPeakReliefStart = 500.0f, LandPeakReliefEnd = 1500.0f;
     float LandPeakMeanR = 0.0f, LandPeakMeanG = 0.0f, LandPeakScaleR = 1.0f, LandPeakScaleG = 1.0f, LandPeakScaleB = 1.0f;
     uint LandPeakSeed = 0, LandNoiseN = 0, LandNoiseMips = 0;
-    uint LandPeakDetailBase = 0, LandPeakDetailN = 0, LandPeakDetailMips = 0;
-    float LandPeakDetailTexelsPerCell = 0.0f, LandPeakDetailMeanR = 0.0f, LandPeakDetailMeanG = 0.0f;
-    float LandPeakDetailScaleR = 0.0f, LandPeakDetailScaleG = 0.0f, LandPeakDetailFade = 0.0f;
-    float LandHillTexelsPerCell = 0.0f, LandHillScaleR = 1.0f, LandHillScaleG = 1.0f, LandHillScaleB = 1.0f, LandHillSpacingM = 0.0f;
+    uint LandDetailBase = 0, LandDetailN = 0, LandDetailMips = 0;
+    float LandPeakDetailTexelsPerCell = 0.0f, LandDetailMeanHard = 0.0f, LandDetailMeanSoft = 0.0f;
+    float LandPeakDetailScaleHard = 0.0f, LandPeakDetailScaleSoft = 0.0f, LandPeakDetailFade = 0.0f;
+    float LandHillTexelsPerCell = 0.0f, LandHillScaleR = 1.0f, LandHillScaleG = 1.0f, LandHillScaleB = 1.0f, LandHillMeanR = 0.0f, LandHillMeanG = 0.0f, LandHillSpacingM = 0.0f;
     uint LandHillBase = 0, LandHillN = 0, LandHillMips = 0;
     float LandHillSwellTexelsPerCell = 0.0f, LandHillSwellM = 0.0f, LandHillSwellScaleG = 1.0f;
-    float LandHillDetailTexelsPerCell = 0.0f, LandHillDetailScaleR = 0.0f, LandHillDetailScaleG = 0.0f, LandHillDetailFade = 0.0f, LandHillFoothill = 0.0f;
+    float LandHillDetailTexelsPerCell = 0.0f, LandHillDetailScaleHard = 0.0f, LandHillDetailScaleSoft = 0.0f, LandHillDetailFade = 0.0f, LandHillFoothill = 0.0f;
+    float LandStrataTexelsPerCell = 0.0f, LandStrataScaleR = 1.0f, LandStrataScaleG = 1.0f, LandStrataScaleB = 1.0f, LandStrataMeanR = 0.0f, LandStrataMeanG = 0.0f, LandStrataSpacingM = 0.0f;
+    uint LandStrataBase = 0, LandStrataN = 0, LandStrataMips = 0, LandStrataSeed = 0;
+    float LandStrataRelief = 0.0f, LandStrataFlat = 0.0f, LandStrataThreshold = 2.0f, LandStrataWidth = 0.05f;
+    float LandStrataDetailTexelsPerCell = 0.0f, LandStrataDetailScaleHard = 0.0f, LandStrataDetailScaleSoft = 0.0f, LandStrataDetailFade = 0.0f;
+    uint LandRiverTilesPerFace = 0;
+    float LandRiverRadiusM = 1.0f, LandRiverWidthScale = 1.0f, LandRiverValleyScale = 1.0f;
+    const float* LandWater = nullptr;   // R2: the carve (VoxelLandCarve.ush)
+    uint LandHasWater = 0;
+    float LandRiverCarve = 0.0f, LandRiverDepthScale = 1.0f, LandRiverFloodplainScale = 1.0f, LandRiverMinLog2Area = 0.0f, LandLakeShoreBand = 0.0f, LandRiverMeander = 0.0f, LandRiverFalls = 0.0f;
+    float LandDetailTexelsPerCell = 0.0f, LandDetailMeanA = 0.0f, LandDetailScaleA = 0.0f, LandDetailScaleGain = 0.0f, LandDetailFade = 0.0f;   // N1: the detail layer
+    uint LandDetailScales = 0, LandDetailSeed = 0;
     float LandCellM = 1.0f;
     float LandWarpInvNorm = 0, LandWarpAmplitude = 0, LandDetailAmplitude = 0;
     float2 LandHeightOffset;
@@ -94,6 +112,9 @@ namespace VoxelShader
         const uint* LandFlow = nullptr;
         const uint* LandForm = nullptr;
         const uint* LandRelief = nullptr;
+        const uint* LandProvince = nullptr;
+        const uint* LandRiverTiles = nullptr;
+        const float* LandRiverData = nullptr;
         const uint* LandNoise = nullptr;
         uint LandN = 1, LandPad = 0, LandHasFlow = 0, LandHasForm = 0;
         float LandHillRelief = 0.0f;
@@ -102,13 +123,24 @@ namespace VoxelShader
         float LandPeakStrength = 0.0f, LandPeakTexelsPerCell = 0.0f, LandPeakSpacingM = 0.0f, LandPeakReliefM = 0.0f, LandPeakReliefStart = 500.0f, LandPeakReliefEnd = 1500.0f;
         float LandPeakMeanR = 0.0f, LandPeakMeanG = 0.0f, LandPeakScaleR = 1.0f, LandPeakScaleG = 1.0f, LandPeakScaleB = 1.0f;
         uint LandPeakSeed = 0, LandNoiseN = 0, LandNoiseMips = 0;
-        uint LandPeakDetailBase = 0, LandPeakDetailN = 0, LandPeakDetailMips = 0;
-        float LandPeakDetailTexelsPerCell = 0.0f, LandPeakDetailMeanR = 0.0f, LandPeakDetailMeanG = 0.0f;
-        float LandPeakDetailScaleR = 0.0f, LandPeakDetailScaleG = 0.0f, LandPeakDetailFade = 0.0f;
-        float LandHillTexelsPerCell = 0.0f, LandHillScaleR = 1.0f, LandHillScaleG = 1.0f, LandHillScaleB = 1.0f, LandHillSpacingM = 0.0f;
+        uint LandDetailBase = 0, LandDetailN = 0, LandDetailMips = 0;
+        float LandPeakDetailTexelsPerCell = 0.0f, LandDetailMeanHard = 0.0f, LandDetailMeanSoft = 0.0f;
+        float LandPeakDetailScaleHard = 0.0f, LandPeakDetailScaleSoft = 0.0f, LandPeakDetailFade = 0.0f;
+        float LandHillTexelsPerCell = 0.0f, LandHillScaleR = 1.0f, LandHillScaleG = 1.0f, LandHillScaleB = 1.0f, LandHillMeanR = 0.0f, LandHillMeanG = 0.0f, LandHillSpacingM = 0.0f;
         uint LandHillBase = 0, LandHillN = 0, LandHillMips = 0;
         float LandHillSwellTexelsPerCell = 0.0f, LandHillSwellM = 0.0f, LandHillSwellScaleG = 1.0f;
-        float LandHillDetailTexelsPerCell = 0.0f, LandHillDetailScaleR = 0.0f, LandHillDetailScaleG = 0.0f, LandHillDetailFade = 0.0f, LandHillFoothill = 0.0f;
+        float LandHillDetailTexelsPerCell = 0.0f, LandHillDetailScaleHard = 0.0f, LandHillDetailScaleSoft = 0.0f, LandHillDetailFade = 0.0f, LandHillFoothill = 0.0f;
+        float LandStrataTexelsPerCell = 0.0f, LandStrataScaleR = 1.0f, LandStrataScaleG = 1.0f, LandStrataScaleB = 1.0f, LandStrataMeanR = 0.0f, LandStrataMeanG = 0.0f, LandStrataSpacingM = 0.0f;
+        uint LandStrataBase = 0, LandStrataN = 0, LandStrataMips = 0, LandStrataSeed = 0;
+        float LandStrataRelief = 0.0f, LandStrataFlat = 0.0f, LandStrataThreshold = 2.0f, LandStrataWidth = 0.05f;
+        float LandStrataDetailTexelsPerCell = 0.0f, LandStrataDetailScaleHard = 0.0f, LandStrataDetailScaleSoft = 0.0f, LandStrataDetailFade = 0.0f;
+        uint LandRiverTilesPerFace = 0;
+        float LandRiverRadiusM = 1.0f, LandRiverWidthScale = 1.0f, LandRiverValleyScale = 1.0f;
+        const float* LandWater = nullptr;   // R2: the carve (VoxelLandCarve.ush)
+        uint LandHasWater = 0;
+        float LandRiverCarve = 0.0f, LandRiverDepthScale = 1.0f, LandRiverFloodplainScale = 1.0f, LandRiverMinLog2Area = 0.0f, LandLakeShoreBand = 0.0f, LandRiverMeander = 0.0f, LandRiverFalls = 0.0f;
+        float LandDetailTexelsPerCell = 0.0f, LandDetailMeanA = 0.0f, LandDetailScaleA = 0.0f, LandDetailScaleGain = 0.0f, LandDetailFade = 0.0f;   // N1: the detail layer
+        uint LandDetailScales = 0, LandDetailSeed = 0;
         float LandCellM = 1.0f;
         float LandGullyStrength = 0.0f;
         uint LandGullyOctaves = 0;
@@ -120,11 +152,16 @@ namespace VoxelShader
 #undef VOXEL_LAND_PEAKS_USH
 #undef VOXEL_LAND_GULLY_USH
 #undef VOXEL_LAND_HILL_SET_USH
+#undef VOXEL_LAND_DETAIL_USH
+#undef VOXEL_LAND_RIVERS_USH
+#undef VOXEL_LAND_CARVE_USH
 #include "VoxelLandSample.ush"
 #include "VoxelLandGully.ush"
     };
 }
 using namespace VoxelShader;
+// R1b: the rivers' GPU build, run on the CPU (Tools/LandRiverHarness).
+#include "../LandRiverHarness/river_build_cpu.h"
 
 static double Now() { return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
 static float2 DF(double V) { const float H = (float)V; return float2(H, (float)(V - (double)H)); }
@@ -231,16 +268,24 @@ struct FPlanet
     std::vector<uint32_t> FlowPacked, FormPacked, ReliefPacked;
     std::vector<uint32_t> Form;        // per cell (VoxelLandPackForm)
     std::vector<uint8_t> Relief;       // per cell (VoxelLandRelief.h)
+    std::vector<uint8_t> Province;     // T4c: per cell (the form dump's bits 16..21)
+    std::vector<uint32_t> ProvincePacked;
+    std::vector<uint32_t> Rec;         // R1: the final routing's receivers (Tag_rec.u32), empty without
+    RiverBuildCPU::FTables Rivers;     // R1b: the rivers (the GPU build's tables, run on the CPU), from the environment
+    std::vector<float> WaterF;
     float MaxRelief = 0;
     VoxelNoiseTiles::FSet NoiseSet;    // the peaks' set (VoxelLand::GetPeakNoise's)
     std::vector<uint32_t> NoiseWords;  // FVoxelLandNoiseSet::Words: the chain in whole rows of N texels, then the detail's
     uint32_t NoiseRows = 0;
-    VoxelNoiseTiles::FSet Detail;      // the peaks' detail tile (VoxelLandNoiseDetail::DetailLocked's)
+    VoxelNoiseTiles::FSet Detail;      // N1: the detail set (DETAIL_SET=file.vxnt, else the generated stand-in)
+    VoxelNoiseTiles::FDetailStats DetailStats;
     uint32_t DetailBase = 0;           // its first texel in NoiseWords
     VoxelNoiseTiles::FSet HillSet;     // T4a: HILL_SET=file.vxnt, after the detail (whole rows)
     uint32_t HillBase = 0;
+    VoxelNoiseTiles::FSet StrataSet;   // T4c: STRATA_SET=file.vxnt, after the hills (whole rows)
+    uint32_t StrataBase = 0;
     std::vector<float2> Tan;
-    FLay Det, W[3];
+    FLay W[3];
     double WarpAmp = 0, DetailAmp = 0, Offset = 0, Finest = 0, Half = 0;
     int Depth = 0;
     FSampler S;
@@ -255,6 +300,13 @@ static std::vector<char> ReadFile(const std::string& Name)
     fseek(F, 0, SEEK_END); const long L = ftell(F); fseek(F, 0, SEEK_SET);
     std::vector<char> B(L); if (fread(B.data(), 1, L, F) != (size_t)L) exit(1); fclose(F);
     return B;
+}
+
+/** The gullies' strength for the harnesses: GULLY_STRENGTH, else the plugin's default (0 since
+ *  N1b: off; 0.22 before). */
+static double HarnessGullyStrength()
+{
+    return getenv("GULLY_STRENGTH") ? atof(getenv("GULLY_STRENGTH")) : 0.0;
 }
 
 static void Load(FPlanet& P, const std::string& Tag, int N, double RadiusM, double FinestM, double Strength)
@@ -275,6 +327,22 @@ static void Load(FPlanet& P, const std::string& Tag, int N, double RadiusM, doub
         P.FormPacked.resize(P.Form.size() / 2);
         for (size_t i = 0; i < P.FormPacked.size(); i++) P.FormPacked[i] = (P.Form[2 * i] & 0xffffu) | ((P.Form[2 * i + 1] & 0xffffu) << 16);
     }
+    // R1: the lake levels and the final routing's receivers (dumps from R1 on).
+    {
+        auto Wt = ReadFile(Tag + "_water.f32");
+        P.WaterF.resize(Wt.size() / 4); std::memcpy(P.WaterF.data(), Wt.data(), Wt.size());
+        if (FILE* RF = fopen((Tag + "_rec.u32").c_str(), "rb"))
+        {
+            fclose(RF);
+            auto Rc = ReadFile(Tag + "_rec.u32");
+            P.Rec.resize(Rc.size() / 4); std::memcpy(P.Rec.data(), Rc.data(), Rc.size());
+        }
+    }
+    // The province (T4c): the form's bits from 16 (0 in dumps from before T4c), four cells per word.
+    P.Province.assign(P.Height.size(), 0);
+    for (size_t i = 0; i < P.Form.size() && i < P.Province.size(); i++) P.Province[i] = (uint8_t)std::min(P.Form[i] >> 16, 63u);
+    P.ProvincePacked.assign((P.Province.size() + 3) / 4, 0u);
+    for (size_t i = 0; i < P.Province.size(); i++) P.ProvincePacked[i >> 2] |= (uint32_t)P.Province[i] << ((i & 3) * 8);
     float Mn = 1e9, Mx = -1e9; for (float h : P.Height) { Mn = std::min(Mn, h); Mx = std::max(Mx, h); }
     P.Cell = M_PI * 0.5 * P.SeaRadius / N;
     // The local relief (FVoxelLandBake::BuildRelief) and the peaks' noise set (VoxelLand::GetPeakNoise).
@@ -302,8 +370,18 @@ static void Load(FPlanet& P, const std::string& Tag, int N, double RadiusM, doub
         }
         const size_t Texels = P.NoiseSet.Texels.size() / 4;
         P.NoiseRows = (uint32_t)((Texels + P.NoiseSet.N - 1) / P.NoiseSet.N);
-        // The detail tile after the chain, from a whole row (VoxelLandNoiseDetail::AppendDetailLocked).
-        P.Detail = VoxelNoiseTiles::GeneratePeakDetail(0x64657461u, 1024, [](int32_t Count, auto&& Body) { ParallelFor(Count, [&](int i) { Body(i); }); });
+        // N1: the detail set after the chain, from a whole row (VoxelLandNoiseDetail::MakePackLocked):
+        // DETAIL_SET=path.vxnt, else the generated stand-in.
+        if (const char* DetailPath = getenv("DETAIL_SET"))
+        {
+            const std::vector<char> Bytes = ReadFile(DetailPath);
+            std::string Error = VoxelNoiseTiles::ReadVxnt((const uint8_t*)Bytes.data(), Bytes.size(), P.Detail);
+            if (Error.empty()) Error = VoxelNoiseTiles::CheckDetail(P.Detail);
+            if (!Error.empty()) { fprintf(stderr, "%s: %s\n", DetailPath, Error.c_str()); exit(1); }
+        }
+        else
+            P.Detail = VoxelNoiseTiles::GenerateDetailStandIn(0x64657461u, 1024, [](int32_t Count, auto&& Body) { ParallelFor(Count, [&](int i) { Body(i); }); });
+        P.DetailStats = VoxelNoiseTiles::DetailStatsOf(P.Detail, P.Detail.Texels.data());
         const size_t DetailTexels = P.Detail.Texels.size() / 4;
         const uint32_t DetailRows = (uint32_t)((DetailTexels + P.NoiseSet.N - 1) / P.NoiseSet.N);
         P.DetailBase = P.NoiseRows * P.NoiseSet.N;
@@ -323,6 +401,20 @@ static void Load(FPlanet& P, const std::string& Tag, int N, double RadiusM, doub
             P.HillBase = (P.NoiseRows + DetailRows) * P.NoiseSet.N;
             P.NoiseWords.resize(2 * (size_t)(P.NoiseRows + DetailRows + HillRows) * P.NoiseSet.N, 0u);
             std::memcpy(P.NoiseWords.data() + 2 * (size_t)P.HillBase, P.HillSet.Texels.data(), HillTexels * 8);
+            // T4c: the strata's set (STRATA_SET=file.vxnt) after the hills'.
+            if (const char* StrataPath = getenv("STRATA_SET"))
+            {
+                const std::vector<char> SBytes = ReadFile(StrataPath);
+                std::string SError = VoxelNoiseTiles::ReadVxnt((const uint8_t*)SBytes.data(), SBytes.size(), P.StrataSet);
+                if (SError.empty()) SError = VoxelNoiseTiles::CheckPeaks(P.StrataSet);
+                if (!SError.empty()) { fprintf(stderr, "%s: %s\n", StrataPath, SError.c_str()); exit(1); }
+                const size_t StrataTexels = P.StrataSet.Texels.size() / 4;
+                const uint32_t StrataRows = (uint32_t)((StrataTexels + P.NoiseSet.N - 1) / P.NoiseSet.N);
+                const uint32_t Rows = (uint32_t)(P.NoiseWords.size() / 2 / P.NoiseSet.N);
+                P.StrataBase = Rows * P.NoiseSet.N;
+                P.NoiseWords.resize(2 * (size_t)(Rows + StrataRows) * P.NoiseSet.N, 0u);
+                std::memcpy(P.NoiseWords.data() + 2 * (size_t)P.StrataBase, P.StrataSet.Texels.data(), StrataTexels * 8);
+            }
         }
     }
     // VoxelLand::GullyOctavesFor and GullyReach.
@@ -330,7 +422,7 @@ static void Load(FPlanet& P, const std::string& Tag, int N, double RadiusM, doub
     const int Octaves = std::clamp((int)std::floor(std::log2(Lambda0 / FinestM)) + 1, 0, 12);
     double GS = 0, Gn = 1; for (int o = 0; o < Octaves; o++) { GS += Gn; Gn *= 0.42; }
     const double GullyReach = 0.5 * Strength * Lambda0 * 100.0 * 0.8 * GS;
-    P.DetailAmp = 250.0 * 100;
+    P.DetailAmp = (getenv("DETAIL_AMP") ? atof(getenv("DETAIL_AMP")) : 250.0) * 100;
     // The hills (VoxelLand::HillOctavesFor, HillFinestFrequency), from the environment.
     constexpr double HillMaxUnit = 2.5;   // VoxelLand::HillMaxUnit (VoxelLandBake.h)
     const double HillRelief = getenv("HILL_RELIEF") ? atof(getenv("HILL_RELIEF")) : 150.0;
@@ -348,20 +440,17 @@ static void Load(FPlanet& P, const std::string& Tag, int N, double RadiusM, doub
     const double PeakDetailWave = std::clamp(getenv("PEAK_DETAIL_WAVELENGTH") ? atof(getenv("PEAK_DETAIL_WAVELENGTH")) : 400.0, 16.0,
         0.25 * std::max(PeakSpacing, 500.0));
     const double DetailTexelM = PeakDetailWave / (double)(P.Detail.N / P.Detail.Channel[0].CellsPerTile);
-    const double PeakUp = bPeaks ? PeakStrength * (P.MaxRelief + (PeakDetail > 0 ? PeakDetail * VoxelNoiseTiles::DetailRangeTexels * DetailTexelM : 0.0)) * 100.0 : 0.0;
+    const double PeakUp = bPeaks ? PeakStrength * (P.MaxRelief + (PeakDetail > 0 ? PeakDetail * VoxelNoiseTiles::DetailRangeWaves * PeakDetailWave : 0.0)) * 100.0 : 0.0;
     const double PeakDown = PeakUp;
-    const double Reach = 2.5 * P.DetailAmp + GullyReach + HillMaxUnit * HillRelief * 100.0 + 100;
+    // The detail layer's bound (VoxelLand::ShapeFor).
+    const double Reach = 1.01 * P.DetailStats.BoundA * P.DetailAmp + GullyReach + HillMaxUnit * HillRelief * 100.0 + 100;
     const double Low = std::min(Mn * 100.0, -PeakDown) - Reach, High = Mx * 100.0 + PeakUp + Reach;
     P.R = P.SeaRadius + Low; P.NA = High - Low;
     const double Root = (P.R + P.NA) * 1.05;
     P.Depth = (int)std::ceil(std::log2(2 * Root / 150.0));
     P.Finest = 2 * Root / std::pow(2.0, P.Depth); P.Half = P.Finest / 2;
-    const double DW = 20000.0 * 100;
-    const int DOct = std::clamp((int)std::ceil(std::log2(DW / P.Finest)) + 1, 1, 24);
-    // On the sea-level sphere, as FVoxelDensityCPU's terrestrial constructor.
-    P.Det = MakeLayer(VoxelLayerDamped, DW / P.SeaRadius, P.SeaRadius, 0.5, DOct, VoxelHashSeed(7, 3));
     for (int a = 0; a < 3; a++) P.W[a] = MakeLayer(VoxelLayerPlain, 6 * P.Cell / P.SeaRadius, P.SeaRadius, 0.5, 3, VoxelHashSeed(7, 0x11 + a));
-    P.WarpAmp = 1.5 * P.Cell; P.Offset = P.SeaRadius - P.R;
+    P.WarpAmp = (getenv("WARP") ? atof(getenv("WARP")) : 1.0) * P.Cell; P.Offset = P.SeaRadius - P.R;
     P.Strength = (float)Strength;
     FSampler& S = P.S;
     S.LandHeight = P.Height.data(); S.LandTanTable = P.Tan.data(); S.LandFlow = P.FlowPacked.data();
@@ -372,6 +461,65 @@ static void Load(FPlanet& P, const std::string& Tag, int N, double RadiusM, doub
     S.LandHillRelief = (float)HillRelief; S.LandHillOctaves = (uint)HillOctaves; S.LandHillFrequency = DF(HillFrequency);
     S.LandHillSeed = VoxelHashSeed(7, 0x31u);
     S.LandRelief = P.ReliefPacked.data();
+    S.LandProvince = P.ProvincePacked.data();
+    // N1: the detail layer (FVoxelDensityCPU's terrestrial constructor): DETAIL_WAVELENGTH (m),
+    // DETAIL_AMP (m, above).
+    if (P.DetailAmp > 0 && P.DetailStats.StdA > 0)
+    {
+        const double WaveM = std::max(getenv("DETAIL_WAVELENGTH") ? atof(getenv("DETAIL_WAVELENGTH")) : 20000.0, 100.0);
+        const double TexelM = WaveM / (double)(P.Detail.N / P.Detail.Channel[0].CellsPerTile);
+        S.LandDetailTexelsPerCell = (float)((double)S.LandCellM / TexelM);
+        const double DetailFinestM = std::max(P.Finest, 1.0) * 0.01;
+        const int DOctaves = std::max((int)std::ceil(std::log2(WaveM / DetailFinestM)) + 1, 1);
+        int Scales = std::clamp((DOctaves + 3) / 4, 1, 4);
+        const double FaceTexels = std::sqrt(2.0) * (0.5 * (double)N + 4.0);
+        while (Scales > 1 && (double)S.LandDetailTexelsPerCell * std::pow(16.0, Scales - 1) * FaceTexels >= 1073741824.0) Scales--;
+        S.LandDetailScales = (uint)Scales;
+        S.LandDetailMeanA = (float)P.DetailStats.MeanA;
+        S.LandDetailScaleA = 0.4f / (float)P.DetailStats.StdA;
+        S.LandDetailScaleGain = (float)P.DetailStats.ScaleGain;
+        S.LandDetailFade = (float)std::floor(std::log2((double)(P.Detail.N / P.Detail.Channel[0].CellsPerTile))) - 1.0f;
+        S.LandDetailSeed = VoxelHashSeed(7, 0x61u);
+        printf("detail layer from %s: %d scales from %.0f m (texel %.2f m), A mean %.4f std %.4f, bound %.2f; hard %.2f soft %.2f texels\n",
+            getenv("DETAIL_SET") ? getenv("DETAIL_SET") : "the generated set", Scales, WaveM, TexelM, P.DetailStats.MeanA, P.DetailStats.StdA,
+            P.DetailStats.BoundA, P.DetailStats.RangeHard, P.DetailStats.RangeSoft);
+    }
+    // R1: the rivers (VoxelLand::GetRivers), when the dump has the receivers: RIVER_MIN_AREA
+    // (km^2, 0 off), RIVER_WIDTH, VALLEY_WIDTH (the scales).
+    if (!P.Rec.empty())
+    {
+        const double MinArea = getenv("RIVER_MIN_AREA") ? atof(getenv("RIVER_MIN_AREA")) : 200.0;
+        const double WidthScale = getenv("RIVER_WIDTH") ? atof(getenv("RIVER_WIDTH")) : 1.0;
+        const double ValleyScale = getenv("VALLEY_WIDTH") ? atof(getenv("VALLEY_WIDTH")) : 1.0;
+        if (MinArea > 0)
+        {
+            RiverBuildCPU::FSettings RS;
+            RS.N = N; RS.Pad = P.Pad; RS.RadiusM = RadiusM; RS.MinAreaKm2 = MinArea; RS.WidthScale = WidthScale; RS.ValleyScale = ValleyScale;
+            for (float H : P.Height) RS.LandCells += H > 0.0f;
+            P.Rivers = RiverBuildCPU::Build(RS, P.Tan.data(), P.Height.data(), P.WaterF.data(), P.FlowPacked.data(), P.Rec.data());
+            S.LandRiverTiles = P.Rivers.Tiles.data(); S.LandRiverData = P.Rivers.Data.data();
+            S.LandRiverTilesPerFace = (uint)P.Rivers.TilesPerFace;
+            S.LandRiverRadiusM = (float)RadiusM; S.LandRiverWidthScale = (float)WidthScale; S.LandRiverValleyScale = (float)ValleyScale;
+            // R2: the carve (FVoxelDensityCPU's terrestrial constructor): CARVE (0 off), RIVER_DEPTH,
+            // FLOODPLAIN, LAKE_SHORE (m).
+            S.LandRiverCarve = getenv("CARVE") ? (float)atof(getenv("CARVE")) : 1.0f;
+            S.LandRiverDepthScale = getenv("RIVER_DEPTH") ? (float)atof(getenv("RIVER_DEPTH")) : 1.0f;
+            S.LandRiverFloodplainScale = getenv("FLOODPLAIN") ? (float)atof(getenv("FLOODPLAIN")) : 1.0f;
+            S.LandRiverMinLog2Area = (float)std::log2(MinArea * 1.0e6);
+            // R3: MEANDER, FALLS (the settings' scales).
+            S.LandRiverMeander = getenv("MEANDER") ? (float)atof(getenv("MEANDER")) : 1.0f;
+            S.LandRiverFalls = getenv("FALLS") ? (float)atof(getenv("FALLS")) : 1.0f;
+            const uint32_t* C = P.Rivers.Counts;
+            printf("rivers from %.0f km^2 (the GPU build, %d build%s): %u segments, %u chains, %u mouths, %u lake inlets, %u outlets; %u entries (max %u a tile, overflow %u)\n",
+                MinArea, P.Rivers.Builds, P.Rivers.Builds == 1 ? "" : "s", C[1], C[6], C[9], C[10], C[11], C[16], C[14], C[15]);
+        }
+    }
+    // R2: the lakes' carve (the dump's levels): LAKE_SHORE (m, the bench's band), CARVE 0 off.
+    if (P.WaterF.size() == P.Height.size() && !(getenv("CARVE") && atof(getenv("CARVE")) <= 0.0))
+    {
+        S.LandWater = P.WaterF.data(); S.LandHasWater = 1;
+        S.LandLakeShoreBand = getenv("LAKE_SHORE") ? (float)atof(getenv("LAKE_SHORE")) : 3.0f;
+    }
     S.LandNoise = P.NoiseWords.data();
     S.LandNoiseN = P.NoiseSet.N; S.LandNoiseMips = P.NoiseSet.Mips;
     if (bPeaks)
@@ -395,14 +543,10 @@ static void Load(FPlanet& P, const std::string& Tag, int N, double RadiusM, doub
         if (PeakDetail > 0)
         {
             const auto& D = P.Detail;
-            auto DUnit = [&](int c, double V) { const auto& C = D.Channel[c]; return (V - (double)C.Min) / std::max((double)C.Max - (double)C.Min, 1e-12); };
-            S.LandPeakDetailBase = P.DetailBase; S.LandPeakDetailN = D.N; S.LandPeakDetailMips = D.Mips;
             S.LandPeakDetailTexelsPerCell = (float)(P.Cell * 0.01 / DetailTexelM);
             const float DTexelMF = S.LandCellM / S.LandPeakDetailTexelsPerCell;
-            S.LandPeakDetailMeanR = (float)VoxelNoiseTiles::MeanOf(D, 0, [&](double V) { return DUnit(0, V); });
-            S.LandPeakDetailMeanG = (float)VoxelNoiseTiles::MeanOf(D, 1, [&](double V) { return DUnit(1, V); });
-            S.LandPeakDetailScaleR = (float)PeakDetail * (D.Channel[0].Max - D.Channel[0].Min) * DTexelMF / S.LandPeakReliefM;
-            S.LandPeakDetailScaleG = (float)PeakDetail * (D.Channel[1].Max - D.Channel[1].Min) * DTexelMF / S.LandPeakReliefM;
+            S.LandPeakDetailScaleHard = (float)PeakDetail * (float)P.DetailStats.RangeHard * DTexelMF / S.LandPeakReliefM;
+            S.LandPeakDetailScaleSoft = (float)PeakDetail * (float)P.DetailStats.RangeSoft * DTexelMF / S.LandPeakReliefM;
             S.LandPeakDetailFade = (float)std::floor(std::log2((double)(D.N / D.Channel[0].CellsPerTile))) - 1.0f;
         }
     }
@@ -410,14 +554,11 @@ static void Load(FPlanet& P, const std::string& Tag, int N, double RadiusM, doub
     if (getenv("PEAK_RELIEF_START")) S.LandPeakReliefStart = (float)atof(getenv("PEAK_RELIEF_START"));
     if (getenv("PEAK_RELIEF_END")) S.LandPeakReliefEnd = (float)atof(getenv("PEAK_RELIEF_END"));
     S.LandPeakReliefEnd = std::max(S.LandPeakReliefEnd, S.LandPeakReliefStart + 1.0f);
-    // The detail tile's chain and means, whoever reads it (the peaks, the hills' set).
-    {
-        const auto& D = P.Detail;
-        auto DUnit = [&](int c, double V) { const auto& C = D.Channel[c]; return (V - (double)C.Min) / std::max((double)C.Max - (double)C.Min, 1e-12); };
-        S.LandPeakDetailBase = P.DetailBase; S.LandPeakDetailN = D.N; S.LandPeakDetailMips = D.Mips;
-        S.LandPeakDetailMeanR = (float)VoxelNoiseTiles::MeanOf(D, 0, [&](double V) { return DUnit(0, V); });
-        S.LandPeakDetailMeanG = (float)VoxelNoiseTiles::MeanOf(D, 1, [&](double V) { return DUnit(1, V); });
-    }
+    // The detail set's chain and means, whoever reads it (the detail layer, the peaks, the hills'
+    // and the strata's sets).
+    S.LandDetailBase = P.DetailBase; S.LandDetailN = P.Detail.N; S.LandDetailMips = P.Detail.Mips;
+    S.LandDetailMeanHard = (float)P.DetailStats.MeanHard;
+    S.LandDetailMeanSoft = (float)P.DetailStats.MeanSoft;
     // T4a: the hills from the set (FVoxelDensityCPU's; VoxelLand::HillTexelsPerCell), from the
     // environment: HILL_SPACING (m), HILL_STRENGTH, HILL_SWELL (m), HILL_SWELL_SCALE (the swells'
     // spacing over the hills'), HILL_DETAIL (strength), HILL_DETAIL_WAVELENGTH (m).
@@ -439,6 +580,12 @@ static void Load(FPlanet& P, const std::string& Tag, int N, double RadiusM, doub
         S.LandHillRelief = (float)HStrength * ReliefM;
         S.LandHillBase = P.HillBase; S.LandHillN = Set.N; S.LandHillMips = Set.Mips;
         S.LandHillScaleR = RangeR / Range; S.LandHillScaleG = RangeG / Range; S.LandHillScaleB = RangeB / Range;
+        {
+            // N1b: R's and G's means (unit), for the face blend (VoxelLandNoiseDetail::MakePackLocked).
+            auto HUnit = [&](int c, double V) { const auto& C = Set.Channel[c]; return (V - (double)C.Min) / std::max((double)C.Max - (double)C.Min, 1e-12); };
+            S.LandHillMeanR = (float)VoxelNoiseTiles::MeanOf(Set, 0, [&](double V) { return HUnit(0, V); });
+            S.LandHillMeanG = (float)VoxelNoiseTiles::MeanOf(Set, 1, [&](double V) { return HUnit(1, V); });
+        }
         S.LandHillSpacingM = (float)Spacing;
         S.LandHillFoothill = getenv("HILL_FOOTHILL") ? (float)atof(getenv("HILL_FOOTHILL")) : 1.0f;
         if (Swell > 0 && SwellScale > 0)
@@ -453,25 +600,85 @@ static void Load(FPlanet& P, const std::string& Tag, int N, double RadiusM, doub
             const double HDTexelM = HDetailWave / (double)(D.N / D.Channel[0].CellsPerTile);
             S.LandHillDetailTexelsPerCell = (float)(P.Cell * 0.01 / HDTexelM);
             const float DTexelMF = S.LandCellM / S.LandHillDetailTexelsPerCell;
-            S.LandHillDetailScaleR = (float)HDetail * (D.Channel[0].Max - D.Channel[0].Min) * DTexelMF / ReliefM;
-            S.LandHillDetailScaleG = (float)HDetail * (D.Channel[1].Max - D.Channel[1].Min) * DTexelMF / ReliefM;
+            S.LandHillDetailScaleHard = (float)HDetail * (float)P.DetailStats.RangeHard * DTexelMF / ReliefM;
+            S.LandHillDetailScaleSoft = (float)HDetail * (float)P.DetailStats.RangeSoft * DTexelMF / ReliefM;
             S.LandHillDetailFade = (float)std::floor(std::log2((double)(D.N / D.Channel[0].CellsPerTile))) - 1.0f;
         }
         printf("hills from %s: spacing %.0f m (texel %.1f m), relief %.0f m at strength %.2f; swells %.0f m at %.1fx; detail %.2f from %.0f m\n",
             getenv("HILL_SET"), Spacing, TexelMF, S.LandHillRelief, HStrength, S.LandHillSwellM, SwellScale, HDetail, HDetailWave);
+        // T4c: the strata (FVoxelDensityCPU's; VoxelLand::StrataTexelsPerCell), from the
+        // environment: STRATA_SPACING (m), STRATA_STRENGTH, STRATA_COVERAGE (share of the land),
+        // STRATA_WIDTH (the switch's half-width), STRATA_FLAT, STRATA_DETAIL, STRATA_DETAIL_WAVELENGTH.
+        const double Coverage = getenv("STRATA_COVERAGE") ? atof(getenv("STRATA_COVERAGE")) : 0.3;
+        const double SStrength = getenv("STRATA_STRENGTH") ? atof(getenv("STRATA_STRENGTH")) : 1.0;
+        if (!P.StrataSet.Texels.empty() && Coverage > 0 && SStrength > 0)
+        {
+            const auto& Ts = P.StrataSet;
+            const double SSpacing = getenv("STRATA_SPACING") ? atof(getenv("STRATA_SPACING")) : 4000.0;
+            const double SDetail = getenv("STRATA_DETAIL") ? atof(getenv("STRATA_DETAIL")) : 0.5;
+            const double SDetailWave = std::clamp(getenv("STRATA_DETAIL_WAVELENGTH") ? atof(getenv("STRATA_DETAIL_WAVELENGTH")) : 400.0, 16.0, 0.25 * SSpacing);
+            const double STexelM = SSpacing / (double)(Ts.N / Ts.Channel[0].CellsPerTile);
+            S.LandStrataTexelsPerCell = (float)(P.Cell * 0.01 / STexelM);
+            const float STexelMF = S.LandCellM / S.LandStrataTexelsPerCell;
+            const float SR = Ts.Channel[0].Max - Ts.Channel[0].Min, SG = Ts.Channel[1].Max - Ts.Channel[1].Min, SB = Ts.Channel[2].Max - Ts.Channel[2].Min;
+            const float SRange = std::max({ SR, SG, 1e-6f });
+            const float SReliefM = SRange * STexelMF;
+            S.LandStrataRelief = std::min((float)SStrength * SReliefM, (float)(SStrength * 0.5 * SSpacing));
+            S.LandStrataBase = P.StrataBase; S.LandStrataN = Ts.N; S.LandStrataMips = Ts.Mips;
+            S.LandStrataScaleR = SR / SRange; S.LandStrataScaleG = SG / SRange; S.LandStrataScaleB = SB / SRange;
+            {
+                auto TUnit = [&](int c, double V) { const auto& C = Ts.Channel[c]; return (V - (double)C.Min) / std::max((double)C.Max - (double)C.Min, 1e-12); };
+                S.LandStrataMeanR = (float)VoxelNoiseTiles::MeanOf(Ts, 0, [&](double V) { return TUnit(0, V); });
+                S.LandStrataMeanG = (float)VoxelNoiseTiles::MeanOf(Ts, 1, [&](double V) { return TUnit(1, V); });
+            }
+            S.LandStrataSpacingM = (float)SSpacing;
+            S.LandStrataFlat = getenv("STRATA_FLAT") ? (float)atof(getenv("STRATA_FLAT")) : 0.35f;
+            S.LandStrataWidth = getenv("STRATA_WIDTH") ? (float)atof(getenv("STRATA_WIDTH")) : 0.05f;
+            S.LandStrataSeed = VoxelHashSeed(7, 0x51u);
+            // FVoxelLandBake::ProvinceThreshold over the dump's land cells.
+            {
+                uint64_t Count[64] = {}, Total = 0;
+                for (size_t i = 0; i < P.Province.size(); i++) if (P.Height[i] > 0.0f) { Count[std::min<int>(P.Province[i], 63)]++; Total++; }
+                const double Wanted = std::min(Coverage, 1.0) * (double)Total;
+                double Above = 0.0;
+                float Th = (float)(-0.5 / 63.0);
+                for (int q = 63; q >= 0; q--)
+                {
+                    const double C = (double)Count[q];
+                    if (Above + C >= Wanted && C > 0.0) { Th = (float)((q + 0.5 - (Wanted - Above) / C) / 63.0); break; }
+                    Above += C;
+                }
+                S.LandStrataThreshold = Total > 0 ? std::max(Th, S.LandStrataWidth) : 2.0f;   // as FVoxelDensityCPU
+            }
+            if (SDetail > 0)
+            {
+                const auto& D = P.Detail;
+                const double SDTexelM = SDetailWave / (double)(D.N / D.Channel[0].CellsPerTile);
+                S.LandStrataDetailTexelsPerCell = (float)(P.Cell * 0.01 / SDTexelM);
+                const float DTexelMF = S.LandCellM / S.LandStrataDetailTexelsPerCell;
+                S.LandStrataDetailScaleHard = (float)SDetail * (float)P.DetailStats.RangeHard * DTexelMF / SReliefM;
+                S.LandStrataDetailScaleSoft = (float)SDetail * (float)P.DetailStats.RangeSoft * DTexelMF / SReliefM;
+                S.LandStrataDetailFade = (float)std::floor(std::log2((double)(D.N / D.Channel[0].CellsPerTile))) - 1.0f;
+            }
+            printf("strata from %s: spacing %.0f m (texel %.1f m), relief %.0f m at strength %.2f; %.0f%% of the land (province above %.3f, +-%.3f); flat %.2f; detail %.2f from %.0f m\n",
+                getenv("STRATA_SET"), SSpacing, STexelMF, S.LandStrataRelief, SStrength, 100.0 * Coverage, S.LandStrataThreshold, S.LandStrataWidth,
+                S.LandStrataFlat, SDetail, SDetailWave);
+        }
     }
     if (P.FormPacked.empty()) S.LandHasForm = 0;
     if (getenv("GULLY_DETAIL")) S.LandGullyDetail = (float)atof(getenv("GULLY_DETAIL"));
-    if (getenv("DETAIL_AMP")) P.DetailAmp = atof(getenv("DETAIL_AMP")) * 100.0;
     printf("planet %s: R %.0f km, N %d, cell %.0f m, lambda0 %.0f m, %d gully octaves, gully reach %.0f m, heights %.0f..%.0f m, lattice finest %.0f cm; hills %.0f m, %d octaves; peaks %.2f, spacing %.0f m (texel %.1f m, set relief %.0f m), relief up to %.0f m%s\n",
         Tag.c_str(), RadiusM * 1e-3, N, P.Cell * 0.01, Lambda0, Octaves, GullyReach * 0.01, Mn, Mx, P.Finest, HillRelief, HillOctaves,
         S.LandPeakStrength, PeakSpacing, S.LandPeakTexelsPerCell > 0 ? S.LandCellM / S.LandPeakTexelsPerCell : 0.0f, S.LandPeakReliefM, P.MaxRelief,
         P.Form.empty() ? " (no landform in the dump)" : "");
 }
 
-struct FTerms { double Bake, Hills, Peaks, Gully, Detail, Height; float DetailScale; };
+struct FTerms { double Bake, Hills, Peaks, Gully, Detail, Height, Carve; float DetailScale; };
 
 /** FVoxelDensityCPU::LandHeightAt at direction D (unit), Footprint (cm). Height in m above sea. */
+/** The strata mode's switch: Terms leaves the strata out while set (T4c). */
+static bool GNoStrata = false;
+
 static FTerms Terms(const FPlanet& P, const double D[3], double Footprint, bool bGullies = true, bool bWarpJacobian = true, bool bHills = true, bool bPeaks = true)
 {
     double SP[3] = { D[0] * P.SeaRadius, D[1] * P.SeaRadius, D[2] * P.SeaRadius };
@@ -485,15 +692,16 @@ static FTerms Terms(const FPlanet& P, const double D[3], double Footprint, bool 
     if (!bGullies) S.LandGullyStrength = 0;
     if (!bHills) S.LandHillRelief = 0;
     if (!bPeaks) S.LandPeakStrength = 0;
+    if (GNoStrata) S.LandStrataTexelsPerCell = 0;
     const auto L = S.VoxelLandSurfaceDF(DF(SP[0]), DF(SP[1]), DF(SP[2]), DF(Q[0]), DF(Q[1]), DF(Q[2]),
         float3((float)DW[0][0], (float)DW[0][1], (float)DW[0][2]), float3((float)DW[1][0], (float)DW[1][1], (float)DW[1][2]),
         float3((float)DW[2][0], (float)DW[2][1], (float)DW[2][2]), (float)std::max(Footprint, P.Finest), false);
     const float Wd = lerp(0.25f, 1.0f, smoothstep(-50.0f, 50.0f, L.Bake));
-    const double Dd = Evaluate(P.Det, SP, std::max(Footprint, P.Finest));
+    const double Dd = (double)S.VoxelLandDetailDF(DF(SP[0]), DF(SP[1]), DF(SP[2]), (float)std::max(Footprint, P.Finest), false).Unit;
     FTerms T;
-    T.Bake = L.Bake; T.Hills = L.Hills; T.Peaks = L.Peaks; T.Gully = L.Gully; T.DetailScale = L.DetailScale;
+    T.Bake = L.Bake; T.Hills = L.Hills; T.Peaks = L.Peaks; T.Gully = L.Gully; T.DetailScale = L.DetailScale; T.Carve = L.Carve;
     T.Detail = Dd * (double)((float)P.DetailAmp * Wd * L.DetailScale) * 0.01;
-    T.Height = T.Bake + T.Hills + T.Peaks + T.Gully + T.Detail;
+    T.Height = T.Bake + T.Hills + T.Peaks + T.Gully + T.Carve + T.Detail;
     return T;
 }
 
@@ -769,11 +977,10 @@ static void Sheet(const std::string& Name, const std::vector<std::vector<float3>
 /** The GPU path's globals (VoxelDensitySample.ush, VoxelLandParameters.ush) for planet P. */
 static void SetGpuGlobals(const FPlanet& P, std::vector<FVoxelOctave>& Gpu)
 {
-    for (auto& O : P.Det.O) Gpu.push_back(ToGPU(O));
     for (int a = 0; a < 3; a++) for (auto& O : P.W[a].O) Gpu.push_back(ToGPU(O));
     VoxelShader::Octaves = Gpu.data();
-    ContinentOctaves = 0; MountainOctaves = 0; DetailOctaves = (uint)P.Det.O.size();
-    InvNormDetail = DF(P.Det.InvNorm); PlanetRadius = DF(P.R); NoiseAmplitude = DF(P.NA); HalfFinest = DF(P.Half);
+    ContinentOctaves = 0; MountainOctaves = 0; DetailOctaves = 0;
+    InvNormDetail = DF(0.0); PlanetRadius = DF(P.R); NoiseAmplitude = DF(P.NA); HalfFinest = DF(P.Half);
     VoxelShader::LandHeight = P.Height.data(); VoxelShader::LandTanTable = P.Tan.data(); VoxelShader::LandFlow = P.FlowPacked.data();
     VoxelShader::LandN = P.N; VoxelShader::LandPad = P.Pad; VoxelShader::LandHasFlow = 1; VoxelShader::LandCellM = P.S.LandCellM;
     LandWarpOctaves = 3; LandWarpInvNorm = (float)P.W[0].InvNorm; LandWarpAmplitude = (float)P.WarpAmp;
@@ -790,20 +997,41 @@ static void SetGpuGlobals(const FPlanet& P, std::vector<FVoxelOctave>& Gpu)
     VoxelShader::LandPeakMeanR = P.S.LandPeakMeanR; VoxelShader::LandPeakMeanG = P.S.LandPeakMeanG;
     VoxelShader::LandPeakScaleR = P.S.LandPeakScaleR; VoxelShader::LandPeakScaleG = P.S.LandPeakScaleG; VoxelShader::LandPeakScaleB = P.S.LandPeakScaleB;
     VoxelShader::LandNoiseN = P.S.LandNoiseN; VoxelShader::LandNoiseMips = P.S.LandNoiseMips;
-    VoxelShader::LandPeakDetailBase = P.S.LandPeakDetailBase; VoxelShader::LandPeakDetailN = P.S.LandPeakDetailN;
-    VoxelShader::LandPeakDetailMips = P.S.LandPeakDetailMips; VoxelShader::LandPeakDetailTexelsPerCell = P.S.LandPeakDetailTexelsPerCell;
-    VoxelShader::LandPeakDetailMeanR = P.S.LandPeakDetailMeanR; VoxelShader::LandPeakDetailMeanG = P.S.LandPeakDetailMeanG;
-    VoxelShader::LandPeakDetailScaleR = P.S.LandPeakDetailScaleR; VoxelShader::LandPeakDetailScaleG = P.S.LandPeakDetailScaleG;
+    VoxelShader::LandDetailBase = P.S.LandDetailBase; VoxelShader::LandDetailN = P.S.LandDetailN;
+    VoxelShader::LandDetailMips = P.S.LandDetailMips; VoxelShader::LandPeakDetailTexelsPerCell = P.S.LandPeakDetailTexelsPerCell;
+    VoxelShader::LandDetailMeanHard = P.S.LandDetailMeanHard; VoxelShader::LandDetailMeanSoft = P.S.LandDetailMeanSoft;
+    VoxelShader::LandPeakDetailScaleHard = P.S.LandPeakDetailScaleHard; VoxelShader::LandPeakDetailScaleSoft = P.S.LandPeakDetailScaleSoft;
     VoxelShader::LandPeakDetailFade = P.S.LandPeakDetailFade;
     VoxelShader::LandHillTexelsPerCell = P.S.LandHillTexelsPerCell; VoxelShader::LandHillBase = P.S.LandHillBase;
     VoxelShader::LandHillN = P.S.LandHillN; VoxelShader::LandHillMips = P.S.LandHillMips;
     VoxelShader::LandHillScaleR = P.S.LandHillScaleR; VoxelShader::LandHillScaleG = P.S.LandHillScaleG; VoxelShader::LandHillScaleB = P.S.LandHillScaleB;
+    VoxelShader::LandHillMeanR = P.S.LandHillMeanR; VoxelShader::LandHillMeanG = P.S.LandHillMeanG;
     VoxelShader::LandHillSpacingM = P.S.LandHillSpacingM;
     VoxelShader::LandHillSwellTexelsPerCell = P.S.LandHillSwellTexelsPerCell; VoxelShader::LandHillSwellM = P.S.LandHillSwellM;
     VoxelShader::LandHillSwellScaleG = P.S.LandHillSwellScaleG;
-    VoxelShader::LandHillDetailTexelsPerCell = P.S.LandHillDetailTexelsPerCell; VoxelShader::LandHillDetailScaleR = P.S.LandHillDetailScaleR;
-    VoxelShader::LandHillDetailScaleG = P.S.LandHillDetailScaleG; VoxelShader::LandHillDetailFade = P.S.LandHillDetailFade;
+    VoxelShader::LandHillDetailTexelsPerCell = P.S.LandHillDetailTexelsPerCell; VoxelShader::LandHillDetailScaleHard = P.S.LandHillDetailScaleHard;
+    VoxelShader::LandHillDetailScaleSoft = P.S.LandHillDetailScaleSoft; VoxelShader::LandHillDetailFade = P.S.LandHillDetailFade;
     VoxelShader::LandHillFoothill = P.S.LandHillFoothill;
+    VoxelShader::LandProvince = P.S.LandProvince;
+    VoxelShader::LandRiverTiles = P.S.LandRiverTiles; VoxelShader::LandRiverData = P.S.LandRiverData;
+    VoxelShader::LandRiverTilesPerFace = P.S.LandRiverTilesPerFace; VoxelShader::LandRiverRadiusM = P.S.LandRiverRadiusM;
+    VoxelShader::LandRiverWidthScale = P.S.LandRiverWidthScale; VoxelShader::LandRiverValleyScale = P.S.LandRiverValleyScale;
+    VoxelShader::LandWater = P.S.LandWater; VoxelShader::LandHasWater = P.S.LandHasWater; VoxelShader::LandRiverCarve = P.S.LandRiverCarve;
+    VoxelShader::LandRiverDepthScale = P.S.LandRiverDepthScale; VoxelShader::LandRiverFloodplainScale = P.S.LandRiverFloodplainScale;
+    VoxelShader::LandRiverMinLog2Area = P.S.LandRiverMinLog2Area; VoxelShader::LandLakeShoreBand = P.S.LandLakeShoreBand;
+    VoxelShader::LandRiverMeander = P.S.LandRiverMeander; VoxelShader::LandRiverFalls = P.S.LandRiverFalls;
+    VoxelShader::LandStrataTexelsPerCell = P.S.LandStrataTexelsPerCell; VoxelShader::LandStrataBase = P.S.LandStrataBase;
+    VoxelShader::LandStrataN = P.S.LandStrataN; VoxelShader::LandStrataMips = P.S.LandStrataMips;
+    VoxelShader::LandStrataScaleR = P.S.LandStrataScaleR; VoxelShader::LandStrataScaleG = P.S.LandStrataScaleG; VoxelShader::LandStrataScaleB = P.S.LandStrataScaleB;
+    VoxelShader::LandStrataMeanR = P.S.LandStrataMeanR; VoxelShader::LandStrataMeanG = P.S.LandStrataMeanG;
+    VoxelShader::LandStrataSpacingM = P.S.LandStrataSpacingM; VoxelShader::LandStrataRelief = P.S.LandStrataRelief;
+    VoxelShader::LandStrataFlat = P.S.LandStrataFlat; VoxelShader::LandStrataThreshold = P.S.LandStrataThreshold;
+    VoxelShader::LandStrataWidth = P.S.LandStrataWidth; VoxelShader::LandStrataSeed = P.S.LandStrataSeed;
+    VoxelShader::LandStrataDetailTexelsPerCell = P.S.LandStrataDetailTexelsPerCell; VoxelShader::LandStrataDetailScaleHard = P.S.LandStrataDetailScaleHard;
+    VoxelShader::LandStrataDetailScaleSoft = P.S.LandStrataDetailScaleSoft; VoxelShader::LandStrataDetailFade = P.S.LandStrataDetailFade;
+    VoxelShader::LandDetailTexelsPerCell = P.S.LandDetailTexelsPerCell; VoxelShader::LandDetailScales = P.S.LandDetailScales;
+    VoxelShader::LandDetailMeanA = P.S.LandDetailMeanA; VoxelShader::LandDetailScaleA = P.S.LandDetailScaleA; VoxelShader::LandDetailScaleGain = P.S.LandDetailScaleGain;
+    VoxelShader::LandDetailFade = P.S.LandDetailFade; VoxelShader::LandDetailSeed = P.S.LandDetailSeed;
 }
 /** pcost's profile pass (kept out of line so a profiler can pick it out). */
 __attribute__((noinline)) static double PcostPass(const FPlanet& P, const std::vector<std::array<double, 3>>& Dirs, bool bPeaks)
@@ -822,7 +1050,7 @@ int main(int argc, char** argv)
     const double RadiusM = argc > 3 ? atof(argv[3]) : 1.0e6;
     const std::string Mode = argc > 4 ? argv[4] : "look";
     FPlanet P;
-    Load(P, Tag, N, RadiusM, 30.0, 0.22);
+    Load(P, Tag, N, RadiusM, 30.0, HarnessGullyStrength());
 
     if (Mode == "look")
     {
@@ -873,6 +1101,101 @@ int main(int argc, char** argv)
                         Name, S0[0], S0[1], S0[2], S1[0], S1[1], S1[2]);
                 }
             }
+    }
+    else if (Mode == "rivers")
+    {
+        // R1b: the bake's surface over the river floors at the nodes (the lookup's own checks,
+        // against brute force and across tile edges, are Tools/LandRiverHarness's).
+        if (P.Rivers.Tiles.empty()) { printf("needs a dump with the receivers (Tag_rec.u32)\n"); return 1; }
+        std::vector<double> Below;
+        VoxelShader::FRiverBuildShader Keys;
+        for (size_t n = 0; n < P.Rivers.NumNodes; n += 7)
+        {
+            if (P.Rivers.NodeKind[n] != 0) continue;
+            const float* D = &P.Rivers.NodePos[4 * n];
+            const auto Bk = P.S.VoxelLandBakeSampleDF(DF(D[0] * P.SeaRadius), DF(D[1] * P.SeaRadius), DF(D[2] * P.SeaRadius), false);
+            Below.push_back((double)Bk.Height - Keys.VoxelRiverFloorOf(P.Rivers.NodeFloor[n]));
+        }
+        std::sort(Below.begin(), Below.end());
+        auto Pc = [&](double q) { return Below[(size_t)(q * (Below.size() - 1))]; };
+        printf("the bake's height over the river floor at %zu nodes: p1 %.1f, p10 %.1f, p50 %.1f, p90 %.1f, p99 %.1f m\n", Below.size(), Pc(0.01), Pc(0.1), Pc(0.5), Pc(0.9), Pc(0.99));
+    }
+    else if (Mode == "strata")
+    {
+        // The strata (T4c): views in strata country (province well above the threshold) in hill
+        // country and on the flats, and on the switch from the hills. Each sheet: the full
+        // surface without the strata (the hills there), with them, the strata's share (orange)
+        // over the land. Slopes at the pixel size. CENTERS picks the views instead.
+        if (P.Form.empty() || !(P.S.LandStrataTexelsPerCell > 0.0f)) { printf("needs a landform and STRATA_SET\n"); return 1; }
+        const float Th = P.S.LandStrataThreshold, W = P.S.LandStrataWidth;
+        struct FKind { const char* Name; float PLo, PHi, HLo, HHi; };
+        const FKind Kinds[] = { { "country", Th + 2 * W, 2.0f, 0.6f, 1.0f }, { "switch", Th - 0.3f * W, Th + 0.3f * W, 0.5f, 1.0f }, { "flats", Th + 2 * W, 2.0f, 0.0f, 0.25f } };
+        std::vector<double> Widths = { 40000.0, 10000.0, 3000.0 };
+        if (getenv("WIDTH")) Widths = { atof(getenv("WIDTH")) };
+        const int Px = getenv("PX") ? atoi(getenv("PX")) : 400;
+        const int Side = P.Side();
+        int v = 0;
+        for (const FKind& K : Kinds)
+        {
+            double C[3];
+            if (getenv("CENTERS"))
+            {
+                if (!FindCrest(P, 0.0, v++, C)) break;
+            }
+            else
+            {
+                // Land cells of the kind, low relief (not the peaks'), away from rivers; the
+                // VIEW-th of them (by a stride).
+                std::vector<int> Cand;
+                for (int f = 0; f < 6; f++)
+                    for (int j = 16; j < P.N - 16; j += 3)
+                        for (int i = 16; i < P.N - 16; i += 3)
+                        {
+                            const int c = f * Side * Side + (j + P.Pad) * Side + i + P.Pad;
+                            const float Pv = P.Province[c] / 63.0f, Hl = (P.Form[c] & 0xffu) / 255.0f;
+                            if (P.Height[c] < 60.0f || Pv < K.PLo || Pv > K.PHi || Hl < K.HLo || Hl > K.HHi) continue;
+                            if (VoxelLandRelief::Decode(P.Relief[c]) > 450.0f) continue;
+                            Cand.push_back(c);
+                        }
+                if (Cand.empty()) { printf("no %s cell\n", K.Name); continue; }
+                const int Pick = getenv("VIEW") ? atoi(getenv("VIEW")) : 0;
+                const int c = Cand[((size_t)Pick * 7919 + Cand.size() / 2) % Cand.size()];
+                const int f = c / (Side * Side), r = c % (Side * Side), j = r / Side - P.Pad, i = r % Side - P.Pad;
+                const float3 D = VoxelCubeDirection(f, VoxelCubeCellCentre(i, P.N), VoxelCubeCellCentre(j, P.N));
+                C[0] = D.x; C[1] = D.y; C[2] = D.z;
+                printf("%s: cell %d,%d,%d\n", K.Name, f, i, j);
+            }
+            for (double Width : Widths)
+            {
+                std::vector<double> H0, H1;
+                GNoStrata = true;
+                auto A = RenderPeaks(P, C, Width, Px, true, true, 0, 1.0, &H0);
+                GNoStrata = false;
+                auto B = RenderPeaks(P, C, Width, Px, true, true, 0, 1.0, &H1);
+                // The strata's share at each pixel (the bake's province through the switch).
+                double E1[3], E2[3]; Frame(C, E1, E2);
+                std::vector<float3> Sh(Px * Px);
+                double ShareSum = 0;
+                for (int k = 0; k < Px * Px; k++)
+                {
+                    const int x = k % Px, y = k / Px;
+                    const double U = ((x + 0.5) / Px - 0.5) * Width * 100.0 / P.SeaRadius, V = (0.5 - (y + 0.5) / Px) * Width * 100.0 / P.SeaRadius;
+                    double D[3] = { C[0] + U * E1[0] + V * E2[0], C[1] + U * E1[1] + V * E2[1], C[2] + U * E1[2] + V * E2[2] };
+                    Normalize(D);
+                    const auto Bk = P.S.VoxelLandBakeSampleDF(DF(D[0] * P.SeaRadius), DF(D[1] * P.SeaRadius), DF(D[2] * P.SeaRadius), true);
+                    const float St = P.S.VoxelLandStrataShare(Bk.Province);
+                    ShareSum += St;
+                    const float3 Base = B[k];
+                    Sh[k] = H1[k] <= 0.0 ? Base : Base * (1.0f - 0.6f * St) + float3(0.95f, 0.5f, 0.15f) * (0.6f * St);
+                }
+                char Name[256]; snprintf(Name, sizeof Name, "%s%s_strata_%s_%.0fkm.ppm", Tag.c_str(), getenv("SUFFIX") ? getenv("SUFFIX") : "", K.Name, Width / 1000);
+                Sheet(Name, { A, B, Sh }, Px);
+                double S0[3], S1[3]; SlopeStats(H0, Px, Width / Px, S0); SlopeStats(H1, Px, Width / Px, S1);
+                double Lo = 1e9, Hi = -1e9; for (size_t k = 0; k < H0.size(); k++) { Lo = std::min(Lo, H1[k] - H0[k]); Hi = std::max(Hi, H1[k] - H0[k]); }
+                printf("wrote %s: strata share %.2f; slope p50/p90/p99 %.1f/%.1f/%.1f deg with the hills, %.1f/%.1f/%.1f with the strata; change %.0f .. %.0f m\n",
+                    Name, ShareSum / (Px * Px), S0[0], S0[1], S0[2], S1[0], S1[1], S1[2], Lo, Hi);
+            }
+        }
     }
     else if (Mode == "peaks")
     {
@@ -1024,7 +1347,7 @@ int main(int argc, char** argv)
         // offset, the mip map between levels, the blend). Run with NOISE_SET for an authored set.
         std::vector<FVoxelOctave> Gpu;
         SetGpuGlobals(P, Gpu);
-        // The peaks' set (from the buffer's start), then the detail tile appended after it.
+        // The peaks' set (from the buffer's start), then the detail set appended after it.
         for (int Which = 0; Which < 2; Which++)
         {
             const VoxelNoiseTiles::FSet& Set = Which == 0 ? P.NoiseSet : P.Detail;
@@ -1080,6 +1403,7 @@ int main(int argc, char** argv)
             }
             for (int c = 0; c < 4; c++) GradRms[c] = std::sqrt(GradRms[c] / 20000);
             double WorstV = 0, WorstG[4] = {}, WorstH = 0;
+            int OnlyAOff = 0;
             const int Count = 100000;
             for (int i = 0; i < Count; i++)
             {
@@ -1089,6 +1413,9 @@ int main(int argc, char** argv)
                 const float FX = (float)U01(Rng), FY = (float)U01(Rng);
                 const FVoxelLandNoise Nz = VoxelLandNoiseMip(SetRef, X, FX, Y, FY, m, VOXEL_LAND_NOISE_WANT_B | VOXEL_LAND_NOISE_WANT_A | VOXEL_LAND_NOISE_WANT_HESSIAN_R | VOXEL_LAND_NOISE_WANT_HESSIAN_B);
                 const FRef R = Ref(m, X + (double)FX, Y + (double)FY);
+                // N1: A alone (one word a texel) gives the same A, and nothing else.
+                const FVoxelLandNoise NA = VoxelLandNoiseMip(SetRef, X, FX, Y, FY, m, VOXEL_LAND_NOISE_WANT_ONLY_A);
+                if (NA.A != Nz.A || NA.AU != Nz.AU || NA.AV != Nz.AV || NA.R != 0.0f || NA.G != 0.0f || NA.B != 0.0f) OnlyAOff++;
                 double V[4], U[4], W[4]; Get(Nz, V, U, W);
                 for (int c = 0; c < 4; c++)
                 {
@@ -1100,8 +1427,8 @@ int main(int argc, char** argv)
                 const double HB = std::max({ std::fabs(R.BUU), std::fabs(R.BUV), std::fabs(R.BVV), 1e-3 });
                 WorstH = std::max(WorstH, std::max({ std::fabs(Nz.BUU - R.BUU), std::fabs(Nz.BUV - R.BUV), std::fabs(Nz.BVV - R.BVV) }) / HB);
             }
-            printf("one mip, %d points: value worst %.3g (unit); gradient worst R %.3g G %.3g B %.3g A %.3g (of each channel's RMS); R's and B's curvature worst %.3g (relative)\n",
-                Count, WorstV, WorstG[0], WorstG[1], WorstG[2], WorstG[3], WorstH);
+            printf("one mip, %d points: value worst %.3g (unit); gradient worst R %.3g G %.3g B %.3g A %.3g (of each channel's RMS); R's and B's curvature worst %.3g (relative); A alone differs at %d\n",
+                Count, WorstV, WorstG[0], WorstG[1], WorstG[2], WorstG[3], WorstH, OnlyAOff);
             // The full lookup.
             double WorstFV = 0, WorstFG = 0;
             int Fails = 0;
@@ -1155,8 +1482,8 @@ int main(int argc, char** argv)
                 Set.Mips, Count, WorstFV, WorstFG, Fails);
         }
         // The statistics the plugin normalises with.
-        printf("detail: base %u, MeanR %.6f, MeanG %.6f, ScaleR %.5f, ScaleG %.5f, texel %.2f m, fade level %.0f\n", P.S.LandPeakDetailBase,
-            P.S.LandPeakDetailMeanR, P.S.LandPeakDetailMeanG, P.S.LandPeakDetailScaleR, P.S.LandPeakDetailScaleG,
+        printf("detail: base %u, MeanHard %.6f, MeanSoft %.6f, ScaleHard %.5f, ScaleSoft %.5f, texel %.2f m, fade level %.0f\n", P.S.LandDetailBase,
+            P.S.LandDetailMeanHard, P.S.LandDetailMeanSoft, P.S.LandPeakDetailScaleHard, P.S.LandPeakDetailScaleSoft,
             P.S.LandPeakDetailTexelsPerCell > 0 ? P.S.LandCellM / P.S.LandPeakDetailTexelsPerCell : 0.0f, P.S.LandPeakDetailFade);
         printf("peaks normalisation: MeanR %.6f, MeanG %.6f, ScaleG %.4f, ScaleB %.4f, %u massifs a side (spacing %u texels)\n", P.S.LandPeakMeanR,
             P.S.LandPeakMeanG, P.S.LandPeakScaleG, P.S.LandPeakScaleB, P.NoiseSet.Channel[0].CellsPerTile,
@@ -1168,6 +1495,8 @@ int main(int argc, char** argv)
         // drainage and bake height at both ends) against central differences of the hills, in
         // random tangent directions at random points, at a fine footprint.
         if (P.Form.empty()) { printf("the dump has no landform\n"); return 1; }
+        // HGRAD_PROVINCE: the province the samples take (T4c: 1 tests the strata's set, 0 the hills').
+        const float HProv = getenv("HGRAD_PROVINCE") ? (float)atof(getenv("HGRAD_PROVINCE")) : 0.0f;
         std::mt19937 Rng(5);
         std::normal_distribution<double> G;
         double WorstRel = 0, SumRel = 0; int Count = 0;
@@ -1182,7 +1511,7 @@ int main(int argc, char** argv)
             const double Step = 20.0;   // cm
             auto At = [&](double S) {
                 double Q[3]; for (int a = 0; a < 3; a++) Q[a] = D[a] * P.SeaRadius + T[a] * S;
-                return P.S.VoxelLandHillsShapeDF(DF(Q[0]), DF(Q[1]), DF(Q[2]), Form, float3(0.0f, 0.0f, 0.0f), 0.0f, 0.0f, 500.0f, 100.0f, true);
+                return P.S.VoxelLandHillsShapeDF(DF(Q[0]), DF(Q[1]), DF(Q[2]), Form, float3(0.0f, 0.0f, 0.0f), 0.0f, HProv, 0.0f, 500.0f, 100.0f, true);
             };
             const auto C = At(0), A = At(Step), B = At(-Step);
             const double Num = ((double)A.Unit * A.AmplitudeM - (double)B.Unit * B.AmplitudeM) / (2 * Step * 0.01);
@@ -1197,7 +1526,7 @@ int main(int argc, char** argv)
             for (int i = 0; i < Range; i++)
             {
                 double D[3] = { G(Rng), G(Rng), G(Rng) }; Normalize(D);
-                const auto H = P.S.VoxelLandHillsShapeDF(DF(D[0] * P.SeaRadius), DF(D[1] * P.SeaRadius), DF(D[2] * P.SeaRadius), float2(1.0f, (float)c), float3(0.0f, 0.0f, 0.0f), 0.0f, 0.0f, 500.0f, 100.0f, true);
+                const auto H = P.S.VoxelLandHillsShapeDF(DF(D[0] * P.SeaRadius), DF(D[1] * P.SeaRadius), DF(D[2] * P.SeaRadius), float2(1.0f, (float)c), float3(0.0f, 0.0f, 0.0f), 0.0f, HProv, 0.0f, 500.0f, 100.0f, true);
                 Lo = std::min(Lo, (double)H.Unit); Hi = std::max(Hi, (double)H.Unit); Mean += H.Unit;
             }
         printf("hills shape over %d points (character 0 and 1): %.3f .. %.3f, mean %.3f\n", 2 * Range, Lo, Hi, Mean / (2 * Range));
@@ -1211,7 +1540,7 @@ int main(int argc, char** argv)
             for (int k = 0; k <= 5000; k++)
             {
                 double Q[3]; for (int a = 0; a < 3; a++) Q[a] = D[a] * P.SeaRadius + E1[a] * (double)k;
-                const auto H = P.S.VoxelLandHillsShapeDF(DF(Q[0]), DF(Q[1]), DF(Q[2]), float2(1.0f, 1.0f), float3(0.0f, 0.0f, 0.0f), 0.0f, 0.0f, 500.0f, 100.0f, true);
+                const auto H = P.S.VoxelLandHillsShapeDF(DF(Q[0]), DF(Q[1]), DF(Q[2]), float2(1.0f, 1.0f), float3(0.0f, 0.0f, 0.0f), 0.0f, HProv, 0.0f, 500.0f, 100.0f, true);
                 const double V = (double)H.Unit * H.AmplitudeM;
                 if (k > 0) { const double St = std::fabs(V - Prev); SumStep += St; MaxStep = std::max(MaxStep, St); }
                 Prev = V;
@@ -1232,7 +1561,7 @@ int main(int argc, char** argv)
             for (int k = 0; k <= 12000; k++)
             {
                 const float Footprint = (float)(100.0 * std::pow(1.001, (double)k));   // 1 m .. about 1600 km
-                const auto H = P.S.VoxelLandHillsShapeDF(DF(D[0] * P.SeaRadius), DF(D[1] * P.SeaRadius), DF(D[2] * P.SeaRadius), F2, float3(0.0f, 0.0f, 0.0f), 0.0f, 0.0f, 500.0f, Footprint, true);
+                const auto H = P.S.VoxelLandHillsShapeDF(DF(D[0] * P.SeaRadius), DF(D[1] * P.SeaRadius), DF(D[2] * P.SeaRadius), F2, float3(0.0f, 0.0f, 0.0f), 0.0f, HProv, 0.0f, 500.0f, Footprint, true);
                 const double Gr[3] = { H.Gradient.x, H.Gradient.y, H.Gradient.z }, St[3] = { H.Steer.x, H.Steer.y, H.Steer.z };
                 if (k > 0)
                 {
@@ -1504,6 +1833,125 @@ int main(int argc, char** argv)
                 F, Best[0] * 1e6, Best[1] * 1e6, (Best[1] - Best[0]) * 1e6, Best[1] / Best[0], Loads, LoadsNormal, Sink * 1e-30);
         }
     }
+    else if (Mode == "dcost")
+    {
+        // N1: the detail layer's CPU cost (VoxelLandDetailDF) against the procedural slope-damped
+        // fBm it replaced (sixteen octaves from 20 km, gain 0.5, as FVoxelDensityCPU made it), at
+        // land points over the planet, at four footprints; and (built with
+        // -DVOXEL_HARNESS_COUNT_NOISE) its noise word loads a sample.
+        std::mt19937 Rng(31);
+        std::normal_distribution<double> G;
+        std::vector<std::array<double, 3>> Dirs;
+        while (Dirs.size() < 20000)
+        {
+            double D[3] = { G(Rng), G(Rng), G(Rng) }; Normalize(D);
+            Dirs.push_back({ D[0], D[1], D[2] });
+        }
+        const double DW = 20000.0 * 100;
+        const int DOct = std::clamp((int)std::ceil(std::log2(DW / P.Finest)) + 1, 1, 24);
+        const FLay Old = MakeLayer(VoxelLayerDamped, DW / P.SeaRadius, P.SeaRadius, 0.5, DOct, VoxelHashSeed(7, 3));
+        std::vector<FVoxelOctave> Gpu;
+        SetGpuGlobals(P, Gpu);
+        for (double F : { P.Finest, 1000.0, 10000.0, 100000.0 })
+        {
+            double Sink = 0, Best[2] = { 1e9, 1e9 };
+            for (int Rep = 0; Rep < 3; Rep++)
+                for (int k = 0; k < 2; k++)
+                {
+                    const double T0 = Now();
+                    for (auto& D : Dirs)
+                    {
+                        const double SP[3] = { D[0] * P.SeaRadius, D[1] * P.SeaRadius, D[2] * P.SeaRadius };
+                        Sink += k == 0 ? Evaluate(Old, SP, F) : (double)VoxelLandDetailDF(DF(SP[0]), DF(SP[1]), DF(SP[2]), (float)F, false).Unit;
+                    }
+                    Best[k] = std::min(Best[k], (Now() - T0) / Dirs.size());
+                }
+            double Loads = 0, LoadsGrad = 0;
+#ifdef VOXEL_HARNESS_COUNT_NOISE
+            GNoiseLoads = 0;
+            for (auto& D : Dirs) Sink += VoxelLandDetailDF(DF(D[0] * P.SeaRadius), DF(D[1] * P.SeaRadius), DF(D[2] * P.SeaRadius), (float)F, false).Unit;
+            Loads = (double)GNoiseLoads / Dirs.size();
+            GNoiseLoads = 0;
+            for (auto& D : Dirs) Sink += VoxelLandDetailDF(DF(D[0] * P.SeaRadius), DF(D[1] * P.SeaRadius), DF(D[2] * P.SeaRadius), (float)F, true).Unit;
+            LoadsGrad = (double)GNoiseLoads / Dirs.size();
+#endif
+            printf("footprint %7.0f cm: the fBm %.2f us (%d octaves at most), the detail set %.2f us (%u scales at most); noise word loads %.1f a sample, %.1f with the gradient  [%g]\n",
+                F, Best[0] * 1e6, DOct, Best[1] * 1e6, VoxelShader::LandDetailScales, Loads, LoadsGrad, Sink * 1e-30);
+        }
+    }
+    else if (Mode == "seam")
+    {
+        // N1b: the set layers' face blend (VoxelLandSetLayerDF) near cube edges and corners, at
+        // amplitude 1: the unit's RMS about its mean in the blend band against inside the faces
+        // (the variance kept), its range, and its gradient (the weights' slope included) and its
+        // change in the character against central differences. The peaks' layer, the hills' and
+        // the strata's (when the planet has them), at a 50 m footprint.
+        std::vector<FVoxelOctave> Gpu;
+        SetGpuGlobals(P, Gpu);
+        std::mt19937 Rng(43);
+        std::uniform_real_distribution<double> U01(0, 1);
+        const double Band = 2.0 * 3.0 / P.N;   // the blend band in face coordinates (VOXEL_LAND_PEAK_BAND_CELLS)
+        struct FNamed { const char* Name; FVoxelLandSetLayer L; bool bOn; };
+        const FNamed Layers[3] = {
+            { "peaks", VoxelLandPeakLayer(0.0f), P.S.LandPeakTexelsPerCell > 0.0f },
+            { "hills", VoxelLandHillLayer(0.0f), P.S.LandHillTexelsPerCell > 0.0f },
+            { "strata", VoxelLandStrataLayer(0.0f), P.S.LandStrataTexelsPerCell > 0.0f } };
+        for (const FNamed& NL : Layers)
+        {
+            if (!NL.bOn) continue;
+            const float C0 = 0.5f;
+            const float MeanU = std::lerp((NL.L.BlendMeanG - NL.L.MeanG) * NL.L.ScaleG, (NL.L.BlendMeanR - NL.L.MeanR) * NL.L.ScaleR, C0);
+            double Sq[3] = {}, Lo[3] = { 1e9, 1e9, 1e9 }, Hi[3] = { -1e9, -1e9, -1e9 };
+            std::vector<double> GErr, CErr;
+            const int Count = 6000;
+            for (int i = 0; i < Count; i++)
+                for (int k = 0; k < 3; k++)
+                {
+                    // k 0 inside a face, 1 on an edge (x = y, inside the band), 2 at a corner.
+                    double D[3];
+                    const double T1 = std::tan((1.0 + (U01(Rng) - 0.5) * Band) * M_PI / 4.0), T2 = std::tan((1.0 + (U01(Rng) - 0.5) * Band) * M_PI / 4.0);
+                    if (k == 0) { D[0] = 1.0; D[1] = U01(Rng) * 1.2 - 0.6; D[2] = U01(Rng) * 1.2 - 0.6; }
+                    else if (k == 1) { D[0] = 1.0; D[1] = T1; D[2] = U01(Rng) * 1.2 - 0.6; }
+                    else { D[0] = 1.0; D[1] = T1; D[2] = T2; }
+                    Normalize(D);
+                    auto At = [&](const double* Dir, float Ch) {
+                        return VoxelLandSetLayerDF(NL.L, DF(Dir[0] * P.SeaRadius), DF(Dir[1] * P.SeaRadius), DF(Dir[2] * P.SeaRadius), Ch,
+                            float3(0.0f, 0.0f, 0.0f), 1.0f, 1000.0f, 5000.0f, true);
+                    };
+                    const FVoxelLandPeaks L0 = At(D, C0);
+                    const double Dev = (double)L0.Unit - MeanU;
+                    Sq[k] += Dev * Dev; Lo[k] = std::min(Lo[k], (double)L0.Unit); Hi[k] = std::max(Hi[k], (double)L0.Unit);
+                    if (k == 0 || i % 4 != 0) continue;
+                    double E1[3], E2[3]; Frame(D, E1, E2);
+                    double Err2 = 0, Mag2 = 0;
+                    for (int e = 0; e < 2; e++)
+                    {
+                        const double* Ev = e == 0 ? E1 : E2;
+                        const double StepM = 0.5;
+                        double A[3], B[3];
+                        for (int a = 0; a < 3; a++) { A[a] = D[a] + StepM * 100.0 / P.SeaRadius * Ev[a]; B[a] = D[a] - StepM * 100.0 / P.SeaRadius * Ev[a]; }
+                        Normalize(A); Normalize(B);
+                        const double Num = ((double)At(A, C0).Unit - At(B, C0).Unit) / (2 * StepM);
+                        const double Ana = L0.Gradient.x * Ev[0] + L0.Gradient.y * Ev[1] + L0.Gradient.z * Ev[2];
+                        Err2 += (Num - Ana) * (Num - Ana); Mag2 += Num * Num;
+                    }
+                    GErr.push_back(std::sqrt(Err2) / std::max(std::sqrt(Mag2), 1e-6));
+                    // The character's change: a unit character gradient along E1 makes the gradient
+                    // along E1 grow by dUnit/dC.
+                    const FVoxelLandPeaks LC = VoxelLandSetLayerDF(NL.L, DF(D[0] * P.SeaRadius), DF(D[1] * P.SeaRadius), DF(D[2] * P.SeaRadius), C0,
+                        float3((float)E1[0], (float)E1[1], (float)E1[2]), 1.0f, 1000.0f, 5000.0f, true);
+                    const double SlopeAna = (LC.Gradient.x - L0.Gradient.x) * E1[0] + (LC.Gradient.y - L0.Gradient.y) * E1[1] + (LC.Gradient.z - L0.Gradient.z) * E1[2];
+                    const double SlopeNum = ((double)At(D, C0 + 0.01f).Unit - At(D, C0 - 0.01f).Unit) / 0.02;
+                    CErr.push_back(std::fabs(SlopeAna - SlopeNum) / std::max(std::fabs(SlopeNum), 1e-3));
+                }
+            std::sort(GErr.begin(), GErr.end()); std::sort(CErr.begin(), CErr.end());
+            auto Q = [](const std::vector<double>& V, double q) { return V.empty() ? -1.0 : V[std::min((size_t)(q * V.size()), V.size() - 1)]; };
+            printf("%s (mean %.4f): unit RMS about the mean inside faces %.4f, on edges %.4f, at corners %.4f; range inside %.3f..%.3f, edges %.3f..%.3f, corners %.3f..%.3f;"
+                " gradient in the band vs FD relative p50 %.4f p99 %.4f; character slope relative p50 %.4f p99 %.4f\n",
+                NL.Name, MeanU, std::sqrt(Sq[0] / Count), std::sqrt(Sq[1] / Count), std::sqrt(Sq[2] / Count), Lo[0], Hi[0], Lo[1], Hi[1], Lo[2], Hi[2],
+                Q(GErr, 0.5), Q(GErr, 0.99), Q(CErr, 0.5), Q(CErr, 0.99));
+        }
+    }
     else if (Mode == "cgrad")
     {
         // The peaks' analytic gradient against central differences of PeakUnit (the real,
@@ -1711,33 +2159,74 @@ int main(int argc, char** argv)
     }
     else if (Mode == "dgrad")
     {
-        // The detail layer's exact gradient (VoxelLayerSumDampedExactDF) against central
-        // differences of its sum, at steps of 20 and 10 cm (Richardson-extrapolated).
+        // N1: the detail layer's gradient (VoxelLandDetailDF: the detail set's B-splines, the face
+        // blend's weights) against central differences of its unit, at steps of 1 m and 50 cm
+        // (Richardson-extrapolated; finer steps measure the float unit's round-off, about 1e-6:
+        // DSTEP sets the smaller), at footprints from the finest cell to 100 m, anywhere, face
+        // edges included (every tenth point put within the blend band of an edge). DSCALES: the
+        // scales.
         std::vector<FVoxelOctave> Gpu;
         SetGpuGlobals(P, Gpu);
         std::mt19937 Rng(29);
         std::normal_distribution<double> G;
-        std::vector<double> Rel;
-        const uint First = ContinentOctaves + MountainOctaves;
-        for (int i = 0; i < 3000; i++)
+        std::uniform_real_distribution<double> U01(0, 1);
+        const double StepM = getenv("DSTEP") ? atof(getenv("DSTEP")) : 0.5;
+        if (getenv("DSCALES")) VoxelShader::LandDetailScales = (uint)atoi(getenv("DSCALES"));
         {
-            double D[3] = { G(Rng), G(Rng), G(Rng) }; Normalize(D);
-            double E1[3], E2[3]; Frame(D, E1, E2);
-            auto Sum = [&](double M) {
-                double Q[3]; for (int a = 0; a < 3; a++) Q[a] = D[a] * P.SeaRadius + E1[a] * M;
-                const FVoxelLayerSum L = VoxelLayerSumDampedExactDF(First, DetailOctaves, DF(Q[0]), DF(Q[1]), DF(Q[2]), (float)P.Finest);
-                return (double)L.Sum.x + L.Sum.y;
-            };
-            const FVoxelLayerSum L0 = VoxelLayerSumDampedExactDF(First, DetailOctaves, DF(D[0] * P.SeaRadius), DF(D[1] * P.SeaRadius), DF(D[2] * P.SeaRadius), (float)P.Finest);
-            const double F4 = (Sum(20) - Sum(-20)) / 40, F2 = (Sum(10) - Sum(-10)) / 20;
-            const double Fd = (4 * F2 - F4) / 3;
-            const double An = L0.Gradient.x * E1[0] + L0.Gradient.y * E1[1] + L0.Gradient.z * E1[2];
-            const double Ref = VoxelLayerSumDF(First, DetailOctaves, VoxelLayerDamped, DF(D[0] * P.SeaRadius), DF(D[1] * P.SeaRadius), DF(D[2] * P.SeaRadius), (float)P.Finest).x;
-            if (i < 3) printf("  sum %.9g (plain path %.9g), gradient analytic %.6g FD %.6g (20 cm %.6g)\n", (double)L0.Sum.x, Ref, An, Fd, F4);
-            Rel.push_back(std::fabs(An - Fd) / std::max(std::fabs(Fd), 1e-9));
+            // The face blend keeps the variance: the unit's RMS on cube edges (x = y, the middle of
+            // the blend band), at corners, and inside faces, at a 100 m footprint.
+            std::uniform_real_distribution<double> U01b(0, 1);
+            double Sq[3] = {}; const int Count = 20000;
+            for (int i = 0; i < Count; i++)
+                for (int k = 0; k < 3; k++)
+                {
+                    double D[3];
+                    if (k == 0) { D[0] = 1.0; D[1] = 1.0; D[2] = U01b(Rng) * 1.6 - 0.8; }
+                    else if (k == 1) { D[0] = 1.0; D[1] = 1.0 + (U01b(Rng) - 0.5) * 0.004; D[2] = 1.0 + (U01b(Rng) - 0.5) * 0.004; }
+                    else { D[0] = 1.0; D[1] = U01b(Rng) * 1.4 - 0.7; D[2] = U01b(Rng) * 1.4 - 0.7; }
+                    Normalize(D);
+                    const double U = VoxelLandDetailDF(DF(D[0] * P.SeaRadius), DF(D[1] * P.SeaRadius), DF(D[2] * P.SeaRadius), 10000.0f, false).Unit;
+                    Sq[k] += U * U;
+                }
+            printf("detail unit RMS: on cube edges %.4f, at corners %.4f, inside faces %.4f\n", std::sqrt(Sq[0] / Count), std::sqrt(Sq[1] / Count), std::sqrt(Sq[2] / Count));
         }
-        std::sort(Rel.begin(), Rel.end());
-        printf("detail layer gradient relative error: median %.2g p90 %.2g p99 %.2g\n", Rel[Rel.size() / 2], Rel[Rel.size() * 9 / 10], Rel[Rel.size() * 99 / 100]);
+        for (double F : { P.Finest, 100.0, 1000.0, 10000.0 })
+        {
+            std::vector<double> Rel, Abs, Slope;
+            for (int i = 0; i < 4000; i++)
+            {
+                double D[3] = { G(Rng), G(Rng), G(Rng) }; Normalize(D);
+                if (i % 10 == 0)
+                {
+                    // Near a face edge: x = y on the +z face side (both within the blend).
+                    const double T = 1.0 + (U01(Rng) - 0.5) * 4.0 * 3.0 / P.N;
+                    D[0] = T; D[1] = 1.0; D[2] = 0.5 + U01(Rng) * 0.4; Normalize(D);
+                }
+                double E1[3], E2[3]; Frame(D, E1, E2);
+                auto Unit = [&](const double* E, double M) {
+                    double Q[3]; for (int a = 0; a < 3; a++) Q[a] = D[a] * P.SeaRadius + E[a] * M * 100.0;
+                    return (double)VoxelLandDetailDF(DF(Q[0]), DF(Q[1]), DF(Q[2]), (float)F, false).Unit;
+                };
+                const FVoxelLandDetail L0 = VoxelLandDetailDF(DF(D[0] * P.SeaRadius), DF(D[1] * P.SeaRadius), DF(D[2] * P.SeaRadius), (float)F, true);
+                double Err = 0, Mag = 0;
+                for (int k = 0; k < 2; k++)
+                {
+                    const double* E = k == 0 ? E1 : E2;
+                    const double F2 = (Unit(E, 2 * StepM) - Unit(E, -2 * StepM)) / (4 * StepM), F1 = (Unit(E, StepM) - Unit(E, -StepM)) / (2 * StepM);
+                    const double Fd = (4 * F1 - F2) / 3;
+                    const double An = L0.Gradient.x * E[0] + L0.Gradient.y * E[1] + L0.Gradient.z * E[2];
+                    Err += (An - Fd) * (An - Fd); Mag += Fd * Fd;
+                }
+                Abs.push_back(std::sqrt(Err));
+                Rel.push_back(std::sqrt(Err) / std::max(std::sqrt(Mag), 1e-9));
+                Slope.push_back(std::sqrt(Mag) * P.DetailAmp * 0.01);
+            }
+            for (auto* V : { &Rel, &Abs, &Slope }) std::sort(V->begin(), V->end());
+            auto Q = [](const std::vector<double>& V, double q) { return V[std::min((size_t)(q * V.size()), V.size() - 1)]; };
+            printf("detail layer gradient at a %.2f m footprint: relative error median %.2g p90 %.2g p99 %.2g; absolute (per m of unit) p99 %.2g, as a normal at %.0f m amplitude %.3f deg; its slope there median %.3f p99 %.3f\n",
+                F * 0.01, Q(Rel, 0.5), Q(Rel, 0.9), Q(Rel, 0.99), Q(Abs, 0.99), P.DetailAmp * 0.01, std::atan(Q(Abs, 0.99) * P.DetailAmp * 0.01) * 57.2957795,
+                Q(Slope, 0.5), Q(Slope, 0.99));
+        }
     }
     else if (Mode == "agree")
     {

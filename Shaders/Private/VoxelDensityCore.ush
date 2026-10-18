@@ -161,8 +161,9 @@ VOXEL_FUNC FVoxelNoiseSample VoxelGradientNoise(uint3 Cell, float3 F, uint Seed)
 }
 
 // VoxelGradientNoise with its Hessian too (lattice units; symmetric, as rows HX, HY, HZ), for
-// exact gradients of slope-damped layers (the terrain material's detail normal). Value and
-// Gradient are computed as VoxelGradientNoise computes them.
+// exact gradients of slope-damped layers (the land's detail normal until N1, which moved the
+// detail to the detail sets: no caller now). Value and Gradient are computed as
+// VoxelGradientNoise computes them.
 struct FVoxelNoiseSample2
 {
     float Value;

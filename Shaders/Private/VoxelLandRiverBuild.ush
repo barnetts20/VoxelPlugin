@@ -1,0 +1,972 @@
+// VoxelLandRiverBuild.ush - The rivers of a land bake, made on the GPU from the final routing
+// (Design/RiversLakes.md, R1b): the network as segments with a floor, a drainage area and a place
+// along their chain, and the per-tile lists the per-sample lookup reads (VoxelLandRivers.ush,
+// VoxelLandRiverLayout.ush). VoxelLandRiverBuild.usf declares the inputs and the entry points
+// (with the scans); VoxelLandRiverBuild.cpp records the passes, either at the end of a fresh
+// bake's solve (on its own buffers) or for a loaded bake (on its GPU copy); the C++ harness runs
+// the same functions in sequence.
+//
+// Shared subset (VoxelShaderCompat.h): included inside a struct whose members carry the names
+// below, so no static data (constants are #defines). Include after VoxelDF64.ush and
+// VoxelCubeSphere.ush.
+//
+// The network (as R1 extracted it on the CPU):
+//   - River cells: interior land cells (with a receiver) outside the kept lakes, draining at least
+//     RiverMinLog2, and every land cell downstream of one.
+//   - Nodes, compacted in cell order: each river cell; a terminal at every non-river cell a river
+//     drains into (a lake inlet at its level, or a mouth at the sea, at most sea level); a start at
+//     every lake cell that drains out of its lake into a river (the outlets, at the lake's level).
+//   - Floors: the bake's height, carved so no node lies above anything upstream of it (the
+//     upstream minimum: pointer jumping, an atomic minimum pushed 2^k nodes down in round k); a
+//     lake inlet keeps its level.
+//   - Chains: runs between sources, confluences, lake inlets and outlets and the sea (a node with
+//     one node above continues its chain). The inner nodes smoothed (1-2-1 with the chain's
+//     neighbours, 4 iterations, the ends fixed); each node's place along its chain (pointer
+//     jumping up the chain) and the chain's length (down it).
+//   - Trunks (N1b): each node's main donor (the node above it draining the most, the lowest index
+//     on a tie), and the source at the top of its line of main donors (pointer jumping, in place):
+//     a river's key through its confluences, so the carve tells a tributary's valley from the
+//     main stem's continuing one.
+//   - Segments: from each kept node to the next kept one. Every node with an even place in its
+//     chain is kept, and every end; an odd one only where leaving it out would move the line more
+//     than RiverSimplifyCells, its floor more than RiverSimplifyFloorM or RiverSimplifyFloorShare
+//     of the drop, or its drainage more than RiverSimplifyLog2Area (R1's Douglas-Peucker
+//     tolerances; 1.2-1.3 nodes a segment on the test bakes).
+//   - Tiles: VOXEL_LAND_RIVER_TILE_CELLS square on a face. A segment is listed in every tile its
+//     corridor's box reaches: the box of its ends in the face's equal-angle cell coordinates
+//     (extended past the face edge), widened by the corridor (RiverReachScale x the valley's
+//     half-width) through the grid's metric there, and RiverMarginCells. Each tile's list sorted
+//     largest first (then by segment), at most VOXEL_LAND_RIVER_MAX_PER_TILE.
+//
+// Every pass is deterministic: atomics only count, take minima and maxima, or fill lists the
+// sort then orders; the jumps' sums are fixed trees. (One plain write races: NodePred, read only
+// where a node has exactly one node above it, so one writer.) What two passes must agree on is
+// decided once and stored (the kept bit; each tile's slots), so no two compilations of the same
+// expression can disagree.
+//
+// Inputs (declared by the includer):
+//   uint RiverN, RiverPad;  float RiverRadiusM;  StructuredBuffer<float2> RiverTan;   the bake's
+//                                            grid and tan table (Side entries from -Pad)
+//   StructuredBuffer<float> RiverHeight;     per cell (m)
+//   StructuredBuffer<float> RiverWater;      the kept lake's level, or below -1e30
+//   StructuredBuffer<uint> RiverFlow;        log2 drainage (m^2) as halves, two cells a word
+//   StructuredBuffer<uint> RiverRec;         the final routing's receiver, or ~0
+//   float RiverMinLog2;                      log2 of RiverMinArea (m^2)
+//   float RiverWidthScale, RiverValleyScale, RiverReachScale, RiverMarginCells;
+//   float RiverSimplifyCells, RiverSimplifyFloorM, RiverSimplifyFloorShare, RiverSimplifyLog2Area;
+//   uint RiverTilesPerFace;
+//   uint RiverNodeCap, RiverSegCap, RiverCandCap, RiverDataCap;   the buffers' sizes
+//   RWStructuredBuffer<uint> RiverCounts;    VOXEL_RIVER_COUNT_* (the scans write their totals)
+//   RWStructuredBuffer<uint> RiverCellFlags, RiverCellNode;       per cell
+//   RWStructuredBuffer<uint> NodeCell, NodeDown, NodePred, NodeUp, NodeKind, NodeFloor, NodeArea, NodeSeg;
+//   RWStructuredBuffer<float> NodePos, NodePosOut;               4 floats a node (current, next)
+//   RWStructuredBuffer<uint> NodeJumpIn, NodeJumpOut;            pointer jumping (double-buffered)
+//   RWStructuredBuffer<float> NodeSIn, NodeSOut, NodeEndIn, NodeEndOut;
+//   RWStructuredBuffer<uint> NodeIdxIn, NodeIdxOut;              (the segment phase: NodeIdxOut holds
+//                                            each node's kept bit, decided once)
+//   RWStructuredBuffer<uint> SegNode, SegEnd;                    per segment: its nodes
+//   RWStructuredBuffer<uint> TileStart, TileFill, TileBlock, TileCand;
+//   RWStructuredBuffer<uint> RiverTiles;  RWStructuredBuffer<float> RiverData;   the tables
+
+#ifndef VOXEL_LAND_RIVER_BUILD_USH
+#define VOXEL_LAND_RIVER_BUILD_USH
+
+#include "VoxelLandRiverLayout.ush"
+
+#ifndef VOXEL_LOOP
+#define VOXEL_LOOP [loop]
+#endif
+
+#define VOXEL_RIVER_NONE 0xffffffffu
+
+// RiverCellFlags.
+#define VOXEL_RIVER_CELL_SEED 1u        // drains RiverMinLog2 itself
+#define VOXEL_RIVER_CELL_RIVER 2u       // a seed or below one
+#define VOXEL_RIVER_CELL_TERMINAL 4u    // not a river; a river drains into it
+#define VOXEL_RIVER_CELL_OUTLET 8u      // a lake cell draining out into a river
+
+// NodeKind.
+#define VOXEL_RIVER_KIND_RIVER 0u
+#define VOXEL_RIVER_KIND_MOUTH 1u
+#define VOXEL_RIVER_KIND_INLET 2u
+#define VOXEL_RIVER_KIND_OUTLET 3u
+
+// RiverCounts (keep equal to VoxelLandRiverBuild.h).
+#define VOXEL_RIVER_COUNT_NODES 0u           // the node scan's total
+#define VOXEL_RIVER_COUNT_SEGMENTS 1u        // the segment scan's
+#define VOXEL_RIVER_COUNT_CANDIDATES 2u      // the tiles' uncapped lists
+#define VOXEL_RIVER_COUNT_BLOCKS 3u          // the tile blocks' floats
+#define VOXEL_RIVER_COUNT_ERRORS 4u          // VOXEL_RIVER_ERROR_*
+#define VOXEL_RIVER_COUNT_RIVER_CELLS 5u
+#define VOXEL_RIVER_COUNT_CHAINS 6u
+#define VOXEL_RIVER_COUNT_SOURCES 7u
+#define VOXEL_RIVER_COUNT_CONFLUENCES 8u
+#define VOXEL_RIVER_COUNT_MOUTHS 9u
+#define VOXEL_RIVER_COUNT_INLETS 10u
+#define VOXEL_RIVER_COUNT_OUTLETS 11u
+#define VOXEL_RIVER_COUNT_LENGTH_DAM 12u     // the segments' lengths, decametres
+#define VOXEL_RIVER_COUNT_TILES_USED 13u
+#define VOXEL_RIVER_COUNT_MAX_IN_TILE 14u    // before the cap
+#define VOXEL_RIVER_COUNT_DROPPED 15u        // entries past the cap
+#define VOXEL_RIVER_COUNT_ENTRIES 16u
+#define VOXEL_RIVER_COUNTS 32u
+
+#define VOXEL_RIVER_ERROR_JUMP 1u            // a path longer than the jumps reach
+
+#define VOXEL_RIVER_JUMP_ROUNDS 20           // paths up to 2^20 nodes
+#define VOXEL_RIVER_SMOOTH_ITERATIONS 4
+
+// --- Grid ----------------------------------------------------------------------------------
+
+VOXEL_FUNC uint VoxelRiverSide()
+{
+    return RiverN + 2u * RiverPad;
+}
+
+VOXEL_FUNC uint VoxelRiverNumCells()
+{
+    const uint Side = VoxelRiverSide();
+    return 6u * Side * Side;
+}
+
+VOXEL_FUNC uint VoxelRiverTileCount()
+{
+    return 6u * RiverTilesPerFace * RiverTilesPerFace;
+}
+
+struct FVoxelRiverCell
+{
+    uint Face;
+    int I;
+    int J;
+};
+
+VOXEL_FUNC FVoxelRiverCell VoxelRiverDecode(uint Cell)
+{
+    const uint Side = VoxelRiverSide();
+    FVoxelRiverCell C;
+    C.Face = Cell / (Side * Side);
+    const uint Rest = Cell - C.Face * Side * Side;
+    C.J = int(Rest / Side) - int(RiverPad);
+    C.I = int(Rest - (Rest / Side) * Side) - int(RiverPad);
+    return C;
+}
+
+VOXEL_FUNC bool VoxelRiverIsInterior(uint Cell)
+{
+    const FVoxelRiverCell C = VoxelRiverDecode(Cell);
+    return C.I >= 0 && C.J >= 0 && C.I < int(RiverN) && C.J < int(RiverN);
+}
+
+/** A cell centre's unit direction (the tan table, as the solve's). */
+VOXEL_FUNC float3 VoxelRiverCellDirection(uint Cell)
+{
+    const FVoxelRiverCell C = VoxelRiverDecode(Cell);
+    const float A = RiverTan[uint(C.I + int(RiverPad))].x;
+    const float B = RiverTan[uint(C.J + int(RiverPad))].x;
+    const float3 N = VoxelCubeAxisVector(VoxelCubeNormalAxis(C.Face)) * VoxelCubeNormalSign(C.Face);
+    return normalize(N + VoxelCubeAxisVector(VoxelCubeUAxis(C.Face)) * A + VoxelCubeAxisVector(VoxelCubeVAxis(C.Face)) * B);
+}
+
+VOXEL_FUNC float VoxelRiverFlow(uint Cell)
+{
+    return f16tof32((RiverFlow[Cell >> 1u] >> ((Cell & 1u) * 16u)) & 0xffffu);
+}
+
+VOXEL_FUNC bool VoxelRiverIsLake(uint Cell)
+{
+    return RiverWater[Cell] > -1.0e30f;
+}
+
+/** A routed land cell (its receiver another cell). */
+VOXEL_FUNC bool VoxelRiverIsLand(uint Cell)
+{
+    const uint R = RiverRec[Cell];
+    return R != VOXEL_RIVER_NONE && R < VoxelRiverNumCells() && R != Cell;
+}
+
+/** A float as a uint in the same order (for the atomic minimum). */
+VOXEL_FUNC uint VoxelRiverFloorKey(float F)
+{
+    const uint U = asuint(F);
+    return (U & 0x80000000u) != 0u ? ~U : (U | 0x80000000u);
+}
+
+VOXEL_FUNC float VoxelRiverFloorOf(uint Key)
+{
+    return asfloat((Key & 0x80000000u) != 0u ? (Key & 0x7fffffffu) : ~Key);
+}
+
+// --- Nodes ---------------------------------------------------------------------------------
+
+VOXEL_FUNC uint VoxelRiverNodes()
+{
+    return min(RiverCounts[VOXEL_RIVER_COUNT_NODES], RiverNodeCap);
+}
+
+VOXEL_FUNC uint VoxelRiverSegments()
+{
+    return min(RiverCounts[VOXEL_RIVER_COUNT_SEGMENTS], RiverSegCap);
+}
+
+VOXEL_FUNC float3 VoxelRiverPos(uint Node)
+{
+    const uint B = Node * 4u;
+    return float3(NodePos[B], NodePos[B + 1u], NodePos[B + 2u]);
+}
+
+/** The chord between two nodes (m): the arc to 1e-7 at a few cells. */
+VOXEL_FUNC float VoxelRiverArc(uint A, uint B)
+{
+    return length(VoxelRiverPos(A) - VoxelRiverPos(B)) * RiverRadiusM;
+}
+
+/** Whether a node ends the chain coming into it (and so starts its own, unless it's a terminal). */
+VOXEL_FUNC bool VoxelRiverEndsChain(uint Node)
+{
+    return NodeUp[Node] != 1u || NodeDown[Node] == VOXEL_RIVER_NONE;
+}
+
+// --- Cell passes ---------------------------------------------------------------------------
+
+/** The seeds: interior routed land outside the lakes draining RiverMinLog2. */
+VOXEL_FUNC void VoxelRiverSeedPass(uint Cell)
+{
+    if (Cell >= VoxelRiverNumCells()) return;
+    const bool bSeed = VoxelRiverIsInterior(Cell) && VoxelRiverIsLand(Cell) && !VoxelRiverIsLake(Cell) && VoxelRiverFlow(Cell) >= RiverMinLog2;
+    RiverCellFlags[Cell] = bSeed ? (VOXEL_RIVER_CELL_SEED | VOXEL_RIVER_CELL_RIVER) : 0u;
+}
+
+/** Every land cell below a seed is a river too (the drainage field spreads on hillslopes, so
+ *  below the channels' threshold it isn't strictly monotone): each seed walks down to the next
+ *  seed or river cell (whoever marked that one walks on from it), a lake or the sea. The walks are
+ *  short gaps; the marks don't depend on their order. */
+VOXEL_FUNC void VoxelRiverClosurePass(uint Cell)
+{
+    if (Cell >= VoxelRiverNumCells()) return;
+    if ((RiverCellFlags[Cell] & VOXEL_RIVER_CELL_SEED) == 0u) return;
+    const uint NumCells = VoxelRiverNumCells();
+    uint Q = RiverRec[Cell];
+    VOXEL_LOOP
+    for (uint Guard = 0u; Guard < (1u << 20); Guard++)
+    {
+        if (Q >= NumCells) return;
+        if (!VoxelRiverIsLand(Q) || VoxelRiverIsLake(Q)) return;
+        uint Before = 0u;
+        InterlockedOr(RiverCellFlags[Q], VOXEL_RIVER_CELL_RIVER, Before);
+        if ((Before & (VOXEL_RIVER_CELL_SEED | VOXEL_RIVER_CELL_RIVER)) != 0u) return;
+        Q = RiverRec[Q];
+    }
+}
+
+/** The terminals (the non-river cells rivers drain into: lakes and the sea) and the outlets
+ *  (lake cells draining out into a river). */
+VOXEL_FUNC void VoxelRiverRolesPass(uint Cell)
+{
+    const uint NumCells = VoxelRiverNumCells();
+    if (Cell >= NumCells) return;
+    const uint F = RiverCellFlags[Cell];
+    if ((F & VOXEL_RIVER_CELL_RIVER) != 0u)
+    {
+        const uint Q = RiverRec[Cell];
+        if (Q < NumCells && (RiverCellFlags[Q] & VOXEL_RIVER_CELL_RIVER) == 0u)
+            InterlockedOr(RiverCellFlags[Q], VOXEL_RIVER_CELL_TERMINAL);
+        return;
+    }
+    if (VoxelRiverIsLake(Cell) && VoxelRiverIsLand(Cell))
+    {
+        const uint Q = RiverRec[Cell];
+        if (!VoxelRiverIsLake(Q) && (RiverCellFlags[Q] & VOXEL_RIVER_CELL_RIVER) != 0u)
+            InterlockedOr(RiverCellFlags[Cell], VOXEL_RIVER_CELL_OUTLET);
+    }
+}
+
+/** A cell's nodes (the scan makes them its first node's index): its river or terminal node,
+ *  then its outlet start. */
+VOXEL_FUNC void VoxelRiverNodeCountPass(uint Cell)
+{
+    if (Cell >= VoxelRiverNumCells()) return;
+    const uint F = RiverCellFlags[Cell];
+    RiverCellNode[Cell] = ((F & (VOXEL_RIVER_CELL_RIVER | VOXEL_RIVER_CELL_TERMINAL)) != 0u ? 1u : 0u) + ((F & VOXEL_RIVER_CELL_OUTLET) != 0u ? 1u : 0u);
+}
+
+VOXEL_FUNC void VoxelRiverWriteNode(uint Node, uint Cell, uint Kind, uint Down, float Floor, float Log2Area, float3 Dir)
+{
+    NodeCell[Node] = Cell;
+    NodeKind[Node] = Kind;
+    NodeDown[Node] = Down < RiverNodeCap ? Down : VOXEL_RIVER_NONE;
+    NodePred[Node] = VOXEL_RIVER_NONE;
+    NodeUp[Node] = 0u;
+    NodeFloor[Node] = VoxelRiverFloorKey(Floor);
+    NodeArea[Node] = asuint(max(Log2Area, 0.0f));
+    const uint B = Node * 4u;
+    NodePos[B] = Dir.x;
+    NodePos[B + 1u] = Dir.y;
+    NodePos[B + 2u] = Dir.z;
+    NodePos[B + 3u] = 0.0f;
+}
+
+/** Every cell's nodes (after the scan of the counts). */
+VOXEL_FUNC void VoxelRiverNodeInitPass(uint Cell)
+{
+    if (Cell >= VoxelRiverNumCells()) return;
+    const uint F = RiverCellFlags[Cell];
+    if ((F & (VOXEL_RIVER_CELL_RIVER | VOXEL_RIVER_CELL_TERMINAL | VOXEL_RIVER_CELL_OUTLET)) == 0u) return;
+    const uint Base = RiverCellNode[Cell];
+    const float3 Dir = VoxelRiverCellDirection(Cell);
+    uint Next = Base;
+    if ((F & VOXEL_RIVER_CELL_RIVER) != 0u)
+    {
+        if (Base < RiverNodeCap)
+            VoxelRiverWriteNode(Base, Cell, VOXEL_RIVER_KIND_RIVER, RiverCellNode[RiverRec[Cell]], RiverHeight[Cell], VoxelRiverFlow(Cell), Dir);
+        InterlockedAdd(RiverCounts[VOXEL_RIVER_COUNT_RIVER_CELLS], 1u);
+        Next = Base + 1u;
+    }
+    else if ((F & VOXEL_RIVER_CELL_TERMINAL) != 0u)
+    {
+        // A lake at its level; the sea at most sea level. Its drainage: the largest river into it.
+        const bool bLake = VoxelRiverIsLake(Cell);
+        if (Base < RiverNodeCap)
+            VoxelRiverWriteNode(Base, Cell, bLake ? VOXEL_RIVER_KIND_INLET : VOXEL_RIVER_KIND_MOUTH, VOXEL_RIVER_NONE,
+                bLake ? RiverWater[Cell] : min(RiverHeight[Cell], 0.0f), 0.0f, Dir);
+        InterlockedAdd(RiverCounts[bLake ? VOXEL_RIVER_COUNT_INLETS : VOXEL_RIVER_COUNT_MOUTHS], 1u);
+        Next = Base + 1u;
+    }
+    if ((F & VOXEL_RIVER_CELL_OUTLET) != 0u)
+    {
+        // Into its receiver's river node, at the lake's level, with the river's drainage.
+        const uint Q = RiverRec[Cell];
+        if (Next < RiverNodeCap)
+            VoxelRiverWriteNode(Next, Cell, VOXEL_RIVER_KIND_OUTLET, RiverCellNode[Q], RiverWater[Cell], VoxelRiverFlow(Q), Dir);
+        InterlockedAdd(RiverCounts[VOXEL_RIVER_COUNT_OUTLETS], 1u);
+    }
+}
+
+// --- Node passes ---------------------------------------------------------------------------
+
+/** Each node's count of nodes above it, the one above (meaningful when there is one), and a
+ *  terminal's drainage (the largest river into it). */
+VOXEL_FUNC void VoxelRiverNodeLinkPass(uint Node)
+{
+    if (Node >= VoxelRiverNodes()) return;
+    const uint D = NodeDown[Node];
+    if (D == VOXEL_RIVER_NONE) return;
+    InterlockedAdd(NodeUp[D], 1u);
+    NodePred[D] = Node;
+    const uint K = NodeKind[D];
+    if ((K == VOXEL_RIVER_KIND_MOUTH || K == VOXEL_RIVER_KIND_INLET) && NodeKind[Node] == VOXEL_RIVER_KIND_RIVER)
+        InterlockedMax(NodeArea[D], NodeArea[Node]);
+}
+
+/** One smoothing iteration (NodePos into NodePosOut): a chain's inner nodes (one above, one
+ *  below) 1-2-1 with their neighbours, the rest fixed. */
+VOXEL_FUNC void VoxelRiverSmoothPass(uint Node)
+{
+    if (Node >= VoxelRiverNodes()) return;
+    const float3 P = VoxelRiverPos(Node);
+    float3 Out = P;
+    if (NodeKind[Node] == VOXEL_RIVER_KIND_RIVER && NodeUp[Node] == 1u && NodeDown[Node] != VOXEL_RIVER_NONE)
+        Out = normalize(VoxelRiverPos(NodePred[Node]) * 0.25f + P * 0.5f + VoxelRiverPos(NodeDown[Node]) * 0.25f);
+    const uint B = Node * 4u;
+    NodePosOut[B] = Out.x;
+    NodePosOut[B + 1u] = Out.y;
+    NodePosOut[B + 2u] = Out.z;
+    NodePosOut[B + 3u] = 0.0f;
+}
+
+/** The floors' jumps: to the node below, but not into a lake (an inlet keeps its level). */
+VOXEL_FUNC void VoxelRiverFloorInitPass(uint Node)
+{
+    if (Node >= VoxelRiverNodes()) return;
+    const uint D = NodeDown[Node];
+    NodeJumpOut[Node] = D != VOXEL_RIVER_NONE && NodeKind[D] != VOXEL_RIVER_KIND_INLET ? D : VOXEL_RIVER_NONE;
+}
+
+/** Round k of the floors: each node's floor (the minimum over 2^k nodes above it, by the earlier
+ *  rounds) lowers the node 2^k below. After the rounds a node's floor is the lowest of everything
+ *  upstream (in place: a value read early or late is still one of them, so the result is exact). */
+VOXEL_FUNC void VoxelRiverFloorPushPass(uint Node)
+{
+    if (Node >= VoxelRiverNodes()) return;
+    const uint J = NodeJumpIn[Node];
+    if (J != VOXEL_RIVER_NONE)
+        InterlockedMin(NodeFloor[J], NodeFloor[Node]);
+}
+
+/** The jumps doubled (NodeJumpIn into NodeJumpOut). */
+VOXEL_FUNC void VoxelRiverJumpPass(uint Node)
+{
+    if (Node >= VoxelRiverNodes()) return;
+    const uint J = NodeJumpIn[Node];
+    NodeJumpOut[Node] = J != VOXEL_RIVER_NONE ? NodeJumpIn[J] : VOXEL_RIVER_NONE;
+}
+
+/** A river's meander wavelength (m) at a log2 drainage area: 11 channel widths
+ *  (VoxelLandRiverWidth; Earth's are 10 to 14). */
+VOXEL_FUNC float VoxelRiverMeanderWavelength(float Log2Area)
+{
+    return 11.0f * RiverWidthScale * 2.35f * exp2(0.4f * Log2Area - 7.97262743f);
+}
+
+/** The places along the chains: each node's arc from the one above it in its chain (none at a
+ *  chain's start), summed up the chain by the jumps, with the count of nodes (its place). The S
+ *  buffers' second halves (from RiverNodeCap) sum the meanders' phase the same way: the arc over
+ *  the wavelength at the two nodes' mean drainage (R3). */
+VOXEL_FUNC void VoxelRiverChainInitPass(uint Node)
+{
+    if (Node >= VoxelRiverNodes()) return;
+    const uint P = NodeUp[Node] == 1u ? NodePred[Node] : VOXEL_RIVER_NONE;
+    const float Arc = P != VOXEL_RIVER_NONE ? VoxelRiverArc(P, Node) : 0.0f;
+    NodeSOut[Node] = Arc;
+    NodeSOut[RiverNodeCap + Node] = P != VOXEL_RIVER_NONE
+        ? Arc / VoxelRiverMeanderWavelength(0.5f * (asfloat(NodeArea[P]) + asfloat(NodeArea[Node]))) : 0.0f;
+    NodeIdxOut[Node] = P != VOXEL_RIVER_NONE ? 1u : 0u;
+    NodeJumpOut[Node] = P;
+}
+
+VOXEL_FUNC void VoxelRiverChainJumpPass(uint Node)
+{
+    if (Node >= VoxelRiverNodes()) return;
+    const uint P = NodeJumpIn[Node];
+    if (P == VOXEL_RIVER_NONE)
+    {
+        NodeSOut[Node] = NodeSIn[Node];
+        NodeSOut[RiverNodeCap + Node] = NodeSIn[RiverNodeCap + Node];
+        NodeIdxOut[Node] = NodeIdxIn[Node];
+        NodeJumpOut[Node] = VOXEL_RIVER_NONE;
+        return;
+    }
+    NodeSOut[Node] = NodeSIn[Node] + NodeSIn[P];
+    NodeSOut[RiverNodeCap + Node] = NodeSIn[RiverNodeCap + Node] + NodeSIn[RiverNodeCap + P];
+    NodeIdxOut[Node] = NodeIdxIn[Node] + NodeIdxIn[P];
+    NodeJumpOut[Node] = NodeJumpIn[P];
+}
+
+/** The chains' lengths: the last node before a chain's end knows it (its place plus the arc to
+ *  the end); the others take it from below by the jumps. NodeSIn: the places. */
+VOXEL_FUNC void VoxelRiverEndInitPass(uint Node)
+{
+    if (Node >= VoxelRiverNodes()) return;
+    const uint D = NodeDown[Node];
+    if (D == VOXEL_RIVER_NONE)
+    {
+        NodeEndOut[Node] = NodeSIn[Node];
+        NodeJumpOut[Node] = VOXEL_RIVER_NONE;
+    }
+    else if (VoxelRiverEndsChain(D))
+    {
+        NodeEndOut[Node] = NodeSIn[Node] + VoxelRiverArc(Node, D);
+        NodeJumpOut[Node] = VOXEL_RIVER_NONE;
+    }
+    else
+    {
+        NodeEndOut[Node] = 0.0f;
+        NodeJumpOut[Node] = D;
+    }
+}
+
+VOXEL_FUNC void VoxelRiverEndJumpPass(uint Node)
+{
+    if (Node >= VoxelRiverNodes()) return;
+    const uint J = NodeJumpIn[Node];
+    if (J == VOXEL_RIVER_NONE)
+    {
+        NodeEndOut[Node] = NodeEndIn[Node];
+        NodeJumpOut[Node] = VOXEL_RIVER_NONE;
+        return;
+    }
+    NodeEndOut[Node] = NodeEndIn[J];
+    NodeJumpOut[Node] = NodeJumpIn[J];
+}
+
+/** The trunks (N1b): NodeJumpOut the largest drainage among a node's donors, NodeJumpIn its main
+ *  donor, then the source at the top of its main donors' line (the trunk's key). The jump buffers
+ *  are free after the chains' lengths. Cleared first. */
+VOXEL_FUNC void VoxelRiverTrunkClearPass(uint Node)
+{
+    if (Node >= VoxelRiverNodes()) return;
+    NodeJumpOut[Node] = 0u;
+    NodeJumpIn[Node] = VOXEL_RIVER_NONE;
+}
+
+/** The largest drainage into each node (log2 areas as float bits: positive, so ordered as uints). */
+VOXEL_FUNC void VoxelRiverTrunkAreaPass(uint Node)
+{
+    if (Node >= VoxelRiverNodes()) return;
+    const uint D = NodeDown[Node];
+    if (D != VOXEL_RIVER_NONE)
+        InterlockedMax(NodeJumpOut[D], NodeArea[Node]);
+}
+
+/** The main donor: the lowest-indexed donor with that drainage. */
+VOXEL_FUNC void VoxelRiverTrunkMainPass(uint Node)
+{
+    if (Node >= VoxelRiverNodes()) return;
+    const uint D = NodeDown[Node];
+    if (D != VOXEL_RIVER_NONE && NodeArea[Node] == NodeJumpOut[D])
+        InterlockedMin(NodeJumpIn[D], Node);
+}
+
+/** The jump's start: the main donor, or the node itself at a source. */
+VOXEL_FUNC void VoxelRiverTrunkInitPass(uint Node)
+{
+    if (Node >= VoxelRiverNodes()) return;
+    if (NodeJumpIn[Node] == VOXEL_RIVER_NONE) NodeJumpIn[Node] = Node;
+}
+
+/** A round of the jumps, in place: a value read early or late is still on the node's line of main
+ *  donors, so after the rounds every node holds its line's top, whatever the order. */
+VOXEL_FUNC void VoxelRiverTrunkJumpPass(uint Node)
+{
+    if (Node >= VoxelRiverNodes()) return;
+    NodeJumpIn[Node] = NodeJumpIn[NodeJumpIn[Node]];
+}
+
+/** After the rounds every node's top is its own top (else the line was longer). */
+VOXEL_FUNC void VoxelRiverTrunkCheckPass(uint Node)
+{
+    if (Node >= VoxelRiverNodes()) return;
+    const uint T = NodeJumpIn[Node];
+    if (NodeJumpIn[T] != T)
+        InterlockedOr(RiverCounts[VOXEL_RIVER_COUNT_ERRORS], VOXEL_RIVER_ERROR_JUMP);
+}
+
+/** After a phase's rounds every jump has reached its end (else the path was longer). */
+VOXEL_FUNC void VoxelRiverJumpCheckPass(uint Node)
+{
+    if (Node >= VoxelRiverNodes()) return;
+    if (NodeJumpIn[Node] != VOXEL_RIVER_NONE)
+        InterlockedOr(RiverCounts[VOXEL_RIVER_COUNT_ERRORS], VOXEL_RIVER_ERROR_JUMP);
+}
+
+/** How far leaving an odd node out moves its chain, over the tolerances (above 1: kept): its
+ *  distance from the great circle through its neighbours, its floor and drainage from their
+ *  interpolation along the chain. */
+VOXEL_FUNC float VoxelRiverDeviation(uint Node)
+{
+    const uint P = NodePred[Node];
+    const uint D = NodeDown[Node];
+    const float3 A = VoxelRiverPos(P);
+    const float3 B = VoxelRiverPos(D);
+    const float3 X = VoxelRiverPos(Node);
+    const float CellRad = 1.57079632679489662f / float(RiverN);
+    const float3 Normal = cross(A, B);
+    const float NL = length(Normal);
+    float E = NL > 1.0e-12f ? abs(dot(X, Normal)) / NL : length(X - A);
+    E = E / max(RiverSimplifyCells * CellRad, 1.0e-12f);
+    const float SA = NodeSIn[P];
+    const float SX = NodeSIn[Node];
+    const float SB = SX + VoxelRiverArc(Node, D);
+    const float T = SB > SA ? (SX - SA) / (SB - SA) : 0.5f;
+    const float FA = VoxelRiverFloorOf(NodeFloor[P]);
+    const float FB = VoxelRiverFloorOf(NodeFloor[D]);
+    const float FX = VoxelRiverFloorOf(NodeFloor[Node]);
+    const float FloorTol = max(RiverSimplifyFloorM, RiverSimplifyFloorShare * abs(FB - FA));
+    E = max(E, abs(FX - lerp(FA, FB, T)) / max(FloorTol, 1.0e-3f));
+    const float LA = asfloat(NodeArea[P]);
+    const float LB = asfloat(NodeArea[D]);
+    const float LX = asfloat(NodeArea[Node]);
+    E = max(E, abs(LX - lerp(LA, LB, T)) / max(RiverSimplifyLog2Area, 1.0e-3f));
+    return E;
+}
+
+/** Whether a node bounds segments: an end, an even place in its chain, or an odd one that moves
+ *  the line too far when left out. (An odd node has one above it and one below, both kept.) */
+VOXEL_FUNC bool VoxelRiverKept(uint Node)
+{
+    if (NodeDown[Node] == VOXEL_RIVER_NONE) return true;
+    if ((NodeIdxIn[Node] & 1u) == 0u) return true;
+    return VoxelRiverDeviation(Node) > 1.0f;
+}
+
+/** Each node's kept bit (into NodeIdxOut: the segment pass reads it, not the test again), and a
+ *  segment at every kept node with a node below (the scan makes it the index; every node up to
+ *  the capacity writes, so the scan covers them). */
+VOXEL_FUNC void VoxelRiverSegCountPass(uint Node)
+{
+    if (Node >= RiverNodeCap) return;
+    const bool bNode = Node < VoxelRiverNodes();
+    const bool bKept = bNode && VoxelRiverKept(Node);
+    if (bNode) NodeIdxOut[Node] = bKept ? 1u : 0u;
+    NodeSeg[Node] = bKept && NodeDown[Node] != VOXEL_RIVER_NONE ? 1u : 0u;
+}
+
+/** The kept node before a kept node in its chain (the one above it, or the one above that when an
+ *  odd one was left out), or none at a chain's start. */
+VOXEL_FUNC uint VoxelRiverKeptAbove(uint Node)
+{
+    if (NodeUp[Node] != 1u) return VOXEL_RIVER_NONE;
+    const uint P1 = NodePred[Node];
+    if (P1 == VOXEL_RIVER_NONE || NodeIdxOut[P1] != 0u) return P1;
+    return NodeUp[P1] == 1u ? NodePred[P1] : VOXEL_RIVER_NONE;
+}
+
+/** The arc (m) from a kept node to the next kept one below it (through a left-out odd one). */
+VOXEL_FUNC float VoxelRiverKeptArc(uint Node, uint E)
+{
+    const uint D1 = NodeDown[Node];
+    return D1 == E ? VoxelRiverArc(Node, E) : VoxelRiverArc(Node, D1) + VoxelRiverArc(D1, E);
+}
+
+/** The turn (rad, positive to the left looking downstream) at node X from A -> X to X -> B, in
+ *  X's tangent plane. */
+VOXEL_FUNC float VoxelRiverTurn(uint A, uint X, uint B)
+{
+    const float3 PX = VoxelRiverPos(X);
+    float3 In = PX - VoxelRiverPos(A);
+    float3 Out = VoxelRiverPos(B) - PX;
+    In = In - PX * dot(In, PX);
+    Out = Out - PX * dot(Out, PX);
+    return atan2(dot(cross(In, Out), PX), dot(In, Out));
+}
+
+/** Each segment: its ends, and its record (at its index x VOXEL_LAND_RIVER_SEG_FLOATS in the
+ *  data; VoxelLandRiverLayout.ush). R3 adds the turns at its ends (the joints' bisectors carry the
+ *  meanders across), its neighbours' grades in its chain (the knickpoints, the grade smoothed
+ *  along) and the meanders' phase; N1b the trunk's key (NodeJumpIn: the trunk phase's tops). */
+VOXEL_FUNC void VoxelRiverSegmentPass(uint Node)
+{
+    if (Node >= VoxelRiverNodes()) return;
+    const uint D1 = NodeDown[Node];
+    if (D1 == VOXEL_RIVER_NONE || NodeIdxOut[Node] == 0u) return;
+    const uint S = NodeSeg[Node];
+    // The next kept node: the one below, or (an odd one left out) the one below that.
+    const uint E = NodeIdxOut[D1] != 0u ? D1 : NodeDown[D1];
+    if (E == VOXEL_RIVER_NONE) return;
+    float Length = VoxelRiverArc(Node, D1);
+    if (E != D1) Length += VoxelRiverArc(D1, E);
+    const uint Up = NodeUp[Node];
+    const uint Kind = NodeKind[Node];
+    if (Up != 1u) InterlockedAdd(RiverCounts[VOXEL_RIVER_COUNT_CHAINS], 1u);
+    if (Kind == VOXEL_RIVER_KIND_RIVER && Up == 0u) InterlockedAdd(RiverCounts[VOXEL_RIVER_COUNT_SOURCES], 1u);
+    if (Up >= 2u) InterlockedAdd(RiverCounts[VOXEL_RIVER_COUNT_CONFLUENCES], 1u);
+    InterlockedAdd(RiverCounts[VOXEL_RIVER_COUNT_LENGTH_DAM], uint(Length * 0.1f + 0.5f));
+    if (S >= RiverSegCap) return;
+    SegNode[S] = Node;
+    SegEnd[S] = E;
+    const uint B = S * VOXEL_LAND_RIVER_SEG_FLOATS;
+    if (B + VOXEL_LAND_RIVER_SEG_FLOATS > RiverDataCap) return;
+    uint Flags = 0u;
+    if (NodeKind[E] == VOXEL_RIVER_KIND_MOUTH) Flags |= VOXEL_LAND_RIVER_FLAG_MOUTH;
+    if (NodeKind[E] == VOXEL_RIVER_KIND_INLET) Flags |= VOXEL_LAND_RIVER_FLAG_LAKE_INLET;
+    if (Kind == VOXEL_RIVER_KIND_OUTLET) Flags |= VOXEL_LAND_RIVER_FLAG_LAKE_OUTLET;
+    if (Kind == VOXEL_RIVER_KIND_RIVER && Up == 0u) Flags |= VOXEL_LAND_RIVER_FLAG_SOURCE;
+    // N1b: the trunk's key (its source's node index, 20 bits) above the flags: exact in a float.
+    Flags |= (NodeJumpIn[Node] & VOXEL_LAND_RIVER_TRUNK_MASK) << VOXEL_LAND_RIVER_TRUNK_SHIFT;
+    RiverData[B] = VoxelRiverFloorOf(NodeFloor[Node]);
+    RiverData[B + 1u] = VoxelRiverFloorOf(NodeFloor[E]);
+    RiverData[B + 2u] = asfloat(NodeArea[Node]);
+    RiverData[B + 3u] = asfloat(NodeArea[E]);
+    RiverData[B + 4u] = NodeSIn[Node];
+    RiverData[B + 5u] = Length;
+    RiverData[B + 6u] = NodeEndIn[Node];
+    RiverData[B + 7u] = float(Flags);
+    // R3: the chain's segments above and below (none at its ends: no turn there, and their own
+    // grade for the missing neighbour's).
+    const float F0 = RiverData[B];
+    const float F1 = RiverData[B + 1u];
+    const float Grade = max(F0 - F1, 0.0f) / max(Length, 1.0f);
+    const uint Above = VoxelRiverKeptAbove(Node);
+    const uint Below = VoxelRiverEndsChain(E) ? VOXEL_RIVER_NONE : (NodeIdxOut[NodeDown[E]] != 0u ? NodeDown[E] : NodeDown[NodeDown[E]]);
+    float GradeAbove = Grade;
+    float GradeBelow = Grade;
+    float TurnStart = 0.0f;
+    float TurnEnd = 0.0f;
+    if (Above != VOXEL_RIVER_NONE)
+    {
+        TurnStart = VoxelRiverTurn(Above, Node, E);
+        GradeAbove = max(VoxelRiverFloorOf(NodeFloor[Above]) - F0, 0.0f) / max(VoxelRiverKeptArc(Above, Node), 1.0f);
+    }
+    if (Below != VOXEL_RIVER_NONE)
+    {
+        TurnEnd = VoxelRiverTurn(Node, E, Below);
+        GradeBelow = max(F1 - VoxelRiverFloorOf(NodeFloor[Below]), 0.0f) / max(VoxelRiverKeptArc(E, Below), 1.0f);
+    }
+    RiverData[B + 8u] = TurnStart;
+    RiverData[B + 9u] = TurnEnd;
+    RiverData[B + 10u] = GradeAbove;
+    RiverData[B + 11u] = GradeBelow;
+    // The phase (cycles) at its start, its fraction (the chains' sums stay exact to 1e-4 of a
+    // cycle at thousands), and over it, as the chain init sums it (the end's own sum restarts
+    // there when it starts another chain).
+    const float Phase0 = NodeSIn[RiverNodeCap + Node];
+    RiverData[B + 12u] = Phase0 - floor(Phase0);
+    float Span = VoxelRiverArc(Node, D1) / VoxelRiverMeanderWavelength(0.5f * (asfloat(NodeArea[Node]) + asfloat(NodeArea[D1])));
+    if (E != D1) Span += VoxelRiverArc(D1, E) / VoxelRiverMeanderWavelength(0.5f * (asfloat(NodeArea[D1]) + asfloat(NodeArea[E])));
+    RiverData[B + 13u] = Span;
+}
+
+// --- Tiles ---------------------------------------------------------------------------------
+
+/** A segment's tiles on one face: the ranges (inclusive), none when Count is 0. */
+struct FVoxelRiverCover
+{
+    uint Count;
+    uint X0;
+    uint X1;
+    uint Y0;
+    uint Y1;
+};
+
+/** A segment's corridor reach (m, RiverReachM): RiverReachScale x the valley's half-width at its
+ *  larger drainage (by the belt: VoxelLandRiverValleyHalfWidth). */
+VOXEL_FUNC float VoxelRiverReachM(uint Seg)
+{
+    const uint B = Seg * VOXEL_LAND_RIVER_SEG_FLOATS;
+    const float Log2Area = max(RiverData[B + 2u], RiverData[B + 3u]);
+    const float Belt = 2.5f * sqrt(exp2(Log2Area) * 1.0e-6f);
+    return RiverReachScale * RiverValleyScale * (400.0f + 15.0f * Belt);
+}
+
+/** The tiles of a face a segment's corridor may reach: the box of its ends in the face's
+ *  equal-angle cell coordinates (extended past the edge; centres at whole numbers), widened by
+ *  the corridor through the grid's metric at each end (a ball of angular radius r spans
+ *  r sqrt(q / (1 + a^2)) / (pi / 4) in s, a = tan(pi s / 4), q = 1 + a^2 + b^2) and the margin. */
+VOXEL_FUNC FVoxelRiverCover VoxelRiverCoverOf(uint Seg, uint Face, float ReachRad)
+{
+    FVoxelRiverCover Out;
+    Out.Count = 0u;
+    Out.X0 = 0u;
+    Out.X1 = 0u;
+    Out.Y0 = 0u;
+    Out.Y1 = 0u;
+    const float3 A = VoxelRiverPos(SegNode[Seg]);
+    const float3 B = VoxelRiverPos(SegEnd[Seg]);
+    const uint NAxis = VoxelCubeNormalAxis(Face);
+    const float Sign = VoxelCubeNormalSign(Face);
+    const float AN = VoxelCubeComponent(A, NAxis) * Sign;
+    const float BN = VoxelCubeComponent(B, NAxis) * Sign;
+    // Every point of a face is within 54.74 degrees of its centre, so an end farther than that
+    // and the corridor (and a cell or two) can't reach it; nearer, its projection is sound.
+    const float MinCos = max(cos(min(0.9553f + ReachRad + 3.0f * 1.5707964f / float(RiverN), 1.48f)), 0.09f);
+    if (!(AN > MinCos) || !(BN > MinCos)) return Out;
+    const uint UA = VoxelCubeUAxis(Face);
+    const uint VA = VoxelCubeVAxis(Face);
+    const float AU = VoxelCubeComponent(A, UA) / AN;
+    const float AV = VoxelCubeComponent(A, VA) / AN;
+    const float BU = VoxelCubeComponent(B, UA) / BN;
+    const float BV = VoxelCubeComponent(B, VA) / BN;
+    const float Half = 0.5f * float(RiverN);
+    const float ToS = 1.27323954473516269f;   // 4 / pi
+    const float XA = (atan(AU) * ToS + 1.0f) * Half - 0.5f;
+    const float YA = (atan(AV) * ToS + 1.0f) * Half - 0.5f;
+    const float XB = (atan(BU) * ToS + 1.0f) * Half - 0.5f;
+    const float YB = (atan(BV) * ToS + 1.0f) * Half - 0.5f;
+    const float QA = 1.0f + AU * AU + AV * AV;
+    const float QB = 1.0f + BU * BU + BV * BV;
+    const float Scale = ReachRad * ToS * Half;
+    const float EX = max(sqrt(QA / (1.0f + AU * AU)), sqrt(QB / (1.0f + BU * BU))) * Scale + RiverMarginCells;
+    const float EY = max(sqrt(QA / (1.0f + AV * AV)), sqrt(QB / (1.0f + BV * BV))) * Scale + RiverMarginCells;
+    const float LoX = min(XA, XB) - EX;
+    const float HiX = max(XA, XB) + EX;
+    const float LoY = min(YA, YB) - EY;
+    const float HiY = max(YA, YB) + EY;
+    const float Last = float(RiverN) - 0.5f;
+    if (HiX < -0.5f || LoX > Last || HiY < -0.5f || LoY > Last) return Out;
+    const int MaxCell = int(RiverN) - 1;
+    const uint I0 = uint(clamp(int(floor(LoX + 0.5f)), 0, MaxCell));
+    const uint I1 = uint(clamp(int(floor(HiX + 0.5f)), 0, MaxCell));
+    const uint J0 = uint(clamp(int(floor(LoY + 0.5f)), 0, MaxCell));
+    const uint J1 = uint(clamp(int(floor(HiY + 0.5f)), 0, MaxCell));
+    const uint TC = uint(VOXEL_LAND_RIVER_TILE_CELLS);
+    Out.X0 = I0 / TC;
+    Out.X1 = I1 / TC;
+    Out.Y0 = J0 / TC;
+    Out.Y1 = J1 / TC;
+    Out.Count = (Out.X1 - Out.X0 + 1u) * (Out.Y1 - Out.Y0 + 1u);
+    return Out;
+}
+
+/** A tile's slots by the count's scan (TileStart: each tile's first, the total after the last). */
+VOXEL_FUNC uint VoxelRiverTileRange(uint Tile)
+{
+    const uint Next = Tile + 1u < VoxelRiverTileCount() ? TileStart[Tile + 1u] : RiverCounts[VOXEL_RIVER_COUNT_CANDIDATES];
+    return Next - TileStart[Tile];
+}
+
+/** Each segment counts itself into its tiles (TileStart, cleared; the scan makes the counts each
+ *  tile's first candidate). */
+VOXEL_FUNC void VoxelRiverCoverCountPass(uint Seg)
+{
+    if (Seg >= VoxelRiverSegments()) return;
+    if ((Seg + 1u) * VOXEL_LAND_RIVER_SEG_FLOATS > RiverDataCap) return;
+    const float ReachRad = VoxelRiverReachM(Seg) / RiverRadiusM;
+    const uint T = RiverTilesPerFace;
+    for (uint Face = 0u; Face < 6u; Face++)
+    {
+        const FVoxelRiverCover C = VoxelRiverCoverOf(Seg, Face, ReachRad);
+        if (C.Count == 0u) continue;
+        VOXEL_LOOP
+        for (uint TY = C.Y0; TY <= C.Y1; TY++)
+            for (uint TX = C.X0; TX <= C.X1; TX++)
+                InterlockedAdd(TileStart[(Face * T + TY) * T + TX], 1u);
+    }
+}
+
+/** And writes itself into them (TileFill cleared: the tile's slots taken so far). */
+VOXEL_FUNC void VoxelRiverCoverFillPass(uint Seg)
+{
+    if (Seg >= VoxelRiverSegments()) return;
+    if ((Seg + 1u) * VOXEL_LAND_RIVER_SEG_FLOATS > RiverDataCap) return;
+    const float ReachRad = VoxelRiverReachM(Seg) / RiverRadiusM;
+    const uint T = RiverTilesPerFace;
+    for (uint Face = 0u; Face < 6u; Face++)
+    {
+        const FVoxelRiverCover C = VoxelRiverCoverOf(Seg, Face, ReachRad);
+        if (C.Count == 0u) continue;
+        VOXEL_LOOP
+        for (uint TY = C.Y0; TY <= C.Y1; TY++)
+            for (uint TX = C.X0; TX <= C.X1; TX++)
+            {
+                const uint Tile = (Face * T + TY) * T + TX;
+                uint Slot = 0u;
+                InterlockedAdd(TileFill[Tile], 1u, Slot);
+                const uint At = TileStart[Tile] + Slot;
+                if (Slot < VoxelRiverTileRange(Tile) && At < RiverCandCap)
+                    TileCand[At] = Seg;
+            }
+    }
+}
+
+/** A tile's candidates: its slots filled, within its range and the buffer (a list past the
+ *  capacity is cut). */
+VOXEL_FUNC uint VoxelRiverTileCandidates(uint Tile)
+{
+    const uint Start = TileStart[Tile];
+    return Start >= RiverCandCap ? 0u : min(min(TileFill[Tile], VoxelRiverTileRange(Tile)), RiverCandCap - Start);
+}
+
+VOXEL_FUNC float VoxelRiverSegLog2Area(uint Seg)
+{
+    const uint B = Seg * VOXEL_LAND_RIVER_SEG_FLOATS;
+    return max(RiverData[B + 2u], RiverData[B + 3u]);
+}
+
+/** Whether segment A goes before B in a tile: larger first, then by index. */
+VOXEL_FUNC bool VoxelRiverBefore(uint A, float AreaA, uint B, float AreaB)
+{
+    return AreaA > AreaB || (AreaA == AreaB && A < B);
+}
+
+/** A tile's list sorted (insertion: a few dozen), and its block's size (frame and entries; 0
+ *  when empty). */
+VOXEL_FUNC void VoxelRiverTileSortPass(uint Tile)
+{
+    if (Tile >= VoxelRiverTileCount()) return;
+    const uint Start = TileStart[Tile];
+    const uint Count = VoxelRiverTileCandidates(Tile);
+    VOXEL_LOOP
+    for (uint i = 1u; i < Count; i++)
+    {
+        const uint Key = TileCand[Start + i];
+        const float KeyArea = VoxelRiverSegLog2Area(Key);
+        uint j = i;
+        VOXEL_LOOP
+        while (j > 0u)
+        {
+            const uint Prev = TileCand[Start + j - 1u];
+            if (!VoxelRiverBefore(Key, KeyArea, Prev, VoxelRiverSegLog2Area(Prev))) break;
+            TileCand[Start + j] = Prev;
+            j--;
+        }
+        TileCand[Start + j] = Key;
+    }
+    const uint Kept = min(Count, VOXEL_LAND_RIVER_MAX_PER_TILE);
+    TileBlock[Tile] = Kept > 0u ? VOXEL_LAND_RIVER_FRAME_FLOATS + VOXEL_LAND_RIVER_ENTRY_FLOATS * Kept : 0u;
+    const uint All = TileFill[Tile];
+    if (All == 0u) return;
+    InterlockedAdd(RiverCounts[VOXEL_RIVER_COUNT_TILES_USED], 1u);
+    InterlockedMax(RiverCounts[VOXEL_RIVER_COUNT_MAX_IN_TILE], All);
+    InterlockedAdd(RiverCounts[VOXEL_RIVER_COUNT_ENTRIES], Kept);
+    if (All > Kept)
+        InterlockedAdd(RiverCounts[VOXEL_RIVER_COUNT_DROPPED], All - Kept);
+}
+
+/** The double-float dot of a float point and a float vector (as the lookup's). */
+VOXEL_FUNC float2 VoxelRiverDotDF(float3 P, float3 V)
+{
+    return VoxelDFAdd(VoxelDFAdd(VoxelDFMulFloat(float2(P.x, 0.0f), V.x), VoxelDFMulFloat(float2(P.y, 0.0f), V.y)),
+        VoxelDFMulFloat(float2(P.z, 0.0f), V.z));
+}
+
+/** A point in a frame's gnomonic plane (m, double-float). */
+struct FVoxelRiverPlane
+{
+    float2 X;
+    float2 Y;
+};
+
+VOXEL_FUNC FVoxelRiverPlane VoxelRiverProject(float3 P, float3 C, float3 T1, float3 T2)
+{
+    const float2 DC = VoxelRiverDotDF(P, C);
+    FVoxelRiverPlane Out;
+    Out.X = VoxelDFMulFloat(VoxelDFDiv(VoxelRiverDotDF(P, T1), DC), RiverRadiusM);
+    Out.Y = VoxelDFMulFloat(VoxelDFDiv(VoxelRiverDotDF(P, T2), DC), RiverRadiusM);
+    return Out;
+}
+
+/** Every tile's start in the data (after the segments, by the scan of the blocks), its frame and
+ *  its entries; thread TileCount writes the end. */
+VOXEL_FUNC void VoxelRiverTileWritePass(uint Tile)
+{
+    const uint TileCount = VoxelRiverTileCount();
+    if (Tile > TileCount) return;
+    const uint SegFloats = VoxelRiverSegments() * VOXEL_LAND_RIVER_SEG_FLOATS;
+    if (Tile == TileCount)
+    {
+        RiverTiles[Tile] = SegFloats + RiverCounts[VOXEL_RIVER_COUNT_BLOCKS];
+        return;
+    }
+    const uint Base = SegFloats + TileBlock[Tile];
+    RiverTiles[Tile] = Base;
+    const uint Kept = min(VoxelRiverTileCandidates(Tile), VOXEL_LAND_RIVER_MAX_PER_TILE);
+    if (Kept == 0u) return;
+    if (Base + VOXEL_LAND_RIVER_FRAME_FLOATS + VOXEL_LAND_RIVER_ENTRY_FLOATS * Kept > RiverDataCap) return;
+    // The frame: the tile's centre (a partial last tile's middle) and its tangents.
+    const uint T = RiverTilesPerFace;
+    const uint Face = Tile / (T * T);
+    const uint Rest = Tile - Face * T * T;
+    const uint TJ = Rest / T;
+    const uint TI = Rest - TJ * T;
+    const float TC = float(VOXEL_LAND_RIVER_TILE_CELLS);
+    const float CI = min((float(TI) + 0.5f) * TC, 0.5f * (float(RiverN) + float(TI) * TC));
+    const float CJ = min((float(TJ) + 0.5f) * TC, 0.5f * (float(RiverN) + float(TJ) * TC));
+    const float3 C = VoxelCubeDirection(Face, -1.0f + 2.0f * CI / float(RiverN), -1.0f + 2.0f * CJ / float(RiverN));
+    const float3 U = VoxelCubeAxisVector(VoxelCubeUAxis(Face));
+    const float3 T1 = normalize(U - C * dot(U, C));
+    const float3 T2 = normalize(cross(C, T1));
+    RiverData[Base] = C.x;
+    RiverData[Base + 1u] = C.y;
+    RiverData[Base + 2u] = C.z;
+    RiverData[Base + 3u] = 0.0f;
+    RiverData[Base + 4u] = T1.x;
+    RiverData[Base + 5u] = T1.y;
+    RiverData[Base + 6u] = T1.z;
+    RiverData[Base + 7u] = 0.0f;
+    RiverData[Base + 8u] = T2.x;
+    RiverData[Base + 9u] = T2.y;
+    RiverData[Base + 10u] = T2.z;
+    RiverData[Base + 11u] = 0.0f;
+    const uint Start = TileStart[Tile];
+    VOXEL_LOOP
+    for (uint k = 0u; k < Kept; k++)
+    {
+        const uint Seg = TileCand[Start + k];
+        const FVoxelRiverPlane P0 = VoxelRiverProject(VoxelRiverPos(SegNode[Seg]), C, T1, T2);
+        const FVoxelRiverPlane P1 = VoxelRiverProject(VoxelRiverPos(SegEnd[Seg]), C, T1, T2);
+        const float DX = VoxelDFSub(P1.X, P0.X).x;
+        const float DY = VoxelDFSub(P1.Y, P0.Y).x;
+        const float L2 = DX * DX + DY * DY;
+        const uint E = Base + VOXEL_LAND_RIVER_FRAME_FLOATS + k * VOXEL_LAND_RIVER_ENTRY_FLOATS;
+        RiverData[E] = P0.X.x;
+        RiverData[E + 1u] = P0.Y.x;
+        RiverData[E + 2u] = DX;
+        RiverData[E + 3u] = DY;
+        RiverData[E + 4u] = L2 > 0.0f ? 1.0f / L2 : 0.0f;
+        const float Reach = VoxelRiverReachM(Seg);
+        RiverData[E + 5u] = Reach * Reach;
+        RiverData[E + 6u] = float(Seg);
+    }
+}
+
+#endif // VOXEL_LAND_RIVER_BUILD_USH
