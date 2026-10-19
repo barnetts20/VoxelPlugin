@@ -50,6 +50,10 @@ struct FVoxelUnderwaterParams
     FTextureResource* Displacement = nullptr;
     FTextureResource* Derivatives = nullptr;
     FTextureResource* Charts = nullptr;
+    /** The open sea's foam (stage O9c: the cascades' foam array; null: none) and the foam's colour
+     *  seen from below (rgb, linear scene units before exposure; w 0: no foam). */
+    FTextureResource* Foam = nullptr;
+    FVector4f FoamColor = FVector4f::Zero();
 
     /** The shore (stage O8): the shore field's texture (null: none), and the ocean pages' depth
      *  probe (render thread data, null: none). A camera in an inland basin (Waves.Shore's distance
@@ -99,5 +103,6 @@ private:
     FTextureRHIRef DisplacementRHI;
     FTextureRHIRef DerivativesRHI;
     FTextureRHIRef ChartsRHI;
+    FTextureRHIRef FoamRHI;
     bool bHasFrame = false;
 };

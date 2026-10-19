@@ -55,6 +55,8 @@ struct FMath
     static double Sqrt(double v) { return std::sqrt(v); }
     static double Abs(double v) { return std::fabs(v); }
     static double Log2(double v) { return std::log2(v); }
+    static double Exp2(double v) { return std::exp2(v); }
+    static double FloorToDouble(double v) { return std::floor(v); }
     static int64 CeilToInt(double v) { return (int64)std::ceil(v); }
     template<class T> static T Square(T v) { return v * v; }
     template<class T> static T Max(T a, T b) { return a > b ? a : b; }

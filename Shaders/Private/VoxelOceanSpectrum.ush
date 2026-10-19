@@ -502,4 +502,14 @@ VOXEL_FUNC FVoxelOceanDetile VoxelOceanDetileOf(float2 Position, float Cell, uin
     return D;
 }
 
+// Band B's lattice (stage O9b3): the cell scaled by the band's tile against the first band's, so
+// each band's period is broken at its own scale (one lattice for all left the 241 m band repeating
+// six times a cell, and the short bands weren't detiled at all), and a seed of its own. Tiles: the
+// bands' tile sides (m).
+VOXEL_FUNC FVoxelOceanDetile VoxelOceanDetileOfBand(float2 Position, float Cell, uint Seed, int Band, float4 Tiles)
+{
+    const float Tile = Band == 0 ? Tiles.x : (Band == 1 ? Tiles.y : (Band == 2 ? Tiles.z : Tiles.w));
+    return VoxelOceanDetileOf(Position, Cell * Tile / max(Tiles.x, 1.0e-3f), Seed + uint(Band) * 0x9e3779b9u);
+}
+
 #endif // VOXEL_OCEAN_SPECTRUM_USH

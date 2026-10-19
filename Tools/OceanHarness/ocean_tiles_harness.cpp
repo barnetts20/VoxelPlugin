@@ -1,5 +1,7 @@
 // Harness for VoxelOceanTiles.h (stage O1): runs the shipped selection and tile geometry and
-// checks the properties Design/OceanMeshing.md relies on.
+// checks the properties Design/OceanMeshing.md relies on. Stage O9c: the same checks with the
+// split bias near shores (FShoreBias) on a synthetic coast by each camera, the material's float
+// effective distance at every vertex from a coast distance off by up to 0.8 of the margin.
 #include "CoreMinimal.h"
 #include VOT_HEADER
 #include <cstdio>
@@ -52,11 +54,49 @@ static FVector ExactVertex(const Key& Tile, int32 Quads, int32 A, int32 B, doubl
     return Direction(Tile.Face, GridCoord((int64)Tile.I * Quads + A, Bits), GridCoord((int64)Tile.J * Quads + B, Bits)) * Radius;
 }
 
+// The split bias (stage O9c): the coast set the selection and the tiles measure from
+// (VoxelOceanTiles::FCoastSet, the shipped code), synthetic coasts by each camera (a straight
+// one, a jagged one with islands). The material's view: each vertex's coast code (CoastCode of
+// the set's distance there), decoded in float as VoxelOcean.ush does.
+struct FKeyHash { size_t operator()(const Key& K) const { return (size_t)GetTypeHash(K); } };
+static FShoreBias GBias;
+static const FCoastSet* GCoast = nullptr;
+// The chain checked on every tile within this of the camera (cm; 0: 24 tiles at random).
+static double GChainNear = 0.0;
+static double GRadius = 1.0;
+static std::unordered_map<Key, double, FKeyHash> GBounds;
+static std::unordered_map<uint64_t, float> GCodes;
+static double HarnessCoastBound(const void*, const Key& Node, const FVector& CenterDir, double Angle)
+{
+    auto It = GBounds.find(Node);
+    if (It != GBounds.end()) return It->second;
+    return GBounds[Node] = CoastCapBound(*GCoast, CenterDir, Angle);
+}
+static float CoastSeen(const FVector& P)
+{
+    const uint64_t K = (uint64_t)(int64_t)std::llround(P.X * 0.1) * 0x9E3779B97F4A7C15ull ^ (uint64_t)(int64_t)std::llround(P.Y * 0.1) * 0xC2B2AE3D27D4EB4Full
+        ^ (uint64_t)(int64_t)std::llround(P.Z * 0.1) * 0x165667B19E3779F9ull;
+    auto It = GCodes.find(K);
+    if (It != GCodes.end()) return It->second;
+    const uint32 Code = CoastCode(GCoast->Distance(P, CoastCapCm));
+    // VoxelOcean.ush's VoxelOceanCoastOf, in float.
+    const float Kf = std::log2(1.0f + 1.0e6f / 2000.0f) / 4095.0f;
+    const float V = 2000.0f * (std::exp2((float)Code * Kf) - 1.0f);
+    return GCodes[K] = V;
+}
+
 static float WeightFloat(const FVector& Vertex, const FVector& Camera, int32 Level, double MorphEnd0Value, double StartFraction)
 {
     // As the material: ToVertex in float, the band in float.
     const float Dx = (float)(Vertex.X - Camera.X), Dy = (float)(Vertex.Y - Camera.Y), Dz = (float)(Vertex.Z - Camera.Z);
-    const float D = std::sqrt(Dx * Dx + Dy * Dy + Dz * Dz);
+    float D = std::sqrt(Dx * Dx + Dy * Dy + Dz * Dz);
+    if (GBias.IsActive())
+    {
+        // VoxelOcean.ush's VoxelOceanShoreDetailDistance, in float.
+        const float Detail = (float)GBias.Detail;
+        const float Outside = std::max(CoastSeen(Vertex) - (float)GBias.BandCm, 0.0f);
+        D = std::min(D, D / Detail + (1.0f - 1.0f / Detail) * std::max(Outside, D - (float)GBias.ReachCm));
+    }
     if (Level <= 0) return 0.0f;
     const float End = (float)MorphEnd0Value * std::exp2(-(float)Level);
     const float Start = End * (float)StartFraction;
@@ -156,10 +196,23 @@ struct FStats
     int32 MaxTiles = 0;
 };
 
+static void RunCameraWith(const FRun& Run, const TSet<Key>& PrevSplit, const FVector& Camera, std::mt19937_64& Rng, FStats& St, bool bVerbose);
 static void RunCamera(const FRun& Run, const FVector& PrevCamera, const FVector& Camera, std::mt19937_64& Rng, FStats& St, bool bVerbose)
 {
-    TArray<Key> Tiles; TSet<Key> Split, PrevSplit; TArray<Key> PrevTiles;
+    TArray<Key> PrevTiles; TSet<Key> PrevSplit;
     Select(PrevCamera, Run.P, nullptr, PrevTiles, PrevSplit);
+    RunCameraWith(Run, PrevSplit, Camera, Rng, St, bVerbose);
+}
+// The previous selection with its own parameters (the bias off, say), then this one.
+static void RunCameraPrev(const FRun& PrevRun, const FRun& Run, const FVector& PrevCamera, const FVector& Camera, std::mt19937_64& Rng, FStats& St, bool bVerbose)
+{
+    TArray<Key> PrevTiles; TSet<Key> PrevSplit;
+    Select(PrevCamera, PrevRun.P, nullptr, PrevTiles, PrevSplit);
+    RunCameraWith(Run, PrevSplit, Camera, Rng, St, bVerbose);
+}
+static void RunCameraWith(const FRun& Run, const TSet<Key>& PrevSplit, const FVector& Camera, std::mt19937_64& Rng, FStats& St, bool bVerbose)
+{
+    TArray<Key> Tiles; TSet<Key> Split;
     Select(Camera, Run.P, &PrevSplit, Tiles, Split);
     TSet<Key> Sel;
     for (const Key& K : Tiles) Sel.Add(K);
@@ -285,9 +338,22 @@ static void RunCamera(const FRun& Run, const FVector& PrevCamera, const FVector&
     }
 
     // The two-level chain: wherever a vertex's grand target is, level L - 2 must not be morphing.
-    for (int32 n = 0; n < 24 && n < Tiles.Num(); n++)
+    TArray<Key> ChainTiles;
+    if (GChainNear > 0.0)
     {
-        const Key& Tile = Tiles[(int32)(Rng() % (uint64)Tiles.Num())];
+        for (const Key& Tile : Tiles)
+        {
+            FVector C; double A;
+            Cap(Tile, C, A);
+            if (DistanceToCap(Camera, C, A, Run.P.Radius) < GChainNear && ChainTiles.Num() < 600) ChainTiles.Add(Tile);
+        }
+    }
+    else
+    {
+        for (int32 n = 0; n < 24 && n < Tiles.Num(); n++) ChainTiles.Add(Tiles[(int32)(Rng() % (uint64)Tiles.Num())]);
+    }
+    for (const Key& Tile : ChainTiles)
+    {
         if (Tile.Level < 2) continue;
         TArray<FTileVertex> Vs;
         BuildTile(Tile, Q, Run.P.Radius, Vs);
@@ -591,6 +657,109 @@ int main(int Argc, char** Argv)
         for (int32 l = 0; l < 20; l++) if (St.ByLevel[l] > 0) std::printf(" L%d %.3f", l, St.ByLevel[l]);
         std::printf("\n");
     }
+
+    // Stage O9c: the split bias near shores (the shipped coast set and codes), cameras from 10 m
+    // under to 30 km over the sea by a coast: a straight one, and a jagged one (a random walk
+    // with sharp turns, and islands of 50 to 500 m), some by a face's edge or corner; the bias the
+    // previous frame selected with sometimes off. The default bias (3x, a 300 m band, 500 m
+    // reach) and a strong one (4x, 2 km band, the largest reach, 2 km). The chain is checked on
+    // every tile within 5 km of the camera.
+    GRadius = Radius;
+    GChainNear = 500000.0;
+    const int32 BiasCameras = Argc > 3 ? std::atoi(Argv[3]) : 200;
+    struct FBiasCase { double Detail, BandM, ReachM; bool bJagged; const char* Name; };
+    const FBiasCase Cases[] = { { 3.0, 300.0, 500.0, false, "3x, 300 m band, straight coast" }, { 3.0, 300.0, 500.0, true, "3x, 300 m band, jagged coast and islands" },
+        { 4.0, 2000.0, 2000.0, true, "4x, 2 km band, 2 km reach, jagged coast and islands" } };
+    for (double F : { 2.25, 2.5 })
+    {
+        for (const FBiasCase& C : Cases)
+        {
+            Run.P.Hysteresis = 1.1;
+            Run.P.LodDistanceFactor = F;
+            Run.MorphEnd0Value = MorphEnd0(Radius, F);
+            Run.StartFraction = StartFractionArg;
+            std::mt19937_64 Rng(99);
+            std::uniform_real_distribution<double> U01(0.0, 1.0);
+            std::normal_distribution<double> G;
+            FStats St;
+            int64 PlainTiles = 0;
+            for (int32 c = 0; c < BiasCameras; c++)
+            {
+                FVector D = FVector(G(Rng), G(Rng), G(Rng)).GetSafeNormal();
+                if (c % 6 == 1) D = (FVector(1.0, 1.0, 0.0) + D * 0.002).GetSafeNormal();
+                if (c % 6 == 2) D = (FVector(1.0, 1.0, 1.0) + D * 0.002).GetSafeNormal();
+                const double Altitude = (c % 5 == 0) ? -1000.0 * U01(Rng) : std::pow(10.0, 2.0 + 4.5 * U01(Rng));   // -10 m .. 30 km
+                const FVector Camera = D * (Radius + Altitude);
+                // The coast: through a point 0 to 2 km from the camera's foot, 80 km long.
+                const FVector Side = (FVector(G(Rng), G(Rng), G(Rng)) ^ D).GetSafeNormal();
+                const FVector Along = (Side ^ D).GetSafeNormal();
+                const double Offset = 200000.0 * U01(Rng);
+                std::vector<double> Segments;
+                auto Push = [&](const FVector& A, const FVector& B)
+                {
+                    const FVector UA = A.GetSafeNormal(), UB = B.GetSafeNormal();
+                    Segments.insert(Segments.end(), { UA.X, UA.Y, UA.Z, UB.X, UB.Y, UB.Z });
+                };
+                {
+                    double Walk = 0.0;
+                    FVector Last;
+                    for (int32 k = 0; k <= 800; k++)
+                    {
+                        const double T = -4000000.0 + 10000.0 * k;
+                        if (C.bJagged) Walk += (U01(Rng) - 0.5) * 30000.0;
+                        const FVector P = D * Radius + Along * T + Side * (Offset + Walk);
+                        if (k > 0) Push(Last, P);
+                        Last = P;
+                    }
+                }
+                if (C.bJagged)
+                {
+                    for (int32 i = 0; i < 12; i++)
+                    {
+                        const FVector Centre = D * Radius + Along * (300000.0 * (U01(Rng) - 0.5) * 2.0) + Side * (300000.0 * (U01(Rng) - 0.5) * 2.0);
+                        const double Ring = 5000.0 + 45000.0 * U01(Rng);
+                        const int32 Sides = 6 + (int32)(U01(Rng) * 14.0);
+                        for (int32 k = 0; k < Sides; k++)
+                        {
+                            const double A0 = 2.0 * UE_DOUBLE_PI * k / Sides, A1 = 2.0 * UE_DOUBLE_PI * (k + 1) / Sides;
+                            Push(Centre + Along * (Ring * std::cos(A0)) + Side * (Ring * std::sin(A0)), Centre + Along * (Ring * std::cos(A1)) + Side * (Ring * std::sin(A1)));
+                        }
+                    }
+                }
+                const FCoastSet Coast(Segments, Radius);
+                GCoast = &Coast;
+                GBounds.clear();
+                GCodes.clear();
+                GBias = FShoreBias();
+                GBias.Detail = C.Detail;
+                GBias.BandCm = C.BandM * 100.0;
+                GBias.ReachCm = C.ReachM * 100.0;
+                GBias.CoastBound = &HarnessCoastBound;
+                const FVector Step = FVector(G(Rng), G(Rng), G(Rng)).GetSafeNormal() * (std::fabs(Altitude) * 0.1 * U01(Rng) + 100.0);
+                Run.P.Bias = GBias;
+                // Every third camera: the previous frame selected without the bias (it just came on).
+                FRun Prev = Run;
+                if (c % 3 == 0) Prev.P.Bias = FShoreBias();
+                RunCameraPrev(Prev, Run, Camera + Step, Camera, Rng, St, c < 2);
+                // The tiles without the bias, for the cost.
+                FRun Plain = Run;
+                Plain.P.Bias = FShoreBias();
+                TArray<Key> T; TSet<Key> S2;
+                Select(Camera, Plain.P, nullptr, T, S2);
+                PlainTiles += T.Num();
+                GCoast = nullptr;
+            }
+            std::printf("BIAS %s, F %.2f: %lld cameras, %.0f tiles average (%d max; %.0f without the bias), %lld balance violations, %lld fine edge vertices not fully morphed, "
+                        "%lld coarse vertices morphing at a boundary (by up to %.3g cm)\n"
+                        "  under 1 m test waves: max crack %.3g cm (%.2g of the coarse spacing), %.3g cm at levels 10+; faded: %.3g cm, %.3g cm at levels 10+; "
+                        "chain: %lld vertices, %lld violations (want 0); seams: drawn positions differ by %.3g cm; %lld of %lld rays missed\n",
+                C.Name, F, (long long)St.Cameras, (double)St.Tiles / St.Cameras, St.MaxTiles, (double)PlainTiles / St.Cameras, (long long)St.BalanceViolations,
+                (long long)St.FineNotMorphed, (long long)St.CoarseMorphing, St.MaxCrack, St.MaxWaveCrack, St.MaxWaveCrackRel, St.MaxWaveCrackFine, St.MaxFadedCrack,
+                St.MaxFadedCrackFine, (long long)St.ChainVertices, (long long)St.ChainViolations, St.MaxSeamDisplayed, (long long)St.HorizonMisses, (long long)St.Rays);
+        }
+    }
+    GChainNear = 0.0;
+    GBias = FShoreBias();
     return 0;
 }
 

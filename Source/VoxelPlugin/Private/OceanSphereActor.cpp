@@ -332,7 +332,10 @@ void AOceanSphereActor::UpdateUnderwater()
         Params.Displacement = Textures->Displacement->GetResource();
         Params.Derivatives = Textures->Derivatives->GetResource();
         Params.Charts = Textures->Charts->GetResource();
+        Params.Foam = Textures->Foam ? Textures->Foam->GetResource() : nullptr;
     }
+    // The foam seen from below (stage O9c), with the foam on.
+    Params.FoamColor = FVector4f(S.UnderwaterFoamColor.R, S.UnderwaterFoamColor.G, S.UnderwaterFoamColor.B, S.bFoam ? 1.0f : 0.0f);
     // The shore (stage O8): the field's texture, the depth probe, the inland basins' margin.
     Params.Shore = ShoreRHI;
     Params.Probe = Surface.IsValid() ? Surface->GetProbeState() : nullptr;
@@ -591,7 +594,7 @@ void AOceanSphereActor::DrawShoreDebug() const
     UWorld* World = GetWorld();
     if (N <= 0 || !World || !bHasCamera || !ShoreField.IsValid()) return;
     const double Spacing = FMath::Max(1.0, (double)CVarVoxelDebugOceanShoreSpacing.GetValueOnGameThread()) * 100.0;
-    const double Margin = ShoreField->MarginCm(AppliedSettings.ShoreBasinMargin);
+    const double Margin = ShoreField->MarginCm(AppliedSettings.ShoreBasinMargin) * VoxelOceanWaves::BasinDrainSpan;
     const FTransform NoScaleTransform(GetActorRotation(), GetActorLocation());
     const FVector Up = CameraPosition.GetSafeNormal();
     FVector E1, E2;
@@ -875,6 +878,8 @@ FVoxelOceanSurfaceInputs AOceanSphereActor::GatherInputs(const AAdaptiveVoxelAct
     Inputs.Density.Density = GPUDensity;
     // As last applied, so a slider drag doesn't write the tiles again every frame.
     Inputs.LandCullMargin = AppliedSettings.bCullUnderLand ? AppliedSettings.LandCullMargin : -1.0;
+    // The depth the waves feel (stage O9b2): as last applied too (a change writes every tile).
+    Inputs.Density.DepthFootprintCm = AppliedSettings.bShoaling ? AppliedSettings.ShoreDepthSmoothing * 100.0 : 0.0;
     Inputs.Time = GetOceanTime();
     Inputs.Environment = GetEnvironment();
     const FVoxelOceanSettings& S = OceanSettings;
@@ -903,6 +908,11 @@ FVoxelOceanSurfaceInputs AOceanSphereActor::GatherInputs(const AAdaptiveVoxelAct
     Inputs.Waves.SurfSwash = S.SurfSwash;
     Inputs.Waves.SurfSkew = S.SurfSkew;
     Inputs.Waves.SurfHandover = S.SurfHandover;
+    Inputs.Waves.SurfSwashReach = S.SurfSwashReach;
+    // The mesh's split bias near shores (stage O9c; live).
+    Inputs.ShoreDetail.Detail = S.ShoreDetail;
+    Inputs.ShoreDetail.BandM = S.ShoreDetailBand;
+    Inputs.ShoreDetail.ReachM = S.ShoreDetailReach;
     // The foam (stage O9b): a decay of 0 makes none.
     Inputs.Waves.FoamDecay = S.bFoam ? S.FoamDecay : 0.0;
     Inputs.Waves.FoamCoverage = S.bFoam ? S.FoamCoverage : 0.0;
@@ -912,7 +922,9 @@ FVoxelOceanSurfaceInputs AOceanSphereActor::GatherInputs(const AAdaptiveVoxelAct
     if (ShoreField.IsValid())
     {
         Inputs.Shore = ShoreField;
-        Inputs.Density.ShoreMarginCm = ShoreField->MarginCm(AppliedSettings.ShoreBasinMargin);
+        // The basins' margin past the sea's drain (stage O9b3): from the bake's margin to 1.5 times it
+        // the sea sinks below the ground, and only past that is the basin land.
+        Inputs.Density.ShoreMarginCm = ShoreField->MarginCm(AppliedSettings.ShoreBasinMargin) * VoxelOceanWaves::BasinDrainSpan;
         if (ShoreRHI.IsValid())
         {
             Inputs.ShoreTexture = ShoreTexture.Get();

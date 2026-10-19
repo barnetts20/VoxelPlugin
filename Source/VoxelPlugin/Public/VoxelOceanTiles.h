@@ -34,11 +34,30 @@
 // points (waves). Two levels of chain suffice while every level-L vertex is nearer than where
 // level L - 2 starts to morph (2 MorphEnd(L)); F of at least MinLodDistanceFactor keeps it so
 // (the harness checks).
+//
+// The split bias near shores (stage O9c; FShoreBias): the selection and the morph both take the
+// distance from the camera through EffectiveDistance, which makes the mesh within a band of the
+// coast as fine as if the camera were Detail times closer: d_eff = min(d, d / Detail + (1 - 1 /
+// Detail) max(u, d - Reach)), u the point's distance outside the band. Inside the band d /
+// Detail; outside it the bias fades over the camera's own distance; past Reach it saves at most
+// (1 - 1 / Detail) Reach. The coast is a set of segments (FCoastSet: the shore field's zero line,
+// VoxelOceanShoreCore::Coastline), and the distance to a set is exactly 1-Lipschitz, so d_eff is
+// too, as the plain distance: the balance, the closed boundaries and the two-level chain hold as
+// they do without the bias (the harness checks). The material doesn't sample anything for it: a
+// tile's vertices carry their coast distance and their morph target's (CoastCode: 12 bits each,
+// on a log scale, packed in one float), written with the tile from the coast set; the selection
+// takes the same codes' least value over a node's cap (CoastCapBound: the exact distance from its
+// centre less the cap's chord, as decoded), so a node it leaves unsplit is at least its range
+// away everywhere the material looks. VoxelOcean.ush decodes the codes and computes d_eff in
+// float, Detail, the band and the reach from the chart table's row 17.
 
 #pragma once
 
 #include "CoreMinimal.h"
 #include "VoxelCubeSphere.h"
+#include <algorithm>
+#include <unordered_map>
+#include <vector>
 
 /** A tile of the ocean quadtree; also a page of tiles (VoxelOceanTiles::PageOf). */
 struct FVoxelOceanTileKey
@@ -96,6 +115,181 @@ namespace VoxelOceanTiles
      *  levels' bands contiguous. Valid from 0.5 (overlapping bands would need a longer chain) to
      *  below 1. */
     constexpr double DefaultMorphStartFraction = 0.5;
+
+    /** The coast distances the split bias works with (stage O9c): held at CoastCapCm beyond
+     *  (where the bias no longer matters but for a constant saving past it), coded in 12 bits on
+     *  a log scale of CoastScaleCm (8 cm steps at the coast, 0.5 m at 300 m, 4 m at 2 km).
+     *  VoxelOcean.ush's VOXEL_OCEAN_COAST_CAP and VOXEL_OCEAN_COAST_SCALE are the same. */
+    constexpr double CoastCapCm = 1.0e6;
+    constexpr double CoastScaleCm = 2000.0;
+    constexpr uint32 CoastCodeMax = 4095;
+
+    /** A distance's code: the largest whose value is at most the distance. */
+    inline uint32 CoastCode(double Cm)
+    {
+        const double X = FMath::Log2(1.0 + FMath::Clamp(Cm, 0.0, CoastCapCm) / CoastScaleCm) / FMath::Log2(1.0 + CoastCapCm / CoastScaleCm);
+        return (uint32)FMath::Clamp((int64)FMath::FloorToDouble(X * (double)CoastCodeMax + 1.0e-9), (int64)0, (int64)CoastCodeMax);
+    }
+
+    /** A code's value (cm). */
+    inline double CoastValue(uint32 Code)
+    {
+        return CoastScaleCm * (FMath::Exp2((double)Code / (double)CoastCodeMax * FMath::Log2(1.0 + CoastCapCm / CoastScaleCm)) - 1.0);
+    }
+
+    /** A vertex's codes (its own and its morph target's) as the float the material reads
+     *  (TexCoord 2 y): an integer below 2^24, exact in a float. */
+    inline float CoastPack(uint32 Self, uint32 Target)
+    {
+        return (float)(FMath::Min(Self, CoastCodeMax) * 4096u + FMath::Min(Target, CoastCodeMax));
+    }
+
+    /** The coast as segments on the sea sphere (cm, planet frame) and a hash of them by cells of
+     *  CoastCapCm: distances up to the cap. Immutable once made; any thread. */
+    class FCoastSet
+    {
+    public:
+        /** Segments as unit directions (six doubles each: VoxelOceanShoreCore::Coastline). */
+        FCoastSet(const std::vector<double>& UnitSegments, double InRadius)
+            : Radius(InRadius)
+        {
+            const size_t Count = UnitSegments.size() / 6;
+            Points.resize(Count * 6);
+            for (size_t i = 0; i < Count * 6; i++) Points[i] = UnitSegments[i] * Radius;
+            for (size_t i = 0; i < Count; i++)
+            {
+                const double* P = &Points[i * 6];
+                int64 Lo[3], Hi[3];
+                for (int k = 0; k < 3; k++)
+                {
+                    Lo[k] = CellOf(FMath::Min(P[k], P[3 + k]));
+                    Hi[k] = CellOf(FMath::Max(P[k], P[3 + k]));
+                }
+                for (int64 X = Lo[0]; X <= Hi[0]; X++)
+                    for (int64 Y = Lo[1]; Y <= Hi[1]; Y++)
+                        for (int64 Z = Lo[2]; Z <= Hi[2]; Z++)
+                            Cells[KeyOf(X, Y, Z)].push_back((int32)i);
+            }
+        }
+
+        int32 Num() const { return (int32)(Points.size() / 6); }
+        double GetRadius() const { return Radius; }
+
+        /** The segments that may lie within Reach (cm) of P (some farther, each once). */
+        void Gather(const FVector& P, double Reach, std::vector<int32>& Out) const
+        {
+            Out.clear();
+            const double C[3] = { P.X, P.Y, P.Z };
+            int64 Lo[3], Hi[3];
+            double Span = 1.0;
+            for (int k = 0; k < 3; k++)
+            {
+                Lo[k] = CellOf(C[k] - Reach);
+                Hi[k] = CellOf(C[k] + Reach);
+                Span *= (double)(Hi[k] - Lo[k] + 1);
+            }
+            // A reach of many cells (a coarse tile): every segment.
+            if (Span > 4096.0 || Span > (double)Num())
+            {
+                Out.resize((size_t)Num());
+                for (int32 i = 0; i < Num(); i++) Out[(size_t)i] = i;
+                return;
+            }
+            for (int64 X = Lo[0]; X <= Hi[0]; X++)
+                for (int64 Y = Lo[1]; Y <= Hi[1]; Y++)
+                    for (int64 Z = Lo[2]; Z <= Hi[2]; Z++)
+                    {
+                        const auto It = Cells.find(KeyOf(X, Y, Z));
+                        if (It != Cells.end()) Out.insert(Out.end(), It->second.begin(), It->second.end());
+                    }
+            std::sort(Out.begin(), Out.end());
+            Out.erase(std::unique(Out.begin(), Out.end()), Out.end());
+        }
+
+        /** The distance (cm) from P to the nearest of Candidates, held at Limit. */
+        double DistanceAmong(const FVector& P, const std::vector<int32>& Candidates, double Limit) const
+        {
+            double Best2 = Limit * Limit;
+            for (int32 i : Candidates)
+            {
+                const double* S = &Points[(size_t)i * 6];
+                const double E[3] = { S[3] - S[0], S[4] - S[1], S[5] - S[2] };
+                const double W[3] = { P.X - S[0], P.Y - S[1], P.Z - S[2] };
+                const double L2 = E[0] * E[0] + E[1] * E[1] + E[2] * E[2];
+                const double T = L2 > 0.0 ? FMath::Clamp((W[0] * E[0] + W[1] * E[1] + W[2] * E[2]) / L2, 0.0, 1.0) : 0.0;
+                const double DX = W[0] - E[0] * T, DY = W[1] - E[1] * T, DZ = W[2] - E[2] * T;
+                Best2 = FMath::Min(Best2, DX * DX + DY * DY + DZ * DZ);
+            }
+            return FMath::Sqrt(Best2);
+        }
+
+        /** The distance (cm) from P to the coast, held at Limit. */
+        double Distance(const FVector& P, double Limit) const
+        {
+            std::vector<int32> Candidates;
+            Gather(P, Limit, Candidates);
+            return DistanceAmong(P, Candidates, Limit);
+        }
+
+    private:
+        static int64 CellOf(double V) { return (int64)FMath::FloorToDouble(V / CoastCapCm); }
+        static uint64 KeyOf(int64 X, int64 Y, int64 Z)
+        {
+            return ((uint64)(X + (1 << 20)) & 0x1fffffu) | (((uint64)(Y + (1 << 20)) & 0x1fffffu) << 21) | (((uint64)(Z + (1 << 20)) & 0x1fffffu) << 42);
+        }
+
+        double Radius = 0.0;
+        std::vector<double> Points;
+        std::unordered_map<uint64, std::vector<int32>> Cells;
+    };
+
+    /** A vertex's coast code (CoastCode of its distance to the coast, held at the cap). */
+    inline uint32 CoastCodeAt(const FCoastSet* Coast, const FVector& Point, const std::vector<int32>& Candidates)
+    {
+        return Coast ? CoastCode(Coast->DistanceAmong(Point, Candidates, CoastCapCm)) : CoastCodeMax;
+    }
+
+    /** The least coast distance (cm) the material can see over a node's cap (centre direction,
+     *  angle), as its vertices' codes decode: the exact distance from the cap's centre less the
+     *  cap's chord radius (every point of the cap is within it), coded down, and less what float
+     *  decoding can lose. */
+    inline double CoastCapBound(const FCoastSet& Coast, const FVector& CenterDir, double Angle)
+    {
+        const double R = Coast.GetRadius();
+        const double Chord = 2.0 * R * FMath::Sin(0.5 * FMath::Min(Angle, UE_DOUBLE_PI));
+        const double AtCenter = Coast.Distance(CenterDir * R, CoastCapCm + Chord);
+        const double Low = FMath::Max(AtCenter - Chord, 0.0);
+        return FMath::Max(CoastValue(CoastCode(Low)) * (1.0 - 1.0e-5) - 0.5, 0.0);
+    }
+
+    /** The split bias near shores (stage O9c). Off unless Detail > 1 and CoastBound is set. */
+    struct FShoreBias
+    {
+        double Detail = 1.0;      // within the band the mesh is as fine as from this times closer
+        double BandCm = 0.0;      // the band: within this of the coast
+        double ReachCm = 0.0;     // the bias saves at most (1 - 1 / Detail) times this of distance
+        /** The least coast distance (cm) the material sees over a node's cap (CoastCapBound, with
+         *  whatever caching the owner keeps). */
+        const void* Context = nullptr;
+        double (*CoastBound)(const void* Context, const FVoxelOceanTileKey& Node, const FVector& CenterDir, double Angle) = nullptr;
+
+        bool IsActive() const { return Detail > 1.0 && CoastBound != nullptr; }
+    };
+
+    /** How far (cm) a point Coast cm from the coast lies outside the bias's band. */
+    inline double ShoreOutside(double Coast, double BandCm)
+    {
+        return FMath::Max(Coast - BandCm, 0.0);
+    }
+
+    /** The distance the selection and the morph take for a point Distance (cm) from the camera,
+     *  Outside (ShoreOutside) from the band; non-decreasing in both, 1-Lipschitz where Outside is. */
+    inline double EffectiveDistance(double Distance, double Outside, double Detail, double ReachCm)
+    {
+        if (Detail <= 1.0) return Distance;
+        const double Keep = 1.0 - 1.0 / Detail;
+        return FMath::Min(Distance, Distance / Detail + Keep * FMath::Max(Outside, Distance - ReachCm));
+    }
 
     // The mapping lives in VoxelCubeSphere.h, shared with the land bake.
     using VoxelCubeSphere::FFace;
@@ -158,6 +352,7 @@ namespace VoxelOceanTiles
         double LodDistanceFactor = 2.5;
         double Hysteresis = 1.1;          // a split node merges beyond this times its range
         double HorizonHeight = 1000.0;    // tiles are kept over the horizon up to this height (cm)
+        FShoreBias Bias;                  // the split bias near shores (stage O9c; off by default)
     };
 
     /** A node of this level splits while the camera is nearer than this (cm). */
@@ -209,7 +404,15 @@ namespace VoxelOceanTiles
             double Range = SplitRange(Params, Node.Level);
             if (PrevSplit && PrevSplit->Contains(Node))
                 Range *= Params.Hysteresis;
-            if (Node.Level < Params.MaxLevel && DistanceToCap(Camera, Center, Angle, Params.Radius) < Range)
+            double Distance = DistanceToCap(Camera, Center, Angle, Params.Radius);
+            if (Params.Bias.IsActive() && Node.Level < Params.MaxLevel)
+            {
+                // The least effective distance over the cap: the least coast distance the
+                // material sees there.
+                const double Coast = Params.Bias.CoastBound(Params.Bias.Context, Node, Center, Angle);
+                Distance = EffectiveDistance(Distance, ShoreOutside(Coast, Params.Bias.BandCm), Params.Bias.Detail, Params.Bias.ReachCm);
+            }
+            if (Node.Level < Params.MaxLevel && Distance < Range)
             {
                 OutSplit.Add(Node);
                 for (int32 Quadrant = 0; Quadrant < 4; Quadrant++)

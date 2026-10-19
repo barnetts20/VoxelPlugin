@@ -468,20 +468,24 @@ int main()
     }
 
     // ---- Detiling ----------------------------------------------------------------------------
-    std::printf("\nDetiling (10 m/s, all four bands; the two long bands detiled, cell 1.5 km):\n");
+    std::printf("\nDetiling (10 m/s, all four bands, each on its own lattice: cell 1.5 km scaled by its tile, stage O9b3):\n");
     {
         const int Use[4] = { 2, 3, 6, 7 };
         const uint32_t Seed = VoxelShader::VoxelOceanHash(Settings.PlanetSeed ^ 0xde711eu);
         const float Cell = 1500.0f;
-        auto Height = [&](double X, double Y, bool Detile, double* SlopeX)
+        const VoxelShader::float4 Tiles(float(Slots[Use[0]].Params.TileLength), float(Slots[Use[1]].Params.TileLength),
+            float(Slots[Use[2]].Params.TileLength), float(Slots[Use[3]].Params.TileLength));
+        // The height (and x slope) of the bands in Mask (bit b: band b).
+        auto Height = [&](double X, double Y, bool Detile, double* SlopeX, int Mask)
         {
             double H = 0, Sx = 0;
             for (int b = 0; b < 4; b++)
             {
+                if (!(Mask & (1 << b))) continue;
                 const double L = Slots[Use[b]].Params.TileLength;
-                if (Detile && b < 2)
+                if (Detile)
                 {
-                    const VoxelShader::FVoxelOceanDetile T = VoxelShader::VoxelOceanDetileOf(float2(float(X), float(Y)), Cell, Seed);
+                    const VoxelShader::FVoxelOceanDetile T = VoxelShader::VoxelOceanDetileOfBand(float2(float(X), float(Y)), Cell, Seed, b, Tiles);
                     const float2 O[3] = { T.Offset0, T.Offset1, T.Offset2 };
                     const float Wt[3] = { T.Weight.x, T.Weight.y, T.Weight.z };
                     for (int c = 0; c < 3; c++)
@@ -500,31 +504,43 @@ int main()
             return H;
         };
         std::mt19937 Rng(21);
-        const double L0 = Slots[2].Params.TileLength;
-        double Var[2] = {}, Corr[2] = {}, SCorr[2] = {}, SVar[2] = {};
-        const int Count = 40000;
-        for (int k = 0; k < Count; k++)
+        // Each band's height correlation one of its own tiles apart, plain and detiled, and the
+        // whole sea's variance.
+        double VarAll[2] = {};
+        bool bHalved = true;
+        for (int b = 0; b < 4; b++)
         {
-            const double X = std::uniform_real_distribution<double>(0, 30000)(Rng), Y = std::uniform_real_distribution<double>(0, 30000)(Rng);
-            for (int d = 0; d < 2; d++)
+            const double L = Slots[Use[b]].Params.TileLength;
+            double Var[2] = {}, Corr[2] = {};
+            const int Count = 20000;
+            for (int k = 0; k < Count; k++)
             {
-                double S0, S1;
-                const double A = Height(X, Y, d == 1, &S0), B = Height(X + L0, Y, d == 1, &S1);
-                Var[d] += A * A; Corr[d] += A * B; SVar[d] += S0 * S0; SCorr[d] += S0 * S1;
+                const double X = std::uniform_real_distribution<double>(0, 30000)(Rng), Y = std::uniform_real_distribution<double>(0, 30000)(Rng);
+                for (int d = 0; d < 2; d++)
+                {
+                    const double A = Height(X, Y, d == 1, nullptr, 1 << b), B = Height(X + L, Y, d == 1, nullptr, 1 << b);
+                    Var[d] += A * A;
+                    Corr[d] += A * B;
+                    if (b == 0)
+                    {
+                        const double All = Height(X, Y, d == 1, nullptr, 15);
+                        VarAll[d] += All * All;
+                    }
+                }
             }
+            std::printf("  band %d (%.0f m tile): correlation one tile apart plain %.3f, detiled %.3f\n", b, L, Corr[0] / Var[0], Corr[1] / Var[1]);
+            bHalved = bHalved && Corr[1] / Var[1] < 0.5 * Corr[0] / Var[0];
         }
-        std::printf("  height variance: plain %.4f m^2, detiled %.4f m^2 (ratio %.3f)\n", Var[0] / Count, Var[1] / Count, Var[1] / Var[0]);
-        std::printf("  correlation one 997 m tile apart: height plain %.3f, detiled %.3f; slope plain %.3f, detiled %.3f\n",
-            Corr[0] / Var[0], Corr[1] / Var[1], SCorr[0] / SVar[0], SCorr[1] / SVar[1]);
-        Expect(std::fabs(Var[1] / Var[0] - 1) < 0.05, "detiling keeps the height variance (5%)");
-        Expect(Corr[1] / Var[1] < 0.5 * Corr[0] / Var[0], "detiling at least halves the correlation at the tile period");
+        std::printf("  height variance: plain %.4f m^2, detiled %.4f m^2 (ratio %.3f)\n", VarAll[0] / 20000, VarAll[1] / 20000, VarAll[1] / VarAll[0]);
+        Expect(std::fabs(VarAll[1] / VarAll[0] - 1) < 0.05, "detiling keeps the height variance (5%)");
+        Expect(bHalved, "detiling at least halves every band's correlation at its own tile period");
         // Continuity: the largest step between points 0.1 mm apart, across many lattice edges (a
         // smooth surface with slopes below 1 changes less than 0.1 mm there; a seam would not).
         double Jump = 0;
         for (int k = 0; k < 20000; k++)
         {
             const double X = std::uniform_real_distribution<double>(0, 30000)(Rng), Y = std::uniform_real_distribution<double>(0, 30000)(Rng);
-            Jump = std::max(Jump, std::fabs(Height(X, Y, true, nullptr) - Height(X + 0.0001, Y + 0.00005, true, nullptr)));
+            Jump = std::max(Jump, std::fabs(Height(X, Y, true, nullptr, 15) - Height(X + 0.0001, Y + 0.00005, true, nullptr, 15)));
         }
         std::printf("  largest height step over 0.1 mm: %.4f mm\n", Jump * 1000);
         Expect(Jump < 0.0002, "the detiled field is continuous (under 0.2 mm per 0.1 mm)");

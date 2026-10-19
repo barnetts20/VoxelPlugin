@@ -25,6 +25,7 @@
 #include "RHIResources.h"
 #include "VoxelOceanWaves.h"
 #include <atomic>
+#include <vector>
 
 struct FVoxelLandBake;
 class UTexture2DArray;
@@ -46,6 +47,10 @@ public:
     /** Any thread. The field at a point (planet frame): distance (cm), direction (planet frame,
      *  tangent, length 1 or less), slope. */
     virtual FVoxelOceanShore Sample(const FVector& PlanetPoint) const override;
+
+    /** The coast as segments of unit directions (six doubles each; stage O9c, the ocean mesh's
+     *  split bias: VoxelOceanShoreCore::Coastline). Any thread; a pass over every texel. */
+    std::vector<double> Coastline() const;
 
     /** Whether a point is sea or within MarginCm of it (not land, not an inland basin). */
     bool IsSea(const FVector& PlanetPoint, double MarginCm) const;

@@ -40,13 +40,14 @@ namespace VoxelOceanWavesFFTDetail
     }
 
     /** The surf's settings as the shaders get them (VoxelOceanSurfSettingsOf; the chart table's
-     *  constants rows 15 and 16): strength (0 off), sets, swash, skew; handover, surf foam, foam coverage. */
+     *  constants rows 15 and 16): strength (0 off), sets, swash, skew; handover, surf foam, foam coverage,
+     *  the swash's reach (m). */
     void SurfRows(const FVoxelOceanFFTSettings& Settings, VoxelShader::float4& Row0, VoxelShader::float4& Row1)
     {
         Row0 = VoxelShader::float4((float)FMath::Max(Settings.SurfStrength, 0.0), (float)FMath::Clamp(Settings.SurfSets, 0.0, 1.0),
             (float)FMath::Max(Settings.SurfSwash, 0.0), (float)FMath::Clamp(Settings.SurfSkew, 0.0, 0.95));
         Row1 = VoxelShader::float4((float)FMath::Max(Settings.SurfHandover, 1.0), (float)FMath::Max(Settings.SurfFoam, 0.0),
-            (float)FMath::Max(Settings.FoamCoverage, 0.0), 0.0f);
+            (float)FMath::Max(Settings.FoamCoverage, 0.0), (float)FMath::Max(Settings.SurfSwashReach, 1.0));
     }
 
     /** The surf's clock: the ocean clock modulo its wrap (the trains' periods divide it). */
@@ -332,6 +333,22 @@ void FVoxelOceanWavesFFT::Evaluate(const FVoxelOceanWaveContext& Context, TConst
         FVoxelOceanShoal Shoal = VoxelOceanShoalNone();
         FVoxelOceanSurf Surf = VoxelOceanSurfNone();
         float3 SurfDir(0.0f, 0.0f, 0.0f);
+        FVoxelOceanSurfDrain Drain;
+        Drain.Keep = 1.0f;
+        Drain.Drop = 0.0f;
+        Drain.Slope = 0.0f;
+        float3 DrainDir(0.0f, 0.0f, 0.0f);
+        // The drain toward inland basins (stage O9b3), as the hook: with shoaling and the field.
+        if (ShoalSettings.Breaking > 0.0f && Context.ShoreCells > 0 && Site.Shore.HasField())
+        {
+            const float Bed = Site.BedSlope > VoxelOceanWaves::BedUnknown * 0.1 ? VoxelOceanBedSlopeOf(VoxelOceanBedCode((float)Site.BedSlope)) : (float)Site.Shore.Slope;
+            Drain = VoxelOceanSurfDrainOf((float)(Site.Shore.Distance * 0.01),
+                Site.Depth < 0.5 * VoxelOceanWaves::Deep ? (float)(Site.Depth * 0.01) : 1.0e30f, Bed, (float)Context.ShoreMarginM);
+            const double L = Site.Shore.Direction.Size();
+            if (L > 1.0e-6)
+                DrainDir = float3((float)(Site.Shore.Direction.X / L), (float)(Site.Shore.Direction.Y / L), (float)(Site.Shore.Direction.Z / L));
+        }
+        const bool bStill = Drain.Keep <= 0.0f;
         if (ShoalSettings.Breaking > 0.0f)
         {
             const bool bField = Context.ShoreCells > 0 && Site.Shore.HasField();
@@ -344,7 +361,7 @@ void FVoxelOceanWavesFFT::Evaluate(const FVoxelOceanWaveContext& Context, TConst
             const float4 Sigma = VoxelOceanShoalBandSigma(SlotSigma0, SlotSigma1, Seas[i]);
             // The surf (VoxelOceanSurf.ush, as the hook's VoxelOceanFFTSurfAt), first: its handover
             // goes into the shoaling, before the long bands' cap.
-            if (bField && SurfSettings.Strength > 0.0f && DepthM < 1.0e20f)
+            if (bField && SurfSettings.Strength > 0.0f && DepthM < 1.0e20f && !bStill)
             {
                 const float Agree = dot(Field.Direction, Field.Direction);
                 FVoxelOceanSurfInput In;
@@ -364,6 +381,11 @@ void FVoxelOceanWavesFFT::Evaluate(const FVoxelOceanWaveContext& Context, TConst
                 In.Time = SurfTime;
                 In.SpacingM = 0.0f;
                 In.FootprintM = 0.0f;
+                // The bed's slope, coded as the mesh codes it (VoxelOceanBedCode, stage O9b2); the
+                // swash's foam isn't queried.
+                In.BedSlope = Site.BedSlope > VoxelOceanWaves::BedUnknown * 0.1 ? VoxelOceanBedSlopeOf(VoxelOceanBedCode((float)Site.BedSlope)) : VOXEL_OCEAN_BED_UNKNOWN;
+                In.BedDepthM = 1.0e30f;
+                In.ForNormals = 0.0f;
                 Surf = VoxelOceanSurfOf(In, SurfSettings);
                 SurfDir = Agree > 1.0e-12f ? Field.Direction * (1.0f / FMath::Sqrt(Agree)) : float3(0.0f, 0.0f, 0.0f);
             }
@@ -387,14 +409,20 @@ void FVoxelOceanWavesFFT::Evaluate(const FVoxelOceanWaveContext& Context, TConst
             SlotWeight[q] = QuerySlots[q].State >= 0 ? StateWeight[QuerySlots[q].State] : Sea.Short2;
 
         FVoxelOceanFFTAccum Sum = VoxelOceanFFTAccumZero();
-        for (int32 m = 0; m < PointCharts.Count; m++)
+        for (int32 m = 0; m < PointCharts.Count && !bStill; m++)
         {
             const VoxelOceanCharts::FChartCPU& Chart = PointCharts.Charts[m];
             double X, Y;
             VoxelOceanCharts::Coords(Chart, P, X, Y);
-            const FVoxelOceanDetile Detile = VoxelOceanDetileOf(float2((float)X, (float)Y), DetileCell, DetileSeed);
-            const float2 Shifts[3] = { Detile.Offset0, Detile.Offset1, Detile.Offset2 };
-            const float CopyWeights[3] = { Detile.Weight.x, Detile.Weight.y, Detile.Weight.z };
+            // Each band's own detiling lattice (stage O9b3, as the hook), the short bands' too.
+            float2 Shifts[4][3];
+            float CopyWeights[4][3];
+            for (int32 b = 0; b < 4; b++)
+            {
+                const FVoxelOceanDetile Detile = VoxelOceanDetileOfBand(float2((float)X, (float)Y), DetileCell, DetileSeed, b, BandTiles);
+                Shifts[b][0] = Detile.Offset0; Shifts[b][1] = Detile.Offset1; Shifts[b][2] = Detile.Offset2;
+                CopyWeights[b][0] = Detile.Weight.x; CopyWeights[b][1] = Detile.Weight.y; CopyWeights[b][2] = Detile.Weight.z;
+            }
 
             // Its headings: the table's (turning while the key's fade runs), or the constant wind's.
             FVoxelOceanChartHeadings H;
@@ -441,13 +469,17 @@ void FVoxelOceanWavesFFT::Evaluate(const FVoxelOceanWaveContext& Context, TConst
                         if (LongW <= 0.0f) continue;
                         for (int32 c = 0; c < 3; c++)
                         {
-                            if (CopyWeights[c] <= 0.0f) continue;
-                            BandSum[B] = VoxelOceanFFTSampleMad(BandSum[B], W * CopyWeights[c], Lookup(q, LX + Shifts[c].x + MX, LY + Shifts[c].y + MY));
+                            if (CopyWeights[B][c] <= 0.0f) continue;
+                            BandSum[B] = VoxelOceanFFTSampleMad(BandSum[B], W * CopyWeights[B][c], Lookup(q, LX + Shifts[B][c].x + MX, LY + Shifts[B][c].y + MY));
                         }
                     }
                     else if (ShortW > 0.0f)
                     {
-                        BandSum[B] = VoxelOceanFFTSampleMad(BandSum[B], W, Lookup(q, SX + MX, SY + MY));
+                        for (int32 c = 0; c < 3; c++)
+                        {
+                            if (CopyWeights[B][c] <= 0.0f) continue;
+                            BandSum[B] = VoxelOceanFFTSampleMad(BandSum[B], W * CopyWeights[B][c], Lookup(q, SX + Shifts[B][c].x + MX, SY + Shifts[B][c].y + MY));
+                        }
                     }
                 }
                 FVoxelOceanFFTSample LongSum = VoxelOceanFFTSampleZero();
@@ -472,6 +504,13 @@ void FVoxelOceanWavesFFT::Evaluate(const FVoxelOceanWaveContext& Context, TConst
             Sum.Height += Surf.Height * 100.0f;
             Sum.Gradient = Sum.Gradient + SurfDir * Surf.Gradient;
             Sum.VelocityUp += Surf.Rate * 100.0f;
+        }
+        // The drain toward inland basins (stage O9b3), as the hook.
+        if (Drain.Keep < 1.0f)
+        {
+            Sum = VoxelOceanFFTAccumScale(Sum, Drain.Keep);
+            Sum.Height -= Drain.Drop * 100.0f;
+            Sum.Gradient = Sum.Gradient - DrainDir * Drain.Slope;
         }
         const float3 Up((float)Site.Up.X, (float)Site.Up.Y, (float)Site.Up.Z);
         const FVoxelOceanFFTResult W = VoxelOceanFFTFinish(Sum, Up);
@@ -518,5 +557,7 @@ void FVoxelOceanWavesFFT::GetShaderParams(const FVoxelOceanWaveContext& Context,
         VoxelOceanShoreCore::FrameOf(Reference.X, Reference.Y, Reference.Z, Context.ShoreCells, Frame);
         for (int32 i = 0; i < 7; i++)
             Out.ShoreFrame[i] = FVector4f(Frame[4 * i], Frame[4 * i + 1], Frame[4 * i + 2], Frame[4 * i + 3]);
+        // The basins' margin (m) in row 9's spare z, for the drain (stage O9b3).
+        Out.ShoreFrame[1].Z = (float)FMath::Max(Context.ShoreMarginM, 0.0);
     }
 }

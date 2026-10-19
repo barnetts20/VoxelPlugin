@@ -86,6 +86,12 @@ struct VOXELPLUGIN_API FVoxelOceanSettings
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Optics")
     FLinearColor MeniscusColor = FLinearColor(0.02f, 0.06f, 0.08f);
 
+    /** The foam on the surface seen from under water (whitecaps, the surf's bores and swash: the
+     *  Foam category's), in the scene's light units (as UnderwaterLight): lit from above, brighter
+     *  than the water around it. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Optics")
+    FLinearColor UnderwaterFoamColor = FLinearColor(0.6f, 0.7f, 0.75f);
+
     // --- Environment (the constant weather: everywhere when bProceduralWeather is off) ---
 
     /** Wind speed (m/s) with the procedural weather off. The FFT waves blend their sea states by
@@ -127,8 +133,9 @@ struct VOXELPLUGIN_API FVoxelOceanSettings
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Waves", meta = (ClampMin = "0.0", ClampMax = "1.0"))
     double WaveSwell = 0.3;
 
-    /** The detiling lattice's cell (m): the long bands blend three shifted copies over it, so
-     *  their 1 km tile doesn't repeat. 0: off. */
+    /** The detiling lattice's cell (m) for the 1 km band: every band blends three shifted copies
+     *  over a lattice this size scaled by its own tile (stage O9b3: 1,500, 363, 89 and 21 m at the
+     *  default), so no band's tile repeats. 0: off. */
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Waves", meta = (ClampMin = "0.0", UIMax = "5000.0"))
     double WaveDetileCell = 1500.0;
 
@@ -232,16 +239,45 @@ struct VOXELPLUGIN_API FVoxelOceanSettings
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Shore", meta = (EditCondition = "bShoaling", ClampMin = "0.0", UIMax = "1000.0"))
     double ShoreFadeDistance = 0.0;
 
+    /** The depth the waves feel leaves out terrain features narrower than about twice this (m):
+     *  waves don't feel bumps much shorter than themselves, and the surf's timing follows the
+     *  depth so closely on a gentle beach that the terrain's fine detail broke its crests into
+     *  spikes. Larger: smoother crests that follow the bottom less. 0: the mesh's own detail.
+     *  The land cull and the query's reported depth keep the terrain's real height. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Shore", meta = (EditCondition = "bShoaling", ClampMin = "0.0", UIMax = "50.0"))
+    double ShoreDepthSmoothing = 10.0;
+
     /** The gentlest beach slope the shoaling assumes (the land bake's coastal slope, at least). */
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Shore", AdvancedDisplay, meta = (EditCondition = "bShoaling", ClampMin = "0.0001", UIMax = "0.1"))
     double ShoreMinSlope = 0.005;
+
+    /** The ocean mesh near coasts (stage O9c): within ShoreDetailBand of the coast it is as fine
+     *  as if the camera were this many times closer, so the surf's bores keep their shape from a
+     *  few hundred metres off the beach. 1: off. Costs tiles with the camera by a coast (3: about
+     *  a third more by a straight one, up to twice as many by a busy one with islands). With the
+     *  FFT waves (their vertex code; no other wiring). */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Shore", meta = (ClampMin = "1.0", UIMax = "4.0"))
+    double ShoreDetail = 3.0;
+
+    /** The band of finer mesh (m from the coastline, the shore field's zero line: either side);
+     *  outside it the refinement fades over the camera's own distance. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Shore", AdvancedDisplay, meta = (ClampMin = "0.0", UIMax = "2000.0"))
+    double ShoreDetailBand = 300.0;
+
+    /** How far the finer mesh reaches from the camera (m, up to 2 km): it saves at most
+     *  (1 - 1 / ShoreDetail) of this distance, so far coasts stay nearly as coarse as without it.
+     *  The coast is measured to 10 km: past that, every point saves the same little (a third of a
+     *  kilometre at the defaults, from 10 km out: a percent or two more tiles there). */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Shore", AdvancedDisplay, meta = (ClampMin = "0.0", ClampMax = "2000.0"))
+    double ShoreDetailReach = 500.0;
 
     /** The shore field holds distances up to this (km); the slowing reaches no farther. */
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Shore", AdvancedDisplay, meta = (ClampMin = "1.0", UIMax = "200.0"))
     double ShoreFieldReach = 40.0;
 
     /** Inland basins below sea level lose their ocean water beyond this many land bake cells from
-     *  the sea (the bake's coast is a cell or so from the terrain's own). */
+     *  the sea (the bake's coast is a cell or so from the terrain's own): from here to 1.5 times it
+     *  the sea's surface sinks below the ground (stage O9b3), past that the basin is land. */
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Shore", AdvancedDisplay, meta = (ClampMin = "0.0", UIMax = "8.0"))
     double ShoreBasinMargin = 1.5;
 
@@ -265,6 +301,12 @@ struct VOXELPLUGIN_API FVoxelOceanSettings
      *  (0: the waterline stays put). */
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Surf", meta = (EditCondition = "bSurf", ClampMin = "0.0", UIMax = "3.0"))
     double SurfSwash = 1.0;
+
+    /** The swash's swing either side of its mean is held within this distance up and down the
+     *  beach (m, at the shore field's beach slope): on a gentle beach Stockdon's infragravity
+     *  swash alone would sweep tens of metres. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Surf", meta = (EditCondition = "bSurf", ClampMin = "1.0", UIMax = "50.0"))
+    double SurfSwashReach = 10.0;
 
     /** How far a breaking wave's landward face steepens: its front grows 1 / (1 - this) times as
      *  steep as its back once the wave is saturated (0: symmetric). */
@@ -334,11 +376,16 @@ struct VOXELPLUGIN_API FVoxelOceanSettings
         ShoreWarp = FMath::Clamp(ShoreWarp, 0.0, 2.0);
         ShoreFadeDistance = FMath::Max(ShoreFadeDistance, 0.0);
         ShoreMinSlope = FMath::Max(ShoreMinSlope, 1.0e-4);
+        ShoreDetail = FMath::Clamp(ShoreDetail, 1.0, 8.0);
+        ShoreDetailBand = FMath::Clamp(ShoreDetailBand, 0.0, 5000.0);
+        ShoreDetailReach = FMath::Clamp(ShoreDetailReach, 0.0, 2000.0);
         ShoreFieldReach = FMath::Max(ShoreFieldReach, 1.0);
         ShoreBasinMargin = FMath::Max(ShoreBasinMargin, 0.0);
+        ShoreDepthSmoothing = FMath::Clamp(ShoreDepthSmoothing, 0.0, 500.0);
         SurfStrength = FMath::Max(SurfStrength, 0.0);
         SurfSets = FMath::Clamp(SurfSets, 0.0, 1.0);
         SurfSwash = FMath::Max(SurfSwash, 0.0);
+        SurfSwashReach = FMath::Max(SurfSwashReach, 1.0);
         SurfSkew = FMath::Clamp(SurfSkew, 0.0, 0.95);
         SurfHandover = FMath::Max(SurfHandover, 1.0);
         FoamCoverage = FMath::Max(FoamCoverage, 0.0);

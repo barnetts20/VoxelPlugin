@@ -32,6 +32,7 @@
 #pragma once
 
 #include "CoreMinimal.h"
+#include "Async/Future.h"
 #include "VoxelOceanTiles.h"
 #include "VoxelOceanPages.h"
 #include "VoxelOceanWaves.h"
@@ -61,6 +62,17 @@ struct VOXELPLUGIN_API FVoxelOceanCascadeTextures
     bool IsValid() const { return Displacement && Derivatives && Charts && Foam; }
 };
 
+/** The split bias near shores (stage O9c; VoxelOceanTiles::FShoreBias): within BandM of the coast
+ *  (the shore field's distance) the mesh is as fine as if the camera were Detail times closer,
+ *  the bias fading over the camera's own distance outside it and saving at most (1 - 1 / Detail)
+ *  ReachM of distance. Detail 1: off. */
+struct FVoxelOceanShoreDetail
+{
+    double Detail = 3.0;
+    double BandM = 300.0;
+    double ReachM = 500.0;
+};
+
 /** What the surface samples the terrain with, refreshed every frame (AOceanSphereActor). */
 struct FVoxelOceanSurfaceInputs
 {
@@ -84,6 +96,8 @@ struct FVoxelOceanSurfaceInputs
      *  margin. */
     TSharedPtr<const FVoxelOceanShoreField, ESPMode::ThreadSafe> Shore;
     UTexture2DArray* ShoreTexture = nullptr;
+    /** The split bias near shores (stage O9c; live: the next selection follows it). */
+    FVoxelOceanShoreDetail ShoreDetail;
 };
 
 /** Inputs of the ocean surface, fixed until the next Initialize (LodDistanceFactor and the
@@ -155,7 +169,9 @@ public:
 private:
     VoxelOceanTiles::FSelectParams SelectParams() const;
     /** Builds the tiles' vertex words (in parallel when there are many). */
-    void BuildWrites(TConstArrayView<FVoxelOceanTileKey> Tiles, TArray<FVoxelOceanPages::FTileWrite>& Out) const;
+    /** The tiles' writes, their vertices' coast codes from Coast (stage O9c; null: none). */
+    void BuildWrites(TConstArrayView<FVoxelOceanTileKey> Tiles, TArray<FVoxelOceanPages::FTileWrite>& Out,
+        const TSharedPtr<const VoxelOceanTiles::FCoastSet, ESPMode::ThreadSafe>& Coast) const;
     /** Writes again the tiles on screen whose depth changed (SetInputs, NotifyEdit). */
     void ApplyRewrites();
     /** Writes the selection camera (world, as a float and the rest) and the morph parameters to
@@ -200,9 +216,9 @@ private:
     const UTexture2D* UploadedTexture = nullptr;
     /** The shore texture the material holds. */
     const UTexture2DArray* BoundShoreTexture = nullptr;
-    /** The shore field's expansion and the surf's settings last written into the chart texture
-     *  (rows 8 to 16 of its constants), and the table upload they were written after. */
-    FVector4f WrittenShoreFrame[9];
+    /** The shore field's expansion, the surf's settings and the split bias last written into the
+     *  chart texture (rows 8 to 17 of its constants), and the table upload they were written after. */
+    FVector4f WrittenShoreFrame[10];
     uint64 ShoreFrameUploads = 0;   // ChartUploads when it was written
     uint64 ChartUploads = 0;        // the weather's full uploads into the chart texture
     const UTexture2D* ShoreFrameTexture = nullptr;
@@ -216,6 +232,7 @@ private:
     const void* ProbeShore = nullptr;
     uint32 ProbeSequence = 0;
     double ProbeHalfFinest = 0.0;
+    double ProbeDepthFootprint = 0.0;
     bool bProbed = false;
     bool bTexturesBound = false;
     bool bReportedFFT = false;
@@ -235,6 +252,29 @@ private:
     TSet<FVoxelOceanTileKey> CommittedSplit;
     FVector SelectionCamera = FVector::ZeroVector;
     bool bHasSelectionCamera = false;
+    /** The split bias the tiles on screen were selected with (the chart table's row 17: Detail,
+     *  band and reach in cm; Detail 1 none), and whether the material can follow one (the FFT
+     *  waves drawn, the shore texture bound, the material has its parameter). */
+    FVector4f SelectionBias = FVector4f(1.0f, 0.0f, 0.0f, 0.0f);
+    bool bShoreDetailReady = false;
+    /** The bias the next selection takes (SelectParams), as the chart table's row 17 holds it. */
+    FVector4f BiasRow() const;
+    /** The coast the split bias measures from (VoxelOceanTiles::FCoastSet, from the shore field:
+     *  made off the game thread for each new field), the field it was made from, the build
+     *  running; and the coast the tiles on screen carry the codes of (a new coast writes them
+     *  all again with the next selection). */
+    TSharedPtr<const VoxelOceanTiles::FCoastSet, ESPMode::ThreadSafe> Coast;
+    const void* CoastField = nullptr;
+    TFuture<TSharedPtr<const VoxelOceanTiles::FCoastSet, ESPMode::ThreadSafe>> CoastBuild;
+    const void* CoastBuildField = nullptr;
+    TSharedPtr<const VoxelOceanTiles::FCoastSet, ESPMode::ThreadSafe> SelectionCoast;
+    /** Per node, the least coast distance the material sees over its cap (CoastCapBound), for
+     *  Coast: nodes are selected again every frame. */
+    mutable TMap<FVoxelOceanTileKey, double> CoastBounds;
+    mutable TMap<FVoxelOceanTileKey, double> CoastBoundsOld;
+    static double CoastBoundOf(const void* Context, const FVoxelOceanTileKey& Node, const FVector& CenterDir, double Angle);
+    /** Starts or takes the coast set's build for the inputs' shore field. */
+    void UpdateCoast();
     /** Nothing complete on screen yet: commits go page by page as pages get ready. */
     bool bFirstFill = true;
     bool bFlipWinding = false;

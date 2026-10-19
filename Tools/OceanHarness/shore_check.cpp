@@ -439,6 +439,84 @@ int main(int Argc, char** Argv)
     }
 
     // -----------------------------------------------------------------------------------------
+    std::printf("\n3b. The coastline (stage O9c: VoxelOceanShoreCore::Coastline, the mesh's split bias)\n");
+    {
+        const std::vector<double> Segs = VoxelOceanShoreCore::Coastline(Texels.data(), N, ReachM);
+        const size_t NumSegs = Segs.size() / 6;
+        auto SampleAt = [&](FDir D) { return VoxelOceanShoreCore::Sample(Texels.data(), N, ReachM, D.X, D.Y, D.Z); };
+        // The ends lie on the field's zero line (its bilinear reads along the texels' edges); within
+        // two cells of a face's edge the faces' own fields differ by part of a cell.
+        auto NearEdge = [&](const double* P)
+        {
+            const FVoxelOceanFacePoint FP = VoxelOceanLocate(float3(float(P[0]), float(P[1]), float(P[2])));
+            return std::max(std::abs(FP.S), std::abs(FP.T)) > 1.0f - 4.0f / float(N);
+        };
+        double WorstEnd = 0.0, WorstEdgeEnd = 0.0;
+        for (size_t i = 0; i < NumSegs; i++)
+            for (int e = 0; e < 2; e++)
+            {
+                const double* P = &Segs[i * 6 + e * 3];
+                const double D = std::abs(double(SampleAt({ P[0], P[1], P[2] }).Distance));
+                if (NearEdge(P)) WorstEdgeEnd = std::max(WorstEdgeEnd, D);
+                else WorstEnd = std::max(WorstEnd, D);
+            }
+        std::printf("  %zu segments; their ends within %.1f m (%.4f cells) of the field's zero line, %.3f cells by a face's edge\n", NumSegs, WorstEnd,
+            WorstEnd / CellM, WorstEdgeEnd / CellM);
+        Check(NumSegs > 100, "a coastline found", double(NumSegs), 100.0);
+        Check(WorstEnd < 0.01 * CellM, "the segments' ends on the field's zero line (0.01 cell)", WorstEnd / CellM, 0.01);
+        Check(WorstEdgeEnd < 0.5 * CellM, "by a face's edge, within the faces' own difference (0.5 cell)", WorstEdgeEnd / CellM, 0.5);
+        // Every point of the zero line lies near a segment: points where the field is near zero,
+        // found along random great-circle walks.
+        std::mt19937 R4(7);
+        std::normal_distribution<double> G4;
+        double WorstGap = 0.0, WorstEdgeGap = 0.0;
+        int Found = 0;
+        for (int w = 0; w < 200 && Found < 600; w++)
+        {
+            FDir A = Norm({ G4(R4), G4(R4), G4(R4) }), B = Norm({ G4(R4), G4(R4), G4(R4) });
+            double Last = SampleAt(A).Distance;
+            auto At = [&](double T) { return Norm({ A.X + (B.X - A.X) * T, A.Y + (B.Y - A.Y) * T, A.Z + (B.Z - A.Z) * T }); };
+            for (int k = 1; k <= 4000; k++)
+            {
+                const double T = k / 4000.0;
+                const double D = SampleAt(At(T)).Distance;
+                if ((D < 0.0) != (Last < 0.0) && std::abs(D) < 0.05 * CellM)
+                {
+                    // Onto the zero line: bisection between the two samples.
+                    double Lo = (k - 1) / 4000.0, Hi = T;
+                    const bool bLoSea = Last >= 0.0;
+                    for (int b = 0; b < 30; b++)
+                    {
+                        const double Mid = 0.5 * (Lo + Hi);
+                        if ((SampleAt(At(Mid)).Distance >= 0.0) == bLoSea) Lo = Mid; else Hi = Mid;
+                    }
+                    const FDir P = At(0.5 * (Lo + Hi));
+                    double Best = 1e30;
+                    for (size_t i = 0; i < NumSegs; i++)
+                    {
+                        const double* S0 = &Segs[i * 6];
+                        const double E[3] = { S0[3] - S0[0], S0[4] - S0[1], S0[5] - S0[2] };
+                        const double Wv[3] = { P.X - S0[0], P.Y - S0[1], P.Z - S0[2] };
+                        const double L2 = E[0] * E[0] + E[1] * E[1] + E[2] * E[2];
+                        const double U = L2 > 0.0 ? std::clamp((Wv[0] * E[0] + Wv[1] * E[1] + Wv[2] * E[2]) / L2, 0.0, 1.0) : 0.0;
+                        const double DX = Wv[0] - E[0] * U, DY = Wv[1] - E[1] * U, DZ = Wv[2] - E[2] * U;
+                        Best = std::min(Best, DX * DX + DY * DY + DZ * DZ);
+                    }
+                    const double Pd[3] = { P.X, P.Y, P.Z };
+                    double& Worst = NearEdge(Pd) ? WorstEdgeGap : WorstGap;
+                    Worst = std::max(Worst, std::sqrt(Best) * RadiusM);
+                    Found++;
+                }
+                Last = D;
+            }
+        }
+        std::printf("  %d points of the zero line: the nearest segment within %.1f m (%.4f cells), %.3f cells by a face's edge\n", Found, WorstGap,
+            WorstGap / CellM, WorstEdgeGap / CellM);
+        Check(Found > 50 && WorstGap < 0.1 * CellM, "the zero line covered by the segments (0.1 cell)", WorstGap / CellM, 0.1);
+        Check(WorstEdgeGap < 0.5 * CellM, "by a face's edge, within the faces' own difference (0.5 cell)", WorstEdgeGap / CellM, 0.5);
+    }
+
+    // -----------------------------------------------------------------------------------------
     std::printf("\n4. Shoaling maths (VoxelOceanShoal.ush)\n");
     {
         // The dispersion against bisection in double.

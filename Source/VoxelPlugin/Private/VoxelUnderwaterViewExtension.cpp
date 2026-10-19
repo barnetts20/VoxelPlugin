@@ -69,6 +69,9 @@ BEGIN_SHADER_PARAMETER_STRUCT(FVoxelUnderwaterParameters, )
     SHADER_PARAMETER(FMatrix44f, UnderwaterClipToCamera)
     SHADER_PARAMETER_STRUCT_INCLUDE(FVoxelUnderwaterWaveParameters, Waves)
     SHADER_PARAMETER_RDG_TEXTURE(Texture2DArray<float>, UnderwaterMap)
+    // The foam map and the foam's colour from below (stage O9c).
+    SHADER_PARAMETER_RDG_TEXTURE(Texture2DArray<float>, UnderwaterFoamMap)
+    SHADER_PARAMETER(FVector4f, UnderwaterFoamColor)
 
     SHADER_PARAMETER(FVector3f, UnderwaterAbsorption)
     SHADER_PARAMETER(FVector3f, UnderwaterScattering)
@@ -107,6 +110,11 @@ IMPLEMENT_GLOBAL_SHADER(FVoxelUnderwaterCS, "/Plugin/VoxelPlugin/Private/VoxelUn
 BEGIN_SHADER_PARAMETER_STRUCT(FVoxelUnderwaterMapParameters, )
     SHADER_PARAMETER_STRUCT_INCLUDE(FVoxelUnderwaterWaveParameters, Waves)
     SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2DArray<float>, UnderwaterMapOut)
+    // The foam map (stage O9c) from the cascades' foam.
+    SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2DArray<float>, UnderwaterFoamMapOut)
+    SHADER_PARAMETER_TEXTURE(Texture2DArray, UnderwaterFoam)
+    SHADER_PARAMETER_SAMPLER(SamplerState, UnderwaterFoamSampler)
+    SHADER_PARAMETER(uint32, UnderwaterFoamOn)
     // The shore (stage O8): the field's texture and the depth probe (VoxelOceanDepthProbe.h).
     SHADER_PARAMETER_TEXTURE(Texture2DArray, UnderwaterShore)
     SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<float>, UnderwaterProbe)
@@ -162,10 +170,12 @@ void FVoxelUnderwaterViewExtension::SetFrame_GameThread(const FVoxelUnderwaterPa
             Self->DisplacementRHI = RHIOf(Snapshot.Displacement);
             Self->DerivativesRHI = RHIOf(Snapshot.Derivatives);
             Self->ChartsRHI = RHIOf(Snapshot.Charts);
+            Self->FoamRHI = RHIOf(Snapshot.Foam);
             Self->Params = Snapshot;
             Self->Params.Displacement = nullptr;
             Self->Params.Derivatives = nullptr;
             Self->Params.Charts = nullptr;
+            Self->Params.Foam = nullptr;
             Self->bHasFrame = true;
         });
 }
@@ -307,11 +317,22 @@ FScreenPassTexture FVoxelUnderwaterViewExtension::Render_RenderThread(
         FRDGTextureDesc::Create2DArray(FIntPoint(MapSize, MapSize), PF_R32_FLOAT, FClearValueBinding::Black,
             TexCreate_ShaderResource | TexCreate_UAV, MapLevels),
         TEXT("VoxelUnderwater.SurfaceMap"));
+    // The foam of the surface above each map point (stage O9c), half floats.
+    FRDGTextureRef FoamMap = GraphBuilder.CreateTexture(
+        FRDGTextureDesc::Create2DArray(FIntPoint(MapSize, MapSize), PF_R16F, FClearValueBinding::Black,
+            TexCreate_ShaderResource | TexCreate_UAV, MapLevels),
+        TEXT("VoxelUnderwater.FoamMap"));
+    FRHITexture* Foam = FoamRHI.GetReference();
+    const bool bFoam = bFFT && Foam && Params.FoamColor.W > 0.0f;
     if (bFFT)
     {
         FVoxelUnderwaterMapParameters* P = GraphBuilder.AllocParameters<FVoxelUnderwaterMapParameters>();
         P->Waves = WaveP;
         P->UnderwaterMapOut = GraphBuilder.CreateUAV(Map);
+        P->UnderwaterFoamMapOut = GraphBuilder.CreateUAV(FoamMap);
+        P->UnderwaterFoam = bFoam ? Foam : GBlackArrayTexture->TextureRHI.GetReference();
+        P->UnderwaterFoamSampler = TStaticSamplerState<SF_Trilinear, AM_Wrap, AM_Wrap, AM_Clamp>::GetRHI();
+        P->UnderwaterFoamOn = bFoam ? 1u : 0u;
         // The shore field's texture, or a stand-in (the waves then see no field: States.x is 0
         // without one, VoxelOceanWaveShaderParams).
         FRHITexture* ShoreTexture = Params.Shore.IsValid() ? Params.Shore->Texture.GetReference() : nullptr;
@@ -358,6 +379,7 @@ FScreenPassTexture FVoxelUnderwaterViewExtension::Render_RenderThread(
     else
     {
         AddClearUAVPass(GraphBuilder, GraphBuilder.CreateUAV(Map), FLinearColor::Black);
+        AddClearUAVPass(GraphBuilder, GraphBuilder.CreateUAV(FoamMap), FLinearColor::Black);
     }
 
     // -- The view through the water -----------------------------------------------------------
@@ -374,6 +396,8 @@ FScreenPassTexture FVoxelUnderwaterViewExtension::Render_RenderThread(
         P->UnderwaterClipToCamera = FMatrix44f(ClipToCamera);
         P->Waves = WaveP;
         P->UnderwaterMap = Map;
+        P->UnderwaterFoamMap = FoamMap;
+        P->UnderwaterFoamColor = bFoam ? Params.FoamColor : FVector4f::Zero();
 
         P->UnderwaterAbsorption = Params.Absorption;
         P->UnderwaterScattering = Params.Scattering;

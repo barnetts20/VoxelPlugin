@@ -533,4 +533,45 @@ VOXEL_FUNC float VoxelOceanShoreCoverage(float Distance, float CellM)
     return saturate(0.5f + Distance / max(CellM, 1.0e-3f));
 }
 
+// THE BED'S SLOPE (stage O9b2): the smoothed bottom's slope toward the coast (m per m along the
+// field's landward direction, plus where the bottom rises landward) at a tile vertex
+// (VoxelOceanPage.usf) or a probe point, in 8 bits: 0 unknown, 128 level, 128 + q and 128 - q
+// (q 1 to 127) for slopes of magnitude 2^(LOG2_MIN + (q - 1) (LOG2_MAX - LOG2_MIN) / 126), 0.0005
+// to 2 (6.8% apart). Three codes to a float (a vertex's, its morph target's and the target's
+// target's: c0 + 256 c1 + 65536 c2, an integer a float holds exactly).
+#define VOXEL_OCEAN_BED_LOG2_MIN (-11.0f)
+#define VOXEL_OCEAN_BED_LOG2_MAX 1.0f
+// An unknown slope (no field direction there, or far from any surf): the field's slope stands in.
+#define VOXEL_OCEAN_BED_UNKNOWN (-1.0e4f)
+
+VOXEL_FUNC uint VoxelOceanBedCode(float Slope)
+{
+    const float A = abs(Slope);
+    if (!(A >= exp2(VOXEL_OCEAN_BED_LOG2_MIN))) return 128u;
+    const float Q = clamp(floor((log2(A) - VOXEL_OCEAN_BED_LOG2_MIN) * (126.0f / (VOXEL_OCEAN_BED_LOG2_MAX - VOXEL_OCEAN_BED_LOG2_MIN)) + 0.5f), 0.0f, 126.0f);
+    const uint Q1 = 1u + uint(Q);
+    return Slope > 0.0f ? 128u + Q1 : 128u - Q1;
+}
+
+VOXEL_FUNC float VoxelOceanBedSlopeOf(uint Code)
+{
+    if (Code == 0u) return VOXEL_OCEAN_BED_UNKNOWN;
+    if (Code == 128u) return 0.0f;
+    const int Q = int(Code) - 128;
+    const float M = exp2(VOXEL_OCEAN_BED_LOG2_MIN + float(abs(Q) - 1) * ((VOXEL_OCEAN_BED_LOG2_MAX - VOXEL_OCEAN_BED_LOG2_MIN) / 126.0f));
+    return Q > 0 ? M : -M;
+}
+
+VOXEL_FUNC float VoxelOceanBedPack(uint C0, uint C1, uint C2)
+{
+    return float((C0 & 255u) + 256u * (C1 & 255u) + 65536u * (C2 & 255u));
+}
+
+// Code Index (0 to 2) of a packed float.
+VOXEL_FUNC uint VoxelOceanBedCodeAt(float Packed, int Index)
+{
+    const uint P = uint(max(Packed, 0.0f) + 0.5f);
+    return Index == 0 ? (P & 255u) : (Index == 1 ? ((P >> 8u) & 255u) : ((P >> 16u) & 255u));
+}
+
 #endif // VOXEL_OCEAN_SHORE_USH

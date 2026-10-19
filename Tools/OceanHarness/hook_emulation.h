@@ -91,6 +91,8 @@ struct FParams
     FVoxelOceanShoreFrame Frame = VoxelOceanShoreFrameNone();
     /** The surf's settings (the chart table's rows 15 and 16). */
     FVector4f Surf0 = FVector4f(0.0f, 0.0f, 0.0f, 0.0f), Surf1 = FVector4f(0.0f, 0.0f, 0.0f, 0.0f);
+    /** The basins' margin (m; the frame's row 9 z, stage O9b3). */
+    float Margin = 0.0f;
 };
 inline FParams ParamsOf(const FVoxelOceanWaveShaderParams& P)
 {
@@ -100,6 +102,7 @@ inline FParams ParamsOf(const FVoxelOceanWaveShaderParams& P)
     W.Frame = VoxelOceanShoreCore::FrameFrom(T);
     W.Surf0 = P.Surf[0];
     W.Surf1 = P.Surf[1];
+    W.Margin = P.ShoreFrame[1].Z;
     return W;
 }
 
@@ -119,6 +122,8 @@ struct FShore
     float Distance = 1.0e30f;   // cm; VOXEL_OCEAN_DEEP: none
     float3 Direction = float3(0.0f, 0.0f, 0.0f);
     float Slope = 0.02f;
+    float BedSlope = VOXEL_OCEAN_BED_UNKNOWN;    // stage O9b2
+    float BedDepth = 1.0e30f;
 };
 constexpr float Deep = 1.0e30f;
 
@@ -173,18 +178,19 @@ inline FBands ChartLookups(const FTextures& Tx, FVoxelOceanChartCoords LongCoord
     const FVoxelOceanShoal& Shoal, float2 LongShore, float2 ShortShore)
 {
     FBands Out { VoxelOceanFFTSampleZero(), VoxelOceanFFTSampleZero() };
-    const FVoxelOceanDetile Detile = VoxelOceanDetileOf(Plane, W.FFT.Z, uint32_t(W.FFT.W));
     const float Bias = W.RefHigh.W;
     const bool bShoal = Shoal.Active > 0.0f;
     for (int B = 0; B < 4; B++)
     {
+        // The band's own lattice (stage O9b3).
+        const FVoxelOceanDetile Detile = VoxelOceanDetileOfBand(Plane, W.FFT.Z, uint32_t(W.FFT.W), B, float4(W.Tiles.X, W.Tiles.Y, W.Tiles.Z, W.Tiles.W));
         const float Amp = bShoal ? VoxelOceanShoalComponent(Shoal.Amp, B) : 1.0f;
         if (Amp <= 0.0f) continue;
         const float Stretch = bShoal ? VoxelOceanShoalComponent(Shoal.Stretch, B) : 0.0f;
         const float L = Comp(W.Tiles, B);
         const float InvL = 1.0f / L;
         const float TexelsPerCm = 0.01f * 256.0f * InvL * (1.0f + Stretch);
-        const float LodD = std::log2(std::max(Spacing * TexelsPerCm, 1.0f)) + Bias;
+        const float LodD = std::log2(std::max(2.0f * Spacing * TexelsPerCm, 1.0f)) + Bias;   // VOXEL_OCEAN_FFT_MESH_TEXEL (O9b2)
         const float LodN = std::log2(std::max(Footprint * TexelsPerCm, 1.0f)) + Bias;
         if (LodD >= 8.0f && (!(Mask & 2u) || LodN >= 8.0f)) continue;   // VOXEL_OCEAN_FFT_TOP_MIP
         const float Half = 0.5f * L / 256.0f;
@@ -213,8 +219,15 @@ inline FBands ChartLookups(const FTextures& Tx, FVoxelOceanChartCoords LongCoord
         {
             const float Scale = B == 2 ? Sea.Short2 : Sea.Short3;
             if (Scale <= 0.0f || W.bLongOnly) continue;
-            const float U = VoxelOceanWrap(ShortCoords.Base.x, ShortCoords.Offset.x + Warp.x + Half, InvL), V = VoxelOceanWrap(ShortCoords.Base.y, ShortCoords.Offset.y + Warp.y + Half, InvL);
-            Band = VoxelOceanFFTSampleMad(Band, Scale, Lookup(Tx, U, V, 4 + B, LodD, LodN, Mask));
+            for (int Copy = 0; Copy < 3; Copy++)
+            {
+                if ((Copy == 1 && Detile.Weight.y <= 0.0f) || (Copy == 2 && Detile.Weight.z <= 0.0f)) continue;
+                const float2 Shift = Copy == 0 ? Detile.Offset0 : (Copy == 1 ? Detile.Offset1 : Detile.Offset2);
+                const float WCopy = Copy == 0 ? Detile.Weight.x : (Copy == 1 ? Detile.Weight.y : Detile.Weight.z);
+                const float U = VoxelOceanWrap(ShortCoords.Base.x, ShortCoords.Offset.x + Shift.x + Warp.x + Half, InvL);
+                const float V = VoxelOceanWrap(ShortCoords.Base.y, ShortCoords.Offset.y + Shift.y + Warp.y + Half, InvL);
+                Band = VoxelOceanFFTSampleMad(Band, Scale * WCopy, Lookup(Tx, U, V, 4 + B, LodD, LodN, Mask));
+            }
         }
         if (bShoal)
             Band = VoxelOceanShoalSample(Band, Amp, VoxelOceanShoalComponent(Shoal.Chop, B), Stretch, E);
@@ -307,6 +320,9 @@ inline FSurfAt SurfAt(float3 D, float Depth, const FShore& Shore, const FVoxelOc
     In.Time = W.SlopeVar.W;
     In.SpacingM = Spacing * 0.01f;
     In.FootprintM = Footprint * 0.01f;
+    In.BedSlope = Shore.BedSlope;
+    In.BedDepthM = Shore.BedDepth < 0.5f * Deep ? Shore.BedDepth * 0.01f : 1.0e30f;
+    In.ForNormals = 0.0f;
     Out.Surf = VoxelOceanSurfOf(In, Settings);
     Out.Dir = Agree > 1.0e-12f ? DirP * (1.0f / std::sqrt(Agree)) : float3(0.0f, 0.0f, 0.0f);
     return Out;
@@ -350,6 +366,20 @@ inline FPoint HookEvaluate(const FTextures& Tx, float3 P, float3 Up, float Spaci
         A.Height += Surf.Surf.Height * 100.0f;
         A.Gradient = A.Gradient + Surf.Dir * Surf.Surf.Gradient;
         A.VelocityUp += Surf.Surf.Rate * 100.0f;
+    }
+    // The drain toward inland basins (stage O9b3), as the hook.
+    if (W.States.X > 0.5f && W.States.Y > 0.0f && Shore.Distance < 0.5f * Deep)
+    {
+        const float Bed = Shore.BedSlope > VOXEL_OCEAN_SURF_BED_KNOWN ? Shore.BedSlope : Shore.Slope;
+        const FVoxelOceanSurfDrain Drain = VoxelOceanSurfDrainOf(Shore.Distance * 0.01f, Depth < 0.5f * Deep ? Depth * 0.01f : 1.0e30f, Bed, W.Margin);
+        if (Drain.Keep < 1.0f)
+        {
+            const float3 DirP = RotateBack(W.Rotation, Shore.Direction);
+            const float L2 = dot(DirP, DirP);
+            A = VoxelOceanFFTAccumScale(A, Drain.Keep);
+            A.Height -= Drain.Drop * 100.0f;
+            if (L2 > 1.0e-12f) A.Gradient = A.Gradient - DirP * (Drain.Slope / std::sqrt(L2));
+        }
     }
     // Each band's slope variance, shoaled as its slopes are (amplitude and stretch), as the hook.
     float4 SlopeVar(0, 0, 0, 0);

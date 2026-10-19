@@ -100,6 +100,24 @@ VOXEL_FUNC FVoxelOceanFFTAccum VoxelOceanFFTAccumZero()
     return A;
 }
 
+// Every wave in the sum scaled by K (stage O9b3: the drain near inland basins).
+VOXEL_FUNC FVoxelOceanFFTAccum VoxelOceanFFTAccumScale(FVoxelOceanFFTAccum A, float K)
+{
+    FVoxelOceanFFTAccum R = A;
+    R.Height = K * A.Height;
+    R.Displacement = A.Displacement * K;
+    R.Gradient = A.Gradient * K;
+    R.J11 = K * A.J11;
+    R.J22 = K * A.J22;
+    R.J33 = K * A.J33;
+    R.J12 = K * A.J12;
+    R.J13 = K * A.J13;
+    R.J23 = K * A.J23;
+    R.VelocityUp = K * A.VelocityUp;
+    R.VelocityH = A.VelocityH * K;
+    return R;
+}
+
 // One chart's lookups (summed in its downwind frame), weighed by the chart's weight.
 VOXEL_FUNC FVoxelOceanFFTAccum VoxelOceanFFTAccumAdd(FVoxelOceanFFTAccum A, FVoxelOceanChart C, float2 Wind, float Weight, FVoxelOceanFFTSample S)
 {

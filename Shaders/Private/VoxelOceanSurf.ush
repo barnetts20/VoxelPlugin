@@ -26,31 +26,47 @@
 // up toward the beach, along the depth's contours (refraction's look), and Phi(0) = 0 (the slope
 // changes the phase only as far out as the waves reach, not at the shoreline).
 //
-// THE WAVE at d > 0: a deep-water height H0 (the long bands' significant height, the sets'
-// factors) shoaled by Ks = sqrt(r / 2n) (capped at 2), held under Breaking x d smoothly (as the
-// FFT's cap): Hc. Its profile (VoxelOceanSurfProfileOf) runs from the crest down the back to the
-// trough over 1 - F of the period and back up the front over F, half a cosine each (C1, its mean
-// the still level): F one half is a cosine; as the wave saturates (H / Breaking d past 0.4) F
-// falls to (1 - Skew) / 2, a bore whose front is (1 - F) / F times as steep as its back. F is held
-// above what the mesh spacing (the height) or the pixel footprint (the gradient) resolves.
+// THE WAVE at d > 0: a deep-water height H0 = Hs / sqrt 2 (the long bands' root-mean-square wave
+// height: a train of it carries the energy the long bands hand over; the sets' factors on top)
+// shoaled by Ks = sqrt(r / 2n) (capped at 2), held under Index x d smoothly (as the FFT's cap):
+// Hc. Index = VOXEL_OCEAN_SURF_INNER x Breaking (0.55 at the default 0.78): a broken wave's
+// height in the surf zone is about half the depth (bores run at 0.5 to 0.6; 0.78 is a single
+// wave's at the moment it breaks). Its profile (VoxelOceanSurfProfileOf) runs from the crest
+// down the back to the trough over 1 - F of the period and back up the front over F, half a
+// cosine each (C1, its mean the still level): F one half is a cosine; as the wave saturates
+// (H / Index d past 0.4) F falls to (1 - Skew) / 2, a bore whose front is (1 - F) / F times as
+// steep as its back. F is held above what the mesh spacing (the height: VOXEL_OCEAN_SURF_MESH_FRONT
+// spacings) or the pixel footprint (the gradient: 2) resolves: the mesh keeps a front it can carry
+// without a sawtooth, the normals the sharp one.
 //
-// THE SWASH: the shoreline's level by Stockdon et al. (2006), each term x 1.1 (their R2):
-//   zeta = setup + S_inc / 2 f(theta0 - lag) + S_ig / 2 cos(group phase),
-//   setup = 0.35 b sqrt(H0 L0), S_inc = 0.75 b sqrt(H0 L0), S_ig = 0.06 sqrt(H0 L0)
-// (b the beach slope held under 0.1, L0 = g T^2 / 2 pi; held under 0.3, 0.8 and 0.5 H0): the
-// incident swash rides each bore (f the profile with a quick uprush, F 0.35, starting as the
-// bore's crest reaches the shoreline: lag = 2 pi 0.35), the infragravity swash (most of it on a
-// gentle beach) rides the groups. Above the still level (d <= 0) the water is that level, flat:
+// THE SWASH: the shoreline's level by Stockdon et al. (2006), as a mean and swings with the
+// variance of theirs (their S is a significant swash height, 4 sigma: a swing of amplitude
+// sqrt 2 sigma = S sqrt 2 / 4 has its variance; their R2 = 1.1 (setup + S / 2) is the 2% run-up,
+// not the typical one):
+//   zeta = setup + q (A_inc f(theta0 - lag) + A_ig cos(group phase)),
+//   setup = 0.35 b sqrt(H0 L0), A_inc = (sqrt 2 / 4) 0.75 b sqrt(H0 L0), A_ig = (sqrt 2 / 4) 0.06 sqrt(H0 L0)
+// (b the beach slope held under 0.1, L0 = g T^2 / 2 pi, H0 the deep significant height; held under
+// 0.3, 0.5 and 0.32 H0): the incident swash rides each bore (f the profile with a quick uprush,
+// F 0.35, starting as the bore's crest reaches the shoreline: lag = 2 pi 0.35), the infragravity
+// swash (most of it on a gentle beach) rides the groups. q holds the swings within SwashReach
+// metres of the mean up and down the beach (at the beach's slope b: within SwashReach x b of
+// height, smoothly: q = 1 / (1 + (A / (SwashReach b))^4)^(1/4), A the two swings' sum): the
+// infragravity swash doesn't shrink with the slope, so on a gentle beach it would sweep tens of
+// metres. b, here, in Stockdon's terms and in the blend's width, is the bed's slope (stage O9b3;
+// held above a twentieth of the field's), so on a flat the swash hardly moves. Above the still level (d <= 0) the water is that level, flat:
 // the terrain hides it where it stands higher, so the waterline climbs the beach and falls back
 // below the still level in the backwash (the wet sand shows). Within Dsw of depth (half the
 // waves' wavelength at the swash's depth along the beach, so the last bore runs into it) the
 // sea's surface (the wave and the surf zone's setup) blends into it. It fades out past 1.5 km
-// inland by the field's distance (low ground behind the beach stays dry), and with the field's
-// agreement (no swash between two coasts).
+// inland by the field's distance (on both sides of the still level: stage O9b3), and with the
+// field's agreement (no swash between two coasts). On land the sheet reaches only 1.5 to 3 times
+// SwashReach up the beach from the still waterline (the ground's height over the bed's slope:
+// stage O9b3), so a plain near sea level isn't covered by it.
 //
 // THE SETS: per wave a group factor 1 + 0.4 Sets cos(group phase), the group phase theta / GROUP
 // plus a 1.6 km noise (groups of GROUP waves, shifted along the coast), a 410 m noise drifting
-// over 2 minutes on the heights, and a 610 m noise on the phase (up to half a period either way):
+// over 2 minutes on the heights (up to 30% either way), and a 610 m noise on the phase (up to half
+// a period either way):
 // the coast doesn't break all at once. The noises' point comes as whole units of 4096 cm and the
 // rest (cm): the waves' reference point's own split (W.RefHigh, W.RefLow) plus the offset from it,
 // so the noise is exact to a fraction of a millimetre anywhere on the planet (a float position
@@ -60,13 +76,16 @@
 // THE HANDOVER: within max(Handover x Hs / Breaking, 2 m) of depth (Hs the long bands'
 // significant height) the surf takes the long bands' energy: the trains' amplitude w = 1 -
 // smoothstep(0.4, 1, d / that depth), times the field's agreement (|e|^2: between two coasts the
-// surf fades, as the warp); the long bands keep sqrt(1 - w^2) (VoxelOceanShoalSettings::LongKeep,
-// before the FFT's breaking cap). Both C1 at the handover's edge.
+// surf fades, as the warp); the long bands keep sqrt(1 - t^2) (VoxelOceanShoalSettings::LongKeep,
+// before the FFT's breaking cap), t the part of w the trains show (stage O9b3: w by the bed's hold
+// and by how far the mesh resolves them, by energy): energy the trains can't show stays with the
+// long bands, so no band of calm opens where they're too short to draw. Both C1 at the
+// handover's edge.
 //
 // FOAM (stage O9b): a bore makes white water on its face and leaves a trail behind its crest,
 // e^(-u / 0.25) over the cycle u since the crest passed (VOXEL_OCEAN_SURF_FOAM_TRAIL; shifted to
 // nothing at the trough, where the face's begins), on a carpet of a quarter of it, all times its
-// saturation (H / Breaking d past 0.4); where the footprint doesn't resolve the wave, the pattern
+// saturation (H / Index d past 0.4); where the footprint doesn't resolve the wave, the pattern
 // fades to its cycle's mean (VoxelOceanSurfResolved: no stripes far away); the swash's sheet
 // is foamy where it runs thin (its thickness, the level less the bed: e^(-h / 6 cm)) and a fifth
 // foam over the rest. Times Foam (the settings' surf foam); the open sea's foam is
@@ -75,8 +94,25 @@
 // GRADIENT: the surf is a function of d, so its gradient is d eta / d d times the depth's
 // gradient, taken as -m e (the field's slope toward the coast); the noises' gradients and the
 // gain's are left out. RESOLUTION: a train's wave is weighed by how well the mesh spacing (the
-// height) or the pixel footprint (the gradient) resolves its local wavelength (VoxelOceanResolved's
-// rule); the swash and the setup are levels and stay.
+// height: VoxelOceanSurfMeshResolved, fully from 8 spacings a wavelength, nothing under 4) or the
+// pixel footprint (the gradient: VoxelOceanResolved's rule, fully from 4) resolves its local
+// wavelength, so a wave too short for the mesh moves the normals only; the swash and the setup
+// are levels and stay.
+//
+// THE DEPTH (stage O9b2): the depth the waves feel is the terrain's with features narrower than
+// about twice the shore's depth footprint left out (VoxelOceanPage.usf): the phase turns by
+// k r / m radians per metre of depth (10 per metre at 1:50 for a 10 s wave a metre deep), so
+// the terrain's fine detail would scatter neighbouring vertices to unrelated phases.
+//
+// THE BED (stage O9b2): the phase spaces the crests by the field's slope m, but the depth falls
+// landward at the bed's own slope b (the smoothed bottom's, BedSlope; m where unknown): on the
+// ground the waves are m / b times their local wavelength. That length (Ground) is what the
+// mesh and the footprint resolve and what the fronts are held to, and b (held within 2 either
+// way) is the depth's gradient the surf's own gradient follows. Where the bottom is much flatter
+// than m (b / m under 0.35, none under 0.05) or rises seaward (behind a bar), the phase would
+// stall or run backward: the trains fade out there, and the long bands take their energy back
+// (stage O9b3: holding it back left calm patches). The swash takes the bed's slope too (stage
+// O9b3), so its level follows the beach it runs up.
 //
 // Lengths: m; the clock: s (wrapped).
 
@@ -110,12 +146,32 @@
 // The bore's foam trail behind its crest (of the cycle), the swash's foamy thickness (m).
 #define VOXEL_OCEAN_SURF_FOAM_TRAIL 0.25f
 #define VOXEL_OCEAN_SURF_FOAM_THIN 0.06f
-// The groups' weight per Sets.
+// The groups' weight per Sets; the heights' drift along the coast per Sets (either way).
 #define VOXEL_OCEAN_SURF_GROUP_WEIGHT 0.4f
+#define VOXEL_OCEAN_SURF_DRIFT 0.3f
+// The trains' deep height per significant height (root mean square: the long bands' energy).
+#define VOXEL_OCEAN_SURF_RMS 0.70710678f
+// The bores' height index per breaking index (a broken wave's height over the depth).
+#define VOXEL_OCEAN_SURF_INNER 0.7f
+// A swing's amplitude per significant swash height (sqrt 2 / 4: the same variance).
+#define VOXEL_OCEAN_SURF_SWING 0.35355339f
+// The mesh: the least front, in spacings, the height keeps.
+#define VOXEL_OCEAN_SURF_MESH_FRONT 4.0f
+// The bed (stage O9b2): slopes above this are known (VOXEL_OCEAN_BED_UNKNOWN below); the trains
+// fade out as the bed's slope falls from FADE1 to FADE0 of the field's; the slope is held within
+// MAX either way.
+#define VOXEL_OCEAN_SURF_BED_KNOWN (-1000.0f)
+#define VOXEL_OCEAN_SURF_BED_FADE0 0.05f
+#define VOXEL_OCEAN_SURF_BED_FADE1 0.35f
+#define VOXEL_OCEAN_SURF_BED_MAX 2.0f
 // The handover's least depth (m; past the blend into the swash's level, at most 2 m).
 #define VOXEL_OCEAN_SURF_MIN_REACH 2.0f
 // The swash fades out inland by the field's distance (m).
 #define VOXEL_OCEAN_SURF_INLAND 1500.0f
+// The swash's sheet reaches up the beach this many times its reach, fading out by the second
+// (stage O9b3).
+#define VOXEL_OCEAN_SURF_SHEET0 1.5f
+#define VOXEL_OCEAN_SURF_SHEET1 3.0f
 // The noises' unit (cm): the reference's split (VoxelOceanCharts.h, SplitHigh).
 #define VOXEL_OCEAN_SURF_UNIT 4096.0f
 
@@ -248,7 +304,8 @@ VOXEL_FUNC FVoxelOceanSurfProfile VoxelOceanSurfProfileOf(float Theta, float Fro
 
 // The settings, as the shaders get them (the chart table's constants, rows 15 and 16, written
 // with the shore frame by the surface; FVoxelOceanWaveShaderParams::Surf): Row0 = (strength, sets,
-// swash, skew), Row1 = (handover, unused...). Breaking: the shoaling's breaking index.
+// swash, skew), Row1 = (handover, surf foam, open foam, swash reach m). Breaking: the shoaling's
+// breaking index.
 struct FVoxelOceanSurfSettings
 {
     float Strength;     // 0: no surf
@@ -259,6 +316,7 @@ struct FVoxelOceanSurfSettings
     float Breaking;
     float Foam;         // the surf's foam (stage O9b; 0 none)
     float OpenFoam;     // the open sea's foam coverage (stage O9b, VoxelOceanFoam.ush; 0 none)
+    float SwashReach;   // the swash's swings held within this up and down the beach (m; 0 no limit; stage O9b2)
 };
 
 VOXEL_FUNC FVoxelOceanSurfSettings VoxelOceanSurfSettingsOf(float4 Row0, float4 Row1, float Breaking)
@@ -272,23 +330,25 @@ VOXEL_FUNC FVoxelOceanSurfSettings VoxelOceanSurfSettingsOf(float4 Row0, float4 
     S.Breaking = Breaking;
     S.Foam = max(Row1.y, 0.0f);
     S.OpenFoam = max(Row1.z, 0.0f);
+    S.SwashReach = max(Row1.w, 0.0f);
     return S;
 }
 
 // The highest the surf can stand above the still level (m) for the long bands' significant height
 // Hs: the drift's and the groups' most; the swash by Stockdon's terms at the steepest slope they
-// take (0.1) and the longest period, within their caps; a crest at the cap with a gain of 1.6.
+// take (0.1) and the longest period, within their caps (the reach's hold left out); a crest at
+// the cap with a gain of 1.6.
 VOXEL_FUNC float VoxelOceanSurfMaxHeight(float Hs, FVoxelOceanSurfSettings S)
 {
     if (S.Strength <= 0.0f || S.Breaking <= 0.0f) return 0.0f;
-    const float Most = Hs * S.Strength * (1.0f + 0.5f * S.Sets);
+    const float Most = Hs * S.Strength * (1.0f + VOXEL_OCEAN_SURF_DRIFT * S.Sets);
     const float Grouped = 1.0f + VOXEL_OCEAN_SURF_GROUP_WEIGHT * S.Sets;
     const float L0 = VOXEL_OCEAN_SHOAL_GRAVITY * VOXEL_OCEAN_SURF_MAX_PERIOD * VOXEL_OCEAN_SURF_MAX_PERIOD / VOXEL_OCEAN_SURF_TWO_PI;
     const float Root = sqrt(Most * L0);
-    const float Setup = S.Swash * min(1.1f * 0.35f * 0.1f * Root, 0.3f * Most);
-    const float Incident = S.Swash * min(1.1f * 0.5f * 0.75f * 0.1f * sqrt(Grouped) * Root, 0.8f * Grouped * Most);
-    const float Infragravity = S.Swash * min(1.1f * 0.5f * 0.06f * Root, 0.5f * Most);
-    const float Crest = Setup + 0.5f * 0.84f * 1.6f * Grouped * Most;
+    const float Setup = S.Swash * min(0.35f * 0.1f * Root, 0.3f * Most);
+    const float Incident = S.Swash * min(VOXEL_OCEAN_SURF_SWING * 0.75f * 0.1f * sqrt(Grouped) * Root, 0.5f * Grouped * Most);
+    const float Infragravity = S.Swash * min(VOXEL_OCEAN_SURF_SWING * 0.06f * Root, 0.32f * Most);
+    const float Crest = Setup + 0.5f * 0.84f * 1.6f * VOXEL_OCEAN_SURF_RMS * Grouped * Most;
     return max(Setup + Incident + Infragravity, Crest);
 }
 
@@ -306,6 +366,9 @@ struct FVoxelOceanSurfInput
     float Time;         // the ocean clock modulo VOXEL_OCEAN_SURF_WRAP (s)
     float SpacingM;     // the mesh spacing (m; 0: no limit), for the height
     float FootprintM;   // the pixel's (m; 0: no limit), for the gradient
+    float BedSlope;     // the bed's slope landward (m per m; at or below VOXEL_OCEAN_SURF_BED_KNOWN: unknown, Slope; stage O9b2)
+    float BedDepthM;    // the terrain's own depth (m; 1e20 or more: unknown, DepthM), for the swash's foam (stage O9b2)
+    float ForNormals;   // 1: the evaluation is for the normals (the footprint's rule for what the trains show), 0: the mesh's (stage O9b3)
 };
 
 struct FVoxelOceanSurf
@@ -338,6 +401,25 @@ VOXEL_FUNC float VoxelOceanSurfResolved(float Wavelength, float Spacing)
     return Spacing > 0.0f ? saturate(Wavelength / (2.0f * Spacing) - 1.0f) : 1.0f;
 }
 
+// How far the mesh carries a wavelength at its spacing: fully from 8 spacings, nothing under 4 (a
+// wave of 4 vertices a wavelength moving through the lattice reads as a sawtooth; 0: no limit).
+VOXEL_FUNC float VoxelOceanSurfMeshResolved(float Wavelength, float Spacing)
+{
+    return Spacing > 0.0f ? saturate(Wavelength / (4.0f * Spacing) - 1.0f) : 1.0f;
+}
+
+// The swash's hold within its reach: the factor q on swings summing to A (m) for a limit of
+// Limit (m; 0 none), and dq / dA.
+VOXEL_FUNC float2 VoxelOceanSurfSwashHold(float A, float Limit)
+{
+    if (Limit <= 0.0f || A <= 0.0f) return float2(1.0f, 0.0f);
+    const float X = A / Limit;
+    const float U = X * X * X * X;
+    const float Q = 1.0f / sqrt(sqrt(1.0f + U));
+    const float Q2 = Q * Q;
+    return float2(Q, -U * Q2 * Q2 * Q / A);
+}
+
 // One train at a point: its wave (d > 0) for the height (Spacing's front) and for the gradient
 // (Footprint's), the shoreline's level, their derivatives.
 struct FVoxelOceanSurfTrain
@@ -352,12 +434,12 @@ struct FVoxelOceanSurfTrain
     float Setup;        // m
     float SetupRate;
     float Swing;        // the swash's mean half range (m; for the blend's width)
-    float Saturation;   // H / (Breaking d)
+    float Saturation;   // H / (Index d)
     float Foam;         // the bore's foam at the point (0 to 1)
 };
 
 VOXEL_FUNC FVoxelOceanSurfTrain VoxelOceanSurfTrainOf(int I, FVoxelOceanSurfInput In, FVoxelOceanSurfSettings S, float Hs, float HsRate, float Jitter,
-    float GroupShift, float Agree)
+    float GroupShift, float Agree, float Ground, float SwashSlope)
 {
     FVoxelOceanSurfTrain Out;
     const float Cycles = VoxelOceanSurfCycles(I);
@@ -380,31 +462,42 @@ VOXEL_FUNC FVoxelOceanSurfTrain VoxelOceanSurfTrainOf(int I, FVoxelOceanSurfInpu
     const float H0Shore = Hs * GroupedShore;
     const float DH0Shore = -Hs * GroupWeight * GroupSin0 * (Omega / Group) + HsRate * GroupedShore;
     const float L0 = VOXEL_OCEAN_SURF_TWO_PI * VOXEL_OCEAN_SHOAL_GRAVITY / (Omega * Omega);
-    const float Beta = min(M, 0.1f);
+    // Stockdon's beach slope and the hold's: the bed's (stage O9b3; on a flat the swash hardly moves).
+    const float Beta = min(SwashSlope, 0.1f);
     const float Weight = S.Swash * Agree;
     const float Root = sqrt(max(Hs * L0, 0.0f));
     const float RootShore = sqrt(max(H0Shore * L0, 0.0f));
-    // Setup.
-    const float SetupStockdon = 1.1f * 0.35f * Beta * Root;
+    // Setup (Stockdon's mean).
+    const float SetupStockdon = 0.35f * Beta * Root;
     const bool bSetup = SetupStockdon < 0.3f * Hs;
     Out.Setup = Weight * (bSetup ? SetupStockdon : 0.3f * Hs);
     Out.SetupRate = Weight * (bSetup ? 0.5f * SetupStockdon * HsRate / max(Hs, 1.0e-6f) : 0.3f * HsRate);
-    // The incident swash, on each bore.
-    const float IncStockdon = 1.1f * 0.5f * 0.75f * Beta * RootShore;
-    const bool bInc = IncStockdon < 0.8f * H0Shore;
-    const float SwingInc = Weight * (bInc ? IncStockdon : 0.8f * H0Shore);
-    const float DSwingInc = Weight * (bInc ? 0.5f * IncStockdon * DH0Shore / max(H0Shore, 1.0e-6f) : 0.8f * DH0Shore);
+    // The incident swash, on each bore (a swing of the variance of Stockdon's).
+    const float IncStockdon = VOXEL_OCEAN_SURF_SWING * 0.75f * Beta * RootShore;
+    const bool bInc = IncStockdon < 0.5f * H0Shore;
+    float SwingInc = Weight * (bInc ? IncStockdon : 0.5f * H0Shore);
+    float DSwingInc = Weight * (bInc ? 0.5f * IncStockdon * DH0Shore / max(H0Shore, 1.0e-6f) : 0.5f * DH0Shore);
     // The infragravity swash, on the groups.
-    const float IgStockdon = 1.1f * 0.5f * 0.06f * Root;
-    const bool bIg = IgStockdon < 0.5f * Hs;
-    const float SwingIg = Weight * (bIg ? IgStockdon : 0.5f * Hs);
-    const float DSwingIg = Weight * (bIg ? 0.5f * IgStockdon * HsRate / max(Hs, 1.0e-6f) : 0.5f * HsRate);
+    const float IgStockdon = VOXEL_OCEAN_SURF_SWING * 0.06f * Root;
+    const bool bIg = IgStockdon < 0.32f * Hs;
+    float SwingIg = Weight * (bIg ? IgStockdon : 0.32f * Hs);
+    float DSwingIg = Weight * (bIg ? 0.5f * IgStockdon * HsRate / max(Hs, 1.0e-6f) : 0.32f * HsRate);
+    // Both held within the reach up and down the beach (at the field's slope).
+    const float Limit = S.SwashReach * SwashSlope;
+    const float SwingSum = SwingInc + SwingIg;
+    const float2 Hold = VoxelOceanSurfSwashHold(SwingSum, Limit);
+    const float DHold = Hold.y * (DSwingInc + DSwingIg);
+    DSwingInc = Hold.x * DSwingInc + SwingInc * DHold;
+    DSwingIg = Hold.x * DSwingIg + SwingIg * DHold;
+    SwingInc *= Hold.x;
+    SwingIg *= Hold.x;
     const FVoxelOceanSurfProfile Swash = VoxelOceanSurfProfileOf(Theta0 - VOXEL_OCEAN_SURF_SWASH_LAG, VOXEL_OCEAN_SURF_SWASH_FRONT);
     Out.Level = Out.Setup + SwingInc * Swash.Shape + SwingIg * GroupCos0;
     Out.LevelRate = Out.SetupRate + SwingInc * Swash.DTheta * Omega + DSwingInc * Swash.Shape
         - SwingIg * GroupSin0 * (Omega / Group) + DSwingIg * GroupCos0;
-    // The mean half range (the groups and the drift aside).
-    Out.Swing = Weight * (min(1.1f * 0.5f * 0.75f * Beta * Root, 0.8f * Hs) + min(IgStockdon, 0.5f * Hs));
+    // The mean half range (the groups and the drift aside), held as the swings are.
+    const float SwingMean = Weight * (min(VOXEL_OCEAN_SURF_SWING * 0.75f * Beta * Root, 0.5f * Hs) + min(IgStockdon, 0.32f * Hs));
+    Out.Swing = SwingMean * VoxelOceanSurfSwashHold(SwingMean, Limit).x;
 
     // The wave at the point (on the sea side).
     Out.Wave = 0.0f;
@@ -431,10 +524,12 @@ VOXEL_FUNC FVoxelOceanSurfTrain VoxelOceanSurfTrainOf(int I, FVoxelOceanSurfInpu
         // The height: shoaled, capped (Hc), with its derivatives in depth and time through the
         // groups and the cap (the gain's left out: it varies slowly).
         const float Gain = min(sqrt(Disp.R / (2.0f * Disp.N)), VOXEL_OCEAN_SHOAL_MAX_GAIN);
-        const float Raw = max(Hs * Grouped * Gain, 1.0e-6f);
-        const float DRawDD = -Hs * Gain * GroupWeight * GroupSin * (DPhi / Group);
-        const float DRawDT = -Hs * Gain * GroupWeight * GroupSin * (Omega / Group) + HsRate * Grouped * Gain;
-        const float Cap = max(S.Breaking * D, 1.0e-6f);
+        const float H0 = VOXEL_OCEAN_SURF_RMS * Hs;
+        const float Raw = max(H0 * Grouped * Gain, 1.0e-6f);
+        const float DRawDD = -H0 * Gain * GroupWeight * GroupSin * (DPhi / Group);
+        const float DRawDT = -H0 * Gain * GroupWeight * GroupSin * (Omega / Group) + VOXEL_OCEAN_SURF_RMS * HsRate * Grouped * Gain;
+        const float Index = VOXEL_OCEAN_SURF_INNER * S.Breaking;
+        const float Cap = max(Index * D, 1.0e-6f);
         const float Ratio = Raw / Cap;
         const float R2 = Ratio * Ratio;
         const float Hc = Raw / sqrt(sqrt(1.0f + R2 * R2));
@@ -442,19 +537,20 @@ VOXEL_FUNC FVoxelOceanSurfTrain VoxelOceanSurfTrainOf(int I, FVoxelOceanSurfInpu
         const float QC = Hc / Cap;
         const float QR2 = QR * QR;
         const float QC2 = QC * QC;
-        const float DHcDD = QR2 * QR2 * QR * DRawDD + S.Breaking * QC2 * QC2 * QC;
+        const float DHcDD = QR2 * QR2 * QR * DRawDD + Index * QC2 * QC2 * QC;
         const float DHcDT = QR2 * QR2 * QR * DRawDT;
-        // The front's share: the saturation's, held above what the spacing and the footprint resolve.
-        const float Wavelength = VOXEL_OCEAN_SURF_TWO_PI / LocalK;
+        // The front's share: the saturation's, held above what the spacing and the footprint resolve
+        // of the wave's length on the ground.
+        const float Wavelength = VOXEL_OCEAN_SURF_TWO_PI / LocalK * Ground;
         const float X = saturate((Ratio - 0.4f) / 0.6f);
         const float Sat = X * X * (3.0f - 2.0f * X);
         const bool bSat = Ratio > 0.4f && Ratio < 1.0f;
         const float DSat = bSat ? 6.0f * X * (1.0f - X) / 0.6f : 0.0f;
         const float Front = 0.5f * (1.0f - S.Skew * Sat);
-        // d Ratio / d depth = DRaw / Cap - Ratio Breaking / Cap (the cap's own clamp aside).
-        const float DFrontDD = bSat ? -0.5f * S.Skew * DSat * (DRawDD - Ratio * S.Breaking) / Cap : 0.0f;
+        // d Ratio / d depth = DRaw / Cap - Ratio Index / Cap (the cap's own clamp aside).
+        const float DFrontDD = bSat ? -0.5f * S.Skew * DSat * (DRawDD - Ratio * Index) / Cap : 0.0f;
         const float DFrontDT = bSat ? -0.5f * S.Skew * DSat * (DRawDT / Cap) : 0.0f;
-        const float FrontH = max(Front, min(2.0f * In.SpacingM / Wavelength, 0.5f));
+        const float FrontH = max(Front, min(VOXEL_OCEAN_SURF_MESH_FRONT * In.SpacingM / Wavelength, 0.5f));
         const float FrontN = max(Front, min(2.0f * In.FootprintM / Wavelength, 0.5f));
         const FVoxelOceanSurfProfile PH = VoxelOceanSurfProfileOf(Theta, FrontH);
         const FVoxelOceanSurfProfile PN = VoxelOceanSurfProfileOf(Theta, FrontN);
@@ -491,17 +587,24 @@ VOXEL_FUNC FVoxelOceanSurf VoxelOceanSurfOf(FVoxelOceanSurfInput In, FVoxelOcean
     // into the swash's level (2 m at most) at least.
     const float Reach = max(S.Handover * Hs / S.Breaking, VOXEL_OCEAN_SURF_MIN_REACH);
     if (D >= Reach) return Out;
-    // The swash's level fades out inland (by the field's distance; the depth may not tell low
-    // ground behind a beach from the beach).
-    const float Inland = D <= 0.0f ? 1.0f - smoothstep(VOXEL_OCEAN_SURF_INLAND, 2.0f * VOXEL_OCEAN_SURF_INLAND, -In.ShoreM) : 1.0f;
-    if (Inland <= 0.0f) return Out;
+    // The swash's level fades out inland by the field's distance, on both sides of the still
+    // level (stage O9b3: on land alone it left a step at every point that crosses it).
+    const float Inland = 1.0f - smoothstep(VOXEL_OCEAN_SURF_INLAND, 2.0f * VOXEL_OCEAN_SURF_INLAND, -In.ShoreM);
+    if (Inland <= 0.0f && D <= 0.0f) return Out;
     const float Agree = saturate(In.Agree);
+    // The bed: its slope (the field's where unknown), the waves' length on the ground against
+    // their local wavelength, and where the trains hold (stage O9b2).
+    const float Bed = In.BedSlope > VOXEL_OCEAN_SURF_BED_KNOWN ? clamp(In.BedSlope, -VOXEL_OCEAN_SURF_BED_MAX, VOXEL_OCEAN_SURF_BED_MAX) : In.Slope;
+    const float BedHeld = max(Bed, VOXEL_OCEAN_SURF_BED_FADE0 * In.Slope);
+    const float Ground = In.Slope / BedHeld;
+    const float Valid = smoothstep(VOXEL_OCEAN_SURF_BED_FADE0, VOXEL_OCEAN_SURF_BED_FADE1, Bed / In.Slope);
     // The trains' amplitude (C1 at the handover's edge) and its derivative in depth; the long
     // bands keep the rest of the energy.
     const float ShareX = saturate((D - 0.4f * Reach) / (0.6f * Reach));
-    const float Share = (1.0f - ShareX * ShareX * (3.0f - 2.0f * ShareX)) * Agree;
-    const float DShare = D > 0.4f * Reach ? -6.0f * ShareX * (1.0f - ShareX) / (0.6f * Reach) * Agree : 0.0f;
-    Out.LongKeep = sqrt(max(1.0f - Share * Share, 0.0f));
+    const float Handed = (1.0f - ShareX * ShareX * (3.0f - 2.0f * ShareX)) * Agree;
+    // The trains' share: what the handover took, where the bed holds them.
+    const float Share = Handed * Valid;
+    const float DShare = D > 0.4f * Reach ? -6.0f * ShareX * (1.0f - ShareX) / (0.6f * Reach) * Agree * Valid : 0.0f;
     Out.Active = 1.0f;
 
     // The two trains around the sea state's peak period, sharing its energy.
@@ -524,34 +627,61 @@ VOXEL_FUNC FVoxelOceanSurf VoxelOceanSurfOf(FVoxelOceanSurfInput In, FVoxelOcean
     const float GroupShift = VOXEL_OCEAN_SURF_TWO_PI * VoxelOceanSurfNoise2(In.Units, In.Low, 40, 0x51u, 0x2c9u).x;
     const float2 Drift = VoxelOceanSurfNoiseTime(In.Units, In.Low, 10, In.Time * (1.0f / 120.0f), 30u, 0x7a3u);
     const float Jitter = VOXEL_OCEAN_SURF_TWO_PI * S.Sets * (VoxelOceanSurfNoise2(In.Units, In.Low, 15, 0x2c9u, 0x51u).x - 0.5f);
-    const float Height = Hs * (1.0f + 0.5f * S.Sets * (2.0f * Drift.x - 1.0f));
-    const float HeightRate = Hs * S.Sets * Drift.y * (1.0f / 120.0f);
+    const float Height = Hs * (1.0f + VOXEL_OCEAN_SURF_DRIFT * S.Sets * (2.0f * Drift.x - 1.0f));
+    const float HeightRate = Hs * 2.0f * VOXEL_OCEAN_SURF_DRIFT * S.Sets * Drift.y * (1.0f / 120.0f);
 
-    const FVoxelOceanSurfTrain A = VoxelOceanSurfTrainOf(Lower, In, S, Height, HeightRate, Jitter, GroupShift, Agree);
-    const FVoxelOceanSurfTrain B = VoxelOceanSurfTrainOf(Lower + 1, In, S, Height, HeightRate, Jitter, GroupShift, Agree);
+    const FVoxelOceanSurfTrain A = VoxelOceanSurfTrainOf(Lower, In, S, Height, HeightRate, Jitter, GroupShift, Agree, Ground, BedHeld);
+    const FVoxelOceanSurfTrain B = VoxelOceanSurfTrainOf(Lower + 1, In, S, Height, HeightRate, Jitter, GroupShift, Agree, Ground, BedHeld);
+    // The long bands keep what the trains don't show (stage O9b3): the handover's share where the
+    // bed holds the trains and the mesh resolves them (by energy). Where they can't be shown (too
+    // short for the mesh or the footprint, a flat or a bar's back) the long bands carry the waves:
+    // a wave is always drawn by one or the other.
+    // The trains' shown energy: the mesh's rule for the height, the footprint's for the normals.
+    const float RA = In.ForNormals > 0.5f ? VoxelOceanSurfResolved(A.Wavelength, In.FootprintM) : VoxelOceanSurfMeshResolved(A.Wavelength, In.SpacingM);
+    const float RB = In.ForNormals > 0.5f ? VoxelOceanSurfResolved(B.Wavelength, In.FootprintM) : VoxelOceanSurfMeshResolved(B.Wavelength, In.SpacingM);
+    const float Taken2 = Share * Share * (WA * RA * RA + WB * RB * RB);
+    Out.LongKeep = sqrt(max(1.0f - Taken2, 0.0f));
+    // The swash's sheet on land reaches only so far up the beach (stage O9b3): its distance from
+    // the still waterline, the ground's height over the bed's slope, held within 1.5 to 3 times
+    // the reach. On a plain near sea level the flat sheet would cover all ground below its level.
+    const float UpBeach = D < 0.0f ? -D / BedHeld : 0.0f;
+    float Sheet = 1.0f;
+    float DSheet = 0.0f;    // d Sheet / d(landward)
+    if (S.SwashReach > 0.0f)
+    {
+        const float S0 = VOXEL_OCEAN_SURF_SHEET0 * S.SwashReach;
+        const float S1 = VOXEL_OCEAN_SURF_SHEET1 * S.SwashReach;
+        const float SX = saturate((UpBeach - S0) / (S1 - S0));
+        Sheet = 1.0f - SX * SX * (3.0f - 2.0f * SX);
+        // Up the beach grows landward by the bed's slope over the held slope.
+        DSheet = D < 0.0f && UpBeach > S0 && UpBeach < S1 ? -6.0f * SX * (1.0f - SX) / (S1 - S0) * (Bed / BedHeld) : 0.0f;
+    }
     // Energy: the waves add by amplitude (cos, sin), the levels by energy.
-    const float Level = WA * A.Level + WB * B.Level;
-    const float LevelRate = WA * A.LevelRate + WB * B.LevelRate;
+    const float LevelHere = (WA * A.Level + WB * B.Level) * Inland;
+    const float Level = LevelHere * Sheet;
+    const float LevelRate = (WA * A.LevelRate + WB * B.LevelRate) * Inland * Sheet;
     const float Setup = WA * A.Setup + WB * B.Setup;
     const float SetupRate = WA * A.SetupRate + WB * B.SetupRate;
     const float Swing = WA * A.Swing + WB * B.Swing;
     Out.Breaking = saturate(WA * A.Saturation + WB * B.Saturation) * Share;
-    // The swash's foam: where its sheet runs thin (the level less the bed), a fifth elsewhere.
-    const float Thickness = max(Level * Inland + D, 0.0f);
-    const float SwashFoam = S.Foam * Agree * Inland * (0.2f + 0.8f * exp(-Thickness * (1.0f / VOXEL_OCEAN_SURF_FOAM_THIN)));
+    // The swash's foam: where its sheet runs thin (the level less the terrain's own bed, so the
+    // foamy edge follows the visible waterline), a fifth elsewhere.
+    const float Thickness = max(Level + (In.BedDepthM < 1.0e20f ? In.BedDepthM : D), 0.0f);
+    const float SwashFoam = S.Foam * Agree * Inland * Sheet * (0.2f + 0.8f * exp(-Thickness * (1.0f / VOXEL_OCEAN_SURF_FOAM_THIN)));
 
     if (D <= 0.0f)
     {
-        // Above the still level: the shoreline's level, flat.
-        Out.Height = Level * Inland;
-        Out.Rate = LevelRate * Inland;
+        // Above the still level: the shoreline's level, flat (up the beach as far as it reaches).
+        Out.Height = Level;
+        Out.Rate = LevelRate;
         Out.Foam = saturate(SwashFoam);
+        Out.Gradient = LevelHere * DSheet;
         return Out;
     }
     // The sea's surface: the trains' waves (weighed by how the spacing resolves them) and the surf
     // zone's setup (from the shoreline's out to the breaking depth of the significant height).
-    const float HeightA = VoxelOceanSurfResolved(A.Wavelength, In.SpacingM) * AmpA * Share;
-    const float HeightB = VoxelOceanSurfResolved(B.Wavelength, In.SpacingM) * AmpB * Share;
+    const float HeightA = VoxelOceanSurfMeshResolved(A.Wavelength, In.SpacingM) * AmpA * Share;
+    const float HeightB = VoxelOceanSurfMeshResolved(B.Wavelength, In.SpacingM) * AmpB * Share;
     const float NormalA = VoxelOceanSurfResolved(A.Wavelength, In.FootprintM) * AmpA;
     const float NormalB = VoxelOceanSurfResolved(B.Wavelength, In.FootprintM) * AmpB;
     const float BreakDepth = max(Hs / S.Breaking, 0.1f);
@@ -568,7 +698,7 @@ VOXEL_FUNC FVoxelOceanSurf VoxelOceanSurfOf(FVoxelOceanSurfInput In, FVoxelOcean
     // depth, along the beach (so the last bore runs into it), within 1.5 times the swash's range
     // and 2 m. Constant in time (the mean swash), so the blend has no rate of its own.
     const float SwashDepth = max(Setup + Swing, 0.1f);
-    const float Dsw = clamp(0.5f * In.Slope * Period * sqrt(VOXEL_OCEAN_SHOAL_GRAVITY * SwashDepth), 0.02f, min(1.5f * SwashDepth, VOXEL_OCEAN_SURF_MIN_REACH));
+    const float Dsw = clamp(0.5f * BedHeld * Period * sqrt(VOXEL_OCEAN_SHOAL_GRAVITY * SwashDepth), 0.02f, min(1.5f * SwashDepth, VOXEL_OCEAN_SURF_MIN_REACH));
     const float X = saturate(D / Dsw);
     const float Blend = X * X * (3.0f - 2.0f * X);
     const float DBlend = D < Dsw ? 6.0f * X * (1.0f - X) / Dsw : 0.0f;
@@ -577,9 +707,52 @@ VOXEL_FUNC FVoxelOceanSurf VoxelOceanSurfOf(FVoxelOceanSurfInput In, FVoxelOcean
     // The bores' foam (by energy) on the sea's side, the swash's within its blend.
     const float BoreFoam = S.Foam * Share * (WA * A.Foam + WB * B.Foam);
     Out.Foam = saturate(SwashFoam + (BoreFoam - SwashFoam) * Blend);
-    // Landward the depth falls by the slope: d / d(landward) = -m d / d depth.
-    Out.Gradient = -In.Slope * ((SeaForSlope - Level) * DBlend + DSea * Blend);
+    // Landward the depth falls by the bed's slope: d / d(landward) = -b d / d depth.
+    Out.Gradient = -Bed * ((SeaForSlope - Level) * DBlend + DSea * Blend);
     return Out;
+}
+
+// THE DRAIN (stage O9b3): an inland basin below sea level (the shore field's distance under minus
+// the margin, not joined to the sea) is dry, and the sea that reaches toward it across low ground
+// within the margin used to end there in mid-air: a wall of water where the ground is below sea
+// level on both sides. From the bake's margin (DRAIN_START of the basins' margin, the cull's: the
+// bake's coast can sit a cell from the terrain's, so the sea is kept whole out to the bake's
+// margin) to the basins' margin inland (by the field) the sea's surface sinks below the bottom (to
+// DRAIN_DEPTH under the depth the waves feel) and its waves die out, so it meets the terrain
+// instead. Every evaluation applies it alike (the mesh, the underwater pass, the query): Keep
+// scales the waves (their slope variance by Keep^2), Drop (m) lowers the surface, Slope is the
+// drop's rise landward (m per m, along the field's direction; the gradient's change is minus it).
+#define VOXEL_OCEAN_SURF_DRAIN_DEPTH 3.0f
+// The drain's start, as a share of the basins' margin (1 / VoxelOceanWaves::BasinDrainSpan).
+#define VOXEL_OCEAN_SURF_DRAIN_START 0.6666667f
+
+struct FVoxelOceanSurfDrain
+{
+    float Keep;
+    float Drop;
+    float Slope;
+};
+
+// ShoreM the field's distance (m, minus inland; 1e20 or more: no field), DepthM the depth the
+// waves feel (m; 1e20 or more unknown), Bed the depth's fall landward (m per m), MarginM the
+// basins' margin (m; 0: no drain).
+VOXEL_FUNC FVoxelOceanSurfDrain VoxelOceanSurfDrainOf(float ShoreM, float DepthM, float Bed, float MarginM)
+{
+    FVoxelOceanSurfDrain D;
+    D.Keep = 1.0f;
+    D.Drop = 0.0f;
+    D.Slope = 0.0f;
+    if (MarginM <= 0.0f || ShoreM >= 1.0e20f) return D;
+    const float Start = VOXEL_OCEAN_SURF_DRAIN_START * MarginM;
+    const float X = saturate((-ShoreM - Start) / (MarginM - Start));
+    const float W = X * X * (3.0f - 2.0f * X);
+    const float Depth = DepthM < 1.0e20f ? DepthM : 0.0f;
+    D.Keep = 1.0f - W;
+    D.Drop = W * (max(Depth, 0.0f) + VOXEL_OCEAN_SURF_DRAIN_DEPTH);
+    // Landward the field's distance falls one for one and the depth by the bed's slope.
+    const float DW = X > 0.0f && X < 1.0f ? 6.0f * X * (1.0f - X) / (MarginM - Start) : 0.0f;
+    D.Slope = DW * (max(Depth, 0.0f) + VOXEL_OCEAN_SURF_DRAIN_DEPTH) - (Depth > 0.0f ? W * Bed : 0.0f);
+    return D;
 }
 
 #endif // VOXEL_OCEAN_SURF_USH

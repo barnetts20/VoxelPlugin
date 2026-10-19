@@ -53,6 +53,10 @@ struct FVoxelOceanDensityInputs
      *  (its field distance below minus ShoreMarginCm) is land. Null: no field, no such cull. */
     TSharedPtr<const FVoxelOceanShoreRHI, ESPMode::ThreadSafe> Shore;
     double ShoreMarginCm = 0.0;
+    /** The depth the waves feel (stage O9b2): the vertices' and the probe's depth leave out
+     *  terrain detail finer than this (cm; the tile's own footprint where that is coarser). The
+     *  land cull keeps the tile's footprint. 0: the tile's footprint. */
+    double DepthFootprintCm = 0.0;
 };
 
 /** Game thread. The pages of one ocean surface. */
@@ -70,13 +74,17 @@ public:
         /** A triangle is culled when the land stands above the sea by more than this (cm) at
          *  each corner (FLT_MAX: never). */
         float CullHeight = 0.0f;
+        /** The level's nominal spacing (cm; stage O9b2): the depth the waves feel leaves out
+         *  detail finer than it (or DepthFootprintCm), the same for every tile of the level. */
+        float Nominal = 0.0f;
     };
 
     /** Words per vertex in a tile write: position (3 floats), morph offset (3 floats), packed
      *  tangent and packed normal (snorm8 x4), the target's own morph offset (3 floats), the
-     *  lattice point sampled for the depth (3 ints), and the tile indices of the morph target
-     *  and of its own target (16 bits each). */
-    static constexpr int32 VertexWords = 15;
+     *  lattice point sampled for the depth (3 ints), the tile indices of the morph target and of
+     *  its own target (16 bits each), and the split bias's coast codes of the vertex and its
+     *  target (stage O9c: VoxelOceanTiles::CoastPack, a float; TexCoord 2 y). */
+    static constexpr int32 VertexWords = 16;
 
     FVoxelOceanPages();
     ~FVoxelOceanPages();
@@ -133,8 +141,8 @@ public:
     FString TakePerf();
 
     /** Vertex words of a tile write for one vertex; Lattice: the lattice point its depth is
-     *  sampled at. */
-    static void PackVertex(const VoxelOceanTiles::FTileVertex& Vertex, const FIntVector& Lattice, uint32* OutWords);
+     *  sampled at; Coast: its coast codes (VoxelOceanTiles::CoastPack). */
+    static void PackVertex(const VoxelOceanTiles::FTileVertex& Vertex, const FIntVector& Lattice, float Coast, uint32* OutWords);
 
 private:
     struct FInstance

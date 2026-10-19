@@ -152,6 +152,12 @@ FVoxelOceanShore FVoxelOceanShoreField::Sample(const FVector& PlanetPoint) const
     return Out;
 }
 
+std::vector<double> FVoxelOceanShoreField::Coastline() const
+{
+    if (!IsValid()) return std::vector<double>();
+    return VoxelOceanShoreCore::Coastline(Texels.GetData(), N, ReachM);
+}
+
 bool FVoxelOceanShoreField::IsSea(const FVector& PlanetPoint, double InMarginCm) const
 {
     if (!IsValid()) return true;

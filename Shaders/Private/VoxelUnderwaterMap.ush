@@ -23,8 +23,13 @@
 // central differences at the texel of the finest level fully covering the point
 // (VoxelUnderwaterMapNormal).
 //
+// THE FOAM (stage O9c; optional): a second array of the same levels holds the foam (0 to 1) of the
+// surface above each point (the open sea's and the surf's, VoxelOceanFoam.ush, with the level's
+// texel as footprint); VoxelUnderwaterMapFoam reads it as the heights are read.
+//
 // The includer defines, before including this file:
 //   VOXEL_UNDERWATER_MAP_LOAD(Level, X, Y)  the height at texel (X, Y) of a level (int arguments);
+//   VOXEL_UNDERWATER_MAP_FOAM_LOAD(Level, X, Y)  (optional) the foam there;
 //   VOXEL_UNDERWATER_MAP_ANCHOR(Level)      float3: the anchor;
 //   VOXEL_UNDERWATER_MAP_TEXEL(Level)       float: the level's texel (cm);
 //   VOXEL_UNDERWATER_MAP_E1(Level), VOXEL_UNDERWATER_MAP_E2(Level)   float3: the plane's axes.
@@ -111,6 +116,43 @@ VOXEL_FUNC float VoxelUnderwaterMapHeight(float3 Foot)
     }
     return Height;
 }
+
+#ifdef VOXEL_UNDERWATER_MAP_FOAM_LOAD
+// A level's foam, bilinear (P inside its grid).
+VOXEL_FUNC float VoxelUnderwaterMapFoamBilinear(int Level, float2 P)
+{
+    const float BX = floor(P.x);
+    const float BY = floor(P.y);
+    const int X = int(BX);
+    const int Y = int(BY);
+    const float FX = P.x - BX;
+    const float FY = P.y - BY;
+    const float F00 = VOXEL_UNDERWATER_MAP_FOAM_LOAD(Level, X, Y);
+    const float F10 = VOXEL_UNDERWATER_MAP_FOAM_LOAD(Level, X + 1, Y);
+    const float F01 = VOXEL_UNDERWATER_MAP_FOAM_LOAD(Level, X, Y + 1);
+    const float F11 = VOXEL_UNDERWATER_MAP_FOAM_LOAD(Level, X + 1, Y + 1);
+    return lerp(lerp(F00, F10, FX), lerp(F01, F11, FX), FY);
+}
+
+// The foam (0 to 1) of the surface above Foot (stage O9c): the levels blended as the heights
+// (VoxelUnderwaterMapHeight); none past the coarsest.
+VOXEL_FUNC float VoxelUnderwaterMapFoam(float3 Foot)
+{
+    float Foam = 0.0f;
+    float Rest = 1.0f;
+    VOXEL_LOOP
+    for (int Level = 0; Level < VOXEL_UNDERWATER_MAP_LEVELS; Level++)
+    {
+        const float2 P = VOXEL_UNDERWATER_MAP_COORDS(Level, Foot);
+        const float Cover = VoxelUnderwaterMapCover(P);
+        if (Cover <= 0.0f) continue;
+        Foam += Rest * Cover * VoxelUnderwaterMapFoamBilinear(Level, P);
+        Rest *= 1.0f - Cover;
+        if (Rest <= 0.0f) break;
+    }
+    return saturate(Foam);
+}
+#endif
 
 // The finest level fully covering Foot, or else the coarsest covering it at all
 // (VOXEL_UNDERWATER_MAP_LEVELS if none): in a level's blend ring the heights are mostly the next

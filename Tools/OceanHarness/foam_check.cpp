@@ -216,13 +216,17 @@ int main()
             if (CacheU[b] != U) { CacheU[b] = U; CacheV[b] = std::sqrt(StatsOf(MakeSlots(A)[6 + b]).HeightVariance) / ShortRef[b]; }
             Scale[b] = CacheV[b];
         }
-        const VoxelShader::FVoxelOceanDetile Det = VoxelShader::VoxelOceanDetileOf(VoxelShader::float2(float(X), float(Y)), 1500.0f, 77u);
-        const double Wc[3] = { Det.Weight.x, Det.Weight.y, Det.Weight.z };
-        const double Ox[3] = { Det.Offset0.x, Det.Offset1.x, Det.Offset2.x }, Oy[3] = { Det.Offset0.y, Det.Offset1.y, Det.Offset2.y };
-        const double Copies2 = Wc[0] * Wc[0] + Wc[1] * Wc[1] + Wc[2] * Wc[2];
+        // Each band's own lattice (stage O9b3, VoxelOceanDetileOfBand), the short bands' too.
+        const float4 TileSides(float(Slots[0].Params.TileLength), float(Slots[1].Params.TileLength), float(Slots[6].Params.TileLength), float(Slots[7].Params.TileLength));
+        double Wc0[3] = {};
         double Dev[4] = {}, Res[4] = {}, Roots[3] = {};
         for (int b = 0; b < 4; b++)
         {
+            const VoxelShader::FVoxelOceanDetile Det = VoxelShader::VoxelOceanDetileOfBand(VoxelShader::float2(float(X), float(Y)), 1500.0f, 77u, b, TileSides);
+            const double Wc[3] = { Det.Weight.x, Det.Weight.y, Det.Weight.z };
+            const double Ox[3] = { Det.Offset0.x, Det.Offset1.x, Det.Offset2.x }, Oy[3] = { Det.Offset0.y, Det.Offset1.y, Det.Offset2.y };
+            const double Copies2 = Wc[0] * Wc[0] + Wc[1] * Wc[1] + Wc[2] * Wc[2];
+            if (b == 0) { Wc0[0] = Wc[0]; Wc0[1] = Wc[1]; Wc0[2] = Wc[2]; }
             const double L = Slots[b < 2 ? b : 4 + b].Params.TileLength;
             const double Lod = std::log2(std::max(Fp * 256.0 / L, 1.0));
             // The deviation added; the variance the lookup leaves unresolved returned.
@@ -250,7 +254,7 @@ int main()
                     Res[b] = Copies2 * Root * Root;
                 }
                 else
-                    Res[b] = Tex[4 + b].Var;
+                    Res[b] = Copies2 * Tex[4 + b].Var;
                 continue;
             }
             if (b < 2)
@@ -265,7 +269,11 @@ int main()
                 Res[b] = Wc[0] * Wc[0] * Roots[0] * Roots[0] + Wc[1] * Wc[1] * Roots[1] * Roots[1] + Wc[2] * Wc[2] * Roots[2] * Roots[2];
             }
             else
-                Res[b] = Look(4 + b, 1.0, X, Y);
+            {
+                Res[b] = 0.0;
+                for (int c = 0; c < 3; c++)
+                    if (Wc[c] > 0) Res[b] += Wc[c] * Wc[c] * Look(4 + b, Wc[c], X + Ox[c], Y + Oy[c]);
+            }
         }
         VoxelShader::FVoxelOceanFoamBands B = VoxelShader::VoxelOceanFoamBandsZero();
         B.Dev = float4(float(Dev[0]), float(Dev[1]), float(Dev[2]), float(Dev[3]));
@@ -281,7 +289,7 @@ int main()
         P.Foam = VoxelShader::VoxelOceanFoamOf(B, float(U), float(Cov));
         const double S0 = B.Steep.x * B.Sigma.x, S1 = B.Steep.y * B.Sigma.y;
         P.Long = (B.Steep.x * Dev[0] + B.Steep.y * Dev[1]) / std::sqrt(S0 * S0 + S1 * S1);
-        const double Mx = std::max({ Wc[0], Wc[1], Wc[2] });
+        const double Mx = std::max({ Wc0[0], Wc0[1], Wc0[2] });
         P.Kind = Mx > 0.97 ? 1 : (Mx < 0.7 ? 2 : 0);
         return P;
     };
@@ -373,7 +381,7 @@ int main()
             FVoxelOceanSurfInput In;
             In.DepthM = D; In.Slope = 0.02f; In.Agree = 1.0f; In.ShoreM = D / 0.02f; In.Hs = 1.5f; In.Speed = 12.0f;
             In.Units = int3(24414, 48, 7); In.Low = float3(1000.0f - 100.0f * D / 0.02f, 300.0f, 30.0f);
-            In.Time = T; In.SpacingM = 0.0f; In.FootprintM = Footprint;
+            In.Time = T; In.SpacingM = 0.0f; In.FootprintM = Footprint; In.BedSlope = VOXEL_OCEAN_BED_UNKNOWN; In.BedDepthM = 1.0e30f; In.ForNormals = Footprint > 0.0f ? 1.0f : 0.0f;
             return In;
         };
         const FVoxelOceanSurfSettings On = Settings(1.0f), Off = Settings(0.0f);

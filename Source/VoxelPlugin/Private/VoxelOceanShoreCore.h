@@ -11,6 +11,8 @@
 
 #include "VoxelOceanCharts.h"
 
+#include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <utility>
 #include <vector>
@@ -186,5 +188,88 @@ namespace VoxelOceanShoreCore
         Reader.Texels = Texels;
         Reader.Side = Side(N);
         return VoxelShader::VoxelOceanShoreFieldAt(Reader, VoxelShader::float3(float(X / L), float(Y / L), float(Z / L)), N, float(ReachM));
+    }
+
+    /** The coast as the field holds it (stage O9c: the ocean mesh's split bias measures from it,
+     *  VoxelOceanTiles::FCoastSet): where the signed distance changes sign between neighbouring
+     *  texels, the crossing found linearly between their centres, the crossings joined square by
+     *  square (marching squares over each face's texels and the first of its apron, so the faces'
+     *  edges are covered from both sides: there the two faces' fields, and so their crossings, can
+     *  differ by part of a cell). Near the coast the field's distance is the terrain's height over
+     *  its slope, so the crossings follow the terrain's own zero line within a cell. Unit
+     *  directions, six doubles a segment (its ends A then B). */
+    inline std::vector<double> Coastline(const uint32_t* Texels, int N, double ReachM)
+    {
+        std::vector<double> Out;
+        if (!Texels || N <= 0) return Out;
+        const int S = Side(N);
+        const float Reach = float(ReachM);
+        std::vector<float> Row0(static_cast<size_t>(S)), Row1(static_cast<size_t>(S));
+        auto Load = [&](int Face, int Y, std::vector<float>& Row)
+        {
+            for (int X = 0; X < S; X++)
+                Row[size_t(X)] = VoxelShader::VoxelOceanShoreUnpack(Texels[(size_t(Face) * S + Y) * S + X], Reach).Distance;
+        };
+        auto Dir = [&](int Face, int X, int Y, double D[3])
+        {
+            const VoxelShader::float3 V = VoxelShader::VoxelOceanShoreCellDir(Face, X - Pad, Y - Pad, N);
+            D[0] = V.x; D[1] = V.y; D[2] = V.z;
+        };
+        // The crossing between texels P and Q (distances DP, DQ of opposite signs).
+        auto Crossing = [&](int Face, int PX, int PY, float DP, int QX, int QY, float DQ, double C[3])
+        {
+            double A[3], B[3];
+            Dir(Face, PX, PY, A);
+            Dir(Face, QX, QY, B);
+            const double F = std::min(std::max(double(DP) / (double(DP) - double(DQ)), 0.0), 1.0);
+            double L = 0.0;
+            for (int k = 0; k < 3; k++) { C[k] = A[k] + (B[k] - A[k]) * F; L += C[k] * C[k]; }
+            L = std::sqrt(L);
+            for (int k = 0; k < 3; k++) C[k] /= L;
+        };
+        auto Add = [&Out](const double A[3], const double B[3])
+        {
+            Out.insert(Out.end(), { A[0], A[1], A[2], B[0], B[1], B[2] });
+        };
+        // Squares from the apron's last texel before the face to its first after it.
+        const int First = Pad - 1, Last = Pad + N - 1;
+        for (int Face = 0; Face < 6; Face++)
+        {
+            Load(Face, First, Row0);
+            for (int Y = First; Y < Last; Y++)
+            {
+                Load(Face, Y + 1, Row1);
+                for (int X = First; X < Last; X++)
+                {
+                    // Corners 0 (X, Y), 1 (X + 1, Y), 2 (X + 1, Y + 1), 3 (X, Y + 1); edge k from
+                    // corner k to corner k + 1.
+                    const float D[4] = { Row0[size_t(X)], Row0[size_t(X + 1)], Row1[size_t(X + 1)], Row1[size_t(X)] };
+                    const bool bSea[4] = { D[0] >= 0.0f, D[1] >= 0.0f, D[2] >= 0.0f, D[3] >= 0.0f };
+                    if (bSea[0] == bSea[1] && bSea[1] == bSea[2] && bSea[2] == bSea[3]) continue;
+                    const int CX[4] = { X, X + 1, X + 1, X };
+                    const int CY[4] = { Y, Y, Y + 1, Y + 1 };
+                    double P[4][3];
+                    int Count = 0;
+                    for (int k = 0; k < 4; k++)
+                    {
+                        const int m = (k + 1) & 3;
+                        if (bSea[k] == bSea[m]) continue;
+                        Crossing(Face, CX[k], CY[k], D[k], CX[m], CY[m], D[m], P[Count++]);
+                    }
+                    if (Count == 2)
+                        Add(P[0], P[1]);
+                    else if (Count == 4)
+                    {
+                        // A saddle: pair the crossings around the corners whose side the square's
+                        // mean takes (either pairing is a coast through the square).
+                        const bool bMeanSea = (D[0] + D[1] + D[2] + D[3]) >= 0.0f;
+                        if (bMeanSea == bSea[0]) { Add(P[0], P[1]); Add(P[2], P[3]); }
+                        else { Add(P[1], P[2]); Add(P[3], P[0]); }
+                    }
+                }
+                std::swap(Row0, Row1);
+            }
+        }
+        return Out;
     }
 }

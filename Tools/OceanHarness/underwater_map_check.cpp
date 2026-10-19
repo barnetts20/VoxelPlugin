@@ -9,6 +9,10 @@
 // - Exits: the pass's march on the map against the old march on the search, rays up through the
 //   surface.
 // - Cost: the map's points and the old search's per pixel.
+// - Foam (stage O9c): the foam map's reads (VoxelUnderwaterMapFoam) against a synthetic foam field
+//   (accuracy, range, continuity across the levels' edges, none past the coarsest), and the map
+//   pass's surface point (the foot less the waves' horizontal displacement there, where the foam
+//   is evaluated) against the inversion.
 //
 //   g++ -O2 -std=c++20 -ffp-contract=off -IUEStandIn -I../../Source/VoxelPlugin/Public -I../../Source/VoxelPlugin/Private
 //       -I../../Shaders/Private -I. underwater_map_check.cpp ../../Source/VoxelPlugin/Private/VoxelOceanWavesFFT.cpp
@@ -44,7 +48,15 @@ struct FMapEmulation
     float3 E2(int L) const { return float3(Levels.E2[L].X, Levels.E2[L].Y, Levels.E2[L].Z); }
 
     float Load(int L, int X, int Y);
+    // A synthetic foam field (stage O9c): 0 to 1, wavelengths of 3 m and 5 m (its steepest change
+    // FoamSlope per cm), read at a map point as UnderwaterMapCS writes its texel.
+    static float FoamAt(float3 P)
+    {
+        return 0.5f + 0.5f * std::sin(P.x * 0.0020944f + P.y * 0.0005f) * std::sin(P.y * 0.0012566f - P.z * 0.0003f);
+    }
+    float LoadFoam(int L, int X, int Y) const;
 };
+static constexpr float FoamSlope = 0.5f * (0.0021535f + 0.0012920f);
 static FMapEmulation* GMap = nullptr;
 
 namespace VoxelShader
@@ -54,7 +66,13 @@ namespace VoxelShader
 #define VOXEL_UNDERWATER_MAP_TEXEL(Level) GMap->Texel(Level)
 #define VOXEL_UNDERWATER_MAP_E1(Level) GMap->E1(Level)
 #define VOXEL_UNDERWATER_MAP_E2(Level) GMap->E2(Level)
+#define VOXEL_UNDERWATER_MAP_FOAM_LOAD(Level, X, Y) GMap->LoadFoam(Level, X, Y)
 #include "VoxelUnderwaterMap.ush"
+}
+
+float FMapEmulation::LoadFoam(int L, int X, int Y) const
+{
+    return FoamAt(VoxelUnderwaterMapPoint(Anchor(L), Texel(L), E1(L), E2(L), X, Y));
 }
 
 // UnderwaterMapCS, ported.
@@ -281,6 +299,67 @@ int main(int argc, char** argv)
         }
         std::printf("  steepest step %.3f cm per cm; past the coarsest level (940 m+) the map's height %.1f cm (the sphere)\n", WorstSlope, Past);
         Expect(WorstSlope < 1.0, "no step at the levels' edges (every step under a slope of 1)");
+    }
+
+    // ---- Foam (stage O9c) ---------------------------------------------------------------------------
+    std::printf("\nFoam: the foam map's reads against a synthetic field; the map pass's surface point:\n");
+    {
+        // Accuracy where the finest levels hold it (the field is resolved there).
+        double WorstNear = 0;
+        for (int k = 0; k < 400; k++)
+        {
+            const float3 Q = SeaPoint(Rng, std::uniform_real_distribution<double>(0.0, 2000.0)(Rng));
+            float3 Up;
+            const float3 Foot = FootOf(Q, Up);
+            WorstNear = std::max(WorstNear, (double)std::fabs(VoxelUnderwaterMapFoam(Foot) - FMapEmulation::FoamAt(Foot)));
+        }
+        std::printf("  within 20 m of the camera: the map's foam within %.4f of the field\n", WorstNear);
+        Expect(WorstNear < 0.01, "the foam map reads the field within 0.01 where it resolves it");
+        // A walk outward across every level's edge: in range, no step, none past the coarsest.
+        FVector T = RandomDir(Rng);
+        const FVector U(CamUp.x, CamUp.y, CamUp.z);
+        T = (T - U * (T | U)).GetSafeNormal();
+        double WorstSlope = 0, Past = 0, Low = 1, High = 0;
+        float Last = 0;
+        double LastD = 0;
+        bool bFirst = true;
+        for (double D = 0; D < 100000.0; D += std::max(1.0, D / 2000.0))
+        {
+            const float3 Q = F3(U * (-CameraHeight) + T * D);
+            float3 Up;
+            const float F = VoxelUnderwaterMapFoam(FootOf(Q, Up));
+            Low = std::min(Low, (double)F);
+            High = std::max(High, (double)F);
+            if (!bFirst) WorstSlope = std::max(WorstSlope, std::fabs(F - Last) / (D - LastD));
+            bFirst = false;
+            Last = F;
+            LastD = D;
+            if (D > 94000.0) Past = std::max(Past, (double)F);
+        }
+        std::printf("  a walk to 1 km: foam %.3f to %.3f, steepest change %.5f per cm (the field's %.5f); past the coarsest level %.3f\n",
+            Low, High, WorstSlope, FoamSlope, Past);
+        Expect(Low >= 0.0 && High <= 1.0, "the foam stays within 0 to 1");
+        Expect(WorstSlope < 2.0 * FoamSlope, "no step at the levels' edges (under twice the field's steepest change)");
+        Expect(Past == 0.0, "no foam past the coarsest level");
+        // The surface point UnderwaterMapCS evaluates the foam at: the foot less the horizontal
+        // displacement the inversion found there; its own waves carry it back over the foot.
+        double WorstBack = 0, Moved = 0;
+        for (int k = 0; k < 60; k++)
+        {
+            const float3 Q = SeaPoint(Rng, std::uniform_real_distribution<double>(0.0, 50000.0)(Rng));
+            float3 Up;
+            const float3 Foot = FootOf(Q, Up);
+            FPoint Out;
+            HookHeightAt(Tx, Q, Centre, Radius, CameraHeight, W, Out, 3, 1u, 0.0f);
+            const float3 Point = Foot - Rotate(W.Rotation, Out.R.Displacement);
+            Moved = std::max(Moved, (double)length(Point - Foot));
+            const FPoint Back = HookEvaluate(Tx, Point, normalize(Point - Centre), 0.0f, 0.0f, W, 1u, Deep, ShoreAt(Tx, Point, normalize(Point - Centre), W));
+            float3 R = Point + Rotate(W.Rotation, Back.R.Displacement) - Foot;
+            R = R - Up * dot(Up, R);
+            WorstBack = std::max(WorstBack, (double)length(R));
+        }
+        std::printf("  the foam's surface point (up to %.0f cm from the foot), carried by its own waves, lands within %.2f cm of the foot\n", Moved, WorstBack);
+        Expect(WorstBack < 2.0 && Moved > 10.0, "the map pass evaluates the foam at the surface point above (within 2 cm; the waves move it)");
     }
 
     // ---- Normals ----------------------------------------------------------------------------------

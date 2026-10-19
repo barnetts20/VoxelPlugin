@@ -38,6 +38,12 @@ namespace VoxelOceanWaves
 {
     /** A depth or shore distance meaning "none near" (cm), as VOXEL_OCEAN_DEEP. */
     constexpr double Deep = 1.0e30;
+    /** The inland basins' margin over the bake's (stage O9b3): the sea drains below the ground
+     *  from the bake's margin (FVoxelOceanSettings::ShoreBasinMargin cells) to this many times it,
+     *  and the basin is land (culled, not water) past that (VOXEL_OCEAN_SURF_DRAIN_START). */
+    constexpr double BasinDrainSpan = 1.5;
+    /** An unknown bed slope (stage O9b2), as VOXEL_OCEAN_BED_UNKNOWN. */
+    constexpr double BedUnknown = -1.0e4;
 
     /** The wave model the console chooses (voxel.Ocean.WaveModel): 0 a flat sea, 1 the test
      *  model, 2 the FFT model (the default). Game thread. */
@@ -137,8 +143,11 @@ struct FVoxelOceanWaveSite
 {
     FVector Point = FVector::ZeroVector;
     FVector Up = FVector::UpVector;             // its radial
-    double Depth = VoxelOceanWaves::Deep;       // when the model asks for it
+    double Depth = VoxelOceanWaves::Deep;       // when the model asks for it: the depth the waves feel (cm)
     FVoxelOceanShore Shore;                     // when the model asks for it
+    /** The bed's slope toward the coast (stage O9b2; with the depth and the shore): the depth
+     *  falling along the field's landward direction (m per m); BedUnknown: unknown. */
+    double BedSlope = VoxelOceanWaves::BedUnknown;
     FVoxelOceanEnvironment Environment;         // the frame's constants unless a source is set
 };
 
@@ -196,6 +205,9 @@ struct FVoxelOceanWaveContext
      *  cells per face edge (0: none) and its reach (m), for the shaders' parameters. */
     int32 ShoreCells = 0;
     double ShoreReachM = 0.0;
+    /** The inland basins' margin (m; stage O9b3): the sea drains below the ground between half of
+     *  it and it inland (VoxelOceanSurfDrainOf). 0: no drain. */
+    double ShoreMarginM = 0.0;
 };
 
 // ---------------------------------------------------------------------------
@@ -296,13 +308,16 @@ struct FVoxelOceanFFTSettings
     double ShoreWarp = 1.0;
     double ShoreFade = 0.0;
     double ShoreMinSlope = 0.005;
-    /** The surf (stage O9a; VoxelOceanSurf.ush): its strength (0: none), sets, swash, skew and
-     *  handover (breaking depths). */
+    /** The surf (stage O9a; VoxelOceanSurf.ush): its strength (0: none), sets, swash, skew,
+     *  handover (breaking depths) and the swash's reach. */
     double SurfStrength = 1.0;
     double SurfSets = 1.0;
     double SurfSwash = 1.0;
     double SurfSkew = 0.85;
     double SurfHandover = 2.5;
+    /** The swash's swing either side of its mean is held within this distance up and down the
+     *  beach (m, stage O9b2; at the field's slope). */
+    double SurfSwashReach = 10.0;
     /** The foam (stage O9b; VoxelOceanFoam.ush, VoxelOceanSurf.ush): the open sea's decay (s; 0:
      *  none made), its coverage (0 none, 1 as calibrated) and the surf's foam. Live: the surface
      *  reads them every frame, so they aren't compared (a change doesn't rebuild the model or
@@ -318,7 +333,7 @@ struct FVoxelOceanFFTSettings
             && WindSpeed == Other.WindSpeed && ShoreBreaking == Other.ShoreBreaking && ShoreChopGrowth == Other.ShoreChopGrowth
             && ShoreWarp == Other.ShoreWarp && ShoreFade == Other.ShoreFade && ShoreMinSlope == Other.ShoreMinSlope
             && SurfStrength == Other.SurfStrength && SurfSets == Other.SurfSets && SurfSwash == Other.SurfSwash
-            && SurfSkew == Other.SurfSkew && SurfHandover == Other.SurfHandover;
+            && SurfSkew == Other.SurfSkew && SurfHandover == Other.SurfHandover && SurfSwashReach == Other.SurfSwashReach;
     }
     bool operator!=(const FVoxelOceanFFTSettings& Other) const { return !(*this == Other); }
 };
@@ -346,6 +361,10 @@ struct VOXELPLUGIN_API FVoxelOceanWaveFrame
     /** Where the shore field marks an inland basin: points whose shore distance is below minus
      *  this (cm) are land (no water, no waves; FVoxelOceanSample::bWater false). */
     double ShoreMarginCm = 0.0;
+    /** The depth the waves feel (stage O9b2): site depths leave out terrain detail finer than
+     *  this (cm), as the drawn surface's (FVoxelOceanDensityInputs::DepthFootprintCm). The
+     *  query's reported depth (FVoxelOceanSample::Depth) stays the terrain's own. */
+    double DepthFootprintCm = 0.0;
 
     double Radius() const { return Context.Radius; }
     bool HasWaves() const { return Model.IsValid() && Model->MaxHeight() > 0.0; }

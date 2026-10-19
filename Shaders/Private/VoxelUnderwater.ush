@@ -18,6 +18,10 @@
 //    inside Snell's window (incidence below about 48.6 degrees from the surface normal) it
 //    shows that scene colour, less the Fresnel reflection; outside, total internal reflection
 //    shows the water below. The normal there includes the waves.
+// 6. Foam (stage O9c; with the map's foam, VOXEL_UNDERWATER_MAP_FOAM_LOAD, and the includer's
+//    VOXEL_UNDERWATER_FOAM_COLOR: rgb in the scene colour's units, a 0 off): where the ray leaves,
+//    the surface's foam covers what lies beyond by its amount, lit from above (whitecaps, the
+//    surf's bores and the swash seen from below), before the water's extinction along the path.
 //
 // Positions are from the view's camera (the reference point): W.Center is the planet centre from
 // it, Sphere = (sea radius, the camera's height above the sphere), both formed in double on the
@@ -41,6 +45,12 @@
 #define VOXEL_UNDERWATER_HAS_MAP 1
 #else
 #define VOXEL_UNDERWATER_HAS_MAP 0
+#endif
+
+#if VOXEL_UNDERWATER_HAS_MAP && defined(VOXEL_UNDERWATER_MAP_FOAM_LOAD) && defined(VOXEL_UNDERWATER_FOAM_COLOR)
+#define VOXEL_UNDERWATER_HAS_FOAM 1
+#else
+#define VOXEL_UNDERWATER_HAS_FOAM 0
 #endif
 
 // An exit distance meaning the ray doesn't leave the water nearby.
@@ -195,6 +205,17 @@ float3 VoxelUnderwaterColor(float3 SceneColor, float3 Dir, float NearDistance, f
             Fresnel = 0.02f + 0.98f * X * X * X * X * X;
         }
         Behind = lerp(SceneColor, WaterColor, Fresnel);
+#if VOXEL_UNDERWATER_HAS_FOAM
+        // The foam where it leaves (the map's, at the exit's foot on the sphere).
+        const float4 FoamColor = VOXEL_UNDERWATER_FOAM_COLOR;
+        if (W.FFT.x >= 0.5f && FoamColor.a > 0.0f)
+        {
+            const float3 ExitPoint = Near + Dir * Exit;
+            const float ExitHeight = VoxelOceanSphereHeight(ExitPoint, Sphere.x, Sphere.y, normalize(-W.Center));
+            const float3 ExitFoot = ExitPoint - normalize(ExitPoint - W.Center) * ExitHeight;
+            Behind = lerp(Behind, FoamColor.rgb, VoxelUnderwaterMapFoam(ExitFoot));
+        }
+#endif
     }
     const float3 Transmittance = exp(-Extinction * (Path * 0.01f));
     const float3 Color = Behind * Transmittance + WaterColor * (1.0f - Transmittance);

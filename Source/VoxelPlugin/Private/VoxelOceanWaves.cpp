@@ -35,8 +35,12 @@ namespace VoxelOceanWavesDetail
     constexpr int32 QuerySteps = 8;
     constexpr double QueryTolerance = 1.0e-3;
     constexpr double QueryMinJacobian = 0.05;
-    /** The depth of a point in an inland basin (cm): land (VOXEL_OCEAN_BASIN_DEPTH). */
-    constexpr double BasinDepth = -1.0e6;
+    /** The bed's slope (stage O9b2; VoxelOceanPage.usf's VOXEL_OCEAN_BED_*): measured where the
+     *  depth lies within these (cm), over at least this step either side (cm). */
+    constexpr double BedLand = -10000.0;
+    constexpr double BedSea = 6000.0;
+    constexpr double BedMinStep = 100.0;
+    constexpr double BedMaxFootprint = 100000.0;
 }
 
 namespace VOW = VoxelOceanWavesDetail;
@@ -172,6 +176,7 @@ void FVoxelOceanWaveFrame::FillSites(TArrayView<FVoxelOceanWaveSite> Sites, doub
     {
         Site.Up = Site.Point.GetSafeNormal();
         Site.Depth = VoxelOceanWaves::Deep;
+        Site.BedSlope = VoxelOceanWaves::BedUnknown;
         Site.Shore = FVoxelOceanShore();
         Site.Environment = Context.Environment;
         if (EnumHasAnyFlags(Required, EVoxelOceanWaveInputs::Shore) && Shore.IsValid())
@@ -194,18 +199,48 @@ void FVoxelOceanWaveFrame::FillSites(TArrayView<FVoxelOceanWaveSite> Sites, doub
             Y[i] = Sites[i].Point.Y;
             Z[i] = Sites[i].Point.Z;
         }
-        Density->Sample(FSampleInput(X.GetData(), Y.GetData(), Z.GetData(), Sites.Num()), Values.GetData());
+        // The depth the waves feel: the terrain's detail finer than the depth footprint left out,
+        // less the point's height over the sea sphere (as the drawn surface's, VoxelOceanPage.usf).
+        const double Footprint = FMath::Max(DepthFootprintCm, 0.0);
+        const double SeaRadius = Context.Radius;
+        Density->Sample(FSampleInput(X.GetData(), Y.GetData(), Z.GetData(), Sites.Num(), Footprint), Values.GetData());
         for (int32 i = 0; i < Sites.Num(); i++)
-            Sites[i].Depth = Values[i];
-        // An inland basin below sea level is land (stage O8, the shore field), as the pages take it.
-        if (Shore.IsValid())
+            Sites[i].Depth = Values[i] - (SeaRadius > 0.0 ? Sites[i].Point.Size() - SeaRadius : 0.0);
+        // An inland basin below sea level keeps the terrain's depth (stage O9b3): the model drains
+        // the surface below the ground toward it (VoxelOceanSurfDrainOf), as the pages' waves do.
+        // The bed's slope (stage O9b2): the depth's fall over the footprint either side along the
+        // field's landward direction, where the depth lies near any surf (as VoxelOceanPage.usf's).
+        if (EnumHasAnyFlags(Required, EVoxelOceanWaveInputs::Shore) && Footprint <= VoxelOceanWavesDetail::BedMaxFootprint)
         {
-            for (FVoxelOceanWaveSite& Site : Sites)
+            const double Step = FMath::Max(Footprint, VoxelOceanWavesDetail::BedMinStep);
+            TArray<int32> Measured;
+            TArray<double> BX, BY, BZ;
+            for (int32 i = 0; i < Sites.Num(); i++)
             {
-                if (Site.Depth <= 0.0) continue;
-                const FVoxelOceanShore At = EnumHasAnyFlags(Required, EVoxelOceanWaveInputs::Shore) ? Site.Shore : Shore->Sample(Site.Point);
-                if (At.HasField() && At.Distance < -ShoreMarginCm)
-                    Site.Depth = VoxelOceanWavesDetail::BasinDepth;
+                const FVoxelOceanWaveSite& Site = Sites[i];
+                const double L2 = Site.Shore.Direction.SizeSquared();
+                if (!Site.Shore.HasField() || L2 < 0.01 || Site.Depth <= VoxelOceanWavesDetail::BedLand || Site.Depth >= VoxelOceanWavesDetail::BedSea)
+                    continue;
+                const FVector Along = Site.Shore.Direction * (Step / FMath::Sqrt(L2));
+                for (int32 Side = 0; Side < 2; Side++)
+                {
+                    const FVector P = Side == 0 ? Site.Point - Along : Site.Point + Along;
+                    BX.Add(P.X);
+                    BY.Add(P.Y);
+                    BZ.Add(P.Z);
+                }
+                Measured.Add(i);
+            }
+            if (Measured.Num() > 0)
+            {
+                TArray<float> BValues;
+                BValues.SetNumZeroed(BX.Num());
+                Density->Sample(FSampleInput(BX.GetData(), BY.GetData(), BZ.GetData(), BX.Num(), Footprint), BValues.GetData());
+                for (int32 k = 0; k < Measured.Num(); k++)
+                {
+                    auto Lifted = [&](int32 j) { return (double)BValues[j] - (SeaRadius > 0.0 ? FVector(BX[j], BY[j], BZ[j]).Size() - SeaRadius : 0.0); };
+                    Sites[Measured[k]].BedSlope = (Lifted(2 * k) - Lifted(2 * k + 1)) / (2.0 * Step);
+                }
             }
         }
     }

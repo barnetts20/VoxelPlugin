@@ -1,7 +1,9 @@
-Ocean harnesses (stages O1-O4, O6a, O6b, O7, O8). Plain C++20; no engine. Each file's head comment says what it checks.
+Ocean harnesses (stages O1-O4, O6a, O6b, O7, O8, O9a-O9c). Plain C++20; no engine. Each file's head comment says what it checks.
 
   ocean_tiles_harness.cpp   the selection and tile geometry of VoxelOceanTiles.h, compiled unchanged:
-                            balance, morph chains, seams and cracks under test waves, rays.
+                            balance, morph chains, seams and cracks under test waves, rays; O9c: the same
+                            with the split bias near shores on a synthetic coast by each camera (args:
+                            cameras per factor, morph start fraction, bias cameras)
       g++ -O2 -std=c++20 -DVOT_HEADER='"<plugin>/Source/VoxelPlugin/Public/VoxelOceanTiles.h"' -I. ocean_tiles_harness.cpp -o ocean_tiles_harness
       (several minutes; expected_tiles_o4.txt is the O4 run's output)
   ocean_pages_stats.cpp     pages, slots and triangles per frame (same -DVOT_HEADER and -I.)
@@ -41,7 +43,8 @@ Ocean harnesses (stages O1-O4, O6a, O6b, O7, O8). Plain C++20; no engine. Each f
   hook_view.cpp             O6b: a top-down relief image of the hook's sea around a cube corner (seams)
   underwater_map_check.cpp  O6b: the underwater pass's surface map (VoxelUnderwaterMap.ush/.h) against
                             the exact search it replaces: heights by level, the waterline, continuity
-                            across levels, normals, exits; optional wind argument (default 12 m/s)
+                            across levels, normals, exits; O9c: the foam map's reads and the map pass's
+                            surface point; optional wind argument (default 12 m/s)
       (both built as hook_check, with their own .cpp)
   weather_check.cpp         O7: the procedural weather (VoxelOceanWeather.cpp) and its table
                             (VoxelOceanWeatherTable.cpp, read through VoxelOceanSeaState.ush): bands,
@@ -55,7 +58,8 @@ Ocean harnesses (stages O1-O4, O6a, O6b, O7, O8). Plain C++20; no engine. Each f
   shore_check.cpp           O8: the land bake's sea-connected flood (VoxelLandSea.h) and the shore field (VoxelOceanShore.ush,
                             VoxelOceanShoreBuild.ush through VoxelOceanShoreCore.h) on a synthetic planet with an inland
                             basin: the flood's rule, the jump flooding against exact distances (the gradient near the
-                            coast), directions, slopes, the smoothing passes, the texels' packing, sampling across face edges and corners; the shoaling maths (VoxelOceanShoal.ush:
+                            coast), directions, slopes, the smoothing passes, the texels' packing, sampling across face edges and corners;
+                            O9c: the coastline (the split bias's segments) against the field's zero line; the shoaling maths (VoxelOceanShoal.ush:
                             dispersion, the warp integral, gains, breaking, the fade, the lookup transform)
       g++ -O2 -std=c++20 -ffp-contract=off -I<plugin>/Source/VoxelPlugin/Public -I<plugin>/Source/VoxelPlugin/Private
           -I<plugin>/Shaders/Private shore_check.cpp -o shore_check

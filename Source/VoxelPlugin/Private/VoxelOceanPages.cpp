@@ -68,6 +68,8 @@ BEGIN_SHADER_PARAMETER_STRUCT(FVoxelOceanDensityParameters, )
     SHADER_PARAMETER(uint32, ShoreN)
     SHADER_PARAMETER(float, ShoreReach)
     SHADER_PARAMETER(float, ShoreMarginM)
+    SHADER_PARAMETER(float, DepthFootprint)
+    SHADER_PARAMETER(FVector2f, SeaRadius)
 END_SHADER_PARAMETER_STRUCT()
 
 BEGIN_SHADER_PARAMETER_STRUCT(FVoxelOceanWriteParameters, )
@@ -151,7 +153,7 @@ static TAutoConsoleVariable<int32> CVarVoxelOceanPageCreates(
 namespace VoxelOceanPagesDetail
 {
     constexpr uint32 JobWords = 6;                 // VOXEL_OCEAN_JOB_WORDS (VoxelOceanPage.usf)
-    constexpr int32 TexCoordChannels = 5;          // morph xy | morph z, depth | target depth, shore | grand xy | grand z, grand depth
+    constexpr int32 TexCoordChannels = 6;          // morph xy | morph z, depth | target depth, coast codes | grand xy | grand z, grand depth | bed codes, land depth
     constexpr int32 MaxPooled = 48;                // emptied buffer sets kept for reuse
     constexpr uint64 KickFrames = 3;               // frames before a run that didn't happen is asked for again
     constexpr uint64 UnusedFrames = 120;           // an empty page no commit wanted is pooled after
@@ -268,7 +270,7 @@ namespace VoxelOceanPagesDetail
     /** Render thread. The density, edits and shore cull a page write or the probe binds. */
     void FillDensity(FRDGBuilder& GraphBuilder, FVoxelOceanInputCache& Cache, const TSharedPtr<const FVoxelDensityGPUData>& InDensity,
         const TSharedPtr<const FVoxelEditGPUData>& InEdits, double HalfFinest, const TSharedPtr<const FVoxelOceanShoreRHI, ESPMode::ThreadSafe>& Shore,
-        double ShoreMarginCm, FVoxelOceanDensityParameters& Out)
+        double ShoreMarginCm, double DepthFootprintCm, double SeaRadiusCm, FVoxelOceanDensityParameters& Out)
     {
         const FVoxelDensityGPUData& Density = *InDensity;
         const VoxelBrickMesherGPU::FInputs Inputs = Cache.Get(GraphBuilder, InDensity, InEdits);
@@ -302,6 +304,9 @@ namespace VoxelOceanPagesDetail
         Out.ShoreN = ShoreTexture ? (uint32)Shore->N : 0u;
         Out.ShoreReach = ShoreTexture ? Shore->ReachM : 0.0f;
         Out.ShoreMarginM = (float)(ShoreMarginCm * 0.01);
+        Out.DepthFootprint = (float)FMath::Max(DepthFootprintCm, 0.0);
+        // The sea sphere: each lattice point's height over it comes off its depth (stage O9b2).
+        Out.SeaRadius = VoxelDoubleFloat(FMath::Max(SeaRadiusCm, 0.0));
     }
 }
 
@@ -326,6 +331,9 @@ public:
         /** The shore field's inland-basin cull (null: none). */
         TSharedPtr<const FVoxelOceanShoreRHI, ESPMode::ThreadSafe> Shore;
         double ShoreMarginCm = 0.0;
+        /** The depth the waves feel: its footprint (cm). The sea sphere (cm). */
+        double DepthFootprintCm = 0.0;
+        double SeaRadiusCm = 0.0;
     };
 
     explicit FVoxelOceanPageProvider(const TSharedPtr<FVoxelOceanInputCache, ESPMode::ThreadSafe>& InInputCache)
@@ -420,7 +428,8 @@ void FVoxelOceanPageProvider::BuildComputePasses(FRDGBuilder& GraphBuilder, cons
     {
         const uint32 NumJobs = (uint32)State.Jobs.Num() / VOP::JobWords;
         FVoxelOceanWriteParameters* Parameters = GraphBuilder.AllocParameters<FVoxelOceanWriteParameters>();
-        VOP::FillDensity(GraphBuilder, *InputCache, State.Density, State.Edits, State.HalfFinest, State.Shore, State.ShoreMarginCm, Parameters->Density);
+        VOP::FillDensity(GraphBuilder, *InputCache, State.Density, State.Edits, State.HalfFinest, State.Shore, State.ShoreMarginCm, State.DepthFootprintCm,
+            State.SeaRadiusCm, Parameters->Density);
         Parameters->Jobs = GraphBuilder.CreateSRV(VoxelGPUCommon::UploadStructuredBuffer<uint32>(GraphBuilder, TEXT("Voxel.OceanJobs"), State.Jobs));
         Parameters->VertexWords = GraphBuilder.CreateSRV(VoxelGPUCommon::UploadStructuredBuffer<uint32>(GraphBuilder, TEXT("Voxel.OceanVertexWords"), State.Words));
         Parameters->OutPositions = Positions;
@@ -463,7 +472,8 @@ void FVoxelOceanPages::ProbeDepth(const VoxelOceanDepthProbe::FLevels& Levels, d
     const TSharedPtr<const FVoxelDensityGPUData> Density = DensityInputs.Density.IsValid() ? DensityInputs.Density : NoDensity;
     const TSharedPtr<const FVoxelEditGPUData> Edits = DensityInputs.Edits.IsValid() ? DensityInputs.Edits : NoEdits;
     ENQUEUE_RENDER_COMMAND(VoxelOceanProbeDepth)([State = ProbeState, Cache = InputCache, Density, Edits, HalfFinest = DensityInputs.HalfFinest,
-        Shore = DensityInputs.Shore, Margin = DensityInputs.ShoreMarginCm, Lattice = MoveTemp(Lattice), Footprint, Levels](FRHICommandListImmediate& RHICmdList)
+        Shore = DensityInputs.Shore, Margin = DensityInputs.ShoreMarginCm, DepthFootprintCm = DensityInputs.DepthFootprintCm, InRadius, Lattice = MoveTemp(Lattice),
+        Footprint, Levels](FRHICommandListImmediate& RHICmdList)
         {
             FGlobalShaderMap* ShaderMap = GetGlobalShaderMap(GMaxRHIFeatureLevel);
             if (!ShaderMap || !ShaderMap->GetShader(&FVoxelOceanProbeCS::GetStaticType(), 0).IsValid())
@@ -474,14 +484,15 @@ void FVoxelOceanPages::ProbeDepth(const VoxelOceanDepthProbe::FLevels& Levels, d
             FRDGBuilder GraphBuilder(RHICmdList);
             RDG_EVENT_SCOPE_STAT(GraphBuilder, VoxelOceanProbe, "VoxelOceanProbe");
             const uint32 Count = (uint32)VoxelOceanDepthProbe::Points;
-            FRDGBufferRef Out = GraphBuilder.CreateBuffer(FRDGBufferDesc::CreateStructuredDesc(sizeof(float), Count), TEXT("Voxel.OceanProbe"));
+            // The depths, then the bed's slopes (stage O9b2).
+            FRDGBufferRef Out = GraphBuilder.CreateBuffer(FRDGBufferDesc::CreateStructuredDesc(sizeof(float), 2 * Count), TEXT("Voxel.OceanProbe"));
             FVoxelOceanProbeParameters* P = GraphBuilder.AllocParameters<FVoxelOceanProbeParameters>();
             P->ProbePoints = GraphBuilder.CreateSRV(VoxelGPUCommon::UploadStructuredBuffer<int32>(GraphBuilder, TEXT("Voxel.OceanProbePoints"), MakeConstArrayView(Lattice)));
             P->ProbeOut = GraphBuilder.CreateUAV(Out);
             P->ProbeCount = Count;
             P->ProbeLevelPoints = (uint32)(VoxelOceanDepthProbe::Size * VoxelOceanDepthProbe::Size);
             P->ProbeFootprint = Footprint;
-            VOP::FillDensity(GraphBuilder, *Cache, Density, Edits, HalfFinest, Shore, Margin, P->Density);
+            VOP::FillDensity(GraphBuilder, *Cache, Density, Edits, HalfFinest, Shore, Margin, DepthFootprintCm, InRadius, P->Density);
             FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("VoxelOceanProbe %u points", Count), TShaderMapRef<FVoxelOceanProbeCS>(ShaderMap), P,
                 FIntVector((int32)FMath::DivideAndRoundUp(Count, 64u), 1, 1));
             GraphBuilder.QueueBufferExtraction(Out, &State->Depth);
@@ -573,7 +584,7 @@ void FVoxelOceanPages::SetMorphEnd0(double InMorphEnd0)
         Apply(Entry.Instance);
 }
 
-void FVoxelOceanPages::PackVertex(const VoxelOceanTiles::FTileVertex& Vertex, const FIntVector& Lattice, uint32* OutWords)
+void FVoxelOceanPages::PackVertex(const VoxelOceanTiles::FTileVertex& Vertex, const FIntVector& Lattice, float Coast, uint32* OutWords)
 {
     OutWords[0] = VOP::FloatBits(Vertex.Position.X);
     OutWords[1] = VOP::FloatBits(Vertex.Position.Y);
@@ -590,6 +601,7 @@ void FVoxelOceanPages::PackVertex(const VoxelOceanTiles::FTileVertex& Vertex, co
     OutWords[12] = (uint32)Lattice.Y;
     OutWords[13] = (uint32)Lattice.Z;
     OutWords[14] = ((uint32)Vertex.TargetIndex & 0xffffu) | ((uint32)Vertex.GrandIndex << 16);
+    OutWords[15] = VOP::FloatBits(Coast);
 }
 
 FVoxelOceanPages::FInstance FVoxelOceanPages::CreateInstance()
@@ -831,7 +843,8 @@ void FVoxelOceanPages::Commit(TConstArrayView<FTileWrite> Writes, TConstArrayVie
         }
         FPageWork& PageWork = Work.FindOrAdd(PageKey);
         PageWork.Cleared &= ~(1u << Slot);
-        PageWork.Jobs.Append({ 0u, (uint32)Slot, (uint32)PageWork.Words.Num(), VOP::FloatBits(Write.Footprint), VOP::FloatBits(Write.CullHeight), 0u });
+        PageWork.Jobs.Append({ 0u, (uint32)Slot, (uint32)PageWork.Words.Num(), VOP::FloatBits(Write.Footprint), VOP::FloatBits(Write.CullHeight),
+            VOP::FloatBits(Write.Nominal) });
         PageWork.Words.Append(Write.Words);
         Perf.TilesWritten++;
     }
@@ -874,6 +887,8 @@ void FVoxelOceanPages::Push(const FVoxelOceanTileKey& PageKey, FInstance& Instan
     State.HalfFinest = DensityInputs.HalfFinest;
     State.Shore = DensityInputs.Shore;
     State.ShoreMarginCm = DensityInputs.ShoreMarginCm;
+    State.DepthFootprintCm = DensityInputs.DepthFootprintCm;
+    State.SeaRadiusCm = Radius;
     State.Version = NextVersion++;
     Instance.PushedVersion = State.Version;
     // The state reaches the provider before the dirty mark: both are render commands.

@@ -15,8 +15,11 @@
 // Where a tile meets a coarser one its vertices are fully collapsed onto the coarser tile's
 // vertices as that tile draws them, so the boundary stays closed. Level 0 doesn't morph.
 //
-// The terrain depth (cm, positive under water; TexCoord 1 y, and at the targets TexCoord 2 x
-// and TexCoord 4 y) morphs the same way, and goes to the waves as their depth input.
+// The depth the waves feel (cm, positive under water; TexCoord 1 y, and at the targets TexCoord 2
+// x and TexCoord 4 y: the terrain smoothed by the shore's depth footprint, VoxelOceanPage.usf)
+// morphs the same way, and goes to the waves as their depth input. So does the bed's slope
+// (stage O9b2: three codes in TexCoord 5 x, VoxelOceanBedMorph); TexCoord 5 y is the terrain's own
+// depth at the vertex (for the swash's foam).
 //
 // Waves: sampled at the morphed (undisplaced) point, so a boundary stays closed under any wave
 // model whose inputs there are the same on both sides. The mesh only takes the waves it can
@@ -38,7 +41,7 @@
 // VoxelOceanWave0 to VoxelOceanWave2 (RGBA); Center = VoxelOceanCenter masked to R G B (the
 // planet centre from the selection camera, world cm); Shape = VoxelOceanShape (RGBA: the test
 // waves' choppiness, storm, wind speed and heading).
-// Outputs: the World Position Offset; Depth, the terrain depth at the vertex, morphed;
+// Outputs: the World Position Offset; Depth, the depth the waves feel at the vertex, morphed;
 // SamplePoint, the undisplaced morphed point from the selection camera (world cm), for the
 // pixel shader.
 //
@@ -68,6 +71,15 @@
 // the waves shoal with the depth and slow toward the coast in the vertex and the pixel alike.
 // Without them (the code above) the material keeps compiling: the vertex shoals by its depth, the
 // pixel sees deep water, and nothing slows.
+//
+// THE SPLIT BIAS NEAR SHORES (stage O9c; VoxelOceanTiles.h, FShoreBias): with the FFT model, the
+// vertex node's morph weights take the effective distance (VoxelOceanShoreDetailDistance) the
+// selection took: the mesh within a band of the coast is as fine as if the camera were Detail
+// times closer. Each vertex carries its coast distance and its morph target's (TexCoord 2 y: two
+// 12-bit codes, VoxelOceanCoastOf), written with its tile; Detail, the band and the reach come
+// from the chart table's row 17 (written with the shore frame for the selection on screen);
+// Detail 1 there (or no FFT model) is the plain distance. No wiring: the FFT vertex code above,
+// with or without the shore field.
 //   return VoxelOceanVertexFFT(Parameters, ToVertex, UV0, UV1, UV2, UV3, UV4, Level, MorphEnd0, Params, Wave0, Wave1, Wave2, Center, Shape, FFT, RefHigh, RefLow, Rotation, Tiles, States, SlopeVar, Displacement, DisplacementSampler, Derivatives, DerivativesSampler, Charts, Shore, Depth, SamplePoint);
 //   return VoxelOceanPixelFFT(Parameters, SamplePoint, Params, Wave0, Wave1, Wave2, Center, Shape, FFT, RefHigh, RefLow, Rotation, Tiles, States, SlopeVar, Displacement, DisplacementSampler, Derivatives, DerivativesSampler, Charts, Shore, Depth, SlopeVariance);
 //
@@ -76,10 +88,50 @@
 // foam, VoxelOceanFoam.ush), and gives a Foam output (0 to 1: whitecaps, the surf's bores and the
 // swash's edge) for the material to blend its foam by:
 //   return VoxelOceanPixelFFT(Parameters, SamplePoint, Params, Wave0, Wave1, Wave2, Center, Shape, FFT, RefHigh, RefLow, Rotation, Tiles, States, SlopeVar, Displacement, DisplacementSampler, Derivatives, DerivativesSampler, Charts, Shore, FoamMap, FoamMapSampler, Depth, SlopeVariance, Foam);
+//
+// THE BED (stage O9b2; wiring: STAGE_O9b2_NOTES.md): the vertex node takes UV5 (TexCoord 5) after
+// UV4 and gives one more output, Bed (float2: the bed's slope toward the coast, morphed, and the
+// terrain's own depth), which the pixel node takes after Depth through a vertex interpolator:
+// the surf spaces, resolves and fades its waves by the bottom's real slope, its normals follow
+// it, and the swash's foam follows the visible waterline. The code without them keeps compiling
+// (the field's slope, the smoothed depth).
+//   return VoxelOceanVertexFFT(Parameters, ToVertex, UV0, UV1, UV2, UV3, UV4, UV5, Level, MorphEnd0, Params, Wave0, Wave1, Wave2, Center, Shape, FFT, RefHigh, RefLow, Rotation, Tiles, States, SlopeVar, Displacement, DisplacementSampler, Derivatives, DerivativesSampler, Charts, Shore, Depth, Bed, SamplePoint);
+//   return VoxelOceanPixelFFT(Parameters, SamplePoint, Params, Wave0, Wave1, Wave2, Center, Shape, FFT, RefHigh, RefLow, Rotation, Tiles, States, SlopeVar, Displacement, DisplacementSampler, Derivatives, DerivativesSampler, Charts, Shore, FoamMap, FoamMapSampler, Depth, Bed, SlopeVariance, Foam);
 
 #pragma once
 
 #include "/Plugin/VoxelPlugin/Private/VoxelOceanWaves.ush"
+
+// The split bias near shores (stage O9c): VoxelOceanTiles::CoastCapCm and CoastScaleCm.
+#define VOXEL_OCEAN_COAST_CAP 1.0e6f
+#define VOXEL_OCEAN_COAST_SCALE 2000.0f
+
+// The bias's settings (Detail, the band and the reach in cm; the chart table's row 17), Detail 1:
+// none (no FFT model).
+float3 VoxelOceanShoreDetailOf(float4 FFT, Texture2D OceanCharts)
+{
+    if (FFT.x < 0.5f || FFT.y < 0.5f) return float3(1.0f, 0.0f, 0.0f);
+    return OceanCharts.Load(int3(VoxelOceanConstantsX(int(FFT.y)), 17, 0)).xyz;
+}
+
+// A vertex's coast distances (cm), its own and its morph target's, from their codes (TexCoord 2
+// y: VoxelOceanTiles::CoastPack, an integer exact in a float; CoastValue).
+float2 VoxelOceanCoastOf(float Packed)
+{
+    const float Self = floor(Packed * (1.0f / 4096.0f));
+    const float Target = Packed - Self * 4096.0f;
+    const float K = log2(1.0f + VOXEL_OCEAN_COAST_CAP / VOXEL_OCEAN_COAST_SCALE) / 4095.0f;
+    return VOXEL_OCEAN_COAST_SCALE * (exp2(float2(Self, Target) * K) - 1.0f);
+}
+
+// The distance the morph weights take for a point D (cm) from the selection camera, Coast (cm)
+// from the coast (VoxelOceanTiles::EffectiveDistance, in float).
+float VoxelOceanShoreDetailDistance(float D, float Coast, float3 Bias)
+{
+    if (Bias.x <= 1.0f) return D;
+    const float Outside = max(Coast - Bias.y, 0.0f);
+    return min(D, D / Bias.x + (1.0f - 1.0f / Bias.x) * max(Outside, D - Bias.z));
+}
 
 // Morph weight of a level-L vertex D (world units) from the selection camera.
 float VoxelOceanMorphWeight(float D, float Level, float MorphEnd0, float2 Params)
@@ -187,13 +239,15 @@ float3 VoxelOceanPixel(FMaterialPixelParameters Parameters, float3 SamplePoint, 
 #define VOXEL_OCEAN_VERTEX_FFT_BODY \
     Depth = UV1.y; \
     float3 Offset = float3(0.0f, 0.0f, 0.0f); \
-    const float W0 = VoxelOceanMorphWeight(length(ToVertex), Level, MorphEnd0, Params.xy); \
+    const float3 Bias = VoxelOceanShoreDetailOf(FFT, Charts); \
+    const float2 Coast = VoxelOceanCoastOf(UV2.y); \
+    const float W0 = VoxelOceanMorphWeight(VoxelOceanShoreDetailDistance(length(ToVertex), Coast.x, Bias), Level, MorphEnd0, Params.xy); \
     float W1 = 0.0f; \
     if (W0 > 0.0f) \
     { \
         const float3 Parent = TransformLocalVectorToWorld(Parameters, float3(UV0.x, UV0.y, UV1.x)); \
         const float3 Grand = TransformLocalVectorToWorld(Parameters, float3(UV3.x, UV3.y, UV4.x)); \
-        W1 = VoxelOceanMorphWeight(length(ToVertex + Parent), Level - 1.0f, MorphEnd0, Params.xy); \
+        W1 = VoxelOceanMorphWeight(VoxelOceanShoreDetailDistance(length(ToVertex + Parent), Coast.y, Bias), Level - 1.0f, MorphEnd0, Params.xy); \
         Depth = lerp(UV1.y, lerp(UV2.x, UV4.y, W1), W0); \
         Offset = (Parent + Grand * W1) * W0; \
     } \
@@ -227,26 +281,55 @@ float3 VoxelOceanVertexFFT(FMaterialPixelParameters Parameters, float3 ToVertex,
 
 #undef VOXEL_OCEAN_VERTEX_FFT_BODY
 
-// With the shore field (stage O8): the wave input reads it at the morphed point.
+// The bed (stage O9b2): the slope of a vertex's packed codes (VoxelOceanBedPack: its own, its
+// target's, the target's target's) morphed as the depth is, an unknown code standing for Field
+// (the field's slope at the morphed point, as the surf takes it): always a real slope, so the
+// morph stays continuous and the pixel's interpolation harmless.
+float VoxelOceanBedOf(uint Code, float Field)
+{
+    const float S = VoxelOceanBedSlopeOf(Code);
+    return S > VOXEL_OCEAN_SURF_BED_KNOWN ? S : Field;
+}
+
+float VoxelOceanBedMorph(float Packed, float W0, float W1, float Field)
+{
+    const float S0 = VoxelOceanBedOf(VoxelOceanBedCodeAt(Packed, 0), Field);
+    if (W0 <= 0.0f) return S0;
+    const float S1 = VoxelOceanBedOf(VoxelOceanBedCodeAt(Packed, 1), Field);
+    const float S2 = VoxelOceanBedOf(VoxelOceanBedCodeAt(Packed, 2), Field);
+    return lerp(S0, lerp(S1, S2, W1), W0);
+}
+
+// With the shore field (stage O8): the wave input reads it at the morphed point; the morph
+// weights take the split bias near shores (stage O9c). Stage O9b2: the
+// bed's slope and the terrain's own depth from BedPacked and BedLand (TexCoord 5; 0 and
+// VOXEL_OCEAN_DEEP: unknown), into Bed (the slope morphed, the terrain's depth).
 #define VOXEL_OCEAN_VERTEX_FFT_SHORE_BODY \
     Depth = UV1.y; \
     float3 Offset = float3(0.0f, 0.0f, 0.0f); \
-    const float W0 = VoxelOceanMorphWeight(length(ToVertex), Level, MorphEnd0, Params.xy); \
+    const FVoxelOceanWaveParams Waves = VoxelOceanMakeWaveParamsFFT(Params, Wave0, Wave1, Wave2, Center, Shape, FFT, RefHigh, RefLow, Rotation, Tiles, States, SlopeVar); \
+    const FVoxelOceanShoreFrame Frame = VoxelOceanShoreFrameOfTable(Charts, int(FFT.y)); \
+    const float3 Bias = VoxelOceanShoreDetailOf(FFT, Charts); \
+    const float2 Coast = VoxelOceanCoastOf(UV2.y); \
+    const float W0 = VoxelOceanMorphWeight(VoxelOceanShoreDetailDistance(length(ToVertex), Coast.x, Bias), Level, MorphEnd0, Params.xy); \
     float W1 = 0.0f; \
     if (W0 > 0.0f) \
     { \
         const float3 Parent = TransformLocalVectorToWorld(Parameters, float3(UV0.x, UV0.y, UV1.x)); \
         const float3 Grand = TransformLocalVectorToWorld(Parameters, float3(UV3.x, UV3.y, UV4.x)); \
-        W1 = VoxelOceanMorphWeight(length(ToVertex + Parent), Level - 1.0f, MorphEnd0, Params.xy); \
+        W1 = VoxelOceanMorphWeight(VoxelOceanShoreDetailDistance(length(ToVertex + Parent), Coast.y, Bias), Level - 1.0f, MorphEnd0, Params.xy); \
         Depth = lerp(UV1.y, lerp(UV2.x, UV4.y, W1), W0); \
         Offset = (Parent + Grand * W1) * W0; \
     } \
+    Bed = float2(VOXEL_OCEAN_SHORE_DEFAULT_SLOPE, BedLand); \
     SamplePoint = ToVertex + Offset; \
     if ((Params.z > 0.0f || FFT.x > 0.5f) && MorphEnd0 > 0.0f) \
     { \
         const float Spacing = MorphEnd0 * exp2(W0 * (1.0f + W1) - Level) * Params.w; \
-        const FVoxelOceanWaveParams Waves = VoxelOceanMakeWaveParamsFFT(Params, Wave0, Wave1, Wave2, Center, Shape, FFT, RefHigh, RefLow, Rotation, Tiles, States, SlopeVar); \
-        const FVoxelOceanWaveInput In = VoxelOceanWaveInputShore(SamplePoint, Spacing, Spacing, Depth, Waves, VoxelOceanShoreFrameOfTable(Charts, int(FFT.y)), Shore); \
+        FVoxelOceanWaveInput In = VoxelOceanWaveInputShore(SamplePoint, Spacing, Spacing, Depth, Waves, Frame, Shore); \
+        Bed.x = VoxelOceanBedMorph(BedPacked, W0, W1, max(In.Shore.Slope, max(Waves.SlopeVar.y, 1.0e-4f))); \
+        In.Shore.BedSlope = Bed.x; \
+        In.Shore.BedDepth = Bed.y; \
         Offset += VoxelOceanWavesFFT(In, Waves, Displacement, DisplacementSampler, Derivatives, DerivativesSampler, Charts, VOXEL_OCEAN_LOOKUP_DISPLACEMENT).Displacement; \
     } \
     return Offset;
@@ -257,6 +340,9 @@ float3 VoxelOceanVertexFFT(FMaterialVertexParameters Parameters, float3 ToVertex
     Texture2DArray Displacement, SamplerState DisplacementSampler, Texture2DArray Derivatives, SamplerState DerivativesSampler,
     Texture2D Charts, Texture2DArray Shore, out float Depth, out float3 SamplePoint)
 {
+    const float BedPacked = 0.0f;
+    const float BedLand = VOXEL_OCEAN_DEEP;
+    float2 Bed;
     VOXEL_OCEAN_VERTEX_FFT_SHORE_BODY
 }
 
@@ -266,6 +352,34 @@ float3 VoxelOceanVertexFFT(FMaterialPixelParameters Parameters, float3 ToVertex,
     Texture2DArray Displacement, SamplerState DisplacementSampler, Texture2DArray Derivatives, SamplerState DerivativesSampler,
     Texture2D Charts, Texture2DArray Shore, out float Depth, out float3 SamplePoint)
 {
+    const float BedPacked = 0.0f;
+    const float BedLand = VOXEL_OCEAN_DEEP;
+    float2 Bed;
+    VOXEL_OCEAN_VERTEX_FFT_SHORE_BODY
+}
+
+// With the bed (stage O9b2): UV5 the vertex's TexCoord 5 (the bed's slope codes, the terrain's own
+// depth); Bed (the slope morphed, the terrain's depth) to the pixel node through a vertex
+// interpolator.
+float3 VoxelOceanVertexFFT(FMaterialVertexParameters Parameters, float3 ToVertex, float2 UV0, float2 UV1, float2 UV2,
+    float2 UV3, float2 UV4, float2 UV5, float Level, float MorphEnd0, float4 Params, float4 Wave0, float4 Wave1, float4 Wave2, float3 Center,
+    float4 Shape, float4 FFT, float4 RefHigh, float4 RefLow, float4 Rotation, float4 Tiles, float4 States, float4 SlopeVar,
+    Texture2DArray Displacement, SamplerState DisplacementSampler, Texture2DArray Derivatives, SamplerState DerivativesSampler,
+    Texture2D Charts, Texture2DArray Shore, out float Depth, out float2 Bed, out float3 SamplePoint)
+{
+    const float BedPacked = UV5.x;
+    const float BedLand = UV5.y;
+    VOXEL_OCEAN_VERTEX_FFT_SHORE_BODY
+}
+
+float3 VoxelOceanVertexFFT(FMaterialPixelParameters Parameters, float3 ToVertex, float2 UV0, float2 UV1, float2 UV2,
+    float2 UV3, float2 UV4, float2 UV5, float Level, float MorphEnd0, float4 Params, float4 Wave0, float4 Wave1, float4 Wave2, float3 Center,
+    float4 Shape, float4 FFT, float4 RefHigh, float4 RefLow, float4 Rotation, float4 Tiles, float4 States, float4 SlopeVar,
+    Texture2DArray Displacement, SamplerState DisplacementSampler, Texture2DArray Derivatives, SamplerState DerivativesSampler,
+    Texture2D Charts, Texture2DArray Shore, out float Depth, out float2 Bed, out float3 SamplePoint)
+{
+    const float BedPacked = UV5.x;
+    const float BedLand = UV5.y;
     VOXEL_OCEAN_VERTEX_FFT_SHORE_BODY
 }
 
@@ -313,11 +427,13 @@ float3 VoxelOceanPixelFFT(FMaterialPixelParameters Parameters, float3 SamplePoin
 }
 
 // The normal, the unresolved slope variance and the foam (0 to 1) at the pixel with the shore
-// field and the foam (stage O9b): FoamMap the Texture Object Parameter VoxelOceanFoam.
-float3 VoxelOceanPixelFFT(FMaterialPixelParameters Parameters, float3 SamplePoint, float4 Params, float4 Wave0, float4 Wave1, float4 Wave2, float3 Center,
+// field and the foam (stage O9b): FoamMap the Texture Object Parameter VoxelOceanFoam. Stage
+// O9b2: Bed, the vertex node's (the bed's slope, the terrain's own depth), through a vertex
+// interpolator; the signature without it takes the field's slope and the depth.
+float3 VoxelOceanPixelFFTBed(FMaterialPixelParameters Parameters, float3 SamplePoint, float4 Params, float4 Wave0, float4 Wave1, float4 Wave2, float3 Center,
     float4 Shape, float4 FFT, float4 RefHigh, float4 RefLow, float4 Rotation, float4 Tiles, float4 States, float4 SlopeVar,
     Texture2DArray Displacement, SamplerState DisplacementSampler, Texture2DArray Derivatives, SamplerState DerivativesSampler,
-    Texture2D Charts, Texture2DArray Shore, Texture2DArray FoamMap, SamplerState FoamMapSampler, float Depth, out float SlopeVariance, out float Foam)
+    Texture2D Charts, Texture2DArray Shore, Texture2DArray FoamMap, SamplerState FoamMapSampler, float Depth, float2 Bed, out float SlopeVariance, out float Foam)
 {
     SlopeVariance = 0.0f;
     Foam = 0.0f;
@@ -328,7 +444,9 @@ float3 VoxelOceanPixelFFT(FMaterialPixelParameters Parameters, float3 SamplePoin
 #else
     const float Footprint = 0.0f;
 #endif
-    const FVoxelOceanWaveInput In = VoxelOceanWaveInputShore(SamplePoint, Footprint, Footprint, Depth, Waves, VoxelOceanShoreFrameOfTable(Charts, int(FFT.y)), Shore);
+    FVoxelOceanWaveInput In = VoxelOceanWaveInputShore(SamplePoint, Footprint, Footprint, Depth, Waves, VoxelOceanShoreFrameOfTable(Charts, int(FFT.y)), Shore);
+    In.Shore.BedSlope = Bed.x;
+    In.Shore.BedDepth = Bed.y;
     if (Waves.FFT.x < 0.5f)
     {
         const FVoxelOceanWaveOutput Test = VoxelOceanWaves(In, Waves);
@@ -342,4 +460,23 @@ float3 VoxelOceanPixelFFT(FMaterialPixelParameters Parameters, float3 SamplePoin
     SlopeVariance = Out.SlopeVariance;
     Foam = Out.Foam;
     return Out.Normal;
+}
+
+float3 VoxelOceanPixelFFT(FMaterialPixelParameters Parameters, float3 SamplePoint, float4 Params, float4 Wave0, float4 Wave1, float4 Wave2, float3 Center,
+    float4 Shape, float4 FFT, float4 RefHigh, float4 RefLow, float4 Rotation, float4 Tiles, float4 States, float4 SlopeVar,
+    Texture2DArray Displacement, SamplerState DisplacementSampler, Texture2DArray Derivatives, SamplerState DerivativesSampler,
+    Texture2D Charts, Texture2DArray Shore, Texture2DArray FoamMap, SamplerState FoamMapSampler, float Depth, float2 Bed, out float SlopeVariance, out float Foam)
+{
+    return VoxelOceanPixelFFTBed(Parameters, SamplePoint, Params, Wave0, Wave1, Wave2, Center, Shape, FFT, RefHigh, RefLow, Rotation, Tiles, States, SlopeVar,
+        Displacement, DisplacementSampler, Derivatives, DerivativesSampler, Charts, Shore, FoamMap, FoamMapSampler, Depth, Bed, SlopeVariance, Foam);
+}
+
+float3 VoxelOceanPixelFFT(FMaterialPixelParameters Parameters, float3 SamplePoint, float4 Params, float4 Wave0, float4 Wave1, float4 Wave2, float3 Center,
+    float4 Shape, float4 FFT, float4 RefHigh, float4 RefLow, float4 Rotation, float4 Tiles, float4 States, float4 SlopeVar,
+    Texture2DArray Displacement, SamplerState DisplacementSampler, Texture2DArray Derivatives, SamplerState DerivativesSampler,
+    Texture2D Charts, Texture2DArray Shore, Texture2DArray FoamMap, SamplerState FoamMapSampler, float Depth, out float SlopeVariance, out float Foam)
+{
+    return VoxelOceanPixelFFTBed(Parameters, SamplePoint, Params, Wave0, Wave1, Wave2, Center, Shape, FFT, RefHigh, RefLow, Rotation, Tiles, States, SlopeVar,
+        Displacement, DisplacementSampler, Derivatives, DerivativesSampler, Charts, Shore, FoamMap, FoamMapSampler, Depth,
+        float2(VOXEL_OCEAN_BED_UNKNOWN, VOXEL_OCEAN_DEEP), SlopeVariance, Foam);
 }

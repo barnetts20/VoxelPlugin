@@ -6,6 +6,11 @@
 // camera (VoxelUnderwaterMap.ush): one thread per grid point, the wave hook's inversion with the
 // level's texel as its footprint. UnderwaterCS then reads it.
 //
+// The foam (stage O9c): the map pass also writes the foam of the surface above each point (the
+// inversion's last lookup reads the foam too, VOXEL_OCEAN_LOOKUP_FOAM, at the converged point)
+// into a second array; UnderwaterCS covers what the ray sees through the surface by it
+// (VoxelUnderwater.ush, step 6).
+//
 // The shore (stage O8): the map's waves shoal and slow as the drawn surface's do, with the depth
 // from the ocean's depth probe (VoxelOceanDepthProbe.h: nested grids of the terrain's depth around
 // the selection camera, read bilinearly, blended across levels; deep water past them) and the
@@ -34,6 +39,13 @@ float4 UnderwaterMapE1[VOXEL_UNDERWATER_MAP_LEVELS];
 float4 UnderwaterMapE2[VOXEL_UNDERWATER_MAP_LEVELS];
 
 #define VOXEL_UNDERWATER_MAP_LOAD(Level, X, Y) UnderwaterMap.Load(int4(X, Y, Level, 0))
+// The foam map (stage O9c): read by UnderwaterCS, written by UnderwaterMapCS; the foam's colour
+// as the ray sees it from below (rgb, linear scene units before exposure; a: 0 off).
+Texture2DArray<float> UnderwaterFoamMap;
+RWTexture2DArray<float> UnderwaterFoamMapOut;
+float4 UnderwaterFoamColor;
+#define VOXEL_UNDERWATER_MAP_FOAM_LOAD(Level, X, Y) UnderwaterFoamMap.Load(int4(X, Y, Level, 0))
+#define VOXEL_UNDERWATER_FOAM_COLOR float4(UnderwaterFoamColor.rgb * View.PreExposure, UnderwaterFoamColor.a)
 #define VOXEL_UNDERWATER_MAP_ANCHOR(Level) UnderwaterMapAnchor[Level].xyz
 #define VOXEL_UNDERWATER_MAP_TEXEL(Level) UnderwaterMapAnchor[Level].w
 #define VOXEL_UNDERWATER_MAP_E1(Level) UnderwaterMapE1[Level].xyz
@@ -54,14 +66,21 @@ uint UnderwaterProbeOn;
 // The depth probe's grids (VoxelOceanDepthProbe.h: 4 levels of 64^2).
 #define VOXEL_UNDERWATER_PROBE_LEVELS 4
 #define VOXEL_UNDERWATER_PROBE_SIZE 64
+// The bed's unknown slope and the least known one (VOXEL_OCEAN_BED_UNKNOWN,
+// VOXEL_OCEAN_SURF_BED_KNOWN; stage O9b2).
+#define VOXEL_UNDERWATER_BED_UNKNOWN (-1.0e4f)
+#define VOXEL_UNDERWATER_BED_KNOWN (-1000.0f)
 // A level fades out over its last texels (as the map's levels).
 #define VOXEL_UNDERWATER_PROBE_BLEND 4.0f
 
-// The terrain's depth (cm) at X (from the camera): the finest probe level covering it, blended
-// outward at each level's edge; deep (VOXEL_OCEAN_DEEP) past them (or without a probe).
-float VoxelUnderwaterProbeDepth(float3 X)
+// The probe's plane Plane (0 the depth the waves feel, cm; 1 the bed's slope, stage O9b2) at X
+// (from the camera): the finest probe level covering it, blended outward at each level's edge;
+// Outside past them (or without a probe). A slope next to an unknown one (VOXEL_OCEAN_BED_UNKNOWN)
+// is unknown.
+float VoxelUnderwaterProbeAt(float3 X, uint Plane, float Outside)
 {
-    if (UnderwaterProbeOn == 0u) return VOXEL_UNDERWATER_PROBE_DEEP;
+    if (UnderwaterProbeOn == 0u) return Outside;
+    const uint PlaneBase = Plane * uint(VOXEL_UNDERWATER_PROBE_LEVELS * VOXEL_UNDERWATER_PROBE_SIZE * VOXEL_UNDERWATER_PROBE_SIZE);
     float Depth = 0.0f;
     float Rest = 1.0f;
     const float Centre = 0.5f * float(VOXEL_UNDERWATER_PROBE_SIZE) - 0.5f;
@@ -77,23 +96,37 @@ float VoxelUnderwaterProbeDepth(float3 X)
         const float2 B = floor(P);
         const int2 T = int2(B);
         const float2 F = P - B;
-        const uint Base = uint(Level) * uint(VOXEL_UNDERWATER_PROBE_SIZE * VOXEL_UNDERWATER_PROBE_SIZE);
+        const uint Base = PlaneBase + uint(Level) * uint(VOXEL_UNDERWATER_PROBE_SIZE * VOXEL_UNDERWATER_PROBE_SIZE);
         const uint Row = uint(VOXEL_UNDERWATER_PROBE_SIZE);
         const uint I00 = Base + uint(T.y) * Row + uint(T.x);
         const float D00 = UnderwaterProbe[I00];
         const float D10 = UnderwaterProbe[I00 + 1u];
         const float D01 = UnderwaterProbe[I00 + Row];
         const float D11 = UnderwaterProbe[I00 + Row + 1u];
+        if (Plane != 0u && min(min(D00, D10), min(D01, D11)) <= VOXEL_UNDERWATER_BED_KNOWN) return VOXEL_UNDERWATER_BED_UNKNOWN;
         Depth += Rest * Cover * lerp(lerp(D00, D10, F.x), lerp(D01, D11, F.x), F.y);
         Rest *= 1.0f - Cover;
         if (Rest <= 0.0f) break;
     }
-    // Past every level: deep water; in the coarsest level's fading ring, its depth alone.
-    if (Rest >= 1.0f) return VOXEL_UNDERWATER_PROBE_DEEP;
+    // Past every level: Outside; in the coarsest level's fading ring, its value alone.
+    if (Rest >= 1.0f) return Outside;
     return Depth / (1.0f - Rest);
 }
 
+// The depth the waves feel (cm) at X: deep (VOXEL_OCEAN_DEEP) past the probe.
+float VoxelUnderwaterProbeDepth(float3 X)
+{
+    return VoxelUnderwaterProbeAt(X, 0u, VOXEL_UNDERWATER_PROBE_DEEP);
+}
+
+// The bed's slope at X (stage O9b2): unknown past the probe.
+float VoxelUnderwaterProbeBed(float3 X)
+{
+    return VoxelUnderwaterProbeAt(X, 1u, VOXEL_UNDERWATER_BED_UNKNOWN);
+}
+
 #define VOXEL_OCEAN_HEIGHT_DEPTH(X, Depth) VoxelUnderwaterProbeDepth(X)
+#define VOXEL_OCEAN_HEIGHT_BED(X, Bed) VoxelUnderwaterProbeBed(X)
 
 #include "/Plugin/VoxelPlugin/Private/VoxelUnderwater.ush"
 
@@ -125,6 +158,11 @@ SamplerState UnderwaterDerivativesSampler;
 Texture2D UnderwaterCharts;
 // The shore (stage O8): the shore field's texture (the depth probe's parameters are above).
 Texture2DArray UnderwaterShore;
+// The open sea's foam (stage O9c: the cascades' VoxelOceanFoam), for the map pass; UnderwaterFoamOn
+// 0: no foam (the foam map holds zeros).
+Texture2DArray UnderwaterFoam;
+SamplerState UnderwaterFoamSampler;
+uint UnderwaterFoamOn;
 // The shore field's texel-space expansion around this view's camera (VoxelOceanShore.ush).
 float4 UnderwaterShoreFrame[7];
 
@@ -154,14 +192,18 @@ void UnderwaterMapCS(uint3 DispatchThreadId : SV_DispatchThreadID)
     const float3 X = VoxelUnderwaterMapPoint(UnderwaterMapAnchor[Level].xyz, Texel, UnderwaterMapE1[Level].xyz, UnderwaterMapE2[Level].xyz,
         int(DispatchThreadId.x), int(DispatchThreadId.y));
     const FVoxelOceanWaveParams Waves = VoxelUnderwaterWaveParams();
+    const FVoxelOceanShoreFrame Frame = VoxelOceanShoreFrameFrom(UnderwaterShoreFrame[0], UnderwaterShoreFrame[1], UnderwaterShoreFrame[2],
+        UnderwaterShoreFrame[3], UnderwaterShoreFrame[4], UnderwaterShoreFrame[5], UnderwaterShoreFrame[6]);
+    // The last lookup reads the foam too (stage O9c): the foam of the surface above X, at the
+    // converged point, with the level's texel as footprint.
+    const uint Mask = UnderwaterFoamOn != 0u ? (VOXEL_OCEAN_LOOKUP_DISPLACEMENT | VOXEL_OCEAN_LOOKUP_FOAM) : VOXEL_OCEAN_LOOKUP_DISPLACEMENT;
     FVoxelOceanWaveOutput Surface;
     const float Above = VoxelOceanHeightAtFFTShore(X, UnderwaterSphere, Waves, UnderwaterDisplacement, UnderwaterDisplacementSampler,
-        UnderwaterDerivatives, UnderwaterDerivativesSampler, UnderwaterCharts, UnderwaterShore,
-        VoxelOceanShoreFrameFrom(UnderwaterShoreFrame[0], UnderwaterShoreFrame[1], UnderwaterShoreFrame[2], UnderwaterShoreFrame[3],
-            UnderwaterShoreFrame[4], UnderwaterShoreFrame[5], UnderwaterShoreFrame[6]),
-        VoxelUnderwaterProbeDepth(X), VOXEL_OCEAN_LOOKUP_DISPLACEMENT, Texel, Surface);
+        UnderwaterDerivatives, UnderwaterDerivativesSampler, UnderwaterCharts, UnderwaterShore, UnderwaterFoam, UnderwaterFoamSampler, Frame,
+        VoxelUnderwaterProbeDepth(X), Mask, Texel, Surface);
     const float Height = VoxelOceanSphereHeight(X, UnderwaterSphere.x, UnderwaterSphere.y, normalize(-Waves.Center));
     UnderwaterMapOut[DispatchThreadId] = Height - Above;
+    UnderwaterFoamMapOut[DispatchThreadId] = UnderwaterFoamOn != 0u ? Surface.Foam : 0.0f;
 }
 
 [numthreads(VOXEL_UNDERWATER_THREADS, VOXEL_UNDERWATER_THREADS, 1)]

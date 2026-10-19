@@ -17,9 +17,10 @@
 //   bands' amplitude against the wind (rows 2-5: VOXEL_OCEAN_SHORT_KNOTS winds, 8 values a band),
 //   and the slots' height standard deviations (rows 6-7, m, in slot order: stage O8's breaking,
 //   VoxelOceanShoal.ush). Rows 8 to 14 hold the shore field's texel-space expansion around the
-//   material's reference (VoxelOceanShore.ush, FVoxelOceanShoreFrame), and rows 15 and 16 the
-//   surf's settings (stage O9a, VoxelOceanSurf.ush), written by the surface with the frame (not
-//   part of the weather's table).
+//   material's reference (VoxelOceanShore.ush, FVoxelOceanShoreFrame), rows 15 and 16 the surf's
+//   settings (stage O9a, VoxelOceanSurf.ush) and row 17 the mesh's split bias near shores (stage
+//   O9c: Detail, the band and the reach in cm, VoxelOcean.ush), written by the surface with the
+//   frame (not part of the weather's table).
 // Width 5 N + F + 3, height max(6 N, 6 (F + 2)).
 //
 // THE SEA STATE at a point (VoxelOceanSeaStateAt): the field's wind and swell there; the long
