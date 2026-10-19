@@ -4,6 +4,7 @@
 #include "VoxelDensityGPU.h"
 #include "VoxelGPUCommon.h"
 #include "VoxelLandRelief.h"
+#include "VoxelLandSea.h"
 #include "VoxelLandRivers.h"
 #include "VoxelLandRiverBuild.h"
 #include "VoxelNoiseTiles.h"
@@ -322,6 +323,7 @@ namespace VoxelLandBakeDetail
         Bake->UpdateRange();
         Bake->BuildRelief();
         Bake->BuildProvinceStats();
+        Bake->BuildSeaConnected();
         // Checked here, on the worker (a scan of every cell).
         if (!VoxelLandCache::IsUsable(*Bake)) return nullptr;
         return Bake;
@@ -446,6 +448,18 @@ void FVoxelLandBake::BuildProvinceStats()
     for (int32 i = 0; i < Province.Num(); i++)
         if (Height[i] > 0.0f)
             ProvinceLand[FMath::Min((int32)Province[i], ProvinceLevels - 1)]++;
+}
+
+void FVoxelLandBake::BuildSeaConnected()
+{
+    SeaCells = 0;
+    SeaRegions = 0;
+    BasinRegions = 0;
+    if (N <= 0 || Height.Num() != NumCells() || Attr.Num() != NumCells()) return;
+    const VoxelLandSea::FStats Stats = VoxelLandSea::Mark(N, Pad, Height.GetData(), Attr.GetData(), SeaBit, SeaMinShare);
+    SeaCells = Stats.SeaCells;
+    SeaRegions = Stats.SeaRegions;
+    BasinRegions = Stats.BasinRegions;
 }
 
 float FVoxelLandBake::ProvinceThreshold(double Coverage) const
@@ -1557,6 +1571,7 @@ namespace VoxelLandCache
         Bake->UpdateRange();
         Bake->BuildRelief();
         Bake->BuildProvinceStats();
+        Bake->BuildSeaConnected();
         if (!IsUsable(*Bake))
         {
             UE_LOG(LogVoxelPlugin, Warning, TEXT("[VoxelLand] Cache file %s holds an invalid bake; baking again."), *Path);
@@ -2165,6 +2180,7 @@ void FVoxelLandBaker::Tick()
                 Bake->UpdateRange();
                 Bake->BuildRelief();
                 Bake->BuildProvinceStats();
+                Bake->BuildSeaConnected();
                 Bake->Rivers = Rivers;
                 return VoxelLandCache::IsUsable(*Bake) ? Bake : nullptr;
             });
@@ -2258,9 +2274,9 @@ void FVoxelLandBaker::Finish(TSharedPtr<FVoxelLandBake, ESPMode::ThreadSafe> Bak
     if (!Bake->bFromCache)
         Bake->BakeSeconds = FPlatformTime::Seconds() - StartSeconds;
     Result = Bake;
-    UE_LOG(LogVoxelPlugin, Log, TEXT("[VoxelLand] Bake %08x ready (%s, %.2f s): 6 x %d^2 cells, heights %.0f .. %.0f m, crust threshold %.4f."),
+    UE_LOG(LogVoxelPlugin, Log, TEXT("[VoxelLand] Bake %08x ready (%s, %.2f s): 6 x %d^2 cells, heights %.0f .. %.0f m, crust threshold %.4f; %d sea cells in %d sea regions, %d inland basins below sea level."),
         Bake->Key, Bake->bFromCache ? TEXT("from the cache") : TEXT("baked"), FPlatformTime::Seconds() - StartSeconds,
-        Bake->N, Bake->MinHeight, Bake->MaxHeight, Bake->CrustThreshold);
+        Bake->N, Bake->MinHeight, Bake->MaxHeight, Bake->CrustThreshold, Bake->SeaCells, Bake->SeaRegions, Bake->BasinRegions);
 
     // Only eroded bakes are cached: a CPU or erosion-off bake would stand in for the real one.
     if (!Bake->bFromCache && Bake->bEroded && CVarVoxelLandCache.GetValueOnGameThread() != 0)

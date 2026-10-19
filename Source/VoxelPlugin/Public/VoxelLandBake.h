@@ -67,9 +67,19 @@ struct VOXELPLUGIN_API FVoxelLandBake
 
     /** Per cell: crust fraction (bits 0-7, 0..255), boundary class (bits 8-10: 0 none,
      *  1 collision, 2 arc range, 3 trench, 4 island arc, 5 rift, 6 ridge), sea-connected
-     *  (bit 11, stage L5), under a kept lake (bit 12). */
+     *  (bit 11, stage O8: FVoxelLandBake::SeaBit, BuildSeaConnected), under a kept lake (bit 12). */
     TArray<uint16> Attr;
     static constexpr uint16 LakeBit = 1u << 12;
+    /** Sea-connected (stage O8, Design/OceanWaves.md section 5): derived from Height whenever a
+     *  bake is ready (BuildSeaConnected), not read from the cache. */
+    static constexpr uint16 SeaBit = 1u << 11;
+    /** A below-sea region is sea when it holds at least this share of all the below-sea cells
+     *  (the largest one always is): oceans and the seas joined to them, not inland basins. */
+    static constexpr double SeaMinShare = 0.02;
+    /** Interior cells with SeaBit, and the below-sea regions found (for the log). */
+    int32 SeaCells = 0;
+    int32 SeaRegions = 0;
+    int32 BasinRegions = 0;
 
     /** Per cell: the landform (VoxelLandPlates.ush VoxelLandFormAt): the hilliness (0 flat
      *  plains .. 255 hill country) in the low byte, the character (0 smooth, rolling .. 255
@@ -143,6 +153,12 @@ struct VOXELPLUGIN_API FVoxelLandBake
 
     /** Fills ProvinceLand from Province and Height (any thread). */
     void BuildProvinceStats();
+
+    /** Sets SeaBit on the sea-connected cells and clears it on the others (any thread): the
+     *  interior cells below sea level, 4-connected across face edges, in regions of at least
+     *  SeaMinShare of the below-sea cells (or the largest region); an apron cell takes the bit of
+     *  the interior cell holding its centre. About 0.1 s at N 1024. */
+    void BuildSeaConnected();
 
     /** The province value (0..1) above which Coverage (0..1) of the land lies, each level's
      *  cells spread evenly over its half-step either side (continuous in Coverage within the

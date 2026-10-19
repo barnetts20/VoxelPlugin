@@ -13,6 +13,21 @@
 // again where the depth under it changed: all of them when the density, the lattice or the
 // cull settings change, and those in an edit's reach once the terrain's GPU edit data holds
 // that edit (the tile keeps its slot; nothing else moves).
+//
+// The waves (stage O6b): the surface holds the wave model the console chooses
+// (voxel.Ocean.WaveModel) and, for the FFT model, drives its GPU cascades every tick
+// (FVoxelOceanCascades, into the textures its settings carry) and hands the material the model's
+// parameters and the textures.
+//
+// The weather (stage O7): for the FFT model the surface keys the inputs' environment source
+// (FVoxelOceanWeatherKeys) into the weather table of the current interval, uploads it into the
+// chart texture when it changes, and hands it to every frame (FVoxelOceanWaveContext::Weather) so
+// the queries read what the GPU reads. The model's reach follows the weather's greatest
+// long-wave speed, in steps.
+//
+// The shore (stage O8): the surface hands the shore field to the frames (the queries' shore
+// source), its texture to the material and to the pages (the inland-basin cull), and keeps the
+// depth probe around the camera for the underwater pass.
 
 #pragma once
 
@@ -25,6 +40,26 @@ class AActor;
 class USceneComponent;
 class UMaterialInterface;
 class UMaterialInstanceDynamic;
+class UTexture2D;
+class UTexture2DArray;
+class FVoxelOceanCascades;
+class FVoxelOceanWavesFFT;
+class FVoxelOceanWeatherKeys;
+class FVoxelOceanShoreField;
+struct FVoxelOceanProbeState;
+
+/** The FFT cascades' textures (VoxelOceanCascades::MakeTextures): written every tick, read by
+ *  the surface material and the underwater pass. Their owner keeps them alive. */
+struct VOXELPLUGIN_API FVoxelOceanCascadeTextures
+{
+    UTexture2DArray* Displacement = nullptr;
+    UTexture2DArray* Derivatives = nullptr;
+    UTexture2D* Charts = nullptr;
+    /** The open sea's foam per slot (stage O9b). */
+    UTexture2DArray* Foam = nullptr;
+
+    bool IsValid() const { return Displacement && Derivatives && Charts && Foam; }
+};
 
 /** What the surface samples the terrain with, refreshed every frame (AOceanSphereActor). */
 struct FVoxelOceanSurfaceInputs
@@ -38,6 +73,17 @@ struct FVoxelOceanSurfaceInputs
     /** The ocean clock (s) and the environment constants, this frame (no rewrite on change). */
     double Time = 0.0;
     FVoxelOceanEnvironment Environment;
+    /** The weather (a procedural or constant source, VoxelOceanWeather.h; the same object until
+     *  its settings change: a new one starts its keys over) and how the FFT model keys it. */
+    TSharedPtr<const IVoxelOceanEnvironmentSource, ESPMode::ThreadSafe> Weather;
+    FVoxelOceanWeatherTiming WeatherTiming;
+    /** The FFT model's settings (its wind speed, the reach's, is chosen here from the weather). */
+    FVoxelOceanFFTSettings Waves;
+    /** The shore field (stage O8; null: none) and its texture (the material's VoxelOceanShore).
+     *  Density.Shore carries the texture to the pages, Density.ShoreMarginCm the inland basins'
+     *  margin. */
+    TSharedPtr<const FVoxelOceanShoreField, ESPMode::ThreadSafe> Shore;
+    UTexture2DArray* ShoreTexture = nullptr;
 };
 
 /** Inputs of the ocean surface, fixed until the next Initialize (LodDistanceFactor and the
@@ -52,6 +98,8 @@ struct FVoxelOceanSurfaceSettings
     int32 SpareBufferSets = 8;            // buffer sets kept ready for commits
     /** The ocean's material instance: receives the selection camera every frame. */
     TWeakObjectPtr<UMaterialInstanceDynamic> Material;
+    /** The FFT cascades' textures (none: the FFT waves stay off screen; queries still have them). */
+    FVoxelOceanCascadeTextures CascadeTextures;
 };
 
 class VOXELPLUGIN_API FVoxelOceanSurface
@@ -94,6 +142,16 @@ public:
     /** Tiles on screen. */
     int32 NumTiles() const { return Committed.Num(); }
 
+    /** The cascades' textures while the FFT model draws them (the underwater pass binds them);
+     *  null otherwise. */
+    const FVoxelOceanCascadeTextures* GetCascadeTextures() const;
+
+    /** The weather's table of this frame (the FFT model's; null otherwise). */
+    TSharedPtr<const FVoxelOceanWeatherTable, ESPMode::ThreadSafe> GetWeatherTable() const;
+
+    /** The depth probe's result for the underwater pass (render thread data; null without pages). */
+    TSharedPtr<FVoxelOceanProbeState, ESPMode::ThreadSafe> GetProbeState() const;
+
 private:
     VoxelOceanTiles::FSelectParams SelectParams() const;
     /** Builds the tiles' vertex words (in parallel when there are many). */
@@ -104,9 +162,16 @@ private:
      *  the material instance. */
     void UpdateMaterial();
     void LogPerf(double Now);
-    /** The wave model from the console's test settings (voxel.Ocean.TestWaves); a change of
-     *  its reach writes the tiles on screen again (the land cull allows for it). */
+    /** The wave model the console chooses (voxel.Ocean.WaveModel) with this frame's settings and
+     *  wind; a change of its reach writes the tiles on screen again (the land cull allows for
+     *  it) and resizes the pages' bounds. */
     void UpdateWaveModel();
+    /** The FFT model's weather table for this frame's time, uploaded into the chart texture when
+     *  it changes. */
+    void UpdateWeather();
+    /** The depth probe around the camera (VoxelOceanDepthProbe.h) while the camera is near the
+     *  sea, sampled again when a grid moves or the terrain changes. */
+    void UpdateProbe(const FVector& Camera);
 
     TWeakObjectPtr<AActor> Owner;
     TWeakObjectPtr<USceneComponent> AttachRoot;
@@ -116,7 +181,44 @@ private:
     FVoxelOceanSurfaceInputs Inputs;
     /** Null: a flat sea. */
     TSharedPtr<const IVoxelOceanWaveModel, ESPMode::ThreadSafe> WaveModel;
+    /** The same model when it is the FFT one. */
+    TSharedPtr<const FVoxelOceanWavesFFT, ESPMode::ThreadSafe> FFTModel;
+    /** The console's choice the model was built for (0 flat, 1 test, 2 FFT), and its settings. */
+    int32 WaveModelKind = -1;
     FVoxelOceanWavesTest::FSettings WaveSettings;
+    FVoxelOceanFFTSettings FFTSettings;
+    double FFTRadius = 0.0;
+    /** The waves' reach (cm, up and sideways) the land cull allows for (BuildWrites): the model's
+     *  with headroom, so a changing wind doesn't write every tile again at each of its steps. */
+    double CullHeight = 0.0;
+    double CullReach = 0.0;
+    /** The FFT model's GPU cascades (none without textures or a renderer). */
+    TUniquePtr<FVoxelOceanCascades> Cascades;
+    /** The FFT model's weather keys and table; what the chart texture holds. */
+    TUniquePtr<FVoxelOceanWeatherKeys> WeatherKeys;
+    uint64 UploadedTable = 0;       // its serial (FVoxelOceanWeatherTable::Serial)
+    const UTexture2D* UploadedTexture = nullptr;
+    /** The shore texture the material holds. */
+    const UTexture2DArray* BoundShoreTexture = nullptr;
+    /** The shore field's expansion and the surf's settings last written into the chart texture
+     *  (rows 8 to 16 of its constants), and the table upload they were written after. */
+    FVector4f WrittenShoreFrame[9];
+    uint64 ShoreFrameUploads = 0;   // ChartUploads when it was written
+    uint64 ChartUploads = 0;        // the weather's full uploads into the chart texture
+    const UTexture2D* ShoreFrameTexture = nullptr;
+    /** Writes the shore field's expansion around the selection camera into the chart texture. */
+    void WriteShoreFrame(const FVoxelOceanWaveShaderParams& Waves);
+    /** What the depth probe last sampled: its grids' anchors (VoxelOceanDepthProbe::Levels) and
+     *  the inputs. */
+    FVector ProbeAnchors[4];
+    const void* ProbeDensity = nullptr;
+    const void* ProbeEdits = nullptr;
+    const void* ProbeShore = nullptr;
+    uint32 ProbeSequence = 0;
+    double ProbeHalfFinest = 0.0;
+    bool bProbed = false;
+    bool bTexturesBound = false;
+    bool bReportedFFT = false;
     bool bHasInputs = false;
     bool bRewriteAll = false;
     struct FPendingEdit

@@ -1,0 +1,70 @@
+// VoxelOceanShoreBuild.usf - The shore field's build on the GPU (VoxelOceanShore.ush, THE BUILD;
+// FVoxelOceanShoreBuilder): one thread per land bake cell (6 faces of (N + 2 Pad)^2), the passes
+// of VoxelOceanShoreBuild.ush. SeedCS writes each interior cell's seed, JumpCS one jump of
+// ShoreStep cells, PackCS the texels, SmoothCS one smoothing pass over them (the last pass's are
+// read back).
+//
+// Parameter names must match VoxelOceanShoreField.cpp exactly.
+
+#include "/Engine/Public/Platform.ush"
+#include "/Plugin/VoxelPlugin/Private/VoxelCubeSphere.ush"
+#include "/Plugin/VoxelPlugin/Private/VoxelOceanCharts.ush"
+#include "/Plugin/VoxelPlugin/Private/VoxelOceanShore.ush"
+
+StructuredBuffer<float> ShoreHeight;     // the bake's heights (m)
+StructuredBuffer<uint> ShoreSea;         // the sea-connected bit (Attr bit 11), 32 cells a word
+StructuredBuffer<uint> ShoreSeedsIn;     // the pass before's seeds (JumpCS, PackCS)
+RWStructuredBuffer<uint> ShoreSeedsOut;  // SeedCS, JumpCS
+StructuredBuffer<uint> ShoreTexelsIn;    // the pass before's texels (SmoothCS)
+RWStructuredBuffer<uint> ShoreTexelsOut; // PackCS, SmoothCS
+uint ShoreN;
+uint ShoreCount;                         // cells
+uint ShoreGroupsX;                       // groups per row of the dispatch
+int ShoreStep;                           // JumpCS
+float ShoreRadiusM;                      // PackCS
+float ShoreReach;                        // PackCS, SmoothCS (m)
+
+#define VOXEL_OCEAN_SHORE_BUILD_PARAM uint ShoreBuildUnused
+#define VOXEL_OCEAN_SHORE_BUILD_ARG 0u
+#define VOXEL_OCEAN_SHORE_BUILD_HEIGHT(Index) ShoreHeight[Index]
+#define VOXEL_OCEAN_SHORE_BUILD_SEA(Index) (((ShoreSea[uint(Index) >> 5u] >> (uint(Index) & 31u)) & 1u) != 0u)
+#define VOXEL_OCEAN_SHORE_BUILD_SEED(Index) ShoreSeedsIn[Index]
+#define VOXEL_OCEAN_SHORE_BUILD_TEXEL(Index) ShoreTexelsIn[Index]
+#include "/Plugin/VoxelPlugin/Private/VoxelOceanShoreBuild.ush"
+
+uint VoxelOceanShoreThreadCell(uint3 GroupId, uint GroupThread)
+{
+    return (GroupId.y * ShoreGroupsX + GroupId.x) * 64u + GroupThread;
+}
+
+[numthreads(64, 1, 1)]
+void SeedCS(uint3 GroupId : SV_GroupID, uint GroupThread : SV_GroupIndex)
+{
+    const uint Cell = VoxelOceanShoreThreadCell(GroupId, GroupThread);
+    if (Cell >= ShoreCount) return;
+    ShoreSeedsOut[Cell] = VoxelOceanShoreSeedPass(VOXEL_OCEAN_SHORE_BUILD_ARG, int(Cell), int(ShoreN));
+}
+
+[numthreads(64, 1, 1)]
+void JumpCS(uint3 GroupId : SV_GroupID, uint GroupThread : SV_GroupIndex)
+{
+    const uint Cell = VoxelOceanShoreThreadCell(GroupId, GroupThread);
+    if (Cell >= ShoreCount) return;
+    ShoreSeedsOut[Cell] = VoxelOceanShoreJumpPass(VOXEL_OCEAN_SHORE_BUILD_ARG, int(Cell), int(ShoreN), ShoreStep);
+}
+
+[numthreads(64, 1, 1)]
+void PackCS(uint3 GroupId : SV_GroupID, uint GroupThread : SV_GroupIndex)
+{
+    const uint Cell = VoxelOceanShoreThreadCell(GroupId, GroupThread);
+    if (Cell >= ShoreCount) return;
+    ShoreTexelsOut[Cell] = VoxelOceanShorePackPass(VOXEL_OCEAN_SHORE_BUILD_ARG, int(Cell), int(ShoreN), ShoreRadiusM, ShoreReach);
+}
+
+[numthreads(64, 1, 1)]
+void SmoothCS(uint3 GroupId : SV_GroupID, uint GroupThread : SV_GroupIndex)
+{
+    const uint Cell = VoxelOceanShoreThreadCell(GroupId, GroupThread);
+    if (Cell >= ShoreCount) return;
+    ShoreTexelsOut[Cell] = VoxelOceanShoreSmoothPass(VOXEL_OCEAN_SHORE_BUILD_ARG, int(Cell), int(ShoreN), ShoreReach);
+}

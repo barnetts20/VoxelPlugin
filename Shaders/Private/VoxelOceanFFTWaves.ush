@@ -1,0 +1,170 @@
+// VoxelOceanFFTWaves.ush - How the FFT model's cascade lookups make the waves at a point
+// (Design/OceanWaves.md sections 2-3). Shared subset (VoxelShaderCompat.h): the wave hook
+// (VoxelOceanWaves.ush, from the cascade textures) and the CPU model (VoxelOceanWavesFFT.cpp,
+// from its query cascades) sum their lookups with this same code.
+//
+// A LOOKUP (FVoxelOceanFFTSample) is one slot's fields at one point of one chart, in that chart's
+// downwind frame (+x downwind; VoxelOceanCharts.ush), the chop applied, already weighed by
+// whatever the caller blends (sea state, detiling copy): height, horizontal displacement, the
+// height's gradient, and the horizontal displacement's gradient J (symmetric: Jxx, Jyy, Jxy).
+//
+// THE SUM (FVoxelOceanFFTAccum) takes each chart's lookups, turned from its downwind frame to its
+// plane (E1, E2) and from there to the planet frame, weighed by the chart's weight; then
+// VoxelOceanFFTFinish makes the displaced surface's normal and area ratio:
+//   M = I + J on the tangent plane, det M = 1 + tr J + det J, adj M = (1 + tr J) I - J,
+//   normal ~ Up det M - adj M g   (g the height's gradient)
+// which is exact for a displaced plane (the sphere adds a relative error of displacement / radius;
+// a chart's plane is tangent at its anchor, within 2 degrees of the point's: its vectors are
+// made tangent at the point).
+
+#ifndef VOXEL_OCEAN_FFT_WAVES_USH
+#define VOXEL_OCEAN_FFT_WAVES_USH
+
+#ifndef VOXEL_FUNC
+#define VOXEL_FUNC
+#endif
+
+// Include after VoxelOceanCharts.ush.
+
+struct FVoxelOceanFFTSample
+{
+    float Height;
+    float2 Displacement;
+    float2 Slope;           // d height / d x, d height / d y
+    float Jxx;
+    float Jyy;
+    float Jxy;
+    float VelocityUp;       // the CPU's only (0 from the textures)
+    float2 VelocityH;
+};
+
+VOXEL_FUNC FVoxelOceanFFTSample VoxelOceanFFTSampleZero()
+{
+    FVoxelOceanFFTSample S;
+    S.Height = 0.0f;
+    S.Displacement = float2(0.0f, 0.0f);
+    S.Slope = float2(0.0f, 0.0f);
+    S.Jxx = 0.0f;
+    S.Jyy = 0.0f;
+    S.Jxy = 0.0f;
+    S.VelocityUp = 0.0f;
+    S.VelocityH = float2(0.0f, 0.0f);
+    return S;
+}
+
+// S + W T, field by field.
+VOXEL_FUNC FVoxelOceanFFTSample VoxelOceanFFTSampleMad(FVoxelOceanFFTSample S, float W, FVoxelOceanFFTSample T)
+{
+    FVoxelOceanFFTSample R;
+    R.Height = S.Height + W * T.Height;
+    R.Displacement = float2(S.Displacement.x + W * T.Displacement.x, S.Displacement.y + W * T.Displacement.y);
+    R.Slope = float2(S.Slope.x + W * T.Slope.x, S.Slope.y + W * T.Slope.y);
+    R.Jxx = S.Jxx + W * T.Jxx;
+    R.Jyy = S.Jyy + W * T.Jyy;
+    R.Jxy = S.Jxy + W * T.Jxy;
+    R.VelocityUp = S.VelocityUp + W * T.VelocityUp;
+    R.VelocityH = float2(S.VelocityH.x + W * T.VelocityH.x, S.VelocityH.y + W * T.VelocityH.y);
+    return R;
+}
+
+// The planet-frame sum (displacements in the units of the samples).
+struct FVoxelOceanFFTAccum
+{
+    float Height;
+    float3 Displacement;    // horizontal
+    float3 Gradient;
+    float J11;
+    float J22;
+    float J33;
+    float J12;
+    float J13;
+    float J23;
+    float VelocityUp;
+    float3 VelocityH;
+};
+
+VOXEL_FUNC FVoxelOceanFFTAccum VoxelOceanFFTAccumZero()
+{
+    FVoxelOceanFFTAccum A;
+    A.Height = 0.0f;
+    A.Displacement = float3(0.0f, 0.0f, 0.0f);
+    A.Gradient = float3(0.0f, 0.0f, 0.0f);
+    A.J11 = 0.0f;
+    A.J22 = 0.0f;
+    A.J33 = 0.0f;
+    A.J12 = 0.0f;
+    A.J13 = 0.0f;
+    A.J23 = 0.0f;
+    A.VelocityUp = 0.0f;
+    A.VelocityH = float3(0.0f, 0.0f, 0.0f);
+    return A;
+}
+
+// One chart's lookups (summed in its downwind frame), weighed by the chart's weight.
+VOXEL_FUNC FVoxelOceanFFTAccum VoxelOceanFFTAccumAdd(FVoxelOceanFFTAccum A, FVoxelOceanChart C, float2 Wind, float Weight, FVoxelOceanFFTSample S)
+{
+    // Downwind frame to the chart's plane: vectors turn by the wind; J as R J R^T.
+    const float2 D = VoxelOceanFromWind(S.Displacement, Wind);
+    const float2 G = VoxelOceanFromWind(S.Slope, Wind);
+    const float2 V = VoxelOceanFromWind(S.VelocityH, Wind);
+    const float Cw = Wind.x;
+    const float Sw = Wind.y;
+    const float Txx = Cw * Cw * S.Jxx - 2.0f * Cw * Sw * S.Jxy + Sw * Sw * S.Jyy;
+    const float Tyy = Sw * Sw * S.Jxx + 2.0f * Cw * Sw * S.Jxy + Cw * Cw * S.Jyy;
+    const float Txy = Cw * Sw * (S.Jxx - S.Jyy) + (Cw * Cw - Sw * Sw) * S.Jxy;
+    // The plane to the planet frame.
+    FVoxelOceanFFTAccum R = A;
+    R.Height = A.Height + Weight * S.Height;
+    R.Displacement = A.Displacement + (C.E1 * D.x + C.E2 * D.y) * Weight;
+    R.Gradient = A.Gradient + (C.E1 * G.x + C.E2 * G.y) * Weight;
+    R.VelocityUp = A.VelocityUp + Weight * S.VelocityUp;
+    R.VelocityH = A.VelocityH + (C.E1 * V.x + C.E2 * V.y) * Weight;
+    // J3 += w (Txx E1 E1^T + Txy (E1 E2^T + E2 E1^T) + Tyy E2 E2^T).
+    const float3 E1 = C.E1;
+    const float3 E2 = C.E2;
+    R.J11 = A.J11 + Weight * (Txx * E1.x * E1.x + 2.0f * Txy * E1.x * E2.x + Tyy * E2.x * E2.x);
+    R.J22 = A.J22 + Weight * (Txx * E1.y * E1.y + 2.0f * Txy * E1.y * E2.y + Tyy * E2.y * E2.y);
+    R.J33 = A.J33 + Weight * (Txx * E1.z * E1.z + 2.0f * Txy * E1.z * E2.z + Tyy * E2.z * E2.z);
+    R.J12 = A.J12 + Weight * (Txx * E1.x * E1.y + Txy * (E1.x * E2.y + E2.x * E1.y) + Tyy * E2.x * E2.y);
+    R.J13 = A.J13 + Weight * (Txx * E1.x * E1.z + Txy * (E1.x * E2.z + E2.x * E1.z) + Tyy * E2.x * E2.z);
+    R.J23 = A.J23 + Weight * (Txx * E1.y * E1.z + Txy * (E1.y * E2.z + E2.y * E1.z) + Tyy * E2.y * E2.z);
+    return R;
+}
+
+VOXEL_FUNC float3 VoxelOceanFFTApplyJ(FVoxelOceanFFTAccum A, float3 X)
+{
+    return float3(A.J11 * X.x + A.J12 * X.y + A.J13 * X.z, A.J12 * X.x + A.J22 * X.y + A.J23 * X.z, A.J13 * X.x + A.J23 * X.y + A.J33 * X.z);
+}
+
+struct FVoxelOceanFFTResult
+{
+    float Height;
+    float3 Displacement;    // horizontal, tangent at the point (planet frame)
+    float3 Normal;          // planet frame
+    float Jacobian;
+    float3 Gradient;        // the height's, tangent at the point
+    float3 Velocity;        // planet frame
+};
+
+// Up: the point's radial (planet frame).
+VOXEL_FUNC FVoxelOceanFFTResult VoxelOceanFFTFinish(FVoxelOceanFFTAccum A, float3 Up)
+{
+    FVoxelOceanFFTResult R;
+    R.Height = A.Height;
+    R.Displacement = A.Displacement - Up * dot(Up, A.Displacement);
+    R.Gradient = A.Gradient - Up * dot(Up, A.Gradient);
+    R.Velocity = Up * A.VelocityUp + (A.VelocityH - Up * dot(Up, A.VelocityH));
+    const float Trace = A.J11 + A.J22 + A.J33;
+    const float TraceSq = A.J11 * A.J11 + A.J22 * A.J22 + A.J33 * A.J33 + 2.0f * (A.J12 * A.J12 + A.J13 * A.J13 + A.J23 * A.J23);
+    const float DetJ = 0.5f * (Trace * Trace - TraceSq);
+    R.Jacobian = 1.0f + Trace + DetJ;
+    const float3 AdjG = R.Gradient * (1.0f + Trace) - VoxelOceanFFTApplyJ(A, R.Gradient);
+    const float3 N = Up * R.Jacobian - AdjG;
+    // A fold turns the normal through the surface; keep it on the water's side (as the test
+    // model).
+    const float3 Kept = R.Jacobian > 0.0f ? N : N + Up * (2.0f * abs(R.Jacobian) + 1.0e-3f);
+    R.Normal = normalize(Kept);
+    return R;
+}
+
+#endif // VOXEL_OCEAN_FFT_WAVES_USH

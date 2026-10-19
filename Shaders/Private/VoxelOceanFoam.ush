@@ -1,0 +1,167 @@
+// VoxelOceanFoam.ush - Open-water foam (Design/OceanWaves.md sections 6 and 15; stage O9b). Shared
+// subset (VoxelShaderCompat.h): the FFT's assembly (VoxelOceanFFT.usf) runs the per-slot step, the
+// wave hook (VoxelOceanWaves.ush) the per-point combination, the checks both.
+//
+// PER SLOT (in each slot's texture space, every frame): the slot's own area ratio J = (1 + Dxx)
+// (1 + Dyy) - Dxy^2, measured at the calibration's chop VOXEL_OCEAN_FOAM_CHOP whatever the waves'
+// (so the foam doesn't depend on the chop), against its spread: the compression c = (1 - J) /
+// sigma_J, sigma_J = VOXEL_OCEAN_FOAM_CHOP sqrt(the slot's slope variance) (the linear part of
+// J - 1 is the chop times the displacement's divergence, whose variance is the slope variance).
+// The slot keeps the envelope of c: Z = max(c, Z - dt / Decay), so where a crest compressed the
+// surface Z stays high and falls one sigma per Decay seconds as the crest moves on (the FFT's
+// waves don't travel in texture space: they rise and fall in place as their phases turn): the
+// trails. Z is continuous and nearly Gaussian (unlike the foam itself, which is sparse), so it
+// blends and mips as the waves do: the texture holds (Z, Z^2), whose mips give each texel's mean
+// and the variance within it.
+//
+// PER POINT (the pixel shader; VoxelOceanFoamOf): the slots' Z looked up as their waves are (the
+// same charts, sea states, detiling copies and warp), each lookup's deviation from its slot's mean
+// (the last mip) weighed as the waves are (the long bands' sea states normalised, the short
+// bands' amplitude scale left out: the steepness below carries both), with the variance the
+// lookup leaves unresolved (its mip's). Per band: the deviations summed (Dev), the unresolved
+// variances by the squared weights (Res), the band's own spread (Sigma). The bands are weighed by
+// their steepness (the slope deviation at the point's sea state, the long bands' times the share
+// the surf leaves them), as their compressions add in the summed surface's J, and standardised:
+// the long bands' L, the short bands' Sh, each about N(0, 1). The short bands aren't detiled (as
+// the waves), so they shape the foam only where the long bands nearly make it (their whitecaps
+// would repeat every tile otherwise): S = L + KAPPA g Sh, g rising from 0 to 1 over GATE sigma
+// below the threshold. The foam is the share of the footprint above the threshold T, through the
+// variance the mips leave unresolved: Phi((S - T) / sqrt(Res + EDGE^2)), so near the camera a
+// whitecap's edge is EDGE sigma soft, and far away (S at its mean, Res its whole variance) the
+// foam is the expected coverage instead of vanishing.
+//
+// THE THRESHOLD: the coverage of whitecaps grows as U^3.41 (Monahan and O'Muircheartaigh 1980);
+// here half as much again (the trails), 1.48% at 10 m/s, 4.7% at 14, 11% at 18, none below 3 m/s,
+// times the coverage setting. T is the standard normal's quantile of that share, corrected for
+// the envelope's skew where foam is rare (calibrated on the emulated cascades, foam_check).
+
+#ifndef VOXEL_OCEAN_FOAM_USH
+#define VOXEL_OCEAN_FOAM_USH
+
+#ifndef VOXEL_FUNC
+#define VOXEL_FUNC
+#endif
+
+// The chop the compression is measured at (the calibration's).
+#define VOXEL_OCEAN_FOAM_CHOP 0.9f
+// The envelope's range (sigma_J).
+#define VOXEL_OCEAN_FOAM_LOW (-6.0f)
+#define VOXEL_OCEAN_FOAM_HIGH 8.0f
+// The coverage at 10 m/s and its growth with the wind (a power).
+#define VOXEL_OCEAN_FOAM_COVER_AT10 0.0148f
+#define VOXEL_OCEAN_FOAM_COVER_POWER 3.41f
+// The short bands' share in the foam's shape, the gate's width below the threshold (sigma), a
+// whitecap's edge near the camera (sigma).
+#define VOXEL_OCEAN_FOAM_KAPPA 0.7f
+#define VOXEL_OCEAN_FOAM_GATE 1.0f
+#define VOXEL_OCEAN_FOAM_EDGE 0.15f
+// The quantile's correction where foam is rare (sigma), and over which coverages it goes.
+#define VOXEL_OCEAN_FOAM_SKEW 0.22f
+#define VOXEL_OCEAN_FOAM_SKEW_LOW 0.015f
+#define VOXEL_OCEAN_FOAM_SKEW_HIGH 0.05f
+// No threshold (no foam).
+#define VOXEL_OCEAN_FOAM_NONE 1.0e30f
+
+// A slot's compression at a texel: its area ratio J (at VOXEL_OCEAN_FOAM_CHOP), its spread sigma_J.
+VOXEL_FUNC float VoxelOceanFoamCompression(float J, float SigmaJ)
+{
+    return clamp((1.0f - J) / max(SigmaJ, 1.0e-6f), VOXEL_OCEAN_FOAM_LOW, VOXEL_OCEAN_FOAM_HIGH);
+}
+
+// One frame's step of the envelope: Z before, the compression now, the fall (dt / Decay).
+VOXEL_FUNC float VoxelOceanFoamStep(float Before, float Compression, float Fall)
+{
+    return max(Compression, max(Before - Fall, VOXEL_OCEAN_FOAM_LOW));
+}
+
+// The standard normal's upper quantile: x with P(X > x) = P, for P in (0, 0.5] (Abramowitz and
+// Stegun 26.2.23; within 5e-4).
+VOXEL_FUNC float VoxelOceanFoamQuantile(float P)
+{
+    const float T = sqrt(-2.0f * 0.693147181f * log2(clamp(P, 1.0e-12f, 0.5f)));
+    return T - (2.515517f + T * (0.802853f + T * 0.010328f)) / (1.0f + T * (1.432788f + T * (0.189269f + T * 0.001308f)));
+}
+
+// The standard normal's distribution function, P(X < x) (the logistic approximation, within 0.01).
+VOXEL_FUNC float VoxelOceanFoamNormal(float X)
+{
+    return 1.0f / (1.0f + exp(-1.702f * X));
+}
+
+// The share of the sea whitecaps cover at a wind (m/s) and the coverage setting (1 as calibrated).
+VOXEL_FUNC float VoxelOceanFoamCoverage(float Wind, float Coverage)
+{
+    if (Coverage <= 0.0f || Wind <= 2.5f) return 0.0f;
+    const float Calm = smoothstep(2.5f, 4.5f, Wind);
+    return VOXEL_OCEAN_FOAM_COVER_AT10 * exp(VOXEL_OCEAN_FOAM_COVER_POWER * 0.693147181f * log2(Wind * 0.1f)) * Coverage * Calm;
+}
+
+// The threshold (sigma) for that coverage; VOXEL_OCEAN_FOAM_NONE: none.
+VOXEL_FUNC float VoxelOceanFoamThreshold(float Wind, float Coverage)
+{
+    const float P = VoxelOceanFoamCoverage(Wind, Coverage);
+    if (P < 1.0e-7f) return VOXEL_OCEAN_FOAM_NONE;
+    const float Q = min(P, 0.45f);
+    return VoxelOceanFoamQuantile(Q) + VOXEL_OCEAN_FOAM_SKEW * (1.0f - smoothstep(VOXEL_OCEAN_FOAM_SKEW_LOW, VOXEL_OCEAN_FOAM_SKEW_HIGH, Q));
+}
+
+// A point's lookups, per band (x to w: bands 0 to 3): the weighed deviations from the slots' means,
+// the variance they leave unresolved, the bands' own spread (their slots' by the normalised
+// weights), their steepness; the long and the short groups' squared weights summed (the charts'
+// and the headings' blends).
+struct FVoxelOceanFoamBands
+{
+    float4 Dev;
+    float4 Res;
+    float4 Sigma;
+    float4 Steep;
+    float LongWeight2;
+    float ShortWeight2;
+};
+
+VOXEL_FUNC FVoxelOceanFoamBands VoxelOceanFoamBandsZero()
+{
+    FVoxelOceanFoamBands B;
+    B.Dev = float4(0.0f, 0.0f, 0.0f, 0.0f);
+    B.Res = float4(0.0f, 0.0f, 0.0f, 0.0f);
+    B.Sigma = float4(0.0f, 0.0f, 0.0f, 0.0f);
+    B.Steep = float4(0.0f, 0.0f, 0.0f, 0.0f);
+    B.LongWeight2 = 0.0f;
+    B.ShortWeight2 = 0.0f;
+    return B;
+}
+
+// The open sea's foam at a point (0 to 1): its bands, the wind (m/s), the coverage setting.
+VOXEL_FUNC float VoxelOceanFoamOf(FVoxelOceanFoamBands B, float Wind, float Coverage)
+{
+    const float T = VoxelOceanFoamThreshold(Wind, Coverage);
+    if (T >= VOXEL_OCEAN_FOAM_NONE) return 0.0f;
+    // The long bands standardised (their spread, the blends' weights).
+    const float S0 = B.Steep.x * B.Sigma.x;
+    const float S1 = B.Steep.y * B.Sigma.y;
+    const float NL = (S0 * S0 + S1 * S1) * B.LongWeight2;
+    if (NL <= 1.0e-12f) return 0.0f;
+    const float InvNL = 1.0f / NL;
+    const float L = (B.Steep.x * B.Dev.x + B.Steep.y * B.Dev.y) * sqrt(InvNL);
+    const float ResL = (B.Steep.x * B.Steep.x * B.Res.x + B.Steep.y * B.Steep.y * B.Res.y) * InvNL;
+    // The short bands, the same, where the long bands nearly make foam.
+    float S = L;
+    float Res = ResL;
+    const float S2 = B.Steep.z * B.Sigma.z;
+    const float S3 = B.Steep.w * B.Sigma.w;
+    const float NS = (S2 * S2 + S3 * S3) * B.ShortWeight2;
+    const float Gate = saturate((L - T + VOXEL_OCEAN_FOAM_GATE) * (1.0f / VOXEL_OCEAN_FOAM_GATE));
+    if (NS > 1.0e-12f && Gate > 0.0f)
+    {
+        const float InvNS = 1.0f / NS;
+        const float Sh = (B.Steep.z * B.Dev.z + B.Steep.w * B.Dev.w) * sqrt(InvNS);
+        const float ResS = (B.Steep.z * B.Steep.z * B.Res.z + B.Steep.w * B.Steep.w * B.Res.w) * InvNS;
+        const float K = VOXEL_OCEAN_FOAM_KAPPA * Gate;
+        S += K * Sh;
+        Res += K * K * ResS;
+    }
+    // The share of the footprint above the threshold.
+    return VoxelOceanFoamNormal((S - T) / sqrt(max(Res, 0.0f) + VOXEL_OCEAN_FOAM_EDGE * VOXEL_OCEAN_FOAM_EDGE));
+}
+
+#endif // VOXEL_OCEAN_FOAM_USH

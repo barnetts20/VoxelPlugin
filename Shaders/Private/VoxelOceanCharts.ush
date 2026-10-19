@@ -1,0 +1,352 @@
+// VoxelOceanCharts.ush - The waves' charts on the sphere (Design/OceanWaves.md section 3): the
+// fixed tangent planes the FFT cascades are laid on. Shared subset (VoxelShaderCompat.h): the
+// wave hook (VoxelOceanWaves.ush) and the CPU model (VoxelOceanWavesFFT.cpp) run this same
+// code, so the drawn surface and the queries use the same charts with the same weights.
+//
+// CHARTS. One per cell of the cube-sphere grid at a fixed level (N = 2^level cells per face edge,
+// equal-angle mapping, VoxelCubeSphere.ush): about 40 km across (level 5 on a 1,075 km ocean).
+// A chart has an anchor A on the sea sphere (its cell's centre) and a tangent frame E1, E2 there
+// (E1 the face's U axis made tangent). A point's chart coordinates are (P - A) . E1 and
+// (P - A) . E2.
+//
+// THE TABLE. The CPU builds the charts once, in double (VoxelOceanCharts.h), into a float
+// texture of 5 texels per chart, chart (face, i, j) at texels (5 i + k, face N + j):
+//   k = 0: anchor high part (xyz, multiples of 4096 cm), E2.x
+//   k = 1: anchor low part (xyz, the rest, in [0, 4096) cm), E2.y
+//   k = 2: E1 (xyz), E2.z
+//   k = 3, 4: the wave headings before and after the weather's last turn (stage O7;
+//     VoxelOceanSeaState.ush), written with the weather.
+// The same texture holds the weather's sea-state field and the model's constants beside the
+// charts (VoxelOceanSeaState.ush, THE TABLE'S OTHER REGIONS).
+// Both parts are exact floats, so the reference point's offset from the anchor is formed from
+// its own high and low parts (RefHigh - AHigh is exact) without cancellation, with plain float
+// operations (no exactness needed from the compiler).
+//
+// PRECISION. A point's chart coordinates come in two parts: the reference's (the same for every
+// point drawn from that reference, tens of km) and the point's offset from the reference (small
+// near the camera, exact to its float). A band's lookup wraps the large part on its own
+// (VoxelOceanWrap), then adds the small one: neighbouring points keep their offsets exactly, and
+// the large part's few millimetres of rounding shift a whole chart's waves together (they move
+// with the reference, not from pixel to pixel).
+//
+// BLENDING. A point takes the charts whose anchors are nearly as close as the nearest one: each
+// chart's weight falls smoothly from 1 at the nearest anchor's distance to 0 at Band further
+// (Voronoi blending), and the weights are divided by sqrt(sum w^2), which keeps the variance of
+// independent wave fields (the charts' frames and anchors differ, so their lookups are
+// independent). Inside a chart's core one chart is used; along cell borders two; near cell
+// corners three or four. The weights are continuous everywhere, across face edges and corners
+// too: the candidates are the point's cell and its 8 neighbours, those past a face edge found
+// on the next face.
+//
+// THE WIND. Rotating a chart's lookup is rotating its wind: a chart turns its plane so its +x
+// runs downwind, the wind taken at its anchor (constant across a chart). With the weather
+// (stage O7) the long and short bands turn apart (swell and wind) and the headings come from the
+// table (VoxelOceanSeaState.ush).
+
+#ifndef VOXEL_OCEAN_CHARTS_USH
+#define VOXEL_OCEAN_CHARTS_USH
+
+#ifndef VOXEL_FUNC
+#define VOXEL_FUNC
+#endif
+
+// Include after VoxelCubeSphere.ush (the C++ side has no shader paths: it includes both in turn).
+
+#define VOXEL_OCEAN_CHART_TEXELS 5
+#define VOXEL_OCEAN_CHART_CANDIDATES 9
+#define VOXEL_OCEAN_CHART_MAX 4
+// The blend band, as a fraction of a cell's nominal width.
+#define VOXEL_OCEAN_CHART_BAND 0.2f
+
+// ---------------------------------------------------------------------------------------------
+// Cells
+// ---------------------------------------------------------------------------------------------
+
+struct FVoxelOceanChartCell
+{
+    int Face;
+    int I;
+    int J;
+};
+
+// The face and face coordinates of a direction (float: cell choice only).
+struct FVoxelOceanFacePoint
+{
+    int Face;
+    float S;
+    float T;
+};
+
+VOXEL_FUNC FVoxelOceanFacePoint VoxelOceanLocate(float3 Dir)
+{
+    const float AX = abs(Dir.x);
+    const float AY = abs(Dir.y);
+    const float AZ = abs(Dir.z);
+    uint Axis = 0u;
+    if (AY > AX && AY >= AZ) Axis = 1u;
+    else if (AZ > AX && AZ > AY) Axis = 2u;
+    const float C = VoxelCubeComponent(Dir, Axis);
+    const uint Face = Axis * 2u + (C < 0.0f ? 1u : 0u);
+    const float Inv = 1.0f / abs(C);
+    FVoxelOceanFacePoint P;
+    P.Face = int(Face);
+    P.S = atan(VoxelCubeComponent(Dir, VoxelCubeUAxis(Face)) * Inv) * (1.0f / VOXEL_CUBE_QUARTER_PI);
+    P.T = atan(VoxelCubeComponent(Dir, VoxelCubeVAxis(Face)) * Inv) * (1.0f / VOXEL_CUBE_QUARTER_PI);
+    return P;
+}
+
+VOXEL_FUNC FVoxelOceanChartCell VoxelOceanCellOf(FVoxelOceanFacePoint P, int N)
+{
+    FVoxelOceanChartCell C;
+    C.Face = P.Face;
+    C.I = clamp(int(floor((P.S + 1.0f) * 0.5f * float(N))), 0, N - 1);
+    C.J = clamp(int(floor((P.T + 1.0f) * 0.5f * float(N))), 0, N - 1);
+    return C;
+}
+
+// The first texel of a chart in the table.
+VOXEL_FUNC int2 VoxelOceanChartTexel(FVoxelOceanChartCell C, int N)
+{
+    return int2(VOXEL_OCEAN_CHART_TEXELS * C.I, C.Face * N + C.J);
+}
+
+// The candidates of a direction: its cell and the 8 around it, those past a face edge replaced by
+// the cell of the next face that holds their centre; no cell twice. Each with its first texel
+// in the table and its centre's direction (from the mapping, as the table's anchors: the blend
+// needs no table reads).
+struct FVoxelOceanChartCandidates
+{
+    int Count;
+    int2 Texel[VOXEL_OCEAN_CHART_CANDIDATES];
+    float3 Centre[VOXEL_OCEAN_CHART_CANDIDATES];
+};
+
+VOXEL_FUNC FVoxelOceanChartCandidates VoxelOceanChartCandidatesOf(float3 Dir, int N)
+{
+    FVoxelOceanChartCandidates Out;
+    Out.Count = 0;
+    for (int Init = 0; Init < VOXEL_OCEAN_CHART_CANDIDATES; Init++)
+    {
+        Out.Texel[Init] = int2(0, 0);
+        Out.Centre[Init] = float3(0.0f, 0.0f, 1.0f);
+    }
+    const FVoxelOceanFacePoint P = VoxelOceanLocate(Dir);
+    const FVoxelOceanChartCell Home = VoxelOceanCellOf(P, N);
+    for (int dj = -1; dj <= 1; dj++)
+    {
+        for (int di = -1; di <= 1; di++)
+        {
+            FVoxelOceanChartCell C;
+            C.Face = Home.Face;
+            C.I = Home.I + di;
+            C.J = Home.J + dj;
+            if (C.I < 0 || C.I >= N || C.J < 0 || C.J >= N)
+            {
+                // The face continued past its edge: the cell of whichever face holds that centre.
+                const float3 Virtual = VoxelCubeDirection(uint(Home.Face), VoxelCubeCellCentre(C.I, uint(N)), VoxelCubeCellCentre(C.J, uint(N)));
+                C = VoxelOceanCellOf(VoxelOceanLocate(Virtual), N);
+            }
+            const int2 T = VoxelOceanChartTexel(C, N);
+            bool bSeen = false;
+            for (int Seen = 0; Seen < VOXEL_OCEAN_CHART_CANDIDATES; Seen++)
+            {
+                if (Seen < Out.Count && Out.Texel[Seen].x == T.x && Out.Texel[Seen].y == T.y) bSeen = true;
+            }
+            if (!bSeen && Out.Count < VOXEL_OCEAN_CHART_CANDIDATES)
+            {
+                Out.Texel[Out.Count] = T;
+                Out.Centre[Out.Count] = VoxelCubeDirection(uint(C.Face), VoxelCubeCellCentre(C.I, uint(N)), VoxelCubeCellCentre(C.J, uint(N)));
+                Out.Count += 1;
+            }
+        }
+    }
+    return Out;
+}
+
+// ---------------------------------------------------------------------------------------------
+// One chart
+// ---------------------------------------------------------------------------------------------
+
+struct FVoxelOceanChart
+{
+    float3 AnchorHigh;  // planet frame, cm
+    float3 AnchorLow;
+    float3 E1;
+    float3 E2;
+};
+
+// From the table's three texels (T0.xyz, T1.xyz, T2.xyz and (T0.w, T1.w, T2.w)).
+VOXEL_FUNC FVoxelOceanChart VoxelOceanChartOf(float3 AnchorHigh, float3 AnchorLow, float3 E1, float3 E2)
+{
+    FVoxelOceanChart C;
+    C.AnchorHigh = AnchorHigh;
+    C.AnchorLow = AnchorLow;
+    C.E1 = E1;
+    C.E2 = E2;
+    return C;
+}
+
+VOXEL_FUNC float3 VoxelOceanChartNormal(FVoxelOceanChart C)
+{
+    return normalize(C.AnchorHigh + C.AnchorLow);
+}
+
+// A chart-plane vector turned into the downwind frame (+x downwind), and back.
+VOXEL_FUNC float2 VoxelOceanToWind(float2 V, float2 Wind)
+{
+    return float2(Wind.x * V.x + Wind.y * V.y, -Wind.y * V.x + Wind.x * V.y);
+}
+
+VOXEL_FUNC float2 VoxelOceanFromWind(float2 V, float2 Wind)
+{
+    return float2(Wind.x * V.x - Wind.y * V.y, Wind.y * V.x + Wind.x * V.y);
+}
+
+// The chart-plane coordinates (m) of the point Ref + D (planet frame, cm; Ref as its high and low
+// parts, as the anchors), as the reference's (Base) and the offset's (Offset); the point's are
+// their sum.
+struct FVoxelOceanChartCoords
+{
+    float2 Base;
+    float2 Offset;
+};
+
+VOXEL_FUNC FVoxelOceanChartCoords VoxelOceanChartCoordsOf(FVoxelOceanChart C, float3 RefHigh, float3 RefLow, float3 D)
+{
+    const float3 Rel = (RefHigh - C.AnchorHigh) + (RefLow - C.AnchorLow);
+    FVoxelOceanChartCoords Out;
+    Out.Base = float2(dot(Rel, C.E1) * 0.01f, dot(Rel, C.E2) * 0.01f);
+    Out.Offset = float2(dot(D, C.E1) * 0.01f, dot(D, C.E2) * 0.01f);
+    return Out;
+}
+
+// Both parts in the downwind frame.
+VOXEL_FUNC FVoxelOceanChartCoords VoxelOceanCoordsToWind(FVoxelOceanChartCoords C, float2 Wind)
+{
+    FVoxelOceanChartCoords Out;
+    Out.Base = VoxelOceanToWind(C.Base, Wind);
+    Out.Offset = VoxelOceanToWind(C.Offset, Wind);
+    return Out;
+}
+
+// A coordinate in tiles of side L (m), wrapped to [0, 1): the base wrapped first, then the
+// offset (and any shift, m) added to it.
+VOXEL_FUNC float VoxelOceanWrap(float Base, float Offset, float InvL)
+{
+    const float B = Base * InvL;
+    const float F = B - floor(B);
+    const float U = F + Offset * InvL;
+    return U - floor(U);
+}
+
+// The downwind direction in the chart's plane, (cos, sin) from E1, for a wind given along local
+// east and north at the anchor (north: toward the planet's +Z). Calm: along E1.
+VOXEL_FUNC float2 VoxelOceanChartWind(FVoxelOceanChart C, float2 WindEastNorth)
+{
+    const float3 N = VoxelOceanChartNormal(C);
+    const float3 Z = float3(0.0f, 0.0f, 1.0f);
+    float3 East = cross(Z, N);
+    const float EastLength = length(East);
+    float3 North;
+    if (EastLength > 1.0e-6f)
+    {
+        East = East * (1.0f / EastLength);
+        North = cross(N, East);
+    }
+    else
+    {
+        // At a pole: the chart's own axes.
+        East = C.E2;
+        North = C.E1;
+    }
+    const float3 W = East * WindEastNorth.x + North * WindEastNorth.y;
+    const float X = dot(W, C.E1);
+    const float Y = dot(W, C.E2);
+    const float L = sqrt(X * X + Y * Y);
+    return L > 1.0e-6f ? float2(X / L, Y / L) : float2(1.0f, 0.0f);
+}
+
+// ---------------------------------------------------------------------------------------------
+// The blend
+// ---------------------------------------------------------------------------------------------
+
+// The candidates' anchor distances (chord, unit sphere): D[k] for candidate k.
+struct FVoxelOceanChartDistances
+{
+    float D[VOXEL_OCEAN_CHART_CANDIDATES];
+};
+
+VOXEL_FUNC FVoxelOceanChartDistances VoxelOceanChartDistancesOf(FVoxelOceanChartCandidates Cand, float3 Dir)
+{
+    FVoxelOceanChartDistances Out;
+    for (int k = 0; k < VOXEL_OCEAN_CHART_CANDIDATES; k++)
+        Out.D[k] = k < Cand.Count ? length(Dir - Cand.Centre[k]) : 1.0e30f;
+    return Out;
+}
+
+struct FVoxelOceanChartBlend
+{
+    int Count;
+    int Index[VOXEL_OCEAN_CHART_MAX];       // into the candidates
+    float Weight[VOXEL_OCEAN_CHART_MAX];    // already divided by sqrt(sum w^2)
+};
+
+VOXEL_FUNC float VoxelOceanChartBand(int N)
+{
+    // A cell is about (pi / 2) / N across (radians, the chord's scale on the unit sphere).
+    return VOXEL_OCEAN_CHART_BAND * 1.57079633f / float(N);
+}
+
+VOXEL_FUNC FVoxelOceanChartBlend VoxelOceanChartBlendOf(int Count, FVoxelOceanChartDistances Distances, int N)
+{
+    FVoxelOceanChartBlend B;
+    B.Count = 0;
+    for (int Init = 0; Init < VOXEL_OCEAN_CHART_MAX; Init++)
+    {
+        B.Index[Init] = 0;
+        B.Weight[Init] = 0.0f;
+    }
+    float Nearest = 1.0e30f;
+    for (int Near = 0; Near < VOXEL_OCEAN_CHART_CANDIDATES; Near++)
+    {
+        if (Near < Count) Nearest = min(Nearest, Distances.D[Near]);
+    }
+    const float Band = VoxelOceanChartBand(N);
+    for (int k = 0; k < VOXEL_OCEAN_CHART_CANDIDATES; k++)
+    {
+        if (k >= Count) continue;
+        const float W = smoothstep(Band, 0.0f, Distances.D[k] - Nearest);
+        if (W <= 0.0f) continue;
+        // Keep the largest VOXEL_OCEAN_CHART_MAX (more is all but impossible on this grid).
+        int Slot = B.Count;
+        if (B.Count == VOXEL_OCEAN_CHART_MAX)
+        {
+            Slot = -1;
+            float Least = W;
+            for (int Least2 = 0; Least2 < VOXEL_OCEAN_CHART_MAX; Least2++)
+            {
+                if (B.Weight[Least2] < Least)
+                {
+                    Least = B.Weight[Least2];
+                    Slot = Least2;
+                }
+            }
+        }
+        else
+        {
+            B.Count += 1;
+        }
+        if (Slot >= 0)
+        {
+            B.Index[Slot] = k;
+            B.Weight[Slot] = W;
+        }
+    }
+    float Sum2 = 0.0f;
+    for (int Sum = 0; Sum < VOXEL_OCEAN_CHART_MAX; Sum++) Sum2 += B.Weight[Sum] * B.Weight[Sum];
+    const float Inv = Sum2 > 0.0f ? 1.0f / sqrt(Sum2) : 0.0f;
+    for (int Norm = 0; Norm < VOXEL_OCEAN_CHART_MAX; Norm++) B.Weight[Norm] *= Inv;
+    return B;
+}
+
+#endif // VOXEL_OCEAN_CHARTS_USH

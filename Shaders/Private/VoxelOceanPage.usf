@@ -6,8 +6,9 @@
 // Page format: position (page units from the page origin; the component carries the unit),
 // tangent and normal (snorm8 x4), and five texture coordinates as ten words: the morph offset
 // (to the parent vertex the vertex collapses into) x, y | z, terrain depth | the depth at that
-// target, shore distance | the target's own morph offset (toward the grandparent grid) x, y |
-// z, the depth at its target (shore 0 until a later stage; VoxelOcean.ush reads them). Colour
+// target, reserved (0; the shore is read from its field's texture at the morphed point, stage
+// O8) | the target's own morph offset (toward the grandparent grid) x, y | z, the depth at its
+// target (VoxelOcean.ush reads them). Colour
 // is the page's (voxel.Debug.LevelColor).
 //
 // The terrain depth of a vertex (cm, positive under water) is the planet density with the
@@ -19,6 +20,14 @@
 // stands above at every corner by more than the job's cull height (a margin plus the slope
 // bound times how far a morphed triangle reaches) is written degenerate: no part of it can be
 // above the terrain.
+//
+// THE SHORE FIELD (stage O8; VoxelOceanShore.ush): a vertex whose field distance is below minus
+// ShoreMarginM lies in an inland basin below sea level (not joined to the sea): its depth is
+// taken as land (VOXEL_OCEAN_BASIN_DEPTH), so its triangles are culled and no wave moves there.
+//
+// THE DEPTH PROBE (ProbeCS; VoxelOceanDepthProbe.h): the same depth, inland-basin cull included,
+// at the probe's lattice points with each level's spacing as the footprint, for the underwater
+// pass.
 
 #include "/Engine/Public/Platform.ush"
 #include "/Plugin/VoxelPlugin/Private/VoxelDensityCore.ush"
@@ -84,6 +93,28 @@ uint EditOpCount;
 #include "/Plugin/VoxelPlugin/Private/VoxelLandGully.ush"
 #include "/Plugin/VoxelPlugin/Private/VoxelDensitySample.ush"
 #include "/Plugin/VoxelPlugin/Private/VoxelEditSample.ush"
+#include "/Plugin/VoxelPlugin/Private/VoxelOceanCharts.ush"
+#include "/Plugin/VoxelPlugin/Private/VoxelOceanShore.ush"
+
+// The shore field (FVoxelOceanShoreRHI; ShoreN 0: none).
+Texture2DArray ShoreTexture;
+uint ShoreN;
+float ShoreReach;
+float ShoreMarginM;
+
+// The depth of a vertex in an inland basin (cm): land, well past any cull height.
+#define VOXEL_OCEAN_BASIN_DEPTH (-1.0e6f)
+
+// The terrain depth (cm, positive under water) at lattice point (X, Y, Z): the density with the
+// edits, an inland basin counted as land.
+float VoxelOceanDepthAt(int X, int Y, int Z, float Footprint)
+{
+    const float Depth = VoxelEditApply(X, Y, Z, Footprint, VoxelSampleDensityDF(X, Y, Z, Footprint));
+    if (ShoreN == 0u || Depth <= 0.0f) return Depth;
+    const float3 Dir = normalize(float3(float(X), float(Y), float(Z)));
+    const FVoxelOceanShoreSample Shore = VoxelOceanShoreFieldAt(ShoreTexture, Dir, int(ShoreN), ShoreReach);
+    return Shore.Distance < -ShoreMarginM ? VOXEL_OCEAN_BASIN_DEPTH : Depth;
+}
 
 // The job's terrain depth per tile vertex.
 groupshared float TileDepth[VOXEL_OCEAN_MAX_TILE_VERTICES];
@@ -135,7 +166,7 @@ void WriteCS(uint3 GroupId : SV_GroupID, uint GroupThread : SV_GroupIndex)
             const int X = asint(VertexWords[Src + 11u]);
             const int Y = asint(VertexWords[Src + 12u]);
             const int Z = asint(VertexWords[Src + 13u]);
-            TileDepth[I] = VoxelEditApply(X, Y, Z, Footprint, VoxelSampleDensityDF(X, Y, Z, Footprint));
+            TileDepth[I] = VoxelOceanDepthAt(X, Y, Z, Footprint);
         }
     }
     GroupMemoryBarrierWithGroupSync();
@@ -166,7 +197,7 @@ void WriteCS(uint3 GroupId : SV_GroupID, uint GroupThread : SV_GroupIndex)
                 OutTexCoords[T + 2u] = VertexWords[Src + 5u];
                 OutTexCoords[T + 3u] = asuint(TileDepth[I]);
                 OutTexCoords[T + 4u] = asuint(TileDepth[Target]);
-                OutTexCoords[T + 5u] = asuint(0.0f);    // shore distance (reserved)
+                OutTexCoords[T + 5u] = asuint(0.0f);    // reserved (the shore comes from its field's texture, stage O8)
                 OutTexCoords[T + 6u] = VertexWords[Src + 8u];
                 OutTexCoords[T + 7u] = VertexWords[Src + 9u];
                 OutTexCoords[T + 8u] = VertexWords[Src + 10u];
@@ -205,4 +236,21 @@ void WriteCS(uint3 GroupId : SV_GroupID, uint GroupThread : SV_GroupIndex)
         OutIndices[Dst + 1u] = Tri.y;
         OutIndices[Dst + 2u] = Tri.z;
     }
+}
+
+// The depth probe: one thread per point (VoxelOceanDepthProbe.h's order: level by level).
+StructuredBuffer<int> ProbePoints;      // 3 ints a point: the lattice point
+RWStructuredBuffer<float> ProbeOut;
+uint ProbeCount;
+uint ProbeLevelPoints;                  // points per level
+float4 ProbeFootprint;                  // per level (cm)
+
+[numthreads(64, 1, 1)]
+void ProbeCS(uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+    const uint I = DispatchThreadId.x;
+    if (I >= ProbeCount) return;
+    const uint Level = min(I / max(ProbeLevelPoints, 1u), 3u);
+    const float Footprint = Level == 0u ? ProbeFootprint.x : (Level == 1u ? ProbeFootprint.y : (Level == 2u ? ProbeFootprint.z : ProbeFootprint.w));
+    ProbeOut[I] = VoxelOceanDepthAt(ProbePoints[I * 3u], ProbePoints[I * 3u + 1u], ProbePoints[I * 3u + 2u], Footprint);
 }

@@ -6,6 +6,12 @@
 #include "VoxelBrickTerrain.h"
 #include "VoxelTerrainStats.h"
 #include "VoxelUnderwaterViewExtension.h"
+#include "VoxelOceanCascades.h"
+#include "VoxelOceanWeather.h"
+#include "VoxelOceanShoreField.h"
+#include "VoxelLandBake.h"
+#include "Engine/Texture2D.h"
+#include "Engine/Texture2DArray.h"
 #include "RealtimeMeshComponent.h"
 #include "Materials/Material.h"
 #include "Materials/MaterialInstanceDynamic.h"
@@ -29,6 +35,26 @@ static TAutoConsoleVariable<int32> CVarVoxelDebugOceanQuery(
 static TAutoConsoleVariable<float> CVarVoxelDebugOceanQuerySpacing(
     TEXT("voxel.Debug.OceanQuerySpacing"), 150.0f,
     TEXT("Spacing (cm) of the voxel.Debug.OceanQuery grid."),
+    ECVF_Default);
+
+static TAutoConsoleVariable<int32> CVarVoxelDebugOceanWeather(
+    TEXT("voxel.Debug.OceanWeather"), 0,
+    TEXT("N > 0: the weather on a (2N + 1) x (2N + 1) grid around the camera's foot (voxel.Debug.OceanWeatherSpacing apart): the wind (white arrows, 1 km per m/s), the swell (cyan) and the storms' centres and radii (red circles)."),
+    ECVF_Default);
+
+static TAutoConsoleVariable<float> CVarVoxelDebugOceanWeatherSpacing(
+    TEXT("voxel.Debug.OceanWeatherSpacing"), 20.0f,
+    TEXT("Spacing (km) of the voxel.Debug.OceanWeather grid."),
+    ECVF_Default);
+
+static TAutoConsoleVariable<int32> CVarVoxelDebugOceanShore(
+    TEXT("voxel.Debug.OceanShore"), 0,
+    TEXT("N > 0: the shore field (stage O8) on a (2N + 1) x (2N + 1) grid around the camera's foot (voxel.Debug.OceanShoreSpacing apart): toward the coast (arrows, 100 m long; green on the sea side, brown on land, red in an inland basin), with the distance and beach slope printed at the centre."),
+    ECVF_Default);
+
+static TAutoConsoleVariable<float> CVarVoxelDebugOceanShoreSpacing(
+    TEXT("voxel.Debug.OceanShoreSpacing"), 500.0f,
+    TEXT("Spacing (m) of the voxel.Debug.OceanShore grid."),
     ECVF_Default);
 
 namespace OceanSphereActorDetail
@@ -77,6 +103,8 @@ void AOceanSphereActor::BeginPlay()
 void AOceanSphereActor::EndPlay(const EEndPlayReason::Type EndPlayReason)
 {
     ReleaseUnderwater();
+    if (ShoreBuilder.IsValid())
+        ShoreBuilder->Reset();
     {
         FWriteScopeLock Lock(QueryLock);
         QueryFrame.Reset();
@@ -298,6 +326,17 @@ void AOceanSphereActor::UpdateUnderwater()
     Params.Scattering = FVector3f(S.Scattering.R, S.Scattering.G, S.Scattering.B);
     Params.Light = FVector3f(S.UnderwaterLight.R, S.UnderwaterLight.G, S.UnderwaterLight.B);
     Params.Meniscus = FVector4f(S.MeniscusColor.R, S.MeniscusColor.G, S.MeniscusColor.B, (float)FMath::Max(S.MeniscusWidth, 0.0));
+    // The FFT model's textures (kept alive here; released after the extension).
+    if (const FVoxelOceanCascadeTextures* Textures = Surface.IsValid() ? Surface->GetCascadeTextures() : nullptr)
+    {
+        Params.Displacement = Textures->Displacement->GetResource();
+        Params.Derivatives = Textures->Derivatives->GetResource();
+        Params.Charts = Textures->Charts->GetResource();
+    }
+    // The shore (stage O8): the field's texture, the depth probe, the inland basins' margin.
+    Params.Shore = ShoreRHI;
+    Params.Probe = Surface.IsValid() ? Surface->GetProbeState() : nullptr;
+    Params.ShoreMarginCm = Frame->ShoreMarginCm;
     UnderwaterExtension->SetFrame_GameThread(Params);
 }
 
@@ -381,6 +420,109 @@ double AOceanSphereActor::GetOceanTime() const
     return Seconds * FMath::Max(OceanSettings.OceanTimeScale, 0.0);
 }
 
+void AOceanSphereActor::UpdateWeatherSource()
+{
+    const FVoxelOceanSettings& S = OceanSettings;
+    const FVoxelOceanSettings& Was = WeatherSourceSettings;
+    const bool bSame = WeatherSource.IsValid() && WeatherSourceRadius == OceanRadius && S.bProceduralWeather == Was.bProceduralWeather
+        && (S.bProceduralWeather
+            ? (S.WeatherSeed == Was.WeatherSeed && S.TradeWind == Was.TradeWind && S.Westerly == Was.Westerly && S.PolarWind == Was.PolarWind
+                && S.WindNoise == Was.WindNoise && S.WindNoiseSize == Was.WindNoiseSize && S.StormCount == Was.StormCount
+                && S.StormWind == Was.StormWind && S.StormRadius == Was.StormRadius && S.StormHours == Was.StormHours
+                && S.SwellStrength == Was.SwellStrength && S.SwellRange == Was.SwellRange
+                && S.WeatherTimeScale == Was.WeatherTimeScale && S.WeatherTimeOffset == Was.WeatherTimeOffset)
+            : (S.WindSpeed == Was.WindSpeed && S.WindHeading == Was.WindHeading && S.StormIntensity == Was.StormIntensity));
+    if (bSame) return;
+    if (S.bProceduralWeather)
+    {
+        FVoxelOceanWeatherSettings W;
+        W.Seed = S.WeatherSeed;
+        W.TradeWind = S.TradeWind;
+        W.Westerly = S.Westerly;
+        W.PolarWind = S.PolarWind;
+        W.NoiseWind = S.WindNoise;
+        W.NoiseSizeKm = S.WindNoiseSize;
+        W.StormCount = S.StormCount;
+        W.StormWind = S.StormWind;
+        W.StormRadiusKm = S.StormRadius;
+        W.StormHours = S.StormHours;
+        W.SwellStrength = S.SwellStrength;
+        W.SwellRangeKm = S.SwellRange;
+        W.TimeScale = S.WeatherTimeScale;
+        W.TimeOffset = S.WeatherTimeOffset;
+        WeatherSource = MakeShared<FVoxelOceanProceduralWeather, ESPMode::ThreadSafe>(W, FMath::Max(OceanRadius, 1.0));
+    }
+    else
+    {
+        WeatherSource = MakeShared<FVoxelOceanConstantWeather, ESPMode::ThreadSafe>(GetEnvironment());
+    }
+    WeatherSourceSettings = S;
+    WeatherSourceRadius = OceanRadius;
+}
+
+bool AOceanSphereActor::GetWeatherAt(const FVector& WorldLocation, FVector& Wind, double& Storm, FVector& Swell) const
+{
+    Wind = FVector::ZeroVector;
+    Swell = FVector::ZeroVector;
+    Storm = 0.0;
+    if (!WeatherSource.IsValid()) return false;
+    const FTransform NoScaleTransform(GetActorRotation(), GetActorLocation());
+    const FVector Planet = NoScaleTransform.InverseTransformPosition(WorldLocation);
+    const FVector Dir = Planet.GetSafeNormal();
+    const FVoxelOceanEnvironment E = WeatherSource->Sample(Planet, GetOceanTime());
+    Wind = NoScaleTransform.TransformVectorNoScale(VoxelOceanWeather::FromSpeedHeading(Dir, E.WindSpeed, E.WindHeading));
+    Swell = NoScaleTransform.TransformVectorNoScale(VoxelOceanWeather::FromSpeedHeading(Dir, E.SwellSpeed, E.SwellHeading));
+    Storm = E.Storm;
+    return true;
+}
+
+void AOceanSphereActor::DrawWeatherDebug() const
+{
+#if ENABLE_DRAW_DEBUG
+    const int32 N = FMath::Clamp(CVarVoxelDebugOceanWeather.GetValueOnGameThread(), 0, 32);
+    UWorld* World = GetWorld();
+    if (N <= 0 || !World || !bHasCamera || !WeatherSource.IsValid()) return;
+    const double Spacing = FMath::Max(0.1, (double)CVarVoxelDebugOceanWeatherSpacing.GetValueOnGameThread()) * 1.0e5;
+    const double Time = GetOceanTime();
+    const FTransform NoScaleTransform(GetActorRotation(), GetActorLocation());
+    const FVector Up = CameraPosition.GetSafeNormal();
+    FVector E1, E2;
+    Up.FindBestAxisVectors(E1, E2);
+    // Arrows drawn a little above the sea, 1 km long per m/s.
+    const double Lift = 2000.0;
+    for (int32 j = -N; j <= N; j++)
+    {
+        for (int32 i = -N; i <= N; i++)
+        {
+            const FVector Dir = (Up * OceanRadius + E1 * (i * Spacing) + E2 * (j * Spacing)).GetSafeNormal();
+            const FVoxelOceanEnvironment E = WeatherSource->Sample(Dir * OceanRadius, Time);
+            const FVector Base = NoScaleTransform.TransformPosition(Dir * (OceanRadius + Lift));
+            const FVector Wind = NoScaleTransform.TransformVectorNoScale(VoxelOceanWeather::FromSpeedHeading(Dir, E.WindSpeed, E.WindHeading));
+            const FVector Swell = NoScaleTransform.TransformVectorNoScale(VoxelOceanWeather::FromSpeedHeading(Dir, E.SwellSpeed, E.SwellHeading));
+            const FColor WindColor = FLinearColor::LerpUsingHSV(FLinearColor::White, FLinearColor::Red, (float)E.Storm).ToFColor(true);
+            DrawDebugDirectionalArrow(World, Base, Base + Wind * 1.0e5, 5000.0f, WindColor, false, -1.0f, SDPG_Foreground, 300.0f);
+            if (E.SwellSpeed > 0.1)
+                DrawDebugDirectionalArrow(World, Base, Base + Swell * 1.0e5, 5000.0f, FColor::Cyan, false, -1.0f, SDPG_Foreground, 150.0f);
+        }
+    }
+    // The source is procedural when the settings it was made for say so.
+    if (const FVoxelOceanProceduralWeather* Procedural = static_cast<const FVoxelOceanProceduralWeather*>(WeatherSourceSettings.bProceduralWeather ? WeatherSource.Get() : nullptr))
+    {
+        TArray<FVoxelOceanStorm> Storms;
+        Procedural->StormsAt(Procedural->WeatherTime(Time), Storms);
+        for (const FVoxelOceanStorm& Storm : Storms)
+        {
+            if (Storm.Strength < 0.05) continue;
+            const FVector Centre = NoScaleTransform.TransformPosition(Storm.Centre * (OceanRadius + Lift));
+            FVector A, B;
+            Storm.Centre.FindBestAxisVectors(A, B);
+            DrawDebugCircle(World, Centre, (float)(Storm.Radius * OceanRadius), 64, FColor(255, (uint8)(255 * (1.0 - Storm.Strength)), 0), false, -1.0f, SDPG_Foreground, 2000.0f,
+                NoScaleTransform.TransformVectorNoScale(A), NoScaleTransform.TransformVectorNoScale(B), false);
+        }
+    }
+#endif
+}
+
 FVoxelOceanEnvironment AOceanSphereActor::GetEnvironment() const
 {
     FVoxelOceanEnvironment Environment;
@@ -388,6 +530,91 @@ FVoxelOceanEnvironment AOceanSphereActor::GetEnvironment() const
     Environment.WindHeading = FMath::DegreesToRadians(OceanSettings.WindHeading);
     Environment.Storm = FMath::Clamp(OceanSettings.StormIntensity, 0.0, 1.0);
     return Environment;
+}
+
+void AOceanSphereActor::UpdateShoreField()
+{
+    if (!ShoreBuilder.IsValid())
+        ShoreBuilder = MakeShared<FVoxelOceanShoreBuilder>();
+    // The planet's land bake (none for a noise planet or a standalone ocean without one).
+    TSharedPtr<const FVoxelLandBake, ESPMode::ThreadSafe> Bake;
+    if (Compositor.IsValid() && Compositor->GetBaseDensity().IsValid())
+        Bake = Compositor->GetBaseDensity()->GetLandBake();
+    // As last applied: a slider drag doesn't start a build every frame.
+    const double ReachM = FMath::Max(AppliedSettings.ShoreFieldReach, 1.0) * 1000.0;
+    const bool bHave = ShoreField.IsValid() && Bake.IsValid() && ShoreField->BakeKey == Bake->Key && ShoreField->N == Bake->N
+        && ShoreField->RadiusCm == OceanRadius && ShoreField->ReachM == ReachM;
+    if (!Bake.IsValid())
+    {
+        if (ShoreField.IsValid() || !ShoreBuilder->IsDone()) ShoreBuilder->Reset();
+        ShoreField.Reset();
+        ShoreTexture = nullptr;
+        ShoreResource = nullptr;
+        ShoreRHI.Reset();
+        return;
+    }
+    if (!bHave && !ShoreBuilder->IsFor(Bake.Get(), OceanRadius, ReachM))
+        ShoreBuilder->Start(Bake, OceanRadius, ReachM);
+    ShoreBuilder->Tick();
+    if (!bHave && ShoreBuilder->IsDone() && ShoreBuilder->IsFor(Bake.Get(), OceanRadius, ReachM))
+    {
+        const TSharedPtr<const FVoxelOceanShoreField, ESPMode::ThreadSafe> Made = ShoreBuilder->GetResult();
+        if (Made.IsValid() && Made != ShoreField)
+        {
+            ShoreField = Made;
+            ShoreTexture = Made->MakeTexture();
+            ShoreResource = ShoreTexture ? ShoreTexture->GetResource() : nullptr;
+            ShoreRHI = FVoxelOceanShoreRHI::Make(ShoreTexture.Get(), Made->N, Made->ReachM);
+        }
+        else if (!Made.IsValid() && ShoreField.IsValid())
+        {
+            // The rebuild failed: no field rather than one for another bake, radius or reach.
+            ShoreField.Reset();
+            ShoreTexture = nullptr;
+            ShoreResource = nullptr;
+            ShoreRHI.Reset();
+        }
+    }
+    // The texture's resource made again (it is ours alone, but a device reset or an editor
+    // action can): its render-thread handle again.
+    if (ShoreField.IsValid() && ShoreTexture && ShoreTexture->GetResource() != ShoreResource)
+    {
+        ShoreResource = ShoreTexture->GetResource();
+        ShoreRHI = FVoxelOceanShoreRHI::Make(ShoreTexture.Get(), ShoreField->N, ShoreField->ReachM);
+    }
+}
+
+void AOceanSphereActor::DrawShoreDebug() const
+{
+#if ENABLE_DRAW_DEBUG
+    const int32 N = FMath::Clamp(CVarVoxelDebugOceanShore.GetValueOnGameThread(), 0, 32);
+    UWorld* World = GetWorld();
+    if (N <= 0 || !World || !bHasCamera || !ShoreField.IsValid()) return;
+    const double Spacing = FMath::Max(1.0, (double)CVarVoxelDebugOceanShoreSpacing.GetValueOnGameThread()) * 100.0;
+    const double Margin = ShoreField->MarginCm(AppliedSettings.ShoreBasinMargin);
+    const FTransform NoScaleTransform(GetActorRotation(), GetActorLocation());
+    const FVector Up = CameraPosition.GetSafeNormal();
+    FVector E1, E2;
+    Up.FindBestAxisVectors(E1, E2);
+    const double Lift = 300.0;
+    for (int32 j = -N; j <= N; j++)
+    {
+        for (int32 i = -N; i <= N; i++)
+        {
+            const FVector Dir = (Up * OceanRadius + E1 * (i * Spacing) + E2 * (j * Spacing)).GetSafeNormal();
+            const FVoxelOceanShore S = ShoreField->Sample(Dir * OceanRadius);
+            const FVector Base = NoScaleTransform.TransformPosition(Dir * (OceanRadius + Lift));
+            const FVector Toward = NoScaleTransform.TransformVectorNoScale(S.Direction);
+            const FColor Color = S.Distance >= 0.0 ? FColor::Green : (S.Distance < -Margin ? FColor::Red : FColor(150, 100, 40));
+            DrawDebugDirectionalArrow(World, Base, Base + Toward * 10000.0, 1500.0f, Color, false, -1.0f, SDPG_Foreground, 60.0f);
+            if (i == 0 && j == 0)
+            {
+                DrawDebugString(World, Base + NoScaleTransform.TransformVectorNoScale(Up) * 500.0,
+                    FString::Printf(TEXT("shore %.0f m, slope %.4f"), S.Distance * 0.01, S.Slope), nullptr, FColor::White, 0.0f, true);
+            }
+        }
+    }
+#endif
 }
 
 void AOceanSphereActor::PublishWaveFrame()
@@ -535,6 +762,24 @@ void AOceanSphereActor::InitializeInternal(TSharedPtr<FDensitySampleCompositor> 
     }
     AppliedSettings = OceanSettings;
 
+    // The FFT cascades' textures: the arrays once, the chart table again for a new radius (the
+    // underwater pass keeps its own references to the old one's RHI texture until replaced).
+    if (FApp::CanEverRender() && (!WaveDisplacement || !WaveDerivatives || !WaveFoam || !WaveCharts || WaveChartsRadius != OceanRadius))
+    {
+        FVoxelOceanCascadeTextures Made;
+        Made.Displacement = WaveDisplacement.Get();
+        Made.Derivatives = WaveDerivatives.Get();
+        Made.Foam = WaveFoam.Get();
+        if (VoxelOceanCascades::MakeTextures(this, VoxelOceanCharts::Build(OceanRadius), Made))
+        {
+            WaveDisplacement = Made.Displacement;
+            WaveDerivatives = Made.Derivatives;
+            WaveFoam = Made.Foam;
+            WaveCharts = Made.Charts;
+            WaveChartsRadius = OceanRadius;
+        }
+    }
+
     FVoxelOceanSurfaceSettings Settings;
     Settings.Radius = OceanRadius;
     Settings.TileQuads = OceanSettings.TileQuads;
@@ -542,6 +787,13 @@ void AOceanSphereActor::InitializeInternal(TSharedPtr<FDensitySampleCompositor> 
     Settings.LodDistanceFactor = OceanSettings.LodDistanceFactor;
     Settings.SpareBufferSets = OceanSettings.SpareBufferSets;
     Settings.Material = SurfaceMaterialInstance.Get();
+    if (WaveChartsRadius == OceanRadius)
+    {
+        Settings.CascadeTextures.Displacement = WaveDisplacement.Get();
+        Settings.CascadeTextures.Derivatives = WaveDerivatives.Get();
+        Settings.CascadeTextures.Charts = WaveCharts.Get();
+        Settings.CascadeTextures.Foam = WaveFoam.Get();
+    }
     if (!Surface.IsValid())
         Surface = MakeShared<FVoxelOceanSurface>();
     Surface->Initialize(this, MeshAttachmentRoot, Settings);
@@ -550,6 +802,8 @@ void AOceanSphereActor::InitializeInternal(TSharedPtr<FDensitySampleCompositor> 
 
     LastInitScale = GetActorScale3D();
     bInitialized = true;
+    // The underwater pass gets the new textures now, not on the next tick.
+    UpdateUnderwater();
 }
 
 void AOceanSphereActor::Tick(float DeltaTime)
@@ -572,6 +826,8 @@ void AOceanSphereActor::Tick(float DeltaTime)
     AAdaptiveVoxelActor* Terrain = FindTerrain();
     if (Terrain != BoundTerrain.Get())
         BindTerrain(Terrain);
+    UpdateWeatherSource();
+    UpdateShoreField();
     Surface->SetInputs(GatherInputs(Terrain));
     Surface->Tick(CameraPosition);
     PublishWaveFrame();
@@ -579,6 +835,8 @@ void AOceanSphereActor::Tick(float DeltaTime)
     // The view from under water: every view decides for itself on the render thread.
     UpdateUnderwater();
     DrawQueryDebug();
+    DrawWeatherDebug();
+    DrawShoreDebug();
 }
 
 AAdaptiveVoxelActor* AOceanSphereActor::FindTerrain() const
@@ -619,6 +877,48 @@ FVoxelOceanSurfaceInputs AOceanSphereActor::GatherInputs(const AAdaptiveVoxelAct
     Inputs.LandCullMargin = AppliedSettings.bCullUnderLand ? AppliedSettings.LandCullMargin : -1.0;
     Inputs.Time = GetOceanTime();
     Inputs.Environment = GetEnvironment();
+    const FVoxelOceanSettings& S = OceanSettings;
+    // The weather and how the waves key it.
+    Inputs.Weather = WeatherSource;
+    Inputs.WeatherTiming.KeySeconds = S.WeatherKeySeconds;
+    Inputs.WeatherTiming.HeadingStepDegrees = S.WaveHeadingStep;
+    Inputs.WeatherTiming.FadeSeconds = S.WaveTurnSeconds;
+    // The FFT waves' settings (the reach's wind is the surface's to choose).
+    Inputs.Waves.Seed = S.WaveSeed;
+    Inputs.Waves.FetchKm = S.WaveFetch;
+    Inputs.Waves.Chop = S.WaveChop;
+    Inputs.Waves.Swell = S.WaveSwell;
+    Inputs.Waves.DetileCell = S.WaveDetileCell;
+    Inputs.Waves.bQueryShortWaves = S.bQueryShortWaves;
+    Inputs.Waves.MipBias = S.WaveMipBias;
+    // The shore (stage O8): shoaling's settings (a breaking index of 0 turns it off), the field.
+    Inputs.Waves.ShoreBreaking = S.bShoaling ? S.ShoreBreaking : 0.0;
+    Inputs.Waves.ShoreChopGrowth = S.ShoreChopGrowth;
+    Inputs.Waves.ShoreWarp = S.ShoreWarp;
+    Inputs.Waves.ShoreFade = S.ShoreFadeDistance;
+    Inputs.Waves.ShoreMinSlope = S.ShoreMinSlope;
+    // The surf (stage O9a): a strength of 0 turns it off.
+    Inputs.Waves.SurfStrength = S.bShoaling && S.bSurf ? S.SurfStrength : 0.0;
+    Inputs.Waves.SurfSets = S.SurfSets;
+    Inputs.Waves.SurfSwash = S.SurfSwash;
+    Inputs.Waves.SurfSkew = S.SurfSkew;
+    Inputs.Waves.SurfHandover = S.SurfHandover;
+    // The foam (stage O9b): a decay of 0 makes none.
+    Inputs.Waves.FoamDecay = S.bFoam ? S.FoamDecay : 0.0;
+    Inputs.Waves.FoamCoverage = S.bFoam ? S.FoamCoverage : 0.0;
+    Inputs.Waves.SurfFoam = S.bFoam ? S.SurfFoam : 0.0;
+    // The field reaches the queries wherever it exists (a server builds it on the CPU, and has
+    // no texture); its texture and the pages' cull only where it was made.
+    if (ShoreField.IsValid())
+    {
+        Inputs.Shore = ShoreField;
+        Inputs.Density.ShoreMarginCm = ShoreField->MarginCm(AppliedSettings.ShoreBasinMargin);
+        if (ShoreRHI.IsValid())
+        {
+            Inputs.ShoreTexture = ShoreTexture.Get();
+            Inputs.Density.Shore = ShoreRHI;
+        }
+    }
     if (Terrain && Terrain->ActualPrecision > 0.0)
     {
         // The terrain's lattice (its edit tree is addressed in it) and slope bound.

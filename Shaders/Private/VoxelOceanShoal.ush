@@ -1,0 +1,345 @@
+// VoxelOceanShoal.ush - The FFT waves in shallow water (Design/OceanWaves.md section 5; stage
+// O8). Shared subset (VoxelShaderCompat.h): the wave hook (VoxelOceanWaves.ush) and the CPU model
+// (VoxelOceanWavesFFT.cpp) shoal their lookups with this same code.
+//
+// PER BAND. The cascades hold deep-water waves; each band's lookups are changed by what depth does
+// to the waves that carry most of its energy: its peak wavelength (0.88 U^2 m, U the speed that
+// weighs the band: the larger of wind and swell for the long bands, the wind for the short), held
+// within the band's own range (VoxelOceanShoalWavelength).
+//
+// FROM THE DEPTH d at the point (the terrain's, as the mesh carries it), with k the band's deep
+// wavenumber, kd its shallow one (k_d tanh(k_d d) = k, VoxelOceanDispersionOf) and n = cg / c:
+// - amplitude: the shoaling gain Ks = sqrt(cg_deep / cg) = sqrt(r / 2n) (r = k_d / k) where the
+//   band is swell (long bands with the swell above the wind); the TMA (Kitaigorodskii) factor,
+//   sqrt(phi) = Ks / r^1.5, for wind sea (it holds the depth-limited spectrum's saturation);
+//   capped at VOXEL_OCEAN_SHOAL_MAX_GAIN;
+// - horizontal: the orbits flatten as 1 / tanh(k_d d) (to the power ChopGrowth, capped);
+// - breaking: the bands' significant height together held under Breaking x d (a smooth cap;
+//   0.78, the breaking index);
+// - the fade: within Fade metres of the coast (d / slope, the slope the shore field's) the bands
+//   fade out (0 by default since stage O9a: the surf's handover does it);
+// - the handover (stage O9a, VoxelOceanSurf.ush): the long bands keep LongKeep of their amplitude
+//   near the coast, the surf trains carrying the rest; applied before the breaking cap, so the
+//   short bands aren't capped for energy the trains took.
+// No effect where the band is deep (k d beyond VOXEL_OCEAN_SHOAL_DEEP).
+//
+// SLOWING (from the shore field): the waves shorten and slow toward the coast. A band's lookup is
+// moved along the shore direction e by U(s) at s metres from the coast, U(s) the integral from s
+// to the open sea of (r - 1): the local wavenumber along e is then k r and the crests move at the
+// shallow-water speed (omega kept). The depth along the way is taken as a uniform beach of the
+// field's slope m, d = m s, so U = G(k m s) / (m k) with G(y) the integral from y to infinity of
+// (r(y') - 1) dy', which is in closed form through the dispersion's k_d d = X:
+//   G = I(2X) / 2 - X (1 - tanh X),   I(z) = integral from z to infinity of u / sinh(u) du
+// (VoxelOceanWarpIntegral; G(0) = pi^2 / 8). r is held under 1 + VOXEL_OCEAN_SHOAL_MAX_STRETCH
+// (below that depth G continues linearly). The lookup's gradients follow the move: the slope's
+// component along e and the horizontal displacement's gradient are stretched by r
+// (VoxelOceanShoalSample). Since only the component along e grows, the crests also turn toward
+// the beach (refraction's look, not its law). Smooth in the field, it doesn't depend on the
+// depth itself: the drawn surface, the underwater pass and the query move the waves alike.
+//
+// Positions and depths: m; the sample's lengths in its own units (cm in the hook).
+
+#ifndef VOXEL_OCEAN_SHOAL_USH
+#define VOXEL_OCEAN_SHOAL_USH
+
+#ifndef VOXEL_FUNC
+#define VOXEL_FUNC
+#endif
+
+// Include after VoxelOceanFFTWaves.ush (FVoxelOceanFFTSample), VoxelOceanSeaState.ush
+// (FVoxelOceanSeaState) and VoxelOceanShore.ush (FVoxelOceanShoreSample).
+
+#define VOXEL_OCEAN_SHOAL_GRAVITY 9.80665f
+// k d past which a band is deep (tanh 6 = 1 - 1.2e-5).
+#define VOXEL_OCEAN_SHOAL_DEEP 6.0f
+#define VOXEL_OCEAN_SHOAL_MAX_GAIN 2.0f
+#define VOXEL_OCEAN_SHOAL_MAX_CHOP 2.5f
+// r - 1 at most (the wavelength shortened to a quarter).
+#define VOXEL_OCEAN_SHOAL_MAX_STRETCH 3.0f
+// The deep wavenumber times depth where r reaches 1 + MAX_STRETCH (r(0.0617) = 4.0).
+#define VOXEL_OCEAN_SHOAL_STRETCH_DEPTH 0.0617f
+// How much the shoaled waves can exceed the deep ones' reach: height (swell's gain before it
+// breaks) and horizontally (the flattened orbits).
+#define VOXEL_OCEAN_SHOAL_REACH_HEIGHT 1.6f
+#define VOXEL_OCEAN_SHOAL_REACH_HORIZONTAL 2.5f
+// The peak wavelength per squared speed (m per (m/s)^2): 2 pi / (0.855 g / U)^2 g.
+#define VOXEL_OCEAN_SHOAL_PEAK_LENGTH 0.8796f
+
+VOXEL_FUNC float VoxelOceanShoalTanh(float X)
+{
+    const float E = exp(-2.0f * abs(X));
+    const float T = (1.0f - E) / (1.0f + E);
+    return X < 0.0f ? -T : T;
+}
+
+// The dispersion at depth: Y = k d (deep wavenumber times depth, > 0). X = k_d d, R = k_d / k,
+// N = cg / c.
+struct FVoxelOceanDispersion
+{
+    float X;
+    float R;
+    float N;
+};
+
+VOXEL_FUNC FVoxelOceanDispersion VoxelOceanDispersionOf(float Y)
+{
+    FVoxelOceanDispersion D;
+    if (Y >= VOXEL_OCEAN_SHOAL_DEEP)
+    {
+        D.X = Y;
+        D.R = 1.0f;
+        D.N = 0.5f;
+        return D;
+    }
+    Y = max(Y, 1.0e-8f);
+    // Fenton and McKee's explicit form, then one Newton step on X tanh X = Y (relative error under
+    // 1e-4).
+    const float X0 = Y / pow(VoxelOceanShoalTanh(pow(Y, 0.75f)), 0.6666667f);
+    const float Th = VoxelOceanShoalTanh(X0);
+    const float X = X0 - (X0 * Th - Y) / (Th + X0 * (1.0f - Th * Th));
+    D.X = X;
+    D.R = X / Y;
+    // 2X / sinh(2X), from exp(-2X) (no overflow).
+    const float E = exp(-2.0f * X);
+    const float Ratio = X > 1.0e-4f ? 4.0f * X * E / max(1.0f - E * E, 1.0e-12f) : 1.0f;
+    D.N = 0.5f * (1.0f + Ratio);
+    return D;
+}
+
+// I(z): the integral from z to infinity of u / sinh(u) du (pi^2 / 4 at 0). Taylor below 1.1, the
+// series sum of 2 e^{-(2k+1)z} (z / (2k+1) + 1 / (2k+1)^2) above (both within 5e-6).
+VOXEL_FUNC float VoxelOceanSinhIntegral(float Z)
+{
+    if (Z < 1.1f)
+    {
+        const float Z2 = Z * Z;
+        return 2.4674011f - Z * (1.0f - Z2 * (0.055555556f - Z2 * (0.0038888889f - Z2 * (0.00029289494f - Z2 * 0.000023331864f))));
+    }
+    float Sum = 0.0f;
+    for (int K = 0; K < 5; K++)
+    {
+        const float M = float(2 * K + 1);
+        Sum += 2.0f * exp(-M * Z) * (Z / M + 1.0f / (M * M));
+    }
+    return Sum;
+}
+
+// The warp of a band at model depth Y = k m s: Shift = G(Y) (to be divided by m k), Stretch =
+// r(Y) - 1, with r held under 1 + MAX_STRETCH (G continues linearly below that depth).
+struct FVoxelOceanWarp
+{
+    float G;
+    float Stretch;
+};
+
+VOXEL_FUNC FVoxelOceanWarp VoxelOceanWarpOf(float Y)
+{
+    FVoxelOceanWarp W;
+    if (Y >= VOXEL_OCEAN_SHOAL_DEEP)
+    {
+        W.G = 0.0f;
+        W.Stretch = 0.0f;
+        return W;
+    }
+    const float YC = max(Y, VOXEL_OCEAN_SHOAL_STRETCH_DEPTH);
+    const FVoxelOceanDispersion D = VoxelOceanDispersionOf(YC);
+    const float G = 0.5f * VoxelOceanSinhIntegral(2.0f * D.X) - D.X * (1.0f - VoxelOceanShoalTanh(D.X));
+    W.Stretch = min(D.R - 1.0f, VOXEL_OCEAN_SHOAL_MAX_STRETCH);
+    W.G = max(G, 0.0f) + W.Stretch * (YC - Y);
+    return W;
+}
+
+// The settings, as the shaders get them (FVoxelOceanWaveParams: States = (field cells, breaking
+// index, chop growth, warp), SlopeVar = (fade m, least slope, the field's reach m, unused)).
+struct FVoxelOceanShoalSettings
+{
+    float Breaking;     // 0: no shoaling at all
+    float ChopGrowth;
+    float Warp;
+    float Fade;         // m
+    float MinSlope;
+    float LongKeep;     // the long bands' amplitude factor the surf leaves them (stage O9a; 1 without)
+};
+
+VOXEL_FUNC FVoxelOceanShoalSettings VoxelOceanShoalSettingsOf(float4 States, float4 SlopeVar)
+{
+    FVoxelOceanShoalSettings S;
+    S.Breaking = States.y;
+    S.ChopGrowth = States.z;
+    S.Warp = States.w;
+    S.Fade = SlopeVar.x;
+    S.MinSlope = max(SlopeVar.y, 1.0e-4f);
+    S.LongKeep = 1.0f;
+    return S;
+}
+
+// What shoaling does to each band at a point (x to w: bands 0 to 3).
+struct FVoxelOceanShoal
+{
+    float4 Amp;         // height and slopes
+    float4 Chop;        // the horizontal displacement and its gradient, on top of Amp
+    float4 Stretch;     // r - 1 along Dir
+    float4 Shift;       // m along Dir
+    float3 Dir;         // toward the coast (planet frame, tangent, unit; zero without a field)
+    float Active;       // 0: every band as in deep water (skip it all)
+};
+
+VOXEL_FUNC FVoxelOceanShoal VoxelOceanShoalNone()
+{
+    FVoxelOceanShoal S;
+    S.Amp = float4(1.0f, 1.0f, 1.0f, 1.0f);
+    S.Chop = float4(1.0f, 1.0f, 1.0f, 1.0f);
+    S.Stretch = float4(0.0f, 0.0f, 0.0f, 0.0f);
+    S.Shift = float4(0.0f, 0.0f, 0.0f, 0.0f);
+    S.Dir = float3(0.0f, 0.0f, 0.0f);
+    S.Active = 0.0f;
+    return S;
+}
+
+VOXEL_FUNC float VoxelOceanShoalComponent(float4 V, int B)
+{
+    return B == 0 ? V.x : (B == 1 ? V.y : (B == 2 ? V.z : V.w));
+}
+
+// A band's dominant wavelength (m): the peak's for its speed, within the band's range (Tiles: the
+// bands' tile sides; band B holds wavelengths from a quarter of band B + 1's tile, or 4 texels of
+// the last, up to a quarter of its own, the first band half its tile).
+VOXEL_FUNC float VoxelOceanShoalWavelength(int B, float Speed, float4 Tiles)
+{
+    const float Peak = VOXEL_OCEAN_SHOAL_PEAK_LENGTH * Speed * Speed;
+    const float Shortest = B == 0 ? 0.25f * Tiles.y : (B == 1 ? 0.25f * Tiles.z : (B == 2 ? 0.25f * Tiles.w : Tiles.w * (4.0f / 256.0f)));
+    const float Longest = B == 0 ? 0.5f * Tiles.x : 0.25f * VoxelOceanShoalComponent(Tiles, B);
+    return clamp(Peak, Shortest, Longest);
+}
+
+// Each band's height deviation (m) at a sea state: the slots' (the table's constants, rows 6-7)
+// weighed as the sea state weighs them.
+VOXEL_FUNC float4 VoxelOceanShoalBandSigma(float4 SlotSigma0, float4 SlotSigma1, FVoxelOceanSeaState Sea)
+{
+    // Slots 0-5: long band (slot & 1) at state (slot >> 1); 6, 7: the short bands.
+    const float B0 = Sea.Long.x * SlotSigma0.x + Sea.Long.y * SlotSigma0.z + Sea.Long.z * SlotSigma1.x;
+    const float B1 = Sea.Long.x * SlotSigma0.y + Sea.Long.y * SlotSigma0.w + Sea.Long.z * SlotSigma1.y;
+    return float4(B0, B1, Sea.Short2 * SlotSigma1.z, Sea.Short3 * SlotSigma1.w);
+}
+
+// The bands' shoaling at a point: DepthM the terrain's depth there (m; 1e20 or more unknown, then
+// only the field's warp), Shore the field's sample (bField false without a field: no warp, the
+// default slope), the point's sea state, the bands' tiles and height deviations.
+VOXEL_FUNC FVoxelOceanShoal VoxelOceanShoalOf(float DepthM, FVoxelOceanShoreSample Shore, bool bField, FVoxelOceanSeaState Sea,
+    float4 Tiles, float4 BandSigma, FVoxelOceanShoalSettings S)
+{
+    FVoxelOceanShoal Out = VoxelOceanShoalNone();
+    if (S.Breaking <= 0.0f) return Out;
+    const bool bDepth = DepthM < 1.0e20f;
+    const float Slope = max(bField ? Shore.Slope : VOXEL_OCEAN_SHORE_DEFAULT_SLOPE, S.MinSlope);
+    const float Distance = bField ? max(Shore.Distance, 0.0f) : 1.0e30f;
+    float Amp[4];
+    float Chop[4];
+    float Stretch[4];
+    float Shift[4];
+    bool bAny = false;
+    for (int B = 0; B < 4; B++)
+    {
+        const float Speed = B < 2 ? max(Sea.Wind, Sea.Swell) : Sea.Wind;
+        const float K = VOXEL_OCEAN_SHORE_TWO_PI / VoxelOceanShoalWavelength(B, Speed, Tiles);
+        Amp[B] = 1.0f;
+        Chop[B] = 1.0f;
+        Stretch[B] = 0.0f;
+        Shift[B] = 0.0f;
+        if (bDepth)
+        {
+            if (DepthM <= 0.0f)
+            {
+                Amp[B] = 0.0f;
+                bAny = true;
+            }
+            else if (K * DepthM < VOXEL_OCEAN_SHOAL_DEEP)
+            {
+                const FVoxelOceanDispersion D = VoxelOceanDispersionOf(K * DepthM);
+                const float Gain = min(sqrt(D.R / (2.0f * D.N)), VOXEL_OCEAN_SHOAL_MAX_GAIN);
+                const float Tma = Gain / (D.R * sqrt(D.R));
+                // Swell where it outweighs the wind (over 2 m/s either side), for the long bands.
+                const float Swell = B < 2 ? smoothstep(-2.0f, 2.0f, Sea.Swell - Sea.Wind) : 0.0f;
+                Amp[B] = min(Tma + (Gain - Tma) * Swell, VOXEL_OCEAN_SHOAL_MAX_GAIN);
+                Chop[B] = pow(min(1.0f / max(VoxelOceanShoalTanh(D.X), 1.0e-4f), VOXEL_OCEAN_SHOAL_MAX_CHOP), max(S.ChopGrowth, 0.0f));
+                bAny = true;
+            }
+        }
+        if (bField && S.Warp > 0.0f)
+        {
+            const float Y = K * Slope * Distance;
+            if (Y < VOXEL_OCEAN_SHOAL_DEEP)
+            {
+                const FVoxelOceanWarp W = VoxelOceanWarpOf(Y);
+                Stretch[B] = S.Warp * W.Stretch;
+                Shift[B] = S.Warp * W.G / (Slope * K);
+                bAny = true;
+            }
+        }
+    }
+    // The surf's handover (VoxelOceanSurf.ush): the long bands keep this much, before the cap
+    // weighs them (the energy handed over has its own cap in the surf).
+    if (S.LongKeep < 1.0f)
+    {
+        Amp[0] *= S.LongKeep;
+        Amp[1] *= S.LongKeep;
+        bAny = true;
+    }
+    if (!bAny) return Out;
+    if (bDepth && DepthM > 0.0f)
+    {
+        // Breaking: Hs = 4 sqrt(sum (A sigma)^2) held under Breaking d, smoothly.
+        float Variance = 0.0f;
+        for (int Bv = 0; Bv < 4; Bv++)
+        {
+            const float A = Amp[Bv] * VoxelOceanShoalComponent(BandSigma, Bv);
+            Variance += A * A;
+        }
+        const float Ratio = 4.0f * sqrt(Variance) / max(S.Breaking * DepthM, 1.0e-6f);
+        const float R2 = Ratio * Ratio;
+        const float Cap = 1.0f / sqrt(sqrt(1.0f + R2 * R2));
+        // The fade toward the coast (the depth over the beach slope as the distance).
+        const float Fade = S.Fade > 0.0f ? smoothstep(0.0f, S.Fade, DepthM / Slope) : 1.0f;
+        for (int Bc = 0; Bc < 4; Bc++)
+            Amp[Bc] *= Cap * Fade;
+    }
+    // The warp along the unit direction, weighed by its squared length: where the field's
+    // directions disagree (between two coasts, at the reach's edge, across a face blend) the
+    // sample's direction shortens, and the warp, which moves the lookup by kilometres, fades
+    // out instead of swinging with it. The stretch's own weight is the move's, so the lookup's
+    // Jacobian is I + Stretch e e^T exactly (e of length 1).
+    const float DirLength2 = bField ? dot(Shore.Direction, Shore.Direction) : 0.0f;
+    const float DirLength = sqrt(DirLength2);
+    const float Agree = min(DirLength2, 1.0f);
+    Out.Amp = float4(Amp[0], Amp[1], Amp[2], Amp[3]);
+    Out.Chop = float4(Chop[0], Chop[1], Chop[2], Chop[3]);
+    Out.Stretch = float4(Stretch[0] * Agree, Stretch[1] * Agree, Stretch[2] * Agree, Stretch[3] * Agree);
+    Out.Shift = float4(Shift[0] * Agree, Shift[1] * Agree, Shift[2] * Agree, Shift[3] * Agree);
+    Out.Dir = DirLength > 1.0e-6f ? Shore.Direction * (1.0f / DirLength) : float3(0.0f, 0.0f, 0.0f);
+    Out.Active = 1.0f;
+    return Out;
+}
+
+// One band's lookup (in its downwind frame) shoaled: Amp, Chop, and the stretch r - 1 along E
+// (the shore direction in that frame, unit at the chart's centre). The slope gains its component along E
+// times the stretch; the horizontal displacement's gradient J becomes J (I + s E E^T), kept
+// symmetric (exact for waves along or across E).
+VOXEL_FUNC FVoxelOceanFFTSample VoxelOceanShoalSample(FVoxelOceanFFTSample S, float Amp, float Chop, float Stretch, float2 E)
+{
+    FVoxelOceanFFTSample R;
+    const float AC = Amp * Chop;
+    R.Height = Amp * S.Height;
+    R.Displacement = float2(AC * S.Displacement.x, AC * S.Displacement.y);
+    const float GE = S.Slope.x * E.x + S.Slope.y * E.y;
+    R.Slope = float2(Amp * (S.Slope.x + Stretch * GE * E.x), Amp * (S.Slope.y + Stretch * GE * E.y));
+    const float JEx = S.Jxx * E.x + S.Jxy * E.y;
+    const float JEy = S.Jxy * E.x + S.Jyy * E.y;
+    R.Jxx = AC * (S.Jxx + Stretch * JEx * E.x);
+    R.Jyy = AC * (S.Jyy + Stretch * JEy * E.y);
+    R.Jxy = AC * (S.Jxy + 0.5f * Stretch * (JEx * E.y + JEy * E.x));
+    R.VelocityUp = Amp * S.VelocityUp;
+    R.VelocityH = float2(AC * S.VelocityH.x, AC * S.VelocityH.y);
+    return R;
+}
+
+#endif // VOXEL_OCEAN_SHOAL_USH

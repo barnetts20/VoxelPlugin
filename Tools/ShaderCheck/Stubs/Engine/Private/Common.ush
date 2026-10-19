@@ -1,0 +1,7 @@
+// Stand-in for the engine's Common.ush (the checks compile the underwater pass outside UE): the
+// view's pre-exposure, all the pass reads from the engine.
+struct FVoxelCheckView
+{
+    float PreExposure;
+};
+ConstantBuffer<FVoxelCheckView> View;

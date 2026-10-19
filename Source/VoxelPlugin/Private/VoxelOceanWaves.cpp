@@ -2,9 +2,9 @@
 #include "FDensitySampleCompositor.h"
 #include "HAL/IConsoleManager.h"
 
-static TAutoConsoleVariable<int32> CVarVoxelOceanTestWaves(
-    TEXT("voxel.Ocean.TestWaves"), 1,
-    TEXT("1 (default): the test wave model on the ocean (three Gerstner waves: voxel.Ocean.TestWaveHeight, TestWaveLength, TestWaveChop), to check the surface, the underwater view and the queries under displacement."),
+static TAutoConsoleVariable<int32> CVarVoxelOceanWaveModel(
+    TEXT("voxel.Ocean.WaveModel"), 2,
+    TEXT("The ocean's waves: 0 a flat sea; 1 the test model (three Gerstner waves: voxel.Ocean.TestWaveHeight, TestWaveLength, TestWaveChop), to check the surface, the underwater view and the queries under displacement; 2 (default) the FFT cascades (stage O6b; the ocean settings' Waves category)."),
     ECVF_Default);
 
 static TAutoConsoleVariable<float> CVarVoxelOceanTestWaveHeight(
@@ -35,6 +35,8 @@ namespace VoxelOceanWavesDetail
     constexpr int32 QuerySteps = 8;
     constexpr double QueryTolerance = 1.0e-3;
     constexpr double QueryMinJacobian = 0.05;
+    /** The depth of a point in an inland basin (cm): land (VOXEL_OCEAN_BASIN_DEPTH). */
+    constexpr double BasinDepth = -1.0e6;
 }
 
 namespace VOW = VoxelOceanWavesDetail;
@@ -43,10 +45,15 @@ namespace VOW = VoxelOceanWavesDetail;
 // Test model
 // ---------------------------------------------------------------------------
 
+int32 VoxelOceanWaves::ChosenModel()
+{
+    return FMath::Clamp(CVarVoxelOceanWaveModel.GetValueOnGameThread(), 0, 2);
+}
+
 FVoxelOceanWavesTest::FSettings FVoxelOceanWavesTest::ReadConsole()
 {
     FSettings Settings;
-    if (CVarVoxelOceanTestWaves.GetValueOnGameThread() <= 0) return Settings;
+    if (VoxelOceanWaves::ChosenModel() != 1) return Settings;
     Settings.Amplitude = FMath::Max(0.0, (double)CVarVoxelOceanTestWaveHeight.GetValueOnGameThread());
     Settings.Wavelength = FMath::Max(10.0, (double)CVarVoxelOceanTestWaveLength.GetValueOnGameThread());
     Settings.Choppiness = FMath::Clamp((double)CVarVoxelOceanTestWaveChop.GetValueOnGameThread(), 0.0, 1.0);
@@ -190,6 +197,17 @@ void FVoxelOceanWaveFrame::FillSites(TArrayView<FVoxelOceanWaveSite> Sites, doub
         Density->Sample(FSampleInput(X.GetData(), Y.GetData(), Z.GetData(), Sites.Num()), Values.GetData());
         for (int32 i = 0; i < Sites.Num(); i++)
             Sites[i].Depth = Values[i];
+        // An inland basin below sea level is land (stage O8, the shore field), as the pages take it.
+        if (Shore.IsValid())
+        {
+            for (FVoxelOceanWaveSite& Site : Sites)
+            {
+                if (Site.Depth <= 0.0) continue;
+                const FVoxelOceanShore At = EnumHasAnyFlags(Required, EVoxelOceanWaveInputs::Shore) ? Site.Shore : Shore->Sample(Site.Point);
+                if (At.HasField() && At.Distance < -ShoreMarginCm)
+                    Site.Depth = VoxelOceanWavesDetail::BasinDepth;
+            }
+        }
     }
 }
 
@@ -306,6 +324,16 @@ void VoxelOceanQuery::Run(const FVoxelOceanWaveFrame& Frame, TConstArrayView<FVe
         }
         if (SurfacePoints.Num() > 0)
             SurfacePoints[i] = S.SurfaceLocation;
+    }
+
+    // No water in an inland basin (stage O8): the shore field at the surface point's foot.
+    if (Frame.Shore.IsValid())
+    {
+        for (int32 i = 0; i < Count; i++)
+        {
+            const FVoxelOceanShore At = Frame.Shore->Sample(Feet[i]);
+            Out[i].bWater = !(At.HasField() && At.Distance < -Frame.ShoreMarginCm);
+        }
     }
 
     if (SurfacePoints.Num() > 0 && Frame.Density.IsValid())

@@ -1,0 +1,256 @@
+// VoxelOceanSeaState.ush - The weather as the FFT waves read it (Design/OceanWaves.md section 4;
+// stage O7). Shared subset (VoxelShaderCompat.h): the wave hook (VoxelOceanWaves.ush) and the
+// CPU model (VoxelOceanWavesFFT.cpp) read the same table texels with this same code, so the
+// drawn sea and the query agree in calm, storm and the turn of the wind.
+//
+// THE TABLE'S OTHER REGIONS. Beside the charts (VoxelOceanCharts.ush, 5 texels per chart, 5 N
+// wide, 6 N high) the table holds, from x = 5 N:
+// - THE FIELD: per face a (F + 2)^2 block (F = VOXEL_OCEAN_FIELD_CELLS cells per face edge, one
+//   border cell all round), face f's at rows f (F + 2) to f (F + 2) + F + 1. Cell (i, j) of a face
+//   lies at equal-angle coordinates s = -1 + (2 i + 1) / F (and t alike), its texel at
+//   (5 N + 1 + i, f (F + 2) + 1 + j); the border cells (i = -1 and F) hold the weather just
+//   past the face's edge, so a face's lookups stay inside its block. A texel holds the wind
+//   speed and the swell speed (m/s) at two weather keys: (wind, swell) at key k in xy, at key
+//   k + 1 in zw; the hook interpolates them in time (Alpha, W.Shape.y).
+// - THE CONSTANTS, at x = 5 N + F + 2, rows 0 to 7: the slots' slope standard deviations
+//   (rows 0-1: slots 0-3, then 4-5 and the short bands' at their reference wind), the short
+//   bands' amplitude against the wind (rows 2-5: VOXEL_OCEAN_SHORT_KNOTS winds, 8 values a band),
+//   and the slots' height standard deviations (rows 6-7, m, in slot order: stage O8's breaking,
+//   VoxelOceanShoal.ush). Rows 8 to 14 hold the shore field's texel-space expansion around the
+//   material's reference (VoxelOceanShore.ush, FVoxelOceanShoreFrame), and rows 15 and 16 the
+//   surf's settings (stage O9a, VoxelOceanSurf.ush), written by the surface with the frame (not
+//   part of the weather's table).
+// Width 5 N + F + 3, height max(6 N, 6 (F + 2)).
+//
+// THE SEA STATE at a point (VoxelOceanSeaStateAt): the field's wind and swell there; the long
+// bands' sea states weighed by the larger of the two (the swell's long waves on a calm sea), the
+// short bands scaled by the wind alone.
+//
+// THE HEADINGS of a chart: its texels 3 and 4 hold, for the weather's previous key and its
+// current one, the long bands' heading (the swell's where the swell outweighs the wind, else
+// the wind's) and the short bands' (the wind's), as unit vectors in the chart's plane, turned to
+// whole steps. A band group (long, short) whose heading changed crossfades its two orientations
+// over the key's first seconds (W.Shape.z: 0 the previous, 1 the current), weighed sin and cos
+// and divided by sqrt(1 + 2 sin cos rho), rho the two orientations' correlation at the point
+// (VoxelOceanTurnWeights): far from the chart's anchor the turned field is another field (rho 0,
+// the variance kept by sin and cos alone); near it, where the turn hardly moves the waves, it is
+// nearly the same field (rho 1, a plain average). A group that didn't turn looks up once.
+//
+// The table reaches these functions as their first argument: VOXEL_OCEAN_TABLE_PARAM (a
+// Texture2D OceanCharts in the shaders; the CPU defines its own reader, VoxelOceanCharts.h, before
+// including this file), passed on as VOXEL_OCEAN_TABLE_ARG and read with
+// VOXEL_OCEAN_TABLE_LOAD(X, Y) (a float4).
+
+#ifndef VOXEL_OCEAN_SEA_STATE_USH
+#define VOXEL_OCEAN_SEA_STATE_USH
+
+#ifndef VOXEL_FUNC
+#define VOXEL_FUNC
+#endif
+
+#ifndef VOXEL_OCEAN_TABLE_PARAM
+#define VOXEL_OCEAN_TABLE_PARAM Texture2D OceanCharts
+#define VOXEL_OCEAN_TABLE_ARG OceanCharts
+#define VOXEL_OCEAN_TABLE_LOAD(X, Y) OceanCharts.Load(int3(X, Y, 0))
+#endif
+
+// Include after VoxelOceanCharts.ush.
+
+#define VOXEL_OCEAN_FIELD_CELLS 64
+#define VOXEL_OCEAN_FIELD_SIDE 66
+#define VOXEL_OCEAN_TABLE_CONSTANTS 8
+#define VOXEL_OCEAN_SHORT_KNOTS 8
+// The sea states' winds (m/s; VoxelOceanSpectrum::FLayoutSettings::StateWind).
+#define VOXEL_OCEAN_STATE_WIND0 5.0f
+#define VOXEL_OCEAN_STATE_WIND1 10.0f
+#define VOXEL_OCEAN_STATE_WIND2 18.0f
+
+// The short bands' amplitude knots (m/s).
+VOXEL_FUNC float VoxelOceanShortKnot(int K)
+{
+    return K == 0 ? 0.0f : (K == 1 ? 2.0f : (K == 2 ? 4.0f : (K == 3 ? 6.0f : (K == 4 ? 8.0f : (K == 5 ? 11.0f : (K == 6 ? 15.0f : 20.0f))))));
+}
+
+VOXEL_FUNC int VoxelOceanFieldX(int N) { return VOXEL_OCEAN_CHART_TEXELS * N; }
+VOXEL_FUNC int VoxelOceanConstantsX(int N) { return VOXEL_OCEAN_CHART_TEXELS * N + VOXEL_OCEAN_FIELD_SIDE; }
+VOXEL_FUNC int VoxelOceanTableWidth(int N) { return VoxelOceanConstantsX(N) + 1; }
+VOXEL_FUNC int VoxelOceanTableHeight(int N) { return max(6 * N, 6 * VOXEL_OCEAN_FIELD_SIDE); }
+
+// The long bands' sea-state weights for a wind (amplitude; the states share their waves): 5-10
+// and 10-18 m/s linearly, scaled by (U / U_state)^2 past the ends.
+VOXEL_FUNC float3 VoxelOceanStateWeights(float U)
+{
+    U = max(U, 0.0f);
+    if (U <= VOXEL_OCEAN_STATE_WIND0)
+    {
+        const float R = U / VOXEL_OCEAN_STATE_WIND0;
+        return float3(R * R, 0.0f, 0.0f);
+    }
+    if (U <= VOXEL_OCEAN_STATE_WIND1)
+    {
+        const float T = (U - VOXEL_OCEAN_STATE_WIND0) / (VOXEL_OCEAN_STATE_WIND1 - VOXEL_OCEAN_STATE_WIND0);
+        return float3(1.0f - T, T, 0.0f);
+    }
+    if (U <= VOXEL_OCEAN_STATE_WIND2)
+    {
+        const float T = (U - VOXEL_OCEAN_STATE_WIND1) / (VOXEL_OCEAN_STATE_WIND2 - VOXEL_OCEAN_STATE_WIND1);
+        return float3(0.0f, 1.0f - T, T);
+    }
+    const float R = U / VOXEL_OCEAN_STATE_WIND2;
+    return float3(0.0f, 0.0f, R * R);
+}
+
+// A constant texel's component (C 0 to 3).
+VOXEL_FUNC float VoxelOceanComponent(float4 V, int C)
+{
+    return C == 0 ? V.x : (C == 1 ? V.y : (C == 2 ? V.z : V.w));
+}
+
+// A short band's (2 or 3) amplitude at a wind, against its reference (piecewise linear over the
+// knots, held past the last).
+VOXEL_FUNC float VoxelOceanShortScale(VOXEL_OCEAN_TABLE_PARAM, int N, int Band, float U)
+{
+    const int X = VoxelOceanConstantsX(N);
+    const int Row = Band == 2 ? 2 : 4;
+    const float4 A = VOXEL_OCEAN_TABLE_LOAD(X, Row);
+    const float4 B = VOXEL_OCEAN_TABLE_LOAD(X, Row + 1);
+    const float Last = VoxelOceanShortKnot(VOXEL_OCEAN_SHORT_KNOTS - 1);
+    if (U >= Last) return B.w;
+    int K = 0;
+    while (K < VOXEL_OCEAN_SHORT_KNOTS - 2 && U >= VoxelOceanShortKnot(K + 1)) K++;
+    const float V0 = K < 4 ? VoxelOceanComponent(A, K) : VoxelOceanComponent(B, K - 4);
+    const float V1 = K + 1 < 4 ? VoxelOceanComponent(A, K + 1) : VoxelOceanComponent(B, K - 3);
+    const float U0 = VoxelOceanShortKnot(K);
+    const float U1 = VoxelOceanShortKnot(K + 1);
+    return V0 + (V1 - V0) * saturate((U - U0) / (U1 - U0));
+}
+
+struct FVoxelOceanSeaState
+{
+    float3 Long;        // the long bands' state weights
+    float Short2;       // band 2's amplitude scale
+    float Short3;       // band 3's
+    float Wind;         // the wind speed (m/s)
+    float Swell;        // the swell speed (m/s)
+};
+
+// The field's wind and swell at a direction (planet frame), Alpha of the way from key k to k + 1.
+VOXEL_FUNC float2 VoxelOceanFieldAt(VOXEL_OCEAN_TABLE_PARAM, float3 Dir, int N, float Alpha)
+{
+    const FVoxelOceanFacePoint P = VoxelOceanLocate(Dir);
+    const float F = float(VOXEL_OCEAN_FIELD_CELLS);
+    // Grid coordinates in the face's block (cell centres at whole numbers, the border at 0 and F + 1).
+    const float GX = clamp((P.S + 1.0f) * 0.5f * F + 0.5f, 0.0f, F + 0.999f);
+    const float GY = clamp((P.T + 1.0f) * 0.5f * F + 0.5f, 0.0f, F + 0.999f);
+    const float BX = floor(GX);
+    const float BY = floor(GY);
+    const int X = VoxelOceanFieldX(N) + int(BX);
+    const int Y = P.Face * VOXEL_OCEAN_FIELD_SIDE + int(BY);
+    const float FX = GX - BX;
+    const float FY = GY - BY;
+    const float4 T00 = VOXEL_OCEAN_TABLE_LOAD(X, Y);
+    const float4 T10 = VOXEL_OCEAN_TABLE_LOAD(X + 1, Y);
+    const float4 T01 = VOXEL_OCEAN_TABLE_LOAD(X, Y + 1);
+    const float4 T11 = VOXEL_OCEAN_TABLE_LOAD(X + 1, Y + 1);
+    const float W00 = (1.0f - FX) * (1.0f - FY);
+    const float W10 = FX * (1.0f - FY);
+    const float W01 = (1.0f - FX) * FY;
+    const float W11 = FX * FY;
+    const float WindK = W00 * T00.x + W10 * T10.x + W01 * T01.x + W11 * T11.x;
+    const float SwellK = W00 * T00.y + W10 * T10.y + W01 * T01.y + W11 * T11.y;
+    const float WindK1 = W00 * T00.z + W10 * T10.z + W01 * T01.z + W11 * T11.z;
+    const float SwellK1 = W00 * T00.w + W10 * T10.w + W01 * T01.w + W11 * T11.w;
+    return float2(WindK + (WindK1 - WindK) * Alpha, SwellK + (SwellK1 - SwellK) * Alpha);
+}
+
+VOXEL_FUNC FVoxelOceanSeaState VoxelOceanSeaStateAt(VOXEL_OCEAN_TABLE_PARAM, float3 Dir, int N, float Alpha)
+{
+    const float2 Field = VoxelOceanFieldAt(VOXEL_OCEAN_TABLE_ARG, Dir, N, Alpha);
+    FVoxelOceanSeaState S;
+    S.Wind = max(Field.x, 0.0f);
+    S.Swell = max(Field.y, 0.0f);
+    S.Long = VoxelOceanStateWeights(max(S.Wind, S.Swell));
+    S.Short2 = VoxelOceanShortScale(VOXEL_OCEAN_TABLE_ARG, N, 2, S.Wind);
+    S.Short3 = VoxelOceanShortScale(VOXEL_OCEAN_TABLE_ARG, N, 3, S.Wind);
+    return S;
+}
+
+// Each band's slope variance as the sea state weighs it (for the roughness the footprint misses).
+VOXEL_FUNC float4 VoxelOceanBandSlopeVariance(VOXEL_OCEAN_TABLE_PARAM, FVoxelOceanSeaState S, int N)
+{
+    const int X = VoxelOceanConstantsX(N);
+    const float4 C0 = VOXEL_OCEAN_TABLE_LOAD(X, 0);
+    const float4 C1 = VOXEL_OCEAN_TABLE_LOAD(X, 1);
+    const float B0 = S.Long.x * C0.x + S.Long.y * C0.z + S.Long.z * C1.x;
+    const float B1 = S.Long.x * C0.y + S.Long.y * C0.w + S.Long.z * C1.y;
+    const float B2 = S.Short2 * C1.z;
+    const float B3 = S.Short3 * C1.w;
+    return float4(B0 * B0, B1 * B1, B2 * B2, B3 * B3);
+}
+
+// The slots' height standard deviations (m): slots 0-3 and 4-7 (rows 6 and 7 of the constants).
+VOXEL_FUNC float4 VoxelOceanSlotSigma(VOXEL_OCEAN_TABLE_PARAM, int N, int Half)
+{
+    return VOXEL_OCEAN_TABLE_LOAD(VoxelOceanConstantsX(N), 6 + Half);
+}
+
+// A chart's headings (unit vectors in its plane, from E1): the previous key's and the current's.
+struct FVoxelOceanChartHeadings
+{
+    float2 LongPrevious;
+    float2 ShortPrevious;
+    float2 LongCurrent;
+    float2 ShortCurrent;
+};
+
+VOXEL_FUNC FVoxelOceanChartHeadings VoxelOceanChartHeadingsAt(VOXEL_OCEAN_TABLE_PARAM, int2 Texel)
+{
+    const float4 P = VOXEL_OCEAN_TABLE_LOAD(Texel.x + 3, Texel.y);
+    const float4 C = VOXEL_OCEAN_TABLE_LOAD(Texel.x + 4, Texel.y);
+    FVoxelOceanChartHeadings H;
+    H.LongPrevious = float2(P.x, P.y);
+    H.ShortPrevious = float2(P.z, P.w);
+    H.LongCurrent = float2(C.x, C.y);
+    H.ShortCurrent = float2(C.z, C.w);
+    return H;
+}
+
+// Whether a chart turned (either group's headings differ between its two keys).
+VOXEL_FUNC bool VoxelOceanChartTurned(FVoxelOceanChartHeadings H)
+{
+    return H.LongPrevious.x != H.LongCurrent.x || H.LongPrevious.y != H.LongCurrent.y
+        || H.ShortPrevious.x != H.ShortCurrent.x || H.ShortPrevious.y != H.ShortCurrent.y;
+}
+
+VOXEL_FUNC bool VoxelOceanHeadingTurned(float2 Previous, float2 Current)
+{
+    return Previous.x != Current.x || Previous.y != Current.y;
+}
+
+// The correlation lengths (m) of the long bands (their peak wavelength over 2 pi at the speed that
+// weighs them, PM's peak k = 0.769 g / U^2, at least the bands' shortest's) and the short bands'.
+VOXEL_FUNC float VoxelOceanLongCorrelationLength(FVoxelOceanSeaState S)
+{
+    const float U = max(S.Wind, S.Swell);
+    return max(U * U * (1.0f / 7.54f), 10.0f);
+}
+#define VOXEL_OCEAN_SHORT_CORRELATION_LENGTH 6.0f
+
+// A group's crossfade weights (x the current orientation, y the previous): Fade of the way through
+// its turn, at Distance (m) from the chart's anchor, the orientations Previous and Current, the
+// group's correlation length (m). Not turning: (1, 0).
+VOXEL_FUNC float2 VoxelOceanTurnWeights(float Fade, float Distance, float2 Previous, float2 Current, float Length)
+{
+    if (Fade >= 1.0f || !VoxelOceanHeadingTurned(Previous, Current)) return float2(1.0f, 0.0f);
+    // A point Distance out moves by the chord of the turn; the fields' correlation falls with it.
+    const float CosTurn = clamp(Previous.x * Current.x + Previous.y * Current.y, -1.0f, 1.0f);
+    const float Moved = Distance * sqrt(max(2.0f - 2.0f * CosTurn, 0.0f));
+    const float R = Moved / Length;
+    const float Rho = exp(-0.5f * R * R);
+    const float A = sin(1.57079633f * Fade);
+    const float B = cos(1.57079633f * Fade);
+    const float Scale = 1.0f / sqrt(1.0f + 2.0f * A * B * Rho);
+    return float2(A * Scale, B * Scale);
+}
+
+#endif

@@ -19,11 +19,15 @@
 
 #include "CoreMinimal.h"
 #include "SceneViewExtension.h"
+#include "RHIResources.h"
 #include "VoxelOceanWaves.h"
 #include <atomic>
 
 struct FPostProcessMaterialInputs;
 struct FScreenPassTexture;
+class FTextureResource;
+struct FVoxelOceanShoreRHI;
+struct FVoxelOceanProbeState;
 
 /** The pass's inputs, flattened for the render thread. The ocean actor sets every member. */
 struct FVoxelUnderwaterParams
@@ -38,6 +42,21 @@ struct FVoxelUnderwaterParams
     FVector3f Light = FVector3f::ZeroVector;
     /** rgb: the waterline's tint (scene units before exposure); w: its width (cm). */
     FVector4f Meniscus = FVector4f::Zero();
+
+    /** The FFT model's textures (FVoxelOceanCascadeTextures' resources; null for any other
+     *  model). Read only by SetFrame_GameThread's render command, which keeps references to their
+     *  RHI textures: a texture released afterwards (a new chart table) stays valid for the pass
+     *  until the next frame replaces it. */
+    FTextureResource* Displacement = nullptr;
+    FTextureResource* Derivatives = nullptr;
+    FTextureResource* Charts = nullptr;
+
+    /** The shore (stage O8): the shore field's texture (null: none), and the ocean pages' depth
+     *  probe (render thread data, null: none). A camera in an inland basin (Waves.Shore's distance
+     *  below minus ShoreMarginCm) isn't under water. */
+    TSharedPtr<const FVoxelOceanShoreRHI, ESPMode::ThreadSafe> Shore;
+    TSharedPtr<FVoxelOceanProbeState, ESPMode::ThreadSafe> Probe;
+    double ShoreMarginCm = 0.0;
 
     bool IsUsable() const { return Waves.Radius() > 0.0; }
 };
@@ -77,5 +96,8 @@ private:
 
     // Render thread only.
     FVoxelUnderwaterParams Params;
+    FTextureRHIRef DisplacementRHI;
+    FTextureRHIRef DerivativesRHI;
+    FTextureRHIRef ChartsRHI;
     bool bHasFrame = false;
 };

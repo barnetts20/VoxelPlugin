@@ -1,0 +1,505 @@
+// VoxelOceanSpectrum.ush - The ocean's wave spectrum and the pieces of its FFT that the GPU and
+// the CPU share (Design/OceanWaves.md section 2). Shared subset (VoxelShaderCompat.h): the GPU
+// passes (VoxelOceanFFT.usf) and the CPU's query cascades (VoxelOceanSpectrum.h) run this same
+// code, so both evolve the same numbers.
+//
+// THE MODEL. Each cascade slot is a periodic tile of side L (m) on an N x N grid, holding the
+// wave modes k = (Ki, Kj) 2 pi / L whose integer radius squared m = Ki^2 + Kj^2 lies in the
+// slot's band [MMin, MMax) (the band split: no wave is counted twice across cascades). The
+// spectrum is JONSWAP (fetch-limited, capped at a fully developed sea) with Hasselmann's
+// directional spreading and Horvath's swell term, wind along the tile's +x (a chart rotates
+// its lookup to turn the wind). Depth (TMA) is applied per point, not here.
+//
+// DETERMINISM.
+// - The start spectrum h0(k) comes from a hash of the slot's seed and the signed mode (Ki, Kj),
+//   never of N: a CPU grid of another size draws the same modes with the same numbers.
+// - Time is a 32-bit tick of the loop period T (VOXEL_OCEAN_LOOP_PERIOD): tick = frac(t / T)
+//   2^32. Every mode's frequency is a whole multiple n of 2 pi / T: the deep-water dispersion
+//   rounded to the nearest multiple, decided in integer arithmetic only (no float rounding,
+//   reassociation or contraction can change it), so the GPU and the CPU always agree on it. Its
+//   phase is the wrapped product n * tick: exact, the same on every machine, and no phase grows
+//   without bound.
+// - The band test is on the integer m, exact on both sides.
+//
+// CONVENTIONS. Grid index i in [0, N) is the signed mode i < N/2 ? i : i - N (the FFT's natural
+// order: no shift, no sign flips). The Nyquist row and column are never in a band. A mode
+// travels along +k: h(k, t) = h0(k) e^(-i phi) + conj(h0(-k)) e^(+i phi). The spatial field is
+// eta(x) = sum_k h(k) e^(i k.x) (the inverse DFT without 1/N^2), x = (i / N) L. The horizontal
+// displacement is D = sum_k i (k / |k|) h e^(i k.x), so x' = x + chop D sharpens the crests.
+
+// Included once per translation unit (the C++ side includes it inside namespace VoxelShader, so
+// a second inclusion in another namespace would be skipped: include VoxelOceanSpectrum.h there).
+#ifndef VOXEL_OCEAN_SPECTRUM_USH
+#define VOXEL_OCEAN_SPECTRUM_USH
+
+#ifndef VOXEL_FUNC
+#define VOXEL_FUNC
+#endif
+
+#define VOXEL_OCEAN_GRAVITY 9.80665f
+#define VOXEL_OCEAN_PI 3.14159265f
+#define VOXEL_OCEAN_TWO_PI 6.28318531f
+// The loop period (s) and its base frequency 2 pi / T (rad/s).
+#define VOXEL_OCEAN_LOOP_PERIOD 1024.0f
+#define VOXEL_OCEAN_OMEGA0 0.00613592315f
+// The dimensionless fetch g F / U^2 of a fully developed sea: a longer fetch adds nothing. Set
+// so a fully developed JONSWAP sea (gamma 3.3) has the observed height, Hs about 0.25 U10^2 / g
+// (Pierson-Moskowitz's 0.21 U19.5^2 / g), and its peak at 0.94 g / U.
+#define VOXEL_OCEAN_FULL_FETCH 13000.0f
+// The highest mode multiple n a band may hold: the exact test forms (2n - 1)^2 in 32 bits.
+// MakeSlot (VoxelOceanSpectrum.h) caps every band below it (omega < 25 rad/s, wavelengths
+// above 10 cm).
+#define VOXEL_OCEAN_MAX_MULTIPLE 4096
+
+// ---------------------------------------------------------------------------------------------
+// One cascade slot's spectrum
+// ---------------------------------------------------------------------------------------------
+
+struct FVoxelOceanSlotParams
+{
+    float TileLength;       // L (m)
+    float WindSpeed;        // U10 (m/s)
+    float Fetch;            // m
+    float Gamma;            // JONSWAP peak enhancement (3.3)
+    float Swell;            // Horvath's swell, 0-1
+    float Scale;            // amplitude multiplier (1)
+    uint DispersionC2;      // C2 = (g 2 pi / (L omega0^2))^2, (omega / omega0)^4 = C2 m in deep
+                            // water, as mantissa (24 bits) | (exponent + 128) << 24: C2 = mant 2^exp
+    uint MMin;              // band: MMin <= Ki^2 + Kj^2 < MMax
+    uint MMax;
+    uint Seed;              // the band's seed (sea states of one band share it)
+};
+
+// The params from their parts (HLSL has no constructors). The CPU forms C2 and the band's
+// bounds once, in double (VoxelOceanSpectrum.h), and both sides take the same numbers.
+VOXEL_FUNC FVoxelOceanSlotParams VoxelOceanMakeSlot(float TileLength, float WindSpeed, float Fetch, float Gamma,
+    float Swell, float Scale, uint DispersionC2, uint MMin, uint MMax, uint Seed)
+{
+    FVoxelOceanSlotParams P;
+    P.TileLength = TileLength;
+    P.WindSpeed = WindSpeed;
+    P.Fetch = Fetch;
+    P.Gamma = Gamma;
+    P.Swell = Swell;
+    P.Scale = Scale;
+    P.DispersionC2 = DispersionC2;
+    P.MMin = MMin;
+    P.MMax = MMax;
+    P.Seed = Seed;
+    return P;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Hash and random numbers
+// ---------------------------------------------------------------------------------------------
+
+// PCG's output permutation of an LCG step (Jarzynski & Olano 2020): a 32-bit integer hash.
+VOXEL_FUNC uint VoxelOceanHash(uint V)
+{
+    const uint State = V * 747796405u + 2891336453u;
+    const uint Word = ((State >> ((State >> 28u) + 4u)) ^ State) * 277803737u;
+    return (Word >> 22u) ^ Word;
+}
+
+// The key of the signed mode (Ki, Kj) in a band: independent of the grid's size.
+VOXEL_FUNC uint VoxelOceanModeKey(uint Seed, int Ki, int Kj)
+{
+    const uint Packed = (uint(Ki) & 0xffffu) | ((uint(Kj) & 0xffffu) << 16u);
+    return VoxelOceanHash(Seed ^ VoxelOceanHash(Packed));
+}
+
+// Two independent unit Gaussians from a key (Box-Muller; the first uniform is never 0).
+VOXEL_FUNC float2 VoxelOceanGaussian2(uint Key)
+{
+    const float U1 = (float(VoxelOceanHash(Key) >> 8u) + 0.5f) * (1.0f / 16777216.0f);
+    const float U2 = float(VoxelOceanHash(Key ^ 0x68e31da4u) >> 8u) * (1.0f / 16777216.0f);
+    const float R = sqrt(-2.0f * 0.693147181f * log2(U1));
+    const float A = VOXEL_OCEAN_TWO_PI * U2;
+    return float2(R * cos(A), R * sin(A));
+}
+
+// ---------------------------------------------------------------------------------------------
+// The spectrum
+// ---------------------------------------------------------------------------------------------
+
+struct FVoxelOceanJonswap
+{
+    float Alpha;    // Phillips' constant
+    float OmegaP;   // peak frequency (rad/s)
+};
+
+// JONSWAP's fetch laws (Hasselmann et al. 1973), the dimensionless fetch capped at a fully
+// developed sea (VOXEL_OCEAN_FULL_FETCH: there Alpha is 0.0094 and OmegaP 0.94 g / U).
+VOXEL_FUNC FVoxelOceanJonswap VoxelOceanJonswapOf(float WindSpeed, float Fetch)
+{
+    const float U = max(WindSpeed, 0.1f);
+    const float Chi = clamp(VOXEL_OCEAN_GRAVITY * Fetch / (U * U), 1.0f, VOXEL_OCEAN_FULL_FETCH);
+    FVoxelOceanJonswap J;
+    J.Alpha = 0.076f * pow(Chi, -0.22f);
+    J.OmegaP = 22.0f * (VOXEL_OCEAN_GRAVITY / U) * pow(Chi, -0.33333333f);
+    return J;
+}
+
+// JONSWAP S(omega) (m^2 s).
+VOXEL_FUNC float VoxelOceanJonswapS(float Omega, FVoxelOceanJonswap J, float Gamma)
+{
+    const float W = max(Omega, 1.0e-4f);
+    const float Sigma = W <= J.OmegaP ? 0.07f : 0.09f;
+    const float D = (W - J.OmegaP) / (Sigma * J.OmegaP);
+    const float R = exp(-0.5f * D * D);
+    const float P = J.OmegaP / W;
+    const float P2 = P * P;
+    const float W2 = W * W;
+    return J.Alpha * VOXEL_OCEAN_GRAVITY * VOXEL_OCEAN_GRAVITY / (W2 * W2 * W)
+        * exp(-1.25f * P2 * P2) * pow(max(Gamma, 1.0f), R);
+}
+
+// The normalisation of cos^2s(theta / 2) over a full turn, Gamma(s + 1) / (2 sqrt(pi)
+// Gamma(s + 1/2)): the gamma ratio's asymptotic series at x = s + 4, brought down to s by the
+// recurrence (relative error below 1e-6 for any s >= 0; Horvath's polynomial fits are off by up
+// to 2.5% at their seam).
+VOXEL_FUNC float VoxelOceanSpreadNorm(float S)
+{
+    const float X = S + 4.0f;
+    const float IX = 1.0f / X;
+    const float Series = 1.0f + IX * (0.125f + IX * (0.0078125f + IX * (-0.0048828125f - IX * 0.000640869141f)));
+    const float Down = ((S + 0.5f) * (S + 1.5f) * (S + 2.5f) * (S + 3.5f)) / ((S + 1.0f) * (S + 2.0f) * (S + 3.0f) * (S + 4.0f));
+    return Down * sqrt(X) * Series * 0.282094792f;
+}
+
+VOXEL_FUNC float VoxelOceanTanh(float X)
+{
+    return 1.0f - 2.0f / (exp(2.0f * X) + 1.0f);
+}
+
+// The directional spreading D(omega, theta), theta from the wind (+x), given cos(theta):
+// Hasselmann's shape (Hasselmann et al. 1980) with Horvath's swell, which narrows the long
+// waves into parallel trains. Integrates to 1 over a full turn.
+VOXEL_FUNC float VoxelOceanSpreading(float Omega, float CosTheta, FVoxelOceanJonswap J, float WindSpeed, float Swell)
+{
+    const float P = Omega / J.OmegaP;
+    float S;
+    if (P <= 1.0f)
+        S = 6.97f * pow(P, 4.06f);
+    else
+        S = 9.77f * pow(P, -2.33f - 1.45f * (WindSpeed * J.OmegaP / VOXEL_OCEAN_GRAVITY - 1.17f));
+    S += 16.0f * VoxelOceanTanh(J.OmegaP / max(Omega, 1.0e-4f)) * Swell * Swell;
+    // cos^2s(theta / 2) = ((1 + cos theta) / 2)^s.
+    const float Half = clamp(0.5f + 0.5f * CosTheta, 0.0f, 1.0f);
+    return VoxelOceanSpreadNorm(S) * pow(Half, S);
+}
+
+// The directional wavenumber spectrum S(kx, ky) (m^4) in deep water: S(omega) d omega / dk
+// D / k, d omega / dk = g / (2 omega).
+VOXEL_FUNC float VoxelOceanSpectrumK(FVoxelOceanSlotParams P, FVoxelOceanJonswap J, float Kx, float Ky)
+{
+    const float K = sqrt(Kx * Kx + Ky * Ky);
+    if (K <= 0.0f) return 0.0f;
+    const float Omega = sqrt(VOXEL_OCEAN_GRAVITY * K);
+    const float S = VoxelOceanJonswapS(Omega, J, P.Gamma);
+    const float D = VoxelOceanSpreading(Omega, Kx / K, J, P.WindSpeed, P.Swell);
+    return S * (VOXEL_OCEAN_GRAVITY / (2.0f * Omega)) * D / K;
+}
+
+VOXEL_FUNC bool VoxelOceanInBand(FVoxelOceanSlotParams P, int Ki, int Kj)
+{
+    const uint M = uint(Ki * Ki + Kj * Kj);
+    return M >= P.MMin && M < P.MMax;
+}
+
+// h0 of the signed mode (Ki, Kj): Gaussian (xi_r + i xi_i) sqrt(S dk^2) / 2, so a mode's wave
+// (its term and its conjugate's) carries a variance S dk^2. Zero outside the band.
+VOXEL_FUNC float2 VoxelOceanH0(FVoxelOceanSlotParams P, int Ki, int Kj)
+{
+    if (!VoxelOceanInBand(P, Ki, Kj)) return float2(0.0f, 0.0f);
+    const float Dk = VOXEL_OCEAN_TWO_PI / P.TileLength;
+    const FVoxelOceanJonswap J = VoxelOceanJonswapOf(P.WindSpeed, P.Fetch);
+    const float S = VoxelOceanSpectrumK(P, J, float(Ki) * Dk, float(Kj) * Dk);
+    const float Amplitude = 0.5f * P.Scale * Dk * sqrt(max(S, 0.0f));
+    const float2 Xi = VoxelOceanGaussian2(VoxelOceanModeKey(P.Seed, Ki, Kj));
+    return float2(Xi.x * Amplitude, Xi.y * Amplitude);
+}
+
+// ---------------------------------------------------------------------------------------------
+// The quantised dispersion
+// ---------------------------------------------------------------------------------------------
+
+// 64-bit unsigned arithmetic in two 32-bit words (shared code has no 64-bit integers).
+struct FVoxelOceanU64
+{
+    uint Hi;
+    uint Lo;
+};
+
+// A * B exactly, by 16-bit halves.
+VOXEL_FUNC FVoxelOceanU64 VoxelOceanMul32(uint A, uint B)
+{
+    const uint A0 = A & 0xffffu;
+    const uint A1 = A >> 16u;
+    const uint B0 = B & 0xffffu;
+    const uint B1 = B >> 16u;
+    const uint P00 = A0 * B0;
+    const uint P01 = A0 * B1;
+    const uint P10 = A1 * B0;
+    const uint P11 = A1 * B1;
+    const uint Mid = (P00 >> 16u) + (P01 & 0xffffu) + (P10 & 0xffffu);
+    FVoxelOceanU64 R;
+    R.Lo = (P00 & 0xffffu) | (Mid << 16u);
+    R.Hi = P11 + (P01 >> 16u) + (P10 >> 16u) + (Mid >> 16u);
+    return R;
+}
+
+// V 2^S, S in [0, 63] (bits shifted past the top are lost; callers stay below 2^64).
+VOXEL_FUNC FVoxelOceanU64 VoxelOceanShiftLeft(FVoxelOceanU64 V, int S)
+{
+    FVoxelOceanU64 R = V;
+    if (S >= 32)
+    {
+        R.Hi = V.Lo << uint(S - 32);
+        R.Lo = 0u;
+    }
+    else if (S > 0)
+    {
+        R.Hi = (V.Hi << uint(S)) | (V.Lo >> uint(32 - S));
+        R.Lo = V.Lo << uint(S);
+    }
+    return R;
+}
+
+VOXEL_FUNC bool VoxelOceanLessEqual(FVoxelOceanU64 A, FVoxelOceanU64 B)
+{
+    return A.Hi < B.Hi || (A.Hi == B.Hi && A.Lo <= B.Lo);
+}
+
+// Whether multiple N >= 1 is at most the nearest multiple of omega / omega0, i.e. N - 1/2 <=
+// (C2 m)^(1/4), i.e. (2N - 1)^4 <= 16 C2 m = mant m 2^(exp + 4). All integer: (2N - 1)^4 < 2^52,
+// mant m < 2^38 and the shift keeps it below 2^64 for any band MakeSlot allows.
+VOXEL_FUNC bool VoxelOceanMultipleFits(int N, uint C2, uint M)
+{
+    const uint Q = uint(2 * N - 1);
+    const uint Q2 = Q * Q;
+    FVoxelOceanU64 L = VoxelOceanMul32(Q2, Q2);
+    FVoxelOceanU64 R = VoxelOceanMul32(C2 & 0xffffffu, M);
+    const int Shift = int(C2 >> 24u) - 128 + 4;
+    if (Shift >= 0) R = VoxelOceanShiftLeft(R, Shift);
+    else L = VoxelOceanShiftLeft(L, -Shift);
+    return VoxelOceanLessEqual(L, R);
+}
+
+// The mode's frequency as a multiple of omega0: n = round(omega / omega0), omega the deep-water
+// sqrt(g k): the largest n that fits (0 for a mode slower than omega0 / 2). The float estimate
+// only picks where to start; the integer test decides, so every machine agrees.
+VOXEL_FUNC int VoxelOceanModeMultiple(FVoxelOceanSlotParams P, int Ki, int Kj)
+{
+    const uint M = uint(Ki * Ki + Kj * Kj);
+    const float C2 = ldexp(float(P.DispersionC2 & 0xffffffu), int(P.DispersionC2 >> 24u) - 128);
+    int N = int(floor(sqrt(sqrt(C2 * float(M))) + 0.5f));
+    N = clamp(N, 0, VOXEL_OCEAN_MAX_MULTIPLE);
+    if (N > 0 && !VoxelOceanMultipleFits(N, P.DispersionC2, M)) N -= 1;
+    if (N > 0 && !VoxelOceanMultipleFits(N, P.DispersionC2, M)) N -= 1;
+    if (N < VOXEL_OCEAN_MAX_MULTIPLE && VoxelOceanMultipleFits(N + 1, P.DispersionC2, M)) N += 1;
+    if (N < VOXEL_OCEAN_MAX_MULTIPLE && VoxelOceanMultipleFits(N + 1, P.DispersionC2, M)) N += 1;
+    return N;
+}
+
+// The phase n omega0 t (rad) at a tick: the wrapped product, exact; then in [0, 2 pi).
+VOXEL_FUNC float VoxelOceanPhase(int Multiple, uint Tick)
+{
+    const uint Cycles = uint(Multiple) * Tick;
+    return float(Cycles >> 8u) * (VOXEL_OCEAN_TWO_PI / 16777216.0f);
+}
+
+// ---------------------------------------------------------------------------------------------
+// The time step: the spectra of the fields, packed two real fields per complex number
+// ---------------------------------------------------------------------------------------------
+
+VOXEL_FUNC float2 VoxelOceanCMul(float2 A, float2 B)
+{
+    return float2(A.x * B.x - A.y * B.y, A.x * B.y + A.y * B.x);
+}
+
+// h(k, t) = h0(k) e^(-i phi) + conj(h0(-k)) e^(+i phi). H0MinusConj is conj(h0(-k)). The two
+// terms are added in the same order at k and -k, so the result is exactly Hermitian.
+VOXEL_FUNC float2 VoxelOceanEvolve(float2 H0, float2 H0MinusConj, float Phase)
+{
+    const float C = cos(Phase);
+    const float S = sin(Phase);
+    const float2 A = VoxelOceanCMul(H0, float2(C, -S));
+    const float2 B = VoxelOceanCMul(H0MinusConj, float2(C, S));
+    return float2(A.x + B.x, A.y + B.y);
+}
+
+// The eight fields the GPU draws with, as four complex spectra Z = A + i B whose inverse FFT is
+// the real field A in the real part and B in the imaginary part (both spectra are Hermitian):
+//   Z0 = eta + i Dx      Z1 = Dy + i eta_x      Z2 = eta_y + i Dxx      Z3 = Dyy + i Dxy
+// (D the horizontal displacement before the chop, Dab = dDa / db; m).
+struct FVoxelOceanGPUFields
+{
+    float2 Z0;
+    float2 Z1;
+    float2 Z2;
+    float2 Z3;
+};
+
+VOXEL_FUNC FVoxelOceanGPUFields VoxelOceanGPUFieldsOf(float2 H, float Kx, float Ky)
+{
+    FVoxelOceanGPUFields F;
+    const float K = sqrt(Kx * Kx + Ky * Ky);
+    const float InvK = K > 0.0f ? 1.0f / K : 0.0f;
+    const float Ux = Kx * InvK;
+    const float Uy = Ky * InvK;
+    // eta = h; Dx = i ux h, so i Dx = -ux h.
+    F.Z0 = float2(H.x - Ux * H.x, H.y - Ux * H.y);
+    // Dy = i uy h; eta_x = i kx h, so i eta_x = -kx h. Z1 = i uy h - kx h.
+    F.Z1 = float2(-Uy * H.y - Kx * H.x, Uy * H.x - Kx * H.y);
+    // eta_y = i ky h; Dxx = -kx ux h, so i Dxx = -i kx ux h. Z2 = i (ky - kx ux) h.
+    const float A2 = Ky - Kx * Ux;
+    F.Z2 = float2(-A2 * H.y, A2 * H.x);
+    // Dyy = -ky uy h; Dxy = -kx uy h, so i Dxy = -i kx uy h. Z3 = -ky uy h - i kx uy h.
+    const float B3 = Ky * Uy;
+    const float C3 = Kx * Uy;
+    F.Z3 = float2(-B3 * H.x + C3 * H.y, -B3 * H.y - C3 * H.x);
+    return F;
+}
+
+// The six fields the CPU query uses (its gradients come from the interpolation), as three:
+//   W0 = eta + i Dx      W1 = Dy + i eta_t      W2 = Dx_t + i Dy_t
+// The time derivative of h is -i omega h0 e^(-i phi) + i omega conj(h0(-k)) e^(+i phi).
+struct FVoxelOceanCPUFields
+{
+    float2 W0;
+    float2 W1;
+    float2 W2;
+};
+
+VOXEL_FUNC FVoxelOceanCPUFields VoxelOceanCPUFieldsOf(float2 H0, float2 H0MinusConj, float Phase, float Omega, float Kx, float Ky)
+{
+    FVoxelOceanCPUFields F;
+    const float C = cos(Phase);
+    const float S = sin(Phase);
+    const float2 A = VoxelOceanCMul(H0, float2(C, -S));
+    const float2 B = VoxelOceanCMul(H0MinusConj, float2(C, S));
+    const float2 H = float2(A.x + B.x, A.y + B.y);
+    // dh/dt = i omega (B - A).
+    const float2 Ht = float2(-Omega * (B.y - A.y), Omega * (B.x - A.x));
+    const float K = sqrt(Kx * Kx + Ky * Ky);
+    const float InvK = K > 0.0f ? 1.0f / K : 0.0f;
+    const float Ux = Kx * InvK;
+    const float Uy = Ky * InvK;
+    F.W0 = float2(H.x - Ux * H.x, H.y - Ux * H.y);
+    // Dy = i uy h; i eta_t: i ht. W1 = i (uy h + ht).
+    F.W1 = float2(-(Uy * H.y + Ht.y), Uy * H.x + Ht.x);
+    // Dx_t = i ux ht; i Dy_t = i (i uy ht) = -uy ht. W2 = i ux ht - uy ht.
+    F.W2 = float2(-Ux * Ht.y - Uy * Ht.x, Ux * Ht.x - Uy * Ht.y);
+    return F;
+}
+
+// ---------------------------------------------------------------------------------------------
+// The FFT's butterflies
+// ---------------------------------------------------------------------------------------------
+
+// One radix-2 Stockham butterfly of the inverse transform (Govindaraju et al. 2008): at the
+// stage of sub-transform size Ns (1, 2, 4 .. N/2), thread J of N/2 reads elements J and J + N/2
+// and writes a + w b to DstA and a - w b to DstB = DstA + Ns, w = e^(+i pi K / Ns), K = J mod Ns.
+// Natural order in and out, no bit reversal. w is entry TwiddleIndex of the N/2 twiddles
+// (VoxelOceanTwiddle), which both sides build once.
+struct FVoxelOceanButterfly
+{
+    uint SrcA;
+    uint SrcB;
+    uint DstA;
+    uint DstB;
+    uint TwiddleIndex;
+};
+
+VOXEL_FUNC FVoxelOceanButterfly VoxelOceanButterflyOf(uint Ns, uint J, uint HalfN)
+{
+    FVoxelOceanButterfly B;
+    const uint K = J & (Ns - 1u);
+    B.SrcA = J;
+    B.SrcB = J + HalfN;
+    B.DstA = (J - K) * 2u + K;
+    B.DstB = B.DstA + Ns;
+    B.TwiddleIndex = K * (HalfN / Ns);
+    return B;
+}
+
+// Twiddle J of N/2: e^(+i pi J / (N/2)).
+VOXEL_FUNC float2 VoxelOceanTwiddle(uint J, uint HalfN)
+{
+    const float Angle = VOXEL_OCEAN_PI * float(J) / float(HalfN);
+    return float2(cos(Angle), sin(Angle));
+}
+
+// ---------------------------------------------------------------------------------------------
+// Detiling: breaking the tiles' period without changing their statistics
+// ---------------------------------------------------------------------------------------------
+
+// The cascades are periodic; seen from altitude, the longest one's period shows. A point blends
+// three copies of each cascade, shifted by random offsets that belong to the vertices of a
+// triangular lattice of side Cell (m) around it (hex tiling: Heitz & Neyret 2018, Mikkelsen
+// 2022). The weights are its barycentric coordinates divided by sqrt(sum w^2), which keeps the
+// variance of a Gaussian field (the waves are one), so blends don't look calmer. A pure function
+// of the chart-plane position and the seed: the CPU query blends the same copies.
+struct FVoxelOceanDetile
+{
+    float2 Offset0;     // m, added to the position before each copy's lookup
+    float2 Offset1;
+    float2 Offset2;
+    float3 Weight;      // already divided by sqrt(sum w^2)
+};
+
+VOXEL_FUNC float2 VoxelOceanDetileOffset(uint Seed, int I, int J)
+{
+    const uint H = VoxelOceanHash(Seed ^ VoxelOceanHash(uint(I) * 73856093u ^ uint(J) * 19349663u));
+    return float2(float(H & 0xffffu) * (1024.0f / 65536.0f), float(H >> 16u) * (1024.0f / 65536.0f));
+}
+
+VOXEL_FUNC FVoxelOceanDetile VoxelOceanDetileOf(float2 Position, float Cell, uint Seed)
+{
+    // No lattice: one copy, unshifted.
+    if (Cell <= 0.0f)
+    {
+        FVoxelOceanDetile None;
+        None.Offset0 = float2(0.0f, 0.0f);
+        None.Offset1 = float2(0.0f, 0.0f);
+        None.Offset2 = float2(0.0f, 0.0f);
+        None.Weight = float3(1.0f, 0.0f, 0.0f);
+        return None;
+    }
+    // Skew the triangular lattice onto the square one (2D simplex grid).
+    const float X = Position.x / Cell;
+    const float Y = Position.y / Cell;
+    const float Skew = (X + Y) * 0.366025404f;
+    const float SX = X + Skew;
+    const float SY = Y + Skew;
+    const float FI = floor(SX);
+    const float FJ = floor(SY);
+    const float FX = SX - FI;
+    const float FY = SY - FJ;
+    const int I = int(FI);
+    const int J = int(FJ);
+    FVoxelOceanDetile D;
+    float W0, W1, W2;
+    D.Offset0 = VoxelOceanDetileOffset(Seed, I, J);
+    D.Offset2 = VoxelOceanDetileOffset(Seed, I + 1, J + 1);
+    if (FX > FY)
+    {
+        D.Offset1 = VoxelOceanDetileOffset(Seed, I + 1, J);
+        W0 = 1.0f - FX;
+        W1 = FX - FY;
+        W2 = FY;
+    }
+    else
+    {
+        D.Offset1 = VoxelOceanDetileOffset(Seed, I, J + 1);
+        W0 = 1.0f - FY;
+        W1 = FY - FX;
+        W2 = FX;
+    }
+    const float Norm = 1.0f / sqrt(W0 * W0 + W1 * W1 + W2 * W2);
+    D.Weight = float3(W0 * Norm, W1 * Norm, W2 * Norm);
+    return D;
+}
+
+#endif // VOXEL_OCEAN_SPECTRUM_USH

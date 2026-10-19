@@ -1,0 +1,31 @@
+Radius 107500000 cm, 16 quads, MaxLevel 18 (spacing 40.3 cm)
+Collapse (exact, 504 tiles, levels 1-3, every face): 0 bad triangles, 0 parent triangles missing, 0 covered twice, 193536 degenerate
+Collapse (exact, 504 tiles, levels 1-3, every face): 0 bad triangles, 0 parent triangles missing, 0 covered twice, 48384 degenerate
+Collapse (exact, 504 tiles, levels 1-3, every face): 0 bad triangles, 0 parent triangles missing, 0 covered twice, 774144 degenerate
+Winding: 307200 triangles, 307200 inward, 0 outward (want all inward)
+Fully morphed tiles on the parent's triangles: off-plane 2.91 cm, outside 8.44 cm (max over 600 tiles); 7.25e-08 page units at worst (float rounding is 6e-8); 0.142 cm at levels 8 and finer
+Cross-face edge vertices: max mismatch 2.46e-08 cm
+F 2.25: morph start fraction 0.500
+H 1.10 F 2.2: 600 cameras, 736 tiles average (1932 max), 7005036 edge samples: 0 balance violations, 0 fine edge vertices not fully morphed, 1664505 coarse vertices morphing at a boundary (by up to 3.21e+06 cm, followed by the chain; worst distance / coarse morph end 0.883), same-level edge mismatch 4.54 cm, 0 of 8183 rays missed
+  383809 seam samples: collapse targets differ by 4.54 cm at most; 3538890 boundary samples under 1 m test waves: max crack 5 cm (4e-06 of the coarse spacing), 0.0642 cm at levels 10+
+  with the waves faded by mesh spacing: max crack 4.54 cm, 0.0641 cm at levels 10+
+  chain: 3744284 vertices, 0 with level L-2 morphing at their grand target (want 0), farthest vertex 1.727 of its level's morph end (chain needs < 2); seams: grand targets differ by 4.54 cm, drawn positions by 4.58 cm
+  worst ratio by coarse level: L0 0.722 L1 0.791 L2 0.815 L3 0.835 L4 0.835 L5 0.841 L6 0.851 L7 0.874 L8 0.876 L9 0.879 L10 0.878 L11 0.877 L12 0.876 L13 0.877 L14 0.877 L15 0.876 L16 0.875 L17 0.883
+F 2.50: morph start fraction 0.500
+H 1.10 F 2.5: 600 cameras, 862 tiles average (2211 max), 8207422 edge samples: 0 balance violations, 0 fine edge vertices not fully morphed, 1797133 coarse vertices morphing at a boundary (by up to 2.85e+06 cm, followed by the chain; worst distance / coarse morph end 0.848), same-level edge mismatch 4.54 cm, 0 of 8322 rays missed
+  393380 seam samples: collapse targets differ by 4.54 cm at most; 3818421 boundary samples under 1 m test waves: max crack 5.01 cm (3.5e-06 of the coarse spacing), 0.0638 cm at levels 10+
+  with the waves faded by mesh spacing: max crack 4.54 cm, 0.0619 cm at levels 10+
+  chain: 3801217 vertices, 0 with level L-2 morphing at their grand target (want 0), farthest vertex 1.669 of its level's morph end (chain needs < 2); seams: grand targets differ by 4.54 cm, drawn positions by 4.58 cm
+  worst ratio by coarse level: L0 0.646 L1 0.768 L2 0.781 L3 0.813 L4 0.800 L5 0.821 L6 0.819 L7 0.836 L8 0.840 L9 0.841 L10 0.839 L11 0.839 L12 0.842 L13 0.842 L14 0.843 L15 0.838 L16 0.847 L17 0.848
+F 3.00: morph start fraction 0.500
+H 1.10 F 3.0: 600 cameras, 1140 tiles average (2907 max), 10870130 edge samples: 0 balance violations, 0 fine edge vertices not fully morphed, 2066964 coarse vertices morphing at a boundary (by up to 2.24e+06 cm, followed by the chain; worst distance / coarse morph end 0.792), same-level edge mismatch 4.54 cm, 0 of 8093 rays missed
+  403002 seam samples: collapse targets differ by 4.54 cm at most; 4393939 boundary samples under 1 m test waves: max crack 4.88 cm (3.8e-06 of the coarse spacing), 0.0718 cm at levels 10+
+  with the waves faded by mesh spacing: max crack 4.54 cm, 0.0667 cm at levels 10+
+  chain: 3756422 vertices, 0 with level L-2 morphing at their grand target (want 0), farthest vertex 1.575 of its level's morph end (chain needs < 2); seams: grand targets differ by 4.54 cm, drawn positions by 4.57 cm
+  worst ratio by coarse level: L0 0.678 L1 0.735 L2 0.752 L3 0.751 L4 0.779 L5 0.755 L6 0.771 L7 0.780 L8 0.782 L9 0.785 L10 0.784 L11 0.786 L12 0.787 L13 0.785 L14 0.786 L15 0.787 L16 0.791 L17 0.792
+F 4.00: morph start fraction 0.500
+H 1.10 F 4.0: 600 cameras, 1834 tiles average (4521 max), 17510020 edge samples: 0 balance violations, 0 fine edge vertices not fully morphed, 2614084 coarse vertices morphing at a boundary (by up to 1.53e+06 cm, followed by the chain; worst distance / coarse morph end 0.726), same-level edge mismatch 4.54 cm, 0 of 8185 rays missed
+  424082 seam samples: collapse targets differ by 4.54 cm at most; 5554750 boundary samples under 1 m test waves: max crack 5.18 cm (3.6e-06 of the coarse spacing), 0.0687 cm at levels 10+
+  with the waves faded by mesh spacing: max crack 4.54 cm, 0.0641 cm at levels 10+
+  chain: 3892830 vertices, 0 with level L-2 morphing at their grand target (want 0), farthest vertex 1.429 of its level's morph end (chain needs < 2); seams: grand targets differ by 4.54 cm, drawn positions by 4.57 cm
+  worst ratio by coarse level: L0 0.605 L1 0.682 L2 0.683 L3 0.700 L4 0.704 L5 0.705 L6 0.716 L7 0.714 L8 0.717 L9 0.718 L10 0.718 L11 0.717 L12 0.716 L13 0.717 L14 0.718 L15 0.717 L16 0.717 L17 0.726

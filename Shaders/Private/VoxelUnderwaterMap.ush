@@ -1,0 +1,144 @@
+// VoxelUnderwaterMap.ush - The underwater pass's map of the sea surface around the camera
+// (stage O6b; shared HLSL/C++ through VoxelShaderCompat.h). Each pixel under water used to find
+// the surface by full wave inversions (VoxelOceanHeightAtFFT) at every step of its march, over a
+// thousand cascade lookups a pixel; now a compute pass writes, once per view, the surface's
+// height at a grid of points (VoxelUnderwaterPass.usf, UnderwaterMapCS: the same inversion), and
+// the march reads it.
+//
+// THE MAP: VOXEL_UNDERWATER_MAP_LEVELS nested square grids of VOXEL_UNDERWATER_MAP_SIZE^2
+// points, each level's texel 4 times the last's from 2 cm (2 cm, 8 cm, 32 cm, 1.28 m, 5.12 m:
+// from 5 m to 1.3 km across; the texels come with the anchors, VoxelUnderwaterMap.h, which also
+// sets the two sizes here through the shader's compile environment). A level lies in the plane
+// tangent to the sphere at its anchor, a sphere point next to the camera's radial, snapped to
+// about the level's texel on the camera's cube face (VoxelUnderwaterMap.h). Its point (i, j) is
+//   Anchor + ((i + 0.5) - Size / 2) Texel E1 + ((j + 0.5) - Size / 2) Texel E2
+// and holds the surface's height (cm) above the sphere along that point's radial, the waves
+// evaluated with the texel as their spacing and footprint (mipped to what the grid can hold).
+// Anchors are from the camera, in world axes, as every position the pass uses.
+//
+// A LOOKUP (VoxelUnderwaterMapHeight) takes a sphere point (the foot of the point asked about),
+// reads each level bilinearly where it covers the point and blends from the finest outward over
+// VOXEL_UNDERWATER_MAP_BLEND texels at each level's edge, so the height is continuous across
+// levels; past the coarsest the sea is the sphere (height 0). The normal comes from the heights'
+// central differences at the texel of the finest level fully covering the point
+// (VoxelUnderwaterMapNormal).
+//
+// The includer defines, before including this file:
+//   VOXEL_UNDERWATER_MAP_LOAD(Level, X, Y)  the height at texel (X, Y) of a level (int arguments);
+//   VOXEL_UNDERWATER_MAP_ANCHOR(Level)      float3: the anchor;
+//   VOXEL_UNDERWATER_MAP_TEXEL(Level)       float: the level's texel (cm);
+//   VOXEL_UNDERWATER_MAP_E1(Level), VOXEL_UNDERWATER_MAP_E2(Level)   float3: the plane's axes.
+
+#pragma once
+
+#ifndef VOXEL_FUNC
+#define VOXEL_FUNC
+#endif
+
+#ifndef VOXEL_LOOP
+#define VOXEL_LOOP [loop]
+#endif
+
+// VoxelUnderwaterMap::Size and Levels (the shaders get them from the compile environment).
+#ifndef VOXEL_UNDERWATER_MAP_SIZE
+#define VOXEL_UNDERWATER_MAP_SIZE 256
+#endif
+#ifndef VOXEL_UNDERWATER_MAP_LEVELS
+#define VOXEL_UNDERWATER_MAP_LEVELS 5
+#endif
+#define VOXEL_UNDERWATER_MAP_BLEND 16.0f
+
+// Level L's grid point (i, j), from the camera.
+VOXEL_FUNC float3 VoxelUnderwaterMapPoint(float3 Anchor, float Texel, float3 E1, float3 E2, int I, int J)
+{
+    const float Half = 0.5f * float(VOXEL_UNDERWATER_MAP_SIZE);
+    return Anchor + E1 * ((float(I) + 0.5f - Half) * Texel) + E2 * ((float(J) + 0.5f - Half) * Texel);
+}
+
+// Where a point lies on a level's grid, in texels (grid points at whole numbers).
+VOXEL_FUNC float2 VoxelUnderwaterMapCoords(float3 Anchor, float Texel, float3 E1, float3 E2, float3 Foot)
+{
+    const float3 D = Foot - Anchor;
+    const float Centre = 0.5f * float(VOXEL_UNDERWATER_MAP_SIZE) - 0.5f;
+    return float2(dot(D, E1) / Texel + Centre, dot(D, E2) / Texel + Centre);
+}
+
+// Level L's grid coordinates of Foot.
+#define VOXEL_UNDERWATER_MAP_COORDS(Level, Foot) VoxelUnderwaterMapCoords(VOXEL_UNDERWATER_MAP_ANCHOR(Level), VOXEL_UNDERWATER_MAP_TEXEL(Level), \
+    VOXEL_UNDERWATER_MAP_E1(Level), VOXEL_UNDERWATER_MAP_E2(Level), Foot)
+
+// How much a level covers a point at grid coordinates P: 1 inside, falling to 0 at its last
+// texel (where bilinear reads would leave the grid).
+VOXEL_FUNC float VoxelUnderwaterMapCover(float2 P)
+{
+    const float Last = float(VOXEL_UNDERWATER_MAP_SIZE) - 1.0f;
+    const float Edge = min(min(P.x, P.y), min(Last - P.x, Last - P.y));
+    return saturate(Edge / VOXEL_UNDERWATER_MAP_BLEND);
+}
+
+// A level's height, bilinear (P inside its grid: 0 <= P < Size - 1).
+VOXEL_FUNC float VoxelUnderwaterMapBilinear(int Level, float2 P)
+{
+    const float BX = floor(P.x);
+    const float BY = floor(P.y);
+    const int X = int(BX);
+    const int Y = int(BY);
+    const float FX = P.x - BX;
+    const float FY = P.y - BY;
+    const float H00 = VOXEL_UNDERWATER_MAP_LOAD(Level, X, Y);
+    const float H10 = VOXEL_UNDERWATER_MAP_LOAD(Level, X + 1, Y);
+    const float H01 = VOXEL_UNDERWATER_MAP_LOAD(Level, X, Y + 1);
+    const float H11 = VOXEL_UNDERWATER_MAP_LOAD(Level, X + 1, Y + 1);
+    return lerp(lerp(H00, H10, FX), lerp(H01, H11, FX), FY);
+}
+
+// The surface's height (cm) above the sphere along the radial through Foot (a sphere point, from
+// the camera): the finest level's where it covers Foot, blended outward at each level's edge;
+// 0 past the coarsest.
+VOXEL_FUNC float VoxelUnderwaterMapHeight(float3 Foot)
+{
+    float Height = 0.0f;
+    float Rest = 1.0f;
+    VOXEL_LOOP
+    for (int Level = 0; Level < VOXEL_UNDERWATER_MAP_LEVELS; Level++)
+    {
+        const float2 P = VOXEL_UNDERWATER_MAP_COORDS(Level, Foot);
+        const float Cover = VoxelUnderwaterMapCover(P);
+        if (Cover <= 0.0f) continue;
+        Height += Rest * Cover * VoxelUnderwaterMapBilinear(Level, P);
+        Rest *= 1.0f - Cover;
+        if (Rest <= 0.0f) break;
+    }
+    return Height;
+}
+
+// The finest level fully covering Foot, or else the coarsest covering it at all
+// (VOXEL_UNDERWATER_MAP_LEVELS if none): in a level's blend ring the heights are mostly the next
+// level's, so their differences are taken at its texel.
+VOXEL_FUNC int VoxelUnderwaterMapLevelOf(float3 Foot)
+{
+    int Found = VOXEL_UNDERWATER_MAP_LEVELS;
+    VOXEL_LOOP
+    for (int Level = 0; Level < VOXEL_UNDERWATER_MAP_LEVELS; Level++)
+    {
+        const float Cover = VoxelUnderwaterMapCover(VOXEL_UNDERWATER_MAP_COORDS(Level, Foot));
+        if (Cover > 0.0f) Found = Level;
+        if (Cover >= 1.0f) break;
+    }
+    return Found;
+}
+
+// The surface's normal (unit, world axes) above Foot, Up its radial: the heights' central
+// differences one texel apart, at the level VoxelUnderwaterMapLevelOf picks (the radial past
+// the coarsest).
+VOXEL_FUNC float3 VoxelUnderwaterMapNormal(float3 Foot, float3 Up)
+{
+    const int Level = VoxelUnderwaterMapLevelOf(Foot);
+    if (Level >= VOXEL_UNDERWATER_MAP_LEVELS) return Up;
+    const float3 E1 = VOXEL_UNDERWATER_MAP_E1(Level);
+    const float3 E2 = VOXEL_UNDERWATER_MAP_E2(Level);
+    const float Step = VOXEL_UNDERWATER_MAP_TEXEL(Level);
+    const float GX = (VoxelUnderwaterMapHeight(Foot + E1 * Step) - VoxelUnderwaterMapHeight(Foot - E1 * Step)) / (2.0f * Step);
+    const float GY = (VoxelUnderwaterMapHeight(Foot + E2 * Step) - VoxelUnderwaterMapHeight(Foot - E2 * Step)) / (2.0f * Step);
+    return normalize(Up - E1 * GX - E2 * GY);
+}

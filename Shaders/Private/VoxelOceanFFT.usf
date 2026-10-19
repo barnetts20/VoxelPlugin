@@ -1,0 +1,250 @@
+// VoxelOceanFFT.usf - The ocean's FFT cascades on the GPU (Design/OceanWaves.md section 2): the
+// start spectrum, the time step, the inverse FFTs and the output textures with their mips. The
+// spectrum, the dispersion, the field packing and the butterflies are the shared code of
+// VoxelOceanSpectrum.ush, which the CPU's query cascades run too.
+//
+// THE PASSES (one dispatch each, over every slot at once; N = VOXEL_OCEAN_FFT_SIZE):
+// 1. InitSpectrumCS, once per spectrum change: per slot and mode, h0(k) and conj(h0(-k)) into
+//    Spectrum (float4 per mode) and the mode's frequency multiple into Multiples. GPU-native:
+//    nothing is uploaded but the slot table.
+// 2. TimeStepCS, per frame: the four packed field spectra of each slot (FVoxelOceanGPUFields)
+//    into Fields, two float4 per mode (slices 2 s and 2 s + 1).
+// 3. FFTCS twice per frame, in place over Fields: once along rows, once along columns (one
+//    thread group per line and slice, the line in groupshared memory). The row pass skips the
+//    rows a band leaves empty (most of them: a band holds |Kj| up to 17 of 128, the last 64);
+//    they are zero and stay zero.
+// 4. AssembleCS: the spatial fields to the slot's output textures, the chop applied:
+//      Displacement = (chop Dx, chop Dy, eta, chop Dxy)      (m)
+//      Derivatives  = (eta_x, eta_y, chop Dxx, chop Dyy)
+//    The displaced surface's tangents are (1 + chop Dxx, chop Dxy, eta_x) and (chop Dxy,
+//    1 + chop Dyy, eta_y); its area ratio (Jacobian) (1 + chop Dxx)(1 + chop Dyy) - (chop Dxy)^2.
+//    And the open sea's foam (stage O9b; VoxelOceanFoam.ush): each slot's compression (its area
+//    ratio J at VOXEL_OCEAN_FOAM_CHOP against its spread, FVoxelOceanSlotGPU B.z, sigma_J) feeds
+//    its envelope Z, which the state buffer FoamState keeps between frames, falling FoamFall
+//    (dt / decay) a frame; FoamOut the texture, (Z, Z^2) (0 with FoamOn 0).
+// 5. MipCS once per mip level: the 2 x 2 average of both textures; FoamMipCS the foam's (so its
+//    mips hold each texel's mean of Z and of Z^2).
+//
+// Buffers, not textures, carry the intermediate data, so nothing needs typed UAV loads.
+// Element (slice, row, column) of Spectrum and Fields is at (slice N + row) N + column.
+
+#include "/Engine/Public/Platform.ush"
+#include "/Plugin/VoxelPlugin/Private/VoxelOceanSpectrum.ush"
+#include "/Plugin/VoxelPlugin/Private/VoxelOceanFoam.ush"
+
+#define VOXEL_OCEAN_FFT_SIZE 256
+#define VOXEL_OCEAN_FFT_HALF 128
+#define VOXEL_OCEAN_FFT_STAGES 8
+
+// One slot as the GPU reads it (FVoxelOceanSlotGPU in VoxelOceanSpectrum.h).
+struct FVoxelOceanSlotGPU
+{
+    float4 A;      // tile length (m), wind speed (m/s), fetch (m), gamma
+    float4 B;      // swell, amplitude scale, sigma_J (the foam's spread: VOXEL_OCEAN_FOAM_CHOP sqrt(slope variance)), chop
+    uint4 C;       // band MMin, band MMax, seed, dispersion C2 (packed, FVoxelOceanSlotParams)
+};
+
+StructuredBuffer<FVoxelOceanSlotGPU> Slots;
+uint SlotCount;
+
+FVoxelOceanSlotParams VoxelOceanSlotParamsOf(FVoxelOceanSlotGPU S)
+{
+    return VoxelOceanMakeSlot(S.A.x, S.A.y, S.A.z, S.A.w, S.B.x, S.B.y, S.C.w, S.C.x, S.C.y, S.C.z);
+}
+
+// The signed mode of a grid index (the FFT's natural order).
+int VoxelOceanSignedMode(uint Index)
+{
+    return Index < VOXEL_OCEAN_FFT_HALF ? int(Index) : int(Index) - VOXEL_OCEAN_FFT_SIZE;
+}
+
+uint VoxelOceanElement(uint Slice, uint Row, uint Column)
+{
+    return (Slice * VOXEL_OCEAN_FFT_SIZE + Row) * VOXEL_OCEAN_FFT_SIZE + Column;
+}
+
+// ---------------------------------------------------------------------------------------------
+// 1. The start spectrum
+// ---------------------------------------------------------------------------------------------
+
+RWStructuredBuffer<float4> SpectrumOut;     // per mode: h0(k).xy, conj(h0(-k)).xy
+RWStructuredBuffer<uint> MultiplesOut;      // per mode: its frequency multiple n (0 outside the band)
+
+[numthreads(8, 8, 1)]
+void InitSpectrumCS(uint3 Id : SV_DispatchThreadID)
+{
+    if (Id.x >= VOXEL_OCEAN_FFT_SIZE || Id.y >= VOXEL_OCEAN_FFT_SIZE || Id.z >= SlotCount) return;
+    const FVoxelOceanSlotParams P = VoxelOceanSlotParamsOf(Slots[Id.z]);
+    const int Ki = VoxelOceanSignedMode(Id.x);
+    const int Kj = VoxelOceanSignedMode(Id.y);
+    const float2 H0 = VoxelOceanH0(P, Ki, Kj);
+    const float2 H0Minus = VoxelOceanH0(P, -Ki, -Kj);
+    const uint Element = VoxelOceanElement(Id.z, Id.y, Id.x);
+    SpectrumOut[Element] = float4(H0.x, H0.y, H0Minus.x, -H0Minus.y);
+    MultiplesOut[Element] = VoxelOceanInBand(P, Ki, Kj) ? uint(VoxelOceanModeMultiple(P, Ki, Kj)) : 0u;
+}
+
+// ---------------------------------------------------------------------------------------------
+// 2. The time step
+// ---------------------------------------------------------------------------------------------
+
+StructuredBuffer<float4> Spectrum;
+StructuredBuffer<uint> Multiples;
+RWStructuredBuffer<float4> FieldsOut;       // per slot two slices: (Z0, Z1), (Z2, Z3)
+uint Tick;                                  // frac(t / T) 2^32
+
+[numthreads(8, 8, 1)]
+void TimeStepCS(uint3 Id : SV_DispatchThreadID)
+{
+    if (Id.x >= VOXEL_OCEAN_FFT_SIZE || Id.y >= VOXEL_OCEAN_FFT_SIZE || Id.z >= SlotCount) return;
+    const FVoxelOceanSlotParams P = VoxelOceanSlotParamsOf(Slots[Id.z]);
+    const int Ki = VoxelOceanSignedMode(Id.x);
+    const int Kj = VoxelOceanSignedMode(Id.y);
+    float4 Out0 = float4(0.0f, 0.0f, 0.0f, 0.0f);
+    float4 Out1 = float4(0.0f, 0.0f, 0.0f, 0.0f);
+    if (VoxelOceanInBand(P, Ki, Kj))
+    {
+        const uint Element = VoxelOceanElement(Id.z, Id.y, Id.x);
+        const float4 H = Spectrum[Element];
+        const float Phase = VoxelOceanPhase(int(Multiples[Element]), Tick);
+        const float2 Ht = VoxelOceanEvolve(H.xy, H.zw, Phase);
+        const float Dk = VOXEL_OCEAN_TWO_PI / P.TileLength;
+        const FVoxelOceanGPUFields F = VoxelOceanGPUFieldsOf(Ht, float(Ki) * Dk, float(Kj) * Dk);
+        Out0 = float4(F.Z0.x, F.Z0.y, F.Z1.x, F.Z1.y);
+        Out1 = float4(F.Z2.x, F.Z2.y, F.Z3.x, F.Z3.y);
+    }
+    FieldsOut[VoxelOceanElement(2u * Id.z, Id.y, Id.x)] = Out0;
+    FieldsOut[VoxelOceanElement(2u * Id.z + 1u, Id.y, Id.x)] = Out1;
+}
+
+// ---------------------------------------------------------------------------------------------
+// 3. The inverse FFT along one axis, in place
+// ---------------------------------------------------------------------------------------------
+
+RWStructuredBuffer<float4> FFTData;         // Fields: two complex numbers per element
+uint FFTLineStride;                         // rows: N (columns: 1)
+uint FFTElementStride;                      // rows: 1 (columns: N)
+uint FFTRowPass;                            // 1: lines are rows (empty ones are skipped)
+
+groupshared float4 FFTShared[2][VOXEL_OCEAN_FFT_SIZE];
+groupshared float2 FFTTwiddles[VOXEL_OCEAN_FFT_HALF];
+
+float4 VoxelOceanButterflyApply(float4 A, float4 B, float2 W, float Sign)
+{
+    // Both complex numbers of the element: A + Sign W B.
+    const float2 B0 = VoxelOceanCMul(float2(B.x, B.y), W);
+    const float2 B1 = VoxelOceanCMul(float2(B.z, B.w), W);
+    return float4(A.x + Sign * B0.x, A.y + Sign * B0.y, A.z + Sign * B1.x, A.w + Sign * B1.y);
+}
+
+// Group (line, slice); thread T handles elements T and T + N/2.
+[numthreads(VOXEL_OCEAN_FFT_HALF, 1, 1)]
+void FFTCS(uint3 Group : SV_GroupID, uint3 Thread : SV_GroupThreadID)
+{
+    // Whole-group exits only, before any barrier.
+    if (Group.y >= 2u * SlotCount) return;
+    if (FFTRowPass != 0u)
+    {
+        const int Kj = VoxelOceanSignedMode(Group.x);
+        if (uint(Kj * Kj) >= Slots[Group.y / 2u].C.y) return;
+    }
+    const uint T = Thread.x;
+    const uint Base = Group.y * VOXEL_OCEAN_FFT_SIZE * VOXEL_OCEAN_FFT_SIZE + Group.x * FFTLineStride;
+    FFTShared[0][T] = FFTData[Base + T * FFTElementStride];
+    FFTShared[0][T + VOXEL_OCEAN_FFT_HALF] = FFTData[Base + (T + VOXEL_OCEAN_FFT_HALF) * FFTElementStride];
+    FFTTwiddles[T] = VoxelOceanTwiddle(T, VOXEL_OCEAN_FFT_HALF);
+    GroupMemoryBarrierWithGroupSync();
+
+    uint Ns = 1u;
+    [unroll]
+    for (uint Stage = 0u; Stage < VOXEL_OCEAN_FFT_STAGES; Stage++)
+    {
+        const uint In = Stage & 1u;
+        const FVoxelOceanButterfly B = VoxelOceanButterflyOf(Ns, T, VOXEL_OCEAN_FFT_HALF);
+        const float2 W = FFTTwiddles[B.TwiddleIndex];
+        const float4 A = FFTShared[In][B.SrcA];
+        const float4 C = FFTShared[In][B.SrcB];
+        FFTShared[1u - In][B.DstA] = VoxelOceanButterflyApply(A, C, W, 1.0f);
+        FFTShared[1u - In][B.DstB] = VoxelOceanButterflyApply(A, C, W, -1.0f);
+        GroupMemoryBarrierWithGroupSync();
+        Ns *= 2u;
+    }
+
+    // Eight stages: the result is back in buffer 0.
+    FFTData[Base + T * FFTElementStride] = FFTShared[0][T];
+    FFTData[Base + (T + VOXEL_OCEAN_FFT_HALF) * FFTElementStride] = FFTShared[0][T + VOXEL_OCEAN_FFT_HALF];
+}
+
+// ---------------------------------------------------------------------------------------------
+// 4. The output textures
+// ---------------------------------------------------------------------------------------------
+
+StructuredBuffer<float4> Fields;
+RWTexture2DArray<float4> DisplacementOut;   // per slot: chop Dx, chop Dy, eta, chop Dxy (m)
+RWTexture2DArray<float4> DerivativesOut;    // per slot: eta_x, eta_y, chop Dxx, chop Dyy
+RWStructuredBuffer<float> FoamState;        // per slot and texel: the foam's envelope Z (element order)
+RWTexture2DArray<float2> FoamOut;           // per slot: (Z, Z^2)
+float FoamFall;                             // dt / decay: Z's fall this frame (sigma)
+uint FoamOn;                                // 0: no foam (the state and the texture zero)
+
+[numthreads(8, 8, 1)]
+void AssembleCS(uint3 Id : SV_DispatchThreadID)
+{
+    if (Id.x >= VOXEL_OCEAN_FFT_SIZE || Id.y >= VOXEL_OCEAN_FFT_SIZE || Id.z >= SlotCount) return;
+    const float Chop = Slots[Id.z].B.w;
+    const float4 F0 = Fields[VoxelOceanElement(2u * Id.z, Id.y, Id.x)];         // eta, Dx, Dy, eta_x
+    const float4 F1 = Fields[VoxelOceanElement(2u * Id.z + 1u, Id.y, Id.x)];    // eta_y, Dxx, Dyy, Dxy
+    DisplacementOut[Id] = float4(Chop * F0.y, Chop * F0.z, F0.x, Chop * F1.w);
+    DerivativesOut[Id] = float4(F0.w, F1.x, Chop * F1.y, Chop * F1.z);
+    // The foam: the envelope of the slot's own compression (at the calibration's chop).
+    const uint Element = VoxelOceanElement(Id.z, Id.y, Id.x);
+    float Z = 0.0f;
+    const float SigmaJ = Slots[Id.z].B.z;
+    if (FoamOn != 0u && SigmaJ > 1.0e-6f)
+    {
+        const float Dxx = VOXEL_OCEAN_FOAM_CHOP * F1.y;
+        const float Dyy = VOXEL_OCEAN_FOAM_CHOP * F1.z;
+        const float Dxy = VOXEL_OCEAN_FOAM_CHOP * F1.w;
+        const float J = (1.0f + Dxx) * (1.0f + Dyy) - Dxy * Dxy;
+        Z = VoxelOceanFoamStep(FoamState[Element], VoxelOceanFoamCompression(J, SigmaJ), FoamFall);
+    }
+    FoamState[Element] = Z;
+    FoamOut[Id] = float2(Z, Z * Z);
+}
+
+// ---------------------------------------------------------------------------------------------
+// 5. Mips
+// ---------------------------------------------------------------------------------------------
+
+Texture2DArray<float4> DisplacementMipIn;   // the finer mip (one-mip views)
+Texture2DArray<float4> DerivativesMipIn;
+RWTexture2DArray<float4> DisplacementMipOut;
+RWTexture2DArray<float4> DerivativesMipOut;
+uint MipSize;                               // the coarser mip's size
+
+[numthreads(8, 8, 1)]
+void MipCS(uint3 Id : SV_DispatchThreadID)
+{
+    if (Id.x >= MipSize || Id.y >= MipSize || Id.z >= SlotCount) return;
+    const int X = int(Id.x) * 2;
+    const int Y = int(Id.y) * 2;
+    const int Z = int(Id.z);
+    DisplacementMipOut[Id] = 0.25f * (DisplacementMipIn.Load(int4(X, Y, Z, 0)) + DisplacementMipIn.Load(int4(X + 1, Y, Z, 0))
+        + DisplacementMipIn.Load(int4(X, Y + 1, Z, 0)) + DisplacementMipIn.Load(int4(X + 1, Y + 1, Z, 0)));
+    DerivativesMipOut[Id] = 0.25f * (DerivativesMipIn.Load(int4(X, Y, Z, 0)) + DerivativesMipIn.Load(int4(X + 1, Y, Z, 0))
+        + DerivativesMipIn.Load(int4(X, Y + 1, Z, 0)) + DerivativesMipIn.Load(int4(X + 1, Y + 1, Z, 0)));
+}
+
+Texture2DArray<float2> FoamMipIn;           // the finer mip (a one-mip view)
+RWTexture2DArray<float2> FoamMipOut;
+
+[numthreads(8, 8, 1)]
+void FoamMipCS(uint3 Id : SV_DispatchThreadID)
+{
+    if (Id.x >= MipSize || Id.y >= MipSize || Id.z >= SlotCount) return;
+    const int X = int(Id.x) * 2;
+    const int Y = int(Id.y) * 2;
+    const int Z = int(Id.z);
+    FoamMipOut[Id] = 0.25f * (FoamMipIn.Load(int4(X, Y, Z, 0)) + FoamMipIn.Load(int4(X + 1, Y, Z, 0))
+        + FoamMipIn.Load(int4(X, Y + 1, Z, 0)) + FoamMipIn.Load(int4(X + 1, Y + 1, Z, 0)));
+}

@@ -8,7 +8,7 @@
 // whose members carry the names of the shader's buffers and constants (VoxelLandBake.cpp,
 // VoxelDensity.cpp), so it must not declare static const data of its own (use #define).
 //
-// Subset rules for shared code: scalar/float2/float3/int3/uint3 only; members .x/.y/.z or
+// Subset rules for shared code: scalar/float2/float3/int3/uint3 only (float4 as a value holder); members .x/.y/.z or
 // [axis] (no swizzles); no out/inout parameters in shared functions (return structs; the
 // Interlocked* intrinsics are the exception); 32-bit int/uint arithmetic (wraps on both
 // sides); float literals with the f suffix; VOXEL_PRECISE on every float operation whose exact
@@ -62,6 +62,14 @@ namespace VoxelShader
     inline float3 operator-(float s, float3 a) { return float3(s - a.x, s - a.y, s - a.z); }
     inline float3 operator*(float s, float3 a) { return float3(s * a.x, s * a.y, s * a.z); }
     inline float3 operator-(float3 a) { return float3(-a.x, -a.y, -a.z); }
+
+    // float4: members only (the ocean's table texels; VoxelOceanSeaState.ush).
+    struct float4
+    {
+        float x, y, z, w;
+        float4() : x(0.f), y(0.f), z(0.f), w(0.f) {}
+        float4(float InX, float InY, float InZ, float InW) : x(InX), y(InY), z(InZ), w(InW) {}
+    };
 
     struct uint3
     {

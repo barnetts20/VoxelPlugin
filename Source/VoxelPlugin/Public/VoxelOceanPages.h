@@ -15,7 +15,9 @@
 // terrain's edits, at the lattice point nearest each vertex, in the page's compute run (the
 // terrain's own VoxelDensitySample.ush and VoxelEditSample.ush). The depth goes to the
 // vertices' texture coordinates, morphed with them, and a triangle the land stands well
-// above at every corner is written degenerate (the land cull).
+// above at every corner is written degenerate (the land cull). With the shore field (stage O8) a
+// vertex in an inland basin below sea level counts as land. The same run's shader samples the
+// depth probe the underwater pass reads (ProbeDepth).
 
 #pragma once
 
@@ -32,6 +34,9 @@ class FVoxelOceanPageProvider;
 class FVoxelOceanInputCache;
 struct FVoxelDensityGPUData;
 struct FVoxelEditGPUData;
+struct FVoxelOceanShoreRHI;
+struct FVoxelOceanProbeState;
+namespace VoxelOceanDepthProbe { struct FLevels; }
 
 /** What the page writes sample the terrain depth from. */
 struct FVoxelOceanDensityInputs
@@ -44,6 +49,10 @@ struct FVoxelOceanDensityInputs
     /** The lattice step (cm): a vertex samples the point of the terrain lattice nearest it,
      *  counted in these from the planet centre (the edit tree is addressed the same way). */
     double HalfFinest = 50.0;
+    /** The shore field's texture (stage O8, FVoxelOceanShoreField): a vertex in an inland basin
+     *  (its field distance below minus ShoreMarginCm) is land. Null: no field, no such cull. */
+    TSharedPtr<const FVoxelOceanShoreRHI, ESPMode::ThreadSafe> Shore;
+    double ShoreMarginCm = 0.0;
 };
 
 /** Game thread. The pages of one ocean surface. */
@@ -85,6 +94,11 @@ public:
     /** Changes where level 0's morph ends (world units) on every buffer set. */
     void SetMorphEnd0(double InMorphEnd0);
 
+    /** How far (cm) the waves move a vertex in any direction (the wave model's reach, its
+     *  vertical and horizontal parts together): a page's bounds grow past the unit cube when its
+     *  own slack (0.23 of its unit) is less. */
+    void SetWaveReach(double InReach);
+
     /** The density and edits the next writes sample. Writes already pushed keep theirs. */
     void SetDensityInputs(const FVoxelOceanDensityInputs& InInputs);
     const FVoxelOceanDensityInputs& GetDensityInputs() const { return DensityInputs; }
@@ -103,6 +117,14 @@ public:
     /** Once per frame, before any commit: registration, kicks, pooling released buffer sets,
      *  dropping unused empty pages, and keeping SpareTarget buffer sets ready. */
     void Flush(int32 SpareTarget);
+
+    /** Samples the terrain depth on the depth probe's grids (VoxelOceanDepthProbe.h) with the
+     *  density inputs set now, in a graph of its own; the result replaces the probe state's on the
+     *  render thread. Radius: the sea sphere (cm). */
+    void ProbeDepth(const VoxelOceanDepthProbe::FLevels& Levels, double InRadius);
+
+    /** The depth probe's result (render thread data; the underwater pass reads it). */
+    const TSharedPtr<FVoxelOceanProbeState, ESPMode::ThreadSafe>& GetProbeState() const { return ProbeState; }
 
     /** Pages, tiles and buffer sets, for the debug log. */
     FString Describe() const;
@@ -181,6 +203,7 @@ private:
     double Radius = 0.0;
     int32 TileQuads = 16;
     double MorphEnd0 = 0.0;
+    double WaveReach = 0.0;
     bool bFlipWinding = false;
     FVoxelOceanDensityInputs DensityInputs;
     /** Stand-ins for missing inputs: a density with no terrain (every vertex deep water) and
@@ -189,6 +212,8 @@ private:
     TSharedPtr<const FVoxelEditGPUData> NoEdits;
     /** The inputs uploaded once for every page's runs (render thread). */
     TSharedPtr<FVoxelOceanInputCache, ESPMode::ThreadSafe> InputCache;
+    /** The depth probe's last result (render thread). */
+    TSharedPtr<FVoxelOceanProbeState, ESPMode::ThreadSafe> ProbeState;
     TMap<FVoxelOceanTileKey, FPage> Pages;
     TArray<FInstance> Pool;
     TArray<FReleasing> Releasing;

@@ -6,9 +6,17 @@
 #include "Components/SceneComponent.h"
 #include "GameFramework/Actor.h"
 #include "Materials/MaterialInstanceDynamic.h"
+#include "Engine/Texture2D.h"
+#include "Engine/Texture2DArray.h"
 #include "Engine/World.h"
 #include "Misc/App.h"
 #include "VoxelDensityGPU.h"
+#include "VoxelOceanCascades.h"
+#include "VoxelOceanWavesFFT.h"
+#include "VoxelOceanWeatherKeys.h"
+#include "VoxelOceanShoreField.h"
+#include "VoxelOceanDepthProbe.h"
+#include "TextureResource.h"
 
 DECLARE_CYCLE_STAT(TEXT("Ocean: select"), STAT_VoxelOceanSelect, STATGROUP_VoxelTerrain);
 DECLARE_CYCLE_STAT(TEXT("Ocean: build tiles"), STAT_VoxelOceanBuild, STATGROUP_VoxelTerrain);
@@ -42,6 +50,20 @@ namespace VoxelOceanSurfaceDetail
     const FName WaveNames[3] = { FName(TEXT("VoxelOceanWave0")), FName(TEXT("VoxelOceanWave1")), FName(TEXT("VoxelOceanWave2")) };
     const FName CenterName(TEXT("VoxelOceanCenter"));
     const FName ShapeName(TEXT("VoxelOceanShape"));
+    // The FFT model's (VoxelOcean.ush, VoxelOceanVertexFFT).
+    const FName FFTName(TEXT("VoxelOceanFFT"));
+    const FName RefHighName(TEXT("VoxelOceanRefHigh"));
+    const FName RefLowName(TEXT("VoxelOceanRefLow"));
+    const FName RotationName(TEXT("VoxelOceanRotation"));
+    const FName TilesName(TEXT("VoxelOceanTiles"));
+    const FName StatesName(TEXT("VoxelOceanStates"));
+    const FName SlopeVarName(TEXT("VoxelOceanSlopeVar"));
+    // The shore field's texture (stage O8; VoxelOcean.ush's shore entry points).
+    const FName ShoreName(TEXT("VoxelOceanShore"));
+    /** The depth probe runs while the camera is within the waves' reach and this (cm) of the sea. */
+    constexpr double ProbeHeight = 2000.0;
+    /** The chart table's per-frame rows (from row 8): the shore frame (7) and the surf (2). */
+    constexpr int32 FrameRows = 9;
     constexpr double Hysteresis = 1.1;
     constexpr int32 ParallelBuildTiles = 8;        // fewer tiles are built on the game thread
     /** How far a point of a drawn triangle can be from the vertices whose depth culls it, in
@@ -71,6 +93,14 @@ void FVoxelOceanSurface::Initialize(AActor* InOwner, USceneComponent* InAttachRo
     bFlipWinding = CVarVoxelOceanFlipWinding.GetValueOnGameThread() > 0;
     bReportedMaterial = false;
     bReportedShape = false;
+    bReportedFFT = false;
+    bTexturesBound = false;
+    BoundShoreTexture = nullptr;
+    bProbed = false;
+    // New textures get the weather's table again, and the shore frame after it.
+    UploadedTable = 0;
+    UploadedTexture = nullptr;
+    ShoreFrameTexture = nullptr;
     // A server, or a commandlet, draws nothing.
     bAvailable = FApp::CanEverRender() && InOwner && InAttachRoot && Settings.Radius > 0.0;
     if (!bAvailable) return;
@@ -79,6 +109,14 @@ void FVoxelOceanSurface::Initialize(AActor* InOwner, USceneComponent* InAttachRo
         VoxelOceanTiles::MorphEnd0(Settings.Radius, Settings.LodDistanceFactor), bFlipWinding);
     if (bHasInputs)
         Pages->SetDensityInputs(Inputs.Density);
+    if (WaveModel.IsValid())
+        Pages->SetWaveReach(FVector2d(WaveModel->MaxHeight(), WaveModel->MaxHorizontal()).Size());
+    if (Settings.CascadeTextures.IsValid())
+    {
+        Cascades = MakeUnique<FVoxelOceanCascades>(Settings.CascadeTextures);
+        if (FFTModel.IsValid())
+            Cascades->SetSlots(FFTModel->GetSlotTable());
+    }
 }
 
 void FVoxelOceanSurface::Reset()
@@ -86,6 +124,10 @@ void FVoxelOceanSurface::Reset()
     if (Pages.IsValid())
         Pages->Reset();
     Pages.Reset();
+    Cascades.Reset();
+    UploadedTable = 0;
+    UploadedTexture = nullptr;
+    ShoreFrameTexture = nullptr;
     Committed.Reset();
     CommittedSplit.Reset();
     PendingEdits.Reset();
@@ -104,7 +146,9 @@ void FVoxelOceanSurface::SetInputs(const FVoxelOceanSurfaceInputs& InInputs)
         || InInputs.Density.Density != Inputs.Density.Density
         || InInputs.Density.HalfFinest != Inputs.Density.HalfFinest
         || InInputs.SlopeBound != Inputs.SlopeBound
-        || InInputs.LandCullMargin != Inputs.LandCullMargin;
+        || InInputs.LandCullMargin != Inputs.LandCullMargin
+        || InInputs.Density.Shore != Inputs.Density.Shore
+        || InInputs.Density.ShoreMarginCm != Inputs.Density.ShoreMarginCm;
     // Tiles written before any inputs, or for other ones, are written again.
     bRewriteAll |= bChanged && Committed.Num() > 0;
     Inputs = InInputs;
@@ -130,6 +174,9 @@ void FVoxelOceanSurface::SetMaterial(UMaterialInstanceDynamic* InMaterial)
     Settings.Material = InMaterial;
     bReportedMaterial = false;
     bReportedShape = false;
+    bReportedFFT = false;
+    bTexturesBound = false;
+    BoundShoreTexture = nullptr;
     if (Pages.IsValid())
         Pages->SetMaterial(InMaterial);
     UpdateMaterial();
@@ -170,8 +217,8 @@ void FVoxelOceanSurface::BuildWrites(TConstArrayView<FVoxelOceanTileKey> Tiles, 
     const double SlopeBound = FMath::Max(Inputs.SlopeBound, 0.0);
     const double Margin = Inputs.LandCullMargin;
     // The waves reach up and sideways over land the cull would otherwise leave dry.
-    const double WaveHeight = WaveModel.IsValid() ? WaveModel->MaxHeight() : 0.0;
-    const double WaveReach = WaveModel.IsValid() ? WaveModel->MaxHorizontal() : 0.0;
+    const double WaveHeight = CullHeight;
+    const double WaveReach = CullReach;
     ParallelFor(Tiles.Num(), [&Tiles, &Out, Quads, Radius, HalfFinest, MinFootprint, SlopeBound, Margin, WaveHeight, WaveReach](int32 Index)
         {
             TArray<VoxelOceanTiles::FTileVertex> Vertices;
@@ -250,9 +297,14 @@ void FVoxelOceanSurface::ApplyRewrites()
 void FVoxelOceanSurface::Tick(const FVector& Camera)
 {
     // The waves before anything drawn: a server has no pages but answers queries with the same
-    // waves as every client.
+    // waves as every client. The weather needs the model; the model's reach follows the weather.
+    UpdateWaveModel();
+    UpdateWeather();
     UpdateWaveModel();
     if (!bAvailable || !Pages.IsValid()) return;
+    // The FFT model's cascades at this tick of the ocean clock, ahead of this frame's drawing.
+    if (FFTModel.IsValid() && Cascades.IsValid())
+        Cascades->Update(VoxelOceanSpectrum::TickOf(Inputs.Time), Inputs.Time, FMath::Max(Inputs.Waves.FoamDecay, 0.0));
     const double Now = FPlatformTime::Seconds();
     Perf.Frames++;
 
@@ -269,6 +321,7 @@ void FVoxelOceanSurface::Tick(const FVector& Camera)
 
     Pages->Flush(Settings.SpareBufferSets);
     ApplyRewrites();
+    UpdateProbe(Camera);
 
     TArray<FVoxelOceanTileKey> Tiles;
     TSet<FVoxelOceanTileKey> Split;
@@ -374,19 +427,158 @@ void FVoxelOceanSurface::Tick(const FVector& Camera)
 
 void FVoxelOceanSurface::UpdateWaveModel()
 {
-    const FVoxelOceanWavesTest::FSettings Next = FVoxelOceanWavesTest::ReadConsole();
-    if (WaveModel.IsValid() == (Next.Amplitude > 0.0) && Next == WaveSettings) return;
-    const double OldHeight = WaveModel.IsValid() ? WaveModel->MaxHeight() : 0.0;
-    const double OldReach = WaveModel.IsValid() ? WaveModel->MaxHorizontal() : 0.0;
-    WaveSettings = Next;
+    const int32 Chosen = VoxelOceanWaves::ChosenModel();
+    const FVoxelOceanWavesTest::FSettings NextTest = FVoxelOceanWavesTest::ReadConsole();
+    // The FFT model's reach covers the weather's greatest long-wave speed, in steps (the slots
+    // don't depend on it, so a rebuild doesn't move the waves).
+    FVoxelOceanFFTSettings NextFFT = Inputs.Waves;
+    const TSharedPtr<const FVoxelOceanWeatherTable, ESPMode::ThreadSafe> Table = GetWeatherTable();
+    double MaxLong = FMath::Max(Inputs.Environment.WindSpeed, Inputs.Environment.SwellSpeed);
+    if (Table.IsValid())
+    {
+        MaxLong = Table->MaxLong;
+    }
+    else if (Chosen == 2 && Inputs.Weather.IsValid() && Settings.Radius > 0.0)
+    {
+        // The first model: its reach from the weather's keys (which the table then reuses), not
+        // a constant it would be rebuilt from at once.
+        if (!WeatherKeys.IsValid())
+            WeatherKeys = MakeUnique<FVoxelOceanWeatherKeys>();
+        MaxLong = WeatherKeys->MaxLongAt(Inputs.Time, Inputs.Weather, Inputs.WeatherTiming, 1 << VoxelOceanCharts::LevelFor(Settings.Radius));
+    }
+    NextFFT.WindSpeed = FVoxelOceanWavesFFT::ReachWind(MaxLong, FFTSettings.WindSpeed, WaveModelKind == 2 && FFTModel.IsValid());
+    bool bSame = false;
+    if (Chosen == 2)
+        bSame = WaveModelKind == 2 && NextFFT == FFTSettings && FFTRadius == Settings.Radius;
+    else if (Chosen == 1)
+        bSame = WaveModelKind == 1 && NextTest == WaveSettings;
+    else
+        bSame = WaveModelKind == 0;
+    if (bSame) return;
+
     WaveModel.Reset();
-    if (Next.Amplitude > 0.0)
-        WaveModel = MakeShared<FVoxelOceanWavesTest, ESPMode::ThreadSafe>(Next);
+    FFTModel.Reset();
+    WaveModelKind = Chosen;
+    WaveSettings = NextTest;
+    if (Chosen == 2 && Settings.Radius > 0.0)
+    {
+        const TSharedPtr<const FVoxelOceanWavesFFT, ESPMode::ThreadSafe> Model = MakeShared<FVoxelOceanWavesFFT, ESPMode::ThreadSafe>(NextFFT, Settings.Radius);
+        FFTModel = Model;
+        WaveModel = Model;
+        FFTSettings = NextFFT;
+        FFTRadius = Settings.Radius;
+        if (Cascades.IsValid())
+            Cascades->SetSlots(Model->GetSlotTable());
+    }
+    else if (Chosen == 1 && NextTest.Amplitude > 0.0)
+    {
+        WaveModel = MakeShared<FVoxelOceanWavesTest, ESPMode::ThreadSafe>(NextTest);
+    }
+    if (Chosen != 2)
+        FFTRadius = 0.0;
     const double NewHeight = WaveModel.IsValid() ? WaveModel->MaxHeight() : 0.0;
     const double NewReach = WaveModel.IsValid() ? WaveModel->MaxHorizontal() : 0.0;
-    // The land cull allows for the waves' reach (BuildWrites).
-    if (Inputs.LandCullMargin >= 0.0 && (OldHeight != NewHeight || OldReach != NewReach))
-        bRewriteAll |= Committed.Num() > 0;
+    // The land cull allows for the waves' reach with headroom (BuildWrites): the tiles are written
+    // again when the waves outgrow it, or shrink well inside it (to cull more again).
+    constexpr double CullHeadroom = 1.25;
+    constexpr double CullShrink = 0.6;
+    const bool bOutgrown = NewHeight > CullHeight || NewReach > CullReach;
+    const bool bShrunk = NewHeight < CullShrink * CullHeight && NewReach <= CullShrink * CullReach;
+    if (bOutgrown || bShrunk)
+    {
+        CullHeight = CullHeadroom * NewHeight;
+        CullReach = CullHeadroom * NewReach;
+        if (Inputs.LandCullMargin >= 0.0)
+            bRewriteAll |= Committed.Num() > 0;
+    }
+    // The pages' bounds hold the reach itself.
+    if (Pages.IsValid())
+        Pages->SetWaveReach(FVector2d(NewHeight, NewReach).Size());
+}
+
+const FVoxelOceanCascadeTextures* FVoxelOceanSurface::GetCascadeTextures() const
+{
+    return FFTModel.IsValid() && Cascades.IsValid() ? &Cascades->GetTextures() : nullptr;
+}
+
+TSharedPtr<const FVoxelOceanWeatherTable, ESPMode::ThreadSafe> FVoxelOceanSurface::GetWeatherTable() const
+{
+    return FFTModel.IsValid() && WeatherKeys.IsValid() ? WeatherKeys->GetTable() : nullptr;
+}
+
+TSharedPtr<FVoxelOceanProbeState, ESPMode::ThreadSafe> FVoxelOceanSurface::GetProbeState() const
+{
+    return Pages.IsValid() ? Pages->GetProbeState() : nullptr;
+}
+
+void FVoxelOceanSurface::UpdateProbe(const FVector& Camera)
+{
+    static_assert(VoxelOceanDepthProbe::Levels == UE_ARRAY_COUNT(ProbeAnchors), "one anchor a level");
+    if (!Pages.IsValid() || !FFTModel.IsValid() || Settings.Radius <= 0.0) return;
+    // Only near the sea: where the underwater view can show.
+    const double Height = Camera.Size() - Settings.Radius;
+    if (Height > FFTModel->MaxHeight() + VOS::ProbeHeight) return;
+    const VoxelOceanDepthProbe::FLevels Levels = VoxelOceanDepthProbe::MakeLevels(Camera, Settings.Radius);
+    // A probe skipped on the render thread (its shader compiling) is made again.
+    const TSharedPtr<FVoxelOceanProbeState, ESPMode::ThreadSafe> State = Pages->GetProbeState();
+    if (State.IsValid() && State->bRetry.exchange(false, std::memory_order_acq_rel))
+        bProbed = false;
+    bool bSame = bProbed && ProbeDensity == Inputs.Density.Density.Get() && ProbeEdits == Inputs.Density.Edits.Get()
+        && ProbeShore == Inputs.Density.Shore.Get() && ProbeSequence == Inputs.EditSequence && ProbeHalfFinest == Inputs.Density.HalfFinest;
+    for (int32 L = 0; bSame && L < VoxelOceanDepthProbe::Levels; L++)
+        bSame = ProbeAnchors[L] == Levels.Anchor[L];
+    if (bSame) return;
+    Pages->ProbeDepth(Levels, Settings.Radius);
+    for (int32 L = 0; L < VoxelOceanDepthProbe::Levels; L++)
+        ProbeAnchors[L] = Levels.Anchor[L];
+    ProbeDensity = Inputs.Density.Density.Get();
+    ProbeEdits = Inputs.Density.Edits.Get();
+    ProbeShore = Inputs.Density.Shore.Get();
+    ProbeSequence = Inputs.EditSequence;
+    ProbeHalfFinest = Inputs.Density.HalfFinest;
+    bProbed = true;
+}
+
+void FVoxelOceanSurface::UpdateWeather()
+{
+    if (!FFTModel.IsValid() || !Inputs.Weather.IsValid())
+    {
+        if (WeatherKeys.IsValid()) WeatherKeys->Reset();
+        UploadedTable = 0;
+        return;
+    }
+    if (!WeatherKeys.IsValid())
+        WeatherKeys = MakeUnique<FVoxelOceanWeatherKeys>();
+    WeatherKeys->Update(Inputs.Time, Inputs.Weather, Inputs.WeatherTiming, FFTModel->GetCharts(), FFTModel->GetTableConstants());
+
+    // Into the chart texture when the table or the texture is new (a server has neither).
+    const TSharedPtr<const FVoxelOceanWeatherTable, ESPMode::ThreadSafe>& Table = WeatherKeys->GetTable();
+    UTexture2D* Texture = Cascades.IsValid() ? Cascades->GetTextures().Charts : nullptr;
+    if (!Table.IsValid() || !Texture || !Texture->GetResource()) return;
+    if (Table->Serial == UploadedTable && Texture == UploadedTexture) return;
+    const VoxelOceanCharts::FTable& T = Table->Table;
+    if (Texture->GetSizeX() != T.Width || Texture->GetSizeY() != T.Height)
+    {
+        UE_LOG(LogVoxelPlugin, Warning, TEXT("[VoxelOcean] The chart texture (%d x %d) doesn't match the weather table (%d x %d)."),
+            Texture->GetSizeX(), Texture->GetSizeY(), T.Width, T.Height);
+        UploadedTable = Table->Serial;
+        UploadedTexture = Texture;
+        return;
+    }
+    const uint32 Pitch = (uint32)T.Width * 16u;
+    const int64 Bytes = (int64)Pitch * T.Height;
+    uint8* Data = (uint8*)FMemory::Malloc(Bytes);
+    FMemory::Memcpy(Data, T.Texels.data(), Bytes);
+    FUpdateTextureRegion2D* Region = new FUpdateTextureRegion2D(0, 0, 0, 0, (uint32)T.Width, (uint32)T.Height);
+    Texture->UpdateTextureRegions(0, 1, Region, Pitch, 16u, Data,
+        [](uint8* InData, const FUpdateTextureRegion2D* InRegion)
+        {
+            FMemory::Free(InData);
+            delete InRegion;
+        });
+    UploadedTable = Table->Serial;
+    UploadedTexture = Texture;
+    ChartUploads++;
 }
 
 bool FVoxelOceanSurface::GetWaveFrame(FVoxelOceanWaveFrame& Out) const
@@ -400,7 +592,19 @@ bool FVoxelOceanSurface::GetWaveFrame(FVoxelOceanWaveFrame& Out) const
     Out.Context.Time = Inputs.Time;
     Out.Context.Radius = Settings.Radius;
     Out.Context.Environment = Inputs.Environment;
+    Out.Context.Weather = GetWeatherTable();
+    // With a table the FFT model reads the weather there; sampling the source per site would be
+    // work thrown away.
+    Out.Environment = Out.Context.Weather.IsValid() ? nullptr : Inputs.Weather;
     Out.Model = WaveModel;
+    // The shore field (stage O8): the queries' shore source, its size for the shaders.
+    if (Inputs.Shore.IsValid() && Inputs.Shore->IsValid())
+    {
+        Out.Shore = Inputs.Shore;
+        Out.ShoreMarginCm = Inputs.Density.ShoreMarginCm;
+        Out.Context.ShoreCells = Inputs.Shore->N;
+        Out.Context.ShoreReachM = Inputs.Shore->ReachM;
+    }
     return true;
 }
 
@@ -437,6 +641,80 @@ void FVoxelOceanSurface::UpdateMaterial()
         for (int32 w = 0; w < 3; w++)
             Material->SetVectorParameterValue(VOS::WaveNames[w], FLinearColor(Waves.Wave[w].X, Waves.Wave[w].Y, Waves.Wave[w].Z, Waves.Wave[w].W));
     }
+    // The FFT model: its parameters every frame (the reference moves), its textures once. Off
+    // (VoxelOceanFFT.x 0) without them: the material then draws the other models.
+    const bool bFFT = Waves.IsFFT() && Cascades.IsValid();
+    auto ToColor = [](const FVector4f& V) { return FLinearColor(V.X, V.Y, V.Z, V.W); };
+    Material->SetVectorParameterValue(VOS::FFTName, bFFT ? ToColor(Waves.FFT) : FLinearColor(0.0f, 0.0f, 0.0f, 0.0f));
+    if (bFFT)
+    {
+        Material->SetVectorParameterValue(VOS::RefHighName, ToColor(Waves.RefHigh));
+        Material->SetVectorParameterValue(VOS::RefLowName, ToColor(Waves.RefLow));
+        Material->SetVectorParameterValue(VOS::RotationName, ToColor(Waves.Rotation));
+        Material->SetVectorParameterValue(VOS::TilesName, ToColor(Waves.Tiles));
+        // No field in the material until its texture is bound (States.x the field's size).
+        FVector4f States = Waves.States;
+        if (!Inputs.ShoreTexture) States.X = 0.0f;
+        Material->SetVectorParameterValue(VOS::StatesName, ToColor(States));
+        Material->SetVectorParameterValue(VOS::SlopeVarName, ToColor(Waves.SlopeVar));
+        if (!bTexturesBound)
+        {
+            const FVoxelOceanCascadeTextures& Textures = Cascades->GetTextures();
+            Material->SetTextureParameterValue(VoxelOceanCascades::DisplacementName, Textures.Displacement);
+            Material->SetTextureParameterValue(VoxelOceanCascades::DerivativesName, Textures.Derivatives);
+            Material->SetTextureParameterValue(VoxelOceanCascades::ChartsName, Textures.Charts);
+            Material->SetTextureParameterValue(VoxelOceanCascades::FoamName, Textures.Foam);
+            bTexturesBound = true;
+            BoundShoreTexture = nullptr;
+        }
+        // The foam's settings live (the model doesn't rebuild for them): the surf's row 16.
+        Waves.Surf[1].Y = (float)FMath::Max(Inputs.Waves.SurfFoam, 0.0);
+        Waves.Surf[1].Z = (float)FMath::Max(Inputs.Waves.FoamCoverage, 0.0);
+        // The shore field's expansion around the selection camera (VoxelOceanShore.ush).
+        WriteShoreFrame(Waves);
+        // The shore field's texture once it exists (until then States.x is 0: no field).
+        if (Inputs.ShoreTexture && Inputs.ShoreTexture != BoundShoreTexture)
+        {
+            Material->SetTextureParameterValue(VOS::ShoreName, Inputs.ShoreTexture);
+            BoundShoreTexture = Inputs.ShoreTexture;
+            UTexture* TextureProbe = nullptr;
+            if (Material->Parent && !Material->Parent->GetTextureParameterValue(FHashedMaterialParameterInfo(VOS::ShoreName), TextureProbe))
+            {
+                UE_LOG(LogVoxelPlugin, Log, TEXT("[VoxelOcean] %s has no texture parameter VoxelOceanShore: the waves don't slow toward the coast and the pixel shader doesn't shoal (stage O8 notes, material setup)."),
+                    *GetNameSafe(Material->Parent));
+            }
+        }
+        if (!bReportedFFT)
+        {
+            // Ask the parent (the instance reports its own overrides whether or not the material
+            // has the parameters).
+            FLinearColor Probe;
+            UTexture* TextureProbe = nullptr;
+            UMaterialInterface* Parent = Material->Parent;
+            if (Parent && !Parent->GetVectorParameterValue(FHashedMaterialParameterInfo(VOS::FFTName), Probe))
+            {
+                UE_LOG(LogVoxelPlugin, Warning, TEXT("[VoxelOcean] %s has no vector parameter VoxelOceanFFT: the FFT waves (voxel.Ocean.WaveModel 2) answer queries but aren't drawn (stage O6b notes, material setup)."),
+                    *GetNameSafe(Parent));
+            }
+            else if (Parent)
+            {
+                for (const FName& Name : { VoxelOceanCascades::DisplacementName, VoxelOceanCascades::DerivativesName, VoxelOceanCascades::ChartsName })
+                {
+                    if (!Parent->GetTextureParameterValue(FHashedMaterialParameterInfo(Name), TextureProbe))
+                    {
+                        UE_LOG(LogVoxelPlugin, Warning, TEXT("[VoxelOcean] %s has no texture parameter %s: the FFT waves can't be drawn (stage O6b notes, material setup)."),
+                            *GetNameSafe(Parent), *Name.ToString());
+                    }
+                }
+                if (!Parent->GetTextureParameterValue(FHashedMaterialParameterInfo(VoxelOceanCascades::FoamName), TextureProbe))
+                {
+                    UE_LOG(LogVoxelPlugin, Log, TEXT("[VoxelOcean] %s has no texture parameter VoxelOceanFoam: the open sea shows no whitecaps (stage O9b notes, material setup)."),
+                        *GetNameSafe(Parent));
+                }
+            }
+            bReportedFFT = true;
+        }
+    }
 
     if (!bReportedMaterial)
     {
@@ -456,7 +734,7 @@ void FVoxelOceanSurface::UpdateMaterial()
         else if (!Parent->GetVectorParameterValue(FHashedMaterialParameterInfo(VOS::WaveNames[0]), Probe)
             || !Parent->GetVectorParameterValue(FHashedMaterialParameterInfo(VOS::CenterName), Probe))
         {
-            UE_LOG(LogVoxelPlugin, Log, TEXT("[VoxelOcean] %s has no vector parameters VoxelOceanWave0 to VoxelOceanWave2 and VoxelOceanCenter: voxel.Ocean.TestWaves shows nothing (stage O2 notes, material setup)."),
+            UE_LOG(LogVoxelPlugin, Log, TEXT("[VoxelOcean] %s has no vector parameters VoxelOceanWave0 to VoxelOceanWave2 and VoxelOceanCenter: voxel.Ocean.WaveModel 1 shows nothing (stage O2 notes, material setup)."),
                 *GetNameSafe(Parent));
         }
         bReportedMaterial = true;
@@ -472,6 +750,46 @@ void FVoxelOceanSurface::UpdateMaterial()
         }
         bReportedShape = true;
     }
+}
+
+void FVoxelOceanSurface::WriteShoreFrame(const FVoxelOceanWaveShaderParams& Waves)
+{
+    UTexture2D* Texture = Cascades.IsValid() ? Cascades->GetTextures().Charts : nullptr;
+    if (!Texture || !Texture->GetResource() || !FFTModel.IsValid()) return;
+    // Rows 8 to 14 the shore field's expansion, 15 and 16 the surf's settings (stage O9a).
+    static_assert(UE_ARRAY_COUNT(WrittenShoreFrame) == VOS::FrameRows, "one written row a frame row");
+    FVector4f Rows[VOS::FrameRows];
+    for (int32 i = 0; i < 7; i++) Rows[i] = Waves.ShoreFrame[i];
+    Rows[7] = Waves.Surf[0];
+    Rows[8] = Waves.Surf[1];
+    // The weather's upload rewrites the whole texture: write again after one (counted as made,
+    // so a table uploaded again under the same serial counts too).
+    bool bSame = ShoreFrameUploads == ChartUploads && ShoreFrameTexture == Texture;
+    for (int32 i = 0; bSame && i < VOS::FrameRows; i++)
+        bSame = WrittenShoreFrame[i] == Rows[i];
+    if (bSame) return;
+    const int32 N = FFTModel->GetCharts().N;
+    const int32 X = VoxelShader::VoxelOceanConstantsX(N);
+    if (X >= Texture->GetSizeX() || 8 + VOS::FrameRows > Texture->GetSizeY()) return;
+    float* Data = (float*)FMemory::Malloc(VOS::FrameRows * 4 * sizeof(float));
+    for (int32 i = 0; i < VOS::FrameRows; i++)
+    {
+        Data[4 * i] = Rows[i].X;
+        Data[4 * i + 1] = Rows[i].Y;
+        Data[4 * i + 2] = Rows[i].Z;
+        Data[4 * i + 3] = Rows[i].W;
+        WrittenShoreFrame[i] = Rows[i];
+    }
+    // A column of FrameRows texels at (X, 8).
+    FUpdateTextureRegion2D* Region = new FUpdateTextureRegion2D((uint32)X, 8, 0, 0, 1, (uint32)VOS::FrameRows);
+    Texture->UpdateTextureRegions(0, 1, Region, 16u, 16u, (uint8*)Data,
+        [](uint8* InData, const FUpdateTextureRegion2D* InRegion)
+        {
+            FMemory::Free(InData);
+            delete InRegion;
+        });
+    ShoreFrameUploads = ChartUploads;
+    ShoreFrameTexture = Texture;
 }
 
 void FVoxelOceanSurface::LogPerf(double Now)

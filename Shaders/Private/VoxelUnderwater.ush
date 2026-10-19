@@ -22,12 +22,26 @@
 // Positions are from the view's camera (the reference point): W.Center is the planet centre from
 // it, Sphere = (sea radius, the camera's height above the sphere), both formed in double on the
 // CPU. Heights come from the stable sphere formula (VoxelOceanSphereHeight) less the waves at
-// the surface point above (VoxelOceanHeightAt, the wave hook), so the waterline is exact to
-// well under a millimetre at the near plane, horizontal displacement included.
+// the surface point above (VoxelOceanHeightAtFFT, the wave hook, any model: the cascade
+// textures come along as VOXEL_OCEAN_TEXTURE_PARAMS), so the waterline is exact to well under
+// a millimetre at the near plane, horizontal displacement included.
+//
+// THE FFT MODEL reads the surface map instead (VoxelUnderwaterMap.ush, written once per view by
+// UnderwaterMapCS from the same inversion): every height the pass asks for is one bilinear read
+// (two at a level's edge) instead of an inversion of a dozen cascade lookups per chart, and the
+// underside's normal comes from the map's heights. The includer that has the map defines
+// VOXEL_UNDERWATER_MAP_LOAD and the rest (VoxelUnderwaterMap.ush) before including this file.
 
 #pragma once
 
 #include "/Plugin/VoxelPlugin/Private/VoxelOceanWaves.ush"
+
+#ifdef VOXEL_UNDERWATER_MAP_LOAD
+#include "/Plugin/VoxelPlugin/Private/VoxelUnderwaterMap.ush"
+#define VOXEL_UNDERWATER_HAS_MAP 1
+#else
+#define VOXEL_UNDERWATER_HAS_MAP 0
+#endif
 
 // An exit distance meaning the ray doesn't leave the water nearby.
 #define VOXEL_UNDERWATER_NO_EXIT 3.0e38f
@@ -44,15 +58,41 @@ float VoxelUnderwaterShellExit(float B, float Height, float Radius, float Offset
     return B > 0.0f ? -C / max(B + Root, 1.0e-6f) : Root - B;
 }
 
+// Q's height above the surface (cm; Q from the camera): the map's surface with the FFT model when
+// the includer has the map, the wave hook's search otherwise. Mask as VoxelOceanHeightAtFFTMask:
+// VOXEL_OCEAN_LOOKUP_ALL fills OutSurface.Normal.
+float VoxelUnderwaterHeight(float3 Q, float2 Sphere, FVoxelOceanWaveParams W, VOXEL_OCEAN_TEXTURE_PARAMS, uint Mask, out FVoxelOceanWaveOutput OutSurface)
+{
+#if VOXEL_UNDERWATER_HAS_MAP
+    if (W.FFT.x >= 0.5f)
+    {
+        const float Height = VoxelOceanSphereHeight(Q, Sphere.x, Sphere.y, normalize(-W.Center));
+        const float3 Up = normalize(Q - W.Center);
+        const float3 Foot = Q - Up * Height;
+        OutSurface = (FVoxelOceanWaveOutput)0;
+        const float Surface = VoxelUnderwaterMapHeight(Foot);
+        OutSurface.Height = Surface;
+        OutSurface.Normal = (Mask & 2u) != 0u ? VoxelUnderwaterMapNormal(Foot, Up) : Up;
+        OutSurface.Jacobian = 1.0f;
+        return Height - Surface;
+    }
+    // The other models (the map pass runs only for the FFT one). Not the FFT search: its code
+    // would set this shader's registers even untaken.
+    return VoxelOceanHeightAt(Q, Sphere, W, OutSurface);
+#else
+    return VoxelOceanHeightAtFFTMask(Q, Sphere, W, VOXEL_OCEAN_TEXTURE_ARGS, Mask, 0.0f, OutSurface);
+#endif
+}
+
 // How far from Start (below the surface) along Dir the ray leaves through the surface;
 // VOXEL_UNDERWATER_NO_EXIT when it doesn't nearby (it heads down into deep water). Without
 // waves it is the sphere's stable root. With them the surface lies in a shell of +-MaxHeight
-// around the sphere (VoxelOceanMaxHeight): the ray is marched across that shell (16 steps,
-// denser near the start; a ray heading down stops where it dives below the shell) and the first
-// crossing is bisected. Inside Snell's window the exit is within a centimetre of the first
+// around the sphere (VoxelOceanMaxHeight): the ray is marched across that shell (16 steps, 32
+// on the map, denser near the start; a ray heading down stops where it dives below the shell)
+// and the first crossing is bisected (6 times, 10 on the map). Inside Snell's window the exit is within a centimetre of the first
 // crossing; a grazing ray may skip a crest tip it only clips, where total internal reflection
 // shows the water colour either way. OutSurface receives the waves where it leaves.
-float VoxelUnderwaterExit(float3 Start, float3 Dir, float2 Sphere, FVoxelOceanWaveParams W, out FVoxelOceanWaveOutput OutSurface)
+float VoxelUnderwaterExit(float3 Start, float3 Dir, float2 Sphere, FVoxelOceanWaveParams W, VOXEL_OCEAN_TEXTURE_PARAMS, out FVoxelOceanWaveOutput OutSurface)
 {
     const float Height = VoxelOceanSphereHeight(Start, Sphere.x, Sphere.y, normalize(-W.Center));
     const float B = dot(Start - W.Center, Dir);
@@ -60,7 +100,7 @@ float VoxelUnderwaterExit(float3 Start, float3 Dir, float2 Sphere, FVoxelOceanWa
     if (MaxHeight <= 0.0f)
     {
         const float T = VoxelUnderwaterShellExit(B, Height, Sphere.x, 0.0f);
-        VoxelOceanHeightAt(Start + Dir * T, Sphere, W, OutSurface);
+        VoxelUnderwaterHeight(Start + Dir * T, Sphere, W, VOXEL_OCEAN_TEXTURE_ARGS, VOXEL_OCEAN_LOOKUP_ALL, OutSurface);
         return T;
     }
 
@@ -83,12 +123,16 @@ float VoxelUnderwaterExit(float3 Start, float3 Dir, float2 Sphere, FVoxelOceanWa
     float Above = Upper;
     bool bFound = false;
     FVoxelOceanWaveOutput Surface;
+    // The map makes a step one read: more of them.
+    const bool bMap = VOXEL_UNDERWATER_HAS_MAP != 0 && W.FFT.x >= 0.5f;
+    const int Steps = bMap ? 32 : 16;
+    const int Bisections = bMap ? 10 : 6;
     [loop]
-    for (int Step = 1; Step <= 16; Step++)
+    for (int Step = 1; Step <= Steps; Step++)
     {
-        const float X = (float)Step / 16.0f;
+        const float X = (float)Step / (float)Steps;
         const float T = Lower + (Upper - Lower) * X * X;
-        if (VoxelOceanHeightAt(Start + Dir * T, Sphere, W, Surface) > 0.0f)
+        if (VoxelUnderwaterHeight(Start + Dir * T, Sphere, W, VOXEL_OCEAN_TEXTURE_ARGS, VOXEL_OCEAN_LOOKUP_DISPLACEMENT, Surface) > 0.0f)
         {
             Above = T;
             bFound = true;
@@ -99,16 +143,16 @@ float VoxelUnderwaterExit(float3 Start, float3 Dir, float2 Sphere, FVoxelOceanWa
     // No crossing before the ray dives below the shell: it stays in the water.
     if (!bFound) return VOXEL_UNDERWATER_NO_EXIT;
     [loop]
-    for (int Bisect = 0; Bisect < 6; Bisect++)
+    for (int Bisect = 0; Bisect < Bisections; Bisect++)
     {
         const float Mid = 0.5f * (Below + Above);
-        if (VoxelOceanHeightAt(Start + Dir * Mid, Sphere, W, Surface) > 0.0f)
+        if (VoxelUnderwaterHeight(Start + Dir * Mid, Sphere, W, VOXEL_OCEAN_TEXTURE_ARGS, VOXEL_OCEAN_LOOKUP_DISPLACEMENT, Surface) > 0.0f)
             Above = Mid;
         else
             Below = Mid;
     }
     const float Exit = 0.5f * (Below + Above);
-    VoxelOceanHeightAt(Start + Dir * Exit, Sphere, W, OutSurface);
+    VoxelUnderwaterHeight(Start + Dir * Exit, Sphere, W, VOXEL_OCEAN_TEXTURE_ARGS, VOXEL_OCEAN_LOOKUP_ALL, OutSurface);
     return Exit;
 }
 
@@ -117,12 +161,12 @@ float VoxelUnderwaterExit(float3 Start, float3 Dir, float2 Sphere, FVoxelOceanWa
 // the scene point (VOXEL_UNDERWATER_FAR for the sky). Light and Meniscus.rgb are in the scene
 // colour's units (pre-exposed).
 float3 VoxelUnderwaterColor(float3 SceneColor, float3 Dir, float NearDistance, float SceneDistance, float2 Sphere,
-    FVoxelOceanWaveParams W, float3 Absorption, float3 Scattering, float3 Light, float4 Meniscus)
+    FVoxelOceanWaveParams W, VOXEL_OCEAN_TEXTURE_PARAMS, float3 Absorption, float3 Scattering, float3 Light, float4 Meniscus)
 {
     // The pixel's point on the near plane.
     const float3 Near = Dir * NearDistance;
     FVoxelOceanWaveOutput NearSurface;
-    const float NearHeight = VoxelOceanHeightAt(Near, Sphere, W, NearSurface);
+    const float NearHeight = VoxelUnderwaterHeight(Near, Sphere, W, VOXEL_OCEAN_TEXTURE_ARGS, VOXEL_OCEAN_LOOKUP_DISPLACEMENT, NearSurface);
     const float MeniscusMix = Meniscus.w > 0.0f ? 1.0f - saturate(abs(NearHeight) / Meniscus.w) : 0.0f;
     if (NearHeight > 0.0f)
         return lerp(SceneColor, Meniscus.rgb, MeniscusMix);
@@ -131,7 +175,7 @@ float3 VoxelUnderwaterColor(float3 SceneColor, float3 Dir, float NearDistance, f
     const float3 Extinction = max(Absorption + Scattering, 1.0e-6f);
     const float3 WaterColor = Light * Scattering / Extinction;
     FVoxelOceanWaveOutput ExitSurface;
-    const float Exit = VoxelUnderwaterExit(Near, Dir, Sphere, W, ExitSurface);
+    const float Exit = VoxelUnderwaterExit(Near, Dir, Sphere, W, VOXEL_OCEAN_TEXTURE_ARGS, ExitSurface);
     const bool bExits = NearDistance + Exit < SceneDistance;
     const float Path = max(bExits ? Exit : SceneDistance - NearDistance, 0.0f);
     float3 Behind = SceneColor;

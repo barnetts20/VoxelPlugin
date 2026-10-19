@@ -6,7 +6,11 @@
 #include "VoxelBrickMesherGPU.h"
 #include "VoxelDensityGPU.h"
 #include "VoxelTerrainStats.h"
+#include "VoxelOceanShoreField.h"
+#include "VoxelOceanDepthProbe.h"
 #include "HAL/IConsoleManager.h"
+#include "RenderUtils.h"
+#include "TextureResource.h"
 #include "RealtimeMeshSimple.h"
 #include "RealtimeMeshComponent.h"
 #include "Compute/RealtimeMeshComputeProvider.h"
@@ -19,6 +23,7 @@
 #include "RenderGraphUtils.h"
 #include "RenderingThread.h"
 #include "Misc/ScopeExit.h"
+#include "Misc/App.h"
 
 DECLARE_CYCLE_STAT(TEXT("Ocean: page flush"), STAT_VoxelOceanFlush, STATGROUP_VoxelTerrain);
 DECLARE_CYCLE_STAT(TEXT("Ocean: page commit"), STAT_VoxelOceanCommit, STATGROUP_VoxelTerrain);
@@ -27,28 +32,14 @@ DECLARE_CYCLE_STAT(TEXT("Ocean: provider (render thread)"), STAT_VoxelOceanProvi
 DECLARE_DWORD_ACCUMULATOR_STAT(TEXT("Ocean: pages"), STAT_VoxelOceanPages, STATGROUP_VoxelTerrain);
 DECLARE_DWORD_ACCUMULATOR_STAT(TEXT("Ocean: pooled buffer sets"), STAT_VoxelOceanPooled, STATGROUP_VoxelTerrain);
 DECLARE_GPU_STAT(VoxelOceanPageWrite);
+DECLARE_GPU_STAT(VoxelOceanProbe);
 
 using namespace RealtimeMesh;
 
-BEGIN_SHADER_PARAMETER_STRUCT(FVoxelOceanWriteParameters, )
-    SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, Jobs)
-    SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, VertexWords)
-    SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<float>, OutPositions)
-    SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<uint>, OutTangents)
-    SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<uint>, OutTexCoords)
-    SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<uint>, OutColors)
-    SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<uint>, OutIndices)
-    SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<uint>, OutArgs)
-    SHADER_PARAMETER(uint32, NumJobs)
-    SHADER_PARAMETER(uint32, TileQuads)
-    SHADER_PARAMETER(uint32, DrawSlots)
-    SHADER_PARAMETER(uint32, VertexCapacity)
-    SHADER_PARAMETER(uint32, TriangleCapacity)
-    SHADER_PARAMETER(uint32, Color)
-    SHADER_PARAMETER(uint32, StreamMask)
-    SHADER_PARAMETER(uint32, FlipWinding)
-    // The density (VoxelDensitySample.ush) and the edits (VoxelEditSample.ush), as the
-    // terrain's FVoxelDensityCS takes them.
+// The density (VoxelDensitySample.ush) and the edits (VoxelEditSample.ush), as the terrain's
+// FVoxelDensityCS takes them, and the shore field's inland-basin cull (stage O8): what a page's
+// vertices and the depth probe sample alike.
+BEGIN_SHADER_PARAMETER_STRUCT(FVoxelOceanDensityParameters, )
     SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<FVoxelOctave>, Octaves)
     SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, EditCells)
     SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, EditOpList)
@@ -73,6 +64,40 @@ BEGIN_SHADER_PARAMETER_STRUCT(FVoxelOceanWriteParameters, )
     SHADER_PARAMETER(float, RidgeGain)
     SHADER_PARAMETER(float, SlopeDamping)
     SHADER_PARAMETER_STRUCT_INCLUDE(FVoxelLandShaderParameters, Land)
+    SHADER_PARAMETER_TEXTURE(Texture2DArray, ShoreTexture)
+    SHADER_PARAMETER(uint32, ShoreN)
+    SHADER_PARAMETER(float, ShoreReach)
+    SHADER_PARAMETER(float, ShoreMarginM)
+END_SHADER_PARAMETER_STRUCT()
+
+BEGIN_SHADER_PARAMETER_STRUCT(FVoxelOceanWriteParameters, )
+    SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, Jobs)
+    SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, VertexWords)
+    SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<float>, OutPositions)
+    SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<uint>, OutTangents)
+    SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<uint>, OutTexCoords)
+    SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<uint>, OutColors)
+    SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<uint>, OutIndices)
+    SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<uint>, OutArgs)
+    SHADER_PARAMETER(uint32, NumJobs)
+    SHADER_PARAMETER(uint32, TileQuads)
+    SHADER_PARAMETER(uint32, DrawSlots)
+    SHADER_PARAMETER(uint32, VertexCapacity)
+    SHADER_PARAMETER(uint32, TriangleCapacity)
+    SHADER_PARAMETER(uint32, Color)
+    SHADER_PARAMETER(uint32, StreamMask)
+    SHADER_PARAMETER(uint32, FlipWinding)
+    SHADER_PARAMETER_STRUCT_INCLUDE(FVoxelOceanDensityParameters, Density)
+END_SHADER_PARAMETER_STRUCT()
+
+// The depth probe (VoxelOceanDepthProbe.h): one thread per point.
+BEGIN_SHADER_PARAMETER_STRUCT(FVoxelOceanProbeParameters, )
+    SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<int>, ProbePoints)
+    SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<float>, ProbeOut)
+    SHADER_PARAMETER(uint32, ProbeCount)
+    SHADER_PARAMETER(uint32, ProbeLevelPoints)
+    SHADER_PARAMETER(FVector4f, ProbeFootprint)
+    SHADER_PARAMETER_STRUCT_INCLUDE(FVoxelOceanDensityParameters, Density)
 END_SHADER_PARAMETER_STRUCT()
 
 class FVoxelOceanWriteCS : public FGlobalShader
@@ -96,6 +121,27 @@ public:
 };
 
 IMPLEMENT_GLOBAL_SHADER(FVoxelOceanWriteCS, "/Plugin/VoxelPlugin/Private/VoxelOceanPage.usf", "WriteCS", SF_Compute);
+
+class FVoxelOceanProbeCS : public FGlobalShader
+{
+public:
+    DECLARE_GLOBAL_SHADER(FVoxelOceanProbeCS);
+    using FParameters = FVoxelOceanProbeParameters;
+    SHADER_USE_PARAMETER_STRUCT(FVoxelOceanProbeCS, FGlobalShader);
+
+    static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
+    {
+        return IsFeatureLevelSupported(Parameters.Platform, ERHIFeatureLevel::SM5);
+    }
+
+    static void ModifyCompilationEnvironment(const FGlobalShaderPermutationParameters& Parameters, FShaderCompilerEnvironment& OutEnvironment)
+    {
+        FGlobalShader::ModifyCompilationEnvironment(Parameters, OutEnvironment);
+        OutEnvironment.CompilerFlags.Add(CFLAG_NoFastMath);
+    }
+};
+
+IMPLEMENT_GLOBAL_SHADER(FVoxelOceanProbeCS, "/Plugin/VoxelPlugin/Private/VoxelOceanPage.usf", "ProbeCS", SF_Compute);
 
 static TAutoConsoleVariable<int32> CVarVoxelOceanPageCreates(
     TEXT("voxel.Ocean.PageCreates"), 8,
@@ -217,6 +263,48 @@ private:
     TRefCountPtr<FRDGPooledBuffer> EditOps;
 };
 
+namespace VoxelOceanPagesDetail
+{
+    /** Render thread. The density, edits and shore cull a page write or the probe binds. */
+    void FillDensity(FRDGBuilder& GraphBuilder, FVoxelOceanInputCache& Cache, const TSharedPtr<const FVoxelDensityGPUData>& InDensity,
+        const TSharedPtr<const FVoxelEditGPUData>& InEdits, double HalfFinest, const TSharedPtr<const FVoxelOceanShoreRHI, ESPMode::ThreadSafe>& Shore,
+        double ShoreMarginCm, FVoxelOceanDensityParameters& Out)
+    {
+        const FVoxelDensityGPUData& Density = *InDensity;
+        const VoxelBrickMesherGPU::FInputs Inputs = Cache.Get(GraphBuilder, InDensity, InEdits);
+        Out.Octaves = GraphBuilder.CreateSRV(Inputs.Octaves);
+        Out.EditCells = GraphBuilder.CreateSRV(Inputs.EditCells);
+        Out.EditOpList = GraphBuilder.CreateSRV(Inputs.EditOpList);
+        Out.EditOps = GraphBuilder.CreateSRV(Inputs.EditOps);
+        Out.EditTableMask = Inputs.EditTableMask;
+        Out.EditCellShift = Inputs.EditCellShift;
+        Out.EditOpCount = Inputs.EditOpCount;
+        Out.HalfFinest = VoxelDoubleFloat(HalfFinest);
+        Out.ContinentOctaves = Density.ContinentOctaves;
+        Out.MountainOctaves = Density.MountainOctaves;
+        Out.DetailOctaves = Density.DetailOctaves;
+        Out.InvNormContinent = Density.InvNormContinent;
+        Out.InvNormMountain = Density.InvNormMountain;
+        Out.InvNormDetail = Density.InvNormDetail;
+        Out.PlanetRadius = Density.PlanetRadius;
+        Out.NoiseAmplitude = Density.NoiseAmplitude;
+        Out.ContinentWeight = Density.ContinentWeight;
+        Out.MountainWeight = Density.MountainWeight;
+        Out.MountainStart = Density.MountainStart;
+        Out.MountainBlend = Density.MountainBlend;
+        Out.DetailWeight = Density.DetailWeight;
+        Out.RidgeGain = Density.RidgeGain;
+        Out.SlopeDamping = Density.SlopeDamping;
+        Out.Land = VoxelLandGPU::GetParameters(GraphBuilder, Density);
+        // The shore field, or a stand-in and no cull.
+        FRHITexture* ShoreTexture = Shore.IsValid() ? Shore->Texture.GetReference() : nullptr;
+        Out.ShoreTexture = ShoreTexture ? ShoreTexture : GBlackArrayTexture->TextureRHI.GetReference();
+        Out.ShoreN = ShoreTexture ? (uint32)Shore->N : 0u;
+        Out.ShoreReach = ShoreTexture ? Shore->ReachM : 0.0f;
+        Out.ShoreMarginM = (float)(ShoreMarginCm * 0.01);
+    }
+}
+
 /** Writes one buffer set's commits when the compute driver runs it (render thread). */
 class FVoxelOceanPageProvider final : public IRealtimeMeshComputeProvider
 {
@@ -235,6 +323,9 @@ public:
         TSharedPtr<const FVoxelDensityGPUData> Density;
         TSharedPtr<const FVoxelEditGPUData> Edits;
         double HalfFinest = 50.0;
+        /** The shore field's inland-basin cull (null: none). */
+        TSharedPtr<const FVoxelOceanShoreRHI, ESPMode::ThreadSafe> Shore;
+        double ShoreMarginCm = 0.0;
     };
 
     explicit FVoxelOceanPageProvider(const TSharedPtr<FVoxelOceanInputCache, ESPMode::ThreadSafe>& InInputCache)
@@ -328,33 +419,8 @@ void FVoxelOceanPageProvider::BuildComputePasses(FRDGBuilder& GraphBuilder, cons
     for (const FState& State : States)
     {
         const uint32 NumJobs = (uint32)State.Jobs.Num() / VOP::JobWords;
-        const FVoxelDensityGPUData& Density = *State.Density;
-        const VoxelBrickMesherGPU::FInputs Inputs = InputCache->Get(GraphBuilder, State.Density, State.Edits);
         FVoxelOceanWriteParameters* Parameters = GraphBuilder.AllocParameters<FVoxelOceanWriteParameters>();
-        Parameters->Octaves = GraphBuilder.CreateSRV(Inputs.Octaves);
-        Parameters->EditCells = GraphBuilder.CreateSRV(Inputs.EditCells);
-        Parameters->EditOpList = GraphBuilder.CreateSRV(Inputs.EditOpList);
-        Parameters->EditOps = GraphBuilder.CreateSRV(Inputs.EditOps);
-        Parameters->EditTableMask = Inputs.EditTableMask;
-        Parameters->EditCellShift = Inputs.EditCellShift;
-        Parameters->EditOpCount = Inputs.EditOpCount;
-        Parameters->HalfFinest = VoxelDoubleFloat(State.HalfFinest);
-        Parameters->ContinentOctaves = Density.ContinentOctaves;
-        Parameters->MountainOctaves = Density.MountainOctaves;
-        Parameters->DetailOctaves = Density.DetailOctaves;
-        Parameters->InvNormContinent = Density.InvNormContinent;
-        Parameters->InvNormMountain = Density.InvNormMountain;
-        Parameters->InvNormDetail = Density.InvNormDetail;
-        Parameters->PlanetRadius = Density.PlanetRadius;
-        Parameters->NoiseAmplitude = Density.NoiseAmplitude;
-        Parameters->ContinentWeight = Density.ContinentWeight;
-        Parameters->MountainWeight = Density.MountainWeight;
-        Parameters->MountainStart = Density.MountainStart;
-        Parameters->MountainBlend = Density.MountainBlend;
-        Parameters->DetailWeight = Density.DetailWeight;
-        Parameters->RidgeGain = Density.RidgeGain;
-        Parameters->SlopeDamping = Density.SlopeDamping;
-        Parameters->Land = VoxelLandGPU::GetParameters(GraphBuilder, Density);
+        VOP::FillDensity(GraphBuilder, *InputCache, State.Density, State.Edits, State.HalfFinest, State.Shore, State.ShoreMarginCm, Parameters->Density);
         Parameters->Jobs = GraphBuilder.CreateSRV(VoxelGPUCommon::UploadStructuredBuffer<uint32>(GraphBuilder, TEXT("Voxel.OceanJobs"), State.Jobs));
         Parameters->VertexWords = GraphBuilder.CreateSRV(VoxelGPUCommon::UploadStructuredBuffer<uint32>(GraphBuilder, TEXT("Voxel.OceanVertexWords"), State.Words));
         Parameters->OutPositions = Positions;
@@ -382,7 +448,47 @@ FVoxelOceanPages::FVoxelOceanPages()
     : NoDensity(MakeShared<FVoxelDensityGPUData>())
     , NoEdits(MakeShared<FVoxelEditGPUData>())
     , InputCache(MakeShared<FVoxelOceanInputCache, ESPMode::ThreadSafe>())
+    , ProbeState(MakeShared<FVoxelOceanProbeState, ESPMode::ThreadSafe>())
 {
+}
+
+void FVoxelOceanPages::ProbeDepth(const VoxelOceanDepthProbe::FLevels& Levels, double InRadius)
+{
+    check(IsInGameThread());
+    if (!FApp::CanEverRender()) return;
+    TArray<int32> Lattice;
+    VoxelOceanDepthProbe::LatticeOf(Levels, InRadius, DensityInputs.HalfFinest, Lattice);
+    static_assert(VoxelOceanDepthProbe::Levels == 4, "the probe's footprints go to the shader as one float4");
+    const FVector4f Footprint((float)Levels.Spacing[0], (float)Levels.Spacing[1], (float)Levels.Spacing[2], (float)Levels.Spacing[3]);
+    const TSharedPtr<const FVoxelDensityGPUData> Density = DensityInputs.Density.IsValid() ? DensityInputs.Density : NoDensity;
+    const TSharedPtr<const FVoxelEditGPUData> Edits = DensityInputs.Edits.IsValid() ? DensityInputs.Edits : NoEdits;
+    ENQUEUE_RENDER_COMMAND(VoxelOceanProbeDepth)([State = ProbeState, Cache = InputCache, Density, Edits, HalfFinest = DensityInputs.HalfFinest,
+        Shore = DensityInputs.Shore, Margin = DensityInputs.ShoreMarginCm, Lattice = MoveTemp(Lattice), Footprint, Levels](FRHICommandListImmediate& RHICmdList)
+        {
+            FGlobalShaderMap* ShaderMap = GetGlobalShaderMap(GMaxRHIFeatureLevel);
+            if (!ShaderMap || !ShaderMap->GetShader(&FVoxelOceanProbeCS::GetStaticType(), 0).IsValid())
+            {
+                State->bRetry.store(true, std::memory_order_release);
+                return;
+            }
+            FRDGBuilder GraphBuilder(RHICmdList);
+            RDG_EVENT_SCOPE_STAT(GraphBuilder, VoxelOceanProbe, "VoxelOceanProbe");
+            const uint32 Count = (uint32)VoxelOceanDepthProbe::Points;
+            FRDGBufferRef Out = GraphBuilder.CreateBuffer(FRDGBufferDesc::CreateStructuredDesc(sizeof(float), Count), TEXT("Voxel.OceanProbe"));
+            FVoxelOceanProbeParameters* P = GraphBuilder.AllocParameters<FVoxelOceanProbeParameters>();
+            P->ProbePoints = GraphBuilder.CreateSRV(VoxelGPUCommon::UploadStructuredBuffer<int32>(GraphBuilder, TEXT("Voxel.OceanProbePoints"), MakeConstArrayView(Lattice)));
+            P->ProbeOut = GraphBuilder.CreateUAV(Out);
+            P->ProbeCount = Count;
+            P->ProbeLevelPoints = (uint32)(VoxelOceanDepthProbe::Size * VoxelOceanDepthProbe::Size);
+            P->ProbeFootprint = Footprint;
+            VOP::FillDensity(GraphBuilder, *Cache, Density, Edits, HalfFinest, Shore, Margin, P->Density);
+            FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("VoxelOceanProbe %u points", Count), TShaderMapRef<FVoxelOceanProbeCS>(ShaderMap), P,
+                FIntVector((int32)FMath::DivideAndRoundUp(Count, 64u), 1, 1));
+            GraphBuilder.QueueBufferExtraction(Out, &State->Depth);
+            GraphBuilder.Execute();
+            State->Levels = Levels;
+            State->bValid = State->Depth.IsValid();
+        });
 }
 
 FVoxelOceanPages::~FVoxelOceanPages()
@@ -441,6 +547,14 @@ void FVoxelOceanPages::SetMaterial(UMaterialInterface* InMaterial)
         Apply(Instance);
     for (const FReleasing& Entry : Releasing)
         Apply(Entry.Instance);
+}
+
+void FVoxelOceanPages::SetWaveReach(double InReach)
+{
+    if (InReach == WaveReach) return;
+    WaveReach = FMath::Max(InReach, 0.0);
+    for (TPair<FVoxelOceanTileKey, FPage>& Pair : Pages)
+        PlaceInstance(Pair.Key, Pair.Value.Instance);
 }
 
 void FVoxelOceanPages::SetMorphEnd0(double InMorphEnd0)
@@ -567,6 +681,11 @@ void FVoxelOceanPages::PlaceInstance(const FVoxelOceanTileKey& PageKey, FInstanc
     VoxelOceanTiles::PageFrame(PageKey, Radius, Origin, Unit);
     Component->SetRelativeTransform(FTransform(FQuat::Identity, Origin, FVector(Unit)));
     Component->SetCustomPrimitiveDataFloat(0, (float)PageKey.Level);
+    // The node and its sag reach 0.77 of the unit cube's half-width (CreateInstance), leaving
+    // 0.23 of a unit around them; the waves may need more.
+    const float BoundsScale = (float)FMath::Max(1.0, (0.77 * Unit + WaveReach) / Unit);
+    if (Component->BoundsScale != BoundsScale)
+        Component->SetBoundsScale(BoundsScale);
 }
 
 bool FVoxelOceanPages::IsReady(const FInstance& Instance)
@@ -753,6 +872,8 @@ void FVoxelOceanPages::Push(const FVoxelOceanTileKey& PageKey, FInstance& Instan
     State.Density = DensityInputs.Density.IsValid() ? DensityInputs.Density : NoDensity;
     State.Edits = DensityInputs.Edits.IsValid() ? DensityInputs.Edits : NoEdits;
     State.HalfFinest = DensityInputs.HalfFinest;
+    State.Shore = DensityInputs.Shore;
+    State.ShoreMarginCm = DensityInputs.ShoreMarginCm;
     State.Version = NextVersion++;
     Instance.PushedVersion = State.Version;
     // The state reaches the provider before the dirty mark: both are render commands.

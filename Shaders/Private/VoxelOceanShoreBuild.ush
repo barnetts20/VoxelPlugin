@@ -1,0 +1,189 @@
+// VoxelOceanShoreBuild.ush - The shore field's build, one cell at a time (VoxelOceanShore.ush,
+// THE BUILD). Shared subset (VoxelShaderCompat.h): the GPU passes (VoxelOceanShoreBuild.usf) and
+// the CPU's build where there is no GPU (VoxelOceanShoreCore.h) run these same functions over the
+// land bake's cells (6 faces of (N + 2 Pad)^2, the bake's layout and apron).
+//
+// The includer defines, before including this file (after VoxelOceanShore.ush):
+//   VOXEL_OCEAN_SHORE_BUILD_PARAM, VOXEL_OCEAN_SHORE_BUILD_ARG   the first argument (its inputs)
+//   VOXEL_OCEAN_SHORE_BUILD_HEIGHT(Index)   a cell's height (m, sea level 0)
+//   VOXEL_OCEAN_SHORE_BUILD_SEA(Index)      whether it is sea-connected (bool; apron cells carry
+//                                           their interior cell's, FVoxelLandBake::BuildSeaConnected)
+//   VOXEL_OCEAN_SHORE_BUILD_SEED(Index)     its seed so far (the jumps' and the pack's input)
+//   VOXEL_OCEAN_SHORE_BUILD_TEXEL(Index)    (optional) a packed texel, the smoothing's input
+
+#ifndef VOXEL_OCEAN_SHORE_BUILD_USH
+#define VOXEL_OCEAN_SHORE_BUILD_USH
+
+// A cell index's face and cell (I, J from -Pad).
+VOXEL_FUNC FVoxelOceanShoreCell VoxelOceanShoreCellOfIndex(int Index, int N)
+{
+    const int S = VoxelOceanShoreSide(N);
+    FVoxelOceanShoreCell C;
+    C.Face = Index / (S * S);
+    const int Rest = Index - C.Face * S * S;
+    C.J = Rest / S - VOXEL_OCEAN_SHORE_PAD;
+    C.I = Rest - (Rest / S) * S - VOXEL_OCEAN_SHORE_PAD;
+    return C;
+}
+
+// The seed pass: an interior cell's nearest coast crossing on its four edges (between it and a
+// neighbour whose flag differs), or none; apron cells none.
+VOXEL_FUNC uint VoxelOceanShoreSeedPass(VOXEL_OCEAN_SHORE_BUILD_PARAM, int Index, int N)
+{
+    const FVoxelOceanShoreCell C = VoxelOceanShoreCellOfIndex(Index, N);
+    if (C.I < 0 || C.I >= N || C.J < 0 || C.J >= N) return VOXEL_OCEAN_SHORE_NONE;
+    const float H = VOXEL_OCEAN_SHORE_BUILD_HEIGHT(Index);
+    const bool bSea = VOXEL_OCEAN_SHORE_BUILD_SEA(Index);
+    float Best = 2.0f;
+    int BestEdge = 0;
+    for (int E = 0; E < 4; E++)
+    {
+        const int2 Step = VoxelOceanShoreEdgeStep(E);
+        // The neighbour's own index: across a face edge, the apron cell at the same place.
+        const int Other = VoxelOceanShoreIndex(C.Face, C.I + Step.x, C.J + Step.y, N);
+        if (VOXEL_OCEAN_SHORE_BUILD_SEA(Other) == bSea) continue;
+        const float Fraction = VoxelOceanShoreCrossing(H, VOXEL_OCEAN_SHORE_BUILD_HEIGHT(Other));
+        if (Fraction < Best)
+        {
+            Best = Fraction;
+            BestEdge = E;
+        }
+    }
+    return Best < 1.5f ? VoxelOceanShoreSeed(C.Face, C.I, C.J, N, BestEdge, Best) : VOXEL_OCEAN_SHORE_NONE;
+}
+
+// A jump of K cells: of a cell's own seed and those of the 8 interior cells K away (on whichever
+// face holds them), the nearest to its centre.
+VOXEL_FUNC uint VoxelOceanShoreJumpPass(VOXEL_OCEAN_SHORE_BUILD_PARAM, int Index, int N, int K)
+{
+    const FVoxelOceanShoreCell C = VoxelOceanShoreCellOfIndex(Index, N);
+    const float3 P = VoxelOceanShoreCellDir(C.Face, C.I, C.J, N);
+    FVoxelOceanShoreBest Best = VoxelOceanShoreConsider(VoxelOceanShoreBestNone(), P, VOXEL_OCEAN_SHORE_BUILD_SEED(Index), N);
+    for (int DJ = -1; DJ <= 1; DJ++)
+    {
+        for (int DI = -1; DI <= 1; DI++)
+        {
+            if (DI == 0 && DJ == 0) continue;
+            const FVoxelOceanShoreCell Q = VoxelOceanShoreCellOf(C.Face, C.I + DI * K, C.J + DJ * K, N);
+            Best = VoxelOceanShoreConsider(Best, P, VOXEL_OCEAN_SHORE_BUILD_SEED(VoxelOceanShoreIndex(Q.Face, Q.I, Q.J, N)), N);
+        }
+    }
+    return Best.Seed;
+}
+
+// The texel: the distance to the coast (signed by the cell's flag; the reach without a seed), the
+// landward direction in the face's axes, and the beach slope.
+// - Away from the coast (from 2.5 cells): the distance to the cell's seed, the direction toward it
+//   (away from it on land: landward on both sides), the slope between the seed's two cells.
+// - Near it (within a cell): from the heights' own gradient, the coast taken as their zero level:
+//   distance |h| / |grad h|, direction uphill, slope |grad h|. The seeds are coast crossings a cell
+//   apart, so near them the direction to the nearest swings as a point moves along the coast, and
+//   the distance scallops between them; the gradient is smooth. Blended between.
+VOXEL_FUNC uint VoxelOceanShorePackPass(VOXEL_OCEAN_SHORE_BUILD_PARAM, int Index, int N, float RadiusM, float Reach)
+{
+    const FVoxelOceanShoreCell C = VoxelOceanShoreCellOfIndex(Index, N);
+    const bool bSea = VOXEL_OCEAN_SHORE_BUILD_SEA(Index);
+    const float Sign = bSea ? 1.0f : -1.0f;
+    const uint Seed = VOXEL_OCEAN_SHORE_BUILD_SEED(Index);
+    if (Seed == VOXEL_OCEAN_SHORE_NONE)
+        return VoxelOceanShorePack(Sign * Reach, Reach, 0.0f, 0.0f, VOXEL_OCEAN_SHORE_DEFAULT_SLOPE, false);
+    const float3 FU = VoxelCubeAxisVector(VoxelCubeUAxis(uint(C.Face)));
+    const float3 FV = VoxelCubeAxisVector(VoxelCubeVAxis(uint(C.Face)));
+    const float3 P = VoxelOceanShoreCellDir(C.Face, C.I, C.J, N);
+    const float3 Q = VoxelOceanShoreSeedPoint(Seed, N);
+    const float3 D = P - Q;
+    const float SeedDistance = min(VoxelOceanShoreArc(dot(D, D), RadiusM), Reach);
+    // Toward the seed from the sea, away from it on land (tangent at the cell).
+    float3 Dir = Q - P * dot(P, Q);
+    const float DirLength = length(Dir);
+    Dir = DirLength > 1.0e-12f ? Dir * (Sign / DirLength) : float3(0.0f, 0.0f, 0.0f);
+    // The seed's slope: its two cells' heights over their distance.
+    const FVoxelOceanShoreSeedParts Parts = VoxelOceanShoreSeedPartsOf(Seed, N);
+    const int2 Step = VoxelOceanShoreEdgeStep(Parts.Edge);
+    const FVoxelOceanShoreSeedCells Cells = VoxelOceanShoreSeedCellsOf(Seed, N);
+    const float3 A = VoxelOceanShoreCellDir(Parts.Face, Parts.I, Parts.J, N);
+    const float3 B = VoxelOceanShoreCellDir(Parts.Face, Parts.I + Step.x, Parts.J + Step.y, N);
+    const float3 AB = A - B;
+    const float Apart = max(VoxelOceanShoreArc(dot(AB, AB), RadiusM), 1.0f);
+    float Slope = abs(VOXEL_OCEAN_SHORE_BUILD_HEIGHT(Cells.B) - VOXEL_OCEAN_SHORE_BUILD_HEIGHT(Cells.A)) / Apart;
+    float Distance = SeedDistance;
+
+    // Near the coast, the heights' gradient (central differences on the face; the apron's last
+    // ring has no neighbour outside, and keeps the seed's).
+    const int Lo = -VOXEL_OCEAN_SHORE_PAD + 1;
+    const int Hi = N + VOXEL_OCEAN_SHORE_PAD - 2;
+    if (C.I >= Lo && C.I <= Hi && C.J >= Lo && C.J <= Hi)
+    {
+        const float H = VOXEL_OCEAN_SHORE_BUILD_HEIGHT(Index);
+        // The grid's steps (m) and the heights' differences along them.
+        const float3 TI = (VoxelOceanShoreCellDir(C.Face, C.I + 1, C.J, N) - VoxelOceanShoreCellDir(C.Face, C.I - 1, C.J, N)) * (0.5f * RadiusM);
+        const float3 TJ = (VoxelOceanShoreCellDir(C.Face, C.I, C.J + 1, N) - VoxelOceanShoreCellDir(C.Face, C.I, C.J - 1, N)) * (0.5f * RadiusM);
+        const float HI = 0.5f * (VOXEL_OCEAN_SHORE_BUILD_HEIGHT(VoxelOceanShoreIndex(C.Face, C.I + 1, C.J, N)) - VOXEL_OCEAN_SHORE_BUILD_HEIGHT(VoxelOceanShoreIndex(C.Face, C.I - 1, C.J, N)));
+        const float HJ = 0.5f * (VOXEL_OCEAN_SHORE_BUILD_HEIGHT(VoxelOceanShoreIndex(C.Face, C.I, C.J + 1, N)) - VOXEL_OCEAN_SHORE_BUILD_HEIGHT(VoxelOceanShoreIndex(C.Face, C.I, C.J - 1, N)));
+        // The gradient in 3D through the steps' metric (they are not quite orthogonal).
+        const float G00 = dot(TI, TI);
+        const float G01 = dot(TI, TJ);
+        const float G11 = dot(TJ, TJ);
+        const float Det = G00 * G11 - G01 * G01;
+        const float CellM = sqrt(G00);
+        if (Det > 1.0e-6f * G00 * G11)
+        {
+            const float CI = (G11 * HI - G01 * HJ) / Det;
+            const float CJ = (G00 * HJ - G01 * HI) / Det;
+            const float3 Grad = TI * CI + TJ * CJ;
+            const float LocalSlope = length(Grad);
+            // Only where the height's sign agrees with the flag (not in an inland basin's rim).
+            if (LocalSlope > 1.0e-5f && bSea == (H < 0.0f))
+            {
+                const float W = smoothstep(1.0f * CellM, 2.5f * CellM, SeedDistance);
+                Distance = min(W * SeedDistance + (1.0f - W) * abs(H) / LocalSlope, Reach);
+                Dir = Dir * W + Grad * ((1.0f - W) / LocalSlope);
+                Slope = W * Slope + (1.0f - W) * LocalSlope;
+            }
+        }
+    }
+    return VoxelOceanShorePack(Sign * Distance, Reach, dot(Dir, FU), dot(Dir, FV), Slope, true);
+}
+
+// A smoothing pass over the texels (the includer defines VOXEL_OCEAN_SHORE_BUILD_TEXEL(Index), the
+// pass before's): the direction and the slope's log averaged over the 5 x 5 texels around (on the
+// face, its apron included; texels with a coast), the distance kept. Two passes take out the
+// cell-to-cell swings of the seeds' directions and slopes that the waves' warp would magnify
+// (its move is kilometres near the coast). Where the directions cancel (between two coasts) the
+// texel keeps its own.
+#ifdef VOXEL_OCEAN_SHORE_BUILD_TEXEL
+VOXEL_FUNC uint VoxelOceanShoreSmoothPass(VOXEL_OCEAN_SHORE_BUILD_PARAM, int Index, int N, float Reach)
+{
+    const uint Bits = VOXEL_OCEAN_SHORE_BUILD_TEXEL(Index);
+    const FVoxelOceanShoreTexel Centre = VoxelOceanShoreUnpack(Bits, Reach);
+    if (Centre.Coast < 0.5f) return Bits;
+    const FVoxelOceanShoreCell C = VoxelOceanShoreCellOfIndex(Index, N);
+    const int Lo = -VOXEL_OCEAN_SHORE_PAD;
+    const int Hi = N + VOXEL_OCEAN_SHORE_PAD - 1;
+    float SumU = 0.0f;
+    float SumV = 0.0f;
+    float SumLog = 0.0f;
+    float Count = 0.0f;
+    for (int DJ = -2; DJ <= 2; DJ++)
+    {
+        for (int DI = -2; DI <= 2; DI++)
+        {
+            const int I = clamp(C.I + DI, Lo, Hi);
+            const int J = clamp(C.J + DJ, Lo, Hi);
+            const FVoxelOceanShoreTexel T = VoxelOceanShoreUnpack(VOXEL_OCEAN_SHORE_BUILD_TEXEL(VoxelOceanShoreIndex(C.Face, I, J, N)), Reach);
+            if (T.Coast < 0.5f) continue;
+            SumU += T.DirU;
+            SumV += T.DirV;
+            SumLog += log2(T.Slope);
+            Count += 1.0f;
+        }
+    }
+    const float Length = sqrt(SumU * SumU + SumV * SumV);
+    const bool bAgree = Length > 0.25f * Count;
+    const float DirU = bAgree ? SumU / Length : Centre.DirU;
+    const float DirV = bAgree ? SumV / Length : Centre.DirV;
+    return VoxelOceanShorePack(Centre.Distance, Reach, DirU, DirV, exp2(SumLog / max(Count, 1.0f)), true);
+}
+#endif
+
+#endif // VOXEL_OCEAN_SHORE_BUILD_USH

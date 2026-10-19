@@ -8,7 +8,8 @@
 // pass per ocean from a view extension, FVoxelUnderwaterViewExtension), the water's optics,
 // and height queries. Stage O4: the wave model interface (VoxelOceanWaves.h, the GPU hook in
 // VoxelOceanWaves.ush), the surface query on any thread, the ocean clock, and the environment
-// inputs (wind, storm) the atmosphere will provide.
+// inputs (wind, storm) the atmosphere will provide. Stage O6b: the FFT waves (the cascades'
+// textures, made and kept here; FVoxelOceanWavesFFT, FVoxelOceanCascades).
 
 #pragma once
 
@@ -23,10 +24,16 @@
 
 class FVoxelOceanSurface;
 class UMaterialInstanceDynamic;
+class UTexture2D;
+class UTexture2DArray;
 class AAdaptiveVoxelActor;
 class FVoxelUnderwaterViewExtension;
 struct FVoxelDensityGPUData;
 struct FVoxelOceanSurfaceInputs;
+class FVoxelOceanShoreField;
+class FVoxelOceanShoreBuilder;
+struct FVoxelOceanShoreRHI;
+class FTextureResource;
 
 /** The ocean surface: every frame the tiles the camera selects are committed to GPU pages
  *  (one frame per change, the previous tiles kept until the new ones can be drawn), and the
@@ -115,6 +122,13 @@ public:
     UFUNCTION(BlueprintCallable, BlueprintPure, Category = "Ocean|Query")
     double GetOceanTime() const;
 
+    /** The weather at a world point now (the weather source: procedural, or the Environment
+     *  constants), exactly; the waves follow it through 5-minute keys and whole heading steps.
+     *  The wind and the swell (world axes, tangent, m/s; where they blow toward) and the storm
+     *  (0-1). False before the ocean is initialized. */
+    UFUNCTION(BlueprintCallable, BlueprintPure, Category = "Ocean|Weather")
+    bool GetWeatherAt(const FVector& WorldLocation, FVector& Wind, double& Storm, FVector& Swell) const;
+
     // --- Accessors ---
 
     USceneComponent* GetMeshAttachmentRoot() const { return MeshAttachmentRoot; }
@@ -174,6 +188,41 @@ private:
     UPROPERTY(Transient)
     TObjectPtr<UMaterialInstanceDynamic> SurfaceMaterialInstance;
 
+    /** The FFT cascades' textures (FVoxelOceanCascadeTextures): the outputs the surface material
+     *  and the underwater pass sample, and the chart table for this radius. Made once (no
+     *  renderer: none). */
+    UPROPERTY(Transient)
+    TObjectPtr<UTexture2DArray> WaveDisplacement;
+
+    UPROPERTY(Transient)
+    TObjectPtr<UTexture2DArray> WaveDerivatives;
+
+    UPROPERTY(Transient)
+    TObjectPtr<UTexture2D> WaveCharts;
+
+    /** The open sea's foam per slot (stage O9b). */
+    UPROPERTY(Transient)
+    TObjectPtr<UTexture2DArray> WaveFoam;
+
+    /** The radius WaveCharts was made for. */
+    double WaveChartsRadius = 0.0;
+
+    /** The shore field (stage O8; FVoxelOceanShoreField): made from the planet's land bake at
+     *  load (ShoreBuilder), its texture for the material and the passes, and that texture's
+     *  render-thread handle. None without a land bake (open water everywhere). */
+    TSharedPtr<FVoxelOceanShoreBuilder> ShoreBuilder;
+    TSharedPtr<const FVoxelOceanShoreField, ESPMode::ThreadSafe> ShoreField;
+    UPROPERTY(Transient)
+    TObjectPtr<UTexture2DArray> ShoreTexture;
+    TSharedPtr<const FVoxelOceanShoreRHI, ESPMode::ThreadSafe> ShoreRHI;
+    /** The texture's resource ShoreRHI was made from (compared only). */
+    const FTextureResource* ShoreResource = nullptr;
+    /** Starts the shore field's build when the land bake, the radius or the reach changed, and
+     *  takes it when done. */
+    void UpdateShoreField();
+    /** voxel.Debug.OceanShore: the shore field around the camera. */
+    void DrawShoreDebug() const;
+
     /** The view from under water: one view extension per ocean, fed every tick. */
     TSharedPtr<FVoxelUnderwaterViewExtension, ESPMode::ThreadSafe> UnderwaterExtension;
 
@@ -222,6 +271,16 @@ private:
     void ApplyOptics();
     /** The environment constants from the properties. */
     FVoxelOceanEnvironment GetEnvironment() const;
+    /** The weather source for the settings (a new one only when they change: its keys start
+     *  over). */
+    void UpdateWeatherSource();
+    /** voxel.Debug.OceanWeather: the wind (white), swell (cyan) and storms (red) around the
+     *  camera. */
+    void DrawWeatherDebug() const;
+    TSharedPtr<const IVoxelOceanEnvironmentSource, ESPMode::ThreadSafe> WeatherSource;
+    /** The settings and radius WeatherSource was made for. */
+    FVoxelOceanSettings WeatherSourceSettings;
+    double WeatherSourceRadius = -1.0;
     /** Publishes this tick's waves to the queries (and the underwater pass). */
     void PublishWaveFrame();
     /** voxel.Debug.OceanQuery: query points around the camera drawn on the surface. */
