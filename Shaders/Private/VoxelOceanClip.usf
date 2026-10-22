@@ -50,6 +50,39 @@ Texture2D ClipCharts;
 Texture2DArray ClipFoam;
 SamplerState ClipFoamSampler;
 uint ClipFoamOn;                    // 0: no foam texture (the waves without foam)
+// The rings (stage W2; VoxelOceanRingLayout.ush): x their half side (cells), y and z the morph's
+// start and end (cells), w their levels (as many as the rings draw; 0: the tile pages).
+float4 ClipRing;
+
+// The rings' vertex spacing at a point (cm; stage W3f), from its plane offset from the camera (cm):
+// level i's cell G_i = 2 T_i where the finest square that holds it lies, doubling through the
+// morph. A function of the point alone, so every level decides the surf's share of the energy as
+// the vertices there see it: the levels agree, and the rings' morph from one to the next doesn't
+// switch the sea from the trains to the long bands (the "cliff" at a level's edge near shores).
+// (The squares about the camera itself, not the snapped ones: a cell's difference at most, the
+// same in every level.)
+float VoxelOceanClipRingSpacing(FVoxelOceanClipFrame F, float2 Offset)
+{
+    const int Count = clamp(min(int(F.Count + 0.5f), int(ClipRing.w + 0.5f)), 0, VOXEL_OCEAN_CLIP_MAX_LEVELS);
+    const float D = max(abs(Offset.x), abs(Offset.y));
+    float G = 0.0f;
+    for (int I = 0; I < VOXEL_OCEAN_CLIP_MAX_LEVELS; I++)
+    {
+        if (I >= Count) break;
+        const FVoxelOceanClipLevel L = VoxelOceanClipLevelOf(ClipInfoRows[VOXEL_OCEAN_CLIP_SHARED_ROWS + VOXEL_OCEAN_CLIP_LEVEL_ROWS * I],
+            ClipInfoRows[VOXEL_OCEAN_CLIP_SHARED_ROWS + VOXEL_OCEAN_CLIP_LEVEL_ROWS * I + 1]);
+        G = 2.0f * L.Spacing;
+        const float Cells = D / max(G, 1.0e-3f);
+        if (Cells <= ClipRing.x)
+        {
+            const bool bOuter = I + 1 >= Count;
+            const float Morph = bOuter ? 0.0f : saturate((Cells - ClipRing.y) / max(ClipRing.z - ClipRing.y, 1.0e-3f));
+            return G * exp2(Morph);
+        }
+    }
+    // Past the outermost ring (the far sphere): twice its cell.
+    return 2.0f * G;
+}
 
 [numthreads(8, 8, 1)]
 void ClipWaveCS(uint3 Id : SV_DispatchThreadID)
@@ -69,10 +102,15 @@ void ClipWaveCS(uint3 Id : SV_DispatchThreadID)
     const int2 OriginMod = ClipWindowMod[Index].xy;
     const float Spacing = Window.z;
     const int Slot = int(Window.w + 0.5f);
-    const FVoxelOceanWaveParams W = VoxelOceanMakeWaveParamsFFT(ClipParams, ClipWave0, ClipWave1, ClipWave2, ClipCenter, ClipShape, ClipFFT,
+    FVoxelOceanWaveParams W = VoxelOceanMakeWaveParamsFFT(ClipParams, ClipWave0, ClipWave1, ClipWave2, ClipCenter, ClipShape, ClipFFT,
         ClipRefHigh, ClipRefLow, ClipRotation, ClipTiles, ClipStates, ClipSlopeVar);
     // The point from the reference (the selection camera), world axes; its radial.
-    const float3 X = VoxelOceanClipPointOf(F, VoxelOceanClipTexelOffset(Window.xy, Spacing, float(Id.x), float(Id.y)));
+    const float2 Offset = VoxelOceanClipTexelOffset(Window.xy, Spacing, float(Id.x), float(Id.y));
+    const float3 X = VoxelOceanClipPointOf(F, Offset);
+    // With the rings, the surf decides by their spacing at the point (at least this level's texel,
+    // which it can hold), not by this level's own.
+    if (ClipRing.w > 0.5f)
+        W.SurfSpacing = max(VoxelOceanClipRingSpacing(F, Offset), Spacing);
     const float3 P = VoxelOceanRotate(W.Rotation, X);
     const float3 Up = normalize(P - W.Center);
     const float3 UpP = VoxelOceanRotateBack(W.Rotation, Up);

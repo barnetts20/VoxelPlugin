@@ -6,6 +6,10 @@
 #include "VoxelBrickTerrain.h"
 #include "VoxelTerrainStats.h"
 #include "VoxelUnderwaterViewExtension.h"
+#include "VoxelOceanSurfacePass.h"
+#include "VoxelOceanRingDraw.h"
+#include "Components/DirectionalLightComponent.h"
+#include "UObject/UObjectIterator.h"
 #include "VoxelOceanCascades.h"
 #include "VoxelOceanWeather.h"
 #include "VoxelOceanShoreField.h"
@@ -111,6 +115,7 @@ void AOceanSphereActor::BeginPlay()
 void AOceanSphereActor::EndPlay(const EEndPlayReason::Type EndPlayReason)
 {
     ReleaseUnderwater();
+    ReleaseSurfacePass();
     if (ShoreBuilder.IsValid())
         ShoreBuilder->Reset();
     if (CoastBuilder.IsValid())
@@ -130,6 +135,7 @@ void AOceanSphereActor::EndPlay(const EEndPlayReason::Type EndPlayReason)
 void AOceanSphereActor::Destroyed()
 {
     ReleaseUnderwater();
+    ReleaseSurfacePass();
     {
         FWriteScopeLock Lock(QueryLock);
         QueryFrame.Reset();
@@ -145,6 +151,7 @@ void AOceanSphereActor::BeginDestroy()
 {
     // An editor world unloads without EndPlay or Destroyed.
     ReleaseUnderwater();
+    ReleaseSurfacePass();
     Super::BeginDestroy();
 }
 
@@ -365,6 +372,108 @@ void AOceanSphereActor::ReleaseUnderwater()
             Extension.Reset();
         });
     UnderwaterExtension.Reset();
+}
+
+void AOceanSphereActor::CreateSurfacePass()
+{
+    // A server or a commandlet draws nothing. One per world the actor lives in.
+    UWorld* World = GetWorld();
+    if (SurfacePass.IsValid() || !World || !FApp::CanEverRender()) return;
+    SurfacePass = FSceneViewExtensions::NewExtension<FVoxelOceanSurfacePass>(World);
+    bSurfacePassOn = false;
+}
+
+UDirectionalLightComponent* AOceanSphereActor::FindSunLight()
+{
+    UWorld* World = GetWorld();
+    if (!World) return nullptr;
+    const double Now = FPlatformTime::Seconds();
+    UDirectionalLightComponent* Current = SunLight.Get();
+    if (Current && Current->GetWorld() == World && Now - SunLightSearchTime < 1.0) return Current;
+    SunLightSearchTime = Now;
+    UDirectionalLightComponent* Best = nullptr;
+    bool bBestAtmosphere = false;
+    float BestBrightness = -1.0f;
+    for (TObjectIterator<UDirectionalLightComponent> It; It; ++It)
+    {
+        UDirectionalLightComponent* Light = *It;
+        if (!Light || Light->GetWorld() != World || !Light->IsRegistered() || !Light->IsVisible() || !Light->bAffectsWorld) continue;
+        const bool bAtmosphere = Light->IsUsedAsAtmosphereSunLight() && Light->GetAtmosphereSunLightIndex() == 0;
+        const float Brightness = Light->GetColoredLightBrightness().GetLuminance();
+        if (!Best || (bAtmosphere && !bBestAtmosphere) || (bAtmosphere == bBestAtmosphere && Brightness > BestBrightness))
+        {
+            Best = Light;
+            bBestAtmosphere = bAtmosphere;
+            BestBrightness = Brightness;
+        }
+    }
+    SunLight = Best;
+    return Best;
+}
+
+void AOceanSphereActor::UpdateSurfacePass()
+{
+    if (!SurfacePass.IsValid()) return;
+    bool bVisible = !IsHidden();
+#if WITH_EDITOR
+    if (const UWorld* World = GetWorld(); World && !World->IsGameWorld())
+        bVisible = bVisible && !IsHiddenEd();
+#endif
+    const TSharedPtr<IVoxelOceanRingDraw, ESPMode::ThreadSafe> Rings = Surface.IsValid() ? Surface->GetRingDraw() : nullptr;
+    const bool bOn = OceanSettings.bOwnShading && bVisible && bInitialized && Rings.IsValid();
+    SurfacePass->SetEnabled(bOn);
+    if (!bOn)
+    {
+        // Off: the render thread lets go of the rings (their buffers).
+        if (bSurfacePassOn) SurfacePass->SetFrame_GameThread(FVoxelOceanShadingParams());
+        bSurfacePassOn = false;
+        return;
+    }
+    bSurfacePassOn = true;
+
+    const FVoxelOceanSettings& S = OceanSettings;
+    FVoxelOceanShadingParams Params;
+    Params.Rings = Rings;
+    Params.Absorption = FVector3f(S.Absorption.R, S.Absorption.G, S.Absorption.B);
+    Params.Scattering = FVector3f(S.Scattering.R, S.Scattering.G, S.Scattering.B);
+    Params.PhaseG = S.PhaseG;
+    // The stand-in light (stage W3a): the world's sun, and a gradient sky by its illuminance.
+    if (UDirectionalLightComponent* Sun = FindSunLight())
+    {
+        const FLinearColor E = Sun->GetColoredLightBrightness();
+        const float Luminance = FMath::Max(E.GetLuminance(), 0.0f);
+        Params.SunDirection = FVector3f(-Sun->GetDirection().GetSafeNormal());
+        Params.SunIlluminance = FVector3f(E.R, E.G, E.B);
+        Params.SkyZenith = FVector3f(S.StandInSkyZenith.R, S.StandInSkyZenith.G, S.StandInSkyZenith.B) * Luminance;
+        Params.SkyHorizon = FVector3f(S.StandInSkyHorizon.R, S.StandInSkyHorizon.G, S.StandInSkyHorizon.B) * Luminance;
+    }
+    else if (!bWarnedNoSun)
+    {
+        UE_LOG(LogVoxelPlugin, Warning, TEXT("[VoxelOcean] %s: no directional light in the world, so the ocean's own pass has no sun or sky to shade with until the atmosphere's light is connected (stage W3b). Add one, or turn off bOwnShading for the material."),
+            *GetName());
+        bWarnedNoSun = true;
+    }
+    Params.ShortWaveSlopeVariance = S.ShortWaveSlopeVariance;
+    Params.Refraction = S.Refraction;
+    Params.bFoam = S.bFoam;
+    Params.FoamAlbedo = FVector3f(S.FoamAlbedo.R, S.FoamAlbedo.G, S.FoamAlbedo.B);
+    SurfacePass->SetFrame_GameThread(Params);
+}
+
+void AOceanSphereActor::ReleaseSurfacePass()
+{
+    if (!SurfacePass.IsValid()) return;
+    SurfacePass->SetEnabled(false);
+    // Off the renderer's hook, and the last reference, on the render thread after the frames that
+    // may still use it.
+    ENQUEUE_RENDER_COMMAND(VoxelOceanSurfacePassRelease)(
+        [Pass = MoveTemp(SurfacePass)](FRHICommandListImmediate&) mutable
+        {
+            Pass->Unregister_RenderThread();
+            Pass.Reset();
+        });
+    SurfacePass.Reset();
+    bSurfacePassOn = false;
 }
 
 bool AOceanSphereActor::QuerySurface(TConstArrayView<FVector> WorldPoints, TArrayView<FVoxelOceanSample> Out,
@@ -729,6 +838,8 @@ void AOceanSphereActor::SetActorHiddenInGame(bool bNewHidden)
     // A hidden ocean (disabled or parked by its planet) has no underwater view.
     if (bNewHidden && UnderwaterExtension.IsValid())
         UnderwaterExtension->SetEnabled(false);
+    if (bNewHidden && SurfacePass.IsValid())
+        SurfacePass->SetEnabled(false);
 }
 
 void AOceanSphereActor::Initialize()
@@ -856,6 +967,7 @@ void AOceanSphereActor::InitializeInternal(TSharedPtr<FDensitySampleCompositor> 
     Settings.Clip.FinestCm = OceanSettings.ClipFinestSpacing;
     Settings.Clip.bRings = OceanSettings.bWaveRings;
     Settings.Clip.FarCells = OceanSettings.FarSphereCells;
+    Settings.Clip.bOwnPass = OceanSettings.bOwnShading;
     Settings.Material = SurfaceMaterialInstance.Get();
     if (WaveChartsRadius == OceanRadius)
     {
@@ -869,6 +981,7 @@ void AOceanSphereActor::InitializeInternal(TSharedPtr<FDensitySampleCompositor> 
     Surface->Initialize(this, MeshAttachmentRoot, Settings);
     ApplyOptics();
     CreateUnderwater();
+    CreateSurfacePass();
 
     LastInitScale = GetActorScale3D();
     bInitialized = true;
@@ -906,6 +1019,8 @@ void AOceanSphereActor::Tick(float DeltaTime)
 
     // The view from under water: every view decides for itself on the render thread.
     UpdateUnderwater();
+    // The ocean's own pass (stage W3), with the rings this frame.
+    UpdateSurfacePass();
     DrawQueryDebug();
     DrawWeatherDebug();
     DrawShoreDebug();

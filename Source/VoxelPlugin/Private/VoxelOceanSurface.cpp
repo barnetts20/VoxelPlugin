@@ -46,7 +46,11 @@ static TAutoConsoleVariable<int32> CVarVoxelOceanDebugSurf(
     TEXT("0 off, 1 the field's direction agreement, 2 the surf trains' share, 3 the swell trains' share, 4 the long FFT waves kept, ")
     TEXT("5 the FFT warp's move (2 km white), 6 the waves' depth (50 m white), 7 the field's slope (1:50 white), 8 the bed's hold, ")
     TEXT("9 the field's distance (10 km white), 10 the drain's keep; the coastal field (stage O9h): 11 a 9 s wave's crests, 12 its cover, ")
-    TEXT("13 its slowness check (half white where right), 14 its rays against the shore field's direction (white: the same)."),
+    TEXT("13 its slowness check (half white where right), 14 its rays against the shore field's direction (white: the same); ")
+    TEXT("the shoaling (stage W3f): 15 the depth's contours (every 10 m), 16 where the surface folds over itself (white), ")
+    TEXT("17 the first long band's horizontal gain (a third grey: none, white: 3x), 18 its height gain (half grey: none), ")
+    TEXT("19 the second long band's horizontal gain, 20 the long bands shoaled as swell (white) or wind sea (black), ")
+    TEXT("21 the first long band's k d (white: 6, where its shoaling starts; black: unknown depth). With the ocean's own shading the view is drawn flat."),
     ECVF_Default);
 
 static TAutoConsoleVariable<int32> CVarVoxelOceanFlipWinding(
@@ -720,6 +724,11 @@ TSharedPtr<FVoxelOceanProbeState, ESPMode::ThreadSafe> FVoxelOceanSurface::GetPr
     return Pages.IsValid() ? Pages->GetProbeState() : nullptr;
 }
 
+TSharedPtr<IVoxelOceanRingDraw, ESPMode::ThreadSafe> FVoxelOceanSurface::GetRingDraw() const
+{
+    return Pages.IsValid() ? Pages->GetRingDraw() : nullptr;
+}
+
 bool FVoxelOceanSurface::SampleCoastDepths(const TSharedPtr<FVoxelOceanCoastDepthJob, ESPMode::ThreadSafe>& Job, int64 First, int32 Count)
 {
     if (!Pages.IsValid() || !bHasInputs || Settings.Radius <= 0.0) return false;
@@ -912,7 +921,7 @@ void FVoxelOceanSurface::UpdateMaterial()
         Waves.Surf[1].Y = (float)FMath::Max(Inputs.Waves.SurfFoam, 0.0);
         Waves.Surf[1].Z = (float)FMath::Max(Inputs.Waves.FoamCoverage, 0.0);
         // The debug view (stage O9f; row 18 w).
-        Waves.Surf[2].W = (float)FMath::Clamp(CVarVoxelOceanDebugSurf.GetValueOnGameThread(), 0, 14);
+        Waves.Surf[2].W = (float)FMath::Clamp(CVarVoxelOceanDebugSurf.GetValueOnGameThread(), 0, 21);
         // The shore field's expansion around the selection camera (VoxelOceanShore.ush).
         WriteShoreFrame(Waves);
         // The shore field's texture once it exists (until then States.x is 0: no field).

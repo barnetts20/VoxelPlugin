@@ -129,16 +129,45 @@ int main()
             bFalls = bFalls && VoxelShader::VoxelOceanFoamThreshold(float(U + 0.5), 1.0f) < VoxelShader::VoxelOceanFoamThreshold(float(U), 1.0f);
         Check(bFalls && VoxelShader::VoxelOceanFoamThreshold(10.0f, 2.0f) < VoxelShader::VoxelOceanFoamThreshold(10.0f, 1.0f),
             "the threshold falls as the wind (to 24 m/s) or the coverage rises", 0, 0);
-        // At the threshold, half; no long bands, none.
+        // Stage W3f: the density's ramp. Its mean over a standard normal is the coverage (the ramp
+        // placed by two Newton steps); it rises from none well below the threshold to solid well
+        // above it, monotonically; no long bands, none.
+        double RampErr = 0.0;
+        for (double P : { 0.002, 0.01, 0.03, 0.1, 0.3 })
+        {
+            const float Lo = VoxelShader::VoxelOceanFoamRampStart(float(P));
+            // The mean by quadrature against the closed form's.
+            double Sum = 0.0;
+            for (int k = -4000; k <= 4000; k++)
+            {
+                const double X = k * 0.002;
+                Sum += std::clamp((X - Lo) / VOXEL_OCEAN_FOAM_RAMP, 0.0, 1.0) * std::exp(-0.5 * X * X) * 0.002 / std::sqrt(2.0 * M_PI);
+            }
+            RampErr = std::max(RampErr, std::abs(Sum - P) / P);
+        }
+        Check(RampErr < 0.01, "the ramp's mean over the sea is the coverage within 1%", RampErr, 0.01);
         VoxelShader::FVoxelOceanFoamBands B = VoxelShader::VoxelOceanFoamBandsZero();
         B.Sigma = float4(1.0f, 1.0f, 1.0f, 1.0f);
         B.Steep = float4(1.0f, 0.0f, 0.0f, 0.0f);
         B.LongWeight2 = 1.0f; B.ShortWeight2 = 1.0f;
-        B.Dev = float4(VoxelShader::VoxelOceanFoamThreshold(10.0f, 1.0f), 0.0f, 0.0f, 0.0f);
-        const float Half = VoxelShader::VoxelOceanFoamOf(B, 10.0f, 1.0f);
+        const float T10 = VoxelShader::VoxelOceanFoamThreshold(10.0f, 1.0f);
+        bool bRises = true;
+        float Before = -1.0f;
+        for (float Dv = T10 - 2.0f; Dv <= T10 + 2.0f; Dv += 0.05f)
+        {
+            B.Dev = float4(Dv, 0.0f, 0.0f, 0.0f);
+            const float Density = VoxelShader::VoxelOceanFoamOf(B, 10.0f, 1.0f);
+            bRises = bRises && Density >= Before - 1e-6f;
+            Before = Density;
+        }
+        B.Dev = float4(T10 - 2.0f, 0.0f, 0.0f, 0.0f);
+        const float Low = VoxelShader::VoxelOceanFoamOf(B, 10.0f, 1.0f);
+        B.Dev = float4(T10 + 2.0f, 0.0f, 0.0f, 0.0f);
+        const float High = VoxelShader::VoxelOceanFoamOf(B, 10.0f, 1.0f);
         B.Steep = float4(0.0f, 0.0f, 1.0f, 1.0f);
         B.Dev = float4(0.0f, 0.0f, 10.0f, 10.0f);
-        Check(std::abs(Half - 0.5f) < 1e-4f && VoxelShader::VoxelOceanFoamOf(B, 10.0f, 1.0f) == 0.0f, "half at the threshold; none without the long bands", Half, 0.5);
+        Check(bRises && Low < 0.01f && High > 0.99f && VoxelShader::VoxelOceanFoamOf(B, 10.0f, 1.0f) == 0.0f,
+            "the density rises from none (2 sigma below) to solid (2 sigma above); none without the long bands", High - Low, 0.98);
     }
 
     std::printf("\n2. The emulated cascades (the runtime layout; 15 Hz for 20 s, decay 2.5 s; detiled, cell 1.5 km)\n");

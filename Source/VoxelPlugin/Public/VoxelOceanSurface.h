@@ -180,6 +180,10 @@ public:
     /** The depth probe's result for the underwater pass (render thread data; null without pages). */
     TSharedPtr<FVoxelOceanProbeState, ESPMode::ThreadSafe> GetProbeState() const;
 
+    /** Stage W3: the rings for the ocean's own pass (render thread object), while they draw the
+     *  surface for it; null otherwise (the tiles, or the rings with the material). */
+    TSharedPtr<IVoxelOceanRingDraw, ESPMode::ThreadSafe> GetRingDraw() const;
+
     /** Game thread. The coastal field's depth sampling (stage O9h; FVoxelOceanPages::
      *  SampleCoastDepths with this frame's terrain inputs). False: not yet. */
     bool SampleCoastDepths(const TSharedPtr<FVoxelOceanCoastDepthJob, ESPMode::ThreadSafe>& Job, int64 First, int32 Count);

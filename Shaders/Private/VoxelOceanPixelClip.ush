@@ -1,0 +1,164 @@
+// VoxelOceanPixelClip.ush - The wave clipmap at a pixel (stages O9k, O9l, W1; VoxelOceanClip.ush):
+// the surface's normal, the slope variance it leaves out and the foam, from the clipmap's levels of
+// the pixel's footprint, with the FFT bands' slope the clipmap can't hold added on top. No material
+// types: the ocean material's pixel node (VoxelOcean.ush, VoxelOceanPixelClip and
+// VoxelOceanPixelClipDetail) and the ocean's own pass (stage W3, VoxelOceanSurfacePass.usf) both
+// call these, so the surface the pass shades is the one the material shaded.
+
+#pragma once
+
+#include "/Plugin/VoxelPlugin/Private/VoxelOceanVertexCore.ush"
+#include "/Plugin/VoxelPlugin/Private/VoxelOceanClip.ush"
+#include "/Plugin/VoxelPlugin/Private/VoxelOceanFoamLace.ush"
+
+// The wave clipmap at a pixel: the normal and the slope variance it leaves out (planet frame), the
+// foam, the levels' footprint there (cm: the blend's, the finer level's spacing times
+// 2^(1 - weight)), whether any level held the point.
+struct FVoxelOceanPixelClipOut
+{
+    float3 Normal;
+    float SlopeVariance;
+    float Foam;
+    float Spacing;
+    float Valid;
+};
+
+FVoxelOceanPixelClipOut VoxelOceanPixelClipOf(float3 X, float3 UpP, float Footprint, Texture2DArray ClipDisplacement, Texture2DArray ClipNormal,
+    SamplerState ClipNormalSampler, Texture2D ClipInfo)
+{
+    FVoxelOceanPixelClipOut O;
+    O.Normal = UpP;
+    O.SlopeVariance = 0.0f;
+    O.Foam = 0.0f;
+    O.Spacing = 0.0f;
+    O.Valid = 0.0f;
+    const FVoxelOceanClipPick Pick = VoxelOceanClipPickOfTexture(ClipInfo, X, Footprint);
+    const FVoxelOceanClipFrame F = VoxelOceanClipFrameOfTexture(ClipInfo);
+    const int Count = clamp(int(F.Count + 0.5f), 0, VOXEL_OCEAN_CLIP_MAX_LEVELS);
+    if (Count <= 0) return O;
+    const FVoxelOceanClipLevel L0 = VoxelOceanClipLevelOfTexture(ClipInfo, 0);
+    if (Pick.Level < 0)
+    {
+        // Past the outermost level: its slope at its reach's edge as roughness.
+        const FVoxelOceanClipLevel L = VoxelOceanClipLevelOfTexture(ClipInfo, Count - 1);
+        if (L.Valid < 0.5f) return O;
+        const float Reach = 0.5f * F.Size - VOXEL_OCEAN_CLIP_EDGE - VOXEL_OCEAN_CLIP_SLACK;
+        const float2 T = clamp(VoxelOceanClipPlaneOffset(F, X) / L.Spacing, -Reach, Reach);
+        const float4 N = ClipNormal.SampleLevel(ClipNormalSampler, VoxelOceanClipStorageUV(F, L, T * L.Spacing), 0.0f);
+        const float C = max(dot(normalize(N.xyz), UpP), 0.1f);
+        O.SlopeVariance = N.w + (1.0f / (C * C) - 1.0f);
+        return O;
+    }
+    // The levels' blend; where the next level doesn't hold the point, its share goes to the radial.
+    const float Missing = Pick.NextValid > 0.5f ? 0.0f : 1.0f - Pick.Weight;
+    const float4 N = VoxelOceanClipSample(ClipNormal, ClipNormalSampler, Pick);
+    const float4 D = VoxelOceanClipSample(ClipDisplacement, ClipNormalSampler, Pick);
+    O.Normal = normalize(N.xyz + UpP * Missing);
+    O.SlopeVariance = N.w;
+    O.Foam = saturate(D.w);
+    O.Spacing = L0.Spacing * exp2(float(Pick.Level) + 1.0f - Pick.Weight);
+    O.Valid = 1.0f;
+    return O;
+}
+
+// The surface at a pixel in world axes: the clipmap's normal, slope variance and foam, plus the
+// detail the clipmap can't hold (stage O9l): the FFT bands' slope between the pixel's footprint and
+// the clipmap's, looked up here (deep water: the bands high-passed through their mips, without the
+// shore's work), added to the clipmap's normal, its variance taken off the clipmap's unresolved
+// variance; faded out within a metre of depth, where the clipmap's bores and swash carry the
+// surface. SamplePoint: the undisplaced point from the selection camera (world axes, cm); Footprint:
+// how far it moves to the next pixel (cm); Depth: the depth the waves feel there (cm); W: the
+// material's wave parameters (VoxelOceanMakeWaveParamsFFT; W.FFT.x 0: no detail). Normal (world
+// axes) in the result.
+FVoxelOceanPixelClipOut VoxelOceanPixelClipDetailOf(float3 SamplePoint, float Footprint, float Depth, FVoxelOceanWaveParams W,
+    Texture2DArray Displacement, SamplerState DisplacementSampler, Texture2DArray Derivatives, SamplerState DerivativesSampler, Texture2D Charts,
+    Texture2DArray ClipDisplacement, Texture2DArray ClipNormal, SamplerState ClipNormalSampler, Texture2D ClipInfo)
+{
+    const float3 Up = normalize(SamplePoint - W.Center);
+    const float3 UpP = VoxelOceanRotateBack(W.Rotation, Up);
+    FVoxelOceanPixelClipOut C = VoxelOceanPixelClipOf(VoxelOceanRotateBack(W.Rotation, SamplePoint), UpP, Footprint,
+        ClipDisplacement, ClipNormal, ClipNormalSampler, ClipInfo);
+    float3 Normal = C.Normal;
+    // The detail: where the clipmap holds the point at a coarser footprint than the pixel's, in water.
+    const float Keep = saturate(Depth * (1.0f / 100.0f));
+    if (W.FFT.x > 0.5f && C.Valid > 0.5f && C.Spacing > Footprint && Keep > 0.0f)
+    {
+        FVoxelOceanWaveParams H = W;
+        H.HighPass = C.Spacing;
+        const FVoxelOceanFFTPoint Pt = VoxelOceanFFTEvaluate(SamplePoint, Up, 1.0e9f, Footprint, VOXEL_OCEAN_DEEP, VoxelOceanShoreNone(), H,
+            Displacement, DisplacementSampler, Derivatives, DerivativesSampler, Charts, 2u);
+        Normal = normalize(Normal - Pt.R.Gradient * Keep);
+        const float Resolved = VoxelOceanFFTSlopeVariance(Pt, H, C.Spacing) - VoxelOceanFFTSlopeVariance(Pt, H, Footprint);
+        C.SlopeVariance = max(C.SlopeVariance - Keep * max(Resolved, 0.0f), 0.0f);
+    }
+    C.Normal = normalize(VoxelOceanRotate(W.Rotation, Normal));
+    return C;
+}
+
+// The foam's structure at a pixel (stage W3f; VoxelOceanFoamLace.ush) for its density: in each
+// chart's coordinates in its short bands' downwind frame (the waves' own lookups', so the structure
+// rides the surface and its streaks lie downwind), blended across the charts as the waves are (the
+// weights summed to 1 here: the structure's mean stays the density). SamplePoint: the undisplaced
+// point from the selection camera (world axes, cm); Footprint: the pixel's (cm); W: the material's
+// wave parameters (W.FFT.x 0: no charts, the density as it is); the clock: the surf's (W.SlopeVar.w).
+FVoxelOceanLace VoxelOceanPixelLaceOf(float3 SamplePoint, float Footprint, float Density, FVoxelOceanWaveParams W, Texture2D OceanCharts)
+{
+    FVoxelOceanLace Out;
+    Out.Foam = saturate(Density);
+    Out.Layer0 = Out.Foam;
+    Out.Layer1 = 1.0f;
+    Out.Layer2 = 1.0f;
+    Out.Thick = 0.5f;
+    if (Density <= 0.0f || W.FFT.x < 0.5f) return Out;
+    const float3 D = VoxelOceanRotateBack(W.Rotation, SamplePoint);
+    const float3 UpP = VoxelOceanRotateBack(W.Rotation, normalize(SamplePoint - W.Center));
+    const int N = max(int(W.FFT.y), 1);
+    const FVoxelOceanChartCandidates Cand = VoxelOceanChartCandidatesOf(UpP, N);
+    const FVoxelOceanChartBlend Blend = VoxelOceanChartBlendOf(Cand.Count, VoxelOceanChartDistancesOf(Cand, UpP), N);
+    float Sum = 0.0f;
+    for (int M = 0; M < VOXEL_OCEAN_CHART_MAX; M++)
+    {
+        if (M < Blend.Count) Sum += Blend.Weight[M];
+    }
+    if (Sum <= 0.0f) return Out;
+    Out.Foam = 0.0f;
+    Out.Layer0 = 0.0f;
+    Out.Layer1 = 0.0f;
+    Out.Layer2 = 0.0f;
+    Out.Thick = 0.0f;
+    const float FootprintM = Footprint * 0.01f;
+    const float Time = W.SlopeVar.w;
+    [unroll]
+    for (int K = 0; K < VOXEL_OCEAN_CHART_MAX; K++)
+    {
+        if (K >= Blend.Count) continue;
+        const int2 T = Cand.Texel[Blend.Index[K]];
+        const float4 T0 = OceanCharts.Load(int3(T.x, T.y, 0));
+        const float4 T1 = OceanCharts.Load(int3(T.x + 1, T.y, 0));
+        const float4 T2 = OceanCharts.Load(int3(T.x + 2, T.y, 0));
+        const FVoxelOceanChart C = VoxelOceanChartOf(T0.xyz, T1.xyz, T2.xyz, float3(T0.w, T1.w, T2.w));
+        const FVoxelOceanChartHeadings H = VoxelOceanChartHeadingsAt(OceanCharts, T);
+        const FVoxelOceanChartCoords Plane = VoxelOceanChartCoordsOf(C, W.RefHigh.xyz, W.RefLow.xyz, D);
+        const uint Seed = VoxelOceanLaceHash(uint(T.x), uint(T.y), 0x1f123bb5u);
+        // A heading that turned crosses over from its previous orientation as the waves do
+        // (VoxelOceanTurnWeights), the weights summed to 1 here.
+        const float2 Turn = VoxelOceanTurnWeights(saturate(W.Shape.z), length(Plane.Base + Plane.Offset), H.ShortPrevious, H.ShortCurrent,
+            VOXEL_OCEAN_SHORT_CORRELATION_LENGTH);
+        const float TurnSum = max(Turn.x + Turn.y, 1.0e-6f);
+        for (int O = 0; O < 2; O++)
+        {
+            const float WO = (O == 0 ? Turn.x : Turn.y) / TurnSum;
+            if (WO <= 0.0f) continue;
+            const FVoxelOceanChartCoords Coords = VoxelOceanCoordsToWind(Plane, O == 0 ? H.ShortCurrent : H.ShortPrevious);
+            const FVoxelOceanLace L = VoxelOceanLaceAt(Coords.Base.x, Coords.Base.y, Coords.Offset.x, Coords.Offset.y, Density, FootprintM, Time,
+                Seed ^ (O == 0 ? 0u : 0x6c8e9cf5u));
+            const float Wk = WO * Blend.Weight[K] / Sum;
+            Out.Foam += Wk * L.Foam;
+            Out.Layer0 += Wk * L.Layer0;
+            Out.Layer1 += Wk * L.Layer1;
+            Out.Layer2 += Wk * L.Layer2;
+            Out.Thick += Wk * L.Thick;
+        }
+    }
+    return Out;
+}

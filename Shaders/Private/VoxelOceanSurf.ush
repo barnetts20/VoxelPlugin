@@ -747,13 +747,14 @@ VOXEL_FUNC FVoxelOceanSurf VoxelOceanSurfOf(FVoxelOceanSurfInput In, FVoxelOcean
     const float MeshB = VoxelOceanSurfMeshResolved(B.Wavelength, In.SpacingM);
     const float SeenA = VoxelOceanSurfResolved(A.Wavelength, In.FootprintM);
     const float SeenB = VoxelOceanSurfResolved(B.Wavelength, In.FootprintM);
-    // The long bands keep what the trains don't show (by the mesh's rule for the height, the
-    // footprint's for the normals), by energy: a train drawn at amplitude m shows m^2 of its own.
+    // THE COMPOSITION IS BY PLACE (stage W3f): the long bands keep 1 - Share of their energy
+    // wherever the trains take Share, whatever the mesh or the footprint shows of the trains (a
+    // train too short for the mesh leaves the height and stays in the normals; too short for the
+    // footprint, it leaves those too). So every clipmap level, every vertex and every pixel composes
+    // the same sea at a point. (Until W3f the long bands took back what the mesh couldn't show,
+    // judged by each level's own spacing: levels disagreed, and the sea stepped where they met.)
     const bool bNormals = In.ForNormals > 0.5f;
-    const float ShownA = bNormals ? SeenA * SeenA : MeshA * MeshA;
-    const float ShownB = bNormals ? SeenB * SeenB : MeshB * MeshB;
-    const float Drawn = Share * (WA * ShownA + WB * ShownB);
-    Out.LongKeep = sqrt(max(1.0f - Drawn, 0.0f));
+    Out.LongKeep = sqrt(max(1.0f - Share * (WA + WB), 0.0f));
     // The swash's sheet on land reaches only so far up the beach (stage O9b3): its distance up the
     // beach held within 1.5 to 3 times the reach; and only as far as the mesh (the height) or the
     // footprint (the normals) carries a sheet that wide (stage O9i: a distant mesh leaves it at

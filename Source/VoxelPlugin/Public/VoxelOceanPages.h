@@ -46,6 +46,7 @@ struct FVoxelOceanShoreRHI;
 struct FVoxelOceanLandCacheRHI;
 struct FVoxelOceanProbeState;
 struct FVoxelOceanCoastDepthJob;
+class IVoxelOceanRingDraw;
 namespace VoxelOceanDepthProbe { struct FLevels; }
 
 /** What the page writes sample the terrain depth from. */
@@ -127,10 +128,14 @@ struct FVoxelOceanClipSettings
      *  instead of the tile pages, whenever the clipmap runs; the far sphere's cells a face edge. */
     bool bRings = true;
     int32 FarCells = 64;
+    /** Stage W3: the rings drawn by the ocean's own pass (no mesh component; GetRingDraw) instead
+     *  of with the ocean material. */
+    bool bOwnPass = true;
 
     bool operator==(const FVoxelOceanClipSettings& O) const
     {
-        return bOn == O.bOn && Size == O.Size && Levels == O.Levels && FinestCm == O.FinestCm && bRings == O.bRings && FarCells == O.FarCells;
+        return bOn == O.bOn && Size == O.Size && Levels == O.Levels && FinestCm == O.FinestCm && bRings == O.bRings && FarCells == O.FarCells
+            && bOwnPass == O.bOwnPass;
     }
     bool operator!=(const FVoxelOceanClipSettings& O) const { return !(*this == O); }
 };
@@ -217,6 +222,9 @@ public:
      *  frame around the camera (planet frame), their land cull (FVoxelOceanDisplaceFrame::
      *  RingCull). Without this frame's clipmap the far sphere still draws. */
     void UpdateRings(const FVector& CameraPlanet, const FVector4f& Cull);
+    /** Stage W3: the rings for the ocean's own pass (render thread object; null unless the rings
+     *  are on for the own pass). */
+    TSharedPtr<IVoxelOceanRingDraw, ESPMode::ThreadSafe> GetRingDraw() const;
 
     /** Changes the material of every buffer set, pooled ones included. */
     void SetMaterial(UMaterialInterface* InMaterial);

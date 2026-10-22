@@ -96,6 +96,14 @@ Ocean harnesses (stages O1-O4, O6a, O6b, O7, O8, O9a-O9c). Plain C++20; no engin
                             from orbit and a flight along the sea with the static layer's strips and the waves'
                             staggering simulated texel by texel (every sample finds its own texel), edit rectangles
       g++ -O2 -std=c++20 -IClipStandIn -I<plugin>/Source/VoxelPlugin/Private clip_check.cpp -o clip_check
+  shading_check.cpp         W3: the ocean's light model (VoxelOceanShading.ush) as C++: the sun glitter's reflectance
+                            against mirror facets drawn from its slopes, Smith's Lambda fit against erfc, the mean
+                            Fresnel fit against the facets the eye sees, the water's single scattering against a march
+      g++ -O2 -std=c++20 -I<plugin>/Source/VoxelPlugin/Public -I<plugin>/Shaders/Private shading_check.cpp -o shading_check
+  lace_check.cpp            W3f: the foam's structure (VoxelOceanFoamLace.ush) as C++: the patterns' distributions and
+                            the thresholds' tables (--fit writes Shaders/Private/VoxelOceanFoamLaceFit.ush), the structure
+                            keeping the density at every footprint, previews (PNG) near and far
+      g++ -O2 -std=c++20 -I<plugin>/Source/VoxelPlugin/Public -I<plugin>/Shaders/Private lace_check.cpp -o lace_check
   ClipStandIn/              stand-ins for the engine types VoxelOceanClipmap.h uses
   UEStandIn/                stand-ins for the few engine types the FFT model and the weather use
 

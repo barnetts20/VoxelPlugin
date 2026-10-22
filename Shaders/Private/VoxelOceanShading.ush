@@ -1,0 +1,180 @@
+// VoxelOceanShading.ush - The ocean's light (stage W3; Design/OceanWaves.md section 30): what the
+// surface reflects and what the water sends up through it, for the ocean's own pass
+// (VoxelOceanSurfacePass.usf). Shared with the harness (Tools/OceanHarness/shading_check.cpp,
+// through VoxelShaderCompat.h): no swizzles, no out parameters, f-suffixed literals, scalars and
+// float3 only.
+//
+// THE SURFACE (Bruneton, Neyret and Holzschuch 2010, "Real-time Realistic Ocean Lighting using
+// Seamless Transitions from Geometry to BRDF"). What the pixel resolves is the normal N (the wave
+// clipmap's, with the FFT detail, VoxelOceanPixelClip.ush); what it doesn't is a Gaussian
+// distribution of slopes about N with the variances the clipmap leaves out (per tangent axis), plus
+// the short waves no band holds. From that one distribution:
+// - the sun's glitter: the facets that mirror the sun into the eye (VoxelOceanGlint), with Smith's
+//   masking for a Gaussian surface (Walter et al. 2007's rational fit);
+// - the Fresnel factor averaged over the slopes seen from the eye (VoxelOceanMeanFresnel,
+//   Bruneton's fit), which weighs the sky's reflection, and 1 minus it the water's light;
+// so the look carries over from a close-up (every wave resolved, a sharp sun) to orbit (none
+// resolved, the broad glint of the whole sea) with no change of model.
+//
+// THE WATER (VoxelOceanWaterBody): single scattering in a homogeneous layer above a bed, per colour
+// channel. The eye's ray refracted into the water; the sun's beam refracted, attenuated down to each
+// point and scattered by the Henyey-Greenstein phase; the sky's light as a diffuse downwelling
+// irradiance scattered isotropically; the bed seen through the layer (its radiance as lit in air,
+// attenuated along the eye's ray and by the light's way down). The path is the refracted ray's to
+// the bed's depth, so it stays bounded at grazing views (Snell's window bends every ray within 49
+// degrees of the vertical). Leaving the water, radiance divides by n^2.
+//
+// UNITS: lengths in cm; Scattering and Extinction per cm; irradiance and radiance in the scene's
+// light units before exposure.
+
+#ifndef VOXEL_OCEAN_SHADING_USH
+#define VOXEL_OCEAN_SHADING_USH
+
+#ifndef VOXEL_FUNC
+#define VOXEL_FUNC
+#endif
+
+#define VOXEL_OCEAN_SHADING_PI 3.14159265f
+#define VOXEL_OCEAN_WATER_IOR 1.333f
+// Normal-incidence reflectance of water from air, ((n - 1) / (n + 1))^2.
+#define VOXEL_OCEAN_WATER_R0 0.0204f
+// The average cosine of diffuse light in the water (the sky's downwelling irradiance): its scalar
+// irradiance is the horizontal one over this, and it attenuates as exp(-sigma z / this).
+#define VOXEL_OCEAN_DIFFUSE_MU 0.75f
+// The hemispherical average of the Fresnel reflectance from air (diffuse sky light entering).
+#define VOXEL_OCEAN_DIFFUSE_FRESNEL 0.066f
+
+/** Schlick's Fresnel reflectance of water seen from air at incidence cos CosI. */
+VOXEL_FUNC float VoxelOceanFresnel(float CosI)
+{
+    const float X = 1.0f - saturate(CosI);
+    const float X2 = X * X;
+    return VOXEL_OCEAN_WATER_R0 + (1.0f - VOXEL_OCEAN_WATER_R0) * X2 * X2 * X;
+}
+
+/** A Gaussian slope distribution's variance along direction D's azimuth (the tangent frame Tx, Ty;
+ *  SX2 and SY2 the variances along each). */
+VOXEL_FUNC float VoxelOceanSlopeVarianceAlong(float3 D, float3 Tx, float3 Ty, float SX2, float SY2)
+{
+    const float X = dot(D, Tx);
+    const float Y = dot(D, Ty);
+    const float R = X * X + Y * Y;
+    if (R < 1.0e-12f) return 0.5f * (SX2 + SY2);
+    return (SX2 * X * X + SY2 * Y * Y) / R;
+}
+
+/** The Fresnel reflectance averaged over the slopes seen from the eye (Bruneton 2010's fit): CosV
+ *  the eye's cos about the mean normal, SigmaV the slopes' standard deviation along its azimuth. At
+ *  SigmaV 0 it is Schlick's. */
+VOXEL_FUNC float VoxelOceanMeanFresnel(float CosV, float SigmaV)
+{
+    const float C = saturate(CosV);
+    const float S = max(SigmaV, 0.0f);
+    const float F = pow(max(1.0f - C, 0.0f), 5.0f * exp(-2.69f * S)) / (1.0f + 22.7f * pow(S, 1.5f));
+    return VOXEL_OCEAN_WATER_R0 + (1.0f - VOXEL_OCEAN_WATER_R0) * saturate(F);
+}
+
+/** Smith's masking term Lambda for a Gaussian (Beckmann) slope distribution of variance SigmaSq
+ *  along the direction's azimuth, the direction at cos CosTheta from the mean normal (Walter et
+ *  al. 2007's rational fit of (exp(-a^2) - a sqrt(pi) erfc(a)) / (2 a sqrt(pi))). */
+VOXEL_FUNC float VoxelOceanLambda(float CosTheta, float SigmaSq)
+{
+    const float C = clamp(CosTheta, 1.0e-4f, 0.9999f);
+    const float A = C / sqrt(max((1.0f - C * C) * 2.0f * SigmaSq, 1.0e-12f));
+    if (A >= 1.6f) return 0.0f;
+    return (1.0f - 1.259f * A + 0.396f * A * A) / (3.535f * A + 2.181f * A * A);
+}
+
+/** The sun's glitter without masking: the radiance toward the eye per unit of the sun's irradiance
+ *  (normal to its beam), F(V.H) P(slope of H) / (4 cos V cos^4 H), P the slopes' Gaussian (SX2 and
+ *  SY2 along Tx and Ty, about the mean normal N). L toward the sun, V toward the eye (unit). */
+VOXEL_FUNC float VoxelOceanGlintUnmasked(float3 L, float3 V, float3 N, float3 Tx, float3 Ty, float SX2, float SY2)
+{
+    const float3 H = normalize(L + V);
+    const float ZH = dot(H, N);
+    const float ZV = dot(V, N);
+    if (ZH <= 1.0e-4f || ZV <= 0.0f || dot(L, N) <= 0.0f) return 0.0f;
+    const float ZetaX = dot(H, Tx) / ZH;
+    const float ZetaY = dot(H, Ty) / ZH;
+    const float P = exp(-0.5f * (ZetaX * ZetaX / SX2 + ZetaY * ZetaY / SY2)) / (2.0f * VOXEL_OCEAN_SHADING_PI * sqrt(SX2 * SY2));
+    const float ZH2 = ZH * ZH;
+    return VoxelOceanFresnel(dot(V, H)) * P / (4.0f * max(ZV, 0.01f) * ZH2 * ZH2);
+}
+
+/** The sun's glitter (Bruneton 2010): the unmasked glitter with Smith's masking and shadowing,
+ *  1 / (1 + Lambda(L) + Lambda(V)). */
+VOXEL_FUNC float VoxelOceanGlint(float3 L, float3 V, float3 N, float3 Tx, float3 Ty, float SX2, float SY2)
+{
+    const float G = VoxelOceanGlintUnmasked(L, V, N, Tx, Ty, SX2, SY2);
+    if (G <= 0.0f) return 0.0f;
+    const float LL = VoxelOceanLambda(dot(L, N), VoxelOceanSlopeVarianceAlong(L, Tx, Ty, SX2, SY2));
+    const float LV = VoxelOceanLambda(dot(V, N), VoxelOceanSlopeVarianceAlong(V, Tx, Ty, SX2, SY2));
+    return G / (1.0f + LL + LV);
+}
+
+/** Henyey-Greenstein's phase function (per steradian) at scattering angle cos CosTheta. */
+VOXEL_FUNC float VoxelOceanPhaseHG(float CosTheta, float G)
+{
+    const float G2 = G * G;
+    const float D = max(1.0f + G2 - 2.0f * G * CosTheta, 1.0e-4f);
+    return (1.0f - G2) / (4.0f * VOXEL_OCEAN_SHADING_PI * D * sqrt(D));
+}
+
+/** The in-scatter integral along the eye's ray through the layer: int_0^Path exp(-Extinction x (1 +
+ *  Ratio)) dx, Ratio the eye ray's cos over the light's (how much faster the light's own way down
+ *  grows). A Path under 0 is the deep sea (infinite). */
+VOXEL_FUNC float VoxelOceanInScatterPath(float Extinction, float Path, float Ratio)
+{
+    const float K = max(Extinction, 1.0e-9f) * (1.0f + Ratio);
+    if (Path < 0.0f) return 1.0f / K;
+    return (1.0f - exp(-K * Path)) / K;
+}
+
+/** One colour channel of the light the water sends up toward the eye, just below the surface
+ *  (VOXEL_OCEAN_WATER_IOR's n^2 not yet taken off).
+ *  Scattering, Extinction: per cm. Path: the refracted eye ray's length to the bed (cm; under 0
+ *  deep). MuView: the refracted eye ray's cos from the vertical (downward). MuSun: the refracted
+ *  sun's. SunPhase: the phase toward the eye. SunIrradiance: the sun's in the water, normal to its
+ *  beam. SkyIrradiance: the sky's in the water, on the horizontal. Bed: the bed's radiance as lit in
+ *  air (0 with Path under 0). */
+VOXEL_FUNC float VoxelOceanWaterBody(float Scattering, float Extinction, float Path, float MuView, float MuSun, float SunPhase,
+    float SunIrradiance, float SkyIrradiance, float Bed)
+{
+    const float MV = max(MuView, 0.05f);
+    const float MS = max(MuSun, 0.05f);
+    const float Sun = Scattering * SunPhase * SunIrradiance * VoxelOceanInScatterPath(Extinction, Path, MV / MS);
+    const float Sky = Scattering * (1.0f / (4.0f * VOXEL_OCEAN_SHADING_PI)) * (SkyIrradiance / VOXEL_OCEAN_DIFFUSE_MU)
+        * VoxelOceanInScatterPath(Extinction, Path, MV / VOXEL_OCEAN_DIFFUSE_MU);
+    float Through = 0.0f;
+    if (Path >= 0.0f)
+    {
+        // Along the eye's ray, and the light's way down to the bed (its depth Path MV, at the
+        // sun's slant: the bed is lit mostly from above).
+        Through = Bed * exp(-Extinction * Path * (1.0f + MV / MS));
+    }
+    return Sun + Sky + Through;
+}
+
+/** The stand-in sky (until the atmosphere's is connected): radiance per unit of the sun's
+ *  illuminance from the horizon's colour to the zenith's; below the horizon, the horizon's. */
+VOXEL_FUNC float3 VoxelOceanStandInSky(float3 Dir, float3 Up, float3 Zenith, float3 Horizon)
+{
+    const float H = saturate(dot(Dir, Up));
+    return lerp(Horizon, Zenith, sqrt(H));
+}
+
+/** The stand-in daylight for the sun at cos SunUp above the local horizon: 1 by day, fading over
+ *  twilight to 0 when the sun is 10 degrees down. */
+VOXEL_FUNC float VoxelOceanStandInDay(float SunUp)
+{
+    return saturate((SunUp + 0.17f) / 0.27f);
+}
+
+/** The sun's beam reaching the surface at cos SunUp above the local horizon: the planet's shadow
+ *  (the sun's disk setting over about half a degree). */
+VOXEL_FUNC float VoxelOceanSunAbove(float SunUp)
+{
+    return saturate((SunUp + 0.0045f) / 0.009f);
+}
+
+#endif

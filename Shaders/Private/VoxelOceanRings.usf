@@ -1,7 +1,7 @@
 // VoxelOceanRings.usf - The ocean's mesh, once a frame (stage W2; Design/OceanWaves.md section 29;
 // VoxelOceanPages.cpp runs it as the rings' compute provider): every vertex of the rings (one
 // square grid per wave clipmap level, VoxelOceanRingLayout.ush) and of the far sphere under them,
-// written to the mesh's streams: the displaced position (the component's frame: the planet's axes,
+// written to the mesh's streams (or, for the ocean's own pass, stage W3, to its buffers): the displaced position (the component's frame: the planet's axes,
 // from its origin near the camera), and what the material's pixel node takes (texture
 // coordinates 0 to 2: the undisplaced point from the selection camera in world axes, the depth the
 // waves feel, the bed). The material's vertex node passes them through (VoxelOceanParams.x 3).
@@ -13,7 +13,9 @@
 // THE FAR SPHERE: a cube sphere at the sea's radius (FarCells cells a face edge) for whatever the
 // rings don't reach (from high up, past the outermost ring). Under the outermost ring, and a far
 // cell and a half past its edge, it sinks below the waves (a sloped skirt under the ring's edge);
-// well inside it, it draws nothing.
+// well inside it, it draws nothing. A sunk vertex's colour has alpha 0: the ocean's own pass
+// leaves those out for any view from near or under the surface (stage W3f), whichever camera the
+// rings were placed for.
 // Its land is sampled once (VoxelOceanPage.usf, FarDepthCS).
 
 #include "/Engine/Public/Platform.ush"
@@ -23,7 +25,7 @@
 
 RWBuffer<float> RingPositions;
 RWBuffer<uint> RingTangents;         // two packed normals a vertex: tangent, normal
-RWBuffer<uint> RingTexCoords;        // 12 words a vertex
+RWBuffer<uint> RingTexCoords;        // RingTexWords words a vertex
 RWBuffer<uint> RingColors;
 RWBuffer<uint> RingArgs;             // FRHIDrawIndexedIndirectParameters
 uint RingIndexCount;                 // indices drawn (0: nothing this frame)
@@ -33,6 +35,7 @@ float RingMorphStart;
 float RingMorphEnd;
 uint RingFarCells;                   // per face edge
 uint RingVertices;                   // all of them
+uint RingTexWords;                   // texture coordinate words a vertex: 12 (the mesh's 6 channels), 6 (the ocean's own pass)
 
 // The clipmap's info (VoxelOceanClip.ush) this frame, and per level: (the camera about the square's
 // centre in cells, the cell in cm, the vertex colour), (the hole's centre, the centre on the next
@@ -116,15 +119,14 @@ void VoxelOceanRingWrite(uint V, float3 Local, float3 SamplePoint, float Depth, 
     RingPositions[V * 3u + 2u] = Local.z;
     RingTangents[V * 2u] = VoxelOceanRingPackSnorm8(Tangent, 1.0f);
     RingTangents[V * 2u + 1u] = VoxelOceanRingPackSnorm8(Up, 1.0f);
-    const uint T = V * 12u;
+    const uint T = V * RingTexWords;
     RingTexCoords[T] = asuint(SamplePoint.x);
     RingTexCoords[T + 1u] = asuint(SamplePoint.y);
     RingTexCoords[T + 2u] = asuint(SamplePoint.z);
     RingTexCoords[T + 3u] = asuint(Depth);
     RingTexCoords[T + 4u] = asuint(VOXEL_OCEAN_SHORE_DEFAULT_SLOPE);
     RingTexCoords[T + 5u] = asuint(Land);
-    [unroll]
-    for (uint K = 6u; K < 12u; K++)
+    for (uint K = 6u; K < RingTexWords; K++)
         RingTexCoords[T + K] = 0u;
     RingColors[V] = Color;
 }
@@ -238,5 +240,10 @@ void RingCS(uint3 DispatchThreadId : SV_DispatchThreadID)
     const float3 Up = Dir;
     const float3 Axis = abs(Up.z) < 0.9f ? float3(0.0f, 0.0f, 1.0f) : float3(1.0f, 0.0f, 0.0f);
     const float3 T1 = normalize(cross(Axis, Up));
-    VoxelOceanRingWrite(V, X3 - Up * Sink + CamToOrigin, VoxelOceanRotate(RingRotation, X3), max(Land, 0.0f), Land, Up, T1, 0xffffffffu);
+    // Its colour: white (magenta with voxel.Debug.LevelColor); alpha 0 where it is sunk under the
+    // rings (stage W3f: the ocean's own pass leaves those out for a view from near or under the
+    // surface, which would see them from above).
+    const uint Rgb = RingFrame0.w > 0.5f ? 0x00ff00ffu : 0x00ffffffu;
+    VoxelOceanRingWrite(V, X3 - Up * Sink + CamToOrigin, VoxelOceanRotate(RingRotation, X3), max(Land, 0.0f), Land, Up, T1,
+        Rgb | (Sink > 0.0f ? 0u : 0xff000000u));
 }

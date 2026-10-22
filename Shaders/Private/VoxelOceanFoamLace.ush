@@ -1,0 +1,320 @@
+// VoxelOceanFoamLace.ush - The foam's structure (stage W3f; Design/OceanWaves.md section 31): where,
+// inside a pixel, a foam density (VoxelOceanFoam.ush: the share of the surface the foam covers, 0
+// to 1) lies. Shared subset (VoxelShaderCompat.h): the ocean's own pass (VoxelOceanPixelClip.ush)
+// runs it per pixel; the harness (Tools/OceanHarness/lace_check.cpp) fits its thresholds
+// (VoxelOceanFoamLaceFit.ush, generated), checks it and renders previews.
+//
+// FOAM IS A NETWORK. Sea foam is bubbles packed into walls: thick foam a white sheet with holes,
+// thinning foam a lace of walls around ever larger holes, a dying trail streaks and filaments. So
+// the structure is three layers:
+// - the streaks (VOXEL_OCEAN_LACE_CELL0 across the wind, stretched downwind): two octaves of a
+//   smooth noise, warped: where a sheet holds together and where it has torn into streaks;
+// - the lace (CELL1): cell walls (Voronoi cells' F2 - F1, the cells weighted to different sizes so
+//   their walls curve), warped and roughened so the walls wander;
+// - the bubbles (CELL2): finer cell walls, the texture inside the sheet.
+//
+// DENSITY, NOT DECORATION. Each layer keeps the share D_i = Density^Share_i of its area: the part of
+// it below its threshold (VoxelOceanLaceThreshold0/1: the inverse of the pattern's distribution, a
+// table the harness fits), so the streaks keep their ridges and the lace its walls first. The layers
+// multiply; being independent, their product covers Density of the surface whatever the density.
+// Thick foam (D near 1) is solid with a few holes; thinner foam the walls and streaks only; none,
+// nothing. The structure never adds or takes foam: it only says where, within the share, it lies.
+//
+// FILTERED BY THE PIXEL. A layer's edges soften over the pixel's footprint, and a layer whose
+// cells shrink under about half a pixel is replaced by its share D_i: far away only the coarse
+// layers draw, and past them the foam is its density, the same mean at every distance (no shimmer,
+// no change in brightness as the camera moves).
+//
+// RIDING THE WATER. The coordinates are the waves' chart coordinates in the short bands' downwind
+// frame (m) at the undisplaced point: the structure moves with the surface as the waves' lookups
+// do. Each pattern repeats over VOXEL_OCEAN_LACE_PERIOD cells, its large part wrapped first (as
+// VoxelOceanWrap), so the coordinates stay exact far from the charts' anchors. The patterns change
+// slowly on the surf's clock (it wraps every 3,600 s; the rates are whole turns over that): the
+// bubbles in seconds, the lace in tens of seconds, the streaks over a minute.
+
+#ifndef VOXEL_OCEAN_FOAM_LACE_USH
+#define VOXEL_OCEAN_FOAM_LACE_USH
+
+#ifndef VOXEL_FUNC
+#define VOXEL_FUNC
+#endif
+
+// Cells a pattern repeats over (its period: its cell times this).
+#define VOXEL_OCEAN_LACE_PERIOD 128
+// The layers: the cell (m, across the wind), the stretch downwind, the share of the density's
+// exponent (the three sum to 1), the change's rate (rad/s: 60, 180 and 1,200 whole turns per 3,600 s).
+#define VOXEL_OCEAN_LACE_CELL0 3.1f
+#define VOXEL_OCEAN_LACE_CELL1 0.43f
+#define VOXEL_OCEAN_LACE_CELL2 0.071f
+#define VOXEL_OCEAN_LACE_STRETCH0 3.0f
+#define VOXEL_OCEAN_LACE_STRETCH1 1.3f
+#define VOXEL_OCEAN_LACE_STRETCH2 1.0f
+#define VOXEL_OCEAN_LACE_SHARE0 0.3f
+#define VOXEL_OCEAN_LACE_SHARE1 0.45f
+#define VOXEL_OCEAN_LACE_SHARE2 0.25f
+#define VOXEL_OCEAN_LACE_RATE0 0.104719755f
+#define VOXEL_OCEAN_LACE_RATE1 0.314159265f
+#define VOXEL_OCEAN_LACE_RATE2 2.094395102f
+// The warps: the noise's cell (a whole divisor of the period, so the warp repeats with the pattern)
+// and reach, in the layer's cells.
+#define VOXEL_OCEAN_LACE_WARP_CELL 2
+#define VOXEL_OCEAN_LACE_WARP_REACH 0.4f
+// An edge's least softness (pattern units), the patterns' steepness (pattern units a cell, for the
+// pixel's softening), and the footprint (the layer's cells) over which a layer gives way to its share.
+#define VOXEL_OCEAN_LACE_SOFT 0.015f
+#define VOXEL_OCEAN_LACE_STEEP_STREAK 1.2f
+#define VOXEL_OCEAN_LACE_STEEP_WALL 2.0f
+#define VOXEL_OCEAN_LACE_BLUR_START 0.15f
+#define VOXEL_OCEAN_LACE_BLUR_END 0.5f
+// The walls: the points' weights (cells of different sizes), the roughness's noise (its frequency,
+// in the layer's cells, and its reach, in the pattern's units).
+#define VOXEL_OCEAN_LACE_WEIGHT_LOW 0.7f
+#define VOXEL_OCEAN_LACE_WEIGHT_HIGH 1.3f
+#define VOXEL_OCEAN_LACE_ROUGH_SCALE 4.0f
+#define VOXEL_OCEAN_LACE_ROUGH 0.06f
+// The seeds' mixes per layer and warp.
+#define VOXEL_OCEAN_LACE_SEED1 0x68e31da4u
+#define VOXEL_OCEAN_LACE_SEED2 0xb5297a4du
+#define VOXEL_OCEAN_LACE_SEED_WARP 0x51ed270bu
+
+VOXEL_FUNC uint VoxelOceanLaceHash(uint X, uint Y, uint Seed)
+{
+    uint H = X * 0x8da6b343u + Y * 0xd8163841u + Seed * 0xcb1ab31fu;
+    H = H ^ (H >> 16u);
+    H = H * 0x7feb352du;
+    H = H ^ (H >> 15u);
+    H = H * 0x846ca68bu;
+    H = H ^ (H >> 16u);
+    return H;
+}
+
+VOXEL_FUNC float VoxelOceanLaceUnit(uint H)
+{
+    return float(H & 0xffffu) * (1.0f / 65535.0f);
+}
+
+// A cell of a periodic lattice of Period cells.
+VOXEL_FUNC uint VoxelOceanLaceCellOf(float I, int D, int Period)
+{
+    return uint((int(I) + D + 2 * Period) % Period);
+}
+
+VOXEL_FUNC uint VoxelOceanLaceCell(float I, int D)
+{
+    return VoxelOceanLaceCellOf(I, D, VOXEL_OCEAN_LACE_PERIOD);
+}
+
+// A value wrapped back into [0, Period).
+VOXEL_FUNC float VoxelOceanLacePeriodicOf(float X, float Period)
+{
+    return X - Period * floor(X / Period);
+}
+
+VOXEL_FUNC float VoxelOceanLacePeriodic(float X)
+{
+    return VoxelOceanLacePeriodicOf(X, float(VOXEL_OCEAN_LACE_PERIOD));
+}
+
+// A smooth noise in [-1, 1] at (U, V) (cells, in [0, Period)) on a lattice repeating every Period cells.
+VOXEL_FUNC float VoxelOceanLaceValueOf(float U, float V, uint Seed, int Period)
+{
+    const float IX = floor(U);
+    const float IY = floor(V);
+    const float FX = U - IX;
+    const float FY = V - IY;
+    const float SX = FX * FX * (3.0f - 2.0f * FX);
+    const float SY = FY * FY * (3.0f - 2.0f * FY);
+    const float A = VoxelOceanLaceUnit(VoxelOceanLaceHash(VoxelOceanLaceCellOf(IX, 0, Period), VoxelOceanLaceCellOf(IY, 0, Period), Seed));
+    const float B = VoxelOceanLaceUnit(VoxelOceanLaceHash(VoxelOceanLaceCellOf(IX, 1, Period), VoxelOceanLaceCellOf(IY, 0, Period), Seed));
+    const float C = VoxelOceanLaceUnit(VoxelOceanLaceHash(VoxelOceanLaceCellOf(IX, 0, Period), VoxelOceanLaceCellOf(IY, 1, Period), Seed));
+    const float D = VoxelOceanLaceUnit(VoxelOceanLaceHash(VoxelOceanLaceCellOf(IX, 1, Period), VoxelOceanLaceCellOf(IY, 1, Period), Seed));
+    return 2.0f * lerp(lerp(A, B, SX), lerp(C, D, SX), SY) - 1.0f;
+}
+
+VOXEL_FUNC float VoxelOceanLaceValue(float U, float V, uint Seed)
+{
+    return VoxelOceanLaceValueOf(U, V, Seed, VOXEL_OCEAN_LACE_PERIOD);
+}
+
+// A warped point (cells): moved by up to VOXEL_OCEAN_LACE_WARP_REACH cells by a smooth noise of
+// VOXEL_OCEAN_LACE_WARP_CELL cells.
+struct FVoxelOceanLacePoint
+{
+    float U;
+    float V;
+};
+
+VOXEL_FUNC FVoxelOceanLacePoint VoxelOceanLaceWarp(float U, float V, uint Seed)
+{
+    const int WarpPeriod = VOXEL_OCEAN_LACE_PERIOD / VOXEL_OCEAN_LACE_WARP_CELL;
+    const float S = 1.0f / float(VOXEL_OCEAN_LACE_WARP_CELL);
+    const float WU = VoxelOceanLacePeriodicOf(U * S, float(WarpPeriod));
+    const float WV = VoxelOceanLacePeriodicOf(V * S, float(WarpPeriod));
+    FVoxelOceanLacePoint P;
+    P.U = VoxelOceanLacePeriodic(U + VOXEL_OCEAN_LACE_WARP_REACH * VoxelOceanLaceValueOf(WU, WV, Seed ^ VOXEL_OCEAN_LACE_SEED_WARP, WarpPeriod));
+    P.V = VoxelOceanLacePeriodic(V + VOXEL_OCEAN_LACE_WARP_REACH * VoxelOceanLaceValueOf(WU, WV, Seed ^ 0x2545f491u, WarpPeriod));
+    return P;
+}
+
+// The streaks' pattern at (U, V) (cells): two octaves of smooth noise, negated (low on a ridge, so
+// a share keeps the ridges first), the second drifting slowly about with the clock.
+VOXEL_FUNC float VoxelOceanLaceStreak(float U, float V, uint Seed, float Time)
+{
+    const FVoxelOceanLacePoint P = VoxelOceanLaceWarp(U, V, Seed);
+    const float Phase = Time * VOXEL_OCEAN_LACE_RATE0;
+    const float A = VoxelOceanLaceValue(P.U, P.V, Seed);
+    const float B = VoxelOceanLaceValue(VoxelOceanLacePeriodic(2.0f * P.U + 0.6f * sin(Phase)), VoxelOceanLacePeriodic(2.0f * P.V + 0.6f * cos(Phase)),
+        Seed ^ 0x9e3779b9u);
+    return -(A + 0.5f * B);
+}
+
+// The cell walls' pattern at (U, V) (cells): F2 - F1 of the cells' points (0 on a wall), warped,
+// each point's distance weighed by its own (0.7 to 1.3: cells of different sizes, their walls
+// curved), roughened by a finer noise. The points sit anywhere but their cells' outer 5% and wobble
+// by 0.1 cells at Rate (rad/s).
+VOXEL_FUNC float VoxelOceanLaceWall(float U, float V, uint Seed, float Time, float Rate)
+{
+    const FVoxelOceanLacePoint P = VoxelOceanLaceWarp(U, V, Seed);
+    const float IX = floor(P.U);
+    const float IY = floor(P.V);
+    const float FX = P.U - IX;
+    const float FY = P.V - IY;
+    float F1 = 1.0e9f;
+    float F2 = 1.0e9f;
+    for (int DY = -1; DY <= 1; DY++)
+    {
+        for (int DX = -1; DX <= 1; DX++)
+        {
+            // (Independent draws: the place from one hash's halves, the weight and the phase from a second's.)
+            const uint H = VoxelOceanLaceHash(VoxelOceanLaceCell(IX, DX), VoxelOceanLaceCell(IY, DY), Seed);
+            const uint H2 = VoxelOceanLaceHash(H, 0x27d4eb2fu, Seed);
+            const float Phase = float(H2 >> 24u) * (6.28318531f / 256.0f) + Time * Rate;
+            const float PX = float(DX) + 0.05f + 0.9f * VoxelOceanLaceUnit(H) + 0.1f * sin(Phase);
+            const float PY = float(DY) + 0.05f + 0.9f * VoxelOceanLaceUnit(H >> 16u) + 0.1f * cos(Phase);
+            const float Weight = VOXEL_OCEAN_LACE_WEIGHT_LOW + (VOXEL_OCEAN_LACE_WEIGHT_HIGH - VOXEL_OCEAN_LACE_WEIGHT_LOW) * VoxelOceanLaceUnit(H2);
+            const float EX = PX - FX;
+            const float EY = PY - FY;
+            const float Dist = sqrt(EX * EX + EY * EY) / Weight;
+            if (Dist < F1)
+            {
+                F2 = F1;
+                F1 = Dist;
+            }
+            else if (Dist < F2)
+            {
+                F2 = Dist;
+            }
+        }
+    }
+    const float Rough = VoxelOceanLaceValue(VoxelOceanLacePeriodic(P.U * VOXEL_OCEAN_LACE_ROUGH_SCALE), VoxelOceanLacePeriodic(P.V * VOXEL_OCEAN_LACE_ROUGH_SCALE),
+        Seed ^ 0x3c6ef372u);
+    return F2 - F1 + VOXEL_OCEAN_LACE_ROUGH * Rough;
+}
+
+// The thresholds: the pattern's value below which it keeps the share D of its area (the inverse
+// of its distribution, tabulated at D = sin^2(pi k / 128), closer toward both ends, and interpolated; the harness fits them).
+#if defined(__cplusplus)
+#include "VoxelOceanFoamLaceFit.ush"
+#else
+#include "/Plugin/VoxelPlugin/Private/VoxelOceanFoamLaceFit.ush"
+#endif
+
+// A layer's foam (0 to 1): the pattern below the threshold for its share D, softened over the
+// pixel's footprint (PixelCells: the footprint in the layer's cells; Steep: the pattern's change a
+// cell), its share itself where its cells are too small to draw.
+VOXEL_FUNC float VoxelOceanLaceLayer(float Value, float Threshold, float D, float PixelCells, float Steep)
+{
+    if (D <= 0.0f) return 0.0f;
+    if (D >= 1.0f) return 1.0f;
+    const float W = max(0.5f * PixelCells * Steep, VOXEL_OCEAN_LACE_SOFT);
+    const float Sharp = 1.0f - smoothstep(Threshold - W, Threshold + W, Value);
+    const float Blur = smoothstep(VOXEL_OCEAN_LACE_BLUR_START, VOXEL_OCEAN_LACE_BLUR_END, PixelCells);
+    return lerp(Sharp, D, Blur);
+}
+
+// The coordinate within a pattern's period (cells): the large part wrapped first, then the offset
+// (m). Cell: the pattern's cell along this axis (m).
+VOXEL_FUNC float VoxelOceanLaceCoord(float Base, float Offset, float Cell)
+{
+    const float InvL = 1.0f / (Cell * float(VOXEL_OCEAN_LACE_PERIOD));
+    const float B = Base * InvL;
+    const float F = B - floor(B);
+    const float U = F + Offset * InvL;
+    return (U - floor(U)) * float(VOXEL_OCEAN_LACE_PERIOD);
+}
+
+// The structure at a point: Foam (0 to 1, its mean the density), each layer's own, and how deep
+// inside the lace's walls the point lies (Thick: 0 at a wall's edge, 1 at its middle; 0.5 where the
+// lace isn't drawn), for the shading (thin foam translucent, the walls' relief).
+struct FVoxelOceanLace
+{
+    float Foam;
+    float Layer0;
+    float Layer1;
+    float Layer2;
+    float Thick;
+};
+
+// The structure for a density at a point: its chart coordinates in the short bands' downwind frame
+// (m; the reference's large part BaseX, BaseY and the point's offset OffsetX, OffsetY), the
+// pixel's footprint (m), the clock (s), a seed (the chart's: neighbouring charts' patterns are
+// independent).
+VOXEL_FUNC FVoxelOceanLace VoxelOceanLaceAt(float BaseX, float BaseY, float OffsetX, float OffsetY, float Density, float FootprintM, float Time, uint Seed)
+{
+    FVoxelOceanLace L;
+    L.Foam = 0.0f;
+    L.Layer0 = 0.0f;
+    L.Layer1 = 0.0f;
+    L.Layer2 = 0.0f;
+    L.Thick = 0.5f;
+    const float Dn = saturate(Density);
+    if (Dn <= 0.0f) return L;
+    const float LogD = log2(max(Dn, 1.0e-6f));
+    const float D0 = exp2(VOXEL_OCEAN_LACE_SHARE0 * LogD);
+    const float D1 = exp2(VOXEL_OCEAN_LACE_SHARE1 * LogD);
+    const float D2 = exp2(VOXEL_OCEAN_LACE_SHARE2 * LogD);
+    const float Foot = max(FootprintM, 0.0f);
+
+    // The streaks.
+    const float Pix0 = Foot / VOXEL_OCEAN_LACE_CELL0;
+    L.Layer0 = D0;
+    if (Pix0 < VOXEL_OCEAN_LACE_BLUR_END && D0 < 1.0f)
+    {
+        const float U = VoxelOceanLaceCoord(BaseX, OffsetX, VOXEL_OCEAN_LACE_CELL0 * VOXEL_OCEAN_LACE_STRETCH0);
+        const float V = VoxelOceanLaceCoord(BaseY, OffsetY, VOXEL_OCEAN_LACE_CELL0);
+        L.Layer0 = VoxelOceanLaceLayer(VoxelOceanLaceStreak(U, V, Seed, Time), VoxelOceanLaceThreshold0(D0), D0, Pix0, VOXEL_OCEAN_LACE_STEEP_STREAK);
+    }
+    // The lace.
+    const float Pix1 = Foot / VOXEL_OCEAN_LACE_CELL1;
+    L.Layer1 = D1;
+    if (Pix1 < VOXEL_OCEAN_LACE_BLUR_END)
+    {
+        const float U = VoxelOceanLaceCoord(BaseX, OffsetX, VOXEL_OCEAN_LACE_CELL1 * VOXEL_OCEAN_LACE_STRETCH1);
+        const float V = VoxelOceanLaceCoord(BaseY, OffsetY, VOXEL_OCEAN_LACE_CELL1);
+        const float Wall = VoxelOceanLaceWall(U, V, Seed ^ VOXEL_OCEAN_LACE_SEED1, Time, VOXEL_OCEAN_LACE_RATE1);
+        const float T1 = VoxelOceanLaceThreshold1(D1);
+        L.Layer1 = VoxelOceanLaceLayer(Wall, T1, D1, Pix1, VOXEL_OCEAN_LACE_STEEP_WALL);
+        // How deep inside the walls: their middles thick, a cell's middle thin (in solid foam too,
+        // where the threshold is past every wall: its cells' middles the thinnest); toward the mean
+        // where the lace gives way to its share.
+        L.Thick = lerp(saturate((T1 - Wall) / (max(T1, 0.0f) + 0.02f)), 0.5f, smoothstep(VOXEL_OCEAN_LACE_BLUR_START, VOXEL_OCEAN_LACE_BLUR_END, Pix1));
+    }
+    // The bubbles.
+    const float Pix2 = Foot / VOXEL_OCEAN_LACE_CELL2;
+    L.Layer2 = D2;
+    if (Pix2 < VOXEL_OCEAN_LACE_BLUR_END)
+    {
+        const float U = VoxelOceanLaceCoord(BaseX, OffsetX, VOXEL_OCEAN_LACE_CELL2 * VOXEL_OCEAN_LACE_STRETCH2);
+        const float V = VoxelOceanLaceCoord(BaseY, OffsetY, VOXEL_OCEAN_LACE_CELL2);
+        const float Wall = VoxelOceanLaceWall(U, V, Seed ^ VOXEL_OCEAN_LACE_SEED2, Time, VOXEL_OCEAN_LACE_RATE2);
+        const float T2 = VoxelOceanLaceThreshold1(D2);
+        L.Layer2 = VoxelOceanLaceLayer(Wall, T2, D2, Pix2, VOXEL_OCEAN_LACE_STEEP_WALL);
+        // The bubbles' own relief on the lace's: thinner in each bubble's middle.
+        const float Inside = lerp(saturate((T2 - Wall) / (max(T2, 0.0f) + 0.02f)), 0.5f, smoothstep(VOXEL_OCEAN_LACE_BLUR_START, VOXEL_OCEAN_LACE_BLUR_END, Pix2));
+        L.Thick *= 0.65f + 0.7f * Inside * 0.5f;
+    }
+    L.Foam = L.Layer0 * L.Layer1 * L.Layer2;
+    return L;
+}
+
+#endif

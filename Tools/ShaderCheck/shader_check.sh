@@ -42,6 +42,19 @@ for n in $NAMES; do
   # Entry points: "void Name(" right after a [numthreads(...)] line, and the river build's macro
   # entries.
   for e in $(awk '/^\[numthreads/ { n = 1; next } n && match($0, /^void [A-Za-z0-9_]+\(/) { print substr($0, 6, RLENGTH - 6) } { n = 0 }' "$src"; grep -oP "^VOXEL_\w*ENTRY\(\K\w+" "$src"); do check "$src" "$e"; done
+  # Raster entry points (stage W3): "// VOXEL_SHADER_ENTRY <profile> <name> [DEFINE=value ...]" lines.
+  while read -r prof e defs; do
+    [ -z "$e" ] && continue
+    dflags=""; gflags=""
+    for d in $defs; do dflags="$dflags -D $d"; gflags="$gflags -D$d"; done
+    case $prof in vs_*) stage=vert ;; ps_*) stage=frag ;; *) stage=comp ;; esac
+    for v in 2018 2021; do
+      out=$("$DXC" -T "$prof" -E "$e" -HV $v $dflags -I "$WORK" "$src" -Fo /dev/null 2>&1 | grep -E "error|warning" | head -5)
+      [ -n "$out" ] && { echo "$(basename "$src") $e ($defs) HLSL $v: $out"; fails=1; }
+    done
+    out=$(glslangValidator -D $gflags -S $stage -e "$e" -I"$WORK" -V "$src" -o "$WORK/x.spv" 2>&1 | grep -iE "error" | head -5)
+    [ -n "$out" ] && { echo "glslang $(basename "$src") $e ($defs): $out"; fails=1; }
+  done < <(grep -oP "^// VOXEL_SHADER_ENTRY \K.*" "$src")
 done
 # The material's Custom-node code: the includes made local.
 for f in "$WORK"/Plugin/VoxelPlugin/Private/*; do sed 's#"Plugin/VoxelPlugin/Private/#"#' "$f" > "$WORK/mat/$(basename "$f")"; done

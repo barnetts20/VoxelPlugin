@@ -77,6 +77,38 @@ struct VOXELPLUGIN_API FVoxelOceanSettings
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Mesh", meta = (EditCondition = "bWaveClipmap && bWaveRings", ClampMin = "4", ClampMax = "256"))
     int32 FarSphereCells = 64;
 
+    // --- Shading (stage W3) ---
+
+    /** The ocean's own pass draws and shades the rings (an atmosphere-lit sea, the same model from
+     *  the shore to orbit) instead of the ocean material. Only with the rings (bWaveRings, the FFT
+     *  waves in the clipmap); the tile pages always use the material. Off: the rings draw with the
+     *  material as in stage W2. Rebuilds the surface. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Shading", meta = (EditCondition = "bWaveClipmap && bWaveRings"))
+    bool bOwnShading = true;
+
+    /** The slope variance (both axes together) of the short waves no wave band holds: the
+     *  capillaries and the shortest gravity waves. Widens the sun's glitter and blurs the sky's
+     *  reflection everywhere, on top of what the bands leave unresolved at a distance. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Shading", meta = (EditCondition = "bOwnShading", ClampMin = "0.0", UIMax = "0.05"))
+    float ShortWaveSlopeVariance = 0.004f;
+
+    /** How far the bed seen through the water shifts with the waves' refraction (1: as the
+     *  refracted ray meets it; 0: no shift). */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Shading", meta = (EditCondition = "bOwnShading", ClampMin = "0.0", UIMax = "2.0"))
+    float Refraction = 1.0f;
+
+    /** The foam's albedo, lit by the sun and the sky. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Shading", meta = (EditCondition = "bOwnShading"))
+    FLinearColor FoamAlbedo = FLinearColor(0.85f, 0.85f, 0.85f);
+
+    /** The stand-in sky until the atmosphere is connected (stage W3b): its radiance at the zenith
+     *  and at the horizon per unit of the sun's illuminance (the world's directional light), by
+     *  day; it dims through twilight. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Shading", AdvancedDisplay, meta = (EditCondition = "bOwnShading"))
+    FLinearColor StandInSkyZenith = FLinearColor(0.035f, 0.07f, 0.14f);
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Shading", AdvancedDisplay, meta = (EditCondition = "bOwnShading"))
+    FLinearColor StandInSkyHorizon = FLinearColor(0.09f, 0.11f, 0.13f);
+
     // --- Depth ---
 
     /** Leave out the triangles the land stands well above (the terrain hides them anyway). */
@@ -109,7 +141,8 @@ struct VOXELPLUGIN_API FVoxelOceanSettings
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Optics")
     FLinearColor Scattering = FLinearColor(0.02f, 0.03f, 0.035f);
 
-    /** Forward scattering anisotropy, for a Single Layer Water surface (VoxelOceanPhaseG). */
+    /** Forward scattering anisotropy: the ocean's own pass (stage W3), or a Single Layer Water
+     *  surface (VoxelOceanPhaseG). */
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Optics", meta = (ClampMin = "-1.0", ClampMax = "1.0"))
     float PhaseG = 0.8f;
 
@@ -469,6 +502,8 @@ struct VOXELPLUGIN_API FVoxelOceanSettings
         FoamCoverage = FMath::Max(FoamCoverage, 0.0);
         FoamDecay = FMath::Max(FoamDecay, 0.1);
         SurfFoam = FMath::Max(SurfFoam, 0.0);
+        ShortWaveSlopeVariance = FMath::Max(ShortWaveSlopeVariance, 0.0f);
+        Refraction = FMath::Max(Refraction, 0.0f);
     }
 
     /** The fields whose change rebuilds the surface. */
@@ -477,7 +512,7 @@ struct VOXELPLUGIN_API FVoxelOceanSettings
         return FinestSpacing == Other.FinestSpacing && TileQuads == Other.TileQuads && SpareBufferSets == Other.SpareBufferSets
             && bWavesInCompute == Other.bWavesInCompute && bWaveClipmap == Other.bWaveClipmap && ClipSize == Other.ClipSize
             && ClipLevels == Other.ClipLevels && ClipFinestSpacing == Other.ClipFinestSpacing && bWaveRings == Other.bWaveRings
-            && FarSphereCells == Other.FarSphereCells;
+            && FarSphereCells == Other.FarSphereCells && bOwnShading == Other.bOwnShading;
     }
 
     /** The fields the surface material receives. */

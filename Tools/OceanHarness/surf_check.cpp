@@ -425,31 +425,26 @@ int main()
         }
         const FVoxelOceanSurf R = VoxelOceanSurfOf(In, S);
         Check(Most < 1.0e-6, "25 m spacing at 8 m deep: no trains in the height", Most, 1.0e-6);
-        Check(std::abs(R.LongKeep - 1.0f) < 1.0e-6, "and the long bands keep it all (no calm band)", R.LongKeep, 1.0);
+        // Stage W3f: the composition is by place: the long bands keep 1 - share whatever the mesh
+        // or the footprint shows of the trains.
+        Check(std::abs(double(R.LongKeep) * R.LongKeep + R.Debug.x - 1.0) < 1.0e-5, "and the long bands keep 1 - share (composition by place)",
+            std::abs(double(R.LongKeep) * R.LongKeep + R.Debug.x - 1.0), 1.0e-5);
         In.SpacingM = 0.0f;
         In.FootprintM = 45.0f;
         In.ForNormals = 1.0f;
         const FVoxelOceanSurf N = VoxelOceanSurfOf(In, S);
-        Check(std::abs(N.LongKeep - 1.0f) < 1.0e-6, "45 m footprint (the normals): the long bands keep it all", N.LongKeep, 1.0);
+        Check(std::abs(double(N.LongKeep) - R.LongKeep) < 1.0e-6, "45 m footprint (the normals): the same composition", std::abs(double(N.LongKeep) - R.LongKeep), 1.0e-6);
         Check(dot(N.GradientPhase, N.GradientPhase) < 1.0e-12, "and no trains in the normals", std::sqrt(dot(N.GradientPhase, N.GradientPhase)), 0.0);
-        // Partly resolved: the long bands give up what the trains show by energy (m^2 of their
-        // share at amplitude m), never more than the share, less as the mesh coarsens.
-        double Over = 0.0, Rise = 0.0, Mid = 0.0, Last = 1.0;
+        // The same at every spacing.
+        double Spread = 0.0;
         for (int i = 0; i <= 200; i++)
         {
             FVoxelOceanSurfInput P = Input(Beach, 6.0 / 0.02, 50.0f);
             P.SpacingM = 0.1f * float(i);
-            const FVoxelOceanSurf R = VoxelOceanSurfOf(P, S);
-            const double Shown = (1.0 - double(R.LongKeep) * R.LongKeep) / std::max(double(R.Debug.x), 1e-9);
-            Over = std::max(Over, Shown - 1.0);
-            Rise = std::max(Rise, Shown - Last);
-            Last = Shown;
-            // 6 m deep the trains' wavelengths are about 60 to 70 m: half resolved (by amplitude)
-            // near a 10 m spacing, a quarter of the share shown.
-            if (i == 100) Mid = Shown;
+            const FVoxelOceanSurf Ri = VoxelOceanSurfOf(P, S);
+            Spread = std::max(Spread, std::abs(double(Ri.LongKeep) * Ri.LongKeep + Ri.Debug.x - 1.0));
         }
-        Check(Over < 1.0e-5 && Rise < 1.0e-6, "partly resolved: the long bands give up no more than the share, less as the mesh coarsens", Over, 1.0e-5);
-        Check(Mid > 0.1 && Mid < 0.45, "at about half the amplitude shown, about a quarter of the energy", Mid, 0.25);
+        Check(Spread < 1.0e-5, "at every spacing from 0 to 20 m: the long bands keep 1 - share", Spread, 1.0e-5);
         // The bores' least front at a 2 m spacing: no slope steeper than a half cosine over 4
         // spacings of the wave's range.
         const FVoxelOceanSurfSettings S0 = Settings(0.0f);

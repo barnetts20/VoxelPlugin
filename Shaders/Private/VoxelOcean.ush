@@ -106,8 +106,8 @@
 
 #pragma once
 
-#include "/Plugin/VoxelPlugin/Private/VoxelOceanVertexCore.ush"
-#include "/Plugin/VoxelPlugin/Private/VoxelOceanClip.ush"
+// (VoxelOceanPixelClip.ush includes VoxelOceanVertexCore.ush and VoxelOceanClip.ush.)
+#include "/Plugin/VoxelPlugin/Private/VoxelOceanPixelClip.ush"
 
 // The body for either parameter type (a Custom node is compiled for the vertex shader here,
 // but the include is seen by every shader of the material).
@@ -465,58 +465,9 @@ float3 VoxelOceanPixelFFT(FMaterialPixelParameters Parameters, float3 SamplePoin
 }
 
 // ---------------------------------------------------------------------------------------------
-// The wave clipmap's pixel (stages O9k, W1; VoxelOceanClip.ush; wiring: STAGE_O9k_NOTES.md)
+// The wave clipmap's pixel (stages O9k, W1; VoxelOceanPixelClip.ush, which the ocean's own pass
+// shares; wiring: STAGE_O9k_NOTES.md)
 // ---------------------------------------------------------------------------------------------
-
-// The wave clipmap at a pixel: the normal and the slope variance it leaves out (planet frame), the
-// foam, the levels' footprint there (cm: the blend's, the finer level's spacing times
-// 2^(1 - weight)), whether any level held the point.
-struct FVoxelOceanPixelClipOut
-{
-    float3 Normal;
-    float SlopeVariance;
-    float Foam;
-    float Spacing;
-    float Valid;
-};
-
-FVoxelOceanPixelClipOut VoxelOceanPixelClipOf(float3 X, float3 UpP, float Footprint, Texture2DArray ClipDisplacement, Texture2DArray ClipNormal,
-    SamplerState ClipNormalSampler, Texture2D ClipInfo)
-{
-    FVoxelOceanPixelClipOut O;
-    O.Normal = UpP;
-    O.SlopeVariance = 0.0f;
-    O.Foam = 0.0f;
-    O.Spacing = 0.0f;
-    O.Valid = 0.0f;
-    const FVoxelOceanClipPick Pick = VoxelOceanClipPickOfTexture(ClipInfo, X, Footprint);
-    const FVoxelOceanClipFrame F = VoxelOceanClipFrameOfTexture(ClipInfo);
-    const int Count = clamp(int(F.Count + 0.5f), 0, VOXEL_OCEAN_CLIP_MAX_LEVELS);
-    if (Count <= 0) return O;
-    const FVoxelOceanClipLevel L0 = VoxelOceanClipLevelOfTexture(ClipInfo, 0);
-    if (Pick.Level < 0)
-    {
-        // Past the outermost level: its slope at its reach's edge as roughness.
-        const FVoxelOceanClipLevel L = VoxelOceanClipLevelOfTexture(ClipInfo, Count - 1);
-        if (L.Valid < 0.5f) return O;
-        const float Reach = 0.5f * F.Size - VOXEL_OCEAN_CLIP_EDGE - VOXEL_OCEAN_CLIP_SLACK;
-        const float2 T = clamp(VoxelOceanClipPlaneOffset(F, X) / L.Spacing, -Reach, Reach);
-        const float4 N = ClipNormal.SampleLevel(ClipNormalSampler, VoxelOceanClipStorageUV(F, L, T * L.Spacing), 0.0f);
-        const float C = max(dot(normalize(N.xyz), UpP), 0.1f);
-        O.SlopeVariance = N.w + (1.0f / (C * C) - 1.0f);
-        return O;
-    }
-    // The levels' blend; where the next level doesn't hold the point, its share goes to the radial.
-    const float Missing = Pick.NextValid > 0.5f ? 0.0f : 1.0f - Pick.Weight;
-    const float4 N = VoxelOceanClipSample(ClipNormal, ClipNormalSampler, Pick);
-    const float4 D = VoxelOceanClipSample(ClipDisplacement, ClipNormalSampler, Pick);
-    O.Normal = normalize(N.xyz + UpP * Missing);
-    O.SlopeVariance = N.w;
-    O.Foam = saturate(D.w);
-    O.Spacing = L0.Spacing * exp2(float(Pick.Level) + 1.0f - Pick.Weight);
-    O.Valid = 1.0f;
-    return O;
-}
 
 // The normal (world), the slope variance it leaves out and the foam at the pixel, from the wave
 // clipmap's levels: the level of the pixel's footprint (and the next, blended), no waves
@@ -542,13 +493,11 @@ float3 VoxelOceanPixelClip(FMaterialPixelParameters Parameters, float3 SamplePoi
     return normalize(VoxelOceanRotate(Rotation, C.Normal));
 }
 
-// The same with the detail the clipmap can't hold (stage O9l): the FFT bands' slope between the
-// pixel's footprint and the clipmap's, looked up here (deep water: the bands high-passed through
-// their mips, without the shore's work: VoxelOceanFFTEvaluate with FVoxelOceanWaveParams.HighPass),
-// added to the clipmap's normal, its variance taken off the clipmap's unresolved variance; faded
-// out within a metre of depth (Depth: the vertex node's, through its vertex interpolator, cm),
-// where the clipmap's bores and swash carry the surface. The inputs: the clipmap node's, and the
-// old pixel node's FFT inputs (Params to Charts) and Depth.
+// The same with the detail the clipmap can't hold (stage O9l; VoxelOceanPixelClipDetailOf): the
+// FFT bands' slope between the pixel's footprint and the clipmap's, added to the clipmap's normal,
+// its variance taken off the clipmap's unresolved variance; faded out within a metre of depth
+// (Depth: the vertex node's, through its vertex interpolator, cm). The inputs: the clipmap node's,
+// and the old pixel node's FFT inputs (Params to Charts) and Depth.
 //   return VoxelOceanPixelClipDetail(Parameters, SamplePoint, Params, Wave0, Wave1, Wave2, Center, Shape, FFT, RefHigh, RefLow, Rotation, Tiles, States, SlopeVar, Displacement, DisplacementSampler, Derivatives, DerivativesSampler, Charts, ClipDisplacement, ClipNormal, ClipNormalSampler, ClipInfo, Depth, SlopeVariance, Foam);
 float3 VoxelOceanPixelClipDetail(FMaterialPixelParameters Parameters, float3 SamplePoint, float4 Params, float4 Wave0, float4 Wave1, float4 Wave2, float3 Center,
     float4 Shape, float4 FFT, float4 RefHigh, float4 RefLow, float4 Rotation, float4 Tiles, float4 States, float4 SlopeVar,
@@ -556,29 +505,15 @@ float3 VoxelOceanPixelClipDetail(FMaterialPixelParameters Parameters, float3 Sam
     Texture2DArray ClipDisplacement, Texture2DArray ClipNormal, SamplerState ClipNormalSampler, Texture2D ClipInfo, float Depth,
     out float SlopeVariance, out float Foam)
 {
-    const float3 Up = normalize(SamplePoint - Center);
 #if defined(PIXELSHADER) && PIXELSHADER
     const float Footprint = max(length(ddx(SamplePoint)), length(ddy(SamplePoint)));
 #else
     const float Footprint = 0.0f;
 #endif
-    const float3 UpP = VoxelOceanRotateBack(Rotation, Up);
-    const FVoxelOceanPixelClipOut C = VoxelOceanPixelClipOf(VoxelOceanRotateBack(Rotation, SamplePoint), UpP, Footprint,
-        ClipDisplacement, ClipNormal, ClipNormalSampler, ClipInfo);
-    float3 Normal = C.Normal;
+    const FVoxelOceanWaveParams W = VoxelOceanMakeWaveParamsFFT(Params, Wave0, Wave1, Wave2, Center, Shape, FFT, RefHigh, RefLow, Rotation, Tiles, States, SlopeVar);
+    const FVoxelOceanPixelClipOut C = VoxelOceanPixelClipDetailOf(SamplePoint, Footprint, Depth, W, Displacement, DisplacementSampler, Derivatives,
+        DerivativesSampler, Charts, ClipDisplacement, ClipNormal, ClipNormalSampler, ClipInfo);
     SlopeVariance = C.SlopeVariance;
     Foam = C.Foam;
-    // The detail: where the clipmap holds the point at a coarser footprint than the pixel's, in water.
-    const float Keep = saturate(Depth * (1.0f / 100.0f));
-    if (FFT.x > 0.5f && C.Valid > 0.5f && C.Spacing > Footprint && Keep > 0.0f)
-    {
-        FVoxelOceanWaveParams W = VoxelOceanMakeWaveParamsFFT(Params, Wave0, Wave1, Wave2, Center, Shape, FFT, RefHigh, RefLow, Rotation, Tiles, States, SlopeVar);
-        W.HighPass = C.Spacing;
-        const FVoxelOceanFFTPoint Pt = VoxelOceanFFTEvaluate(SamplePoint, Up, 1.0e9f, Footprint, VOXEL_OCEAN_DEEP, VoxelOceanShoreNone(), W,
-            Displacement, DisplacementSampler, Derivatives, DerivativesSampler, Charts, 2u);
-        Normal = normalize(Normal - Pt.R.Gradient * Keep);
-        const float Resolved = VoxelOceanFFTSlopeVariance(Pt, W, C.Spacing) - VoxelOceanFFTSlopeVariance(Pt, W, Footprint);
-        SlopeVariance = max(SlopeVariance - Keep * max(Resolved, 0.0f), 0.0f);
-    }
-    return normalize(VoxelOceanRotate(Rotation, Normal));
+    return C.Normal;
 }

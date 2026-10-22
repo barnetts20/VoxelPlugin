@@ -9,7 +9,9 @@
 // and height queries. Stage O4: the wave model interface (VoxelOceanWaves.h, the GPU hook in
 // VoxelOceanWaves.ush), the surface query on any thread, the ocean clock, and the environment
 // inputs (wind, storm) the atmosphere will provide. Stage O6b: the FFT waves (the cascades'
-// textures, made and kept here; FVoxelOceanWavesFFT, FVoxelOceanCascades).
+// textures, made and kept here; FVoxelOceanWavesFFT, FVoxelOceanCascades). Stage W3: the ocean's
+// own pass draws and shades the rings (FVoxelOceanSurfacePass), lit by a stand-in sun (the world's
+// directional light) and sky until the atmosphere's light is connected.
 
 #pragma once
 
@@ -28,6 +30,8 @@ class UTexture2D;
 class UTexture2DArray;
 class AAdaptiveVoxelActor;
 class FVoxelUnderwaterViewExtension;
+class FVoxelOceanSurfacePass;
+class UDirectionalLightComponent;
 struct FVoxelDensityGPUData;
 struct FVoxelOceanSurfaceInputs;
 class FVoxelOceanShoreField;
@@ -246,6 +250,14 @@ private:
     /** The view from under water: one view extension per ocean, fed every tick. */
     TSharedPtr<FVoxelUnderwaterViewExtension, ESPMode::ThreadSafe> UnderwaterExtension;
 
+    /** The ocean's own pass (stage W3): one per ocean, fed every tick while the rings draw for it. */
+    TSharedPtr<FVoxelOceanSurfacePass, ESPMode::ThreadSafe> SurfacePass;
+    bool bSurfacePassOn = false;
+    /** The stand-in sun: the world's directional light (looked for again every second). */
+    TWeakObjectPtr<UDirectionalLightComponent> SunLight;
+    double SunLightSearchTime = -1.0e9;
+    bool bWarnedNoSun = false;
+
     /** The last tick's waves for the queries, swapped whole under QueryLock. */
     TSharedPtr<const FVoxelOceanWaveFrame, ESPMode::ThreadSafe> QueryFrame;
     mutable FRWLock QueryLock;
@@ -289,6 +301,15 @@ private:
     void UpdateUnderwater();
     /** Disables the underwater extension and releases it on the render thread. */
     void ReleaseUnderwater();
+    /** The ocean's own pass (stage W3), once per world (no renderer: none). */
+    void CreateSurfacePass();
+    /** Enables the own pass while the rings draw for it and hands it this frame. */
+    void UpdateSurfacePass();
+    /** Disables the own pass and releases it on the render thread (off the renderer's hook first). */
+    void ReleaseSurfacePass();
+    /** The stand-in sun: the world's atmosphere sun light (the first), else its brightest
+     *  directional light; null: none. */
+    UDirectionalLightComponent* FindSunLight();
     /** The optics properties on the surface material instance (Single Layer Water). */
     void ApplyOptics();
     /** The environment constants from the properties. */
