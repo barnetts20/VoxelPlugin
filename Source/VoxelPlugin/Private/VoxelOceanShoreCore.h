@@ -25,9 +25,19 @@ namespace VoxelShader
     {
         const uint32_t* Texels = nullptr;
         int Side = 0;
+        /** The coastal field's slices (stage O9h, VoxelOceanCoast.ush: slices 6 and up of the
+         *  texture), or none. */
+        const uint32_t* Coast = nullptr;
+        int CoastSlices = 0;
 
         uint Load(int Face, int X, int Y) const
         {
+            if (Face >= 6)
+            {
+                const int Slice = Face - 6;
+                if (!Coast || Slice >= CoastSlices) return 0u;
+                return Coast[(size_t(Slice) * size_t(Side) + size_t(Y)) * size_t(Side) + size_t(X)];
+            }
             return Texels[(size_t(Face) * size_t(Side) + size_t(Y)) * size_t(Side) + size_t(X)];
         }
     };

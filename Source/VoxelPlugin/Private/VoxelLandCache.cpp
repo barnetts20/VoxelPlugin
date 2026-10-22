@@ -216,8 +216,16 @@ void FVoxelLandCache::Reset()
     SeaRadius = 0.0;
     TexelsWritten = 0;
     LastTickFrame = MAX_uint64;
+    LastLiveFrame = 0;
+    SettledEditSequence = 0;
+    Unsettled.Reset();
     Generation = 0;
     FailedGeneration.Reset();
+}
+
+bool FVoxelLandCache::IsLive() const
+{
+    return IsInitialized() && LastLiveFrame > 0 && GFrameCounter <= LastLiveFrame + 2;
 }
 
 int32 FVoxelLandCache::GetLevels() const
@@ -246,6 +254,8 @@ void FVoxelLandCache::SetEdits(TSharedPtr<const FVoxelEditGPUData> InEdits, uint
         if (Plan.IsValid())
             Plan->InvalidateAll();
         PendingEdits.Reset();
+        Unsettled.Reset();
+        SettledEditSequence = FMath::Min(SettledEditSequence, Sequence);
     }
     Edits = MoveTemp(InEdits);
     EditsSequence = Sequence;
@@ -309,7 +319,21 @@ void FVoxelLandCache::Tick(const FVector& CameraPlanet)
         const double Min[3] = { Box.Min.X, Box.Min.Y, Box.Min.Z };
         const double Max[3] = { Box.Max.X, Box.Max.Y, Box.Max.Z };
         Plan->MarkDirty(Min, Max);
+        // Settled once none of its texels is left to write (stage O9m).
+        Unsettled.Add(PendingEdits[i]);
         PendingEdits.RemoveAtSwap(i);
+    }
+    // Many at once (a long stroke written slowly): one box, as old as the oldest.
+    if (Unsettled.Num() > 256)
+    {
+        FPendingEdit All = Unsettled[0];
+        for (const FPendingEdit& Pending : Unsettled)
+        {
+            All.Sequence = FMath::Min(All.Sequence, Pending.Sequence);
+            All.Bounds += Pending.Bounds;
+        }
+        Unsettled.Reset();
+        Unsettled.Add(All);
     }
 
     VoxelLandCachePlan::FSettings Settings;
@@ -318,7 +342,26 @@ void FVoxelLandCache::Tick(const FVector& CameraPlanet)
     const double Direction[3] = { CameraPlanet.X, CameraPlanet.Y, CameraPlanet.Z };
     std::vector<VoxelLandCachePlan::FJob> Jobs;
     Plan->Tick(Direction, Settings, Jobs);
-    Dispatch(Jobs.data(), (int32)Jobs.size());
+    if (!Dispatch(Jobs.data(), (int32)Jobs.size())) return;
+    LastLiveFrame = GFrameCounter;
+    // Every notice the edits set carries is now in the plan's dirty texels (above). Those whose
+    // texels the writes so far have all reached are in what they leave; the settled sequence is
+    // the newest before the oldest that isn't (sequences only grow).
+    uint32 OldestUnsettled = MAX_uint32;
+    for (int32 i = 0; i < Unsettled.Num();)
+    {
+        const FBox& Box = Unsettled[i].Bounds;
+        const double Min[3] = { Box.Min.X, Box.Min.Y, Box.Min.Z };
+        const double Max[3] = { Box.Max.X, Box.Max.Y, Box.Max.Z };
+        if (!Plan->IsDirtyIn(Min, Max))
+        {
+            Unsettled.RemoveAtSwap(i);
+            continue;
+        }
+        OldestUnsettled = FMath::Min(OldestUnsettled, Unsettled[i].Sequence);
+        i++;
+    }
+    SettledEditSequence = OldestUnsettled == MAX_uint32 ? EditsSequence : FMath::Min(EditsSequence, OldestUnsettled - 1);
 }
 
 bool FVoxelLandCache::Dispatch(const VoxelLandCachePlan::FJob* InJobs, int32 NumJobs)

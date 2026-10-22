@@ -1,0 +1,832 @@
+// VoxelLandBelts.ush - The belts (stage B1, Design/Belts.md): where convergent boundaries
+// (collision and arc ranges) raised the mountains, a belt set (Design/NoiseTiles2D_Addendum4.md:
+// an eroded set in the peaks' layout whose x axis runs along the strike, its thrust fronts facing
+// -y) takes the peaks' place, laid in a frame tied to each boundary.
+//
+// The frame of a plate pair a < b, from their seeds Sa, Sb (the plates are a warped spherical
+// Voronoi diagram, VoxelLandPlates.ush; in the warped domain their boundary is the great circle
+// equidistant from the seeds):
+//   - E1 = normalize(Sa + Sb), on the circle between the seeds; A = normalize(Sb - Sa), its pole;
+//     E2 = A x E1;
+//   - along the strike, u = R atan2(W.E2, W.E1): the arc along the circle from E1;
+//   - across it, v = R (acos(W.Sa) - acos(W.Sb)) / 2: the profiles' own distance
+//     (VoxelLandPartsForOwn's Dist), positive on b's side, so the grain follows the profiles'
+//     contours (they widen away from E1, and the grain with them);
+// at W, the plates' warped direction. The bake records W per cell (FVoxelLandBeltRecord), and
+// each cell's u and v are computed from it: the frame is the B-spline of the cells' values, so a
+// float's round-off is a per-cell constant, smoothed, never a jitter between neighbouring samples
+// (at a planet's radius a coordinate computed at the point would be 10 cm noise). In the set's
+// texels, about a reference integer (exact): the lookup keeps its precision at any radius.
+//
+// Per sample, at the bake's warped point Q (where the bake's height is read, so the grain sits on
+// its ridges), on each cube face Q's side of (two or three near an edge, blended as the bake):
+//   1. the cells' belt pairs, weighted by the B-spline (with its derivatives); the two heaviest
+//      less the third's weight, so a pair leaves at weight 0;
+//   2. for each, the frame from the cells' warped directions, and one lookup of the set: the
+//      tile's U along u, its V along v, offset by a hash of the pair, mirrored along the strike by
+//      it, and across it so the fronts face the lighter (overriding) plate;
+//   3. the hard and soft rock blended by the character, as the peaks'.
+// With the peaks (at P, VoxelLandPeaks.ush), weights w0 = 1 - share x the belts' weight, and
+// share x each belt's, in metres, keeping the variance (independent tiles): H = sum w_i H_i /
+// sqrt(sum w_i^2). The peaks' detail is kept whole: the part of it the peaks' weight leaves is
+// added back, so the belts carry the same detail. The gradient is exact at fixed amplitudes
+// (the weights' and the frame's own slopes in), as the peaks'.
+//
+// Shared subset (VoxelShaderCompat.h). Included by VoxelLandGully.ush after VoxelLandPeaks.ush;
+// its inputs, declared by the host:
+//
+//   StructuredBuffer<uint> LandBeltBlocks;     FVoxelLandBake::BeltBlocks (VOXEL_LAND_BELT_BLOCK)
+//   StructuredBuffer<uint> LandBeltCells;      FVoxelLandBake::BeltCells (VOXEL_LAND_BELT_RECORD)
+//   StructuredBuffer<float> LandBeltPlates;    the plate table (VOXEL_LAND_BELT_PLATE)
+//   uint LandHasBelts;                         1 when those are the bake's
+//   float LandBeltRadiusM;                     the sea-level radius (m)
+//   float LandBeltShare;                       BeltShare (0: the peaks everywhere)
+//   float LandBeltInvTexelM;                   the belt set's texels per m (0: no set)
+//   uint LandBeltBase, LandBeltN, LandBeltMips;   its chain in LandNoise
+//   float LandBeltReliefM;                     its relief at its placement (m)
+//   float LandBeltMeanR, LandBeltMeanG;        R's and G's means over mip 0 (unit values)
+//   float LandBeltScaleR, LandBeltScaleG, LandBeltScaleB;   R's, G's and B's ranges over the larger of R's and G's
+//   uint LandBeltSeed;
+
+#ifndef VOXEL_LAND_BELTS_USH
+#define VOXEL_LAND_BELTS_USH
+
+#include "VoxelLandAccess.ush"
+
+#ifndef VOXEL_LOOP
+#define VOXEL_LOOP [loop]
+#endif
+
+// The salt of the pairs' hash (offsets and the strike's mirror).
+#define VOXEL_LAND_BELT_SALT 0x62656c74u
+// The stripes of the belt view (m apart).
+#define VOXEL_LAND_BELT_VIEW_STRIPE 20000.0f
+
+/** Whether the bake has belts to read (the frame view's test). */
+VOXEL_FUNC bool VoxelLandBeltFrameOn(VOXEL_LAND_ARGS_DECL float Dummy)
+{
+    return LandHasBelts != 0u && LandBeltRadiusM > 0.0f;
+}
+
+/** Whether the belts shape the surface: their records, their set, a share, and the peaks (they
+ *  take the peaks' place and amplitude). */
+VOXEL_FUNC bool VoxelLandBeltsOn(VOXEL_LAND_ARGS_DECL float Dummy)
+{
+    return VoxelLandBeltFrameOn(VOXEL_LAND_ARGS 0.0f) && LandBeltShare > 0.0f && LandBeltInvTexelM > 0.0f && LandBeltN != 0u
+        && VoxelLandPeaksOn(VOXEL_LAND_ARGS 0.0f);
+}
+
+/** The belt record of padded cell (X, Y) of a face (VoxelLandAccess.ush): none outside the kept
+ *  blocks. */
+VOXEL_FUNC FVoxelLandBeltRecord VoxelLandBeltCellRecord(VOXEL_LAND_ARGS_DECL uint Face, uint X, uint Y)
+{
+    const uint Side = LandN + 2u * LandPad;
+    const uint BS = (Side + 3u) >> 2u;   // FVoxelLandBake::BeltBlockSide
+    const uint Entry = VOXEL_LAND_BELT_BLOCK(Face * BS * BS + (Y >> 2u) * BS + (X >> 2u));
+    if (Entry == 0u) return VoxelLandBeltRecordNone();
+    return VOXEL_LAND_BELT_RECORD((Entry - 1u) * 16u + (Y & 3u) * 4u + (X & 3u));
+}
+
+/** A slot's weight (0..1). */
+VOXEL_FUNC float VoxelLandBeltSlotWeight(uint Slot)
+{
+    return float(Slot >> 12u) * (1.0f / 4095.0f);
+}
+
+/** The pairs met in a sample's cells: up to four (pair, weight and its derivatives along the
+ *  face's U and V in cells; VOXEL_LAND_BELT_NONE where none). */
+struct FVoxelLandBeltAcc
+{
+    uint P0;
+    uint P1;
+    uint P2;
+    uint P3;
+    float W0;
+    float W1;
+    float W2;
+    float W3;
+    float U0;
+    float U1;
+    float U2;
+    float U3;
+    float V0;
+    float V1;
+    float V2;
+    float V3;
+};
+
+VOXEL_FUNC FVoxelLandBeltAcc VoxelLandBeltAccNone()
+{
+    FVoxelLandBeltAcc A;
+    A.P0 = VOXEL_LAND_BELT_NONE;
+    A.P1 = VOXEL_LAND_BELT_NONE;
+    A.P2 = VOXEL_LAND_BELT_NONE;
+    A.P3 = VOXEL_LAND_BELT_NONE;
+    A.W0 = 0.0f; A.W1 = 0.0f; A.W2 = 0.0f; A.W3 = 0.0f;
+    A.U0 = 0.0f; A.U1 = 0.0f; A.U2 = 0.0f; A.U3 = 0.0f;
+    A.V0 = 0.0f; A.V1 = 0.0f; A.V2 = 0.0f; A.V3 = 0.0f;
+    return A;
+}
+
+/** Adds a slot's weight W at B-spline weight B (derivatives BU, BV) to its pair. A fifth pair in
+ *  one sample's cells (five plates' boundaries within two cells) takes the lightest's place if
+ *  its own part is heavier, as the bake's list does (VoxelLandBeltListAdd). */
+VOXEL_FUNC FVoxelLandBeltAcc VoxelLandBeltAccAdd(FVoxelLandBeltAcc A, uint Slot, float B, float BU, float BV)
+{
+    FVoxelLandBeltAcc Out = A;
+    if (Slot == 0u) return Out;
+    const uint Pair = Slot & 0xfffu;
+    const float W = VoxelLandBeltSlotWeight(Slot);
+    if (A.P0 == Pair || A.P0 == VOXEL_LAND_BELT_NONE) { Out.P0 = Pair; Out.W0 += W * B; Out.U0 += W * BU; Out.V0 += W * BV; return Out; }
+    if (A.P1 == Pair || A.P1 == VOXEL_LAND_BELT_NONE) { Out.P1 = Pair; Out.W1 += W * B; Out.U1 += W * BU; Out.V1 += W * BV; return Out; }
+    if (A.P2 == Pair || A.P2 == VOXEL_LAND_BELT_NONE) { Out.P2 = Pair; Out.W2 += W * B; Out.U2 += W * BU; Out.V2 += W * BV; return Out; }
+    if (A.P3 == Pair || A.P3 == VOXEL_LAND_BELT_NONE) { Out.P3 = Pair; Out.W3 += W * B; Out.U3 += W * BU; Out.V3 += W * BV; return Out; }
+    // Full: in place of the lightest, if heavier.
+    float Least = A.W0;
+    uint K = 0u;
+    if (A.W1 < Least) { Least = A.W1; K = 1u; }
+    if (A.W2 < Least) { Least = A.W2; K = 2u; }
+    if (A.W3 < Least) { Least = A.W3; K = 3u; }
+    if (W * B <= Least) return Out;
+    if (K == 0u) { Out.P0 = Pair; Out.W0 = W * B; Out.U0 = W * BU; Out.V0 = W * BV; }
+    else if (K == 1u) { Out.P1 = Pair; Out.W1 = W * B; Out.U1 = W * BU; Out.V1 = W * BV; }
+    else if (K == 2u) { Out.P2 = Pair; Out.W2 = W * B; Out.U2 = W * BU; Out.V2 = W * BV; }
+    else { Out.P3 = Pair; Out.W3 = W * B; Out.U3 = W * BU; Out.V3 = W * BV; }
+    return Out;
+}
+
+/** The accumulator sorted by weight, heaviest first (a sorting network). */
+VOXEL_FUNC FVoxelLandBeltAcc VoxelLandBeltAccSort(FVoxelLandBeltAcc A)
+{
+    FVoxelLandBeltAcc S = A;
+    uint TP = 0u;
+    float TW = 0.0f;
+    float TU = 0.0f;
+    float TV = 0.0f;
+    if (S.W1 > S.W0) { TP = S.P0; TW = S.W0; TU = S.U0; TV = S.V0; S.P0 = S.P1; S.W0 = S.W1; S.U0 = S.U1; S.V0 = S.V1; S.P1 = TP; S.W1 = TW; S.U1 = TU; S.V1 = TV; }
+    if (S.W3 > S.W2) { TP = S.P2; TW = S.W2; TU = S.U2; TV = S.V2; S.P2 = S.P3; S.W2 = S.W3; S.U2 = S.U3; S.V2 = S.V3; S.P3 = TP; S.W3 = TW; S.U3 = TU; S.V3 = TV; }
+    if (S.W2 > S.W0) { TP = S.P0; TW = S.W0; TU = S.U0; TV = S.V0; S.P0 = S.P2; S.W0 = S.W2; S.U0 = S.U2; S.V0 = S.V2; S.P2 = TP; S.W2 = TW; S.U2 = TU; S.V2 = TV; }
+    if (S.W3 > S.W1) { TP = S.P1; TW = S.W1; TU = S.U1; TV = S.V1; S.P1 = S.P3; S.W1 = S.W3; S.U1 = S.U3; S.V1 = S.V3; S.P3 = TP; S.W3 = TW; S.U3 = TU; S.V3 = TV; }
+    if (S.W2 > S.W1) { TP = S.P1; TW = S.W1; TU = S.U1; TV = S.V1; S.P1 = S.P2; S.W1 = S.W2; S.U1 = S.U2; S.V1 = S.V2; S.P2 = TP; S.W2 = TW; S.U2 = TU; S.V2 = TV; }
+    return S;
+}
+
+/** A plate pair's frame (the file's header): the seeds, E1 and E2, and its lookup's offsets and
+ *  orientation (VoxelLandNoiseAt: bit 1 mirrors the strike by the pair's hash, bit 2 the cross
+ *  axis when b is the lighter plate, so the set's fronts, facing -y, face the overriding plate;
+ *  never bit 0, which would swap the axes). */
+struct FVoxelLandBeltPairFrame
+{
+    float3 SA;
+    float3 SB;
+    float3 E1;
+    float3 E2;
+    uint OffU;
+    uint OffV;
+    uint Orient;
+};
+
+VOXEL_FUNC float3 VoxelLandBeltSeed(VOXEL_LAND_ARGS_DECL uint Plate)
+{
+    return float3(VOXEL_LAND_BELT_PLATE(Plate * 8u), VOXEL_LAND_BELT_PLATE(Plate * 8u + 1u), VOXEL_LAND_BELT_PLATE(Plate * 8u + 2u));
+}
+
+VOXEL_FUNC FVoxelLandBeltPairFrame VoxelLandBeltPairFrameOf(VOXEL_LAND_ARGS_DECL uint Pair)
+{
+    const uint A = Pair & 63u;
+    const uint B = (Pair >> 6u) & 63u;
+    FVoxelLandBeltPairFrame F;
+    F.SA = VoxelLandBeltSeed(VOXEL_LAND_ARGS A);
+    F.SB = VoxelLandBeltSeed(VOXEL_LAND_ARGS B);
+    F.E1 = normalize(F.SA + F.SB);
+    const float3 Pole = normalize(F.SB - F.SA);
+    F.E2 = cross(Pole, F.E1);
+    const uint H = VoxelHash(uint3(A, B, VOXEL_LAND_BELT_SALT), LandBeltSeed);
+    F.OffU = H;
+    F.OffV = VoxelHash(uint3(B, A, VOXEL_LAND_BELT_SALT), LandBeltSeed);
+    const bool bLighterB = VOXEL_LAND_BELT_PLATE(B * 8u + 7u) < VOXEL_LAND_BELT_PLATE(A * 8u + 7u);
+    F.Orient = ((H >> 31u) != 0u ? 2u : 0u) | (bLighterB ? 4u : 0u);
+    return F;
+}
+
+/** A cell's warped direction (not normalised): its face's N + QX U + QY V. */
+VOXEL_FUNC float3 VoxelLandBeltCellDirection(VOXEL_LAND_ARGS_DECL uint Face, FVoxelLandBeltRecord R)
+{
+    const float3 N = VoxelCubeAxisVector(VoxelCubeNormalAxis(Face)) * VoxelCubeNormalSign(Face);
+    const float3 U = VoxelCubeAxisVector(VoxelCubeUAxis(Face));
+    const float3 V = VoxelCubeAxisVector(VoxelCubeVAxis(Face));
+    // Exact: a 24-bit integer times a power of two.
+    return N + U * (float(R.QX) * (1.0f / VOXEL_LAND_BELT_WARP_SCALE)) + V * (float(R.QY) * (1.0f / VOXEL_LAND_BELT_WARP_SCALE));
+}
+
+/** A frame's coordinates (m) at a cell's warped direction G (any length): along the strike (u)
+ *  and across it (v). */
+VOXEL_FUNC float2 VoxelLandBeltFrameCoords(VOXEL_LAND_ARGS_DECL FVoxelLandBeltPairFrame F, float3 G)
+{
+    // The angles to the seeds by atan2 (exact at any angle; acos of a float dot loses a third of a
+    // milliradian next to a seed, where belts can reach on small planets), unaffected by G's length.
+    const float U = LandBeltRadiusM * atan2(dot(G, F.E2), dot(G, F.E1));
+    const float TA = atan2(length(cross(G, F.SA)), dot(G, F.SA));
+    const float TB = atan2(length(cross(G, F.SB)), dot(G, F.SB));
+    const float V = 0.5f * LandBeltRadiusM * (TA - TB);
+    return float2(U, V);
+}
+
+/** One face's pairs at a sample: the cells' accumulated weights (sorted), less the third's. */
+VOXEL_FUNC FVoxelLandBeltAcc VoxelLandBeltPairsAt(VOXEL_LAND_ARGS_DECL uint Face, uint I0, uint J0, FVoxelLandWeights WU, FVoxelLandWeights WV,
+    FVoxelLandWeights DWU, FVoxelLandWeights DWV)
+{
+    FVoxelLandBeltAcc Acc = VoxelLandBeltAccNone();
+    for (uint b = 0u; b < 4u; b++)
+    {
+        for (uint a = 0u; a < 4u; a++)
+        {
+            const FVoxelLandBeltRecord R = VoxelLandBeltCellRecord(VOXEL_LAND_ARGS Face, I0 + a, J0 + b);
+            if (R.Slot0 == 0u && R.Slot1 == 0u) continue;
+            const float B = VoxelLandWeightAt(WU, a) * VoxelLandWeightAt(WV, b);
+            const float BU = VoxelLandWeightAt(DWU, a) * VoxelLandWeightAt(WV, b);
+            const float BV = VoxelLandWeightAt(WU, a) * VoxelLandWeightAt(DWV, b);
+            Acc = VoxelLandBeltAccAdd(Acc, R.Slot0, B, BU, BV);
+            Acc = VoxelLandBeltAccAdd(Acc, R.Slot1, B, BU, BV);
+        }
+    }
+    Acc = VoxelLandBeltAccSort(Acc);
+    // The third's weight off the first two: a pair leaves the two at weight 0.
+    Acc.W0 -= Acc.W2; Acc.U0 -= Acc.U2; Acc.V0 -= Acc.V2;
+    Acc.W1 -= Acc.W2; Acc.U1 -= Acc.U2; Acc.V1 -= Acc.V2;
+    if (!(Acc.W1 > 0.0f)) { Acc.W1 = 0.0f; Acc.U1 = 0.0f; Acc.V1 = 0.0f; }
+    if (!(Acc.W0 > 0.0f)) { Acc.W0 = 0.0f; Acc.U0 = 0.0f; Acc.V0 = 0.0f; }
+    return Acc;
+}
+
+/** The frame of up to two pairs over a sample's cells (texels of the set, about integer
+ *  references; and the B-spline's derivatives along the face's U and V in cells). */
+struct FVoxelLandBeltFrames
+{
+    float RefU0;    // integers (floats holding them)
+    float RefV0;
+    float SU0;      // u0 = RefU0 + SU0 (texels)
+    float SV0;
+    float SUU0;     // d u0 / d cell along U
+    float SUV0;     // d u0 / d cell along V
+    float SVU0;
+    float SVV0;
+    float RefU1;
+    float RefV1;
+    float SU1;
+    float SV1;
+    float SUU1;
+    float SUV1;
+    float SVU1;
+    float SVV1;
+};
+
+VOXEL_FUNC FVoxelLandBeltFrames VoxelLandBeltFramesAt(VOXEL_LAND_ARGS_DECL uint Face, uint I0, uint J0, FVoxelLandWeights WU, FVoxelLandWeights WV,
+    FVoxelLandWeights DWU, FVoxelLandWeights DWV, FVoxelLandBeltPairFrame F0, FVoxelLandBeltPairFrame F1, bool bSecond, float InvTexelM)
+{
+    FVoxelLandBeltFrames Out;
+    Out.RefU0 = 0.0f; Out.RefV0 = 0.0f; Out.SU0 = 0.0f; Out.SV0 = 0.0f; Out.SUU0 = 0.0f; Out.SUV0 = 0.0f; Out.SVU0 = 0.0f; Out.SVV0 = 0.0f;
+    Out.RefU1 = 0.0f; Out.RefV1 = 0.0f; Out.SU1 = 0.0f; Out.SV1 = 0.0f; Out.SUU1 = 0.0f; Out.SUV1 = 0.0f; Out.SVU1 = 0.0f; Out.SVV1 = 0.0f;
+    bool bFirst = true;
+    for (uint b = 0u; b < 4u; b++)
+    {
+        for (uint a = 0u; a < 4u; a++)
+        {
+            const uint X = I0 + a;
+            const uint Y = J0 + b;
+            const float3 G = VoxelLandBeltCellDirection(VOXEL_LAND_ARGS Face, VoxelLandBeltCellRecord(VOXEL_LAND_ARGS Face, X, Y));
+            const float B = VoxelLandWeightAt(WU, a) * VoxelLandWeightAt(WV, b);
+            const float BU = VoxelLandWeightAt(DWU, a) * VoxelLandWeightAt(WV, b);
+            const float BV = VoxelLandWeightAt(WU, a) * VoxelLandWeightAt(DWV, b);
+            // Each cell's coordinates in texels (a per-cell constant: its round-off is smoothed),
+            // about the first cell's integer parts (exact differences).
+            const float2 C0 = VoxelLandBeltFrameCoords(VOXEL_LAND_ARGS F0, G);
+            const float TU0 = C0.x * InvTexelM;
+            const float TV0 = C0.y * InvTexelM;
+            float TU1 = 0.0f;
+            float TV1 = 0.0f;
+            if (bSecond)
+            {
+                const float2 C1 = VoxelLandBeltFrameCoords(VOXEL_LAND_ARGS F1, G);
+                TU1 = C1.x * InvTexelM;
+                TV1 = C1.y * InvTexelM;
+            }
+            if (bFirst)
+            {
+                Out.RefU0 = floor(TU0);
+                Out.RefV0 = floor(TV0);
+                Out.RefU1 = floor(TU1);
+                Out.RefV1 = floor(TV1);
+                bFirst = false;
+            }
+            const float DU0 = TU0 - Out.RefU0;
+            const float DV0 = TV0 - Out.RefV0;
+            Out.SU0 += B * DU0; Out.SUU0 += BU * DU0; Out.SUV0 += BV * DU0;
+            Out.SV0 += B * DV0; Out.SVU0 += BU * DV0; Out.SVV0 += BV * DV0;
+            const float DU1 = TU1 - Out.RefU1;
+            const float DV1 = TV1 - Out.RefV1;
+            Out.SU1 += B * DU1; Out.SUU1 += BU * DU1; Out.SUV1 += BV * DU1;
+            Out.SV1 += B * DV1; Out.SVU1 += BU * DV1; Out.SVV1 += BV * DV1;
+        }
+    }
+    return Out;
+}
+
+/** A coordinate as the noise lookup takes it: the reference integer plus the sum. */
+VOXEL_FUNC FVoxelLandNoiseAxis VoxelLandBeltAxis(float Ref, float Sum)
+{
+    const float W = floor(Sum);
+    FVoxelLandNoiseAxis A;
+    A.I = int(Ref) + int(W);
+    A.F = Sum - W;
+    return A;
+}
+
+/** One belt's lookup: the shape (over the larger of R's and G's ranges, the character's blend),
+ *  its hard - soft, its derivatives along the frame's u and v (per texel), the steering's
+ *  (B's, per texel) and the steering's curvature (per texel^2). */
+struct FVoxelLandBeltLookup
+{
+    float Unit;
+    float HardMinusSoft;
+    float DU;
+    float DV;
+    float SU;
+    float SV;
+    float Curve;
+};
+
+VOXEL_FUNC FVoxelLandBeltLookup VoxelLandBeltLookupAt(VOXEL_LAND_ARGS_DECL FVoxelLandBeltPairFrame F, float RefU, float SU, float RefV, float SV,
+    float Character, float Footprint, bool bShape)
+{
+    const float TexelM = 1.0f / LandBeltInvTexelM;
+    // As the peaks: texels about half the footprint.
+    const float Level = max(log2(max(Footprint, 1.0f) / (TexelM * 100.0f)) - 1.0f, 0.0f);
+    const bool bSteer = VoxelLandSetSteers(VOXEL_LAND_ARGS 0.0f);
+    const FVoxelLandNoise N = VoxelLandNoiseAt(VOXEL_LAND_ARGS VoxelLandNoiseSetOf(LandBeltBase, LandBeltN, LandBeltMips),
+        VoxelLandBeltAxis(RefU, SU), VoxelLandBeltAxis(RefV, SV), F.Orient, F.OffU, F.OffV, Level,
+        bShape ? (bSteer ? VOXEL_LAND_NOISE_WANT_HESSIAN_B : 0u) : (VOXEL_LAND_NOISE_WANT_ONLY_B | VOXEL_LAND_NOISE_WANT_HESSIAN_B));
+    const float C = saturate(Character);
+    FVoxelLandBeltLookup Out;
+    const float Hard = (N.R - LandBeltMeanR) * LandBeltScaleR;
+    const float Soft = (N.G - LandBeltMeanG) * LandBeltScaleG;
+    Out.Unit = bShape ? lerp(Soft, Hard, C) : 0.0f;
+    Out.HardMinusSoft = bShape ? Hard - Soft : 0.0f;
+    Out.DU = bShape ? lerp(N.GU * LandBeltScaleG, N.RU * LandBeltScaleR, C) : 0.0f;
+    Out.DV = bShape ? lerp(N.GV * LandBeltScaleG, N.RV * LandBeltScaleR, C) : 0.0f;
+    Out.SU = N.BU * LandBeltScaleB;
+    Out.SV = N.BV * LandBeltScaleB;
+    Out.Curve = sqrt(N.BUU * N.BUU + 2.0f * N.BUV * N.BUV + N.BVV * N.BVV) * LandBeltScaleB;
+    return Out;
+}
+
+/** The belts' sums at a point, before the blend with the peaks (VoxelLandPeaksBeltsDF): over the
+ *  two belts (weights w_i 0..1, units U_i), SW = sum w_i, SW2 = sum w_i^2, SWU = sum w_i U_i,
+ *  SWD = sum w_i (hard - soft)_i, SSteer and SCurve their steerings and curvatures (per unit of
+ *  amplitude: per m, and per m^2), with the sums' gradients (per m, tangent vectors at the
+ *  sampled point: GradSW, GradSW2, GradSWU). */
+struct FVoxelLandBeltSums
+{
+    float SW;
+    float SW2;
+    float SWU;
+    float SWD;
+    float3 GradSW;
+    float3 GradSW2;
+    float3 GradSWU;
+    float3 SSteer;
+    float SCurve;
+};
+
+VOXEL_FUNC FVoxelLandBeltSums VoxelLandBeltSumsNone()
+{
+    FVoxelLandBeltSums S;
+    S.SW = 0.0f;
+    S.SW2 = 0.0f;
+    S.SWU = 0.0f;
+    S.SWD = 0.0f;
+    S.GradSW = float3(0.0f, 0.0f, 0.0f);
+    S.GradSW2 = float3(0.0f, 0.0f, 0.0f);
+    S.GradSWU = float3(0.0f, 0.0f, 0.0f);
+    S.SSteer = float3(0.0f, 0.0f, 0.0f);
+    S.SCurve = 0.0f;
+    return S;
+}
+
+/** A face's covector (per cell along its U and V) as a tangent vector per m. */
+VOXEL_FUNC float3 VoxelLandBeltCellVector(VOXEL_LAND_ARGS_DECL FVoxelLandFaceFrame Frame, float CU, float CV)
+{
+    const float HU = CU / LandCellM;
+    const float HV = CV / LandCellM;
+    return Frame.TU * (Frame.GUU * HU + Frame.GUV * HV) + Frame.TV * (Frame.GUV * HU + Frame.GVV * HV);
+}
+
+/** One face's belts at a point: up to two pairs (VOXEL_LAND_BELT_NONE where none), each with its
+ *  weight and its frame's coordinates (texels: about integer references), and their gradients
+ *  (per m, tangent vectors at the point). */
+struct FVoxelLandBeltFacePair
+{
+    uint Pair;
+    float W;
+    float3 GW;
+    float RefU;   // integers (floats holding them)
+    float RefV;
+    float SU;     // u = RefU + SU (texels)
+    float SV;
+    float3 GU;    // grad u (texels per m)
+    float3 GV;
+};
+
+struct FVoxelLandBeltFacePairs
+{
+    FVoxelLandBeltFacePair A;
+    FVoxelLandBeltFacePair B;
+};
+
+VOXEL_FUNC FVoxelLandBeltFacePair VoxelLandBeltFacePairNone()
+{
+    FVoxelLandBeltFacePair P;
+    P.Pair = VOXEL_LAND_BELT_NONE;
+    P.W = 0.0f;
+    P.GW = float3(0.0f, 0.0f, 0.0f);
+    P.RefU = 0.0f;
+    P.RefV = 0.0f;
+    P.SU = 0.0f;
+    P.SV = 0.0f;
+    P.GU = float3(0.0f, 0.0f, 0.0f);
+    P.GV = float3(0.0f, 0.0f, 0.0f);
+    return P;
+}
+
+/** One face's belts at a point with segments U, V along its axes (tan values A, B). */
+VOXEL_FUNC FVoxelLandBeltFacePairs VoxelLandBeltFacePairsAt(VOXEL_LAND_ARGS_DECL uint Face, FVoxelLandAxis U, FVoxelLandAxis V, float A, float B)
+{
+    FVoxelLandBeltFacePairs Out;
+    Out.A = VoxelLandBeltFacePairNone();
+    Out.B = VoxelLandBeltFacePairNone();
+    const uint I0 = uint(U.Cell - 1 + int(LandPad));
+    const uint J0 = uint(V.Cell - 1 + int(LandPad));
+    const FVoxelLandWeights WU = VoxelLandBSpline(U.Frac);
+    const FVoxelLandWeights WV = VoxelLandBSpline(V.Frac);
+    const FVoxelLandWeights DWU = VoxelLandBSplineSlope(U.Frac);
+    const FVoxelLandWeights DWV = VoxelLandBSplineSlope(V.Frac);
+    const FVoxelLandBeltAcc Acc = VoxelLandBeltPairsAt(VOXEL_LAND_ARGS Face, I0, J0, WU, WV, DWU, DWV);
+    if (!(Acc.W0 > 0.0f)) return Out;
+    const bool bSecond = Acc.W1 > 0.0f;
+    const FVoxelLandBeltPairFrame F0 = VoxelLandBeltPairFrameOf(VOXEL_LAND_ARGS Acc.P0);
+    const FVoxelLandBeltPairFrame F1 = VoxelLandBeltPairFrameOf(VOXEL_LAND_ARGS bSecond ? Acc.P1 : Acc.P0);
+    const FVoxelLandBeltFrames R = VoxelLandBeltFramesAt(VOXEL_LAND_ARGS Face, I0, J0, WU, WV, DWU, DWV, F0, F1, bSecond, LandBeltInvTexelM);
+    const FVoxelLandFaceFrame Frame = VoxelLandFaceFrameAt(Face, A, B);
+    Out.A.Pair = Acc.P0;
+    Out.A.W = Acc.W0;
+    Out.A.GW = VoxelLandBeltCellVector(VOXEL_LAND_ARGS Frame, Acc.U0, Acc.V0);
+    Out.A.RefU = R.RefU0;
+    Out.A.RefV = R.RefV0;
+    Out.A.SU = R.SU0;
+    Out.A.SV = R.SV0;
+    Out.A.GU = VoxelLandBeltCellVector(VOXEL_LAND_ARGS Frame, R.SUU0, R.SUV0);
+    Out.A.GV = VoxelLandBeltCellVector(VOXEL_LAND_ARGS Frame, R.SVU0, R.SVV0);
+    if (bSecond)
+    {
+        Out.B.Pair = Acc.P1;
+        Out.B.W = Acc.W1;
+        Out.B.GW = VoxelLandBeltCellVector(VOXEL_LAND_ARGS Frame, Acc.U1, Acc.V1);
+        Out.B.RefU = R.RefU1;
+        Out.B.RefV = R.RefV1;
+        Out.B.SU = R.SU1;
+        Out.B.SV = R.SV1;
+        Out.B.GU = VoxelLandBeltCellVector(VOXEL_LAND_ARGS Frame, R.SUU1, R.SUV1);
+        Out.B.GV = VoxelLandBeltCellVector(VOXEL_LAND_ARGS Frame, R.SVU1, R.SVV1);
+    }
+    return Out;
+}
+
+/** The faces' pairs merged (VoxelLandBeltSumsDF): per pair, over the faces f with ramp r_f, the
+ *  sum of K_f = r_f w_f, the sums of K_f times the coordinates (about the first face's
+ *  references) and their gradients. The faces' frames differ by the B-spline's smoothing (tens
+ *  to hundreds of metres, a texel or more of a set): blending the coordinates, not the lookups,
+ *  keeps one texture through the band (no ghost of a second one), slightly stretched. */
+struct FVoxelLandBeltMergeSlot
+{
+    uint Pair;
+    float K;
+    float3 GK;
+    float RefU;
+    float RefV;
+    float CU;     // sum K (u - RefU)
+    float CV;
+    float3 GCU;   // its gradient
+    float3 GCV;
+};
+
+struct FVoxelLandBeltMerge
+{
+    FVoxelLandBeltMergeSlot S0;
+    FVoxelLandBeltMergeSlot S1;
+    FVoxelLandBeltMergeSlot S2;
+};
+
+VOXEL_FUNC FVoxelLandBeltMergeSlot VoxelLandBeltMergeSlotNone()
+{
+    FVoxelLandBeltMergeSlot S;
+    S.Pair = VOXEL_LAND_BELT_NONE;
+    S.K = 0.0f;
+    S.GK = float3(0.0f, 0.0f, 0.0f);
+    S.RefU = 0.0f;
+    S.RefV = 0.0f;
+    S.CU = 0.0f;
+    S.CV = 0.0f;
+    S.GCU = float3(0.0f, 0.0f, 0.0f);
+    S.GCV = float3(0.0f, 0.0f, 0.0f);
+    return S;
+}
+
+/** Slot S with a face's pair P at ramp R (gradient GR) added (S empty: P's references). */
+VOXEL_FUNC FVoxelLandBeltMergeSlot VoxelLandBeltMergeSlotAdd(FVoxelLandBeltMergeSlot S, FVoxelLandBeltFacePair P, float R, float3 GR)
+{
+    FVoxelLandBeltMergeSlot Out = S;
+    if (Out.Pair == VOXEL_LAND_BELT_NONE)
+    {
+        Out = VoxelLandBeltMergeSlotNone();
+        Out.Pair = P.Pair;
+        Out.RefU = P.RefU;
+        Out.RefV = P.RefV;
+    }
+    const float K = R * P.W;
+    const float3 GK = GR * P.W + P.GW * R;
+    // The coordinates about the slot's references (exact integer differences).
+    const float DU = (P.RefU - Out.RefU) + P.SU;
+    const float DV = (P.RefV - Out.RefV) + P.SV;
+    Out.K += K;
+    Out.GK = Out.GK + GK;
+    Out.CU += K * DU;
+    Out.CV += K * DV;
+    Out.GCU = Out.GCU + GK * DU + P.GU * K;
+    Out.GCV = Out.GCV + GK * DV + P.GV * K;
+    return Out;
+}
+
+/** Adds a face's pair to its slot, else a free one, else in place of the lightest if heavier
+ *  (three pairs over the faces of a band are already a junction's). */
+VOXEL_FUNC FVoxelLandBeltMerge VoxelLandBeltMergeAdd(FVoxelLandBeltMerge M, FVoxelLandBeltFacePair P, float R, float3 GR)
+{
+    FVoxelLandBeltMerge Out = M;
+    if (P.Pair == VOXEL_LAND_BELT_NONE || !(P.W > 0.0f)) return Out;
+    if (M.S0.Pair == P.Pair || M.S0.Pair == VOXEL_LAND_BELT_NONE) { Out.S0 = VoxelLandBeltMergeSlotAdd(M.S0, P, R, GR); return Out; }
+    if (M.S1.Pair == P.Pair || M.S1.Pair == VOXEL_LAND_BELT_NONE) { Out.S1 = VoxelLandBeltMergeSlotAdd(M.S1, P, R, GR); return Out; }
+    if (M.S2.Pair == P.Pair || M.S2.Pair == VOXEL_LAND_BELT_NONE) { Out.S2 = VoxelLandBeltMergeSlotAdd(M.S2, P, R, GR); return Out; }
+    const float K = R * P.W;
+    if (M.S0.K <= M.S1.K && M.S0.K <= M.S2.K) { if (K > M.S0.K) Out.S0 = VoxelLandBeltMergeSlotAdd(VoxelLandBeltMergeSlotNone(), P, R, GR); }
+    else if (M.S1.K <= M.S2.K) { if (K > M.S1.K) Out.S1 = VoxelLandBeltMergeSlotAdd(VoxelLandBeltMergeSlotNone(), P, R, GR); }
+    else { if (K > M.S2.K) Out.S2 = VoxelLandBeltMergeSlotAdd(VoxelLandBeltMergeSlotNone(), P, R, GR); }
+    return Out;
+}
+
+/** A merged pair's weight and coordinates over the faces' ramps (sum RSum, gradient GRSum). */
+struct FVoxelLandBeltPairAt
+{
+    uint Pair;
+    float W;
+    float3 GW;
+    float RefU;
+    float RefV;
+    float SU;
+    float SV;
+    float3 GU;
+    float3 GV;
+};
+
+VOXEL_FUNC FVoxelLandBeltPairAt VoxelLandBeltMergedPair(FVoxelLandBeltMergeSlot S, float RSum, float3 GRSum)
+{
+    FVoxelLandBeltPairAt P;
+    P.Pair = S.Pair;
+    P.W = 0.0f;
+    P.GW = float3(0.0f, 0.0f, 0.0f);
+    P.RefU = S.RefU;
+    P.RefV = S.RefV;
+    P.SU = 0.0f;
+    P.SV = 0.0f;
+    P.GU = float3(0.0f, 0.0f, 0.0f);
+    P.GV = float3(0.0f, 0.0f, 0.0f);
+    if (S.Pair == VOXEL_LAND_BELT_NONE || !(S.K > 0.0f)) return P;
+    const float InvR = 1.0f / RSum;
+    P.W = S.K * InvR;
+    P.GW = (S.GK - GRSum * P.W) * InvR;
+    const float InvK = 1.0f / S.K;
+    P.SU = S.CU * InvK;
+    P.SV = S.CV * InvK;
+    P.GU = (S.GCU - S.GK * P.SU) * InvK;
+    P.GV = (S.GCV - S.GK * P.SV) * InvK;
+    return P;
+}
+
+/** Adds a pair (its weight W, gradient GW, past the third's subtraction) to the sums. */
+VOXEL_FUNC FVoxelLandBeltSums VoxelLandBeltSumsAdd(VOXEL_LAND_ARGS_DECL FVoxelLandBeltSums In, FVoxelLandBeltPairAt P, float W, float3 GW, float Character,
+    float Footprint, bool bShape)
+{
+    FVoxelLandBeltSums Out = In;
+    if (!(W > 0.0f)) return Out;
+    const FVoxelLandBeltPairFrame F = VoxelLandBeltPairFrameOf(VOXEL_LAND_ARGS P.Pair);
+    const FVoxelLandBeltLookup L = VoxelLandBeltLookupAt(VOXEL_LAND_ARGS F, P.RefU, P.SU, P.RefV, P.SV, Character, Footprint, bShape);
+    // d unit / d m = d unit / d texel u x grad u + the same along v.
+    const float3 GUnit = P.GU * L.DU + P.GV * L.DV;
+    const float3 GSteer = P.GU * L.SU + P.GV * L.SV;
+    Out.SW += W;
+    Out.SW2 += W * W;
+    Out.SWU += W * L.Unit;
+    Out.SWD += W * L.HardMinusSoft;
+    Out.GradSW = Out.GradSW + GW;
+    Out.GradSW2 = Out.GradSW2 + GW * (2.0f * W);
+    Out.GradSWU = Out.GradSWU + GUnit * W + GW * L.Unit;
+    Out.SSteer = Out.SSteer + GSteer * W;
+    Out.SCurve += W * L.Curve * (LandBeltInvTexelM * LandBeltInvTexelM);
+    return Out;
+}
+
+/** The belts' sums at the warped point Q (double-float, cm, any length; the bake's point), the
+ *  character Character: each face on Q's side (blended by the bake's ramps, the ramps' own slope
+ *  in: the faces' frames differ by the B-spline's smoothing), their pairs merged, the two
+ *  heaviest looked up once each, less the third's weight. Gradients at Q. */
+VOXEL_FUNC FVoxelLandBeltSums VoxelLandBeltSumsDF(VOXEL_LAND_ARGS_DECL float2 QX, float2 QY, float2 QZ, float Character, float Footprint, bool bShape)
+{
+    const float Band = 2.0f / float(LandN);
+    // The face coordinate's change per m along the face's angles (VoxelLandSetLayerDF's).
+    const float DSDX = 2.0f / (float(LandN) * LandCellM);
+    FVoxelLandBeltMerge M;
+    M.S0 = VoxelLandBeltMergeSlotNone();
+    M.S1 = VoxelLandBeltMergeSlotNone();
+    M.S2 = VoxelLandBeltMergeSlotNone();
+    float RSum = 0.0f;
+    float3 GRSum = float3(0.0f, 0.0f, 0.0f);
+    VOXEL_LOOP
+    for (uint Axis = 0u; Axis < 3u; Axis++)
+    {
+        const float2 PN = VoxelLandPick(QX, QY, QZ, Axis);
+        if (PN.x == 0.0f) continue;
+        const bool bNegative = PN.x < 0.0f;
+        const uint Face = Axis * 2u + (bNegative ? 1u : 0u);
+        const float2 Den = bNegative ? float2(-PN.x, -PN.y) : PN;
+        const float2 AU = VoxelDFDiv(VoxelLandPick(QX, QY, QZ, VoxelCubeUAxis(Face)), Den);
+        const float2 AV = VoxelDFDiv(VoxelLandPick(QX, QY, QZ, VoxelCubeVAxis(Face)), Den);
+        const float S = atan(AU.x) * VOXEL_LAND_INV_QUARTER_PI;
+        const float T = atan(AV.x) * VOXEL_LAND_INV_QUARTER_PI;
+        const float RS = VoxelLandFaceRamp(S, Band);
+        const float RT = VoxelLandFaceRamp(T, Band);
+        const float R = RS * RT;
+        if (R <= 0.0f) continue;
+        const FVoxelLandFaceFrame Frame = VoxelLandFaceFrameAt(Face, AU.x, AV.x);
+        const float3 GR = VoxelLandFaceVector(Frame, VoxelLandFaceRampSlope(S, Band) * RT * DSDX, RS * VoxelLandFaceRampSlope(T, Band) * DSDX);
+        RSum += R;
+        GRSum = GRSum + GR;
+        const FVoxelLandBeltFacePairs F = VoxelLandBeltFacePairsAt(VOXEL_LAND_ARGS Face, VoxelLandAxisAt(VOXEL_LAND_ARGS AU, S),
+            VoxelLandAxisAt(VOXEL_LAND_ARGS AV, T), AU.x, AV.x);
+        M = VoxelLandBeltMergeAdd(M, F.A, R, GR);
+        M = VoxelLandBeltMergeAdd(M, F.B, R, GR);
+    }
+    if (!(RSum > 0.0f)) return VoxelLandBeltSumsNone();
+    FVoxelLandBeltPairAt P0 = VoxelLandBeltMergedPair(M.S0, RSum, GRSum);
+    FVoxelLandBeltPairAt P1 = VoxelLandBeltMergedPair(M.S1, RSum, GRSum);
+    FVoxelLandBeltPairAt P2 = VoxelLandBeltMergedPair(M.S2, RSum, GRSum);
+    // Heaviest first (three: a sorting network), then the third's weight off the two.
+    FVoxelLandBeltPairAt T = P2;
+    if (P1.W > P0.W) { T = P0; P0 = P1; P1 = T; }
+    if (P2.W > P1.W) { T = P1; P1 = P2; P2 = T; }
+    if (P1.W > P0.W) { T = P0; P0 = P1; P1 = T; }
+    FVoxelLandBeltSums Sum = VoxelLandBeltSumsNone();
+    Sum = VoxelLandBeltSumsAdd(VOXEL_LAND_ARGS Sum, P0, P0.W - P2.W, P0.GW - P2.GW, Character, Footprint, bShape);
+    Sum = VoxelLandBeltSumsAdd(VOXEL_LAND_ARGS Sum, P1, P1.W - P2.W, P1.GW - P2.GW, Character, Footprint, bShape);
+    return Sum;
+}
+
+/** The peaks and the belts at the sea-level sphere point P (double-float, cm) and the warped point
+ *  Q where the bake is read (DWX, DWY, DWZ the sampling warp's Jacobian, Normal P's direction:
+ *  VoxelLandWarpedGradient), with the bake's landform Form (its character shapes both; its
+ *  gradient CharacterGradient at P), local relief, drainage and height: VoxelLandPeaksShapeDF's
+ *  outputs with the belts in (Unit over the peaks' amplitude, AmplitudeM the peaks'; the belts'
+ *  own amplitude, VoxelLandPeakAmplitudeFor of their set's relief, inside Unit). Without belts
+ *  there, the peaks exactly. bShape as the peaks'. */
+VOXEL_FUNC FVoxelLandPeaks VoxelLandPeaksBeltsDF(VOXEL_LAND_ARGS_DECL float2 PX, float2 PY, float2 PZ, float2 QX, float2 QY, float2 QZ,
+    float3 DWX, float3 DWY, float3 DWZ, float3 Normal, float2 Form, float3 CharacterGradient, float Relief, float Flow, float Bake, float Footprint,
+    bool bShape)
+{
+    if (!VoxelLandBeltsOn(VOXEL_LAND_ARGS 0.0f))
+        return VoxelLandPeaksShapeDF(VOXEL_LAND_ARGS PX, PY, PZ, Form, CharacterGradient, Relief, Flow, Bake, Footprint, bShape);
+    const float AP = VoxelLandPeakAmplitude(VOXEL_LAND_ARGS Relief, Flow, Bake);
+    if (AP <= 0.0f || (!bShape && !VoxelLandSetSteers(VOXEL_LAND_ARGS 0.0f)))
+        return VoxelLandPeaksShapeDF(VOXEL_LAND_ARGS PX, PY, PZ, Form, CharacterGradient, Relief, Flow, Bake, Footprint, bShape);
+    const FVoxelLandBeltSums Belts = VoxelLandBeltSumsDF(VOXEL_LAND_ARGS QX, QY, QZ, Form.y, Footprint, bShape);
+    if (!(Belts.SW > 0.0f))
+        return VoxelLandPeaksShapeDF(VOXEL_LAND_ARGS PX, PY, PZ, Form, CharacterGradient, Relief, Flow, Bake, Footprint, bShape);
+
+    // The members' weights: the peaks' w0, the belts' share x w_i.
+    const float Share = LandBeltShare;
+    const float W0 = max(1.0f - Share * Belts.SW, 0.0f);
+    // The belts' amplitude: the peaks' in the ratio of the sets' reliefs (at full relief their
+    // own set's, VoxelLandPeakAmplitudeFor of LandBeltReliefM). A fixed ratio keeps the layer
+    // AmplitudeM x Unit with Unit free of the amplitude, which the callers' differenced normals
+    // (PeakUnit x the change of PeakAmplitudeM: VoxelLandMaterial.ush, VoxelLandCacheWriter.ush)
+    // rely on; the sets' own caps (min(relief, set's relief)) would part where the relief lies
+    // between the two.
+    const float AB = AP * (LandBeltReliefM / max(LandPeakReliefM, 1.0e-6f));
+    // The peaks: their own shape only where they keep a weight (their detail always: the belts
+    // keep it).
+    FVoxelLandSetLayer L = VoxelLandPeakLayer(VOXEL_LAND_ARGS 0.0f);
+    L.SkipMain = W0 > 0.0f ? 0u : 1u;
+    const FVoxelLandPeaks P = VoxelLandSetLayerDF(VOXEL_LAND_ARGS L, PX, PY, PZ, Form.y, CharacterGradient, AP, LandPeakSpacingM, Footprint, bShape);
+
+    // The belts' gradients at P (through the sampling warp), the character's change in.
+    const float3 GradSW = VoxelLandWarpedGradient(Belts.GradSW, DWX, DWY, DWZ, Normal);
+    const float3 GradSW2 = VoxelLandWarpedGradient(Belts.GradSW2, DWX, DWY, DWZ, Normal);
+    const float C = Form.y;
+    float3 GradSWU = VoxelLandWarpedGradient(Belts.GradSWU, DWX, DWY, DWZ, Normal);
+    if (C > 0.0f && C < 1.0f)
+        GradSWU = GradSWU + CharacterGradient * Belts.SWD;
+    const float3 SSteer = VoxelLandWarpedGradient(Belts.SSteer, DWX, DWY, DWZ, Normal);
+
+    // The blend: N / S with N = w0 H0 + share AB SWU, S^2 = w0^2 + share^2 SW2; and the peaks'
+    // detail the peaks' weight leaves, AP D (1 - w0 / S).
+    const float S2 = W0 * W0 + Share * Share * Belts.SW2;
+    const float S = sqrt(max(S2, 1.0e-12f));
+    const float InvS = 1.0f / S;
+    const float3 GradW0 = W0 > 0.0f ? GradSW * -Share : float3(0.0f, 0.0f, 0.0f);
+    const float3 GradS = (GradW0 * (2.0f * W0) + GradSW2 * (Share * Share)) * (0.5f * InvS);
+    const float Keep = W0 * InvS;                                  // w0 / S
+    const float3 GradKeep = (GradW0 - GradS * Keep) * InvS;        // its gradient
+
+    FVoxelLandPeaks Out = P;
+    Out.AmplitudeM = AP;
+    // The gullies' wavelength (VoxelLandGully.ush: the steering's scale), the members' spacings
+    // blended as the curvature below.
+    Out.Lambda = (LandPeakSpacingM * W0 + LandBeltSpacingM * (Share * Belts.SW)) / max(W0 + Share * Belts.SW, 1.0e-6f);
+    if (bShape)
+    {
+        const float H0 = P.Unit * AP;
+        const float D = P.DetailUnit;
+        const float N = W0 * H0 + Share * AB * Belts.SWU;
+        const float Total = N * InvS + AP * D * (1.0f - Keep);
+        const float3 GradN = P.Gradient * W0 + GradW0 * H0 + GradSWU * (Share * AB);
+        Out.Unit = Total / AP;
+        Out.Gradient = (GradN - GradS * (N * InvS)) * InvS + P.DetailGradient * (1.0f - Keep) - GradKeep * (AP * D);
+    }
+    else
+    {
+        Out.Unit = 0.0f;
+        Out.Gradient = float3(0.0f, 0.0f, 0.0f);
+    }
+    // The steering as the shape (the peaks' detail doesn't steer), the curvature their weighted mean.
+    Out.Steer = (P.Steer * W0 + SSteer * (Share * AB)) * InvS;
+    Out.Curve = (P.Curve * W0 + Belts.SCurve * (Share * AB)) / max(W0 + Share * Belts.SW, 1.0e-6f);
+    return Out;
+}
+
+/** The belt frame view's values at the bake direction Dir (unit; voxel.Debug.LandView 20): the
+ *  heaviest pair there (VOXEL_LAND_BELT_NONE: none), its weight (0..1), and its frame's u and v
+ *  (m), on the face Dir is most on. */
+struct FVoxelLandBeltView
+{
+    uint Pair;
+    float Weight;
+    float U;
+    float V;
+};
+
+VOXEL_FUNC FVoxelLandBeltView VoxelLandBeltViewAt(VOXEL_LAND_ARGS_DECL float3 Dir)
+{
+    FVoxelLandBeltView Out;
+    Out.Pair = VOXEL_LAND_BELT_NONE;
+    Out.Weight = 0.0f;
+    Out.U = 0.0f;
+    Out.V = 0.0f;
+    if (!VoxelLandBeltFrameOn(VOXEL_LAND_ARGS 0.0f)) return Out;
+    const float AX = abs(Dir.x);
+    const float AY = abs(Dir.y);
+    const float AZ = abs(Dir.z);
+    uint Axis = 2u;
+    if (AX >= AY && AX >= AZ) Axis = 0u;
+    else if (AY >= AZ) Axis = 1u;
+    const float PN = VoxelCubeComponent(Dir, Axis);
+    const uint Face = Axis * 2u + (PN < 0.0f ? 1u : 0u);
+    const float Den = max(abs(PN), 1.0e-20f);
+    const float2 AU = float2(VoxelCubeComponent(Dir, VoxelCubeUAxis(Face)) / Den, 0.0f);
+    const float2 AV = float2(VoxelCubeComponent(Dir, VoxelCubeVAxis(Face)) / Den, 0.0f);
+    const FVoxelLandAxis U = VoxelLandAxisAt(VOXEL_LAND_ARGS AU, atan(AU.x) * VOXEL_LAND_INV_QUARTER_PI);
+    const FVoxelLandAxis V = VoxelLandAxisAt(VOXEL_LAND_ARGS AV, atan(AV.x) * VOXEL_LAND_INV_QUARTER_PI);
+    const uint I0 = uint(U.Cell - 1 + int(LandPad));
+    const uint J0 = uint(V.Cell - 1 + int(LandPad));
+    const FVoxelLandWeights WU = VoxelLandBSpline(U.Frac);
+    const FVoxelLandWeights WV = VoxelLandBSpline(V.Frac);
+    const FVoxelLandWeights DWU = VoxelLandBSplineSlope(U.Frac);
+    const FVoxelLandWeights DWV = VoxelLandBSplineSlope(V.Frac);
+    const FVoxelLandBeltAcc Acc = VoxelLandBeltPairsAt(VOXEL_LAND_ARGS Face, I0, J0, WU, WV, DWU, DWV);
+    if (!(Acc.W0 > 0.0f)) return Out;
+    const FVoxelLandBeltPairFrame F = VoxelLandBeltPairFrameOf(VOXEL_LAND_ARGS Acc.P0);
+    // In metres (a texel of 1 m), about the integer reference.
+    const FVoxelLandBeltFrames R = VoxelLandBeltFramesAt(VOXEL_LAND_ARGS Face, I0, J0, WU, WV, DWU, DWV, F, F, false, 1.0f);
+    Out.Pair = Acc.P0;
+    Out.Weight = Acc.W0;
+    Out.U = R.RefU0 + R.SU0;
+    Out.V = R.RefV0 + R.SV0;
+    return Out;
+}
+
+#endif // VOXEL_LAND_BELTS_USH

@@ -115,6 +115,16 @@ struct FVoxelOceanShore
     FVector Direction = FVector::ZeroVector;
     /** The beach slope at the nearest coast (the land bake's, over its cells). */
     double Slope = 0.02;
+    /** The coastal travel-time field (stage O9i; VoxelOceanCoast.ush, FVoxelOceanCoastField): its
+     *  integrals A (m^0.5: the integral of ds / sqrt(depth)) and B, their gradients (planet
+     *  frame, per metre), its cover (0: none), and its layout's seed depth and reach (m). */
+    double CoastA = 0.0;
+    double CoastB = 0.0;
+    FVector CoastGradA = FVector::ZeroVector;
+    FVector CoastGradB = FVector::ZeroVector;
+    double CoastCover = 0.0;
+    double CoastSeedM = 0.0;
+    double CoastReachM = 0.0;
 
     bool HasField() const { return Distance < 0.5 * VoxelOceanWaves::Deep; }
 };
@@ -145,9 +155,12 @@ struct FVoxelOceanWaveSite
     FVector Up = FVector::UpVector;             // its radial
     double Depth = VoxelOceanWaves::Deep;       // when the model asks for it: the depth the waves feel (cm)
     FVoxelOceanShore Shore;                     // when the model asks for it
-    /** The bed's slope toward the coast (stage O9b2; with the depth and the shore): the depth
-     *  falling along the field's landward direction (m per m); BedUnknown: unknown. */
+    /** The bed's slope (stage O9b2; with the depth and the shore): its steepness, the depth's fall
+     *  up its whole slope (m per m; stage O9e, it was along the field's landward direction);
+     *  BedUnknown: unknown. BedRise: the way it rises (toward its shallows; unit, planet frame;
+     *  zero: unknown, the field's landward direction stands in). */
     double BedSlope = VoxelOceanWaves::BedUnknown;
+    FVector BedRise = FVector::ZeroVector;
     FVoxelOceanEnvironment Environment;         // the frame's constants unless a source is set
 };
 
@@ -185,9 +198,9 @@ struct FVoxelOceanWaveShaderParams
     FVector4f ShoreFrame[7] = { FVector4f(0.0f, 0.0f, 0.0f, 0.0f), FVector4f(0.0f, 0.0f, 0.0f, 0.0f), FVector4f(0.0f, 0.0f, 0.0f, 0.0f),
         FVector4f(0.0f, 0.0f, 0.0f, 0.0f), FVector4f(0.0f, 0.0f, 0.0f, 0.0f), FVector4f(0.0f, 0.0f, 0.0f, 0.0f), FVector4f(0.0f, 0.0f, 0.0f, 0.0f) };
     /** The surf's settings (stage O9a; VoxelOceanSurf.ush, VoxelOceanSurfSettingsOf): the chart
-     *  table's constants rows 15 and 16, written with the shore frame (the material and the
-     *  underwater pass read them from the table). All zero: no surf. */
-    FVector4f Surf[2] = { FVector4f(0.0f, 0.0f, 0.0f, 0.0f), FVector4f(0.0f, 0.0f, 0.0f, 0.0f) };
+     *  table's constants rows 15, 16 and 18 (the last stage O9i's), written with the shore frame
+     *  (the material and the underwater pass read them from the table). All zero: no surf. */
+    FVector4f Surf[3] = { FVector4f(0.0f, 0.0f, 0.0f, 0.0f), FVector4f(0.0f, 0.0f, 0.0f, 0.0f), FVector4f(0.0f, 0.0f, 0.0f, 0.0f) };
 
     bool IsFFT() const { return FFT.X > 0.5f; }
 };
@@ -305,19 +318,22 @@ struct FVoxelOceanFFTSettings
      *  the least beach slope. */
     double ShoreBreaking = 0.78;
     double ShoreChopGrowth = 1.0;
-    double ShoreWarp = 1.0;
+    double ShoreWarp = 0.0;     // stage O9f: off by default (VoxelOceanSettings.h)
     double ShoreFade = 0.0;
     double ShoreMinSlope = 0.005;
-    /** The surf (stage O9a; VoxelOceanSurf.ush): its strength (0: none), sets, swash, skew,
-     *  handover (breaking depths) and the swash's reach. */
+    /** The surf (stage O9a; VoxelOceanSurf.ush): its strength (0: none), sets, swash, skew
+     *  and the swash's reach. */
     double SurfStrength = 1.0;
     double SurfSets = 1.0;
     double SurfSwash = 1.0;
     double SurfSkew = 0.85;
-    double SurfHandover = 2.5;
     /** The swash's swing either side of its mean is held within this distance up and down the
      *  beach (m, stage O9b2; at the field's slope). */
     double SurfSwashReach = 10.0;
+    /** The shore's directed waves (stage O9i): from this many deep wavelengths of the coastal
+     *  field's depth in; the share of the long bands' energy the FFT always keeps. */
+    double SurfCutoff = 0.2;
+    double SurfFFTFloor = 0.25;
     /** The foam (stage O9b; VoxelOceanFoam.ush, VoxelOceanSurf.ush): the open sea's decay (s; 0:
      *  none made), its coverage (0 none, 1 as calibrated) and the surf's foam. Live: the surface
      *  reads them every frame, so they aren't compared (a change doesn't rebuild the model or
@@ -333,7 +349,8 @@ struct FVoxelOceanFFTSettings
             && WindSpeed == Other.WindSpeed && ShoreBreaking == Other.ShoreBreaking && ShoreChopGrowth == Other.ShoreChopGrowth
             && ShoreWarp == Other.ShoreWarp && ShoreFade == Other.ShoreFade && ShoreMinSlope == Other.ShoreMinSlope
             && SurfStrength == Other.SurfStrength && SurfSets == Other.SurfSets && SurfSwash == Other.SurfSwash
-            && SurfSkew == Other.SurfSkew && SurfHandover == Other.SurfHandover && SurfSwashReach == Other.SurfSwashReach;
+            && SurfSkew == Other.SurfSkew && SurfSwashReach == Other.SurfSwashReach
+            && SurfCutoff == Other.SurfCutoff && SurfFFTFloor == Other.SurfFFTFloor;
     }
     bool operator!=(const FVoxelOceanFFTSettings& Other) const { return !(*this == Other); }
 };

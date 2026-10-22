@@ -78,7 +78,12 @@ struct FField
     int N = 256;
     double ReachM = 40000.0;
     std::vector<uint32_t> Texels;
+    /** The coastal field (stage O9i; FVoxelOceanCoastField's texels and layout). */
+    std::vector<uint32_t> Coast;
+    int CoastSlices = 0;
+    float Row0[4] = { 0, 0, 0, 0 }, Row1[4] = { 0, 0, 0, 0 };
 
+    // FVoxelOceanShoreField::Sample, with the coast's as FVoxelOceanCoastField::Sample adds it.
     FVoxelOceanShore Sample(const FVector& P) const
     {
         const FVoxelOceanShoreSample S = VoxelOceanShoreCore::Sample(Texels.data(), N, ReachM, P.X, P.Y, P.Z);
@@ -86,6 +91,16 @@ struct FField
         Out.Distance = double(S.Distance) * 100.0;
         Out.Direction = FVector(S.Direction.x, S.Direction.y, S.Direction.z);
         Out.Slope = S.Slope;
+        if (Coast.empty() || !Out.HasField()) return Out;
+        Out.CoastSeedM = Row1[2];
+        Out.CoastReachM = Row1[3];
+        if (Row0[0] < 0.5f || Out.Distance * 0.01 >= double(Row1[3]) + 2.0 * double(Row1[1])) return Out;
+        const FVoxelOceanCoastSample C = VoxelOceanCoastCore::Sample(Texels.data(), Coast.data(), CoastSlices, N, Row0, Row1, Radius * 0.01, P.X, P.Y, P.Z);
+        Out.CoastA = C.A;
+        Out.CoastB = C.B;
+        Out.CoastGradA = FVector(C.GradA.x, C.GradA.y, C.GradA.z);
+        Out.CoastGradB = FVector(C.GradB.x, C.GradB.y, C.GradB.z);
+        Out.CoastCover = C.Cover;
         return Out;
     }
 };
@@ -168,6 +183,33 @@ int main()
     std::printf("Planet: a continent of radius %.0f km; bake N %d (cells %.1f km), %d sea cells; shore field built in %.0f ms\n",
         ContinentAngle * Radius * 1e-5, N, 1.5708 * Radius * 1e-5 / N, Sea.SeaCells,
         std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - T0).count());
+    // The coastal field (stage O9i): planned, the fine cells' depths exact, solved and packed as
+    // the builder does (a small budget: coarse cells, a quick solve).
+    {
+        const auto TC = std::chrono::steady_clock::now();
+        VoxelOceanCoastCore::FSettings CS;
+        CS.BudgetBytes = 64.0 * 1024.0 * 1024.0;
+        CS.MinCellM = 120.0;
+        CS.LandReachM = 1000.0;
+        const VoxelOceanCoastCore::FPlan Plan = VoxelOceanCoastCore::Plan(N, Radius * 0.01, Field.Texels.data(), Field.ReachM, Height.data(), CS);
+        if (Plan.bValid)
+        {
+            std::vector<float> Depth(Plan.InteriorCells());
+            for (size_t c = 0; c < Depth.size(); c++)
+            {
+                double D[3];
+                VoxelOceanCoastCore::InteriorCellDir(Plan, c, D);
+                Depth[c] = float(-HeightAt(FVector(D[0], D[1], D[2]).GetSafeNormal()));
+            }
+            const VoxelOceanCoastCore::FSolved V = VoxelOceanCoastCore::Solve(Plan, Depth.data(), Field.Texels.data(), Field.ReachM);
+            Field.Coast = VoxelOceanCoastCore::Pack(Plan, V);
+            Field.CoastSlices = Plan.Slices();
+            VoxelOceanCoastCore::LayoutRows(Plan, Field.Row0, Field.Row1);
+        }
+        std::printf("Coastal field: %s, cells of %.0f m, reach %.1f km, in %.1f s\n", Plan.bValid ? "made" : "NONE", Plan.CellM, Plan.Settings.ReachM * 1e-3,
+            std::chrono::duration<double>(std::chrono::steady_clock::now() - TC).count());
+        Expect(Plan.bValid && Plan.Settings.ReachM > 3000.0, "the coastal field is made (reaching past the seed depth's 4 km)");
+    }
 
     // The field's distance against the true one (the coast is a circle).
     {
@@ -273,6 +315,8 @@ int main()
         FVoxelOceanFFTSettings Settings;
         Settings.Seed = 11;
         Settings.WindSpeed = FVoxelOceanWavesFFT::ReachWind(std::max(E.WindSpeed, E.SwellSpeed), 0.0, false);
+        // The warp is off by default since stage O9f; this check keeps it on to cover it.
+        Settings.ShoreWarp = 1.0;
         Settings.ShoreFade = 0.0;   // the shoaling up to the beach
         const FVoxelOceanWavesFFT Model(Settings, Radius);
         const FVoxelOceanWeatherKey Key = VoxelOceanWeatherTable::BuildKey(*Source, Model.GetCharts().N, Timing, 0);
@@ -287,6 +331,10 @@ int main()
         Tx.Charts = &Table->Table;
         Tx.Shore = Field.Texels.data();
         Tx.ShoreN = N;
+        Tx.Coast = Field.Coast.empty() ? nullptr : Field.Coast.data();
+        Tx.CoastSlices = Field.CoastSlices;
+        for (int i = 0; i < 4; i++) { Tx.CoastRow0[i] = Field.Row0[i]; Tx.CoastRow1[i] = Field.Row1[i]; }
+        Tx.CoastRadiusM = float(Radius * 0.01);
         const uint32_t Tick = VoxelOceanSpectrum::TickOf(Context.Time);
         for (int s = 0; s < VoxelOceanSpectrum::SlotCount; s++)
         {
@@ -302,6 +350,8 @@ int main()
         // Drawn (the hook, mip 0, the long bands) against queried (Evaluate) near the coast.
         std::mt19937_64 Rng(5 + Case);
         double EH = 0.0, MH = 0.0, SumAmp = 0.0, MaxShift = 0.0, MaxHeightSeen = 0.0;
+        double CoastA = 0.0, CoastG = 0.0, CoastC = 0.0;
+        int CoastOn = 0;
         int Count = 0, Active = 0;
         for (int k = 0; k < 1500; k++)
         {
@@ -317,6 +367,14 @@ int main()
             const FShore Sh = ShoreAt(Tx, F3(PW), F3(UpW), W);
             const FPoint Hook = HookEvaluate(Tx, F3(PW), F3(UpW), 0.0f, 0.0f, W, 3u, DepthAt(Dir), Sh);
             const FVoxelOceanWaveResult R = EvaluateAt(Model, Context, Field, Dir);
+            {
+                // The coastal field as the hook reads it (the expansion) against the queries' (exact).
+                const FVoxelOceanShore Q = Field.Sample(Dir * Radius);
+                CoastA = std::max(CoastA, std::abs(double(Sh.Coast.A) - Q.CoastA));
+                CoastG = std::max(CoastG, (FVector(Sh.Coast.GradA.x, Sh.Coast.GradA.y, Sh.Coast.GradA.z) - Q.CoastGradA).Size() / std::max(Q.CoastGradA.Size(), 1e-6));
+                CoastC = std::max(CoastC, std::abs(double(Sh.Coast.Cover) - Q.CoastCover));
+                CoastOn += Q.CoastCover > 0.5 ? 1 : 0;
+            }
             EH = std::max(EH, std::abs(double(Hook.R.Height) - R.Height));
             MH = std::max(MH, std::abs(R.Height));
             MaxHeightSeen = std::max(MaxHeightSeen, std::abs(R.Height));
@@ -330,13 +388,25 @@ int main()
         }
         std::printf("  %d points 5 m to 6 km off the coast: drawn against queried height up to %.1f mm of waves up to %.2f m; shoaling at %d, long band's mean amplitude %.2f, its largest move %.0f m\n",
             Count, EH * 10.0, MH * 0.01, Active, SumAmp / std::max(1, Active), MaxShift);
-        Expect(EH < 40.0 * std::max(1.0, MH / 300.0), "drawn and queried shoaled waves agree within 4 cm per 3 m of waves");
+        // (cm: this read 40, 40 cm, until stage O9g.) 6 cm per 3 m of waves: the drawn field's
+        // distance and the query's differ by up to about 13 cm here, and since stage O9g the swell's
+        // trains (phased by it) carry the surf wherever the bottom lies below the field's model,
+        // breaking fronts included.
+        Expect(EH < 6.0 * std::max(1.0, MH / 300.0), "drawn and queried shoaled waves agree within 6 cm per 3 m of waves");
+        std::printf("  the coastal field, drawn against queried (%d of the points in it): A within %.4f m^0.5, its gradient within %.2f%%, the cover within %.4f\n",
+            CoastOn, CoastA, 100.0 * CoastG, CoastC);
+        Expect(CoastOn > 300 && CoastA < 0.01 && CoastG < 0.01 && CoastC < 0.01, "the hook reads the coastal field as the queries do");
         Expect(Active > Count / 2 && MaxShift > 50.0, "the shoaling and the warp are at work near the coast");
         Expect(MaxHeightSeen <= Model.MaxHeight(), "the shoaled waves stay within the model's reach");
 
         // Shorter waves toward the coast: zero crossings of the long bands along transects toward
-        // the shore, near (3 to 10 m deep) against far (40 m deep and more).
+        // the shore, near (3 to 10 m deep) against far (40 m deep and more). The FFT's waves alone
+        // (the surf off: since stage O9g its trains follow the field's model where the bottom lies
+        // below it, as the harness's baked slope does, so their crests are spaced by the field).
         {
+            FVoxelOceanFFTSettings WarpSettings = Settings;
+            WarpSettings.SurfStrength = 0.0;
+            const FVoxelOceanWavesFFT WarpModel(WarpSettings, Radius);
             double Near = 0.0, Far = 0.0;
             const int Transects = 24;
             for (int t = 0; t < Transects; t++)
@@ -349,7 +419,7 @@ int main()
                         const int Steps = int((To - From) / 1.0);
                         for (int i = 0; i <= Steps; i++)
                         {
-                            const FVoxelOceanWaveResult R = EvaluateAt(Model, Context, Field, CoastPoint(Along, From + i * 1.0));
+                            const FVoxelOceanWaveResult R = EvaluateAt(WarpModel, Context, Field, CoastPoint(Along, From + i * 1.0));
                             if (i > 0 && (R.Height > 0.0) != (Prev > 0.0)) Count2++;
                             Prev = R.Height;
                         }
@@ -399,7 +469,9 @@ int main()
             std::mt19937_64 R4(29 + Case);
             double Worst = 0.0, Highest = 0.0;
             int Wet = 0, Dry = 0;
-            const double BeachUp = 15.0;    // m up the beach: 0.15 m above the still level
+            // m up the beach: 0.08 m above the still level (stage O9f: the swash's thinnest film,
+            // under 4.4 cm, sinks under the beach; 0.15 m up it was wet 55 times in 600 before).
+            const double BeachUp = 8.0;
             FVoxelOceanWaveContext SurfContext = Context;
             for (int k = 0; k < 600; k++)
             {
@@ -422,11 +494,36 @@ int main()
                 const FVoxelOceanWaveResult B = EvaluateAt(Model, SurfContext, Field, Beach);
                 (B.Height > -DepthAt(Beach) ? Wet : Dry)++;
             }
-            std::printf("  surf from 60 m up the beach to 400 m out: drawn against queried up to %.1f mm, highest %.2f m; a beach point 0.15 m up wet %d of %d times\n",
+            std::printf("  surf from 60 m up the beach to 400 m out: drawn against queried up to %.1f mm, highest %.2f m; a beach point 0.08 m up wet %d of %d times\n",
                 Worst * 10.0, Highest * 0.01, Wet, Wet + Dry);
             Expect(Worst < 2.0, "drawn and queried surf agree within 2 cm");
             Expect(Highest <= Model.MaxHeight(), "the surf stays within the model's reach");
             Expect(Wet > 30 && Dry > 30, "the swash wets and dries the beach");
+        }
+
+        // The swell's turn (stage O9d): drawn against queried from 400 m to 8 km out (the swell
+        // zone's trains, phased by the field's distance and slope).
+        {
+            std::mt19937_64 R5(41 + Case);
+            double Worst = 0.0, Moved = 0.0;
+            for (int k = 0; k < 400; k++)
+            {
+                const double Sd = std::exp(std::uniform_real_distribution<double>(std::log(400.0), std::log(8000.0))(R5));
+                const FVector Dir = CoastPoint(std::uniform_real_distribution<double>(0, 6.2832)(R5), Sd);
+                const FVector Ref = (Dir * Radius + FVector(1, 2, 3).GetSafeNormal() * 300.0).GetSafeNormal() * (Radius + 200.0);
+                FVoxelOceanWaveShaderParams SP;
+                Model.GetShaderParams(Context, Ref, PlanetToWorld, SP);
+                FParams W = ParamsOf(SP);
+                W.bLongOnly = true;
+                const FVector PW = PlanetToWorld.TransformPositionNoScale(Dir * Radius) - PlanetToWorld.TransformPositionNoScale(Ref);
+                const FVector UpW = PlanetToWorld.TransformVectorNoScale(Dir);
+                const FPoint Hook = HookEvaluate(Tx, F3(PW), F3(UpW), 0.0f, 0.0f, W, 3u, DepthAt(Dir), ShoreAt(Tx, F3(PW), F3(UpW), W));
+                const FVoxelOceanWaveResult R = EvaluateAt(Model, Context, Field, Dir);
+                Worst = std::max(Worst, std::abs(double(Hook.R.Height) - R.Height));
+                Moved = std::max(Moved, std::abs(R.Height));
+            }
+            std::printf("  the swell zone, 400 m to 8 km out: drawn against queried up to %.1f mm (heights to %.2f m)\n", Worst * 10.0, Moved * 0.01);
+            Expect(Worst < 2.0, "drawn and queried swell agree within 2 cm");
         }
 
         // The underwater waterline (VoxelOceanHeightAtFFTShore, the depth at the foot) against the

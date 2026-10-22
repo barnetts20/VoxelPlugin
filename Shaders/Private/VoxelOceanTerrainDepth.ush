@@ -1,0 +1,240 @@
+// VoxelOceanTerrainDepth.ush - The terrain under the ocean, as its passes sample it (split from
+// VoxelOceanPage.usf in stage O9m; VoxelOceanPage.usf's header describes the depths): the planet
+// density with the terrain's edits at lattice points, the shore field's inland basins and landward
+// direction, the depth the waves feel and the bed's slope. Stage O9m: the land surface cache
+// (Design/LandSurfaceCache.md) first, wherever it holds the point: its texels hold the land chain
+// band-limited to their size, with the edits, so a depth at a footprint is a few loads instead of
+// the land chain, and the bed's slope comes from its gradient instead of four more densities.
+//
+// For compute passes (globals). Include after VoxelDF64.ush.
+
+#ifndef VOXEL_OCEAN_TERRAIN_DEPTH_USH
+#define VOXEL_OCEAN_TERRAIN_DEPTH_USH
+
+// The density (VoxelDensitySample.ush).
+StructuredBuffer<FVoxelOctave> Octaves;
+uint ContinentOctaves;
+uint MountainOctaves;
+uint DetailOctaves;
+float2 InvNormContinent;
+float2 InvNormMountain;
+float2 InvNormDetail;
+float2 PlanetRadius;
+float2 NoiseAmplitude;
+float2 HalfFinest;
+float2 ContinentWeight;
+float2 MountainWeight;
+float2 MountainStart;
+float2 MountainBlend;
+float2 DetailWeight;
+float RidgeGain;
+float SlopeDamping;
+
+// The edits (VoxelEditSample.ush).
+StructuredBuffer<uint> EditCells;
+StructuredBuffer<uint> EditOpList;
+StructuredBuffer<uint> EditOps;
+uint EditTableMask;
+uint EditCellShift;
+uint EditOpCount;
+
+#include "/Plugin/VoxelPlugin/Private/VoxelCubeSphere.ush"
+#include "/Plugin/VoxelPlugin/Private/VoxelLandParameters.ush"
+#include "/Plugin/VoxelPlugin/Private/VoxelLandSample.ush"
+#include "/Plugin/VoxelPlugin/Private/VoxelLandGully.ush"
+#include "/Plugin/VoxelPlugin/Private/VoxelDensitySample.ush"
+#include "/Plugin/VoxelPlugin/Private/VoxelEditSample.ush"
+#include "/Plugin/VoxelPlugin/Private/VoxelOceanCharts.ush"
+#include "/Plugin/VoxelPlugin/Private/VoxelOceanShore.ush"
+
+// The shore field (FVoxelOceanShoreRHI; ShoreN 0: none).
+Texture2DArray ShoreTexture;
+uint ShoreN;
+float ShoreReach;
+float ShoreMarginM;
+// The depth the waves feel is sampled at this footprint at least (cm; stage O9b2).
+float DepthFootprint;
+// The sea sphere's radius (cm, double-float; 0: unknown, no lift; stage O9b2).
+float2 SeaRadius;
+
+// The land surface cache (stage O9m; VoxelLandCache.ush, FVoxelOceanLandCacheRHI): the depths read
+// it wherever it holds the point (LandCacheOn 0: none). Its heights are about its own sea-level
+// radius (LandCacheSeaRadius, double-float cm); the ocean's sea sphere stands LandCacheSeaOffset cm
+// above that.
+Texture2D LandCacheHeight;
+Texture2D LandCacheSlope;
+Texture2D LandCacheFields;
+Texture2D LandCacheState;
+uint LandCacheOn;
+float2 LandCacheSeaRadius;
+float LandCacheSeaOffset;
+
+#include "/Plugin/VoxelPlugin/Private/VoxelLandCache.ush"
+#include "/Plugin/VoxelPlugin/Private/VoxelLandCacheSample.ush"
+
+// The depth of a vertex in an inland basin (cm): land, well past any cull height.
+#define VOXEL_OCEAN_BASIN_DEPTH (-1.0e6f)
+// The bed's slope is measured where the depth lies within these (cm; the surf's trains reach at
+// most 0.8 of the coastal field's seed depth, 32 m at the defaults: stage O9i), and at footprints up to
+// VOXEL_OCEAN_BED_MAX_FOOTPRINT (a mesh that coarse carries no surf): unknown elsewhere (the
+// field's slope stands in). Both rules follow from the point and the footprint alone, so a vertex
+// and the coarser tile it collapses onto agree.
+#define VOXEL_OCEAN_BED_LAND (-10000.0f)
+#define VOXEL_OCEAN_BED_SEA 6000.0f
+#define VOXEL_OCEAN_BED_MAX_FOOTPRINT 100000.0f
+// The bed slope's least step either side (cm).
+#define VOXEL_OCEAN_BED_MIN_STEP 100.0f
+
+// How far lattice point (X, Y, Z) stands above the sea sphere (cm).
+float VoxelOceanLatticeLift(int X, int Y, int Z)
+{
+    if (SeaRadius.x <= 0.0f) return 0.0f;
+    const float2 PX = VoxelDFMul(VoxelDFFromInt(X), HalfFinest);
+    const float2 PY = VoxelDFMul(VoxelDFFromInt(Y), HalfFinest);
+    const float2 PZ = VoxelDFMul(VoxelDFFromInt(Z), HalfFinest);
+    const float2 Radius = VoxelDFSqrt(VoxelDFAdd(VoxelDFAdd(VoxelDFMul(PX, PX), VoxelDFMul(PY, PY)), VoxelDFMul(PZ, PZ)));
+    const float2 Lift = VoxelDFSub(Radius, SeaRadius);
+    return Lift.x + Lift.y;
+}
+
+// The terrain's depth below the sea sphere (cm, positive under water) at lattice point (X, Y, Z)
+// at a footprint from the density with the edits, less the point's lift.
+float VoxelOceanDensityDepthAt(int X, int Y, int Z, float Footprint)
+{
+    return VoxelEditApply(X, Y, Z, Footprint, VoxelSampleDensityDF(X, Y, Z, Footprint)) - VoxelOceanLatticeLift(X, Y, Z);
+}
+
+// The same from the land surface cache (stage O9m): its height band-limited to the footprint (the
+// level whose texel it is, blended toward the next), its gradient's steepness (m/m). Not held
+// (bCache false) where the cache has no level over the point, hasn't written it yet, or flags it
+// as edited into more than one surface (an overhang, a wall: the density decides there).
+struct FVoxelOceanCacheDepth
+{
+    bool bCache;
+    float Depth;       // cm, positive under water
+    float Steep;       // the bed's whole slope (m/m)
+    float3 Rise;       // the way it rises (planet frame, unit; zero on the flat)
+};
+
+FVoxelOceanCacheDepth VoxelOceanCacheDepthAtDF(float2 PX, float2 PY, float2 PZ, float Footprint)
+{
+    FVoxelOceanCacheDepth Out;
+    Out.bCache = false;
+    Out.Depth = 0.0f;
+    Out.Steep = 0.0f;
+    Out.Rise = float3(0.0f, 0.0f, 0.0f);
+    if (LandCacheOn == 0u) return Out;
+    const FVoxelLandCacheSample C = VoxelLandCacheSampleAt(LandCacheHeight, LandCacheSlope, LandCacheFields, LandCacheState, PX, PY, PZ,
+        LandCacheSeaRadius, Footprint);
+    if (!C.bValid || C.Edited > 0.0f) return Out;
+    Out.bCache = true;
+    Out.Depth = LandCacheSeaOffset - 100.0f * C.Height;
+    Out.Steep = length(C.Gradient);
+    Out.Rise = Out.Steep > 1.0e-6f ? C.Gradient / Out.Steep : float3(0.0f, 0.0f, 0.0f);
+    return Out;
+}
+
+FVoxelOceanCacheDepth VoxelOceanCacheDepthAt(int X, int Y, int Z, float Footprint)
+{
+    return VoxelOceanCacheDepthAtDF(VoxelDFMul(VoxelDFFromInt(X), HalfFinest), VoxelDFMul(VoxelDFFromInt(Y), HalfFinest),
+        VoxelDFMul(VoxelDFFromInt(Z), HalfFinest), Footprint);
+}
+
+// The terrain's depth below the sea sphere (cm, positive under water) at lattice point (X, Y, Z)
+// at a footprint: the land surface cache's where it holds the point, else the density's; in an
+// inland basin (bBasin) water is land.
+float VoxelOceanDepthAt(int X, int Y, int Z, float Footprint, bool bBasin)
+{
+    const FVoxelOceanCacheDepth C = VoxelOceanCacheDepthAt(X, Y, Z, Footprint);
+    const float Depth = C.bCache ? C.Depth : VoxelOceanDensityDepthAt(X, Y, Z, Footprint);
+    return bBasin && Depth > 0.0f ? VOXEL_OCEAN_BASIN_DEPTH : Depth;
+}
+
+// The shore field at a lattice point: whether it lies in an inland basin below sea level (its
+// field distance below minus ShoreMarginM), and the landward direction (planet frame, unit; zero
+// without a field or where its directions disagree).
+struct FVoxelOceanPointShore
+{
+    bool bBasin;
+    float3 Landward;
+};
+
+FVoxelOceanPointShore VoxelOceanPointShoreAt(int X, int Y, int Z)
+{
+    FVoxelOceanPointShore S;
+    S.bBasin = false;
+    S.Landward = float3(0.0f, 0.0f, 0.0f);
+    if (ShoreN == 0u) return S;
+    const float3 Dir = normalize(float3(float(X), float(Y), float(Z)));
+    const FVoxelOceanShoreSample F = VoxelOceanShoreFieldAt(ShoreTexture, Dir, int(ShoreN), ShoreReach);
+    S.bBasin = F.Distance < -ShoreMarginM;
+    const float L2 = dot(F.Direction, F.Direction);
+    if (L2 >= 0.01f) S.Landward = F.Direction * rsqrt(L2);
+    return S;
+}
+
+// The depth the waves feel at a footprint, and the bed's slope code there (0: unknown); with the
+// land surface cache (stage O9m) the bed's rise too (planet frame, unit; zero: unknown).
+struct FVoxelOceanWaveDepth
+{
+    float Depth;
+    uint Code;
+    float3 Rise;
+};
+
+FVoxelOceanWaveDepth VoxelOceanWaveDepthAt(int X, int Y, int Z, float Footprint, FVoxelOceanPointShore Shore, bool bBasin)
+{
+    FVoxelOceanWaveDepth Out;
+    const FVoxelOceanCacheDepth C = VoxelOceanCacheDepthAt(X, Y, Z, Footprint);
+    const float Depth = C.bCache ? C.Depth : VoxelOceanDensityDepthAt(X, Y, Z, Footprint);
+    Out.Depth = bBasin && Depth > 0.0f ? VOXEL_OCEAN_BASIN_DEPTH : Depth;
+    Out.Code = 0u;
+    Out.Rise = float3(0.0f, 0.0f, 0.0f);
+    if (bBasin || Out.Depth <= VOXEL_OCEAN_BED_LAND || Out.Depth >= VOXEL_OCEAN_BED_SEA || Footprint > VOXEL_OCEAN_BED_MAX_FOOTPRINT
+        || dot(Shore.Landward, Shore.Landward) <= 0.0f) return Out;
+    // The cache's gradient is the bed's slope at the footprint already (its texels band-limited
+    // to it): the whole steepness, and the way it rises.
+    if (C.bCache)
+    {
+        Out.Code = VoxelOceanBedCode(C.Steep);
+        Out.Rise = C.Rise;
+        return Out;
+    }
+    // The step along the landward direction, in whole lattice steps.
+    const float Step = max(Footprint, VOXEL_OCEAN_BED_MIN_STEP);
+    const float Lattice = HalfFinest.x + HalfFinest.y;
+    const int3 O = int3(round(Shore.Landward * (Step / Lattice)));
+    const float Apart = 2.0f * length(float3(O)) * Lattice;
+    if (Apart <= 0.0f) return Out;
+    const float Seaward = VoxelOceanDensityDepthAt(X - O.x, Y - O.y, Z - O.z, Footprint);
+    const float Inland = VoxelOceanDensityDepthAt(X + O.x, Y + O.y, Z + O.z, Footprint);
+    const float Along = (Seaward - Inland) / Apart;
+    // Across it too (stage O9e): the bed's whole slope (its steepness, whichever way it falls),
+    // so a bank the field's direction runs along or away from (an inlet's far side) has its own.
+    // Over the lattice steps actually taken (rounded), each's tangent direction: exact for a
+    // plane bed.
+    const float3 Up = normalize(float3(float(X), float(Y), float(Z)));
+    const float3 Side = cross(Up, Shore.Landward);
+    const float SideLength = length(Side);
+    float Steep = abs(Along);
+    if (SideLength > 1.0e-3f)
+    {
+        const int3 Q = int3(round(Side * (Step / (Lattice * SideLength))));
+        const float3 OT = float3(O) - Up * dot(float3(O), Up);
+        const float3 QT = float3(Q) - Up * dot(float3(Q), Up);
+        const float OL = length(OT);
+        const float QL = length(QT);
+        if (QL > 0.0f && OL > 0.0f)
+        {
+            // The falls along each tangent step (the radial parts cancel: the depth is the
+            // density less the lift).
+            const float AlongT = (Seaward - Inland) / (2.0f * OL * Lattice);
+            const float AcrossT = (VoxelOceanDensityDepthAt(X - Q.x, Y - Q.y, Z - Q.z, Footprint) - VoxelOceanDensityDepthAt(X + Q.x, Y + Q.y, Z + Q.z, Footprint)) / (2.0f * QL * Lattice);
+            Steep = VoxelOceanBedWhole(AlongT, AcrossT, OT / OL, QT / QL);
+        }
+    }
+    Out.Code = VoxelOceanBedCode(Steep);
+    return Out;
+}
+
+#endif // VOXEL_OCEAN_TERRAIN_DEPTH_USH

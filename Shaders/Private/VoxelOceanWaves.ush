@@ -56,11 +56,14 @@
 // follow the stretch). W.States and W.SlopeVar carry the settings and the field's size
 // (VoxelOceanShoalSettingsOf); the table's constants the bands' height deviations.
 //
-// THE SURF (stage O9a; VoxelOceanSurf.ush): near the coast the long bands hand their energy to
-// surf trains that follow the depth's contours, break into bores and run up the beach as swash;
-// added to the FFT's sum (height, gradient, the vertical rate) before its normal is made. Its
-// settings are the chart table's constants rows 15 and 16 (written with the shore frame by the
-// surface), the clock W.SlopeVar.w (seconds modulo VOXEL_OCEAN_SURF_WRAP).
+// THE SURF (stages O9a to O9i; VoxelOceanSurf.ush): near the coast the long bands hand part of
+// their energy (down to the FFT's floor) to directed trains timed and steered by the coastal
+// travel-time field (stage O9h, VoxelOceanCoast.ush: read with the shore field, its layout from
+// the table's rows 19 to 21), which shoal by the real depth, break into bores and run up the
+// beach as swash; added to the FFT's sum (height, gradient, the vertical rate) before its normal
+// is made, their slope variance to the open sea's foam. Its settings are the chart table's
+// constants rows 15, 16 and 18 (written with the shore frame by the surface), the clock
+// W.SlopeVar.w (seconds modulo VOXEL_OCEAN_SURF_WRAP).
 //
 // THE FOAM (stage O9b; VoxelOceanFoam.ush): with VOXEL_OCEAN_LOOKUP_FOAM (the pixel shader) each
 // lookup of a band also reads its slot's foam envelope (the foam texture's (Z, Z^2) at the same
@@ -88,6 +91,7 @@
 #include "/Plugin/VoxelPlugin/Private/VoxelOceanSeaState.ush"
 #include "/Plugin/VoxelPlugin/Private/VoxelOceanFFTWaves.ush"
 #include "/Plugin/VoxelPlugin/Private/VoxelOceanShore.ush"
+#include "/Plugin/VoxelPlugin/Private/VoxelOceanCoast.ush"
 #include "/Plugin/VoxelPlugin/Private/VoxelOceanShoal.ush"
 #include "/Plugin/VoxelPlugin/Private/VoxelOceanSurf.ush"
 #include "/Plugin/VoxelPlugin/Private/VoxelOceanFoam.ush"
@@ -128,6 +132,9 @@ struct FVoxelOceanWaveParams
     float4 Tiles;      // the bands' tile sides (m)
     float4 States;     // the shore (O8): x the shore field's cells per face edge (0: no field), y the breaking index (0: no shoaling), z chop growth, w warp
     float4 SlopeVar;   // the shore (O8): x the fade distance (m), y the least beach slope, z the field's reach (m); w the surf's clock (O9a, s modulo VOXEL_OCEAN_SURF_WRAP)
+    // Stage O9l: the normal's lookups high-passed above this footprint (cm; 0 none): the slope
+    // between the pixel's footprint and the wave clipmap's (the detail the clipmap can't hold).
+    float HighPass;
 };
 
 FVoxelOceanWaveParams VoxelOceanMakeWaveParams(float4 Params, float4 Wave0, float4 Wave1, float4 Wave2, float3 Center, float4 Shape)
@@ -145,6 +152,7 @@ FVoxelOceanWaveParams VoxelOceanMakeWaveParams(float4 Params, float4 Wave0, floa
     W.Rotation = float4(0.0f, 0.0f, 0.0f, 1.0f);
     W.Tiles = float4(1.0f, 1.0f, 1.0f, 1.0f);
     W.States = float4(0.0f, 0.0f, 0.0f, 0.0f);
+    W.HighPass = 0.0f;
     W.SlopeVar = float4(0.0f, 0.0f, 0.0f, 0.0f);
     return W;
 }
@@ -200,6 +208,16 @@ struct FVoxelOceanShore
     // in). From the mesh (VoxelOceanPage.usf) or the depth probe.
     float BedSlope;
     float BedDepth;
+    // Stage O9e: BedSlope is the bed's steepness (its whole slope); BedRise the way it rises
+    // (toward its shallows; world axes, unit; zero: unknown, the field's direction stands in).
+    // The pixel's from the depth's own derivatives.
+    float3 BedRise;
+    // Stage O9h: the coastal travel-time field at the point (VoxelOceanCoast.ush; its gradients in
+    // the planet frame, per metre; stage O9i); Cover 0: none. Its layout's seed depth and reach
+    // ride along (the surf's ramp and fade).
+    FVoxelOceanCoastSample Coast;
+    float CoastSeedM;
+    float CoastReachM;
 };
 
 // V turned by the unit quaternion Q (q v q^-1), and back.
@@ -254,6 +272,10 @@ FVoxelOceanShore VoxelOceanShoreNone()
     S.Slope = VOXEL_OCEAN_SHORE_DEFAULT_SLOPE;
     S.BedSlope = VOXEL_OCEAN_BED_UNKNOWN;
     S.BedDepth = VOXEL_OCEAN_DEEP;
+    S.BedRise = float3(0.0f, 0.0f, 0.0f);
+    S.Coast = VoxelOceanCoastSampleNone();
+    S.CoastSeedM = 0.0f;
+    S.CoastReachM = 0.0f;
     return S;
 }
 
@@ -266,11 +288,34 @@ FVoxelOceanShoreFrame VoxelOceanShoreFrameOfTable(Texture2D OceanCharts, int N)
         OceanCharts.Load(int3(X, 11, 0)), OceanCharts.Load(int3(X, 12, 0)), OceanCharts.Load(int3(X, 13, 0)), OceanCharts.Load(int3(X, 14, 0)));
 }
 
+// The coastal travel-time field's layout (stage O9h), from the chart table (rows 19 to 21 of its
+// constants, written with the frame by the surface: VoxelOceanCoast.ush).
+FVoxelOceanCoastLayout VoxelOceanCoastLayoutOfTable(Texture2D OceanCharts, int N)
+{
+    const int X = VoxelOceanConstantsX(N);
+    const float4 Row2 = OceanCharts.Load(int3(X, 21, 0));
+    return VoxelOceanCoastLayoutFrom(OceanCharts.Load(int3(X, 19, 0)), OceanCharts.Load(int3(X, 20, 0)), Row2.x);
+}
+
+// The coastal field at a point P (from the reference point) whose radial is Up (world axes), its
+// gradients in the planet frame (stage O9i: the surf works there); near the reference through
+// Frame's expansion.
+FVoxelOceanCoastSample VoxelOceanCoastAt(float3 P, float3 Up, FVoxelOceanWaveParams W, FVoxelOceanShoreFrame Frame, FVoxelOceanCoastLayout L,
+    VOXEL_OCEAN_SHORE_TEXTURE_PARAM)
+{
+    if (W.States.x < 0.5f || L.Valid < 0.5f) return VoxelOceanCoastSampleNone();
+    return VoxelOceanCoastNear(VOXEL_OCEAN_SHORE_TEXTURE_ARG, L, VoxelOceanRotateBack(W.Rotation, Up), Frame, VoxelOceanRotateBack(W.Rotation, P));
+}
+
 // The shore at a point P (from the reference point) whose radial is Up (world axes): the shore
 // field's texture there (planet frame, W.Rotation), when W carries a field (W.States.x its cells
 // per face edge, W.SlopeVar.z its reach); near the reference through Frame's expansion
-// (VoxelOceanShore.ush, NEAR THE CAMERA).
-FVoxelOceanShore VoxelOceanShoreAt(float3 P, float3 Up, FVoxelOceanWaveParams W, FVoxelOceanShoreFrame Frame, VOXEL_OCEAN_SHORE_TEXTURE_PARAM)
+// (VoxelOceanShore.ush, NEAR THE CAMERA). Stage O9i: the coastal field's too, by its layout
+// (VoxelOceanCoastLayoutOfTable; not valid: none), within its reach where the surf can use it at
+// Depth (cm, the terrain's: from 100 m up the beach, VOXEL_OCEAN_SURF_LAND, to 1.5 seed depths
+// out, VOXEL_OCEAN_SURF_SEED_FADE, where the trains have faded out).
+FVoxelOceanShore VoxelOceanShoreAt(float3 P, float3 Up, FVoxelOceanWaveParams W, FVoxelOceanShoreFrame Frame, FVoxelOceanCoastLayout CoastLayout,
+    float Depth, VOXEL_OCEAN_SHORE_TEXTURE_PARAM)
 {
     if (W.States.x < 0.5f) return VoxelOceanShoreNone();
     const FVoxelOceanShoreSample F = VoxelOceanShoreFieldNear(VOXEL_OCEAN_SHORE_TEXTURE_ARG, VoxelOceanRotateBack(W.Rotation, Up), int(W.States.x), W.SlopeVar.z,
@@ -281,7 +326,22 @@ FVoxelOceanShore VoxelOceanShoreAt(float3 P, float3 Up, FVoxelOceanWaveParams W,
     S.Slope = F.Slope;
     S.BedSlope = VOXEL_OCEAN_BED_UNKNOWN;
     S.BedDepth = VOXEL_OCEAN_DEEP;
+    S.BedRise = float3(0.0f, 0.0f, 0.0f);
+    S.Coast = VoxelOceanCoastSampleNone();
+    S.CoastSeedM = CoastLayout.SeedDepthM;
+    S.CoastReachM = CoastLayout.ReachM;
+    // Past the field's reach (and a cell's margin) nothing to read.
+    const bool bUsed = Depth < 100.0f * VOXEL_OCEAN_SURF_SEED_FADE * CoastLayout.SeedDepthM && Depth > -100.0f * VOXEL_OCEAN_SURF_LAND
+        && W.States.y > 0.0f;
+    if (CoastLayout.Valid > 0.5f && bUsed && F.Distance < CoastLayout.ReachM + 2.0f * CoastLayout.CellM)
+        S.Coast = VoxelOceanCoastAt(P, Up, W, Frame, CoastLayout, VOXEL_OCEAN_SHORE_TEXTURE_ARG);
     return S;
+}
+
+// The debug view's mode (stage O9f; voxel.Ocean.DebugSurf, the chart table's row 18 w).
+int VoxelOceanDebugModeOf(Texture2D OceanCharts, int N)
+{
+    return int(OceanCharts.Load(int3(VoxelOceanConstantsX(N), 18, 0)).w + 0.5f);
 }
 
 FVoxelOceanWaveInput VoxelOceanWaveInput(float3 P, float Spacing, float Footprint, float Depth, FVoxelOceanWaveParams W)
@@ -297,12 +357,13 @@ FVoxelOceanWaveInput VoxelOceanWaveInput(float3 P, float Spacing, float Footprin
     return In;
 }
 
-// With the shore field's texture and its expansion around the reference.
+// With the shore field's texture and its expansion around the reference; the coastal field's
+// layout (stage O9i).
 FVoxelOceanWaveInput VoxelOceanWaveInputShore(float3 P, float Spacing, float Footprint, float Depth, FVoxelOceanWaveParams W, FVoxelOceanShoreFrame Frame,
-    VOXEL_OCEAN_SHORE_TEXTURE_PARAM)
+    FVoxelOceanCoastLayout CoastLayout, VOXEL_OCEAN_SHORE_TEXTURE_PARAM)
 {
     FVoxelOceanWaveInput In = VoxelOceanWaveInput(P, Spacing, Footprint, Depth, W);
-    In.Shore = VoxelOceanShoreAt(P, In.Up, W, Frame, VOXEL_OCEAN_SHORE_TEXTURE_ARG);
+    In.Shore = VoxelOceanShoreAt(P, In.Up, W, Frame, CoastLayout, Depth, VOXEL_OCEAN_SHORE_TEXTURE_ARG);
     return In;
 }
 
@@ -637,6 +698,12 @@ FVoxelOceanFFTBands VoxelOceanFFTChartLookups(VOXEL_OCEAN_TEXTURE_PARAMS, FVoxel
         const float TexelsPerCm = 0.01f * 256.0f * InvL * (1.0f + Stretch);
         const float LodD = log2(max(VOXEL_OCEAN_FFT_MESH_TEXEL * Spacing * TexelsPerCm, 1.0f)) + Bias;
         const float LodN = log2(max(Footprint * TexelsPerCm, 1.0f)) + Bias;
+        // The high pass (stage O9l): the band's slope at the footprint less its slope at the
+        // clipmap's; nothing to add where the clipmap's footprint is no coarser.
+        const bool bHigh = W.HighPass > 0.0f && bNormal;
+        const float LodHP = bHigh ? log2(max(W.HighPass * TexelsPerCm, 1.0f)) + Bias : VOXEL_OCEAN_FFT_TOP_MIP;
+        if (bHigh && (LodN >= LodHP - 0.01f || LodN >= VOXEL_OCEAN_FFT_TOP_MIP)) continue;
+        const bool bHighSample = bHigh && LodHP < VOXEL_OCEAN_FFT_TOP_MIP;
         const bool bFoamHere = bFoam && LodN < VOXEL_OCEAN_FFT_TOP_MIP;
         if (bFoam && !bFoamHere)
             Out.FoamRes = VoxelOceanAddComponent(Out.FoamRes, B, Unresolved);
@@ -668,6 +735,8 @@ FVoxelOceanFFTBands VoxelOceanFFTChartLookups(VOXEL_OCEAN_TEXTURE_PARAMS, FVoxel
                     const float WCopy = Copy == 0 ? Detile.Weight.x : (Copy == 1 ? Detile.Weight.y : Detile.Weight.z);
                     const float2 UV = VoxelOceanFFTBandUV(LongCoords, Shift, Warp, Half, InvL);
                     Band = VoxelOceanFFTSampleMad(Band, WState * WCopy, VoxelOceanFFTLookup(VOXEL_OCEAN_TEXTURE_ARGS, UV, Slice, LodD, LodN, Mask));
+                    if (bHighSample)
+                        Band = VoxelOceanFFTSampleMad(Band, -WState * WCopy, VoxelOceanFFTLookup(VOXEL_OCEAN_TEXTURE_ARGS, UV, Slice, LodD, LodHP, Mask));
                     if (bFoamHere)
                     {
                         const float WN = WState * InvLongSum;
@@ -693,6 +762,8 @@ FVoxelOceanFFTBands VoxelOceanFFTChartLookups(VOXEL_OCEAN_TEXTURE_PARAMS, FVoxel
                 const float WCopy = Copy == 0 ? Detile.Weight.x : (Copy == 1 ? Detile.Weight.y : Detile.Weight.z);
                 const float2 UV = VoxelOceanFFTBandUV(ShortCoords, Shift, Warp, Half, InvL);
                 Band = VoxelOceanFFTSampleMad(Band, Scale * WCopy, VoxelOceanFFTLookup(VOXEL_OCEAN_TEXTURE_ARGS, UV, float(4 + B), LodD, LodN, Mask));
+                if (bHighSample)
+                    Band = VoxelOceanFFTSampleMad(Band, -Scale * WCopy, VoxelOceanFFTLookup(VOXEL_OCEAN_TEXTURE_ARGS, UV, float(4 + B), LodD, LodHP, Mask));
                 if (bFoamHere)
                 {
                     const float2 F = VoxelOceanFoamLookup(VOXEL_OCEAN_FOAM_TEXTURE_ARGS, UV, 4 + B, LodN, FoamSlots);
@@ -777,15 +848,25 @@ FVoxelOceanShoal VoxelOceanFFTShoalAt(float Depth, FVoxelOceanShore Shore, FVoxe
     return VoxelOceanShoalOf(DepthM, Field, bField, Sea, W.Tiles, Sigma, Settings);
 }
 
+// The bed's rise (planet frame, unit): the shore's (world axes) where known, else Landward (the
+// field's direction, planet frame; stage O9e).
+float3 VoxelOceanBedRiseOf(FVoxelOceanShore Shore, FVoxelOceanWaveParams W, float3 Landward)
+{
+    const float L2 = dot(Shore.BedRise, Shore.BedRise);
+    return L2 > 0.25f ? VoxelOceanRotateBack(W.Rotation, Shore.BedRise) * rsqrt(L2) : Landward;
+}
+
 // The surf at a point (VoxelOceanSurf.ush): D its offset from the reference in the planet frame,
-// Depth (cm) and Shore (world axes) as the wave input carries them, Sea its sea state, Sigma its
-// bands' height deviations; its settings from the chart table (rows 15 and 16), the clock from
-// W.SlopeVar.w. Dir receives the landward direction in the planet frame (unit; the surf's
-// gradient is along it).
+// Depth (cm) and Shore (world axes; its coastal field's planet frame) as the wave input carries
+// them, Sea its sea state, Sigma its bands' height deviations; its settings from the chart table
+// (rows 15, 16 and 18), the clock from W.SlopeVar.w. Dir receives the landward direction in the
+// planet frame (unit; the surf's inland gradient is along it; its phase's comes in the planet
+// frame, Surf.GradientPhase).
 struct FVoxelOceanFFTSurf
 {
     FVoxelOceanSurf Surf;
     float3 Dir;
+    float3 BedDir;     // the bed's rise (planet frame, unit; the landward direction where unknown; stage O9e)
 };
 
 FVoxelOceanFFTSurf VoxelOceanFFTSurfAt(float3 D, float Depth, FVoxelOceanShore Shore, FVoxelOceanSeaState Sea, float4 Sigma, FVoxelOceanWaveParams W,
@@ -794,17 +875,18 @@ FVoxelOceanFFTSurf VoxelOceanFFTSurfAt(float3 D, float Depth, FVoxelOceanShore S
     FVoxelOceanFFTSurf Out;
     Out.Surf = VoxelOceanSurfNone();
     Out.Dir = float3(0.0f, 0.0f, 0.0f);
+    Out.BedDir = float3(0.0f, 0.0f, 0.0f);
     const bool bField = W.States.x > 0.5f && Shore.Distance < 0.5f * VOXEL_OCEAN_DEEP;
     if (!bField || W.States.y <= 0.0f || Depth >= 0.5f * VOXEL_OCEAN_DEEP) return Out;
     const int X = VoxelOceanConstantsX(N);
-    const FVoxelOceanSurfSettings Settings = VoxelOceanSurfSettingsOf(OceanCharts.Load(int3(X, 15, 0)), OceanCharts.Load(int3(X, 16, 0)), W.States.y);
+    const FVoxelOceanSurfSettings Settings = VoxelOceanSurfSettingsOf(OceanCharts.Load(int3(X, 15, 0)), OceanCharts.Load(int3(X, 16, 0)),
+        OceanCharts.Load(int3(X, 18, 0)), W.States.y);
     if (Settings.Strength <= 0.0f) return Out;
     const float3 DirP = VoxelOceanRotateBack(W.Rotation, Shore.Direction);
     const float Agree = dot(DirP, DirP);
     FVoxelOceanSurfInput In;
     In.DepthM = Depth * 0.01f;
     In.Slope = max(Shore.Slope, max(W.SlopeVar.y, 1.0e-4f));
-    In.Agree = Agree;
     In.ShoreM = Shore.Distance * 0.01f;
     In.Hs = 4.0f * sqrt(Sigma.x * Sigma.x + Sigma.y * Sigma.y);
     In.Speed = max(Sea.Wind, Sea.Swell);
@@ -817,15 +899,25 @@ FVoxelOceanFFTSurf VoxelOceanFFTSurfAt(float3 D, float Depth, FVoxelOceanShore S
     In.BedSlope = Shore.BedSlope;
     In.BedDepthM = Shore.BedDepth < 0.5f * VOXEL_OCEAN_DEEP ? Shore.BedDepth * 0.01f : 1.0e30f;
     In.ForNormals = (Mask & 2u) != 0u ? 1.0f : 0.0f;
+    // The coastal field (stage O9i; planet frame, as the rest here).
+    In.CoastA = Shore.Coast.A;
+    In.CoastB = Shore.Coast.B;
+    In.CoastGradA = Shore.Coast.GradA;
+    In.CoastGradB = Shore.Coast.GradB;
+    In.CoastCover = Shore.Coast.Cover;
+    In.CoastSeedM = Shore.CoastSeedM;
+    In.CoastReachM = Shore.CoastReachM;
     Out.Surf = VoxelOceanSurfOf(In, Settings);
     Out.Dir = Agree > 1.0e-12f ? DirP * rsqrt(Agree) : float3(0.0f, 0.0f, 0.0f);
+    Out.BedDir = VoxelOceanBedRiseOf(Shore, W, Out.Dir);
     return Out;
 }
 
 // The open sea's foam at a point (VoxelOceanFoamOf) from its bands' lookups, the slots'
-// statistics, its sea state and the long bands' share the surf leaves them; the surf's foam where
-// larger. The coverage is the surf's settings' (the chart table's row 16).
-float VoxelOceanFFTFoamOf(FVoxelOceanFoamBands Foam, FVoxelOceanFoamSlots Slots, FVoxelOceanSeaState Sea, float LongKeep, float SurfFoam,
+// statistics, its sea state, the long bands' share the surf leaves them and the surf's trains'
+// slope variance (stage O9i: the composed sea's steepness, so the whitecaps follow the trains);
+// the surf's foam where larger. The coverage is the surf's settings' (the chart table's row 16).
+float VoxelOceanFFTFoamOf(FVoxelOceanFoamBands Foam, FVoxelOceanFoamSlots Slots, FVoxelOceanSeaState Sea, float LongKeep, float SurfSteepVar, float SurfFoam,
     Texture2D OceanCharts, int N)
 {
     const float Coverage = max(OceanCharts.Load(int3(VoxelOceanConstantsX(N), 16, 0)).z, 0.0f);
@@ -834,7 +926,7 @@ float VoxelOceanFFTFoamOf(FVoxelOceanFoamBands Foam, FVoxelOceanFoamSlots Slots,
     {
         // The bands' spread (the long bands' slots by the normalised sea-state weights, as their
         // waves blend) and steepness (the slope deviation at the sea state; the long bands' times
-        // what the surf leaves them).
+        // what the surf leaves them, with the trains' own).
         const float LongSum = Sea.Long.x + Sea.Long.y + Sea.Long.z;
         const float3 WN = LongSum > 0.0f ? Sea.Long / LongSum : float3(0.0f, 0.0f, 0.0f);
         const float4 Sd0 = sqrt(Slots.Var0);
@@ -842,7 +934,7 @@ float VoxelOceanFFTFoamOf(FVoxelOceanFoamBands Foam, FVoxelOceanFoamSlots Slots,
         Foam.Sigma = float4(WN.x * Sd0.x + WN.y * Sd0.z + WN.z * Sd1.x, WN.x * Sd0.y + WN.y * Sd0.w + WN.z * Sd1.y, Sd1.z, Sd1.w);
         const float4 V = VoxelOceanBandSlopeVariance(OceanCharts, Sea, N);
         const float Keep = saturate(LongKeep);
-        Foam.Steep = float4(sqrt(V.x) * Keep, sqrt(V.y) * Keep, sqrt(V.z), sqrt(V.w));
+        Foam.Steep = float4(sqrt(V.x * Keep * Keep + max(SurfSteepVar, 0.0f)), sqrt(V.y) * Keep, sqrt(V.z), sqrt(V.w));
         Open = VoxelOceanFoamOf(Foam, Sea.Wind, Coverage);
     }
     return saturate(max(Open, SurfFoam));
@@ -860,7 +952,8 @@ FVoxelOceanFFTPoint VoxelOceanFFTEvaluate(float3 P, float3 Up, float Spacing, fl
     const float3 UpP = VoxelOceanRotateBack(W.Rotation, Up);
     const int N = max(int(W.FFT.y), 1);
     const FVoxelOceanSeaState Sea = VoxelOceanSeaStateAt(OceanCharts, UpP, N, W.Shape.y);
-    // The surf takes the long bands' energy near the coast (the handover), before their cap.
+    // The surf takes part of the long bands' energy near the coast (stage O9i: down to the FFT's
+    // floor), before their cap.
     const float4 Sigma = VoxelOceanFFTBandSigma(Sea, OceanCharts, N);
     // The drain toward inland basins (stage O9b3; VoxelOceanSurf.ush): the margin from the shore
     // frame's row 9 z in the chart table; with shoaling, as the CPU model. Where it has stilled the
@@ -869,7 +962,9 @@ FVoxelOceanFFTPoint VoxelOceanFFTEvaluate(float3 P, float3 Up, float Spacing, fl
     Drain.Keep = 1.0f;
     Drain.Drop = 0.0f;
     Drain.Slope = 0.0f;
+    Drain.SlopeBed = 0.0f;
     float3 DrainDir = float3(0.0f, 0.0f, 0.0f);
+    float3 DrainBedDir = float3(0.0f, 0.0f, 0.0f);
     if (W.States.x > 0.5f && W.States.y > 0.0f && Shore.Distance < 0.5f * VOXEL_OCEAN_DEEP)
     {
         const float Margin = OceanCharts.Load(int3(VoxelOceanConstantsX(N), 9, 0)).z;
@@ -878,11 +973,13 @@ FVoxelOceanFFTPoint VoxelOceanFFTEvaluate(float3 P, float3 Up, float Spacing, fl
         const float3 DirP = VoxelOceanRotateBack(W.Rotation, Shore.Direction);
         const float L2 = dot(DirP, DirP);
         DrainDir = L2 > 1.0e-12f ? DirP * rsqrt(L2) : float3(0.0f, 0.0f, 0.0f);
+        DrainBedDir = VoxelOceanBedRiseOf(Shore, W, DrainDir);
     }
     const bool bStill = Drain.Keep <= 0.0f;
     FVoxelOceanFFTSurf Surf;
     Surf.Surf = VoxelOceanSurfNone();
     Surf.Dir = float3(0.0f, 0.0f, 0.0f);
+    Surf.BedDir = float3(0.0f, 0.0f, 0.0f);
     if (!bStill)
         Surf = VoxelOceanFFTSurfAt(D, Depth, Shore, Sea, Sigma, W, OceanCharts, N, Spacing, Footprint, Mask);
     const FVoxelOceanShoal Shoal = VoxelOceanFFTShoalAt(Depth, Shore, Sea, Sigma, Surf.Surf.LongKeep, W);
@@ -917,11 +1014,11 @@ FVoxelOceanFFTPoint VoxelOceanFFTEvaluate(float3 P, float3 Up, float Spacing, fl
             A = VoxelOceanFFTAddOrientation(A, VOXEL_OCEAN_TEXTURE_ARGS, C, Coords, H.LongPrevious, H.ShortPrevious,
                 Blend.Weight[M] * WLong.y, Blend.Weight[M] * WShort.y, Sea, W, Spacing, Footprint, Mask, Shoal, VOXEL_OCEAN_FOAM_TEXTURE_ARGS, FoamSlots, Foam);
     }
-    // The surf's height, gradient (along the landward direction) and rate (cm).
+    // The surf's height, gradient (along the landward direction and up the bed) and rate (cm).
     if (Surf.Surf.Active > 0.5f)
     {
         A.Height += Surf.Surf.Height * 100.0f;
-        A.Gradient += Surf.Dir * Surf.Surf.Gradient;
+        A.Gradient += Surf.Dir * Surf.Surf.Gradient + Surf.BedDir * Surf.Surf.GradientBed + Surf.Surf.GradientPhase;
         A.VelocityUp += Surf.Surf.Rate * 100.0f;
     }
     // The drain: the waves scaled, the surface lowered, its slope landward taken off the gradient.
@@ -929,12 +1026,58 @@ FVoxelOceanFFTPoint VoxelOceanFFTEvaluate(float3 P, float3 Up, float Spacing, fl
     {
         A = VoxelOceanFFTAccumScale(A, Drain.Keep);
         A.Height -= Drain.Drop * 100.0f;
-        A.Gradient -= DrainDir * Drain.Slope;
+        A.Gradient -= DrainDir * Drain.Slope + DrainBedDir * Drain.SlopeBed;
+    }
+    // Thin water (stage O9f; VoxelOceanSurfThinDrop): a film of a few centimetres over the bottom
+    // sinks just under it. The bottom: the depth the waves feel (smoothed; morphed with the mesh,
+    // the same in the underwater pass and the query), or the terrain's own where that stands
+    // higher (the mesh's BedDepth: a bump the smoothing left out pokes through cleanly).
+    if (Depth < 0.5f * VOXEL_OCEAN_DEEP && W.States.x > 0.5f && W.States.y > 0.0f && Shore.Distance < 0.5f * VOXEL_OCEAN_DEEP)
+    {
+        const float Bottom = Shore.BedDepth < 0.5f * VOXEL_OCEAN_DEEP ? min(Depth, Shore.BedDepth) : Depth;
+        A.Height -= 100.0f * VoxelOceanSurfThinDrop((A.Height + Bottom) * 0.01f, Spacing * 0.01f);
     }
     FVoxelOceanFFTPoint Out;
     Out.R = VoxelOceanFFTFinish(A, UpP);
     Out.A = A;
-    Out.Foam = bFoam ? Drain.Keep * VoxelOceanFFTFoamOf(Foam, FoamSlots, Sea, Surf.Surf.LongKeep, Surf.Surf.Foam, OceanCharts, N) : 0.0f;
+    Out.Foam = bFoam ? Drain.Keep * VoxelOceanFFTFoamOf(Foam, FoamSlots, Sea, Surf.Surf.LongKeep, Surf.Surf.SteepVar, Surf.Surf.Foam, OceanCharts, N) : 0.0f;
+    // The debug view (stage O9f; voxel.Ocean.DebugSurf, the chart table's row 18 w): one of the
+    // surf's and the shore's quantities as the foam (0 to 1), to find where one changes abruptly.
+    if (bFoam)
+    {
+    const int DebugMode = VoxelOceanDebugModeOf(OceanCharts, N);
+    if (DebugMode > 0)
+    {
+        const bool bShore = Shore.Distance < 0.5f * VOXEL_OCEAN_DEEP;
+        float V = 0.0f;
+        if (DebugMode == 1) V = bShore ? dot(Shore.Direction, Shore.Direction) : 0.0f;              // the field's agreement
+        else if (DebugMode == 2) V = Surf.Surf.Debug.x;                                                 // the trains' share (stage O9i)
+        else if (DebugMode == 3) V = Surf.Surf.Debug.y;                                                 // the coastal field's depth (50 m white)
+        else if (DebugMode == 4) V = Surf.Surf.Active > 0.5f ? Surf.Surf.LongKeep : 1.0f;              // the long bands kept
+        else if (DebugMode == 5) V = Shoal.Active > 0.0f ? Shoal.Shift.x * (1.0f / 2000.0f) : 0.0f;    // the warp's move (2 km white)
+        else if (DebugMode == 6) V = Depth < 0.5f * VOXEL_OCEAN_DEEP ? Depth * (1.0f / 5000.0f) : 1.0f; // the waves' depth (50 m white)
+        else if (DebugMode == 7) V = bShore ? Shore.Slope * 50.0f : 0.0f;                              // the field's slope (1:50 white)
+        else if (DebugMode == 8) V = Surf.Surf.Debug.w;                                                 // the trains' ramp by depth
+        else if (DebugMode == 9) V = bShore ? Shore.Distance * (1.0f / 1.0e6f) : 1.0f;                 // the field's distance (10 km white)
+        else if (DebugMode == 10) V = Drain.Keep;                                                       // the drain's keep
+        // Stage O9h: the coastal travel-time field (planet frame).
+        else if (DebugMode >= 11 && DebugMode <= 14)
+        {
+            const FVoxelOceanCoastSample C = Shore.Coast;
+            // A 9 s wave's crests (static), the field's cover, its slowness check (|grad A|
+            // sqrt(held depth), 1 at half white) and its rays against the shore field's direction.
+            const float K0 = 0.0497f;
+            const float4 Ph = VoxelOceanCoastPhase(C, K0);
+            const float Held = VoxelOceanCoastHeldDepth(Depth < 0.5f * VOXEL_OCEAN_DEEP ? Depth * 0.01f : 0.0f);
+            const float GA = length(C.GradA);
+            if (DebugMode == 11) V = C.Cover * (0.5f + 0.5f * cos(Ph.x));
+            else if (DebugMode == 12) V = C.Cover;
+            else if (DebugMode == 13) V = C.Cover * 0.5f * GA * sqrt(Held);
+            else V = C.Cover * (bShore && GA > 0.0f ? 0.5f + 0.5f * dot(C.GradA / GA, VoxelOceanRotateBack(W.Rotation, Shore.Direction)) : 0.0f);
+        }
+        Out.Foam = saturate(V);
+    }
+    }
     Out.SlopeVar = float4(0.0f, 0.0f, 0.0f, 0.0f);
     if ((Mask & 2u) != 0u)
     {
@@ -1013,7 +1156,8 @@ float VoxelOceanHeightAtFFTShore(float3 Q, float2 Sphere, FVoxelOceanWaveParams 
     const float3 Up = normalize(Q - W.Center);
     const float3 Foot = Q - Up * Height;
     float3 X = Foot;
-    FVoxelOceanWaveInput In = VoxelOceanWaveInputShore(X, Footprint, Footprint, Depth, W, Frame, VOXEL_OCEAN_SHORE_TEXTURE_ARG);
+    const FVoxelOceanCoastLayout CoastLayout = VoxelOceanCoastLayoutOfTable(OceanCharts, max(int(W.FFT.y), 1));
+    FVoxelOceanWaveInput In = VoxelOceanWaveInputShore(X, Footprint, Footprint, Depth, W, Frame, CoastLayout, VOXEL_OCEAN_SHORE_TEXTURE_ARG);
     In.Shore.BedSlope = VOXEL_OCEAN_HEIGHT_BED(X, VOXEL_OCEAN_BED_UNKNOWN);
     FVoxelOceanFFTPoint Pt = VoxelOceanFFTEvaluate(X, In.Up, Footprint, Footprint, Depth, In.Shore, W, VOXEL_OCEAN_TEXTURE_ARGS, VOXEL_OCEAN_FOAM_TEXTURE_ARGS,
         VOXEL_OCEAN_LOOKUP_ALL);
@@ -1030,7 +1174,7 @@ float VoxelOceanHeightAtFFTShore(float3 Q, float2 Sphere, FVoxelOceanWaveParams 
         const float3 StepP = (RP * (1.0f + Trace) - VoxelOceanFFTApplyJ(J, RP)) * InvDet;
         X -= VoxelOceanRotate(W.Rotation, StepP);
         const float StepDepth = VOXEL_OCEAN_HEIGHT_DEPTH(X, Depth);
-        In = VoxelOceanWaveInputShore(X, Footprint, Footprint, StepDepth, W, Frame, VOXEL_OCEAN_SHORE_TEXTURE_ARG);
+        In = VoxelOceanWaveInputShore(X, Footprint, Footprint, StepDepth, W, Frame, CoastLayout, VOXEL_OCEAN_SHORE_TEXTURE_ARG);
         In.Shore.BedSlope = VOXEL_OCEAN_HEIGHT_BED(X, VOXEL_OCEAN_BED_UNKNOWN);
         const uint StepMask = Step == VOXEL_OCEAN_HEIGHT_STEPS - 1 ? Mask : (Step == 0 ? VOXEL_OCEAN_LOOKUP_ALL : VOXEL_OCEAN_LOOKUP_DISPLACEMENT);
         Pt = VoxelOceanFFTEvaluate(X, In.Up, Footprint, Footprint, StepDepth, In.Shore, W, VOXEL_OCEAN_TEXTURE_ARGS, VOXEL_OCEAN_FOAM_TEXTURE_ARGS, StepMask);

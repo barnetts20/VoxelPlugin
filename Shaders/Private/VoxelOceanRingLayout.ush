@@ -1,0 +1,112 @@
+// VoxelOceanRingLayout.ush - The ocean's rings (stage W2; Design/OceanWaves.md section 29): where a
+// ring vertex lies and which wave clipmap level it samples. Shared by the rings' per-frame pass
+// (VoxelOceanRings.usf) and the harness (Tools/OceanHarness/clip_check.cpp, through
+// VoxelShaderCompat.h).
+//
+// THE RINGS. One square grid per wave clipmap level in use, on the clipmap's shared plane
+// (VoxelOceanClipmap.h): level i has 2 Half cells a side of spacing G_i = twice the level's texel
+// (the clipmap's texels hold the waves as a vertex of that spacing sees them), centred on the
+// plane vertex S_i nearest the camera on the grid of 2 G_i (so the square lies on the next level's
+// grid). Local vertex (X, Y) runs from -Half to Half about S_i.
+//
+// THE HOLE. Level i > 0 leaves out the square of level i - 1: Half / 2 of its cells either side
+// of (HoleX, HoleY) = S_{i-1} / 2 - S_i (in its own cells; -1, 0 or 1 each). A vertex strictly
+// inside has no triangles (the pass writes it as NaN, so every triangle using it is culled; the
+// index pattern turns each cell's diagonal toward the centre, so every cell of the hole has a
+// vertex strictly inside: VoxelOceanPages.cpp, the rings' indices).
+//
+// THE MORPH. Toward its outer edge, level i's vertices slide onto the next level's grid: between
+// MorphStart and MorphEnd cells from the camera (the larger axis) a vertex moves from its own
+// place to the even vertex at or below it on each axis, and the clipmap level it samples goes from
+// i to i + 1 with it (its scale from G_i / 2 to G_{i+1} / 2). Past MorphEnd, and so on the edge,
+// it IS the next level's vertex there: its plane offset and scale are computed with the next
+// level's numbers exactly as that vertex computes its own, so the two levels meet without a crack.
+// The outermost level doesn't morph (the far sphere lies under its edge).
+//
+// Shared subset (VoxelShaderCompat.h): no swizzles, no out parameters, f-suffixed literals.
+
+#ifndef VOXEL_OCEAN_RING_LAYOUT_USH
+#define VOXEL_OCEAN_RING_LAYOUT_USH
+
+#ifndef VOXEL_FUNC
+#define VOXEL_FUNC
+#endif
+
+#define VOXEL_OCEAN_RING_MAX_LEVELS 16
+
+/** A level's ring: the camera's place about the square's centre (cells), the cell (cm), its hole's
+ *  centre (cells) and its centre on the next level's grid (the next level's cells). */
+struct FVoxelOceanRingLevel
+{
+    float CamX;
+    float CamY;
+    float Spacing;
+    int HoleX;
+    int HoleY;
+    int CoarseX;
+    int CoarseY;
+};
+
+/** A ring vertex: in the hole (Valid 0), or its plane offset from the camera (cm), the clipmap
+ *  level its static layer comes from (the level's or the next one's once fully morphed), the scale
+ *  its displacement is sampled at (cm) and how far it has morphed. */
+struct FVoxelOceanRingPoint
+{
+    int Valid;
+    int Level;
+    float OffsetX;
+    float OffsetY;
+    float Scale;
+    float Morph;
+};
+
+/** Local vertex (X, Y) of level I of Count, Half cells a side, morphing between MorphStart and
+ *  MorphEnd cells from the camera. L: level I's ring; Next: level I + 1's (unused for the
+ *  outermost). */
+VOXEL_FUNC FVoxelOceanRingPoint VoxelOceanRingPointOf(int X, int Y, int I, int Count, int Half, float MorphStart, float MorphEnd,
+    FVoxelOceanRingLevel L, FVoxelOceanRingLevel Next)
+{
+    FVoxelOceanRingPoint P;
+    P.Valid = 1;
+    P.Level = I;
+    P.OffsetX = 0.0f;
+    P.OffsetY = 0.0f;
+    P.Scale = 0.0f;
+    P.Morph = 0.0f;
+    if (I > 0)
+    {
+        const int H = Half / 2;
+        if (X > L.HoleX - H && X < L.HoleX + H && Y > L.HoleY - H && Y < L.HoleY + H)
+        {
+            P.Valid = 0;
+            return P;
+        }
+    }
+    const float D = max(abs(float(X) - L.CamX), abs(float(Y) - L.CamY));
+    const bool bOuter = I + 1 >= Count;
+    const float Morph = bOuter ? 0.0f : saturate((D - MorphStart) / (MorphEnd - MorphStart));
+    // The even vertex at or below on each axis (two's complement: X & 1 is 1 for odd negatives too).
+    const int XC = X - (X & 1);
+    const int YC = Y - (Y & 1);
+    if (!bOuter && Morph >= 1.0f)
+    {
+        // The next level's vertex: computed as it computes itself.
+        const int CX = XC / 2 + L.CoarseX;
+        const int CY = YC / 2 + L.CoarseY;
+        P.Level = I + 1;
+        P.OffsetX = (float(CX) - Next.CamX) * Next.Spacing;
+        P.OffsetY = (float(CY) - Next.CamY) * Next.Spacing;
+        P.Scale = 0.5f * Next.Spacing;
+        P.Morph = 1.0f;
+        return P;
+    }
+    const float LX = float(X) + (float(XC) - float(X)) * Morph;
+    const float LY = float(Y) + (float(YC) - float(Y)) * Morph;
+    P.OffsetX = (LX - L.CamX) * L.Spacing;
+    P.OffsetY = (LY - L.CamY) * L.Spacing;
+    P.Scale = 0.5f * L.Spacing * exp2(Morph);
+    P.Morph = Morph;
+    return P;
+}
+
+#endif // VOXEL_OCEAN_RING_LAYOUT_USH

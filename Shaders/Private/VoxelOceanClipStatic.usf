@@ -1,0 +1,112 @@
+// VoxelOceanClipStatic.usf - The wave clipmap's static layer (stage W1; Design/OceanWaves.md
+// section 28; VoxelOceanClip.ush has the layout, VoxelOceanPages.cpp plans the writes): what the
+// waves at a level's texel need of the terrain and the shore and doesn't change with time, written
+// once per texel as its level's window reaches it (the strips a window gains as the camera moves,
+// a whole level when it's new or the plane is laid again, an edit's rectangle once the land
+// surface cache carries it) and read by the per-frame waves (VoxelOceanClip.usf).
+//
+// A texel holds, at its sphere point (as a vertex of twice the level's spacing feels the depth,
+// and the level's spacing the terrain's own; VoxelOceanTerrainDepth.ush: the land surface cache
+// where it holds the point, the density elsewhere):
+//   0: the depth the waves feel (cm), the bed's steepness (VOXEL_OCEAN_BED_UNKNOWN: unknown), the
+//      terrain's own depth (cm; an inland basin's as land), the shore field's distance (cm;
+//      VOXEL_OCEAN_DEEP: none)
+//   1: the shore field's direction (toward the coast, length its agreement) and the bed's rise
+//      (unit; zero unknown), each as (T1, T2) components
+//   2: the field's beach slope, the coastal field's A, B and cover
+//   3: the coastal field's gradients of A and of B, as (T1, T2) components
+// (T1, T2: the tangent basis at the texel's point, T1 the plane's E1 made tangent, T2 = Up x T1;
+// planet frame). Slice 4 Slot + c of the static arrays, at the texel's toroidal place.
+
+#include "/Engine/Public/Platform.ush"
+#include "/Plugin/VoxelPlugin/Private/VoxelDensityCore.ush"
+#include "/Plugin/VoxelPlugin/Private/VoxelDF64.ush"
+#include "/Plugin/VoxelPlugin/Private/VoxelOceanTerrainDepth.ush"
+#include "/Plugin/VoxelPlugin/Private/VoxelOceanWaves.ush"
+#include "/Plugin/VoxelPlugin/Private/VoxelOceanClip.ush"
+
+RWTexture2DArray<float4> StaticOut;
+// The job: a rectangle of a level's window (window texels), the level's slot, its window's first
+// texel's place in the storage (the origin mod Size), the camera's coordinate in the window, the
+// spacing (cm).
+uint StaticSlot;
+int2 StaticRectMin;
+int2 StaticRectSize;
+int2 StaticOriginMod;
+float2 StaticInWindow;
+float StaticSpacing;
+// The plane (VoxelOceanClip.ush's shared info rows).
+float4 StaticFrame[VOXEL_OCEAN_CLIP_SHARED_ROWS];
+// The camera's nearest terrain lattice point (planet frame) and the camera from it (cm), so a
+// texel's lattice point is exact anywhere on the planet.
+int3 StaticCameraLattice;
+float3 StaticCameraFrac;
+
+// The frame's wave parameters (the shore field's and the coastal field's sampling) and the chart
+// table, the shore field's texture.
+float4 StaticParams;
+float4 StaticWave0;
+float4 StaticWave1;
+float4 StaticWave2;
+float3 StaticCenter;
+float4 StaticShape;
+float4 StaticFFT;
+float4 StaticRefHigh;
+float4 StaticRefLow;
+float4 StaticRotation;
+float4 StaticTiles;
+float4 StaticStates;
+float4 StaticSlopeVar;
+Texture2D StaticCharts;
+Texture2DArray StaticShore;
+
+// The components of a tangent vector V (planet frame) along the basis at Up.
+float2 VoxelOceanClipTangentOf(float3 V, float3 T1, float3 T2)
+{
+    return float2(dot(V, T1), dot(V, T2));
+}
+
+[numthreads(8, 8, 1)]
+void ClipStaticCS(uint3 Id : SV_DispatchThreadID)
+{
+    if (int(Id.x) >= StaticRectSize.x || int(Id.y) >= StaticRectSize.y) return;
+    const FVoxelOceanClipFrame F = VoxelOceanClipFrameOf(StaticFrame[0], StaticFrame[1], StaticFrame[2], StaticFrame[3]);
+    const int Size = int(F.Size + 0.5f);
+    const int I = StaticRectMin.x + int(Id.x);
+    const int J = StaticRectMin.y + int(Id.y);
+    const FVoxelOceanWaveParams W = VoxelOceanMakeWaveParamsFFT(StaticParams, StaticWave0, StaticWave1, StaticWave2, StaticCenter, StaticShape, StaticFFT,
+        StaticRefHigh, StaticRefLow, StaticRotation, StaticTiles, StaticStates, StaticSlopeVar);
+
+    // The texel's sphere point from the camera (planet frame), in the world's axes, its radial.
+    const float3 X = VoxelOceanClipPointOf(F, VoxelOceanClipTexelOffset(StaticInWindow, StaticSpacing, float(I), float(J)));
+    const float3 P = VoxelOceanRotate(W.Rotation, X);
+    const float3 Up = normalize(P - W.Center);
+    const float3 UpP = VoxelOceanRotateBack(W.Rotation, Up);
+    const float3 T1 = normalize(F.E1 - UpP * dot(F.E1, UpP));
+    const float3 T2 = cross(UpP, T1);
+
+    // The terrain: at the lattice point nearest it (counted from the camera's).
+    const float3 Steps = (StaticCameraFrac + X) / (HalfFinest.x + HalfFinest.y);
+    const int LX = StaticCameraLattice.x + int(round(Steps.x));
+    const int LY = StaticCameraLattice.y + int(round(Steps.y));
+    const int LZ = StaticCameraLattice.z + int(round(Steps.z));
+    const FVoxelOceanPointShore PointShore = VoxelOceanPointShoreAt(LX, LY, LZ);
+    const FVoxelOceanWaveDepth Wave = VoxelOceanWaveDepthAt(LX, LY, LZ, max(2.0f * StaticSpacing, DepthFootprint), PointShore, false);
+    float Land = VoxelOceanDepthAt(LX, LY, LZ, StaticSpacing, false);
+    if (PointShore.bBasin && (Land > 0.0f || Wave.Depth > 0.0f))
+        Land = VOXEL_OCEAN_BASIN_DEPTH;
+
+    // The shore field and the coastal field there (as the waves would read them).
+    const FVoxelOceanShoreFrame Frame = VoxelOceanShoreFrameOfTable(StaticCharts, max(int(W.FFT.y), 1));
+    const FVoxelOceanCoastLayout CoastLayout = VoxelOceanCoastLayoutOfTable(StaticCharts, max(int(W.FFT.y), 1));
+    const FVoxelOceanShore Shore = VoxelOceanShoreAt(P, Up, W, Frame, CoastLayout, Wave.Depth, StaticShore);
+
+    const int2 S = int2((StaticOriginMod.x + I) % Size, (StaticOriginMod.y + J) % Size);
+    const int Base = 4 * int(StaticSlot);
+    const float2 Dir = VoxelOceanClipTangentOf(VoxelOceanRotateBack(W.Rotation, Shore.Direction), T1, T2);
+    const float2 Rise = VoxelOceanClipTangentOf(Wave.Rise, T1, T2);
+    StaticOut[int3(S, Base)] = float4(Wave.Depth, VoxelOceanBedSlopeOf(Wave.Code), Land, Shore.Distance);
+    StaticOut[int3(S, Base + 1)] = float4(Dir, Rise);
+    StaticOut[int3(S, Base + 2)] = float4(Shore.Slope, Shore.Coast.A, Shore.Coast.B, Shore.Coast.Cover);
+    StaticOut[int3(S, Base + 3)] = float4(VoxelOceanClipTangentOf(Shore.Coast.GradA, T1, T2), VoxelOceanClipTangentOf(Shore.Coast.GradB, T1, T2));
+}

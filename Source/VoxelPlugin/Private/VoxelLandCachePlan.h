@@ -500,7 +500,52 @@ namespace VoxelLandCachePlan
          *  some: the whole window (a box that large is a reload, not a brush). */
         void MarkDirtyIn(FLevel& Level, const double Min[3], const double Max[3]) const
         {
-            if (!Level.bAnchored) return;
+            FRect R;
+            if (!DirtyRectOf(Level, Min, Max, R)) return;
+            // Coalesced: a rectangle inside one queued with it (both brush-sized, so written as
+            // soon) adds nothing; past the limit, all merge into their bounds.
+            for (const FRect& Q : Level.Dirty)
+                if (IsLargeRect(Q) == IsLargeRect(R) && R.I0 >= Q.I0 && R.J0 >= Q.J0 && R.I0 + R.Width <= Q.I0 + Q.Width && R.J0 + R.Height <= Q.J0 + Q.Height)
+                    return;
+            Level.Dirty.push_back(R);
+            if (Level.Dirty.size() > MaxDirtyRects)
+            {
+                int64_t I0 = Level.Dirty[0].I0, J0 = Level.Dirty[0].J0, I1 = I0 + Level.Dirty[0].Width, J1 = J0 + Level.Dirty[0].Height;
+                for (const FRect& Q : Level.Dirty)
+                {
+                    I0 = (std::min)(I0, (int64_t)Q.I0); J0 = (std::min)(J0, (int64_t)Q.J0);
+                    I1 = (std::max)(I1, (int64_t)Q.I0 + Q.Width); J1 = (std::max)(J1, (int64_t)Q.J0 + Q.Height);
+                }
+                Level.Dirty.assign(1, FRect{ (int32_t)I0, (int32_t)J0, (int32_t)(I1 - I0), (int32_t)(J1 - J0) });
+            }
+        }
+
+    public:
+        /** Some texel of the box (planet frame, cm; MarkDirty's rectangles) is still to be
+         *  written again, in any level's window or the re-centring's (stage O9m: whether an
+         *  edit's texels are all in what the writes so far leave). */
+        bool IsDirtyIn(const double Min[3], const double Max[3]) const
+        {
+            auto Overlaps = [&](const FLevel& Level)
+            {
+                if (Level.Dirty.empty()) return false;
+                FRect R;
+                if (!DirtyRectOf(Level, Min, Max, R)) return false;
+                for (const FRect& Q : Level.Dirty)
+                    if (R.I0 < Q.I0 + Q.Width && Q.I0 < R.I0 + R.Width && R.J0 < Q.J0 + Q.Height && Q.J0 < R.J0 + R.Height)
+                        return true;
+                return false;
+            };
+            for (const FLevel& Level : Levels)
+                if (Overlaps(Level)) return true;
+            return PendingLevel >= 0 && Overlaps(Next);
+        }
+
+    private:
+        /** MarkDirtyIn's rectangle for the box in a level's window; false: none. */
+        bool DirtyRectOf(const FLevel& Level, const double Min[3], const double Max[3], FRect& Out) const
+        {
+            if (!Level.bAnchored) return false;
             double X0 = 0.0, X1 = 0.0, Y0 = 0.0, Y1 = 0.0;
             int32_t Behind = 0, Projected = 0;
             for (int c = 0; c < 8; c++)
@@ -518,7 +563,7 @@ namespace VoxelLandCachePlan
                 X0 = (std::min)(X0, X); X1 = (std::max)(X1, X);
                 Y0 = (std::min)(Y0, Y); Y1 = (std::max)(Y1, Y);
             }
-            if (Behind == 8) return;
+            if (Behind == 8) return false;
             const bool bWhole = Behind > 0;
             FRect R{ Level.OriginI, Level.OriginJ, N, N };
             if (!bWhole)
@@ -528,27 +573,13 @@ namespace VoxelLandCachePlan
                 auto Index = [Limit](double V) { return (int64_t)std::clamp(std::floor(V), -Limit, Limit); };
                 const int64_t I0 = Index(X0 / Level.TexelSize) - 1, I1 = Index(X1 / Level.TexelSize) + 1;
                 const int64_t J0 = Index(Y0 / Level.TexelSize) - 1, J1 = Index(Y1 / Level.TexelSize) + 1;
-                if (I1 < Level.OriginI || J1 < Level.OriginJ || I0 >= (int64_t)Level.OriginI + N || J0 >= (int64_t)Level.OriginJ + N) return;
+                if (I1 < Level.OriginI || J1 < Level.OriginJ || I0 >= (int64_t)Level.OriginI + N || J0 >= (int64_t)Level.OriginJ + N) return false;
                 const int64_t CI0 = (std::max)(I0, (int64_t)Level.OriginI), CJ0 = (std::max)(J0, (int64_t)Level.OriginJ);
                 const int64_t CI1 = (std::min)(I1, (int64_t)Level.OriginI + N - 1), CJ1 = (std::min)(J1, (int64_t)Level.OriginJ + N - 1);
                 R = FRect{ (int32_t)CI0, (int32_t)CJ0, (int32_t)(CI1 - CI0 + 1), (int32_t)(CJ1 - CJ0 + 1) };
             }
-            // Coalesced: a rectangle inside one queued with it (both brush-sized, so written as
-            // soon) adds nothing; past the limit, all merge into their bounds.
-            for (const FRect& Q : Level.Dirty)
-                if (IsLargeRect(Q) == IsLargeRect(R) && R.I0 >= Q.I0 && R.J0 >= Q.J0 && R.I0 + R.Width <= Q.I0 + Q.Width && R.J0 + R.Height <= Q.J0 + Q.Height)
-                    return;
-            Level.Dirty.push_back(R);
-            if (Level.Dirty.size() > MaxDirtyRects)
-            {
-                int64_t I0 = Level.Dirty[0].I0, J0 = Level.Dirty[0].J0, I1 = I0 + Level.Dirty[0].Width, J1 = J0 + Level.Dirty[0].Height;
-                for (const FRect& Q : Level.Dirty)
-                {
-                    I0 = (std::min)(I0, (int64_t)Q.I0); J0 = (std::min)(J0, (int64_t)Q.J0);
-                    I1 = (std::max)(I1, (int64_t)Q.I0 + Q.Width); J1 = (std::max)(J1, (int64_t)Q.J0 + Q.Height);
-                }
-                Level.Dirty.assign(1, FRect{ (int32_t)I0, (int32_t)J0, (int32_t)(I1 - I0), (int32_t)(J1 - J0) });
-            }
+            Out = R;
+            return true;
         }
     };
 }

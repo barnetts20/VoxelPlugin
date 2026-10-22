@@ -1,0 +1,236 @@
+// VoxelOceanClip.ush - The wave clipmap (stages O9k, W1; Design/OceanWaves.md sections 26 and 28):
+// the composed sea (the FFT's bands, the shoaling, the shore's waves, the swash, the drain, the
+// foam) evaluated on a stack of camera-centred levels (VoxelOceanClip.usf, from the static layer
+// VoxelOceanClipStatic.usf writes), which the mesh's vertices (VoxelOceanDisplace.usf) and the
+// material's pixels (VoxelOcean.ush, VoxelOceanPixelClip) only sample.
+//
+// THE PLANE (VoxelOceanClipmap.h): every level lies on one gnomonic plane tangent to the sea sphere
+// (radius S) at an anchor A, axes E1, E2; a sphere point P has plane coordinates
+// S (P.E1, P.E2) / (P.A). Everything here works from the camera (planet frame) in a stable form:
+// the plane offset of a point X from the camera's (VoxelOceanClipPlaneOffset), and back
+// (VoxelOceanClipPointOf), so no large coordinate meets float.
+//
+// A LEVEL has texels of Spacing cm on the plane and a window of Size x Size of them around the
+// camera, stored toroidally: plane texel (I, J) at (I mod Size, J mod Size) of the level's slot in
+// the texture arrays (sampled with wrap). Level i's info holds the camera's coordinate in the
+// window its waves were evaluated for (texels: the window's texel centres at i + 0.5) and in the
+// storage (Mod: the camera's plane texel coordinate mod Size), so a point's storage coordinate is
+// Mod + its plane offset in texels.
+//
+// WHAT A TEXEL HOLDS (evaluated as a vertex of spacing 2 Spacing and a pixel of footprint Spacing
+// would see it, so each level carries exactly the waves its users can show):
+//   Displacement (Texture2DArray, RGBA32F): the displacement (planet frame, cm) and the foam (0 to 1);
+//   Normal (Texture2DArray, RGBA16F): the normal (planet frame) and the slope variance it leaves out.
+//
+// WHO SAMPLES WHICH LEVEL: a vertex of spacing s the level of spacing s / 2, a pixel of footprint F
+// the level of spacing F (fractional: the two around it blended, so the choice is continuous in s
+// and F); where the point lies outside a level's reach (a square around the camera that every
+// window holds wherever it moved) the next coarser one takes over, by a fade over its last texels.
+// Past the outermost level: no waves (the pixel: the outermost level's slope as roughness).
+//
+// THE INFO (VOXEL_OCEAN_CLIP_INFO_ROWS float4; shader constants for the displacement, a small
+// texture for the material, written with the levels by VoxelOceanClip.usf):
+//   0: (A, S)   1: (E1, the camera . A, cm)   2: (E2, the camera's height over the sphere, cm)
+//   3: (the camera's plane coordinates / S, the level count, Size)
+//   4 + 2 i: (the camera in level i's evaluated window, its spacing, its slot)
+//   5 + 2 i: (the camera's storage coordinate, valid, its absolute index K)
+
+#pragma once
+
+#define VOXEL_OCEAN_CLIP_MAX_LEVELS 16
+#define VOXEL_OCEAN_CLIP_SHARED_ROWS 4
+#define VOXEL_OCEAN_CLIP_LEVEL_ROWS 2
+#define VOXEL_OCEAN_CLIP_INFO_ROWS 36           // VoxelOceanClipmap::InfoRows
+// A level's reach: no samples within EDGE texels of a window's edge (bilinear and the vertex's
+// spacing), nor within SLACK of how far the camera can be from an evaluated window's centre
+// (VoxelOceanClipmap::OriginSlack + EvaluatedSlack); the fade to the next level over FADE of the
+// level's size inside that.
+#define VOXEL_OCEAN_CLIP_EDGE 2.0f
+#define VOXEL_OCEAN_CLIP_SLACK 3.5f
+#define VOXEL_OCEAN_CLIP_FADE 0.0625f
+
+struct FVoxelOceanClipFrame
+{
+    float3 A;
+    float Radius;       // S (cm)
+    float3 E1;
+    float Along;        // the camera . A (cm)
+    float3 E2;
+    float Height;       // the camera's height over the sphere (cm)
+    float2 CamS;        // the camera's plane coordinates / S
+    float Count;
+    float Size;
+};
+
+FVoxelOceanClipFrame VoxelOceanClipFrameOf(float4 R0, float4 R1, float4 R2, float4 R3)
+{
+    FVoxelOceanClipFrame F;
+    F.A = R0.xyz;
+    F.Radius = max(R0.w, 1.0f);
+    F.E1 = R1.xyz;
+    F.Along = R1.w;
+    F.E2 = R2.xyz;
+    F.Height = R2.w;
+    F.CamS = R3.xy;
+    F.Count = R3.z;
+    F.Size = max(R3.w, 1.0f);
+    return F;
+}
+
+struct FVoxelOceanClipLevel
+{
+    float2 InWindow;    // the camera in the evaluated window (texels)
+    float Spacing;      // cm
+    float Slot;
+    float2 Mod;         // the camera's storage coordinate (texels)
+    float Valid;
+    float K;
+};
+
+FVoxelOceanClipLevel VoxelOceanClipLevelOf(float4 R0, float4 R1)
+{
+    FVoxelOceanClipLevel L;
+    L.InWindow = R0.xy;
+    L.Spacing = max(R0.z, 1.0e-3f);
+    L.Slot = R0.w;
+    L.Mod = R1.xy;
+    L.Valid = R1.z;
+    L.K = R1.w;
+    return L;
+}
+
+// From the info texture (the material's).
+FVoxelOceanClipFrame VoxelOceanClipFrameOfTexture(Texture2D Info)
+{
+    return VoxelOceanClipFrameOf(Info.Load(int3(0, 0, 0)), Info.Load(int3(1, 0, 0)), Info.Load(int3(2, 0, 0)), Info.Load(int3(3, 0, 0)));
+}
+
+FVoxelOceanClipLevel VoxelOceanClipLevelOfTexture(Texture2D Info, int I)
+{
+    const int R = VOXEL_OCEAN_CLIP_SHARED_ROWS + VOXEL_OCEAN_CLIP_LEVEL_ROWS * I;
+    return VoxelOceanClipLevelOf(Info.Load(int3(R, 0, 0)), Info.Load(int3(R + 1, 0, 0)));
+}
+
+// The plane offset (cm) of the point X (planet frame, from the camera) from the camera's own:
+// S ((C + X).E1 / ((C + X).A) - C.E1 / C.A), rearranged so no large term cancels.
+float2 VoxelOceanClipPlaneOffset(FVoxelOceanClipFrame F, float3 X)
+{
+    const float XA = dot(X, F.A);
+    const float Den = max(F.Along + XA, 1.0f);
+    return (float2(dot(X, F.E1), dot(X, F.E2)) - F.CamS * XA) * (F.Radius / Den);
+}
+
+// The sea sphere's point (planet frame, from the camera) at the plane offset D (cm) from the
+// camera's: S (u + d) / |u + d| - C with u the camera's plane direction (A + its coordinates / S)
+// and d = D / S along the axes, in a form whose terms are each small.
+float3 VoxelOceanClipPointOf(FVoxelOceanClipFrame F, float2 D)
+{
+    const float3 U = F.A + F.E1 * F.CamS.x + F.E2 * F.CamS.y;
+    const float N = length(U);
+    const float3 Dv = (F.E1 * D.x + F.E2 * D.y) * (1.0f / F.Radius);
+    const float UD = dot(U, Dv);
+    const float DD = dot(Dv, Dv);
+    const float M = sqrt(max(N * N + 2.0f * UD + DD, 1.0e-12f));
+    const float NMinusM = -(2.0f * UD + DD) / (N + M);
+    const float3 Diff = Dv / M + U * (NMinusM / (M * N));
+    return Diff * F.Radius - (U / N) * F.Height;
+}
+
+// Window texel (I, J)'s centre's plane offset (cm) from the camera, in a level whose camera
+// coordinate in the window is InWindow.
+float2 VoxelOceanClipTexelOffset(float2 InWindow, float Spacing, float I, float J)
+{
+    return (float2(I + 0.5f, J + 0.5f) - InWindow) * Spacing;
+}
+
+// How far inside a level's reach a point is whose plane offset from the camera is T texels:
+// 1 within the reach less the fade, 0 past it.
+float VoxelOceanClipInside(FVoxelOceanClipFrame F, float2 T)
+{
+    const float2 D = abs(T);
+    const float Reach = 0.5f * F.Size - VOXEL_OCEAN_CLIP_EDGE - VOXEL_OCEAN_CLIP_SLACK;
+    return saturate((Reach - max(D.x, D.y)) / max(VOXEL_OCEAN_CLIP_FADE * F.Size, 1.0f));
+}
+
+// The blend of levels for a point: the level the user's scale asks for (Want: log2 of the scale
+// over the first level's spacing), the first one at or past it that holds the point, its weight
+// (the rest goes to the next one; past the outermost, to nothing). The sample coordinates are the
+// storage's (UV, with wrap) and the slot.
+struct FVoxelOceanClipPick
+{
+    int Level;          // the level's index in use; -1: none holds the point
+    float Weight;
+    float3 UV;          // in Level: storage UV and slot
+    float3 UVNext;      // in Level + 1 (when it exists)
+    float NextValid;    // 1 when Level + 1 exists and holds the point
+};
+
+float3 VoxelOceanClipStorageUV(FVoxelOceanClipFrame F, FVoxelOceanClipLevel L, float2 Offset)
+{
+    return float3((L.Mod + Offset / L.Spacing) / F.Size, L.Slot);
+}
+
+#define VOXEL_OCEAN_CLIP_PICK_BODY(FRAME, LEVEL_OF) \
+    FVoxelOceanClipPick P; \
+    P.Level = -1; \
+    P.Weight = 0.0f; \
+    P.UV = float3(0.0f, 0.0f, 0.0f); \
+    P.UVNext = float3(0.0f, 0.0f, 0.0f); \
+    P.NextValid = 0.0f; \
+    const FVoxelOceanClipFrame F = FRAME; \
+    const int Count = clamp(int(F.Count + 0.5f), 0, VOXEL_OCEAN_CLIP_MAX_LEVELS); \
+    if (Count <= 0) return P; \
+    const float2 Offset = VoxelOceanClipPlaneOffset(F, X); \
+    const FVoxelOceanClipLevel L0 = LEVEL_OF(0); \
+    const float Want = max(log2(max(Scale, 1.0e-3f) / L0.Spacing), 0.0f); \
+    const int First = min(int(floor(Want)), Count - 1); \
+    const float Frac = Want - floor(Want); \
+    [loop] \
+    for (int K = First; K < Count; K++) \
+    { \
+        const FVoxelOceanClipLevel L = LEVEL_OF(K); \
+        if (L.Valid < 0.5f) continue; \
+        const float In = VoxelOceanClipInside(F, Offset / L.Spacing); \
+        if (In <= 0.0f) continue; \
+        P.Level = K; \
+        P.UV = VoxelOceanClipStorageUV(F, L, Offset); \
+        P.Weight = (K == First && Want < float(Count - 1) ? 1.0f - Frac : 1.0f) * In; \
+        if (K + 1 < Count) \
+        { \
+            const FVoxelOceanClipLevel N = LEVEL_OF(K + 1); \
+            P.UVNext = VoxelOceanClipStorageUV(F, N, Offset); \
+            P.NextValid = N.Valid > 0.5f && VoxelOceanClipInside(F, Offset / N.Spacing) > 0.0f ? 1.0f : 0.0f; \
+        } \
+        break; \
+    } \
+    return P;
+
+// The level pick for X (planet frame, from the camera) at a user's Scale (cm: a vertex's spacing
+// over 2, a pixel's footprint) from the info texture (the material's).
+#define VOXEL_OCEAN_CLIP_FRAME_TEXTURE VoxelOceanClipFrameOfTexture(Info)
+#define VOXEL_OCEAN_CLIP_LEVEL_TEXTURE(I) VoxelOceanClipLevelOfTexture(Info, I)
+FVoxelOceanClipPick VoxelOceanClipPickOfTexture(Texture2D Info, float3 X, float Scale)
+{
+    VOXEL_OCEAN_CLIP_PICK_BODY(VOXEL_OCEAN_CLIP_FRAME_TEXTURE, VOXEL_OCEAN_CLIP_LEVEL_TEXTURE)
+}
+#undef VOXEL_OCEAN_CLIP_FRAME_TEXTURE
+#undef VOXEL_OCEAN_CLIP_LEVEL_TEXTURE
+
+// The first level's spacing (cm; the material's: the clip-footprint note), 0 without levels.
+float VoxelOceanClipFirstSpacingOfTexture(Texture2D Info)
+{
+    const FVoxelOceanClipFrame F = VoxelOceanClipFrameOfTexture(Info);
+    return F.Count > 0.5f ? VoxelOceanClipLevelOfTexture(Info, 0).Spacing : 0.0f;
+}
+
+// A pick's blend of one of the level arrays (a float4 per texel; nothing past the outermost). The
+// sampler wraps (the storage is toroidal).
+float4 VoxelOceanClipSample(Texture2DArray Levels, SamplerState Sampler, FVoxelOceanClipPick P)
+{
+    if (P.Level < 0) return float4(0.0f, 0.0f, 0.0f, 0.0f);
+    const float4 A = Levels.SampleLevel(Sampler, P.UV, 0.0f);
+    float4 B = float4(0.0f, 0.0f, 0.0f, 0.0f);
+    if (P.Weight < 1.0f && P.NextValid > 0.5f)
+        B = Levels.SampleLevel(Sampler, P.UVNext, 0.0f);
+    return A * P.Weight + B * (1.0f - P.Weight);
+}

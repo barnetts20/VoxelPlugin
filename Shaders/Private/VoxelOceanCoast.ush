@@ -1,0 +1,434 @@
+// VoxelOceanCoast.ush - The coastal travel-time field (stage O9h; Design/OceanWaves.md section
+// 23). Shared subset (VoxelShaderCompat.h): the wave hook, the ocean pages and the underwater pass
+// sample it on the GPU; the CPU builds it (VoxelOceanCoastCore.h, from depths the GPU samples off
+// the terrain) and samples the same texels for the queries, with this code.
+//
+// WHAT IT HOLDS. Along every sea coast, out to SeedDepth of water (40 m by default) or Reach of
+// the shore field's distance, whichever comes first, a fine grid (cells of CellM, 25 to 150 m,
+// chosen to fit the memory budget) holding two integrals along the waves' rays from that outer
+// edge toward the shore:
+//   A = integral of ds / sqrt(D)       (m^1/2; the shallow-water travel time times sqrt(g))
+//   B = integral of sqrt(D) ds         (m^3/2)
+// D the smoothed depth held at VOXEL_OCEAN_COAST_FLOOR at least (smoothly; the bores keep a
+// sensible spacing in the last metre). A wave of angular frequency w (deep wavenumber
+// k0 = w^2 / g) then has the phase
+//   phi = sqrt(k0) A + k0^3/2 / 6 B
+// the first two terms of the dispersion's series in k0 D (kD = sqrt(q) (1 + q/6 + ...), q = k0 D):
+// its local wavenumber is within 4% of the exact one at k0 D 1.25 (a fifth of the deep
+// wavelength), 0.4% at 0.6, whatever the period, and its crests are spaced at the local wavelength
+// by construction; A's gradient is the rays' direction (the crests' normal, turning toward the
+// shallows as real waves do). The rays start shore-normal at the outer edge (SeedDepth's contour;
+// along Reach where the shelf is wider): A and B are 0 there.
+//
+// THE GRID. The cube-sphere's land bake cells (N per face edge), each split into R x R fine cells
+// on the same equal-angle grid (fine cell f of a face at s = -1 + (2 f + 1) / (N R)). Only the
+// bake cells near a coast have them (a TILE): within Reach seaward and the inland reach of water,
+// not where the bake shows deep water all round (VoxelOceanCoastCore.h's selection). Tiles also
+// exist for the bake's apron cells past a face's edge (up to two cells, the face continued), so
+// the blend across face edges reads whole samples on both faces, as the shore field's does.
+//
+// THE TEXELS live in the shore field's texture (VoxelOceanShore.ush: a Texture2DArray of R32F
+// texels' bits, (N + 2 Pad)^2 a slice), past its 6 slices:
+// - slices 6 to 11, THE INDEX: per bake cell (the shore field's layout, apron included) the tile
+//   number plus one as a float's value (0: no tile);
+// - slices 12 and up, THE ATLAS: tiles of S = R + 2 APRON texels square plus a header row, laid
+//   in rows of TilesPerRow, TilesPerColumn rows a slice. Texel (i, j) of a tile holds fine cell
+//   (R ci + i - APRON, R cj + j - APRON) of its face (the apron: the neighbouring tiles' cells, or
+//   the neighbouring face's resampled past an edge), 30 bits in a normal float's pattern as the
+//   shore texels: A in 15 bits and B in 14 relative to the tile's ranges, and a trust bit (0:
+//   cells no ray reached within the tiles, and the sources well inside the deep water, where the
+//   values are flat: the cover fades from the outer edge). The header
+//   row's first four texels: A's base and span, B's base and span (plain floats).
+//
+// A SAMPLE (VoxelOceanCoastNear) reads 4 x 4 texels per face (Catmull-Rom: the phase and its
+// gradient continuous), on the face holding the point and within VOXEL_OCEAN_SHORE_BLEND_CELLS of
+// an edge on the neighbouring faces too, blended as the shore field's samples; near the camera
+// the reference face's coordinates come from the shore field's texel-space expansion. Its
+// gradients are tangent at the point (planet frame, per metre); Cover is 1 where the field's
+// values hold (the trust bits, interpolated), 0 outside the tiles.
+//
+// The layout reaches the shaders in rows 19 to 21 of the chart table's constants (written with
+// the frame, VoxelOceanSeaState.ush), and the CPU from FVoxelOceanCoastField.
+
+#ifndef VOXEL_OCEAN_COAST_USH
+#define VOXEL_OCEAN_COAST_USH
+
+#ifndef VOXEL_FUNC
+#define VOXEL_FUNC
+#endif
+
+// Include after VoxelOceanShore.ush (its texture, VOXEL_OCEAN_SHORE_LOAD, its frame and pad).
+
+// Apron cells on each side of a tile (Catmull-Rom reads one before and two after a cell).
+#define VOXEL_OCEAN_COAST_APRON 2
+#define VOXEL_OCEAN_COAST_INDEX_SLICE 6
+#define VOXEL_OCEAN_COAST_ATLAS_SLICE 12
+// The depth floor (m) of the slowness, and the width of its rounding.
+#define VOXEL_OCEAN_COAST_FLOOR 1.5f
+#define VOXEL_OCEAN_COAST_FLOOR_SOFT 1.0f
+// The codes' ranges: A 15 bits, B 14 bits.
+#define VOXEL_OCEAN_COAST_CODE_A 32767.0f
+#define VOXEL_OCEAN_COAST_CODE_B 16383.0f
+#define VOXEL_OCEAN_COAST_PI 3.14159265f
+
+// ---------------------------------------------------------------------------------------------
+// The layout
+// ---------------------------------------------------------------------------------------------
+
+struct FVoxelOceanCoastLayout
+{
+    float Valid;            // 1: a field
+    int N;                  // bake cells per face edge (the shore field's)
+    int R;                  // fine cells per bake cell edge
+    int TilesPerRow;
+    int TilesPerColumn;
+    float CellM;            // a fine cell's arc at a face's centre (m)
+    float SeedDepthM;       // the outer edge's depth (m)
+    float ReachM;           // the outer edge's farthest distance (m, the shore field's)
+    float RadiusM;          // the sea sphere (m)
+};
+
+VOXEL_FUNC FVoxelOceanCoastLayout VoxelOceanCoastLayoutNone()
+{
+    FVoxelOceanCoastLayout L;
+    L.Valid = 0.0f;
+    L.N = 0;
+    L.R = 1;
+    L.TilesPerRow = 1;
+    L.TilesPerColumn = 1;
+    L.CellM = 1.0f;
+    L.SeedDepthM = 0.0f;
+    L.ReachM = 0.0f;
+    L.RadiusM = 1.0f;
+    return L;
+}
+
+// From rows 19 and 20 of the chart table's constants: (valid, N, R, tiles per row), (tiles per
+// column, cell m, seed depth m, reach m); the radius (m) is row 21's x (the caller reads it).
+VOXEL_FUNC FVoxelOceanCoastLayout VoxelOceanCoastLayoutFrom(float4 Row0, float4 Row1, float RadiusM)
+{
+    FVoxelOceanCoastLayout L = VoxelOceanCoastLayoutNone();
+    if (Row0.x < 0.5f || Row0.y < 0.5f || Row0.z < 0.5f || Row0.w < 0.5f || Row1.x < 0.5f) return L;
+    L.Valid = 1.0f;
+    L.N = int(Row0.y + 0.5f);
+    L.R = int(Row0.z + 0.5f);
+    L.TilesPerRow = int(Row0.w + 0.5f);
+    L.TilesPerColumn = int(Row1.x + 0.5f);
+    L.CellM = Row1.y;
+    L.SeedDepthM = Row1.z;
+    L.ReachM = Row1.w;
+    L.RadiusM = RadiusM;
+    return L;
+}
+
+VOXEL_FUNC int VoxelOceanCoastStride(int R)
+{
+    return R + 2 * VOXEL_OCEAN_COAST_APRON;
+}
+
+// A tile's first texel (x, y) and slice in the atlas.
+VOXEL_FUNC int3 VoxelOceanCoastTileOrigin(FVoxelOceanCoastLayout L, int Tile)
+{
+    const int S = VoxelOceanCoastStride(L.R);
+    const int PerSlice = max(L.TilesPerRow * L.TilesPerColumn, 1);
+    const int Slice = Tile / PerSlice;
+    const int Within = Tile - Slice * PerSlice;
+    const int Row = Within / max(L.TilesPerRow, 1);
+    const int Column = Within - Row * max(L.TilesPerRow, 1);
+    return int3(Column * S, Row * (S + 1), VOXEL_OCEAN_COAST_ATLAS_SLICE + Slice);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Texels
+// ---------------------------------------------------------------------------------------------
+
+// A cell's bits from its codes (A01, B01 in [0, 1] of the tile's spans) and trust.
+VOXEL_FUNC uint VoxelOceanCoastPack(float A01, float B01, bool bTrust)
+{
+    const uint CA = uint(clamp(int(floor(saturate(A01) * VOXEL_OCEAN_COAST_CODE_A + 0.5f)), 0, 32767));
+    const uint CB = uint(clamp(int(floor(saturate(B01) * VOXEL_OCEAN_COAST_CODE_B + 0.5f)), 0, 16383));
+    const uint Payload = CA | (CB << 15u) | (bTrust ? (1u << 29u) : 0u);
+    // As the shore texels: bit 29 of the payload to the sign bit, bits 30 and 29 of the float 0 and 1.
+    return (Payload & 0x1fffffffu) | 0x20000000u | ((Payload >> 29u) << 31u);
+}
+
+// (A01, B01, trust) of a cell's bits.
+VOXEL_FUNC float3 VoxelOceanCoastUnpack(uint Bits)
+{
+    const uint Payload = (Bits & 0x1fffffffu) | ((Bits >> 31u) << 29u);
+    const float A01 = float(Payload & 0x7fffu) * (1.0f / VOXEL_OCEAN_COAST_CODE_A);
+    const float B01 = float((Payload >> 15u) & 0x3fffu) * (1.0f / VOXEL_OCEAN_COAST_CODE_B);
+    const float Trust = ((Payload >> 29u) & 1u) != 0u ? 1.0f : 0.0f;
+    return float3(A01, B01, Trust);
+}
+
+// The tile of bake cell (I, J) of a face (I, J from -Pad): its number, or -1.
+VOXEL_FUNC int VoxelOceanCoastTileAt(VOXEL_OCEAN_SHORE_PARAM, FVoxelOceanCoastLayout L, int Face, int I, int J)
+{
+    if (I < -VOXEL_OCEAN_SHORE_PAD || J < -VOXEL_OCEAN_SHORE_PAD || I >= L.N + VOXEL_OCEAN_SHORE_PAD || J >= L.N + VOXEL_OCEAN_SHORE_PAD) return -1;
+    const float Value = asfloat(VOXEL_OCEAN_SHORE_LOAD(VOXEL_OCEAN_COAST_INDEX_SLICE + Face, I + VOXEL_OCEAN_SHORE_PAD, J + VOXEL_OCEAN_SHORE_PAD));
+    return int(Value + 0.5f) - 1;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Sampling
+// ---------------------------------------------------------------------------------------------
+
+// Catmull-Rom's weights at fraction T (x, y, z, w: the cells at -1, 0, 1 and 2).
+VOXEL_FUNC float4 VoxelOceanCoastWeights(float T)
+{
+    const float T2 = T * T;
+    const float T3 = T2 * T;
+    return float4(0.5f * (-T3 + 2.0f * T2 - T), 0.5f * (3.0f * T3 - 5.0f * T2 + 2.0f), 0.5f * (-3.0f * T3 + 4.0f * T2 + T), 0.5f * (T3 - T2));
+}
+
+// Their derivatives by T.
+VOXEL_FUNC float4 VoxelOceanCoastWeightsD(float T)
+{
+    const float T2 = T * T;
+    return float4(0.5f * (-3.0f * T2 + 4.0f * T - 1.0f), 0.5f * (9.0f * T2 - 10.0f * T), 0.5f * (-9.0f * T2 + 8.0f * T + 1.0f), 0.5f * (3.0f * T2 - 2.0f * T));
+}
+
+VOXEL_FUNC float VoxelOceanCoastPick(float4 W, int I)
+{
+    return I == 0 ? W.x : (I == 1 ? W.y : (I == 2 ? W.z : W.w));
+}
+
+// One face's values at fine coordinates (U, V: fine cell centres at whole numbers): A, B and
+// their derivatives by U and V (per fine cell), the trust.
+struct FVoxelOceanCoastFace
+{
+    float Valid;
+    float A;
+    float B;
+    float AU;
+    float AV;
+    float BU;
+    float BV;
+    float Trust;
+};
+
+VOXEL_FUNC FVoxelOceanCoastFace VoxelOceanCoastFaceNone()
+{
+    FVoxelOceanCoastFace F;
+    F.Valid = 0.0f;
+    F.A = 0.0f;
+    F.B = 0.0f;
+    F.AU = 0.0f;
+    F.AV = 0.0f;
+    F.BU = 0.0f;
+    F.BV = 0.0f;
+    F.Trust = 0.0f;
+    return F;
+}
+
+// A fine coordinate as a whole number of cells and the rest (stage O9i): a float holds a face's
+// fine coordinates (up to N R, ten thousand cells and more) only to a thousandth of a cell, some
+// 10 to 15 cm, which a bore's front shows as a jitter; the whole part apart, the rest is exact.
+struct FVoxelOceanCoastCoord
+{
+    int I;          // the cell centre at or before the point
+    float F;        // the fraction past it (0 to 1)
+};
+
+VOXEL_FUNC FVoxelOceanCoastCoord VoxelOceanCoastCoordOf(int Whole, float Rest)
+{
+    const float K = floor(Rest);
+    FVoxelOceanCoastCoord C;
+    C.I = Whole + int(K);
+    C.F = Rest - K;
+    return C;
+}
+
+// A / B rounded down (B > 0).
+VOXEL_FUNC int VoxelOceanCoastFloorDiv(int A, int B)
+{
+    return A >= 0 ? A / B : -((B - 1 - A) / B);
+}
+
+VOXEL_FUNC FVoxelOceanCoastFace VoxelOceanCoastFaceSample(VOXEL_OCEAN_SHORE_PARAM, FVoxelOceanCoastLayout L, int Face, FVoxelOceanCoastCoord CU, FVoxelOceanCoastCoord CV)
+{
+    FVoxelOceanCoastFace Out = VoxelOceanCoastFaceNone();
+    // The tile holding the point (cell centres at whole numbers: its cells from -1/2 to R - 1/2).
+    const int CI = VoxelOceanCoastFloorDiv(CU.I + (CU.F >= 0.5f ? 1 : 0), L.R);
+    const int CJ = VoxelOceanCoastFloorDiv(CV.I + (CV.F >= 0.5f ? 1 : 0), L.R);
+    const int Tile = VoxelOceanCoastTileAt(VOXEL_OCEAN_SHORE_ARG, L, Face, CI, CJ);
+    if (Tile < 0) return Out;
+    const int3 O = VoxelOceanCoastTileOrigin(L, Tile);
+    const int S = VoxelOceanCoastStride(L.R);
+    // The tile's ranges.
+    const float BaseA = asfloat(VOXEL_OCEAN_SHORE_LOAD(O.z, O.x, O.y + S));
+    const float SpanA = asfloat(VOXEL_OCEAN_SHORE_LOAD(O.z, O.x + 1, O.y + S));
+    const float BaseB = asfloat(VOXEL_OCEAN_SHORE_LOAD(O.z, O.x + 2, O.y + S));
+    const float SpanB = asfloat(VOXEL_OCEAN_SHORE_LOAD(O.z, O.x + 3, O.y + S));
+    // Within the tile (cell centres at whole numbers from 0), the cell before and its fraction.
+    const int FU = CU.I - CI * L.R;
+    const int FV = CV.I - CJ * L.R;
+    const float4 WU = VoxelOceanCoastWeights(CU.F);
+    const float4 WV = VoxelOceanCoastWeights(CV.F);
+    const float4 DU = VoxelOceanCoastWeightsD(CU.F);
+    const float4 DV = VoxelOceanCoastWeightsD(CV.F);
+    // The 4 x 4 cells from (F - 1), texels from the apron's start.
+    const int X0 = O.x + FU - 1 + VOXEL_OCEAN_COAST_APRON;
+    const int Y0 = O.y + FV - 1 + VOXEL_OCEAN_COAST_APRON;
+    float A = 0.0f;
+    float B = 0.0f;
+    float AU = 0.0f;
+    float AV = 0.0f;
+    float BU = 0.0f;
+    float BV = 0.0f;
+    float Trust = 0.0f;
+    for (int j = 0; j < 4; j++)
+    {
+        const float Wj = VoxelOceanCoastPick(WV, j);
+        const float Dj = VoxelOceanCoastPick(DV, j);
+        for (int i = 0; i < 4; i++)
+        {
+            const float Wi = VoxelOceanCoastPick(WU, i);
+            const float Di = VoxelOceanCoastPick(DU, i);
+            const float3 C = VoxelOceanCoastUnpack(VOXEL_OCEAN_SHORE_LOAD(O.z, X0 + i, Y0 + j));
+            const float W = Wi * Wj;
+            A += W * C.x;
+            B += W * C.y;
+            AU += Di * Wj * C.x;
+            AV += Wi * Dj * C.x;
+            BU += Di * Wj * C.y;
+            BV += Wi * Dj * C.y;
+            Trust += W * C.z;
+        }
+    }
+    Out.Valid = 1.0f;
+    Out.A = BaseA + SpanA * A;
+    Out.B = BaseB + SpanB * B;
+    Out.AU = SpanA * AU;
+    Out.AV = SpanA * AV;
+    Out.BU = SpanB * BU;
+    Out.BV = SpanB * BV;
+    Out.Trust = saturate(Trust);
+    return Out;
+}
+
+// The gradient (planet frame, per metre, tangent at Dir) of a face's coordinate along Axis (its U
+// or V axis) in fine cells: (N R / 2) (4 / pi) d atan(x_a / x_n) / dp, on a sphere of RadiusM.
+VOXEL_FUNC float3 VoxelOceanCoastAxisGradient(float3 Dir, int Face, uint Axis, FVoxelOceanCoastLayout L)
+{
+    const float3 NV = VoxelCubeAxisVector(VoxelCubeNormalAxis(uint(Face))) * VoxelCubeNormalSign(uint(Face));
+    const float3 AV = VoxelCubeAxisVector(Axis);
+    const float XN = dot(Dir, NV);
+    const float XA = dot(Dir, AV);
+    const float Q = max(XN * XN + XA * XA, 1.0e-12f);
+    const float Scale = 0.5f * float(L.N * L.R) * (4.0f / VOXEL_OCEAN_COAST_PI) / max(L.RadiusM, 1.0f);
+    // d atan(r) / dp = (a x_n - n x_a) / (x_n^2 + x_a^2) / R; tangent already (homogeneous in p).
+    return (AV * XN - NV * XA) * (Scale / Q);
+}
+
+struct FVoxelOceanCoastSample
+{
+    float A;            // m^1/2
+    float B;            // m^3/2
+    float3 GradA;       // planet frame, tangent, per metre
+    float3 GradB;
+    float Cover;        // 0 to 1: how far the values hold
+};
+
+VOXEL_FUNC FVoxelOceanCoastSample VoxelOceanCoastSampleNone()
+{
+    FVoxelOceanCoastSample S;
+    S.A = 0.0f;
+    S.B = 0.0f;
+    S.GradA = float3(0.0f, 0.0f, 0.0f);
+    S.GradB = float3(0.0f, 0.0f, 0.0f);
+    S.Cover = 0.0f;
+    return S;
+}
+
+// The field at a direction (planet frame, unit), blended across face edges; on the frame's face
+// within its reach of the reference (D: the point's offset from it, planet frame, cm) from the
+// shore field's texel-space expansion (VoxelOceanShoreFieldNear's).
+VOXEL_FUNC FVoxelOceanCoastSample VoxelOceanCoastNear(VOXEL_OCEAN_SHORE_PARAM, FVoxelOceanCoastLayout L, float3 Dir, FVoxelOceanShoreFrame Frame, float3 D)
+{
+    FVoxelOceanCoastSample Sum = VoxelOceanCoastSampleNone();
+    if (L.Valid < 0.5f || L.N <= 0) return Sum;
+    const float Band = 2.0f * VOXEL_OCEAN_SHORE_BLEND_CELLS / float(L.N);
+    const float R = float(L.R);
+    float WeightAll = 0.0f;
+    float WeightValid = 0.0f;
+    for (uint Axis = 0u; Axis < 3u; Axis++)
+    {
+        const float Component = VoxelCubeComponent(Dir, Axis);
+        const float Along = abs(Component);
+        if (Along < 1.0e-3f) continue;
+        const uint Face = Axis * 2u + (Component < 0.0f ? 1u : 0u);
+        const float Inv = 1.0f / Along;
+        const float S = atan(VoxelCubeComponent(Dir, VoxelCubeUAxis(Face)) * Inv) * (1.0f / VOXEL_CUBE_QUARTER_PI);
+        const float T = atan(VoxelCubeComponent(Dir, VoxelCubeVAxis(Face)) * Inv) * (1.0f / VOXEL_CUBE_QUARTER_PI);
+        const float Inside = 1.0f - max(abs(S), abs(T));
+        const float W = smoothstep(-Band, Band, Inside);
+        if (W <= 0.0f) continue;
+        WeightAll += W;
+        // Fine coordinates: (s + 1) / 2 N R - 1/2 (to a thousandth of a cell).
+        const float U = (S + 1.0f) * 0.5f * float(L.N) * R - 0.5f;
+        const float V = (T + 1.0f) * 0.5f * float(L.N) * R - 0.5f;
+        FVoxelOceanCoastCoord CU = VoxelOceanCoastCoordOf(int(floor(U)), U - floor(U));
+        FVoxelOceanCoastCoord CV = VoxelOceanCoastCoordOf(int(floor(V)), V - floor(V));
+        // Near the reference on its face: from the expansion's bake texel coordinates (texel
+        // centres at whole numbers, cell i's at i + Pad): U = (X - Pad) R + (1/2 R - 1/2 + Frac R),
+        // its whole part apart (exact).
+        const float Near = Frame.Valid > 0.5f && int(Face) == Frame.Face
+            ? 1.0f - smoothstep(VOXEL_OCEAN_SHORE_FRAME_REACH, 1.25f * VOXEL_OCEAN_SHORE_FRAME_REACH, length(D)) : 0.0f;
+        if (Near > 0.0f)
+        {
+            const float FX = Frame.FracX + VoxelOceanShoreFrameDelta(Frame.GradX, Frame.HessXDiag, Frame.HessXOff, D);
+            const float FY = Frame.FracY + VoxelOceanShoreFrameDelta(Frame.GradY, Frame.HessYDiag, Frame.HessYOff, D);
+            const int WholeU = (int(floor(Frame.BaseX + 0.5f)) - VOXEL_OCEAN_SHORE_PAD) * L.R;
+            const int WholeV = (int(floor(Frame.BaseY + 0.5f)) - VOXEL_OCEAN_SHORE_PAD) * L.R;
+            const float NearU = 0.5f * R - 0.5f + FX * R;
+            const float NearV = 0.5f * R - 0.5f + FY * R;
+            const float FarU = U - float(WholeU);
+            const float FarV = V - float(WholeV);
+            CU = VoxelOceanCoastCoordOf(WholeU, FarU + (NearU - FarU) * Near);
+            CV = VoxelOceanCoastCoordOf(WholeV, FarV + (NearV - FarV) * Near);
+        }
+        const FVoxelOceanCoastFace F = VoxelOceanCoastFaceSample(VOXEL_OCEAN_SHORE_ARG, L, int(Face), CU, CV);
+        if (F.Valid < 0.5f) continue;
+        WeightValid += W;
+        const float3 GU = VoxelOceanCoastAxisGradient(Dir, int(Face), VoxelCubeUAxis(Face), L);
+        const float3 GV = VoxelOceanCoastAxisGradient(Dir, int(Face), VoxelCubeVAxis(Face), L);
+        Sum.A += W * F.A;
+        Sum.B += W * F.B;
+        Sum.GradA = Sum.GradA + (GU * F.AU + GV * F.AV) * W;
+        Sum.GradB = Sum.GradB + (GU * F.BU + GV * F.BV) * W;
+        Sum.Cover += W * F.Trust;
+    }
+    if (WeightValid <= 0.0f) return VoxelOceanCoastSampleNone();
+    const float Inv = 1.0f / WeightValid;
+    Sum.A *= Inv;
+    Sum.B *= Inv;
+    Sum.GradA = Sum.GradA * Inv;
+    Sum.GradB = Sum.GradB * Inv;
+    // A face without a tile in the blend fades the field out with its weight.
+    Sum.Cover = saturate(Sum.Cover * Inv) * (WeightValid / max(WeightAll, 1.0e-6f));
+    return Sum;
+}
+
+// The phase of a wave of deep wavenumber K0 (rad; it grows toward the shore) and its gradient
+// (planet frame, rad per metre): x the phase, y z w the gradient.
+VOXEL_FUNC float4 VoxelOceanCoastPhase(FVoxelOceanCoastSample S, float K0)
+{
+    const float RootK = sqrt(max(K0, 0.0f));
+    const float Third = K0 * RootK * (1.0f / 6.0f);
+    const float3 G = S.GradA * RootK + S.GradB * Third;
+    return float4(RootK * S.A + Third * S.B, G.x, G.y, G.z);
+}
+
+// The slowness's depth (m): D held at the floor, rounded over FLOOR_SOFT.
+VOXEL_FUNC float VoxelOceanCoastHeldDepth(float DepthM)
+{
+    const float X = DepthM - VOXEL_OCEAN_COAST_FLOOR;
+    const float W = 0.5f * VOXEL_OCEAN_COAST_FLOOR_SOFT;
+    if (X >= W) return DepthM;
+    if (X <= -W) return VOXEL_OCEAN_COAST_FLOOR;
+    return VOXEL_OCEAN_COAST_FLOOR + (X + W) * (X + W) / (4.0f * W);
+}
+
+#endif // VOXEL_OCEAN_COAST_USH

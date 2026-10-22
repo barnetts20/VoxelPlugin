@@ -1,0 +1,132 @@
+// VoxelOceanDisplace.usf - The ocean's drawn vertices, once a frame (stage O9j; Design/OceanWaves.md
+// section 25). Each page's provider runs it every frame after its writes (VoxelOceanPages.cpp):
+// every vertex of its drawn slots, from the static data its tile write left (BaseWords:
+// VoxelOceanPage.usf's position and texture coordinates), is morphed and displaced by the waves
+// exactly as the material's vertex node did it (VoxelOceanVertexCore.ush, the same function), and
+// written back to the page's streams: the displaced position (page units), and in texture
+// coordinates 0 to 2 what the pixel node takes (the undisplaced morphed point from the selection
+// camera, the depth the waves feel, the bed). The material's vertex node, told so by
+// VoxelOceanParams.x 3, passes those through and offsets nothing (VoxelOcean.ush), so every pass
+// that draws the ocean (depth, velocity, base, shadows) runs a plain vertex shader, and the waves
+// are evaluated once per vertex per frame instead of once per vertex per pass.
+
+#include "/Engine/Public/Platform.ush"
+#include "/Plugin/VoxelPlugin/Private/VoxelOceanVertexCore.ush"
+#include "/Plugin/VoxelPlugin/Private/VoxelOceanClip.ush"
+
+#define VOXEL_OCEAN_BASE_WORDS 16u        // VoxelOceanPagesDetail::BaseWords
+
+static const uint DisplaceTexCoordWords = 12u;
+
+// Per vertex: position (3 floats, page units) and the twelve texture coordinate words the tile
+// write produced (VoxelOceanPage.usf), then one spare.
+StructuredBuffer<uint> BaseWords;
+RWBuffer<float> DisplacePositions;
+RWBuffer<uint> DisplaceTexCoords;
+uint DisplaceVertices;               // the drawn slots' vertices (within the buffers' capacity)
+
+// The page: its origin from the selection camera (world cm), its axes (a unit quaternion: page
+// axes to world) and its unit (cm per page unit), its level, level 0's morph end (world cm).
+float3 PageToCamera;
+float4 PageRotation;
+float PageUnit;
+float PageLevel;
+float MorphEnd0;
+
+// The material's parameters for this frame (FVoxelOceanSurface::UpdateMaterial's: VoxelOceanParams
+// with its real morph mode, the test waves, the planet centre from the selection camera, the FFT
+// model's vectors) and its textures.
+float4 DisplaceParams;
+float4 DisplaceWave0;
+float4 DisplaceWave1;
+float4 DisplaceWave2;
+float3 DisplaceCenter;
+float4 DisplaceShape;
+float4 DisplaceFFT;
+float4 DisplaceRefHigh;
+float4 DisplaceRefLow;
+float4 DisplaceRotation;
+float4 DisplaceTiles;
+float4 DisplaceStates;
+float4 DisplaceSlopeVar;
+Texture2DArray DisplaceDisplacement;
+SamplerState DisplaceDisplacementSampler;
+Texture2DArray DisplaceDerivatives;
+SamplerState DisplaceDerivativesSampler;
+Texture2D DisplaceCharts;
+Texture2DArray DisplaceShore;
+
+// The wave clipmap (stages O9k, W1; VoxelOceanClip.ush): with ClipOn the vertex only morphs and samples
+// the levels' displacement at its spacing (the levels hold the composed sea); without, the waves
+// are evaluated here (stage O9j).
+uint ClipOn;
+float4 ClipLevels[VOXEL_OCEAN_CLIP_INFO_ROWS];
+Texture2DArray ClipDisplacementLevels;
+SamplerState ClipSampler;               // wraps (the levels are stored toroidally)
+
+#define VOXEL_OCEAN_CLIP_FRAME_CONSTANTS VoxelOceanClipFrameOf(ClipLevels[0], ClipLevels[1], ClipLevels[2], ClipLevels[3])
+#define VOXEL_OCEAN_CLIP_LEVEL_CONSTANTS(I) VoxelOceanClipLevelOf(ClipLevels[VOXEL_OCEAN_CLIP_SHARED_ROWS + VOXEL_OCEAN_CLIP_LEVEL_ROWS * (I)], \
+    ClipLevels[VOXEL_OCEAN_CLIP_SHARED_ROWS + VOXEL_OCEAN_CLIP_LEVEL_ROWS * (I) + 1])
+FVoxelOceanClipPick VoxelOceanClipPickOfConstants(float3 X, float Scale)
+{
+    VOXEL_OCEAN_CLIP_PICK_BODY(VOXEL_OCEAN_CLIP_FRAME_CONSTANTS, VOXEL_OCEAN_CLIP_LEVEL_CONSTANTS)
+}
+
+[numthreads(64, 1, 1)]
+void DisplaceCS(uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+    const uint I = DispatchThreadId.x;
+    if (I >= DisplaceVertices) return;
+    const uint B = I * VOXEL_OCEAN_BASE_WORDS;
+    const float3 Local = float3(asfloat(BaseWords[B]), asfloat(BaseWords[B + 1u]), asfloat(BaseWords[B + 2u]));
+    const float2 UV0 = float2(asfloat(BaseWords[B + 3u]), asfloat(BaseWords[B + 4u]));
+    const float2 UV1 = float2(asfloat(BaseWords[B + 5u]), asfloat(BaseWords[B + 6u]));
+    const float2 UV2 = float2(asfloat(BaseWords[B + 7u]), asfloat(BaseWords[B + 8u]));
+    const float2 UV3 = float2(asfloat(BaseWords[B + 9u]), asfloat(BaseWords[B + 10u]));
+    const float2 UV4 = float2(asfloat(BaseWords[B + 11u]), asfloat(BaseWords[B + 12u]));
+    const float2 UV5 = float2(asfloat(BaseWords[B + 13u]), asfloat(BaseWords[B + 14u]));
+
+    // Page units to world axes and cm (the component's transform: the planet's rotation, the unit).
+    const float3 ToVertex = PageToCamera + VoxelOceanRotate(PageRotation, Local * PageUnit);
+    const float3 Parent = VoxelOceanRotate(PageRotation, float3(UV0.x, UV0.y, UV1.x) * PageUnit);
+    const float3 Grand = VoxelOceanRotate(PageRotation, float3(UV3.x, UV3.y, UV4.x) * PageUnit);
+    const FVoxelOceanWaveParams Waves = VoxelOceanMakeWaveParamsFFT(DisplaceParams, DisplaceWave0, DisplaceWave1, DisplaceWave2, DisplaceCenter,
+        DisplaceShape, DisplaceFFT, DisplaceRefHigh, DisplaceRefLow, DisplaceRotation, DisplaceTiles, DisplaceStates, DisplaceSlopeVar);
+    FVoxelOceanVertexOut V;
+    if (ClipOn != 0u)
+    {
+        // The morph, then the levels' displacement at the morphed point (planet frame from the
+        // selection camera) for the vertex's spacing (a level of half of it).
+        const FVoxelOceanVertexMorph M = VoxelOceanVertexMorphOf(ToVertex, Parent, Grand, UV1, UV2, UV4, PageLevel, MorphEnd0, DisplaceParams,
+            Waves.FFT, DisplaceCharts);
+        V.Offset = M.Offset;
+        V.SamplePoint = M.SamplePoint;
+        V.Depth = M.Depth;
+        V.Bed = float2(VOXEL_OCEAN_SHORE_DEFAULT_SLOPE, UV5.y);
+        if (MorphEnd0 > 0.0f)
+        {
+            const float3 X = VoxelOceanRotateBack(PageRotation, M.SamplePoint);
+            const FVoxelOceanClipPick Pick = VoxelOceanClipPickOfConstants(X, 0.5f * M.Spacing);
+            const float4 D = VoxelOceanClipSample(ClipDisplacementLevels, ClipSampler, Pick);
+            V.Offset += VoxelOceanRotate(PageRotation, D.xyz);
+        }
+    }
+    else
+    {
+        V = VoxelOceanVertexCore(ToVertex, Parent, Grand, UV1, UV2, UV4, UV5, PageLevel, MorphEnd0, DisplaceParams, Waves,
+            DisplaceDisplacement, DisplaceDisplacementSampler, DisplaceDerivatives, DisplaceDerivativesSampler, DisplaceCharts, DisplaceShore);
+    }
+
+    // Back to page units.
+    const float3 Moved = Local + VoxelOceanRotateBack(PageRotation, V.Offset) * (1.0f / PageUnit);
+    DisplacePositions[I * 3u] = Moved.x;
+    DisplacePositions[I * 3u + 1u] = Moved.y;
+    DisplacePositions[I * 3u + 2u] = Moved.z;
+    const uint T = I * DisplaceTexCoordWords;
+    DisplaceTexCoords[T] = asuint(V.SamplePoint.x);
+    DisplaceTexCoords[T + 1u] = asuint(V.SamplePoint.y);
+    DisplaceTexCoords[T + 2u] = asuint(V.SamplePoint.z);
+    DisplaceTexCoords[T + 3u] = asuint(V.Depth);
+    DisplaceTexCoords[T + 4u] = asuint(V.Bed.x);
+    DisplaceTexCoords[T + 5u] = asuint(V.Bed.y);
+}

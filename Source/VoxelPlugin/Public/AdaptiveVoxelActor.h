@@ -216,6 +216,11 @@ public:
     /** The brick terrain (exists once initialized). */
     TSharedPtr<FVoxelBrickTerrain> GetBrickTerrain() const { return BrickTerrain; }
 
+    /** The land surface cache (Design/LandSurfaceCache.md) once it's made (the ocean's depths read
+     *  it while it's written for the camera, FVoxelLandCache::IsLive; stage O9m); null otherwise.
+     *  Game thread. */
+    const FVoxelLandCache* GetLandCache() const { return LandCache.IsValid() && LandCache->IsInitialized() ? LandCache.Get() : nullptr; }
+
     /** Game thread. Broadcast from Tick for every edit written to the edit store, as it is
      *  forwarded to the collision and brick terrain (the ocean rewrites its depth there):
      *  within twice Radius of Center the surface may have moved. */

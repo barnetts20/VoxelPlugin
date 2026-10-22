@@ -9,6 +9,9 @@
 #include "VoxelOceanCascades.h"
 #include "VoxelOceanWeather.h"
 #include "VoxelOceanShoreField.h"
+#include "VoxelOceanCoastField.h"
+#include "VoxelOceanLandCacheRHI.h"
+#include "VoxelLandCache.h"
 #include "VoxelLandBake.h"
 #include "Engine/Texture2D.h"
 #include "Engine/Texture2DArray.h"
@@ -26,6 +29,11 @@
 #include "HAL/IConsoleManager.h"
 
 DECLARE_CYCLE_STAT(TEXT("Ocean: actor tick"), STAT_VoxelOceanActorTick, STATGROUP_VoxelTerrain);
+
+static TAutoConsoleVariable<int32> CVarVoxelOceanDepthFromLandCache(
+    TEXT("voxel.Ocean.DepthFromLandCache"), 1,
+    TEXT("The ocean's depths (its tiles, the wave clipmap's static layer, the depth probe) read the terrain's land surface cache where it holds the point (stage O9m): 0 the density everywhere, as before."),
+    ECVF_Default);
 
 static TAutoConsoleVariable<int32> CVarVoxelDebugOceanQuery(
     TEXT("voxel.Debug.OceanQuery"), 0,
@@ -105,6 +113,9 @@ void AOceanSphereActor::EndPlay(const EEndPlayReason::Type EndPlayReason)
     ReleaseUnderwater();
     if (ShoreBuilder.IsValid())
         ShoreBuilder->Reset();
+    if (CoastBuilder.IsValid())
+        CoastBuilder->Reset();
+    CoastField.Reset();
     {
         FWriteScopeLock Lock(QueryLock);
         QueryFrame.Reset();
@@ -587,6 +598,55 @@ void AOceanSphereActor::UpdateShoreField()
     }
 }
 
+void AOceanSphereActor::UpdateCoastField()
+{
+    if (!CoastBuilder.IsValid())
+        CoastBuilder = MakeShared<FVoxelOceanCoastBuilder>();
+    const FVoxelOceanSettings& S = AppliedSettings;
+    TSharedPtr<const FVoxelLandBake, ESPMode::ThreadSafe> Bake;
+    if (Compositor.IsValid() && Compositor->GetBaseDensity().IsValid())
+        Bake = Compositor->GetBaseDensity()->GetLandBake();
+    // A field for another shore field (made again) is dropped: its texels went with that texture.
+    if (CoastField.IsValid() && CoastField->Shore != ShoreField)
+        CoastField.Reset();
+    const bool bWant = S.bShoaling && S.bCoastField && ShoreField.IsValid() && ShoreTexture && Bake.IsValid() && Surface.IsValid() && FApp::CanEverRender();
+    if (!bWant)
+    {
+        if (!CoastBuilder->IsDone()) CoastBuilder->Reset();
+        if (CoastField.IsValid())
+        {
+            // The shore field's texture again without the coast's slices.
+            CoastField.Reset();
+            ShoreTexture = ShoreField.IsValid() ? ShoreField->MakeTexture() : nullptr;
+            ShoreResource = ShoreTexture ? ShoreTexture->GetResource() : nullptr;
+            ShoreRHI = ShoreField.IsValid() ? FVoxelOceanShoreRHI::Make(ShoreTexture.Get(), ShoreField->N, ShoreField->ReachM) : nullptr;
+        }
+        return;
+    }
+    VoxelOceanCoastCore::FSettings Settings;
+    Settings.SeedDepthM = FMath::Max(S.CoastSeedDepth, 1.0);
+    Settings.ReachM = FMath::Max(S.CoastReach, 0.1) * 1000.0;
+    Settings.BudgetBytes = FMath::Max(S.CoastMemoryMB, 1.0) * 1024.0 * 1024.0;
+    const bool bHave = CoastField.IsValid() && CoastField->Requested == Settings;
+    if (!bHave && !CoastBuilder->IsFor(ShoreField.Get(), Settings))
+        CoastBuilder->Start(ShoreField, Bake, Settings);
+    CoastBuilder->Tick([this](const TSharedPtr<FVoxelOceanCoastDepthJob, ESPMode::ThreadSafe>& Job, int64 First, int32 Count)
+        {
+            return Surface.IsValid() && Surface->SampleCoastDepths(Job, First, Count);
+        });
+    if (!bHave && CoastBuilder->IsDone() && CoastBuilder->IsFor(ShoreField.Get(), Settings))
+    {
+        const TSharedPtr<const FVoxelOceanCoastField, ESPMode::ThreadSafe> Made = CoastBuilder->GetResult();
+        if (Made.IsValid() && Made != CoastField && Made->Shore == ShoreField)
+        {
+            CoastField = Made;
+            ShoreTexture = ShoreField->MakeTexture(Made->Texels.data(), Made->Slices);
+            ShoreResource = ShoreTexture ? ShoreTexture->GetResource() : nullptr;
+            ShoreRHI = FVoxelOceanShoreRHI::Make(ShoreTexture.Get(), ShoreField->N, ShoreField->ReachM);
+        }
+    }
+}
+
 void AOceanSphereActor::DrawShoreDebug() const
 {
 #if ENABLE_DRAW_DEBUG
@@ -789,6 +849,13 @@ void AOceanSphereActor::InitializeInternal(TSharedPtr<FDensitySampleCompositor> 
     Settings.MaxLevel = MaxLevel;
     Settings.LodDistanceFactor = OceanSettings.LodDistanceFactor;
     Settings.SpareBufferSets = OceanSettings.SpareBufferSets;
+    Settings.bWavesInCompute = OceanSettings.bWavesInCompute;
+    Settings.Clip.bOn = OceanSettings.bWaveClipmap;
+    Settings.Clip.Size = OceanSettings.ClipSize;
+    Settings.Clip.Levels = OceanSettings.ClipLevels;
+    Settings.Clip.FinestCm = OceanSettings.ClipFinestSpacing;
+    Settings.Clip.bRings = OceanSettings.bWaveRings;
+    Settings.Clip.FarCells = OceanSettings.FarSphereCells;
     Settings.Material = SurfaceMaterialInstance.Get();
     if (WaveChartsRadius == OceanRadius)
     {
@@ -831,7 +898,9 @@ void AOceanSphereActor::Tick(float DeltaTime)
         BindTerrain(Terrain);
     UpdateWeatherSource();
     UpdateShoreField();
+    UpdateLandCache(Terrain);
     Surface->SetInputs(GatherInputs(Terrain));
+    UpdateCoastField();
     Surface->Tick(CameraPosition);
     PublishWaveFrame();
 
@@ -907,8 +976,9 @@ FVoxelOceanSurfaceInputs AOceanSphereActor::GatherInputs(const AAdaptiveVoxelAct
     Inputs.Waves.SurfSets = S.SurfSets;
     Inputs.Waves.SurfSwash = S.SurfSwash;
     Inputs.Waves.SurfSkew = S.SurfSkew;
-    Inputs.Waves.SurfHandover = S.SurfHandover;
     Inputs.Waves.SurfSwashReach = S.SurfSwashReach;
+    Inputs.Waves.SurfCutoff = S.SurfCutoff;
+    Inputs.Waves.SurfFFTFloor = S.SurfFFTFloor;
     // The mesh's split bias near shores (stage O9c; live).
     Inputs.ShoreDetail.Detail = S.ShoreDetail;
     Inputs.ShoreDetail.BandM = S.ShoreDetailBand;
@@ -929,6 +999,9 @@ FVoxelOceanSurfaceInputs AOceanSphereActor::GatherInputs(const AAdaptiveVoxelAct
         {
             Inputs.ShoreTexture = ShoreTexture.Get();
             Inputs.Density.Shore = ShoreRHI;
+            // The coastal field's layout (stage O9h) with the texture that holds its texels.
+            if (CoastField.IsValid() && CoastField->Shore == ShoreField)
+                Inputs.Coast = CoastField;
         }
     }
     if (Terrain && Terrain->ActualPrecision > 0.0)
@@ -953,5 +1026,36 @@ FVoxelOceanSurfaceInputs AOceanSphereActor::GatherInputs(const AAdaptiveVoxelAct
         Inputs.Density.HalfFinest = FMath::Max(25.0, OceanRadius * 1.0e-9);
         Inputs.SlopeBound = 3.5;
     }
+    // The land surface cache (stage O9m): its texels follow the edit data, so an edit counts as
+    // in the depths once both carry it.
+    Inputs.WrittenEditSequence = Inputs.EditSequence;
+    if (LandCacheRHI.IsValid())
+    {
+        Inputs.Density.LandCache = LandCacheRHI;
+        Inputs.Density.LandEditSequence = LandCacheEditSequence;
+        Inputs.WrittenEditSequence = FMath::Min(Inputs.EditSequence, LandCacheEditSequence);
+    }
     return Inputs;
+}
+
+void AOceanSphereActor::UpdateLandCache(const AAdaptiveVoxelActor* Terrain)
+{
+    const FVoxelLandCache* Cache = Terrain && CVarVoxelOceanDepthFromLandCache.GetValueOnGameThread() != 0 && FApp::CanEverRender()
+        ? Terrain->GetLandCache() : nullptr;
+    // Its heights are about its own sea level; one far from this ocean's isn't this planet's.
+    if (Cache && FMath::Abs(Cache->GetSeaRadius() - OceanRadius) > 0.01 * OceanRadius) Cache = nullptr;
+    // Written for the camera, or not for long: a cache left behind (its material unbound, the
+    // terrain not drawn) is let go after two seconds' worth of frames. Meanwhile its edits don't
+    // settle, so the ocean's wait for them.
+    LandCacheIdleFrames = Cache && Cache->IsLive() ? 0 : LandCacheIdleFrames + 1;
+    if (!Cache || !Cache->GetTextures().IsValid() || LandCacheIdleFrames > 120)
+    {
+        LandCacheRHI.Reset();
+        LandCacheEditSequence = 0;
+        LandCacheIdleFrames = FMath::Min(LandCacheIdleFrames, 1000);
+        return;
+    }
+    if (!LandCacheRHI.IsValid() || !LandCacheRHI->IsFor(Cache->GetTextures(), Cache->GetSeaRadius(), OceanRadius))
+        LandCacheRHI = FVoxelOceanLandCacheRHI::Make(Cache->GetTextures(), Cache->GetSeaRadius(), OceanRadius);
+    LandCacheEditSequence = Cache->GetSettledEditSequence();
 }

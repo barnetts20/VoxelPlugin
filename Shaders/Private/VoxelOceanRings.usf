@@ -1,0 +1,242 @@
+// VoxelOceanRings.usf - The ocean's mesh, once a frame (stage W2; Design/OceanWaves.md section 29;
+// VoxelOceanPages.cpp runs it as the rings' compute provider): every vertex of the rings (one
+// square grid per wave clipmap level, VoxelOceanRingLayout.ush) and of the far sphere under them,
+// written to the mesh's streams: the displaced position (the component's frame: the planet's axes,
+// from its origin near the camera), and what the material's pixel node takes (texture
+// coordinates 0 to 2: the undisplaced point from the selection camera in world axes, the depth the
+// waves feel, the bed). The material's vertex node passes them through (VoxelOceanParams.x 3).
+//
+// A vertex that draws nothing is written as NaN, so the GPU culls every triangle using it: the
+// rings' holes, and the land cull (a vertex the land stands above by more than the cull height,
+// which with the slope bound puts every triangle it's in under the terrain; an inland basin's).
+//
+// THE FAR SPHERE: a cube sphere at the sea's radius (FarCells cells a face edge) for whatever the
+// rings don't reach (from high up, past the outermost ring). Under the outermost ring, and a far
+// cell and a half past its edge, it sinks below the waves (a sloped skirt under the ring's edge);
+// well inside it, it draws nothing.
+// Its land is sampled once (VoxelOceanPage.usf, FarDepthCS).
+
+#include "/Engine/Public/Platform.ush"
+#include "/Plugin/VoxelPlugin/Private/VoxelOceanWaves.ush"
+#include "/Plugin/VoxelPlugin/Private/VoxelOceanClip.ush"
+#include "/Plugin/VoxelPlugin/Private/VoxelOceanRingLayout.ush"
+
+RWBuffer<float> RingPositions;
+RWBuffer<uint> RingTangents;         // two packed normals a vertex: tangent, normal
+RWBuffer<uint> RingTexCoords;        // 12 words a vertex
+RWBuffer<uint> RingColors;
+RWBuffer<uint> RingArgs;             // FRHIDrawIndexedIndirectParameters
+uint RingIndexCount;                 // indices drawn (0: nothing this frame)
+uint RingSlots;                      // levels the mesh holds (each (2 Half + 1)^2 vertices)
+int RingHalf;
+float RingMorphStart;
+float RingMorphEnd;
+uint RingFarCells;                   // per face edge
+uint RingVertices;                   // all of them
+
+// The clipmap's info (VoxelOceanClip.ush) this frame, and per level: (the camera about the square's
+// centre in cells, the cell in cm, the vertex colour), (the hole's centre, the centre on the next
+// level's grid).
+float4 RingInfo[VOXEL_OCEAN_CLIP_INFO_ROWS];
+float4 RingLevel[VOXEL_OCEAN_RING_MAX_LEVELS];
+int4 RingInts[VOXEL_OCEAN_RING_MAX_LEVELS];
+uint RingCount;
+// (the camera from the component's origin, planet frame, cm; 1: colour by level), (the camera,
+// planet frame, cm, as a float; the far sphere's sink, cm), (the rest of the camera; the sea
+// sphere's radius, cm), (the cull height, cm, negative: no cull; the slope bound; the reach a
+// triangle adds, cm; the far sphere's cell, cm), the planet's rotation to world. Without this
+// frame's clipmap levels (RingCount 0) only the far sphere draws.
+float4 RingFrame0;
+float4 RingFrame1;
+float4 RingFrame2;
+float4 RingCull;
+float4 RingRotation;
+
+Texture2DArray RingDisplacement;
+Texture2DArray RingStatic;
+SamplerState RingSampler;            // bilinear, wrapping (the levels are toroidal)
+
+// The far sphere's vertices: unit directions (planet frame), and their land's depth (cm).
+StructuredBuffer<float4> FarDirections;
+StructuredBuffer<float> FarLand;
+
+#define VOXEL_OCEAN_RING_FRAME VoxelOceanClipFrameOf(RingInfo[0], RingInfo[1], RingInfo[2], RingInfo[3])
+#define VOXEL_OCEAN_RING_CLIP_LEVEL(I) VoxelOceanClipLevelOf(RingInfo[VOXEL_OCEAN_CLIP_SHARED_ROWS + VOXEL_OCEAN_CLIP_LEVEL_ROWS * (I)], \
+    RingInfo[VOXEL_OCEAN_CLIP_SHARED_ROWS + VOXEL_OCEAN_CLIP_LEVEL_ROWS * (I) + 1])
+FVoxelOceanClipPick VoxelOceanRingPick(float3 X, float Scale)
+{
+    VOXEL_OCEAN_CLIP_PICK_BODY(VOXEL_OCEAN_RING_FRAME, VOXEL_OCEAN_RING_CLIP_LEVEL)
+}
+
+FVoxelOceanRingLevel VoxelOceanRingLevelOf(uint I)
+{
+    FVoxelOceanRingLevel L;
+    const float4 F = RingLevel[I];
+    const int4 N = RingInts[I];
+    L.CamX = F.x;
+    L.CamY = F.y;
+    L.Spacing = max(F.z, 1.0e-3f);
+    L.HoleX = N.x;
+    L.HoleY = N.y;
+    L.CoarseX = N.z;
+    L.CoarseY = N.w;
+    return L;
+}
+
+// The vertex colour: white, or with voxel.Debug.LevelColor (RingFrame0.w 1) a hue per level.
+uint VoxelOceanRingColorOf(int I)
+{
+    if (RingFrame0.w < 0.5f) return 0xffffffffu;
+    const float H = frac(float(I) * 0.618034f);
+    const float3 C = saturate(abs(frac(H + float3(0.0f, 2.0f / 3.0f, 1.0f / 3.0f)) * 6.0f - 3.0f) - 1.0f);
+    const uint3 B = uint3(round(C * 255.0f));
+    // FColor's DWORD: B, G, R, A from the low byte.
+    return B.z | (B.y << 8u) | (B.x << 16u) | (0xffu << 24u);
+}
+
+// As VoxelBrickPageGPU.usf's PackSnorm8: x, y, z and w in the four bytes.
+uint VoxelOceanRingPackSnorm8(float3 V, float W)
+{
+    const int4 B = int4(round(clamp(float4(V, W), -1.0f, 1.0f) * 127.0f));
+    return (uint(B.x) & 0xffu) | ((uint(B.y) & 0xffu) << 8u) | ((uint(B.z) & 0xffu) << 16u) | ((uint(B.w) & 0xffu) << 24u);
+}
+
+void VoxelOceanRingWriteNothing(uint V)
+{
+    const float N = asfloat(0x7fc00000u);
+    RingPositions[V * 3u] = N;
+    RingPositions[V * 3u + 1u] = N;
+    RingPositions[V * 3u + 2u] = N;
+}
+
+void VoxelOceanRingWrite(uint V, float3 Local, float3 SamplePoint, float Depth, float Land, float3 Up, float3 Tangent, uint Color)
+{
+    RingPositions[V * 3u] = Local.x;
+    RingPositions[V * 3u + 1u] = Local.y;
+    RingPositions[V * 3u + 2u] = Local.z;
+    RingTangents[V * 2u] = VoxelOceanRingPackSnorm8(Tangent, 1.0f);
+    RingTangents[V * 2u + 1u] = VoxelOceanRingPackSnorm8(Up, 1.0f);
+    const uint T = V * 12u;
+    RingTexCoords[T] = asuint(SamplePoint.x);
+    RingTexCoords[T + 1u] = asuint(SamplePoint.y);
+    RingTexCoords[T + 2u] = asuint(SamplePoint.z);
+    RingTexCoords[T + 3u] = asuint(Depth);
+    RingTexCoords[T + 4u] = asuint(VOXEL_OCEAN_SHORE_DEFAULT_SLOPE);
+    RingTexCoords[T + 5u] = asuint(Land);
+    [unroll]
+    for (uint K = 6u; K < 12u; K++)
+        RingTexCoords[T + K] = 0u;
+    RingColors[V] = Color;
+}
+
+// Culled by the land: it stands above the sea at the vertex by more than the cull height plus the
+// slope bound over the triangles' reach (Spacing: the vertex's cell).
+bool VoxelOceanRingUnderLand(float Land, float Spacing)
+{
+    return RingCull.x >= 0.0f && Land < -(RingCull.x + RingCull.y * (2.83f * Spacing + RingCull.z));
+}
+
+[numthreads(64, 1, 1)]
+void RingCS(uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+    const uint V = DispatchThreadId.x;
+    if (V == 0u)
+    {
+        RingArgs[0] = RingIndexCount;
+        RingArgs[1] = 1u;
+        RingArgs[2] = 0u;
+        RingArgs[3] = 0u;
+        RingArgs[4] = 0u;
+    }
+    if (V >= RingVertices) return;
+    const FVoxelOceanClipFrame F = VOXEL_OCEAN_RING_FRAME;
+    const float3 CamToOrigin = RingFrame0.xyz;
+    const float3 Camera = RingFrame1.xyz;
+    const int Side = 2 * RingHalf + 1;
+    const uint RingVerticesAll = RingSlots * uint(Side * Side);
+    const int Count = int(RingCount);
+
+    if (V < RingVerticesAll)
+    {
+        const uint I = V / uint(Side * Side);
+        const uint K = V - I * uint(Side * Side);
+        const int X = int(K % uint(Side)) - RingHalf;
+        const int Y = int(K / uint(Side)) - RingHalf;
+        if (int(I) >= Count)
+        {
+            VoxelOceanRingWriteNothing(V);
+            return;
+        }
+        const FVoxelOceanRingLevel L = VoxelOceanRingLevelOf(I);
+        const FVoxelOceanRingLevel Next = VoxelOceanRingLevelOf(min(I + 1u, uint(VOXEL_OCEAN_RING_MAX_LEVELS - 1)));
+        const FVoxelOceanRingPoint P = VoxelOceanRingPointOf(X, Y, int(I), Count, RingHalf, RingMorphStart, RingMorphEnd, L, Next);
+        if (P.Valid == 0)
+        {
+            VoxelOceanRingWriteNothing(V);
+            return;
+        }
+        const float2 Offset = float2(P.OffsetX, P.OffsetY);
+        const float3 X3 = VoxelOceanClipPointOf(F, Offset);
+        // The static layer of its level (the depth, the land), the waves at its scale.
+        const FVoxelOceanClipLevel CL = VOXEL_OCEAN_RING_CLIP_LEVEL(P.Level);
+        const float3 SUV = VoxelOceanClipStorageUV(F, CL, VoxelOceanClipPlaneOffset(F, X3));
+        const float4 S0 = RingStatic.SampleLevel(RingSampler, float3(SUV.xy, 4.0f * SUV.z), 0.0f);
+        const float Spacing = P.Level == int(I) ? L.Spacing : Next.Spacing;
+        // (A level not valid yet holds nothing to cull by.)
+        if (CL.Valid > 0.5f && VoxelOceanRingUnderLand(S0.z, Spacing))
+        {
+            VoxelOceanRingWriteNothing(V);
+            return;
+        }
+        const FVoxelOceanClipPick Pick = VoxelOceanRingPick(X3, P.Scale);
+        const float3 D = VoxelOceanClipSample(RingDisplacement, RingSampler, Pick).xyz;
+        const float3 Up = normalize(X3 + Camera);
+        const float3 T1 = normalize(F.E1 - Up * dot(F.E1, Up));
+        VoxelOceanRingWrite(V, X3 + D + CamToOrigin, VoxelOceanRotate(RingRotation, X3), S0.x, S0.z, Up, T1, VoxelOceanRingColorOf(int(I)));
+        return;
+    }
+
+    // The far sphere (its colour: white).
+    const uint FV = V - RingVerticesAll;
+    const float3 Dir = FarDirections[FV].xyz;
+    const float Land = FarLand[FV];
+    if (VoxelOceanRingUnderLand(Land, RingCull.w))
+    {
+        VoxelOceanRingWriteNothing(V);
+        return;
+    }
+    // From the camera as a float and the rest: small terms, so the far points don't step as the
+    // camera moves.
+    const float3 X3 = (Dir * RingFrame2.w - Camera) - RingFrame2.xyz;
+    float Sink = 0.0f;
+    if (Count > 0 && F.Along + dot(X3, F.A) > 0.0f)
+    {
+        // Under the outermost ring: sunk below the waves; well inside it, nothing.
+        const FVoxelOceanRingLevel O = VoxelOceanRingLevelOf(uint(Count - 1));
+        // (Its place about the square's centre, in cells: the offset from the camera plus the
+        // camera's place.)
+        const float2 T = VoxelOceanClipPlaneOffset(F, X3) / O.Spacing + float2(O.CamX, O.CamY);
+        const float M = max(abs(T.x), abs(T.y));
+        // A far cell and a half in the ring's cells, as the plane stretches it there (1 / cos^2).
+        const float Cos = max(dot(Dir, F.A), 0.1f);
+        const float Far = 1.5f * RingCull.w / (O.Spacing * Cos * Cos);
+        // Nothing where every triangle using the vertex lies under the ring; sunk out to a far cell
+        // and a half past the ring's edge (at least one of its cells), so a far triangle reaching in
+        // under the ring is sunk at its outer corners too and its chord can't rise into the waves'
+        // troughs near the edge.
+        // From near or under the surface, nothing under the ring at all: the sunk sphere would
+        // show from below as a second surface (and past the ring's edge, beyond the horizon, a far
+        // triangle culled with it isn't seen).
+        const float Inside = F.Height < 1000.0f ? 1.0f : 1.0f + Far;
+        if (M < float(RingHalf) - Inside)
+        {
+            VoxelOceanRingWriteNothing(V);
+            return;
+        }
+        if (M < float(RingHalf) + max(1.0f, Far)) Sink = RingFrame1.w;
+    }
+    const float3 Up = Dir;
+    const float3 Axis = abs(Up.z) < 0.9f ? float3(0.0f, 0.0f, 1.0f) : float3(1.0f, 0.0f, 0.0f);
+    const float3 T1 = normalize(cross(Axis, Up));
+    VoxelOceanRingWrite(V, X3 - Up * Sink + CamToOrigin, VoxelOceanRotate(RingRotation, X3), max(Land, 0.0f), Land, Up, T1, 0xffffffffu);
+}

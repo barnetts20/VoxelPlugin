@@ -97,6 +97,16 @@ public:
     /** The levels' windows as texels written, valid and pending (voxel.Debug.LandCache). */
     FString Describe() const;
 
+    /** Game thread (stage O9m: the ocean's depths read the cache). The textures (valid once
+     *  initialized). */
+    const FVoxelLandCacheTextures& GetTextures() const { return Textures; }
+    /** The newest edit sequence whose texels the writes enqueued so far all carry: every edit
+     *  at or before it is in what a render command enqueued from the next frame on reads. */
+    uint32 GetSettledEditSequence() const { return SettledEditSequence; }
+    /** The cache is being written for the camera: its writes ran in one of the last two frames
+     *  (an unticked cache's windows stay where they were, and its edits never settle). */
+    bool IsLive() const;
+
 private:
     /** Enqueues the jobs (the plan's, this frame) and the state after them; false when the
      *  textures have no resources. */
@@ -118,6 +128,11 @@ private:
     FVoxelLandCacheTextures Textures;
     uint64 TexelsWritten = 0;
     uint64 LastTickFrame = MAX_uint64;
+    /** The last frame whose writes were enqueued (IsLive), and GetSettledEditSequence's. */
+    uint64 LastLiveFrame = 0;
+    uint32 SettledEditSequence = 0;
+    /** Notices whose texels are in the plan's dirty rectangles, not yet all written. */
+    TArray<FPendingEdit> Unsettled;
     /** A frame's writes that couldn't run on the render thread (the plan had moved on): the
      *  render thread raises FailedGeneration past the generation the frame was planned in; the
      *  game thread then writes every level again (a new generation), and until it has, every

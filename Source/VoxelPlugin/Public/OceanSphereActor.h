@@ -32,7 +32,10 @@ struct FVoxelDensityGPUData;
 struct FVoxelOceanSurfaceInputs;
 class FVoxelOceanShoreField;
 class FVoxelOceanShoreBuilder;
+class FVoxelOceanCoastField;
+class FVoxelOceanCoastBuilder;
 struct FVoxelOceanShoreRHI;
+struct FVoxelOceanLandCacheRHI;
 class FTextureResource;
 
 /** The ocean surface: every frame the tiles the camera selects are committed to GPU pages
@@ -215,6 +218,13 @@ private:
     UPROPERTY(Transient)
     TObjectPtr<UTexture2DArray> ShoreTexture;
     TSharedPtr<const FVoxelOceanShoreRHI, ESPMode::ThreadSafe> ShoreRHI;
+    /** The terrain's land surface cache as the ocean's depths read it (stage O9m; null: none, or
+     *  not written for the camera) and the newest edit its texels carry. */
+    TSharedPtr<const FVoxelOceanLandCacheRHI, ESPMode::ThreadSafe> LandCacheRHI;
+    uint32 LandCacheEditSequence = 0;
+    /** Frames the cache hasn't been written for the camera: kept through short gaps (dropping it
+     *  writes the clipmap's static layer again), let go after a while. */
+    int32 LandCacheIdleFrames = 0;
     /** The texture's resource ShoreRHI was made from (compared only). */
     const FTextureResource* ShoreResource = nullptr;
     /** Starts the shore field's build when the land bake, the radius or the reach changed, and
@@ -222,6 +232,16 @@ private:
     void UpdateShoreField();
     /** voxel.Debug.OceanShore: the shore field around the camera. */
     void DrawShoreDebug() const;
+
+    /** The coastal travel-time field (stage O9h; FVoxelOceanCoastField): baked after the shore
+     *  field from the terrain (CoastBuilder, the depths sampled on the GPU through the surface),
+     *  its texels in ShoreTexture's slices 6 and up once made (the texture made again). None
+     *  without a shore field, a renderer, or with bCoastField off. */
+    TSharedPtr<FVoxelOceanCoastBuilder> CoastBuilder;
+    TSharedPtr<const FVoxelOceanCoastField, ESPMode::ThreadSafe> CoastField;
+    /** Starts the coastal field's bake when the shore field or its settings changed, and puts it
+     *  into the shore texture when done. After the surface's inputs (it samples with them). */
+    void UpdateCoastField();
 
     /** The view from under water: one view extension per ocean, fed every tick. */
     TSharedPtr<FVoxelUnderwaterViewExtension, ESPMode::ThreadSafe> UnderwaterExtension;
@@ -260,6 +280,8 @@ private:
     void HandleTerrainEdit(uint32 Sequence, const FVector& Center, double Radius);
     /** The surface's terrain inputs this frame. */
     FVoxelOceanSurfaceInputs GatherInputs(const AAdaptiveVoxelActor* Terrain) const;
+    /** Every frame before GatherInputs: the terrain's land surface cache (stage O9m). */
+    void UpdateLandCache(const AAdaptiveVoxelActor* Terrain);
 
     /** The underwater extension, once per world (no renderer: none). */
     void CreateUnderwater();

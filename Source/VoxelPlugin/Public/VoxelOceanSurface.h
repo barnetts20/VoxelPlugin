@@ -47,6 +47,8 @@ class FVoxelOceanCascades;
 class FVoxelOceanWavesFFT;
 class FVoxelOceanWeatherKeys;
 class FVoxelOceanShoreField;
+class FVoxelOceanCoastField;
+struct FVoxelOceanCoastDepthJob;
 struct FVoxelOceanProbeState;
 
 /** The FFT cascades' textures (VoxelOceanCascades::MakeTextures): written every tick, read by
@@ -78,6 +80,9 @@ struct FVoxelOceanSurfaceInputs
 {
     FVoxelOceanDensityInputs Density;
     uint32 EditSequence = 0;          // the newest edit Density.Edits holds
+    /** The newest edit the depths carry (stage O9m): EditSequence, or with the land surface cache
+     *  (Density.LandCache) the older of it and the cache's (its texels follow the edit data). */
+    uint32 WrittenEditSequence = 0;
     double SlopeBound = 3.5;          // the steepest density gradient assumed (the land cull's reach)
     /** How far (cm) the land must stand above the sea, beyond what the slope bound allows for
      *  over a morphed triangle, before the triangle is culled. Negative: no cull. */
@@ -98,6 +103,9 @@ struct FVoxelOceanSurfaceInputs
     UTexture2DArray* ShoreTexture = nullptr;
     /** The split bias near shores (stage O9c; live: the next selection follows it). */
     FVoxelOceanShoreDetail ShoreDetail;
+    /** The coastal travel-time field (stage O9h; null: none): its layout goes to the shaders with
+     *  the frame (rows 19 to 21 of the chart table's constants), its texels in ShoreTexture. */
+    TSharedPtr<const FVoxelOceanCoastField, ESPMode::ThreadSafe> Coast;
 };
 
 /** Inputs of the ocean surface, fixed until the next Initialize (LodDistanceFactor and the
@@ -114,6 +122,12 @@ struct FVoxelOceanSurfaceSettings
     TWeakObjectPtr<UMaterialInstanceDynamic> Material;
     /** The FFT cascades' textures (none: the FFT waves stay off screen; queries still have them). */
     FVoxelOceanCascadeTextures CascadeTextures;
+    /** The waves in compute (stage O9j): the pages displace their vertices once a frame and the
+     *  material's vertex node passes them through (VoxelOceanParams.x 3). */
+    bool bWavesInCompute = true;
+    /** The wave clipmap (stage O9k; with the waves in compute): the composed sea evaluated once a
+     *  frame on camera-centred levels the vertices and the material's pixel node sample. */
+    FVoxelOceanClipSettings Clip;
 };
 
 class VOXELPLUGIN_API FVoxelOceanSurface
@@ -166,6 +180,10 @@ public:
     /** The depth probe's result for the underwater pass (render thread data; null without pages). */
     TSharedPtr<FVoxelOceanProbeState, ESPMode::ThreadSafe> GetProbeState() const;
 
+    /** Game thread. The coastal field's depth sampling (stage O9h; FVoxelOceanPages::
+     *  SampleCoastDepths with this frame's terrain inputs). False: not yet. */
+    bool SampleCoastDepths(const TSharedPtr<FVoxelOceanCoastDepthJob, ESPMode::ThreadSafe>& Job, int64 First, int32 Count);
+
 private:
     VoxelOceanTiles::FSelectParams SelectParams() const;
     /** Builds the tiles' vertex words (in parallel when there are many). */
@@ -176,6 +194,8 @@ private:
     void ApplyRewrites();
     /** Writes the selection camera (world, as a float and the rest) and the morph parameters to
      *  the material instance. */
+    /** The rings' land cull this frame (stage W2; FVoxelOceanDisplaceFrame::RingCull). */
+    FVector4f RingCull() const;
     void UpdateMaterial();
     void LogPerf(double Now);
     /** The wave model the console chooses (voxel.Ocean.WaveModel) with this frame's settings and
@@ -216,9 +236,10 @@ private:
     const UTexture2D* UploadedTexture = nullptr;
     /** The shore texture the material holds. */
     const UTexture2DArray* BoundShoreTexture = nullptr;
-    /** The shore field's expansion, the surf's settings and the split bias last written into the
-     *  chart texture (rows 8 to 17 of its constants), and the table upload they were written after. */
-    FVector4f WrittenShoreFrame[10];
+    /** The shore field's expansion, the surf's settings, the split bias and the coastal field's
+     *  layout last written into the chart texture (rows 8 to 21 of its constants), and the table
+     *  upload they were written after. */
+    FVector4f WrittenShoreFrame[14];
     uint64 ShoreFrameUploads = 0;   // ChartUploads when it was written
     uint64 ChartUploads = 0;        // the weather's full uploads into the chart texture
     const UTexture2D* ShoreFrameTexture = nullptr;
@@ -231,9 +252,11 @@ private:
     const void* ProbeEdits = nullptr;
     const void* ProbeShore = nullptr;
     uint32 ProbeSequence = 0;
+    const void* ProbeLandCache = nullptr;
     double ProbeHalfFinest = 0.0;
     double ProbeDepthFootprint = 0.0;
     bool bProbed = false;
+    bool bClipBound = false;
     bool bTexturesBound = false;
     bool bReportedFFT = false;
     bool bHasInputs = false;

@@ -36,6 +36,47 @@ struct VOXELPLUGIN_API FVoxelOceanSettings
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Mesh", meta = (ClampMin = "0", UIMax = "32"))
     int32 SpareBufferSets = 8;
 
+    /** Evaluate the waves once a frame per vertex in compute (stage O9j) instead of in the
+     *  material's vertex shader in every pass that draws the ocean (depth, velocity, base). The
+     *  material needs nothing new; disconnecting its World Position Offset also takes the ocean
+     *  out of the velocity pass. Off: the old path, for comparison. Rebuilds the surface. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Mesh")
+    bool bWavesInCompute = true;
+
+    /** The wave clipmap (stage O9k; with the waves in compute): the waves evaluated once a frame
+     *  on camera-centred levels of texels, which the vertices and the material's pixel node
+     *  (VoxelOceanPixelClip) only sample. Its cost is the levels' texels, not the mesh's vertices
+     *  or the screen's pixels. Rebuilds the surface. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Mesh")
+    bool bWaveClipmap = true;
+
+    /** Texels along a clipmap level's side (a power of two, 32 to 512). The cost grows with its
+     *  square. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Mesh", meta = (EditCondition = "bWaveClipmap", ClampMin = "32", ClampMax = "512"))
+    int32 ClipSize = 128;
+
+    /** Clipmap levels at most, each twice as coarse and wide as the one before (at most 16; stage
+     *  W1: only as many as reach one and a half horizon distances are in use, and those whose
+     *  window stays within 60 degrees of the clipmap's anchor). */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Mesh", meta = (EditCondition = "bWaveClipmap", ClampMin = "1", ClampMax = "16"))
+    int32 ClipLevels = 12;
+
+    /** The finest clipmap level's texel (cm), near the sea; coarser with the camera's height
+     *  (about a 64th of it). Waves shorter than about four of these near the camera shade as
+     *  roughness only. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Mesh", meta = (EditCondition = "bWaveClipmap", ClampMin = "1.0", UIMax = "200.0"))
+    double ClipFinestSpacing = 20.0;
+
+    /** Stage W2: the surface drawn as rings on the clipmap's levels, with a far sphere for the
+     *  rest, instead of the tile pages (whenever the clipmap runs: the FFT waves). No tile
+     *  selection, no page writes. Off: the tile pages as before. Rebuilds the surface. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Mesh", meta = (EditCondition = "bWaveClipmap"))
+    bool bWaveRings = true;
+
+    /** The far sphere's cells along each cube face's edge (under and past the rings). */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Mesh", meta = (EditCondition = "bWaveClipmap && bWaveRings", ClampMin = "4", ClampMax = "256"))
+    int32 FarSphereCells = 64;
+
     // --- Depth ---
 
     /** Leave out the triangles the land stands well above (the terrain hides them anyway). */
@@ -228,10 +269,14 @@ struct VOXELPLUGIN_API FVoxelOceanSettings
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Shore", meta = (EditCondition = "bShoaling", ClampMin = "0.0", ClampMax = "2.0"))
     double ShoreChopGrowth = 1.0;
 
-    /** The waves shorten and slow toward the coast (the shallow-water dispersion, along the
-     *  shore field's direction): 1 as the dispersion says, 0 off. */
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Shore", meta = (EditCondition = "bShoaling", ClampMin = "0.0", ClampMax = "2.0"))
-    double ShoreWarp = 1.0;
+    /** The FFT's own waves shorten and slow toward the coast (the shallow-water dispersion, along
+     *  the shore field's direction): 1 as the dispersion says, 0 off. Off by default since stage
+     *  O9f: it moves the FFT's lookups by up to kilometres along the field's direction, and
+     *  wherever that direction turns quickly (midway between coasts, across a bay's mouth) the
+     *  FFT's pattern tears into a seam. The swell's and the surf's trains (stages O9a, O9d) turn
+     *  and shorten toward the shore themselves. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Shore", AdvancedDisplay, meta = (EditCondition = "bShoaling", ClampMin = "0.0", ClampMax = "2.0"))
+    double ShoreWarp = 0.0;
 
     /** The FFT waves fade out over this distance to the coast (m; the depth over the beach
      *  slope). 0: no fade; the surf (Surf category) takes the long waves over near the coast by
@@ -281,6 +326,32 @@ struct VOXELPLUGIN_API FVoxelOceanSettings
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Shore", AdvancedDisplay, meta = (ClampMin = "0.0", UIMax = "8.0"))
     double ShoreBasinMargin = 1.5;
 
+    // -- Coast (stage O9h; Design/OceanWaves.md section 23) -------------------------------------
+
+    /** The coastal travel-time field: baked at load from the terrain along every sea coast, the
+     *  time the waves take to come in from deep water to each point. It gives the shore's waves
+     *  their direction and crest spacing (stage O9i). Seconds to bake, after the shore field. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Coast", meta = (EditCondition = "bShoaling"))
+    bool bCoastField = true;
+
+    /** The memory the field's atlas may take on the GPU (MB; its index takes 6 more slices of
+     *  the shore texture, 25 MB on a 1024 bake): it picks the finest cells that fit, 25 to 150 m,
+     *  and where even 150 m cells don't fit it leaves out the tiles farthest from the coast (the
+     *  log says which). Finer cells space the crests more exactly near steep beaches; the bake's
+     *  time grows with the cells (at most 40 million: about a minute's solve). */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Coast", meta = (EditCondition = "bCoastField", ClampMin = "8.0", ClampMax = "1024.0", UIMax = "512.0"))
+    double CoastMemoryMB = 128.0;
+
+    /** The field's outer edge (m of depth): the waves' rays start shore-normal there. The shore's
+     *  waves ramp in from shallower water than this. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Coast", AdvancedDisplay, meta = (EditCondition = "bCoastField", ClampMin = "5.0", UIMax = "100.0"))
+    double CoastSeedDepth = 40.0;
+
+    /** The field reaches no farther out than this (km of the shore field's distance), on shelves
+     *  too gentle to reach the seed depth sooner. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Coast", AdvancedDisplay, meta = (EditCondition = "bCoastField", ClampMin = "0.5", UIMax = "30.0"))
+    double CoastReach = 8.0;
+
     // -- Surf (stage O9a; Design/OceanWaves.md section 6) ----------------------------------------
 
     /** Surf near the coast: the long waves become trains that follow the depth's contours, break
@@ -313,10 +384,16 @@ struct VOXELPLUGIN_API FVoxelOceanSettings
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Surf", meta = (EditCondition = "bSurf", ClampMin = "0.0", ClampMax = "0.95"))
     double SurfSkew = 0.85;
 
-    /** Where the surf takes over from the long FFT waves: this many breaking depths of their
-     *  significant height. */
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Surf", AdvancedDisplay, meta = (EditCondition = "bSurf", ClampMin = "1.0", UIMax = "6.0"))
-    double SurfHandover = 2.5;
+    /** Where the shore's directed waves begin (stage O9i): where the coastal field's depth is
+     *  shallower than this many deep wavelengths of the sea's peak period (fully in from 40% of
+     *  it). 0.2: about 25 m deep for a 9 s swell. Deeper, the FFT's waves alone. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Surf", meta = (EditCondition = "bSurf", ClampMin = "0.0", ClampMax = "0.5"))
+    double SurfCutoff = 0.2;
+
+    /** The share of the long waves' energy the FFT's waves always keep near the coast (stage O9i):
+     *  their irregular crests and chop under the shore's directed waves. 1: no directed waves. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Surf", meta = (EditCondition = "bSurf", ClampMin = "0.0", ClampMax = "1.0"))
+    double SurfFFTFloor = 0.25;
 
     // -- Foam (stage O9b; Design/OceanWaves.md section 6) ----------------------------------------
 
@@ -387,7 +464,8 @@ struct VOXELPLUGIN_API FVoxelOceanSettings
         SurfSwash = FMath::Max(SurfSwash, 0.0);
         SurfSwashReach = FMath::Max(SurfSwashReach, 1.0);
         SurfSkew = FMath::Clamp(SurfSkew, 0.0, 0.95);
-        SurfHandover = FMath::Max(SurfHandover, 1.0);
+        SurfCutoff = FMath::Clamp(SurfCutoff, 0.0, 0.5);
+        SurfFFTFloor = FMath::Clamp(SurfFFTFloor, 0.0, 1.0);
         FoamCoverage = FMath::Max(FoamCoverage, 0.0);
         FoamDecay = FMath::Max(FoamDecay, 0.1);
         SurfFoam = FMath::Max(SurfFoam, 0.0);
@@ -396,7 +474,10 @@ struct VOXELPLUGIN_API FVoxelOceanSettings
     /** The fields whose change rebuilds the surface. */
     bool SameMesh(const FVoxelOceanSettings& Other) const
     {
-        return FinestSpacing == Other.FinestSpacing && TileQuads == Other.TileQuads && SpareBufferSets == Other.SpareBufferSets;
+        return FinestSpacing == Other.FinestSpacing && TileQuads == Other.TileQuads && SpareBufferSets == Other.SpareBufferSets
+            && bWavesInCompute == Other.bWavesInCompute && bWaveClipmap == Other.bWaveClipmap && ClipSize == Other.ClipSize
+            && ClipLevels == Other.ClipLevels && ClipFinestSpacing == Other.ClipFinestSpacing && bWaveRings == Other.bWaveRings
+            && FarSphereCells == Other.FarSphereCells;
     }
 
     /** The fields the surface material receives. */

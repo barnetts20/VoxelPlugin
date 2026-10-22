@@ -40,6 +40,14 @@ namespace VoxelShader
         float2(float InX, float InY) : x(InX), y(InY) {}
     };
 
+    // float2 arithmetic as HLSL's (component-wise; with a scalar either side).
+    inline float2 operator+(float2 a, float2 b) { return float2(a.x + b.x, a.y + b.y); }
+    inline float2 operator-(float2 a, float2 b) { return float2(a.x - b.x, a.y - b.y); }
+    inline float2 operator*(float2 a, float2 b) { return float2(a.x * b.x, a.y * b.y); }
+    inline float2 operator*(float2 a, float s) { return float2(a.x * s, a.y * s); }
+    inline float2 operator*(float s, float2 a) { return float2(s * a.x, s * a.y); }
+    inline float2 operator-(float2 a) { return float2(-a.x, -a.y); }
+
     struct float3
     {
         float x, y, z;

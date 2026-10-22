@@ -177,6 +177,7 @@ void FVoxelOceanWaveFrame::FillSites(TArrayView<FVoxelOceanWaveSite> Sites, doub
         Site.Up = Site.Point.GetSafeNormal();
         Site.Depth = VoxelOceanWaves::Deep;
         Site.BedSlope = VoxelOceanWaves::BedUnknown;
+        Site.BedRise = FVector::ZeroVector;
         Site.Shore = FVoxelOceanShore();
         Site.Environment = Context.Environment;
         if (EnumHasAnyFlags(Required, EVoxelOceanWaveInputs::Shore) && Shore.IsValid())
@@ -209,7 +210,9 @@ void FVoxelOceanWaveFrame::FillSites(TArrayView<FVoxelOceanWaveSite> Sites, doub
         // An inland basin below sea level keeps the terrain's depth (stage O9b3): the model drains
         // the surface below the ground toward it (VoxelOceanSurfDrainOf), as the pages' waves do.
         // The bed's slope (stage O9b2): the depth's fall over the footprint either side along the
-        // field's landward direction, where the depth lies near any surf (as VoxelOceanPage.usf's).
+        // field's landward direction and across it (stage O9e: the whole slope's steepness,
+        // VoxelOceanBedWhole, and the way it rises), where the depth lies near any surf (as
+        // VoxelOceanPage.usf's).
         if (EnumHasAnyFlags(Required, EVoxelOceanWaveInputs::Shore) && Footprint <= VoxelOceanWavesDetail::BedMaxFootprint)
         {
             const double Step = FMath::Max(Footprint, VoxelOceanWavesDetail::BedMinStep);
@@ -222,9 +225,12 @@ void FVoxelOceanWaveFrame::FillSites(TArrayView<FVoxelOceanWaveSite> Sites, doub
                 if (!Site.Shore.HasField() || L2 < 0.01 || Site.Depth <= VoxelOceanWavesDetail::BedLand || Site.Depth >= VoxelOceanWavesDetail::BedSea)
                     continue;
                 const FVector Along = Site.Shore.Direction * (Step / FMath::Sqrt(L2));
-                for (int32 Side = 0; Side < 2; Side++)
+                const FVector Cross = FVector::CrossProduct(Site.Point.GetSafeNormal(), Site.Shore.Direction);
+                const double CrossLength = Cross.Size();
+                const FVector Across = CrossLength > 1.0e-3 * FMath::Sqrt(L2) ? Cross * (Step / CrossLength) : FVector::ZeroVector;
+                for (int32 Side = 0; Side < 4; Side++)
                 {
-                    const FVector P = Side == 0 ? Site.Point - Along : Site.Point + Along;
+                    const FVector P = Side == 0 ? Site.Point - Along : (Side == 1 ? Site.Point + Along : (Side == 2 ? Site.Point - Across : Site.Point + Across));
                     BX.Add(P.X);
                     BY.Add(P.Y);
                     BZ.Add(P.Z);
@@ -239,7 +245,16 @@ void FVoxelOceanWaveFrame::FillSites(TArrayView<FVoxelOceanWaveSite> Sites, doub
                 for (int32 k = 0; k < Measured.Num(); k++)
                 {
                     auto Lifted = [&](int32 j) { return (double)BValues[j] - (SeaRadius > 0.0 ? FVector(BX[j], BY[j], BZ[j]).Size() - SeaRadius : 0.0); };
-                    Sites[Measured[k]].BedSlope = (Lifted(2 * k) - Lifted(2 * k + 1)) / (2.0 * Step);
+                    const double AlongSlope = (Lifted(4 * k) - Lifted(4 * k + 1)) / (2.0 * Step);
+                    const double AcrossSlope = (Lifted(4 * k + 2) - Lifted(4 * k + 3)) / (2.0 * Step);
+                    // The steepness (VoxelOceanBedWhole, VoxelOceanShore.ush: the two steps are
+                    // orthogonal here) and the direction it rises in (toward the shallows).
+                    const double Whole = FMath::Sqrt(AlongSlope * AlongSlope + AcrossSlope * AcrossSlope);
+                    Sites[Measured[k]].BedSlope = Whole;
+                    const FVector& Dir = Sites[Measured[k]].Shore.Direction;
+                    const FVector E = Dir.GetSafeNormal();
+                    const FVector F = FVector::CrossProduct(Sites[Measured[k]].Point.GetSafeNormal(), Dir).GetSafeNormal();
+                    Sites[Measured[k]].BedRise = Whole > 1.0e-9 ? ((E * AlongSlope + F * AcrossSlope) / Whole) : FVector::ZeroVector;
                 }
             }
         }

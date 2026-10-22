@@ -40,13 +40,15 @@ namespace VoxelOceanWavesFFTDetail
     }
 
     /** The surf's settings as the shaders get them (VoxelOceanSurfSettingsOf; the chart table's
-     *  constants rows 15 and 16): strength (0 off), sets, swash, skew; handover, surf foam, foam coverage,
-     *  the swash's reach (m). */
-    void SurfRows(const FVoxelOceanFFTSettings& Settings, VoxelShader::float4& Row0, VoxelShader::float4& Row1)
+     *  constants rows 15, 16 and 18): strength (0 off), sets, swash, skew; -, surf foam, foam
+     *  coverage, the swash's reach (m); the directed trains' cutoff (deep wavelengths) and the
+     *  FFT's floor (stage O9i; the debug view in w, the surface's). */
+    void SurfRows(const FVoxelOceanFFTSettings& Settings, VoxelShader::float4& Row0, VoxelShader::float4& Row1, VoxelShader::float4& Row2)
     {
+        Row2 = VoxelShader::float4((float)FMath::Clamp(Settings.SurfCutoff, 0.0, 0.5), (float)FMath::Clamp(Settings.SurfFFTFloor, 0.0, 1.0), 0.0f, 0.0f);
         Row0 = VoxelShader::float4((float)FMath::Max(Settings.SurfStrength, 0.0), (float)FMath::Clamp(Settings.SurfSets, 0.0, 1.0),
             (float)FMath::Max(Settings.SurfSwash, 0.0), (float)FMath::Clamp(Settings.SurfSkew, 0.0, 0.95));
-        Row1 = VoxelShader::float4((float)FMath::Max(Settings.SurfHandover, 1.0), (float)FMath::Max(Settings.SurfFoam, 0.0),
+        Row1 = VoxelShader::float4(0.0f, (float)FMath::Max(Settings.SurfFoam, 0.0),
             (float)FMath::Max(Settings.FoamCoverage, 0.0), (float)FMath::Max(Settings.SurfSwashReach, 1.0));
     }
 
@@ -134,9 +136,9 @@ FVoxelOceanWavesFFT::FVoxelOceanWavesFFT(const FVoxelOceanFFTSettings& InSetting
         MaxHeightCm *= VOXEL_OCEAN_SHOAL_REACH_HEIGHT;
         // The surf (stage O9a) at its most: the long bands' significant height taken as 4 sigma
         // of the whole sea (at least theirs), the short bands' 3 sigma on top.
-        VoxelShader::float4 Row0, Row1;
-        VOF::SurfRows(Settings, Row0, Row1);
-        const VoxelShader::FVoxelOceanSurfSettings Surf = VoxelShader::VoxelOceanSurfSettingsOf(Row0, Row1, (float)Settings.ShoreBreaking);
+        VoxelShader::float4 Row0, Row1, Row2;
+        VOF::SurfRows(Settings, Row0, Row1, Row2);
+        const VoxelShader::FVoxelOceanSurfSettings Surf = VoxelShader::VoxelOceanSurfSettingsOf(Row0, Row1, Row2, (float)Settings.ShoreBreaking);
         const double Sigma = SigmaAt(FMath::Max(Settings.WindSpeed, 0.0));
         const double SurfCm = ((double)VoxelShader::VoxelOceanSurfMaxHeight((float)(4.0 * Sigma), Surf) + 3.0 * Sigma) * 100.0;
         MaxHeightCm = FMath::Max(MaxHeightCm, SurfCm);
@@ -312,9 +314,9 @@ void FVoxelOceanWavesFFT::Evaluate(const FVoxelOceanWaveContext& Context, TConst
     ShoalSettings.LongKeep = 1.0f;
     const float4 BandTiles(Tiles.X, Tiles.Y, Tiles.Z, Tiles.W);
     // The surf's settings (as the shaders get them, VOF::SurfRows) and the clock it runs on.
-    float4 SurfRow0, SurfRow1;
-    VOF::SurfRows(Settings, SurfRow0, SurfRow1);
-    const FVoxelOceanSurfSettings SurfSettings = VoxelOceanSurfSettingsOf(SurfRow0, SurfRow1, ShoalSettings.Breaking);
+    float4 SurfRow0, SurfRow1, SurfRow2;
+    VOF::SurfRows(Settings, SurfRow0, SurfRow1, SurfRow2);
+    const FVoxelOceanSurfSettings SurfSettings = VoxelOceanSurfSettingsOf(SurfRow0, SurfRow1, SurfRow2, ShoalSettings.Breaking);
     const float SurfTime = VOF::SurfClock(Context.Time);
     const float* Sig = Constants.Texels + 24;
     const float4 SlotSigma0(Sig[0], Sig[1], Sig[2], Sig[3]);
@@ -337,7 +339,12 @@ void FVoxelOceanWavesFFT::Evaluate(const FVoxelOceanWaveContext& Context, TConst
         Drain.Keep = 1.0f;
         Drain.Drop = 0.0f;
         Drain.Slope = 0.0f;
+        Drain.SlopeBed = 0.0f;
         float3 DrainDir(0.0f, 0.0f, 0.0f);
+        // The bed's rise (stage O9e; the site's, the field's landward direction where unknown).
+        const double RiseL = Site.BedRise.Size();
+        const bool bRise = RiseL > 0.5;
+        const float3 Rise = bRise ? float3((float)(Site.BedRise.X / RiseL), (float)(Site.BedRise.Y / RiseL), (float)(Site.BedRise.Z / RiseL)) : float3(0.0f, 0.0f, 0.0f);
         // The drain toward inland basins (stage O9b3), as the hook: with shoaling and the field.
         if (ShoalSettings.Breaking > 0.0f && Context.ShoreCells > 0 && Site.Shore.HasField())
         {
@@ -367,7 +374,6 @@ void FVoxelOceanWavesFFT::Evaluate(const FVoxelOceanWaveContext& Context, TConst
                 FVoxelOceanSurfInput In;
                 In.DepthM = DepthM;
                 In.Slope = FMath::Max(Field.Slope, ShoalSettings.MinSlope);
-                In.Agree = Agree;
                 In.ShoreM = Field.Distance;
                 In.Hs = 4.0f * FMath::Sqrt(Sigma.x * Sigma.x + Sigma.y * Sigma.y);
                 In.Speed = FMath::Max(Seas[i].Wind, Seas[i].Swell);
@@ -386,6 +392,14 @@ void FVoxelOceanWavesFFT::Evaluate(const FVoxelOceanWaveContext& Context, TConst
                 In.BedSlope = Site.BedSlope > VoxelOceanWaves::BedUnknown * 0.1 ? VoxelOceanBedSlopeOf(VoxelOceanBedCode((float)Site.BedSlope)) : VOXEL_OCEAN_BED_UNKNOWN;
                 In.BedDepthM = 1.0e30f;
                 In.ForNormals = 0.0f;
+                // The coastal field (stage O9i; the site's shore source's, planet frame).
+                In.CoastA = (float)Site.Shore.CoastA;
+                In.CoastB = (float)Site.Shore.CoastB;
+                In.CoastGradA = float3((float)Site.Shore.CoastGradA.X, (float)Site.Shore.CoastGradA.Y, (float)Site.Shore.CoastGradA.Z);
+                In.CoastGradB = float3((float)Site.Shore.CoastGradB.X, (float)Site.Shore.CoastGradB.Y, (float)Site.Shore.CoastGradB.Z);
+                In.CoastCover = (float)Site.Shore.CoastCover;
+                In.CoastSeedM = (float)Site.Shore.CoastSeedM;
+                In.CoastReachM = (float)Site.Shore.CoastReachM;
                 Surf = VoxelOceanSurfOf(In, SurfSettings);
                 SurfDir = Agree > 1.0e-12f ? Field.Direction * (1.0f / FMath::Sqrt(Agree)) : float3(0.0f, 0.0f, 0.0f);
             }
@@ -502,7 +516,7 @@ void FVoxelOceanWavesFFT::Evaluate(const FVoxelOceanWaveContext& Context, TConst
         if (Surf.Active > 0.5f)
         {
             Sum.Height += Surf.Height * 100.0f;
-            Sum.Gradient = Sum.Gradient + SurfDir * Surf.Gradient;
+            Sum.Gradient = Sum.Gradient + SurfDir * Surf.Gradient + (bRise ? Rise : SurfDir) * Surf.GradientBed + Surf.GradientPhase;
             Sum.VelocityUp += Surf.Rate * 100.0f;
         }
         // The drain toward inland basins (stage O9b3), as the hook.
@@ -510,8 +524,11 @@ void FVoxelOceanWavesFFT::Evaluate(const FVoxelOceanWaveContext& Context, TConst
         {
             Sum = VoxelOceanFFTAccumScale(Sum, Drain.Keep);
             Sum.Height -= Drain.Drop * 100.0f;
-            Sum.Gradient = Sum.Gradient - DrainDir * Drain.Slope;
+            Sum.Gradient = Sum.Gradient - DrainDir * Drain.Slope - (bRise ? Rise : DrainDir) * Drain.SlopeBed;
         }
+        // Thin water (stage O9f), as the hook (the query's spacing: none, the least band).
+        if (ShoalSettings.Breaking > 0.0f && Context.ShoreCells > 0 && Site.Shore.HasField() && Site.Depth < 0.5 * VoxelOceanWaves::Deep)
+            Sum.Height -= 100.0f * VoxelOceanSurfThinDrop((Sum.Height + (float)Site.Depth) * 0.01f, 0.0f);
         const float3 Up((float)Site.Up.X, (float)Site.Up.Y, (float)Site.Up.Z);
         const FVoxelOceanFFTResult W = VoxelOceanFFTFinish(Sum, Up);
         R.Height = W.Height;
@@ -543,12 +560,13 @@ void FVoxelOceanWavesFFT::GetShaderParams(const FVoxelOceanWaveContext& Context,
         (float)FMath::Max(Settings.ShoreChopGrowth, 0.0), (float)FMath::Max(Settings.ShoreWarp, 0.0));
     Out.SlopeVar = FVector4f((float)FMath::Max(Settings.ShoreFade, 0.0), (float)FMath::Max(Settings.ShoreMinSlope, 1.0e-4),
         (float)FMath::Max(Context.ShoreReachM, 0.0), VOF::SurfClock(Context.Time));
-    // The surf (stage O9a; VoxelOceanSurfSettingsOf): the chart table's rows 15 and 16.
+    // The surf (stage O9a; VoxelOceanSurfSettingsOf): the chart table's rows 15, 16 and 18.
     {
-        VoxelShader::float4 Row0, Row1;
-        VOF::SurfRows(Settings, Row0, Row1);
+        VoxelShader::float4 Row0, Row1, Row2;
+        VOF::SurfRows(Settings, Row0, Row1, Row2);
         Out.Surf[0] = FVector4f(Row0.x, Row0.y, Row0.z, Row0.w);
         Out.Surf[1] = FVector4f(Row1.x, Row1.y, Row1.z, Row1.w);
+        Out.Surf[2] = FVector4f(Row2.x, Row2.y, Row2.z, Row2.w);
     }
     // The field's texel-space expansion around the reference (VoxelOceanShore.ush, NEAR THE CAMERA).
     if (Context.ShoreCells > 0)

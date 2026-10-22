@@ -14,6 +14,7 @@
 #include "VoxelShaderCompat.h"
 #include "ocean_fft_emulation.h"
 #include "VoxelOceanShoreCore.h"
+#include "VoxelOceanCoastCore.h"
 
 namespace VoxelShader
 {
@@ -376,12 +377,34 @@ int main()
     std::printf("\n3. The surf's foam (VoxelOceanSurf.ush; a 1:50 beach, 1.5 m waves at 12 m/s)\n");
     {
         using namespace VoxelShader;
-        auto Settings = [](float Foam) { return VoxelOceanSurfSettingsOf(float4(1.0f, 1.0f, 1.0f, 0.85f), float4(2.5f, Foam, 1.0f, 0.0f), 0.78f); };
-        auto Input = [](float D, float T, float Footprint) {
+        auto Settings = [](float Foam) { return VoxelOceanSurfSettingsOf(float4(1.0f, 1.0f, 1.0f, 0.85f), float4(0.0f, Foam, 1.0f, 0.0f), float4(0.2f, 0.25f, 0.0f, 0.0f), 0.78f); };
+        // The coastal field on the beach (stage O9i): along straight rays from the seed depth
+        // (40 m) in, A = integral ds / sqrt(held depth), B = integral sqrt(held depth) ds,
+        // tabulated every 5 cm from 1 m up the beach.
+        const double M = 0.02, X0 = -50.0, Step = 0.05, XSeed = 40.0 / M;
+        std::vector<double> TA(size_t((XSeed - X0) / Step) + 2, 0.0), TB(TA.size(), 0.0);
+        for (int i = int(TA.size()) - 2; i >= 0; i--)
+        {
+            const double Xa = X0 + Step * i, Xb = Xa + Step;
+            if (Xb > XSeed) continue;
+            const double Ha = VoxelOceanCoastHeldDepth(float(M * Xa)), Hb = VoxelOceanCoastHeldDepth(float(M * Xb));
+            TA[size_t(i)] = TA[size_t(i + 1)] + 0.5 * Step * (1.0 / std::sqrt(Ha) + 1.0 / std::sqrt(Hb));
+            TB[size_t(i)] = TB[size_t(i + 1)] + 0.5 * Step * (std::sqrt(Ha) + std::sqrt(Hb));
+        }
+        auto Lerp = [&](const std::vector<double>& T, double X) {
+            const double U = std::clamp((X - X0) / Step, 0.0, double(T.size() - 2));
+            const int I = int(U);
+            return T[size_t(I)] + (T[size_t(I + 1)] - T[size_t(I)]) * (U - I);
+        };
+        auto Input = [&](float D, float T, float Footprint) {
             FVoxelOceanSurfInput In;
-            In.DepthM = D; In.Slope = 0.02f; In.Agree = 1.0f; In.ShoreM = D / 0.02f; In.Hs = 1.5f; In.Speed = 12.0f;
+            In.DepthM = D; In.Slope = 0.02f; In.ShoreM = D / 0.02f; In.Hs = 1.5f; In.Speed = 12.0f;
             In.Units = int3(24414, 48, 7); In.Low = float3(1000.0f - 100.0f * D / 0.02f, 300.0f, 30.0f);
             In.Time = T; In.SpacingM = 0.0f; In.FootprintM = Footprint; In.BedSlope = VOXEL_OCEAN_BED_UNKNOWN; In.BedDepthM = 1.0e30f; In.ForNormals = Footprint > 0.0f ? 1.0f : 0.0f;
+            const double X = D / M, Held = VoxelOceanCoastHeldDepth(D);
+            In.CoastA = float(Lerp(TA, X)); In.CoastB = float(Lerp(TB, X));
+            In.CoastGradA = float3(float(1.0 / std::sqrt(Held)), 0.0f, 0.0f); In.CoastGradB = float3(float(std::sqrt(Held)), 0.0f, 0.0f);
+            In.CoastCover = 1.0f; In.CoastSeedM = 40.0f; In.CoastReachM = 8000.0f;
             return In;
         };
         const FVoxelOceanSurfSettings On = Settings(1.0f), Off = Settings(0.0f);

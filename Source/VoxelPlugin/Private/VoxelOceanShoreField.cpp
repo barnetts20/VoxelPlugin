@@ -175,10 +175,12 @@ bool FVoxelOceanShoreField::IsValid() const
     return N > 0 && Texels.Num() == VoxelOceanShoreCore::NumTexels(N);
 }
 
-UTexture2DArray* FVoxelOceanShoreField::MakeTexture() const
+UTexture2DArray* FVoxelOceanShoreField::MakeTexture(const uint32* Extra, int32 ExtraSlices) const
 {
     if (!IsValid() || !FApp::CanEverRender()) return nullptr;
     const int32 Side = VoxelOceanShoreCore::Side(N);
+    if (!Extra || ExtraSlices <= 0 || 6 + ExtraSlices > 2048) ExtraSlices = 0;
+    const int32 Slices = 6 + ExtraSlices;
     UTexture2DArray* Texture = NewObject<UTexture2DArray>(GetTransientPackage(),
         MakeUniqueObjectName(GetTransientPackage(), UTexture2DArray::StaticClass(), FName(TEXT("VoxelOceanShore"))), RF_Transient);
     if (!Texture) return nullptr;
@@ -186,14 +188,16 @@ UTexture2DArray* FVoxelOceanShoreField::MakeTexture() const
     FTexturePlatformData* Data = new FTexturePlatformData();
     Data->SizeX = Side;
     Data->SizeY = Side;
-    Data->SetNumSlices(6);
+    Data->SetNumSlices(Slices);
     Data->PixelFormat = PF_R32_FLOAT;
-    FTexture2DMipMap* Level = new FTexture2DMipMap(Side, Side, 6);
+    FTexture2DMipMap* Level = new FTexture2DMipMap(Side, Side, Slices);
     Data->Mips.Add(Level);
     const int64 Bytes = (int64)Texels.Num() * sizeof(uint32);
+    const int64 ExtraBytes = (int64)ExtraSlices * Side * Side * (int64)sizeof(uint32);
     Level->BulkData.Lock(LOCK_READ_WRITE);
-    void* Memory = Level->BulkData.Realloc(Bytes);
+    uint8* Memory = (uint8*)Level->BulkData.Realloc(Bytes + ExtraBytes);
     FMemory::Memcpy(Memory, Texels.GetData(), Bytes);
+    if (ExtraBytes > 0) FMemory::Memcpy(Memory + Bytes, Extra, ExtraBytes);
     Level->BulkData.Unlock();
     Texture->SetPlatformData(Data);
     Texture->SRGB = false;

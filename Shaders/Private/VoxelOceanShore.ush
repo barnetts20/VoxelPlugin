@@ -544,6 +544,20 @@ VOXEL_FUNC float VoxelOceanShoreCoverage(float Distance, float CellM)
 // An unknown slope (no field direction there, or far from any surf): the field's slope stands in.
 #define VOXEL_OCEAN_BED_UNKNOWN (-1.0e4f)
 
+// The bed's steepness (stage O9e): its whole slope from its falls along two tangent directions
+// (unit E and F, which needn't be orthogonal; m per m along each). Its direction isn't coded: the
+// pixel takes it from the depth's own derivatives, the query from the falls themselves.
+VOXEL_FUNC float VoxelOceanBedWhole(float Along, float Across, float3 E, float3 F)
+{
+    // The gradient G in the plane of E and F with G.E = Along, G.F = Across.
+    const float C = dot(E, F);
+    const float Det = 1.0f - C * C;
+    if (Det < 1.0e-4f) return abs(Along);
+    const float A = (Along - C * Across) / Det;
+    const float B = (Across - C * Along) / Det;
+    return sqrt(max(A * A + B * B + 2.0f * A * B * C, 0.0f));
+}
+
 VOXEL_FUNC uint VoxelOceanBedCode(float Slope)
 {
     const float A = abs(Slope);

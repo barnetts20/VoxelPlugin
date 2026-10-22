@@ -23,6 +23,7 @@
 
 #include "CoreMinimal.h"
 #include "VoxelOceanTiles.h"
+#include "UObject/StrongObjectPtr.h"
 #include <atomic>
 
 class AActor;
@@ -32,10 +33,19 @@ class URealtimeMeshSimple;
 class URealtimeMeshComponent;
 class FVoxelOceanPageProvider;
 class FVoxelOceanInputCache;
+class FTextureResource;
+class UTexture2D;
+class UTexture2DArray;
+struct FVoxelOceanDisplaceState;
+struct FVoxelOceanClipState;
+struct FVoxelOceanClipPlan;
+struct FVoxelOceanRingSet;
 struct FVoxelDensityGPUData;
 struct FVoxelEditGPUData;
 struct FVoxelOceanShoreRHI;
+struct FVoxelOceanLandCacheRHI;
 struct FVoxelOceanProbeState;
+struct FVoxelOceanCoastDepthJob;
 namespace VoxelOceanDepthProbe { struct FLevels; }
 
 /** What the page writes sample the terrain depth from. */
@@ -57,6 +67,72 @@ struct FVoxelOceanDensityInputs
      *  terrain detail finer than this (cm; the tile's own footprint where that is coarser). The
      *  land cull keeps the tile's footprint. 0: the tile's footprint. */
     double DepthFootprintCm = 0.0;
+    /** The terrain's land surface cache (stage O9m; null: none, or not written for the camera):
+     *  the depths read it wherever it holds the point, the density elsewhere. */
+    TSharedPtr<const FVoxelOceanLandCacheRHI, ESPMode::ThreadSafe> LandCache;
+    /** The newest edit the cache's texels carry (FVoxelLandCache::GetSettledEditSequence). */
+    uint32 LandEditSequence = 0;
+};
+
+/** The waves in compute (stage O9j; VoxelOceanDisplace.usf): what every page's per-frame
+ *  displacement takes, as the material gets it this frame (FVoxelOceanSurface::UpdateMaterial). */
+struct FVoxelOceanDisplaceFrame
+{
+    /** False: no displacement this frame (the pages keep what they last drew). */
+    bool bOn = false;
+    /** The planet frame in world space (the pages' attach root, without scale) and the selection
+     *  camera in world space: the pages' vertices are morphed and waved from it. */
+    FTransform PlanetToWorld = FTransform::Identity;
+    FVector CameraWorld = FVector::ZeroVector;
+    /** Level 0's morph end (world cm; the pages' own, set by SetDisplaceFrame). */
+    double MorphEnd0 = 0.0;
+    /** VoxelOceanParams with its real morph mode (x), the test waves, the planet centre from the
+     *  selection camera, the FFT model's vectors (States.x 0 without the shore texture). */
+    FVector4f Params = FVector4f(0.0f, 0.0f, 0.0f, 0.0f);
+    FVector4f Wave[3] = { FVector4f(0.0f, 0.0f, 0.0f, 0.0f), FVector4f(0.0f, 0.0f, 0.0f, 0.0f), FVector4f(0.0f, 0.0f, 0.0f, 0.0f) };
+    FVector3f Center = FVector3f::ZeroVector;
+    FVector4f Shape = FVector4f(0.0f, 0.0f, 0.0f, 0.0f);
+    FVector4f FFT = FVector4f(0.0f, 0.0f, 0.0f, 0.0f);
+    FVector4f RefHigh = FVector4f(0.0f, 0.0f, 0.0f, 0.0f);
+    FVector4f RefLow = FVector4f(0.0f, 0.0f, 0.0f, 0.0f);
+    FVector4f Rotation = FVector4f(0.0f, 0.0f, 0.0f, 1.0f);
+    FVector4f Tiles = FVector4f(1.0f, 1.0f, 1.0f, 1.0f);
+    FVector4f States = FVector4f(0.0f, 0.0f, 0.0f, 0.0f);
+    FVector4f SlopeVar = FVector4f(0.0f, 0.0f, 0.0f, 0.0f);
+    /** The rings' land cull (stage W2): x the height the land must stand above the sea at a vertex
+     *  (cm, the margin and the waves'; negative: no cull), y the slope bound, z the reach a
+     *  triangle adds besides its cells (cm: the waves' horizontal reach, the lattice step), w how
+     *  far the far sphere sinks under the rings (cm). */
+    FVector4f RingCull = FVector4f(-1.0f, 0.0f, 0.0f, 0.0f);
+    /** The material's textures (null: stand-ins, and FFT.x 0). Read by the render command only. */
+    FTextureResource* Displacement = nullptr;
+    FTextureResource* Derivatives = nullptr;
+    FTextureResource* Charts = nullptr;
+    FTextureResource* Shore = nullptr;
+};
+
+/** The wave clipmap (stages O9k, W1; VoxelOceanClip.ush, VoxelOceanClipmap.h): the composed sea
+ *  evaluated on up to Levels camera-centred levels of Size^2 texels (as many as reach past the
+ *  horizon), the first's spacing Finest cm or coarser with the camera's height, from a static
+ *  layer of what the terrain and the shore give each texel (written as the windows reach it); the
+ *  pages' vertices (with the waves in compute) and the material's pixel node (VoxelOceanPixelClip)
+ *  sample them. */
+struct FVoxelOceanClipSettings
+{
+    bool bOn = true;
+    int32 Size = 128;
+    int32 Levels = 12;
+    double FinestCm = 20.0;
+    /** Stage W2: the mesh as rings on the clipmap's levels and a far sphere (VoxelOceanRings.usf)
+     *  instead of the tile pages, whenever the clipmap runs; the far sphere's cells a face edge. */
+    bool bRings = true;
+    int32 FarCells = 64;
+
+    bool operator==(const FVoxelOceanClipSettings& O) const
+    {
+        return bOn == O.bOn && Size == O.Size && Levels == O.Levels && FinestCm == O.FinestCm && bRings == O.bRings && FarCells == O.FarCells;
+    }
+    bool operator!=(const FVoxelOceanClipSettings& O) const { return !(*this == O); }
 };
 
 /** Game thread. The pages of one ocean surface. */
@@ -96,6 +172,52 @@ public:
     /** Destroys every page and buffer set. */
     void Reset();
 
+    /** The waves in compute (stage O9j): each page displaces its vertices every frame
+     *  (VoxelOceanDisplace.usf) from SetDisplaceFrame's inputs, and the material's vertex node
+     *  passes them through (VoxelOceanParams.x 3). A change drops every page (they register
+     *  again with the driver's every-frame trigger, or on demand). */
+    void SetWavesInCompute(bool bInCompute);
+    bool IsWavesInCompute() const { return bWavesInCompute; }
+
+    /** Game thread, once a frame with the waves in compute: this frame's displacement inputs, for
+     *  every page's run in this frame's rendering. */
+    void SetDisplaceFrame(const FVoxelOceanDisplaceFrame& Frame);
+
+    /** The wave clipmap's settings (stage O9k): makes its textures (the material binds them:
+     *  GetClipTextures). Off: none, the vertices evaluate the waves themselves. */
+    void SetClipmap(const FVoxelOceanClipSettings& InSettings);
+    bool IsClipmapOn() const { return ClipSettings.bOn && ClipDisplacement.IsValid(); }
+    UTexture2DArray* GetClipDisplacement() const { return ClipDisplacement.Get(); }
+    UTexture2DArray* GetClipNormal() const { return ClipNormal.Get(); }
+    UTexture2D* GetClipInfo() const { return ClipInfo.Get(); }
+
+    /** Game thread, once a frame after SetDisplaceFrame, with the clipmap on: the levels around
+     *  the selection camera (planet frame) evaluated with Waves (the material's parameters and
+     *  textures) and the open sea's foam texture; their beds sampled again where they moved or the
+     *  terrain changed. */
+    void UpdateClipmap(const FVector& CameraPlanet, const FVoxelOceanDisplaceFrame& Waves, FTextureResource* Foam);
+
+    /** Game thread (stage W1). An edit's sphere (planet frame, cm) that the depths now carry (the
+     *  surface's: once the terrain's edit data, and the land surface cache, hold it): the static
+     *  layer writes it again. */
+    void NotifyClipEdit(const FVector& Center, double Reach);
+    /** Game thread. The static layer and the waves written again everywhere (the edits replaced). */
+    void InvalidateClip();
+    /** The clipmap's last second (the surface's log): levels, static texels written, re-anchors. */
+    FString TakeClipPerf();
+
+    /** Stage W2: the rings can draw the surface (the setting on, the clipmap on with the waves in
+     *  compute, the clipmap's size big enough for rings). */
+    bool CanDrawRings() const;
+    /** Game thread. The rings on (made: one mesh for every level and the far sphere, which the
+     *  clipmap's frames then fill; the tile pages are the surface's to drop) or off (destroyed). */
+    void SetRings(bool bOn);
+    bool IsRingsOn() const;
+    /** Game thread, every frame with the rings on (after the clipmap's update): their origin and
+     *  frame around the camera (planet frame), their land cull (FVoxelOceanDisplaceFrame::
+     *  RingCull). Without this frame's clipmap the far sphere still draws. */
+    void UpdateRings(const FVector& CameraPlanet, const FVector4f& Cull);
+
     /** Changes the material of every buffer set, pooled ones included. */
     void SetMaterial(UMaterialInterface* InMaterial);
 
@@ -130,6 +252,12 @@ public:
      *  density inputs set now, in a graph of its own; the result replaces the probe state's on the
      *  render thread. Radius: the sea sphere (cm). */
     void ProbeDepth(const VoxelOceanDepthProbe::FLevels& Levels, double InRadius);
+
+    /** Game thread. Samples the terrain's depth at Count of a coastal field job's fine cells from
+     *  First (stage O9h, VoxelOceanCoastField.h: VoxelOceanPage.usf's CoastDepthCS), read back
+     *  into the job on the render thread. False when it can't yet (no terrain density, or no
+     *  rendering): nothing is enqueued. */
+    bool SampleCoastDepths(const TSharedPtr<FVoxelOceanCoastDepthJob, ESPMode::ThreadSafe>& Job, int64 First, int32 Count, double InRadius);
 
     /** The depth probe's result (render thread data; the underwater pass reads it). */
     const TSharedPtr<FVoxelOceanProbeState, ESPMode::ThreadSafe>& GetProbeState() const { return ProbeState; }
@@ -213,6 +341,26 @@ private:
     double MorphEnd0 = 0.0;
     double WaveReach = 0.0;
     bool bFlipWinding = false;
+    bool bWavesInCompute = false;
+    /** The displacement's inputs this frame (render thread; stage O9j). */
+    TSharedPtr<FVoxelOceanDisplaceState, ESPMode::ThreadSafe> DisplaceState;
+    /** The wave clipmap (stages O9k, W1): its settings, textures, its plan (the levels, what each
+     *  slot holds), the density inputs' version (the static layer is written again when it
+     *  changes), its render state. */
+    FVoxelOceanClipSettings ClipSettings;
+    TStrongObjectPtr<UTexture2DArray> ClipDisplacement;
+    TStrongObjectPtr<UTexture2DArray> ClipNormal;
+    TStrongObjectPtr<UTexture2D> ClipInfo;
+    TUniquePtr<FVoxelOceanClipPlan> ClipPlan;
+    /** The rings (stage W2; null: off). */
+    TUniquePtr<FVoxelOceanRingSet> Rings;
+    void DestroyRings();
+    /** Game thread, once a frame with the clipmap's: registers the rings' provider once it can
+     *  run, moves their origin when the camera is far from it, samples the far sphere's land again
+     *  when the terrain changed. Returns the camera from the origin (planet frame, cm). */
+    FVector AdvanceRings(const FVector& CameraPlanet);
+    uint32 DensityVersion = 1;
+    TSharedPtr<FVoxelOceanClipState, ESPMode::ThreadSafe> ClipState;
     FVoxelOceanDensityInputs DensityInputs;
     /** Stand-ins for missing inputs: a density with no terrain (every vertex deep water) and
      *  no edits. */

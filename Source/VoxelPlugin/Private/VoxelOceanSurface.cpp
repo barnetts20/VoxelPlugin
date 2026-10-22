@@ -16,6 +16,7 @@
 #include "VoxelOceanWavesFFT.h"
 #include "VoxelOceanWeatherKeys.h"
 #include "VoxelOceanShoreField.h"
+#include "VoxelOceanCoastField.h"
 #include "VoxelOceanDepthProbe.h"
 #include "TextureResource.h"
 
@@ -37,6 +38,15 @@ static TAutoConsoleVariable<int32> CVarVoxelOceanShoreDetail(
     TEXT("voxel.Ocean.ShoreDetail"),
     1,
     TEXT("The ocean mesh's split bias near shores (stage O9c; the settings' ShoreDetail): 1 on, 0 off (the plain CDLOD distance)."),
+    ECVF_Default);
+
+static TAutoConsoleVariable<int32> CVarVoxelOceanDebugSurf(
+    TEXT("voxel.Ocean.DebugSurf"), 0,
+    TEXT("Shows one of the surf's or the shore's quantities as the ocean's foam (0 to 1; stage O9f), to find where one changes abruptly: ")
+    TEXT("0 off, 1 the field's direction agreement, 2 the surf trains' share, 3 the swell trains' share, 4 the long FFT waves kept, ")
+    TEXT("5 the FFT warp's move (2 km white), 6 the waves' depth (50 m white), 7 the field's slope (1:50 white), 8 the bed's hold, ")
+    TEXT("9 the field's distance (10 km white), 10 the drain's keep; the coastal field (stage O9h): 11 a 9 s wave's crests, 12 its cover, ")
+    TEXT("13 its slowness check (half white where right), 14 its rays against the shore field's direction (white: the same)."),
     ECVF_Default);
 
 static TAutoConsoleVariable<int32> CVarVoxelOceanFlipWinding(
@@ -67,11 +77,16 @@ namespace VoxelOceanSurfaceDetail
     const FName SlopeVarName(TEXT("VoxelOceanSlopeVar"));
     // The shore field's texture (stage O8; VoxelOcean.ush's shore entry points).
     const FName ShoreName(TEXT("VoxelOceanShore"));
+    // The wave clipmap's textures (stage O9k).
+    const FName ClipDisplacementName(TEXT("VoxelOceanClipDisplacement"));
+    const FName ClipNormalName(TEXT("VoxelOceanClipNormal"));
+    const FName ClipInfoName(TEXT("VoxelOceanClipInfo"));
     /** The depth probe runs while the camera is within the waves' reach and this (cm) of the sea. */
     constexpr double ProbeHeight = 2000.0;
-    /** The chart table's per-frame rows (from row 8): the shore frame (7), the surf (2) and the
-     *  split bias (1, stage O9c). */
-    constexpr int32 FrameRows = 10;
+    /** The chart table's per-frame rows (from row 8): the shore frame (7), the surf (2), the
+     *  split bias (1, stage O9c), the surf's third (1, stage O9d) and the coastal field's layout
+     *  (3, stage O9h). */
+    constexpr int32 FrameRows = 14;
     /** The split bias's per-node coast bounds kept at most (then dropped and made again). */
     constexpr int32 CoastBoundCacheMax = 200000;
     constexpr double Hysteresis = 1.1;
@@ -120,6 +135,11 @@ void FVoxelOceanSurface::Initialize(AActor* InOwner, USceneComponent* InAttachRo
     Pages = MakeUnique<FVoxelOceanPages>();
     Pages->Initialize(InOwner, InAttachRoot, Settings.Material.Get(), Settings.Radius, Settings.TileQuads,
         VoxelOceanTiles::MorphEnd0(Settings.Radius, Settings.LodDistanceFactor), bFlipWinding);
+    Pages->SetWavesInCompute(Settings.bWavesInCompute);
+    FVoxelOceanClipSettings Clip = Settings.Clip;
+    Clip.bOn = Clip.bOn && Settings.bWavesInCompute;
+    Pages->SetClipmap(Clip);
+    bClipBound = false;
     if (bHasInputs)
         Pages->SetDensityInputs(Inputs.Density);
     if (WaveModel.IsValid())
@@ -166,6 +186,9 @@ void FVoxelOceanSurface::SetInputs(const FVoxelOceanSurfaceInputs& InInputs)
     // Tiles written before any inputs, or for other ones, are written again.
     bRewriteAll |= bChanged && Committed.Num() > 0;
     Inputs = InInputs;
+    // Without the land surface cache the depths carry whatever the edit data does.
+    if (!Inputs.Density.LandCache.IsValid())
+        Inputs.WrittenEditSequence = Inputs.EditSequence;
     bHasInputs = true;
     if (Pages.IsValid())
         Pages->SetDensityInputs(Inputs.Density);
@@ -387,30 +410,36 @@ void FVoxelOceanSurface::BuildWrites(TConstArrayView<FVoxelOceanTileKey> Tiles, 
 
 void FVoxelOceanSurface::ApplyRewrites()
 {
+    // The edits the depths now carry (stage O9m: the terrain's edit data, and the land surface
+    // cache's texels when the depths read it): the clipmap's static layer and the tiles under
+    // them are written again.
+    const uint32 Written = Inputs.WrittenEditSequence;
+    TArray<FPendingEdit> Ready;
+    for (int32 i = 0; i < PendingEdits.Num(); i++)
+    {
+        if (PendingEdits[i].Sequence > Written) continue;
+        Ready.Add(PendingEdits[i]);
+        PendingEdits.RemoveAtSwap(i--);
+    }
+    if (bRewriteAll)
+        Pages->InvalidateClip();
+    else
+        for (const FPendingEdit& Edit : Ready) Pages->NotifyClipEdit(Edit.Center, Edit.Reach);
     if (Committed.Num() == 0)
     {
         // Tiles written later sample the edits the inputs hold by then.
         bRewriteAll = false;
-        PendingEdits.RemoveAll([this](const FPendingEdit& Edit) { return Edit.Sequence <= Inputs.EditSequence; });
         return;
     }
     TArray<FVoxelOceanTileKey> ToWrite;
     if (bRewriteAll)
     {
+        // The edits the inputs hold are in these writes.
         ToWrite = Committed.Array();
         bRewriteAll = false;
-        // The edits the inputs hold are in these writes.
-        PendingEdits.RemoveAll([this](const FPendingEdit& Edit) { return Edit.Sequence <= Inputs.EditSequence; });
     }
     else
     {
-        TArray<FPendingEdit> Ready;
-        for (int32 i = 0; i < PendingEdits.Num(); i++)
-        {
-            if (PendingEdits[i].Sequence > Inputs.EditSequence) continue;
-            Ready.Add(PendingEdits[i]);
-            PendingEdits.RemoveAtSwap(i--);
-        }
         if (Ready.Num() == 0) return;
         for (const FVoxelOceanTileKey& Tile : Committed)
         {
@@ -460,9 +489,37 @@ void FVoxelOceanSurface::Tick(const FVector& Camera)
         bFirstFill = true;
     }
 
-    Pages->Flush(Settings.SpareBufferSets);
+    // (No spare buffer sets for tiles while the rings draw: stage W2.)
+    Pages->Flush(Pages->IsRingsOn() ? 0 : Settings.SpareBufferSets);
     ApplyRewrites();
     UpdateProbe(Camera);
+
+    // Stage W2: the rings draw the surface whenever the wave clipmap runs (the FFT waves, in
+    // compute); the tile pages only otherwise. Switching drops the other's mesh.
+    const bool bRings = Pages->CanDrawRings() && FFTModel.IsValid() && Cascades.IsValid();
+    if (bRings != Pages->IsRingsOn())
+    {
+        Pages->SetRings(bRings);
+        if (Pages->IsRingsOn())
+        {
+            Pages->Reset();
+            Committed.Reset();
+            CommittedSplit.Reset();
+            bFirstFill = true;
+        }
+    }
+    if (Pages->IsRingsOn())
+    {
+        // Every frame around this camera: the clipmap and the rings follow it (UpdateMaterial).
+        SelectionCamera = Camera;
+        SelectionBias = BiasRow();
+        bHasSelectionCamera = true;
+        Perf.Wait = 0;
+        UpdateMaterial();
+        Pages->UpdateRings(Camera, RingCull());
+        LogPerf(Now);
+        return;
+    }
     // The split bias's coast (stage O9c): the selection below measures from it; a new one is
     // written into every tile with the selection that first uses it.
     UpdateCoast();
@@ -663,6 +720,12 @@ TSharedPtr<FVoxelOceanProbeState, ESPMode::ThreadSafe> FVoxelOceanSurface::GetPr
     return Pages.IsValid() ? Pages->GetProbeState() : nullptr;
 }
 
+bool FVoxelOceanSurface::SampleCoastDepths(const TSharedPtr<FVoxelOceanCoastDepthJob, ESPMode::ThreadSafe>& Job, int64 First, int32 Count)
+{
+    if (!Pages.IsValid() || !bHasInputs || Settings.Radius <= 0.0) return false;
+    return Pages->SampleCoastDepths(Job, First, Count, Settings.Radius);
+}
+
 void FVoxelOceanSurface::UpdateProbe(const FVector& Camera)
 {
     static_assert(VoxelOceanDepthProbe::Levels == UE_ARRAY_COUNT(ProbeAnchors), "one anchor a level");
@@ -676,8 +739,8 @@ void FVoxelOceanSurface::UpdateProbe(const FVector& Camera)
     if (State.IsValid() && State->bRetry.exchange(false, std::memory_order_acq_rel))
         bProbed = false;
     bool bSame = bProbed && ProbeDensity == Inputs.Density.Density.Get() && ProbeEdits == Inputs.Density.Edits.Get()
-        && ProbeShore == Inputs.Density.Shore.Get() && ProbeSequence == Inputs.EditSequence && ProbeHalfFinest == Inputs.Density.HalfFinest
-        && ProbeDepthFootprint == Inputs.Density.DepthFootprintCm;
+        && ProbeShore == Inputs.Density.Shore.Get() && ProbeSequence == Inputs.WrittenEditSequence && ProbeHalfFinest == Inputs.Density.HalfFinest
+        && ProbeDepthFootprint == Inputs.Density.DepthFootprintCm && ProbeLandCache == Inputs.Density.LandCache.Get();
     for (int32 L = 0; bSame && L < VoxelOceanDepthProbe::Levels; L++)
         bSame = ProbeAnchors[L] == Levels.Anchor[L];
     if (bSame) return;
@@ -687,7 +750,8 @@ void FVoxelOceanSurface::UpdateProbe(const FVector& Camera)
     ProbeDensity = Inputs.Density.Density.Get();
     ProbeEdits = Inputs.Density.Edits.Get();
     ProbeShore = Inputs.Density.Shore.Get();
-    ProbeSequence = Inputs.EditSequence;
+    ProbeSequence = Inputs.WrittenEditSequence;
+    ProbeLandCache = Inputs.Density.LandCache.Get();
     ProbeHalfFinest = Inputs.Density.HalfFinest;
     ProbeDepthFootprint = Inputs.Density.DepthFootprintCm;
     bProbed = true;
@@ -753,16 +817,29 @@ bool FVoxelOceanSurface::GetWaveFrame(FVoxelOceanWaveFrame& Out) const
     Out.Model = WaveModel;
     // The depth the waves feel (stage O9b2), as the pages sample it.
     Out.DepthFootprintCm = Inputs.Density.DepthFootprintCm;
-    // The shore field (stage O8): the queries' shore source, its size for the shaders.
+    // The shore field (stage O8): the queries' shore source, its size for the shaders; with the
+    // coastal field when it goes with it (stage O9i: the surf's trains).
     if (Inputs.Shore.IsValid() && Inputs.Shore->IsValid())
     {
-        Out.Shore = Inputs.Shore;
+        if (Inputs.Coast.IsValid() && Inputs.Coast->Shore == Inputs.Shore && Inputs.Coast->IsValid())
+            Out.Shore = Inputs.Coast;
+        else
+            Out.Shore = Inputs.Shore;
         Out.ShoreMarginCm = Inputs.Density.ShoreMarginCm;
         Out.Context.ShoreCells = Inputs.Shore->N;
         Out.Context.ShoreReachM = Inputs.Shore->ReachM;
         Out.Context.ShoreMarginM = Inputs.Density.ShoreMarginCm * 0.01;
     }
     return true;
+}
+
+FVector4f FVoxelOceanSurface::RingCull() const
+{
+    // The rings' land cull (stage W2): as the tiles' (BuildWrites) per vertex, the waves' height
+    // and reach with their headroom; the far sphere sinks under the waves.
+    const float Sink = (float)(CullHeight + 200.0);
+    if (Inputs.LandCullMargin < 0.0) return FVector4f(-1.0f, 0.0f, 0.0f, Sink);
+    return FVector4f((float)(Inputs.LandCullMargin + CullHeight), (float)Inputs.SlopeBound, (float)(CullReach + 2.0 * Inputs.Density.HalfFinest), Sink);
 }
 
 void FVoxelOceanSurface::UpdateMaterial()
@@ -790,7 +867,10 @@ void FVoxelOceanSurface::UpdateMaterial()
     // camera).
     FVoxelOceanWaveShaderParams Waves;
     Frame.ShaderParams(SelectionCamera, Waves);
-    Material->SetVectorParameterValue(VOS::ParamsName, FLinearColor((float)Mode, (float)StartFraction, Waves.Amplitude, (float)SpacingPerMorphEnd));
+    // With the waves in compute (stage O9j) the material's vertex node only passes the pages'
+    // displaced vertices through (mode 3); the pages morph with the real mode.
+    const bool bCompute = Pages.IsValid() && Pages->IsWavesInCompute();
+    Material->SetVectorParameterValue(VOS::ParamsName, FLinearColor(bCompute ? 3.0f : (float)Mode, (float)StartFraction, Waves.Amplitude, (float)SpacingPerMorphEnd));
     Material->SetVectorParameterValue(VOS::CenterName, FLinearColor((float)Center.X, (float)Center.Y, (float)Center.Z, 0.0f));
     Material->SetVectorParameterValue(VOS::ShapeName, FLinearColor(Waves.Shape.X, Waves.Shape.Y, Waves.Shape.Z, Waves.Shape.W));
     if (Waves.Amplitude > 0.0f)
@@ -831,6 +911,8 @@ void FVoxelOceanSurface::UpdateMaterial()
         // The foam's settings live (the model doesn't rebuild for them): the surf's row 16.
         Waves.Surf[1].Y = (float)FMath::Max(Inputs.Waves.SurfFoam, 0.0);
         Waves.Surf[1].Z = (float)FMath::Max(Inputs.Waves.FoamCoverage, 0.0);
+        // The debug view (stage O9f; row 18 w).
+        Waves.Surf[2].W = (float)FMath::Clamp(CVarVoxelOceanDebugSurf.GetValueOnGameThread(), 0, 14);
         // The shore field's expansion around the selection camera (VoxelOceanShore.ush).
         WriteShoreFrame(Waves);
         // The shore field's texture once it exists (until then States.x is 0: no field).
@@ -877,6 +959,57 @@ void FVoxelOceanSurface::UpdateMaterial()
         }
     }
 
+    // The pages' displacement this frame (stage O9j): what the material's vertex node took.
+    if (bCompute)
+    {
+        FVoxelOceanDisplaceFrame D;
+        D.bOn = true;
+        D.PlanetToWorld = Frame.PlanetToWorld;
+        D.CameraWorld = CameraWorld;
+        D.Params = FVector4f((float)Mode, (float)StartFraction, Waves.Amplitude, (float)SpacingPerMorphEnd);
+        for (int32 w = 0; w < 3; w++) D.Wave[w] = Waves.Wave[w];
+        D.Center = FVector3f(Center);
+        D.Shape = Waves.Shape;
+        D.RingCull = RingCull();
+        if (bFFT)
+        {
+            const FVoxelOceanCascadeTextures& Textures = Cascades->GetTextures();
+            D.FFT = Waves.FFT;
+            D.RefHigh = Waves.RefHigh;
+            D.RefLow = Waves.RefLow;
+            D.Rotation = Waves.Rotation;
+            D.Tiles = Waves.Tiles;
+            D.States = Waves.States;
+            if (!Inputs.ShoreTexture) D.States.X = 0.0f;
+            D.SlopeVar = Waves.SlopeVar;
+            D.Displacement = Textures.Displacement ? Textures.Displacement->GetResource() : nullptr;
+            D.Derivatives = Textures.Derivatives ? Textures.Derivatives->GetResource() : nullptr;
+            D.Charts = Textures.Charts ? Textures.Charts->GetResource() : nullptr;
+            D.Shore = Inputs.ShoreTexture ? Inputs.ShoreTexture->GetResource() : nullptr;
+        }
+        Pages->SetDisplaceFrame(D);
+        // The wave clipmap (stage O9k): its levels around the selection camera this frame, and its
+        // textures to the material once.
+        if (Pages->IsClipmapOn() && bFFT)
+        {
+            const FVoxelOceanCascadeTextures& Textures = Cascades->GetTextures();
+            Pages->UpdateClipmap(SelectionCamera, D, Textures.Foam ? Textures.Foam->GetResource() : nullptr);
+            if (!bClipBound)
+            {
+                Material->SetTextureParameterValue(VOS::ClipDisplacementName, Pages->GetClipDisplacement());
+                Material->SetTextureParameterValue(VOS::ClipNormalName, Pages->GetClipNormal());
+                Material->SetTextureParameterValue(VOS::ClipInfoName, Pages->GetClipInfo());
+                bClipBound = true;
+                UTexture* TextureProbe = nullptr;
+                if (Material->Parent && !Material->Parent->GetTextureParameterValue(FHashedMaterialParameterInfo(VOS::ClipNormalName), TextureProbe))
+                {
+                    UE_LOG(LogVoxelPlugin, Log, TEXT("[VoxelOcean] %s has no texture parameters VoxelOceanClipDisplacement, VoxelOceanClipNormal and VoxelOceanClipInfo: its pixel node still evaluates the waves itself (stage O9k notes, material setup)."),
+                        *GetNameSafe(Material->Parent));
+                }
+            }
+        }
+    }
+
     if (!bReportedMaterial)
     {
         // Ask the parent: the instance reports its own overrides (just set above) whether or
@@ -918,13 +1051,17 @@ void FVoxelOceanSurface::WriteShoreFrame(const FVoxelOceanWaveShaderParams& Wave
     UTexture2D* Texture = Cascades.IsValid() ? Cascades->GetTextures().Charts : nullptr;
     if (!Texture || !Texture->GetResource() || !FFTModel.IsValid()) return;
     // Rows 8 to 14 the shore field's expansion, 15 and 16 the surf's settings (stage O9a), 17 the
-    // split bias the tiles on screen were selected with (stage O9c).
+    // split bias the tiles on screen were selected with (stage O9c), 18 the surf's swell and
+    // blends (stage O9d), 19 to 21 the coastal field's layout (stage O9h; zeros: none).
     static_assert(UE_ARRAY_COUNT(WrittenShoreFrame) == VOS::FrameRows, "one written row a frame row");
     FVector4f Rows[VOS::FrameRows];
     for (int32 i = 0; i < 7; i++) Rows[i] = Waves.ShoreFrame[i];
     Rows[7] = Waves.Surf[0];
     Rows[8] = Waves.Surf[1];
     Rows[9] = SelectionBias;
+    Rows[10] = Waves.Surf[2];
+    const bool bCoast = Inputs.Coast.IsValid() && Inputs.Coast->IsValid() && Inputs.ShoreTexture != nullptr;
+    for (int32 i = 0; i < 3; i++) Rows[11 + i] = bCoast ? Inputs.Coast->Rows[i] : FVector4f(0.0f, 0.0f, 0.0f, 0.0f);
     // The weather's upload rewrites the whole texture: write again after one (counted as made,
     // so a table uploaded again under the same serial counts too).
     bool bSame = ShoreFrameUploads == ChartUploads && ShoreFrameTexture == Texture;

@@ -71,10 +71,11 @@ Ocean harnesses (stages O1-O4, O6a, O6b, O7, O8, O9a-O9c). Plain C++20; no engin
                             shorter waves toward the coast, no seams (the texel-space expansion near the camera), the
                             underwater waterline against the query, the reach
       (built as hook_check, with shore_hook_check.cpp and -pthread)
-  surf_check.cpp            O9a: the surf (VoxelOceanSurf.ush) on a uniform beach: its gradient and rate against finite
-                            differences, continuity in depth, across the clock's wrap and between trains, breaking under
-                            0.78 d, the bores' steep fronts, the swash climbing the beach and falling below the still level,
-                            the handover, the sets (wave to wave, along the coast), the resolution fade, the reach
+  surf_check.cpp            O9i: the shore's waves (VoxelOceanSurf.ush) from a coastal field integrated along straight rays
+                            on uniform beaches: the composition (cutoff, ramp, the FFT's floor, cover, reach), the crests'
+                            spacing against the exact wavelength, the gradient and rate against finite differences,
+                            continuity (depth, the still level, the clock's wrap), the swash and its fade on land by the
+                            mesh, the trains' fade by the mesh, the bores' least front, the foam, the bound
       g++ -O2 -std=c++20 -ffp-contract=off -I<plugin>/Source/VoxelPlugin/Public -I<plugin>/Source/VoxelPlugin/Private
           -I<plugin>/Shaders/Private surf_check.cpp -o surf_check
   foam_check.cpp            O9b: the open sea's foam (VoxelOceanFoam.ush: the per-slot envelope, the point's combination) on
@@ -84,6 +85,18 @@ Ocean harnesses (stages O1-O4, O6a, O6b, O7, O8, O9a-O9c). Plain C++20; no engin
                             (VoxelOceanSurf.ush: bores, no step at the trough, the mean unresolved, the swash's edge, off)
       g++ -O2 -std=c++20 -ffp-contract=off -I<plugin>/Source/VoxelPlugin/Public -I<plugin>/Source/VoxelPlugin/Private
           -I<plugin>/Shaders/Private -I. foam_check.cpp -o foam_check
+  coast_check.cpp           O9h: the coastal travel-time field (VoxelOceanCoastCore.h's plan, solve and packing,
+                            VoxelOceanCoast.ush's sampling) on a planet of known depths: the budget, the crests' spacing
+                            against the exact local wavenumber, the rays' direction, continuity along the coast across
+                            tiles and face edges, the texels against the solve, up the beach, the channel behind an island
+      g++ -O2 -std=c++20 -ffp-contract=off -I<plugin>/Source/VoxelPlugin/Public -I<plugin>/Source/VoxelPlugin/Private
+          -I<plugin>/Shaders/Private coast_check.cpp -o coast_check
+  clip_check.cpp            W1: the wave clipmap's levels (VoxelOceanClipmap.h, unchanged) and the shader's
+                            camera-relative projection in float: precision from 2 m to 20,000 km up, a descent
+                            from orbit and a flight along the sea with the static layer's strips and the waves'
+                            staggering simulated texel by texel (every sample finds its own texel), edit rectangles
+      g++ -O2 -std=c++20 -IClipStandIn -I<plugin>/Source/VoxelPlugin/Private clip_check.cpp -o clip_check
+  ClipStandIn/              stand-ins for the engine types VoxelOceanClipmap.h uses
   UEStandIn/                stand-ins for the few engine types the FFT model and the weather use
 
 CoreMinimal.h is a stand-in for the UE types VoxelOceanTiles.h uses. waves_check, underwater_check,

@@ -64,8 +64,9 @@ public:
     bool IsValid() const;
 
     /** Game thread. The texture the material and the passes read (made from Texels; a server
-     *  makes none). */
-    UTexture2DArray* MakeTexture() const;
+     *  makes none). Extra: slices after the field's 6 (stage O9h: the coastal field's,
+     *  VoxelOceanCoast.ush), ExtraSlices of Side^2 texels. */
+    UTexture2DArray* MakeTexture(const uint32* Extra = nullptr, int32 ExtraSlices = 0) const;
 };
 
 /** The field's texture as the render thread's passes bind it (the ocean pages' cull, the depth

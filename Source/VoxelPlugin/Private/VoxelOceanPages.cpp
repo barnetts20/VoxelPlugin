@@ -8,6 +8,15 @@
 #include "VoxelTerrainStats.h"
 #include "VoxelOceanShoreField.h"
 #include "VoxelOceanDepthProbe.h"
+#include "VoxelOceanCoastField.h"
+#include "VoxelOceanClipmap.h"
+#include "VoxelOceanLandCacheRHI.h"
+#include "VoxelLandCache.h"
+#include "Engine/Texture2D.h"
+#include "Engine/Texture2DArray.h"
+#include "Engine/TextureRenderTarget2D.h"
+#include "Engine/Texture2DDynamic.h"
+#include "RHIGPUReadback.h"
 #include "HAL/IConsoleManager.h"
 #include "RenderUtils.h"
 #include "TextureResource.h"
@@ -33,6 +42,9 @@ DECLARE_DWORD_ACCUMULATOR_STAT(TEXT("Ocean: pages"), STAT_VoxelOceanPages, STATG
 DECLARE_DWORD_ACCUMULATOR_STAT(TEXT("Ocean: pooled buffer sets"), STAT_VoxelOceanPooled, STATGROUP_VoxelTerrain);
 DECLARE_GPU_STAT(VoxelOceanPageWrite);
 DECLARE_GPU_STAT(VoxelOceanProbe);
+DECLARE_GPU_STAT(VoxelOceanDisplace);
+DECLARE_GPU_STAT(VoxelOceanClipmap);
+DECLARE_GPU_STAT(VoxelOceanRings);
 
 using namespace RealtimeMesh;
 
@@ -70,6 +82,14 @@ BEGIN_SHADER_PARAMETER_STRUCT(FVoxelOceanDensityParameters, )
     SHADER_PARAMETER(float, ShoreMarginM)
     SHADER_PARAMETER(float, DepthFootprint)
     SHADER_PARAMETER(FVector2f, SeaRadius)
+    // The land surface cache (stage O9m; VoxelOceanTerrainDepth.ush).
+    SHADER_PARAMETER_TEXTURE(Texture2D, LandCacheHeight)
+    SHADER_PARAMETER_TEXTURE(Texture2D, LandCacheSlope)
+    SHADER_PARAMETER_TEXTURE(Texture2D, LandCacheFields)
+    SHADER_PARAMETER_TEXTURE(Texture2D, LandCacheState)
+    SHADER_PARAMETER(uint32, LandCacheOn)
+    SHADER_PARAMETER(FVector2f, LandCacheSeaRadius)
+    SHADER_PARAMETER(float, LandCacheSeaOffset)
 END_SHADER_PARAMETER_STRUCT()
 
 BEGIN_SHADER_PARAMETER_STRUCT(FVoxelOceanWriteParameters, )
@@ -81,6 +101,8 @@ BEGIN_SHADER_PARAMETER_STRUCT(FVoxelOceanWriteParameters, )
     SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<uint>, OutColors)
     SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<uint>, OutIndices)
     SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<uint>, OutArgs)
+    SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint>, OutBase)
+    SHADER_PARAMETER(uint32, BaseOn)
     SHADER_PARAMETER(uint32, NumJobs)
     SHADER_PARAMETER(uint32, TileQuads)
     SHADER_PARAMETER(uint32, DrawSlots)
@@ -145,6 +167,348 @@ public:
 
 IMPLEMENT_GLOBAL_SHADER(FVoxelOceanProbeCS, "/Plugin/VoxelPlugin/Private/VoxelOceanPage.usf", "ProbeCS", SF_Compute);
 
+// The coastal field's depths (stage O9h, VoxelOceanCoastField.h): one thread per fine cell.
+BEGIN_SHADER_PARAMETER_STRUCT(FVoxelOceanCoastDepthParameters, )
+    SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<int>, CoastTiles)
+    SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<float>, CoastOut)
+    SHADER_PARAMETER(uint32, CoastFirst)
+    SHADER_PARAMETER(uint32, CoastCount)
+    SHADER_PARAMETER(uint32, CoastR)
+    SHADER_PARAMETER(uint32, CoastN)
+    SHADER_PARAMETER(uint32, CoastGroupsX)
+    SHADER_PARAMETER(float, CoastFootprint)
+    SHADER_PARAMETER(float, CoastLatticeScale)
+    SHADER_PARAMETER_STRUCT_INCLUDE(FVoxelOceanDensityParameters, Density)
+END_SHADER_PARAMETER_STRUCT()
+
+class FVoxelOceanCoastDepthCS : public FGlobalShader
+{
+public:
+    DECLARE_GLOBAL_SHADER(FVoxelOceanCoastDepthCS);
+    using FParameters = FVoxelOceanCoastDepthParameters;
+    SHADER_USE_PARAMETER_STRUCT(FVoxelOceanCoastDepthCS, FGlobalShader);
+
+    static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
+    {
+        return IsFeatureLevelSupported(Parameters.Platform, ERHIFeatureLevel::SM5);
+    }
+
+    static void ModifyCompilationEnvironment(const FGlobalShaderPermutationParameters& Parameters, FShaderCompilerEnvironment& OutEnvironment)
+    {
+        FGlobalShader::ModifyCompilationEnvironment(Parameters, OutEnvironment);
+        OutEnvironment.CompilerFlags.Add(CFLAG_NoFastMath);
+    }
+};
+
+IMPLEMENT_GLOBAL_SHADER(FVoxelOceanCoastDepthCS, "/Plugin/VoxelPlugin/Private/VoxelOceanPage.usf", "CoastDepthCS", SF_Compute);
+
+// The waves in compute (stage O9j, VoxelOceanDisplace.usf): one thread per drawn vertex.
+BEGIN_SHADER_PARAMETER_STRUCT(FVoxelOceanDisplaceParameters, )
+    SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, BaseWords)
+    SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<float>, DisplacePositions)
+    SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<uint>, DisplaceTexCoords)
+    SHADER_PARAMETER(uint32, DisplaceVertices)
+    SHADER_PARAMETER(FVector3f, PageToCamera)
+    SHADER_PARAMETER(FVector4f, PageRotation)
+    SHADER_PARAMETER(float, PageUnit)
+    SHADER_PARAMETER(float, PageLevel)
+    SHADER_PARAMETER(float, MorphEnd0)
+    SHADER_PARAMETER(FVector4f, DisplaceParams)
+    SHADER_PARAMETER(FVector4f, DisplaceWave0)
+    SHADER_PARAMETER(FVector4f, DisplaceWave1)
+    SHADER_PARAMETER(FVector4f, DisplaceWave2)
+    SHADER_PARAMETER(FVector3f, DisplaceCenter)
+    SHADER_PARAMETER(FVector4f, DisplaceShape)
+    SHADER_PARAMETER(FVector4f, DisplaceFFT)
+    SHADER_PARAMETER(FVector4f, DisplaceRefHigh)
+    SHADER_PARAMETER(FVector4f, DisplaceRefLow)
+    SHADER_PARAMETER(FVector4f, DisplaceRotation)
+    SHADER_PARAMETER(FVector4f, DisplaceTiles)
+    SHADER_PARAMETER(FVector4f, DisplaceStates)
+    SHADER_PARAMETER(FVector4f, DisplaceSlopeVar)
+    SHADER_PARAMETER_TEXTURE(Texture2DArray, DisplaceDisplacement)
+    SHADER_PARAMETER_SAMPLER(SamplerState, DisplaceDisplacementSampler)
+    SHADER_PARAMETER_TEXTURE(Texture2DArray, DisplaceDerivatives)
+    SHADER_PARAMETER_SAMPLER(SamplerState, DisplaceDerivativesSampler)
+    SHADER_PARAMETER_TEXTURE(Texture2D, DisplaceCharts)
+    SHADER_PARAMETER_TEXTURE(Texture2DArray, DisplaceShore)
+    SHADER_PARAMETER(uint32, ClipOn)
+    SHADER_PARAMETER_ARRAY(FVector4f, ClipLevels, [VoxelOceanClipmap::InfoRows])
+    SHADER_PARAMETER_TEXTURE(Texture2DArray, ClipDisplacementLevels)
+    SHADER_PARAMETER_SAMPLER(SamplerState, ClipSampler)
+END_SHADER_PARAMETER_STRUCT()
+
+class FVoxelOceanDisplaceCS : public FGlobalShader
+{
+public:
+    DECLARE_GLOBAL_SHADER(FVoxelOceanDisplaceCS);
+    using FParameters = FVoxelOceanDisplaceParameters;
+    SHADER_USE_PARAMETER_STRUCT(FVoxelOceanDisplaceCS, FGlobalShader);
+
+    static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
+    {
+        return IsFeatureLevelSupported(Parameters.Platform, ERHIFeatureLevel::SM5);
+    }
+};
+
+IMPLEMENT_GLOBAL_SHADER(FVoxelOceanDisplaceCS, "/Plugin/VoxelPlugin/Private/VoxelOceanDisplace.usf", "DisplaceCS", SF_Compute);
+
+/** The displacement's inputs this frame (render thread; FVoxelOceanPages::SetDisplaceFrame), and
+ *  the wave clipmap's levels when it is on (stage O9k: FVoxelOceanPages::UpdateClipmap). */
+struct FVoxelOceanDisplaceState
+{
+    FVoxelOceanDisplaceFrame Frame;
+    FTextureRHIRef Displacement;
+    FTextureRHIRef Derivatives;
+    FTextureRHIRef Charts;
+    FTextureRHIRef Shore;
+    bool bClip = false;
+    FVector4f ClipRows[VoxelOceanClipmap::InfoRows];
+    FTextureRHIRef ClipDisplacement;
+    /** The rings this frame (stage W2; UpdateClipmap's command, with the clipmap's levels): per
+     *  level (the camera about the square's centre in cells, the cell, unused), (the hole's
+     *  centre, the centre on the next level's grid); the frame rows (VoxelOceanRings.usf). */
+    bool bRings = false;
+    uint32 RingCount = 0;
+    FVector4f RingLevel[VoxelOceanClipmap::MaxLevels];
+    FIntVector4 RingInts[VoxelOceanClipmap::MaxLevels];
+    /** The rings' frame (FVoxelOceanPages::UpdateRings, every frame whether or not the clipmap
+     *  ran: the far sphere draws without it): VoxelOceanRings.usf's RingFrame0 to 2 and RingCull. */
+    bool bRingsFar = false;
+    FVector4f RingFrame0 = FVector4f(0.0f, 0.0f, 0.0f, 0.0f);
+    FVector4f RingFrame1 = FVector4f(0.0f, 0.0f, 0.0f, 0.0f);
+    FVector4f RingFrame2 = FVector4f(0.0f, 0.0f, 0.0f, 0.0f);
+    FVector4f RingCull = FVector4f(-1.0f, 0.0f, 0.0f, 0.0f);
+};
+
+// The wave clipmap (stages O9k, W1): the static layer's rectangles (VoxelOceanClipStatic.usf) ...
+BEGIN_SHADER_PARAMETER_STRUCT(FVoxelOceanClipStaticParameters, )
+    SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2DArray<float4>, StaticOut)
+    SHADER_PARAMETER(uint32, StaticSlot)
+    SHADER_PARAMETER(FIntPoint, StaticRectMin)
+    SHADER_PARAMETER(FIntPoint, StaticRectSize)
+    SHADER_PARAMETER(FIntPoint, StaticOriginMod)
+    SHADER_PARAMETER(FVector2f, StaticInWindow)
+    SHADER_PARAMETER(float, StaticSpacing)
+    SHADER_PARAMETER_ARRAY(FVector4f, StaticFrame, [VoxelOceanClipmap::SharedRows])
+    SHADER_PARAMETER(FIntVector, StaticCameraLattice)
+    SHADER_PARAMETER(FVector3f, StaticCameraFrac)
+    SHADER_PARAMETER(FVector4f, StaticParams)
+    SHADER_PARAMETER(FVector4f, StaticWave0)
+    SHADER_PARAMETER(FVector4f, StaticWave1)
+    SHADER_PARAMETER(FVector4f, StaticWave2)
+    SHADER_PARAMETER(FVector3f, StaticCenter)
+    SHADER_PARAMETER(FVector4f, StaticShape)
+    SHADER_PARAMETER(FVector4f, StaticFFT)
+    SHADER_PARAMETER(FVector4f, StaticRefHigh)
+    SHADER_PARAMETER(FVector4f, StaticRefLow)
+    SHADER_PARAMETER(FVector4f, StaticRotation)
+    SHADER_PARAMETER(FVector4f, StaticTiles)
+    SHADER_PARAMETER(FVector4f, StaticStates)
+    SHADER_PARAMETER(FVector4f, StaticSlopeVar)
+    SHADER_PARAMETER_TEXTURE(Texture2D, StaticCharts)
+    SHADER_PARAMETER_TEXTURE(Texture2DArray, StaticShore)
+    SHADER_PARAMETER_STRUCT_INCLUDE(FVoxelOceanDensityParameters, Density)
+END_SHADER_PARAMETER_STRUCT()
+
+class FVoxelOceanClipStaticCS : public FGlobalShader
+{
+public:
+    DECLARE_GLOBAL_SHADER(FVoxelOceanClipStaticCS);
+    using FParameters = FVoxelOceanClipStaticParameters;
+    SHADER_USE_PARAMETER_STRUCT(FVoxelOceanClipStaticCS, FGlobalShader);
+
+    static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
+    {
+        return IsFeatureLevelSupported(Parameters.Platform, ERHIFeatureLevel::SM5);
+    }
+
+    static void ModifyCompilationEnvironment(const FGlobalShaderPermutationParameters& Parameters, FShaderCompilerEnvironment& OutEnvironment)
+    {
+        FGlobalShader::ModifyCompilationEnvironment(Parameters, OutEnvironment);
+        OutEnvironment.CompilerFlags.Add(CFLAG_NoFastMath);
+    }
+};
+
+IMPLEMENT_GLOBAL_SHADER(FVoxelOceanClipStaticCS, "/Plugin/VoxelPlugin/Private/VoxelOceanClipStatic.usf", "ClipStaticCS", SF_Compute);
+
+// ... and every level's waves (VoxelOceanClip.usf, ClipWaveCS).
+BEGIN_SHADER_PARAMETER_STRUCT(FVoxelOceanClipWaveParameters, )
+    SHADER_PARAMETER_ARRAY(FVector4f, ClipInfoRows, [VoxelOceanClipmap::InfoRows])
+    SHADER_PARAMETER_ARRAY(FUintVector4, ClipDue, [VoxelOceanClipmap::MaxLevels / 4])
+    SHADER_PARAMETER(uint32, ClipDueCount)
+    SHADER_PARAMETER_ARRAY(FVector4f, ClipWindow, [VoxelOceanClipmap::MaxLevels])
+    SHADER_PARAMETER_ARRAY(FIntVector4, ClipWindowMod, [VoxelOceanClipmap::MaxLevels])
+    SHADER_PARAMETER_RDG_TEXTURE(Texture2DArray<float4>, ClipStatic)
+    SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2DArray<float4>, ClipDisplacementOut)
+    SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2DArray<float4>, ClipNormalOut)
+    SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2D<float4>, ClipInfoOut)
+    SHADER_PARAMETER(FVector4f, ClipParams)
+    SHADER_PARAMETER(FVector4f, ClipWave0)
+    SHADER_PARAMETER(FVector4f, ClipWave1)
+    SHADER_PARAMETER(FVector4f, ClipWave2)
+    SHADER_PARAMETER(FVector3f, ClipCenter)
+    SHADER_PARAMETER(FVector4f, ClipShape)
+    SHADER_PARAMETER(FVector4f, ClipFFT)
+    SHADER_PARAMETER(FVector4f, ClipRefHigh)
+    SHADER_PARAMETER(FVector4f, ClipRefLow)
+    SHADER_PARAMETER(FVector4f, ClipRotation)
+    SHADER_PARAMETER(FVector4f, ClipTiles)
+    SHADER_PARAMETER(FVector4f, ClipStates)
+    SHADER_PARAMETER(FVector4f, ClipSlopeVar)
+    SHADER_PARAMETER_TEXTURE(Texture2DArray, ClipDisplacement)
+    SHADER_PARAMETER_SAMPLER(SamplerState, ClipDisplacementSampler)
+    SHADER_PARAMETER_TEXTURE(Texture2DArray, ClipDerivatives)
+    SHADER_PARAMETER_SAMPLER(SamplerState, ClipDerivativesSampler)
+    SHADER_PARAMETER_TEXTURE(Texture2D, ClipCharts)
+    SHADER_PARAMETER_TEXTURE(Texture2DArray, ClipFoam)
+    SHADER_PARAMETER_SAMPLER(SamplerState, ClipFoamSampler)
+    SHADER_PARAMETER(uint32, ClipFoamOn)
+END_SHADER_PARAMETER_STRUCT()
+
+class FVoxelOceanClipWaveCS : public FGlobalShader
+{
+public:
+    DECLARE_GLOBAL_SHADER(FVoxelOceanClipWaveCS);
+    using FParameters = FVoxelOceanClipWaveParameters;
+    SHADER_USE_PARAMETER_STRUCT(FVoxelOceanClipWaveCS, FGlobalShader);
+
+    static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
+    {
+        return IsFeatureLevelSupported(Parameters.Platform, ERHIFeatureLevel::SM5);
+    }
+};
+
+IMPLEMENT_GLOBAL_SHADER(FVoxelOceanClipWaveCS, "/Plugin/VoxelPlugin/Private/VoxelOceanClip.usf", "ClipWaveCS", SF_Compute);
+
+// The rings (stage W2): every vertex of the rings and the far sphere, once a frame
+// (VoxelOceanRings.usf) ...
+BEGIN_SHADER_PARAMETER_STRUCT(FVoxelOceanRingParameters, )
+    SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<float>, RingPositions)
+    SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<uint>, RingTangents)
+    SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<uint>, RingTexCoords)
+    SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<uint>, RingColors)
+    SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<uint>, RingArgs)
+    SHADER_PARAMETER(uint32, RingIndexCount)
+    SHADER_PARAMETER(uint32, RingSlots)
+    SHADER_PARAMETER(int32, RingHalf)
+    SHADER_PARAMETER(float, RingMorphStart)
+    SHADER_PARAMETER(float, RingMorphEnd)
+    SHADER_PARAMETER(uint32, RingFarCells)
+    SHADER_PARAMETER(uint32, RingVertices)
+    SHADER_PARAMETER_ARRAY(FVector4f, RingInfo, [VoxelOceanClipmap::InfoRows])
+    SHADER_PARAMETER_ARRAY(FVector4f, RingLevel, [VoxelOceanClipmap::MaxLevels])
+    SHADER_PARAMETER_ARRAY(FIntVector4, RingInts, [VoxelOceanClipmap::MaxLevels])
+    SHADER_PARAMETER(uint32, RingCount)
+    SHADER_PARAMETER(FVector4f, RingFrame0)
+    SHADER_PARAMETER(FVector4f, RingFrame1)
+    SHADER_PARAMETER(FVector4f, RingFrame2)
+    SHADER_PARAMETER(FVector4f, RingCull)
+    SHADER_PARAMETER(FVector4f, RingRotation)
+    SHADER_PARAMETER_TEXTURE(Texture2DArray, RingDisplacement)
+    SHADER_PARAMETER_RDG_TEXTURE(Texture2DArray, RingStatic)
+    SHADER_PARAMETER_SAMPLER(SamplerState, RingSampler)
+    SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<float4>, FarDirections)
+    SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<float>, FarLand)
+END_SHADER_PARAMETER_STRUCT()
+
+class FVoxelOceanRingCS : public FGlobalShader
+{
+public:
+    DECLARE_GLOBAL_SHADER(FVoxelOceanRingCS);
+    using FParameters = FVoxelOceanRingParameters;
+    SHADER_USE_PARAMETER_STRUCT(FVoxelOceanRingCS, FGlobalShader);
+
+    static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
+    {
+        return IsFeatureLevelSupported(Parameters.Platform, ERHIFeatureLevel::SM5);
+    }
+};
+
+IMPLEMENT_GLOBAL_SHADER(FVoxelOceanRingCS, "/Plugin/VoxelPlugin/Private/VoxelOceanRings.usf", "RingCS", SF_Compute);
+
+// ... and the far sphere's land, once (VoxelOceanPage.usf, FarDepthCS).
+BEGIN_SHADER_PARAMETER_STRUCT(FVoxelOceanFarDepthParameters, )
+    SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<int>, FarLattice)
+    SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<float>, FarLandOut)
+    SHADER_PARAMETER(uint32, FarCount)
+    SHADER_PARAMETER(float, FarFootprint)
+    SHADER_PARAMETER_STRUCT_INCLUDE(FVoxelOceanDensityParameters, Density)
+END_SHADER_PARAMETER_STRUCT()
+
+class FVoxelOceanFarDepthCS : public FGlobalShader
+{
+public:
+    DECLARE_GLOBAL_SHADER(FVoxelOceanFarDepthCS);
+    using FParameters = FVoxelOceanFarDepthParameters;
+    SHADER_USE_PARAMETER_STRUCT(FVoxelOceanFarDepthCS, FGlobalShader);
+
+    static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
+    {
+        return IsFeatureLevelSupported(Parameters.Platform, ERHIFeatureLevel::SM5);
+    }
+
+    static void ModifyCompilationEnvironment(const FGlobalShaderPermutationParameters& Parameters, FShaderCompilerEnvironment& OutEnvironment)
+    {
+        FGlobalShader::ModifyCompilationEnvironment(Parameters, OutEnvironment);
+        OutEnvironment.CompilerFlags.Add(CFLAG_NoFastMath);
+    }
+};
+
+IMPLEMENT_GLOBAL_SHADER(FVoxelOceanFarDepthCS, "/Plugin/VoxelPlugin/Private/VoxelOceanPage.usf", "FarDepthCS", SF_Compute);
+
+/** The wave clipmap's render-thread state: the static layer and the levels' waves as last
+ *  evaluated, in their slots (a level not due this frame keeps its own). Lost: a frame's passes
+ *  couldn't run (the game thread writes everything again). */
+struct FVoxelOceanClipState
+{
+    TRefCountPtr<IPooledRenderTarget> Static;
+    TRefCountPtr<IPooledRenderTarget> DisplacementWork;
+    TRefCountPtr<IPooledRenderTarget> NormalWork;
+    int32 Size = 0;
+    int32 Slots = 0;
+    std::atomic<bool> bLost{ false };
+};
+
+/** The wave clipmap's game-thread plan (stage W1): the last frame's levels, and per slot what its
+ *  static layer and its waves hold. */
+struct FVoxelOceanClipPlan
+{
+    VoxelOceanClipmap::FFrame Frame;
+    bool bHasFrame = false;
+    struct FSlot
+    {
+        // The static layer: written for this plane, level and window, from these inputs.
+        bool bStatic = false;
+        uint32 Plane = 0;
+        int32 K = MIN_int32;
+        FIntPoint Origin = FIntPoint(0, 0);
+        uint64 Key = 0;
+        // The waves: evaluated for this plane, level and window.
+        bool bEvaluated = false;
+        uint32 EvalPlane = 0;
+        int32 EvalK = MIN_int32;
+        FIntPoint EvalOrigin = FIntPoint(0, 0);
+    };
+    FSlot Slots[VoxelOceanClipmap::MaxLevels];
+    uint64 Turn = 0;
+    /** Edits the static layer writes again (planet frame, cm; their reach). */
+    struct FEdit
+    {
+        FVector Center = FVector::ZeroVector;
+        double Reach = 0.0;
+    };
+    TArray<FEdit> Edits;
+    /** Texels the static layer wrote in the last second, for the log. */
+    int64 StaticTexels = 0;
+    int32 Reanchors = 0;
+};
+
+static TAutoConsoleVariable<int32> CVarVoxelOceanClipStagger(
+    TEXT("voxel.Ocean.ClipStagger"), 1,
+    TEXT("The wave clipmap's coarse levels evaluated every few frames (stage O9k): 0 every level every frame; 1 levels 4 to 7 every second frame and 8 on every fourth (a level that moved, at once)."),
+    ECVF_Default);
+
 static TAutoConsoleVariable<int32> CVarVoxelOceanPageCreates(
     TEXT("voxel.Ocean.PageCreates"), 8,
     TEXT("Ocean page buffer sets created per frame at most (recycled ones don't count)."),
@@ -153,6 +517,7 @@ static TAutoConsoleVariable<int32> CVarVoxelOceanPageCreates(
 namespace VoxelOceanPagesDetail
 {
     constexpr uint32 JobWords = 6;                 // VOXEL_OCEAN_JOB_WORDS (VoxelOceanPage.usf)
+    constexpr uint32 BaseWords = 16;               // VOXEL_OCEAN_BASE_WORDS (VoxelOceanPage.usf, VoxelOceanDisplace.usf)
     constexpr int32 TexCoordChannels = 6;          // morph xy | morph z, depth | target depth, coast codes | grand xy | grand z, grand depth | bed codes, land depth
     constexpr int32 MaxPooled = 48;                // emptied buffer sets kept for reuse
     constexpr uint64 KickFrames = 3;               // frames before a run that didn't happen is asked for again
@@ -206,7 +571,9 @@ namespace VoxelOceanPagesDetail
     bool AreShadersReady()
     {
         FGlobalShaderMap* ShaderMap = GetGlobalShaderMap(GMaxRHIFeatureLevel);
-        return ShaderMap && ShaderMap->GetShader(&FVoxelOceanWriteCS::GetStaticType(), 0).IsValid();
+        // The displacement's too (stage O9j): a run with the waves in compute writes, then displaces.
+        return ShaderMap && ShaderMap->GetShader(&FVoxelOceanWriteCS::GetStaticType(), 0).IsValid()
+            && ShaderMap->GetShader(&FVoxelOceanDisplaceCS::GetStaticType(), 0).IsValid();
     }
 
     uint32 FloatBits(float Value)
@@ -225,6 +592,29 @@ namespace VoxelOceanPagesDetail
 }
 
 namespace VOP = VoxelOceanPagesDetail;
+
+namespace VoxelOceanPagesDetail
+{
+    /** A coastal depth chunk's readback (stage O9h), deleted on the render thread whichever
+     *  thread lets it go last (a poll torn down at exit: as the shore builder's). */
+    struct FCoastReadback
+    {
+        TUniquePtr<FRHIGPUBufferReadback> Buffer;
+        ~FCoastReadback();
+    };
+
+    FCoastReadback::~FCoastReadback()
+    {
+        if (!Buffer.IsValid()) return;
+        FRHIGPUBufferReadback* Orphan = Buffer.Release();
+        if (IsInRenderingThread())
+        {
+            delete Orphan;
+            return;
+        }
+        ENQUEUE_RENDER_COMMAND(VoxelOceanCoastReadbackRelease)([Orphan](FRHICommandListImmediate&) { delete Orphan; });
+    }
+}
 
 /** The density and edit inputs as graph buffers, uploaded once for every page's runs while
  *  they stay the same (render thread; as the terrain pages' GetInputs). */
@@ -270,7 +660,8 @@ namespace VoxelOceanPagesDetail
     /** Render thread. The density, edits and shore cull a page write or the probe binds. */
     void FillDensity(FRDGBuilder& GraphBuilder, FVoxelOceanInputCache& Cache, const TSharedPtr<const FVoxelDensityGPUData>& InDensity,
         const TSharedPtr<const FVoxelEditGPUData>& InEdits, double HalfFinest, const TSharedPtr<const FVoxelOceanShoreRHI, ESPMode::ThreadSafe>& Shore,
-        double ShoreMarginCm, double DepthFootprintCm, double SeaRadiusCm, FVoxelOceanDensityParameters& Out)
+        double ShoreMarginCm, double DepthFootprintCm, double SeaRadiusCm, const TSharedPtr<const FVoxelOceanLandCacheRHI, ESPMode::ThreadSafe>& LandCache,
+        FVoxelOceanDensityParameters& Out)
     {
         const FVoxelDensityGPUData& Density = *InDensity;
         const VoxelBrickMesherGPU::FInputs Inputs = Cache.Get(GraphBuilder, InDensity, InEdits);
@@ -307,6 +698,15 @@ namespace VoxelOceanPagesDetail
         Out.DepthFootprint = (float)FMath::Max(DepthFootprintCm, 0.0);
         // The sea sphere: each lattice point's height over it comes off its depth (stage O9b2).
         Out.SeaRadius = VoxelDoubleFloat(FMath::Max(SeaRadiusCm, 0.0));
+        // The land surface cache (stage O9m), or stand-ins and none.
+        const bool bCache = LandCache.IsValid() && LandCache->IsReady();
+        Out.LandCacheHeight = bCache ? LandCache->Height.GetReference() : GBlackTexture->TextureRHI.GetReference();
+        Out.LandCacheSlope = bCache ? LandCache->Slope.GetReference() : GBlackTexture->TextureRHI.GetReference();
+        Out.LandCacheFields = bCache ? LandCache->Fields.GetReference() : GBlackTexture->TextureRHI.GetReference();
+        Out.LandCacheState = bCache ? LandCache->State.GetReference() : GBlackTexture->TextureRHI.GetReference();
+        Out.LandCacheOn = bCache ? 1u : 0u;
+        Out.LandCacheSeaRadius = VoxelDoubleFloat(bCache ? LandCache->LandSeaRadiusCm : 0.0);
+        Out.LandCacheSeaOffset = bCache ? (float)LandCache->SeaOffsetCm : 0.0f;
     }
 }
 
@@ -334,11 +734,25 @@ public:
         /** The depth the waves feel: its footprint (cm). The sea sphere (cm). */
         double DepthFootprintCm = 0.0;
         double SeaRadiusCm = 0.0;
+        /** The land surface cache the depths read first (stage O9m; null: the density only). */
+        TSharedPtr<const FVoxelOceanLandCacheRHI, ESPMode::ThreadSafe> LandCache;
     };
 
-    explicit FVoxelOceanPageProvider(const TSharedPtr<FVoxelOceanInputCache, ESPMode::ThreadSafe>& InInputCache)
+    FVoxelOceanPageProvider(const TSharedPtr<FVoxelOceanInputCache, ESPMode::ThreadSafe>& InInputCache,
+        const TSharedPtr<FVoxelOceanDisplaceState, ESPMode::ThreadSafe>& InDisplace, bool bInDisplace)
         : InputCache(InInputCache)
+        , Displace(InDisplace)
+        , bDisplace(bInDisplace)
     {
+    }
+
+    /** The page this buffer set is placed on (stage O9j): its origin (planet frame, cm), its unit
+     *  (cm per page unit) and level. */
+    void SetPlacement_RenderThread(const FVector& InOrigin, double InUnit, int32 InLevel)
+    {
+        Origin = InOrigin;
+        Unit = InUnit;
+        Level = InLevel;
     }
 
     /** States not yet run accumulate: each is written in order, so none is lost. */
@@ -363,8 +777,21 @@ public:
     std::atomic<uint64> RenderMicros{ 0 };
 
 private:
+    /** The waves in compute (stage O9j): every frame, the drawn vertices from Base. */
+    void AddDisplacePass(FRDGBuilder& GraphBuilder, FRDGBufferRef BaseBuffer, FRDGBufferUAVRef Positions, FRDGBufferUAVRef TexCoords, uint32 VertexCapacity);
+
     TArray<FState> States;
     TSharedPtr<FVoxelOceanInputCache, ESPMode::ThreadSafe> InputCache;
+    TSharedPtr<FVoxelOceanDisplaceState, ESPMode::ThreadSafe> Displace;
+    const bool bDisplace = false;
+    /** Each vertex's static data (VoxelOceanPagesDetail::BaseWords words; stage O9j). */
+    TRefCountPtr<FRDGPooledBuffer> Base;
+    FVector Origin = FVector::ZeroVector;
+    double Unit = 1.0;
+    int32 Level = 0;
+    /** The slots drawn and the tile size, as the last state set them. */
+    uint32 DrawSlots = 0;
+    uint32 TileQuads = 16;
 };
 
 void FVoxelOceanPageProvider::BuildComputePasses(FRDGBuilder& GraphBuilder, const FRealtimeMeshComputeContext& Context)
@@ -376,7 +803,8 @@ void FVoxelOceanPageProvider::BuildComputePasses(FRDGBuilder& GraphBuilder, cons
         RenderMicros.fetch_add((uint64)(FPlatformTime::ToSeconds64(FPlatformTime::Cycles64() - StartCycles) * 1.0e6), std::memory_order_relaxed);
     };
     Calls.fetch_add(1, std::memory_order_relaxed);
-    if (States.Num() == 0)
+    const bool bDisplaceNow = bDisplace && Displace.IsValid() && Displace->Frame.bOn && DrawSlots > 0u;
+    if (States.Num() == 0 && !bDisplaceNow)
     {
         IdleCalls.fetch_add(1, std::memory_order_relaxed);
         return;
@@ -411,6 +839,7 @@ void FVoxelOceanPageProvider::BuildComputePasses(FRDGBuilder& GraphBuilder, cons
 
     // Streams the driver doesn't expose are written to a scratch word and left alone.
     const uint32 StreamMask = (Tangents ? 1u : 0u) | (TexCoords ? 2u : 0u) | (Colors ? 4u : 0u);
+    const bool bHasTexCoords = TexCoords != nullptr;
     auto Scratch = [&GraphBuilder]()
         {
             return GraphBuilder.CreateUAV(GraphBuilder.CreateBuffer(FRDGBufferDesc::CreateBufferDesc(sizeof(uint32), 1), TEXT("Voxel.OceanScratch")), PF_R32_UINT);
@@ -422,6 +851,30 @@ void FVoxelOceanPageProvider::BuildComputePasses(FRDGBuilder& GraphBuilder, cons
     const uint32 VertexCapacity = (uint32)FMath::Max(0, Context.GetVertexCapacity());
     const uint32 TriangleCapacity = (uint32)FMath::Max(0, Context.GetIndexCapacity() / 3);
 
+    // The vertices' static data (stage O9j): made once a buffer set draws, cleared (a slot never
+    // written reads as zeros: its triangles are degenerate anyway).
+    FRDGBufferRef BaseBuffer = nullptr;
+    bool bDrawsAny = DrawSlots > 0;
+    for (const FState& State : States) bDrawsAny |= State.DrawSlots > 0;
+    // Not before a state draws something (spare and pooled sets carry an empty one).
+    if (bDisplace && (Base.IsValid() || bDrawsAny))
+    {
+        const uint32 BaseCount = FMath::Max(1u, VertexCapacity * VOP::BaseWords);
+        if (Base.IsValid() && Base->Desc.NumElements != BaseCount) Base.SafeRelease();
+        if (Base.IsValid())
+        {
+            BaseBuffer = GraphBuilder.RegisterExternalBuffer(Base);
+        }
+        else
+        {
+            BaseBuffer = GraphBuilder.CreateBuffer(FRDGBufferDesc::CreateStructuredDesc(sizeof(uint32), BaseCount), TEXT("Voxel.OceanBase"));
+            AddClearUAVPass(GraphBuilder, GraphBuilder.CreateUAV(BaseBuffer), 0u);
+            Base = GraphBuilder.ConvertToExternalBuffer(BaseBuffer);
+        }
+    }
+    FRDGBufferUAVRef BaseUAV = BaseBuffer ? GraphBuilder.CreateUAV(BaseBuffer) : GraphBuilder.CreateUAV(GraphBuilder.CreateBuffer(
+        FRDGBufferDesc::CreateStructuredDesc(sizeof(uint32), 1), TEXT("Voxel.OceanBaseScratch")));
+
     RDG_EVENT_SCOPE_STAT(GraphBuilder, VoxelOceanPageWrite, "VoxelOceanPage write");
     TShaderMapRef<FVoxelOceanWriteCS> Shader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
     for (const FState& State : States)
@@ -429,7 +882,7 @@ void FVoxelOceanPageProvider::BuildComputePasses(FRDGBuilder& GraphBuilder, cons
         const uint32 NumJobs = (uint32)State.Jobs.Num() / VOP::JobWords;
         FVoxelOceanWriteParameters* Parameters = GraphBuilder.AllocParameters<FVoxelOceanWriteParameters>();
         VOP::FillDensity(GraphBuilder, *InputCache, State.Density, State.Edits, State.HalfFinest, State.Shore, State.ShoreMarginCm, State.DepthFootprintCm,
-            State.SeaRadiusCm, Parameters->Density);
+            State.SeaRadiusCm, State.LandCache, Parameters->Density);
         Parameters->Jobs = GraphBuilder.CreateSRV(VoxelGPUCommon::UploadStructuredBuffer<uint32>(GraphBuilder, TEXT("Voxel.OceanJobs"), State.Jobs));
         Parameters->VertexWords = GraphBuilder.CreateSRV(VoxelGPUCommon::UploadStructuredBuffer<uint32>(GraphBuilder, TEXT("Voxel.OceanVertexWords"), State.Words));
         Parameters->OutPositions = Positions;
@@ -438,6 +891,8 @@ void FVoxelOceanPageProvider::BuildComputePasses(FRDGBuilder& GraphBuilder, cons
         Parameters->OutColors = Colors;
         Parameters->OutIndices = Triangles;
         Parameters->OutArgs = Args;
+        Parameters->OutBase = BaseUAV;
+        Parameters->BaseOn = BaseBuffer ? 1u : 0u;
         Parameters->NumJobs = NumJobs;
         Parameters->TileQuads = State.TileQuads;
         Parameters->DrawSlots = State.DrawSlots;
@@ -448,17 +903,369 @@ void FVoxelOceanPageProvider::BuildComputePasses(FRDGBuilder& GraphBuilder, cons
         Parameters->FlipWinding = State.FlipWinding;
         FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("VoxelOceanPage write %u jobs", NumJobs), Shader, Parameters,
             FIntVector((int32)FMath::Max(1u, NumJobs), 1, 1));
+        DrawSlots = State.DrawSlots;
+        TileQuads = State.TileQuads;
     }
-    ShownVersion.store(States.Last().Version, std::memory_order_release);
-    States.Reset();
+    if (States.Num() > 0)
+    {
+        ShownVersion.store(States.Last().Version, std::memory_order_release);
+        States.Reset();
+    }
+    // The waves (stage O9j), after the writes: every drawn vertex from its static data.
+    if (BaseBuffer && bHasTexCoords && Displace.IsValid() && Displace->Frame.bOn && DrawSlots > 0)
+        AddDisplacePass(GraphBuilder, BaseBuffer, Positions, TexCoords, VertexCapacity);
 }
 
+void FVoxelOceanPageProvider::AddDisplacePass(FRDGBuilder& GraphBuilder, FRDGBufferRef BaseBuffer, FRDGBufferUAVRef Positions, FRDGBufferUAVRef TexCoords,
+    uint32 VertexCapacity)
+{
+    const FVoxelOceanDisplaceState& D = *Displace;
+    const FVoxelOceanDisplaceFrame& F = D.Frame;
+    // (Ready: VOP::AreShadersReady checked it for this run.)
+    TShaderMapRef<FVoxelOceanDisplaceCS> Shader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
+    const uint32 Vertices = FMath::Min(DrawSlots * (uint32)VOP::TileVertices((int32)TileQuads), VertexCapacity);
+    if (Vertices == 0) return;
+    RDG_EVENT_SCOPE_STAT(GraphBuilder, VoxelOceanDisplace, "VoxelOceanDisplace");
+    FVoxelOceanDisplaceParameters* P = GraphBuilder.AllocParameters<FVoxelOceanDisplaceParameters>();
+    P->BaseWords = GraphBuilder.CreateSRV(BaseBuffer);
+    P->DisplacePositions = Positions;
+    P->DisplaceTexCoords = TexCoords;
+    P->DisplaceVertices = Vertices;
+    // The page from the selection camera, in double (the component's transform: the planet's
+    // rotation, the page's origin and unit).
+    P->PageToCamera = FVector3f(F.PlanetToWorld.TransformPosition(Origin) - F.CameraWorld);
+    const FQuat Q = F.PlanetToWorld.GetRotation();
+    P->PageRotation = FVector4f((float)Q.X, (float)Q.Y, (float)Q.Z, (float)Q.W);
+    P->PageUnit = (float)Unit;
+    P->PageLevel = (float)Level;
+    P->MorphEnd0 = (float)F.MorphEnd0;
+    P->DisplaceParams = F.Params;
+    P->DisplaceWave0 = F.Wave[0];
+    P->DisplaceWave1 = F.Wave[1];
+    P->DisplaceWave2 = F.Wave[2];
+    P->DisplaceCenter = F.Center;
+    P->DisplaceShape = F.Shape;
+    const bool bFFT = F.FFT.X > 0.5f && D.Displacement && D.Derivatives && D.Charts;
+    P->DisplaceFFT = bFFT ? F.FFT : FVector4f(0.0f, 0.0f, 0.0f, 0.0f);
+    P->DisplaceRefHigh = F.RefHigh;
+    P->DisplaceRefLow = F.RefLow;
+    P->DisplaceRotation = F.Rotation;
+    P->DisplaceTiles = F.Tiles;
+    FVector4f DisplaceStates = F.States;
+    if (!D.Shore) DisplaceStates.X = 0.0f;
+    P->DisplaceStates = DisplaceStates;
+    P->DisplaceSlopeVar = F.SlopeVar;
+    P->DisplaceDisplacement = bFFT ? D.Displacement.GetReference() : GBlackArrayTexture->TextureRHI.GetReference();
+    P->DisplaceDerivatives = bFFT ? D.Derivatives.GetReference() : GBlackArrayTexture->TextureRHI.GetReference();
+    P->DisplaceCharts = D.Charts ? D.Charts.GetReference() : GBlackTexture->TextureRHI.GetReference();
+    P->DisplaceShore = D.Shore ? D.Shore.GetReference() : GBlackArrayTexture->TextureRHI.GetReference();
+    // As the material's texture objects sample them (the underwater pass's too).
+    P->DisplaceDisplacementSampler = TStaticSamplerState<SF_Trilinear, AM_Wrap, AM_Wrap, AM_Clamp>::GetRHI();
+    P->DisplaceDerivativesSampler = TStaticSamplerState<SF_Trilinear, AM_Wrap, AM_Wrap, AM_Clamp>::GetRHI();
+    // The wave clipmap (stage O9k): the vertices sample its levels instead.
+    const bool bClip = D.bClip && D.ClipDisplacement.IsValid();
+    P->ClipOn = bClip ? 1u : 0u;
+    for (int32 i = 0; i < VoxelOceanClipmap::InfoRows; i++)
+        P->ClipLevels[i] = bClip ? D.ClipRows[i] : FVector4f(0.0f, 0.0f, 0.0f, 0.0f);
+    P->ClipDisplacementLevels = bClip ? D.ClipDisplacement.GetReference() : GBlackArrayTexture->TextureRHI.GetReference();
+    // The levels are stored toroidally (stage W1): the sampler wraps.
+    P->ClipSampler = TStaticSamplerState<SF_Bilinear, AM_Wrap, AM_Wrap, AM_Clamp>::GetRHI();
+    FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("VoxelOceanDisplace %u vertices", Vertices), Shader, P,
+        FIntVector((int32)FMath::DivideAndRoundUp(Vertices, 64u), 1, 1));
+}
+
+// ---------------------------------------------------------------------------------------------
+// The rings (stage W2; VoxelOceanRingLayout.ush, VoxelOceanRings.usf)
+// ---------------------------------------------------------------------------------------------
+
+namespace VoxelOceanPagesDetail
+{
+    int32 RingHalf(int32 Size) { return VoxelOceanClipmap::RingHalf(Size); }
+
+    int32 RingSide(int32 Half) { return 2 * Half + 1; }
+
+    /** The far sphere's face axes: N outward, U x V = N (so its cells wind as the rings'). */
+    void FarAxes(int32 Face, FVector& N, FVector& U, FVector& V)
+    {
+        const int32 Axis = Face >> 1;
+        const bool bNegative = (Face & 1) != 0;
+        N = FVector::ZeroVector;
+        U = FVector::ZeroVector;
+        V = FVector::ZeroVector;
+        N[Axis] = bNegative ? -1.0 : 1.0;
+        U[bNegative ? (Axis + 2) % 3 : (Axis + 1) % 3] = 1.0;
+        V[bNegative ? (Axis + 1) % 3 : (Axis + 2) % 3] = 1.0;
+    }
+
+    /** The far sphere's vertex directions (planet frame, unit): face by face, (Cells + 1)^2 each
+     *  (equal-angle; a face's edge exactly the neighbour's, so the faces meet). */
+    void FarDirections(int32 Cells, TArray<FVector>& Out)
+    {
+        const int32 Side = Cells + 1;
+        Out.SetNum(6 * Side * Side);
+        auto Tan = [Cells](int32 I) { return I == 0 ? -1.0 : (I == Cells ? 1.0 : FMath::Tan((-1.0 + 2.0 * I / Cells) * UE_DOUBLE_PI * 0.25)); };
+        for (int32 Face = 0; Face < 6; Face++)
+        {
+            FVector N, U, V;
+            FarAxes(Face, N, U, V);
+            for (int32 J = 0; J < Side; J++)
+                for (int32 I = 0; I < Side; I++)
+                    Out[(Face * Side + J) * Side + I] = (N + U * Tan(I) + V * Tan(J)).GetSafeNormal();
+        }
+    }
+
+    /** A cell's two triangles (lower-left vertex V00, the next along x V10, along y V01): the
+     *  diagonal toward the centre in every quadrant (so every cell of a ring's hole has a vertex
+     *  strictly inside it: VoxelOceanRingLayout.ush), wound as the tiles (QuadTriangles: (B - A) x
+     *  (C - A) into the sphere); bFlip reverses them. */
+    void CellTriangles(uint32 V00, uint32 V10, uint32 V01, uint32 V11, bool bToward11, bool bFlip, TArray<uint32>& Out)
+    {
+        uint32 T[6];
+        if (bToward11)
+        {
+            T[0] = V00; T[1] = V11; T[2] = V10;
+            T[3] = V00; T[4] = V01; T[5] = V11;
+        }
+        else
+        {
+            T[0] = V00; T[1] = V01; T[2] = V10;
+            T[3] = V10; T[4] = V01; T[5] = V11;
+        }
+        if (bFlip)
+        {
+            Swap(T[1], T[2]);
+            Swap(T[4], T[5]);
+        }
+        Out.Append(T, 6);
+    }
+}
+
+/** Writes the rings' vertices every frame (render thread; stage W2). */
+class FVoxelOceanRingProvider final : public IRealtimeMeshComputeProvider
+{
+public:
+    /** The far sphere's land to sample (again): what the depths read, the vertices' lattice points. */
+    struct FFarJob
+    {
+        TSharedPtr<const FVoxelDensityGPUData> Density;
+        TSharedPtr<const FVoxelEditGPUData> Edits;
+        double HalfFinest = 50.0;
+        TSharedPtr<const FVoxelOceanShoreRHI, ESPMode::ThreadSafe> Shore;
+        double ShoreMarginCm = 0.0;
+        double DepthFootprintCm = 0.0;
+        double SeaRadiusCm = 0.0;
+        TSharedPtr<const FVoxelOceanLandCacheRHI, ESPMode::ThreadSafe> LandCache;
+        TArray<int32> Lattice;
+        float FootprintCm = 0.0f;
+    };
+
+    FVoxelOceanRingProvider(const TSharedPtr<FVoxelOceanInputCache, ESPMode::ThreadSafe>& InInputCache,
+        const TSharedPtr<FVoxelOceanDisplaceState, ESPMode::ThreadSafe>& InDisplace, const TSharedPtr<FVoxelOceanClipState, ESPMode::ThreadSafe>& InClip,
+        int32 InHalf, int32 InSlots, int32 InFarCells, TArray<FVector4f>&& InFarDirections, uint32 InIndexCount)
+        : InputCache(InInputCache)
+        , Displace(InDisplace)
+        , Clip(InClip)
+        , Half(InHalf)
+        , Slots(InSlots)
+        , FarCells(InFarCells)
+        , FarDirectionWords(MoveTemp(InFarDirections))
+        , IndexCount(InIndexCount)
+    {
+    }
+
+    void SetFarJob_RenderThread(FFarJob&& InJob)
+    {
+        FarJob = MoveTemp(InJob);
+        bFarJob = true;
+    }
+
+    virtual void BuildComputePasses(FRDGBuilder& GraphBuilder, const FRealtimeMeshComputeContext& Context) override;
+
+    std::atomic<uint32> Runs{ 0 };
+    std::atomic<uint32> SkippedRuns{ 0 };
+    std::atomic<uint32> DrawnRuns{ 0 };
+
+private:
+    TSharedPtr<FVoxelOceanInputCache, ESPMode::ThreadSafe> InputCache;
+    TSharedPtr<FVoxelOceanDisplaceState, ESPMode::ThreadSafe> Displace;
+    TSharedPtr<FVoxelOceanClipState, ESPMode::ThreadSafe> Clip;
+    const int32 Half;
+    const int32 Slots;
+    const int32 FarCells;
+    TArray<FVector4f> FarDirectionWords;
+    const uint32 IndexCount;
+    TRefCountPtr<FRDGPooledBuffer> FarDirectionBuffer;
+    TRefCountPtr<FRDGPooledBuffer> FarLandBuffer;
+    FFarJob FarJob;
+    bool bFarJob = false;
+};
+
+void FVoxelOceanRingProvider::BuildComputePasses(FRDGBuilder& GraphBuilder, const FRealtimeMeshComputeContext& Context)
+{
+    FRDGBufferUAVRef Positions = Context.GetStreamUAV(FRealtimeMeshStreams::Position, PF_R32_FLOAT);
+    FRDGBufferUAVRef Tangents = Context.GetStreamUAV(FRealtimeMeshStreams::Tangents, PF_R32_UINT);
+    FRDGBufferUAVRef TexCoords = Context.GetStreamUAV(FRealtimeMeshStreams::TexCoords, PF_R32_UINT);
+    FRDGBufferUAVRef Colors = Context.GetStreamUAV(FRealtimeMeshStreams::Color, PF_R32_UINT);
+    FRDGBufferUAVRef Args = Context.GetIndirectArgsUAV();
+    FGlobalShaderMap* ShaderMap = GetGlobalShaderMap(GMaxRHIFeatureLevel);
+    const bool bShaders = ShaderMap && ShaderMap->GetShader(&FVoxelOceanRingCS::GetStaticType(), 0).IsValid()
+        && ShaderMap->GetShader(&FVoxelOceanFarDepthCS::GetStaticType(), 0).IsValid();
+    if (!Positions || !Tangents || !TexCoords || !Colors || !Args || !bShaders)
+    {
+        SkippedRuns.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    Runs.fetch_add(1, std::memory_order_relaxed);
+    const int32 Side = VOP::RingSide(Half);
+    const uint32 FarCount = (uint32)FarDirectionWords.Num();
+    const uint32 Vertices = (uint32)(Slots * Side * Side) + FarCount;
+    RDG_EVENT_SCOPE_STAT(GraphBuilder, VoxelOceanRings, "VoxelOceanRings");
+
+    // The far sphere's directions, once; its land when asked (zero, not culled, until then).
+    FRDGBufferRef FarDirections = FarDirectionBuffer.IsValid() ? GraphBuilder.RegisterExternalBuffer(FarDirectionBuffer) : nullptr;
+    if (!FarDirections)
+    {
+        FarDirections = VoxelGPUCommon::UploadStructuredBuffer<FVector4f>(GraphBuilder, TEXT("Voxel.OceanFarDirections"), FarDirectionWords);
+        FarDirectionBuffer = GraphBuilder.ConvertToExternalBuffer(FarDirections);
+    }
+    FRDGBufferRef FarLand = FarLandBuffer.IsValid() ? GraphBuilder.RegisterExternalBuffer(FarLandBuffer) : nullptr;
+    if (!FarLand)
+    {
+        FarLand = GraphBuilder.CreateBuffer(FRDGBufferDesc::CreateStructuredDesc(sizeof(float), FMath::Max(FarCount, 1u)), TEXT("Voxel.OceanFarLand"));
+        AddClearUAVPass(GraphBuilder, GraphBuilder.CreateUAV(FarLand), 0u);
+        FarLandBuffer = GraphBuilder.ConvertToExternalBuffer(FarLand);
+    }
+    if (bFarJob && FarJob.Density.IsValid() && FarJob.Lattice.Num() == 3 * (int32)FarCount && FarCount > 0)
+    {
+        FVoxelOceanFarDepthParameters* P = GraphBuilder.AllocParameters<FVoxelOceanFarDepthParameters>();
+        P->FarLattice = GraphBuilder.CreateSRV(VoxelGPUCommon::UploadStructuredBuffer<int32>(GraphBuilder, TEXT("Voxel.OceanFarLattice"), MakeConstArrayView(FarJob.Lattice)));
+        P->FarLandOut = GraphBuilder.CreateUAV(FarLand);
+        P->FarCount = FarCount;
+        P->FarFootprint = FarJob.FootprintCm;
+        VOP::FillDensity(GraphBuilder, *InputCache, FarJob.Density, FarJob.Edits, FarJob.HalfFinest, FarJob.Shore, FarJob.ShoreMarginCm, FarJob.DepthFootprintCm,
+            FarJob.SeaRadiusCm, FarJob.LandCache, P->Density);
+        FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("VoxelOceanFarDepth %u vertices", FarCount), TShaderMapRef<FVoxelOceanFarDepthCS>(ShaderMap), P,
+            FIntVector((int32)FMath::DivideAndRoundUp(FarCount, 64u), 1, 1));
+        bFarJob = false;
+        FarJob = FFarJob();
+    }
+
+    // The vertices; nothing drawn (no indices) until the clipmap's levels are there this frame.
+    const FVoxelOceanDisplaceState& D = *Displace;
+    // The rings with the clipmap's levels this frame; the far sphere alone without (never written
+    // its frame: nothing).
+    const bool bLevels = D.bClip && D.bRings && D.ClipDisplacement.IsValid() && Clip.IsValid() && Clip->Static.IsValid();
+    const bool bReady = D.bRingsFar;
+    FVoxelOceanRingParameters* P = GraphBuilder.AllocParameters<FVoxelOceanRingParameters>();
+    P->RingPositions = Positions;
+    P->RingTangents = Tangents;
+    P->RingTexCoords = TexCoords;
+    P->RingColors = Colors;
+    P->RingArgs = Args;
+    P->RingIndexCount = bReady ? IndexCount : 0u;
+    P->RingSlots = (uint32)Slots;
+    P->RingHalf = Half;
+    P->RingMorphStart = (float)Half * (2.0f / 3.0f);
+    P->RingMorphEnd = (float)Half - 2.0f;
+    P->RingFarCells = (uint32)FarCells;
+    P->RingVertices = bReady ? Vertices : 0u;
+    for (int32 i = 0; i < VoxelOceanClipmap::InfoRows; i++) P->RingInfo[i] = bLevels ? D.ClipRows[i] : FVector4f(0.0f, 0.0f, 0.0f, 0.0f);
+    for (int32 i = 0; i < VoxelOceanClipmap::MaxLevels; i++)
+    {
+        P->RingLevel[i] = D.RingLevel[i];
+        P->RingInts[i] = D.RingInts[i];
+    }
+    P->RingCount = bLevels ? D.RingCount : 0u;
+    P->RingFrame0 = D.RingFrame0;
+    P->RingFrame1 = D.RingFrame1;
+    P->RingFrame2 = D.RingFrame2;
+    P->RingCull = D.RingCull;
+    P->RingRotation = D.Frame.Rotation;
+    P->RingDisplacement = bLevels ? D.ClipDisplacement.GetReference() : GBlackArrayTexture->TextureRHI.GetReference();
+    FRDGTextureRef Static = bLevels ? GraphBuilder.RegisterExternalTexture(Clip->Static) : nullptr;
+    if (!Static)
+    {
+        Static = GraphBuilder.CreateTexture(FRDGTextureDesc::Create2DArray(FIntPoint(1, 1), PF_A32B32G32R32F, FClearValueBinding::Black,
+            TexCreate_ShaderResource | TexCreate_UAV, 1), TEXT("Voxel.OceanRingsNoStatic"));
+        AddClearUAVPass(GraphBuilder, GraphBuilder.CreateUAV(Static), FVector4f(0.0f, 0.0f, 0.0f, 0.0f));
+    }
+    P->RingStatic = Static;
+    P->RingSampler = TStaticSamplerState<SF_Bilinear, AM_Wrap, AM_Wrap, AM_Clamp>::GetRHI();
+    P->FarDirections = GraphBuilder.CreateSRV(FarDirections);
+    P->FarLand = GraphBuilder.CreateSRV(FarLand);
+    FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("VoxelOceanRings %u vertices", bReady ? Vertices : 0u), TShaderMapRef<FVoxelOceanRingCS>(ShaderMap), P,
+        FIntVector((int32)FMath::Max(FMath::DivideAndRoundUp(bReady ? Vertices : 1u, 64u), 1u), 1, 1));
+    if (bLevels) DrawnRuns.fetch_add(1, std::memory_order_relaxed);
+}
+
+/** The rings' mesh (game thread; stage W2): one buffer set for every level and the far sphere. */
+struct FVoxelOceanRingSet
+{
+    TWeakObjectPtr<URealtimeMeshSimple> Mesh;
+    TWeakObjectPtr<URealtimeMeshComponent> Component;
+    TSharedPtr<FVoxelOceanRingProvider, ESPMode::ThreadSafe> Provider;
+    TSharedPtr<std::atomic<bool>, ESPMode::ThreadSafe> bBuffersReady;
+    uint64 Handle = 0;
+    uint64 CreatedFrame = 0;
+    int32 Half = 0;
+    int32 Slots = 0;
+    int32 FarCells = 0;
+    /** The far sphere's directions (double, for its lattice points) and cell (cm). */
+    TArray<FVector> FarDirections;
+    double FarCellCm = 0.0;
+    /** The density version and lattice step its land was last asked for (0: never). */
+    uint32 FarVersion = 0;
+    double FarHalfFinest = 0.0;
+    /** The component's origin (planet frame, cm). */
+    FVector Origin = FVector::ZeroVector;
+    bool bHasOrigin = false;
+};
+
 FVoxelOceanPages::FVoxelOceanPages()
-    : NoDensity(MakeShared<FVoxelDensityGPUData>())
+    : DisplaceState(MakeShared<FVoxelOceanDisplaceState, ESPMode::ThreadSafe>())
+    , ClipPlan(MakeUnique<FVoxelOceanClipPlan>())
+    , ClipState(MakeShared<FVoxelOceanClipState, ESPMode::ThreadSafe>())
+    , NoDensity(MakeShared<FVoxelDensityGPUData>())
     , NoEdits(MakeShared<FVoxelEditGPUData>())
     , InputCache(MakeShared<FVoxelOceanInputCache, ESPMode::ThreadSafe>())
     , ProbeState(MakeShared<FVoxelOceanProbeState, ESPMode::ThreadSafe>())
 {
+}
+
+void FVoxelOceanPages::SetWavesInCompute(bool bInCompute)
+{
+    check(IsInGameThread());
+    if (bInCompute == bWavesInCompute) return;
+    // Every buffer set registers again: with the driver's every-frame trigger and a base buffer,
+    // or on demand without.
+    Reset();
+    bWavesInCompute = bInCompute;
+}
+
+void FVoxelOceanPages::SetDisplaceFrame(const FVoxelOceanDisplaceFrame& InFrame)
+{
+    check(IsInGameThread());
+    if (!bWavesInCompute) return;
+    FVoxelOceanDisplaceFrame Frame = InFrame;
+    Frame.MorphEnd0 = MorphEnd0;
+    ENQUEUE_RENDER_COMMAND(VoxelOceanDisplaceFrame)([State = DisplaceState, Frame](FRHICommandListImmediate&)
+        {
+            auto RHIOf = [](FTextureResource* Resource) { return Resource ? Resource->TextureRHI : FTextureRHIRef(); };
+            State->Frame = Frame;
+            // The clipmap's levels only for a frame whose clipmap ran (UpdateClipmap's command,
+            // after this one, sets it again; stage O9k).
+            State->bClip = false;
+            State->bRings = false;
+            State->Displacement = RHIOf(Frame.Displacement);
+            State->Derivatives = RHIOf(Frame.Derivatives);
+            State->Charts = RHIOf(Frame.Charts);
+            State->Shore = RHIOf(Frame.Shore);
+            // The resources are only read here.
+            State->Frame.Displacement = nullptr;
+            State->Frame.Derivatives = nullptr;
+            State->Frame.Charts = nullptr;
+            State->Frame.Shore = nullptr;
+        });
 }
 
 void FVoxelOceanPages::ProbeDepth(const VoxelOceanDepthProbe::FLevels& Levels, double InRadius)
@@ -473,7 +1280,7 @@ void FVoxelOceanPages::ProbeDepth(const VoxelOceanDepthProbe::FLevels& Levels, d
     const TSharedPtr<const FVoxelEditGPUData> Edits = DensityInputs.Edits.IsValid() ? DensityInputs.Edits : NoEdits;
     ENQUEUE_RENDER_COMMAND(VoxelOceanProbeDepth)([State = ProbeState, Cache = InputCache, Density, Edits, HalfFinest = DensityInputs.HalfFinest,
         Shore = DensityInputs.Shore, Margin = DensityInputs.ShoreMarginCm, DepthFootprintCm = DensityInputs.DepthFootprintCm, InRadius, Lattice = MoveTemp(Lattice),
-        Footprint, Levels](FRHICommandListImmediate& RHICmdList)
+        Footprint, Levels, LandCache = DensityInputs.LandCache](FRHICommandListImmediate& RHICmdList)
         {
             FGlobalShaderMap* ShaderMap = GetGlobalShaderMap(GMaxRHIFeatureLevel);
             if (!ShaderMap || !ShaderMap->GetShader(&FVoxelOceanProbeCS::GetStaticType(), 0).IsValid())
@@ -492,7 +1299,7 @@ void FVoxelOceanPages::ProbeDepth(const VoxelOceanDepthProbe::FLevels& Levels, d
             P->ProbeCount = Count;
             P->ProbeLevelPoints = (uint32)(VoxelOceanDepthProbe::Size * VoxelOceanDepthProbe::Size);
             P->ProbeFootprint = Footprint;
-            VOP::FillDensity(GraphBuilder, *Cache, Density, Edits, HalfFinest, Shore, Margin, DepthFootprintCm, InRadius, P->Density);
+            VOP::FillDensity(GraphBuilder, *Cache, Density, Edits, HalfFinest, Shore, Margin, DepthFootprintCm, InRadius, LandCache, P->Density);
             FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("VoxelOceanProbe %u points", Count), TShaderMapRef<FVoxelOceanProbeCS>(ShaderMap), P,
                 FIntVector((int32)FMath::DivideAndRoundUp(Count, 64u), 1, 1));
             GraphBuilder.QueueBufferExtraction(Out, &State->Depth);
@@ -502,26 +1309,879 @@ void FVoxelOceanPages::ProbeDepth(const VoxelOceanDepthProbe::FLevels& Levels, d
         });
 }
 
+bool FVoxelOceanPages::SampleCoastDepths(const TSharedPtr<FVoxelOceanCoastDepthJob, ESPMode::ThreadSafe>& Job, int64 First, int32 Count, double InRadius)
+{
+    check(IsInGameThread());
+    if (!FApp::CanEverRender() || !Job.IsValid() || Count <= 0 || First < 0 || First + Count > Job->Cells) return false;
+    // The terrain's density must be there (the stand-in has no terrain: every point deep water),
+    // and the shader compiled.
+    if (!DensityInputs.Density.IsValid()) return false;
+    {
+        FGlobalShaderMap* ShaderMap = GetGlobalShaderMap(GMaxRHIFeatureLevel);
+        if (!ShaderMap || !ShaderMap->GetShader(&FVoxelOceanCoastDepthCS::GetStaticType(), 0).IsValid()) return false;
+    }
+    const TSharedPtr<const FVoxelDensityGPUData> Density = DensityInputs.Density;
+    const TSharedPtr<const FVoxelEditGPUData> Edits = DensityInputs.Edits.IsValid() ? DensityInputs.Edits : NoEdits;
+    const double HalfFinest = FMath::Max(DensityInputs.HalfFinest, 1.0e-3);
+    ENQUEUE_RENDER_COMMAND(VoxelOceanCoastDepths)([Job, Cache = InputCache, Density, Edits, HalfFinest, Shore = DensityInputs.Shore,
+        Margin = DensityInputs.ShoreMarginCm, DepthFootprintCm = DensityInputs.DepthFootprintCm, InRadius, First, Count](FRHICommandListImmediate& RHICmdList)
+        {
+            FGlobalShaderMap* ShaderMap = GetGlobalShaderMap(GMaxRHIFeatureLevel);
+            if (!ShaderMap || !ShaderMap->GetShader(&FVoxelOceanCoastDepthCS::GetStaticType(), 0).IsValid())
+            {
+                // Gone since the game thread looked: the job fails (the builder reports it).
+                Job->InFlight.fetch_sub(1, std::memory_order_acq_rel);
+                Job->Failed.store(1, std::memory_order_release);
+                return;
+            }
+            FRDGBuilder GraphBuilder(RHICmdList);
+            RDG_EVENT_SCOPE_STAT(GraphBuilder, VoxelOceanProbe, "VoxelOceanCoastDepths");
+            FRDGBufferRef Out = GraphBuilder.CreateBuffer(FRDGBufferDesc::CreateStructuredDesc(sizeof(float), (uint32)Count), TEXT("Voxel.OceanCoastDepths"));
+            const uint32 NumGroups = FMath::Max(FMath::DivideAndRoundUp((uint32)Count, 64u), 1u);
+            const uint32 GroupsX = FMath::Min(NumGroups, 32768u);
+            FVoxelOceanCoastDepthParameters* P = GraphBuilder.AllocParameters<FVoxelOceanCoastDepthParameters>();
+            P->CoastTiles = GraphBuilder.CreateSRV(VoxelGPUCommon::UploadStructuredBuffer<int32>(GraphBuilder, TEXT("Voxel.OceanCoastTiles"), MakeConstArrayView(Job->Tiles)));
+            P->CoastOut = GraphBuilder.CreateUAV(Out);
+            P->CoastFirst = (uint32)First;
+            P->CoastCount = (uint32)Count;
+            P->CoastR = (uint32)Job->R;
+            P->CoastN = (uint32)Job->N;
+            P->CoastGroupsX = GroupsX;
+            P->CoastFootprint = (float)Job->FootprintCm;
+            P->CoastLatticeScale = (float)(InRadius / HalfFinest);
+            // The density only (stage O9m): the coastal field is the queries' and the server's too,
+            // which sample the terrain on the CPU.
+            VOP::FillDensity(GraphBuilder, *Cache, Density, Edits, HalfFinest, Shore, Margin, DepthFootprintCm, InRadius, nullptr, P->Density);
+            FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("VoxelOceanCoastDepths %d cells", Count), TShaderMapRef<FVoxelOceanCoastDepthCS>(ShaderMap), P,
+                FIntVector((int32)GroupsX, (int32)FMath::DivideAndRoundUp(NumGroups, GroupsX), 1));
+            // The readback, released on the render thread whichever thread lets it go last (a poll
+            // torn down at exit: as the shore builder's).
+            TSharedPtr<VOP::FCoastReadback, ESPMode::ThreadSafe> Readback = MakeShared<VOP::FCoastReadback, ESPMode::ThreadSafe>();
+            Readback->Buffer = MakeUnique<FRHIGPUBufferReadback>(TEXT("Voxel.OceanCoastDepthsReadback"));
+            AddEnqueueCopyPass(GraphBuilder, Readback->Buffer.Get(), Out, (uint32)Count * (uint32)sizeof(float));
+            GraphBuilder.Execute();
+            VoxelGPUCommon::PollRenderThread([Job, Readback, First, Count]() -> bool
+                {
+                    if (!Readback->Buffer.IsValid() || !Readback->Buffer->IsReady()) return false;
+                    const void* Data = Readback->Buffer->Lock((uint32)Count * (uint32)sizeof(float));
+                    FMemory::Memcpy(Job->DepthCm.GetData() + First, Data, (SIZE_T)Count * sizeof(float));
+                    Readback->Buffer->Unlock();
+                    Readback->Buffer.Reset();
+                    Job->Received.fetch_add(Count, std::memory_order_acq_rel);
+                    Job->InFlight.fetch_sub(1, std::memory_order_acq_rel);
+                    return true;
+                });
+        });
+    return true;
+}
+
 FVoxelOceanPages::~FVoxelOceanPages()
 {
     Reset();
+    DestroyRings();
     // The cached graph buffers are let go on the render thread (the providers may still hold
     // the cache there too).
-    ENQUEUE_RENDER_COMMAND(VoxelOceanReleaseInputs)([Cache = MoveTemp(InputCache)](FRHICommandListImmediate&) mutable
+    ENQUEUE_RENDER_COMMAND(VoxelOceanReleaseInputs)([Cache = MoveTemp(InputCache), Clip = MoveTemp(ClipState), Displace = MoveTemp(DisplaceState)](FRHICommandListImmediate&) mutable
         {
             Cache.Reset();
+            Clip.Reset();
+            Displace.Reset();
         });
 }
 
 void FVoxelOceanPages::SetDensityInputs(const FVoxelOceanDensityInputs& InInputs)
 {
+    // The clipmap's static layer is written again when what it samples changes (stages O9k, W1;
+    // the edits reach it as rectangles instead: NotifyClipEdit).
+    if (InInputs.Density != DensityInputs.Density || InInputs.Shore != DensityInputs.Shore || InInputs.LandCache != DensityInputs.LandCache
+        || InInputs.HalfFinest != DensityInputs.HalfFinest || InInputs.ShoreMarginCm != DensityInputs.ShoreMarginCm
+        || InInputs.DepthFootprintCm != DensityInputs.DepthFootprintCm)
+        DensityVersion++;
     DensityInputs = InInputs;
+}
+
+namespace VoxelOceanPagesDetail
+{
+    /** A transient texture array of the clipmap (no mips, bilinear, wrapping: the levels are
+     *  stored toroidally, stage W1), zeroed. */
+    UTexture2DArray* MakeClipArray(const TCHAR* Name, int32 Size, int32 Slices, EPixelFormat Format, int64 BytesPerTexel)
+    {
+        UTexture2DArray* Texture = NewObject<UTexture2DArray>(GetTransientPackage(),
+            MakeUniqueObjectName(GetTransientPackage(), UTexture2DArray::StaticClass(), FName(Name)), RF_Transient);
+        if (!Texture) return nullptr;
+        FTexturePlatformData* Data = new FTexturePlatformData();
+        Data->SizeX = Size;
+        Data->SizeY = Size;
+        Data->SetNumSlices(Slices);
+        Data->PixelFormat = Format;
+        FTexture2DMipMap* Level = new FTexture2DMipMap(Size, Size, Slices);
+        Data->Mips.Add(Level);
+        const int64 Bytes = (int64)Size * Size * Slices * BytesPerTexel;
+        Level->BulkData.Lock(LOCK_READ_WRITE);
+        void* Memory = Level->BulkData.Realloc(Bytes);
+        FMemory::Memzero(Memory, Bytes);
+        Level->BulkData.Unlock();
+        Texture->SetPlatformData(Data);
+        Texture->SRGB = false;
+        Texture->CompressionSettings = TC_HDR;
+        Texture->Filter = TF_Bilinear;
+        Texture->AddressX = TA_Wrap;
+        Texture->AddressY = TA_Wrap;
+        Texture->AddressZ = TA_Clamp;
+        Texture->LODGroup = TEXTUREGROUP_Pixels2D;
+        Texture->NeverStream = true;
+        Texture->UpdateResource();
+        return Texture;
+    }
+}
+
+void FVoxelOceanPages::SetClipmap(const FVoxelOceanClipSettings& InSettings)
+{
+    check(IsInGameThread());
+    FVoxelOceanClipSettings S = InSettings;
+    S.Size = (int32)FMath::Clamp<uint32>(FMath::RoundUpToPowerOfTwo((uint32)FMath::Max(S.Size, 8)), 32u, 512u);
+    S.Levels = FMath::Clamp(S.Levels, 1, VoxelOceanClipmap::MaxLevels);
+    S.FinestCm = FMath::Max(S.FinestCm, 1.0);
+    const bool bSameTextures = ClipDisplacement.IsValid() && S.Size == ClipSettings.Size && S.Levels == ClipSettings.Levels;
+    // The rings' mesh is made for the size, the levels and the far sphere's cells (stage W2).
+    if (S != ClipSettings) DestroyRings();
+    ClipSettings = S;
+    ClipPlan = MakeUnique<FVoxelOceanClipPlan>();
+    if (!S.bOn || !FApp::CanEverRender())
+    {
+        ClipDisplacement.Reset();
+        ClipNormal.Reset();
+        ClipInfo.Reset();
+        return;
+    }
+    if (bSameTextures) return;
+    ClipDisplacement.Reset(VOP::MakeClipArray(TEXT("VoxelOceanClipDisplacement"), S.Size, S.Levels, PF_A32B32G32R32F, 16));
+    ClipNormal.Reset(VOP::MakeClipArray(TEXT("VoxelOceanClipNormal"), S.Size, S.Levels, PF_FloatRGBA, 8));
+    UTexture2D* Info = UTexture2D::CreateTransient(VoxelOceanClipmap::InfoRows, 1, PF_A32B32G32R32F,
+        MakeUniqueObjectName(GetTransientPackage(), UTexture2D::StaticClass(), FName(TEXT("VoxelOceanClipInfo"))));
+    if (Info)
+    {
+        Info->SRGB = false;
+        Info->CompressionSettings = TC_HDR;
+        Info->Filter = TF_Nearest;
+        Info->AddressX = TA_Clamp;
+        Info->AddressY = TA_Clamp;
+        Info->LODGroup = TEXTUREGROUP_Pixels2D;
+        Info->NeverStream = true;
+        Info->UpdateResource();
+    }
+    ClipInfo.Reset(Info);
+    if (!ClipDisplacement.IsValid() || !ClipNormal.IsValid() || !ClipInfo.IsValid())
+    {
+        UE_LOG(LogVoxelPlugin, Warning, TEXT("[VoxelOcean] Couldn't create the wave clipmap's textures: the vertices evaluate the waves themselves."));
+        ClipDisplacement.Reset();
+        ClipNormal.Reset();
+        ClipInfo.Reset();
+        return;
+    }
+    UE_LOG(LogVoxelPlugin, Log, TEXT("[VoxelOcean] Wave clipmap: %d levels of %d x %d, finest %.0f cm."), S.Levels, S.Size, S.Size, S.FinestCm);
+}
+
+void FVoxelOceanPages::UpdateClipmap(const FVector& CameraPlanet, const FVoxelOceanDisplaceFrame& Waves, FTextureResource* Foam)
+{
+    // (Aliased: UE has a global FFrame.)
+    using namespace VoxelOceanClipmap;
+    using FClipFrame = VoxelOceanClipmap::FFrame;
+    using FClipLevel = VoxelOceanClipmap::FLevel;
+    using FClipRect = VoxelOceanClipmap::FRect;
+    check(IsInGameThread());
+    if (!IsClipmapOn() || !bWavesInCompute) return;
+    FTextureResource* DispResource = ClipDisplacement->GetResource();
+    FTextureResource* NormalResource = ClipNormal->GetResource();
+    FTextureResource* InfoResource = ClipInfo.IsValid() ? ClipInfo->GetResource() : nullptr;
+    if (!DispResource || !NormalResource || !InfoResource) return;
+    if (!ClipPlan.IsValid()) ClipPlan = MakeUnique<FVoxelOceanClipPlan>();
+    FVoxelOceanClipPlan& Plan = *ClipPlan;
+    // A frame whose passes couldn't run: everything is written again.
+    if (ClipState->bLost.exchange(false))
+    {
+        for (FVoxelOceanClipPlan::FSlot& Slot : Plan.Slots) Slot = FVoxelOceanClipPlan::FSlot();
+    }
+
+    // The levels: on the shared plane, the first's spacing by the camera's height.
+    const int32 Slots = ClipSettings.Levels;
+    const FClipFrame Frame = MakeFrame(CameraPlanet, Radius, ClipSettings.Size, Slots, ClipSettings.FinestCm, Plan.bHasFrame ? &Plan.Frame : nullptr);
+    if (!Frame.IsValid()) return;
+    if (Plan.bHasFrame && Frame.Plane.Id != Plan.Frame.Plane.Id) Plan.Reanchors++;
+    const int32 N = Frame.Size;
+
+    // What the static layer was written from: a texel written for other inputs is written again.
+    auto Mix = [](uint64 H, uint64 V) { return H ^ (V + 0x9e3779b97f4a7c15ull + (H << 6) + (H >> 2)); };
+    uint64 Key = Mix(0x51ed270b0b2a5ull, (uint64)DensityVersion);
+    Key = Mix(Key, (uint64)(UPTRINT)Waves.Shore);
+    Key = Mix(Key, Waves.States.X > 0.5f ? 1u : 0u);
+    Key = Mix(Key, Waves.States.Y > 0.0f ? 1u : 0u);
+    Key = Mix(Key, (uint64)FMath::RoundToInt(Waves.SlopeVar.Z));
+    Key = Mix(Key, (uint64)FMath::RoundToInt(Waves.FFT.Y));
+
+    // The static layer's rectangles: a level new to its slot (or written for another plane or
+    // other inputs) whole, else the strips its window gained and the edits' rectangles.
+    struct FStaticJob
+    {
+        int32 Level = 0;
+        FClipRect Rect;
+    };
+    TArray<FStaticJob> StaticJobs;
+    bool bWhole[MaxLevels] = {};
+    bool bEdited[MaxLevels] = {};
+    bool bAllWhole = true;
+    for (int32 i = 0; i < Frame.Count; i++)
+    {
+        const FClipLevel& L = Frame.Levels[i];
+        FVoxelOceanClipPlan::FSlot& Slot = Plan.Slots[L.Slot];
+        const bool bSame = Slot.bStatic && Slot.Plane == Frame.Plane.Id && Slot.K == L.K && Slot.Key == Key;
+        if (!bSame)
+        {
+            StaticJobs.Add({ i, FClipRect{ 0, 0, N, N } });
+            bWhole[i] = true;
+        }
+        else
+        {
+            bAllWhole = false;
+            FClipRect Gained[2];
+            const int32 NumGained = GainedStrips(Slot.Origin, L.Origin, N, Gained);
+            for (int32 g = 0; g < NumGained; g++)
+            {
+                StaticJobs.Add({ i, Gained[g] });
+                if (Gained[g].Width == N && Gained[g].Height == N) bWhole[i] = true;
+            }
+            // An edit reaches a texel through the depth's footprint (the waves feel it smoothed
+            // over twice the spacing or the depth smoothing) and the bed's slope step, and the
+            // land cache's texel at that footprint; then its waves are due at once.
+            const double Footprint = FMath::Max(FMath::Max(2.0 * L.Spacing, DensityInputs.DepthFootprintCm), 100.0);
+            for (const FVoxelOceanClipPlan::FEdit& Edit : Plan.Edits)
+            {
+                const FClipRect E = RectAround(Frame, L, Edit.Center, Edit.Reach + 2.0 * Footprint, 2.0);
+                if (E.IsEmpty()) continue;
+                StaticJobs.Add({ i, E });
+                bEdited[i] = true;
+            }
+        }
+        Slot.bStatic = true;
+        Slot.Plane = Frame.Plane.Id;
+        Slot.K = L.K;
+        Slot.Origin = L.Origin;
+        Slot.Key = Key;
+    }
+    Plan.Edits.Reset();
+    for (const FStaticJob& J : StaticJobs) Plan.StaticTexels += (int64)J.Rect.Width * J.Rect.Height;
+
+    // The waves due: every level whose static layer is new, or whose window has moved on from
+    // the one its waves were evaluated for; the fine ones every frame, the coarse ones in turn.
+    const int32 Stagger = FMath::Clamp(CVarVoxelOceanClipStagger.GetValueOnGameThread(), 0, 1);
+    const uint64 Turn = Plan.Turn++;
+    int32 Due[MaxLevels];
+    int32 NumDue = 0;
+    FIntPoint Evaluated[MaxLevels];
+    bool Valid[MaxLevels];
+    for (int32 i = 0; i < Frame.Count; i++)
+    {
+        const FClipLevel& L = Frame.Levels[i];
+        FVoxelOceanClipPlan::FSlot& Slot = Plan.Slots[L.Slot];
+        const bool bSameLevel = Slot.bEvaluated && Slot.EvalPlane == Frame.Plane.Id && Slot.EvalK == L.K;
+        const bool bNear = bSameLevel && FMath::Abs(Slot.EvalOrigin.X - L.Origin.X) <= EvaluatedSlack && FMath::Abs(Slot.EvalOrigin.Y - L.Origin.Y) <= EvaluatedSlack;
+        const uint64 Period = Stagger == 0 || i < 4 ? 1u : (i < 8 ? 2u : 4u);
+        if (bWhole[i] || bEdited[i] || !bNear || Turn % Period == (uint64)i % Period)
+        {
+            Due[NumDue++] = i;
+            Slot.bEvaluated = true;
+            Slot.EvalPlane = Frame.Plane.Id;
+            Slot.EvalK = L.K;
+            Slot.EvalOrigin = L.Origin;
+        }
+        Evaluated[i] = Slot.EvalOrigin;
+        Valid[i] = true;
+    }
+
+    struct FJob
+    {
+        FVoxelOceanDisplaceFrame Waves;
+        int32 Size = 0;
+        int32 Slots = 0;
+        FVector4f Rows[InfoRows];
+        FVector4f Window[MaxLevels];
+        FIntVector4 WindowMod[MaxLevels];
+        int32 Due[MaxLevels] = {};
+        int32 NumDue = 0;
+        TArray<FStaticJob> Static;
+        bool bAllWhole = false;
+        FIntVector CameraLattice = FIntVector::ZeroValue;
+        FVector3f CameraFrac = FVector3f::ZeroVector;
+        double Radius = 0.0;
+        double HalfFinest = 50.0;
+        // The rings this frame (stage W2).
+        bool bRings = false;
+        uint32 RingCount = 0;
+        FVector4f RingLevel[MaxLevels];
+        FIntVector4 RingInts[MaxLevels];
+    };
+    TSharedRef<FJob> Job = MakeShared<FJob>();
+    Job->Waves = Waves;
+    Job->Size = N;
+    Job->Slots = Slots;
+    MakeInfoRows(Frame, Evaluated, Valid, Job->Rows);
+    for (int32 i = 0; i < MaxLevels; i++)
+    {
+        Job->Window[i] = FVector4f(0.0f, 0.0f, 0.0f, 0.0f);
+        Job->WindowMod[i] = FIntVector4(0, 0, 0, 0);
+        if (i >= Frame.Count) continue;
+        const FClipLevel& L = Frame.Levels[i];
+        const FVector2D InWindow = CameraInWindow(Frame, L.Spacing, L.Origin);
+        Job->Window[i] = FVector4f((float)InWindow.X, (float)InWindow.Y, (float)L.Spacing, (float)L.Slot);
+        Job->WindowMod[i] = FIntVector4(PositiveMod(L.Origin.X, N), PositiveMod(L.Origin.Y, N), 0, 0);
+    }
+    for (int32 i = 0; i < NumDue; i++) Job->Due[i] = Due[i];
+    Job->NumDue = NumDue;
+    Job->Static = MoveTemp(StaticJobs);
+    Job->bAllWhole = bAllWhole;
+    Job->Radius = Radius;
+    Job->HalfFinest = FMath::Max(DensityInputs.HalfFinest, 1.0e-3);
+    {
+        // The camera's nearest lattice point, in double (the static layer counts from it).
+        const FVector Lattice(FMath::RoundToDouble(CameraPlanet.X / Job->HalfFinest), FMath::RoundToDouble(CameraPlanet.Y / Job->HalfFinest),
+            FMath::RoundToDouble(CameraPlanet.Z / Job->HalfFinest));
+        Job->CameraLattice = FIntVector((int32)Lattice.X, (int32)Lattice.Y, (int32)Lattice.Z);
+        Job->CameraFrac = FVector3f(CameraPlanet - Lattice * Job->HalfFinest);
+    }
+    Plan.Frame = Frame;
+    Plan.bHasFrame = true;
+
+    // The rings (stage W2; VoxelOceanRingLayout.ush): level i's cell is twice its texel; its square
+    // centred on the even vertex nearest the camera (so it lies on the next level's grid); its hole
+    // where the previous level's square lies, its centre on the next level's grid.
+    if (Rings.IsValid())
+    {
+        const int32 Count = FMath::Min(Frame.Count, Rings->Slots);
+        FRingRow RingRows[MaxLevels];
+        MakeRings(Frame, Count, RingRows);
+        for (int32 i = 0; i < MaxLevels; i++)
+        {
+            const FRingRow& Row = RingRows[i];
+            Job->RingLevel[i] = FVector4f((float)Row.CamX, (float)Row.CamY, (float)Row.Spacing, 0.0f);
+            Job->RingInts[i] = FIntVector4(Row.HoleX, Row.HoleY, Row.CoarseX, Row.CoarseY);
+        }
+        Job->bRings = true;
+        Job->RingCount = (uint32)Count;
+    }
+
+    const TSharedPtr<const FVoxelDensityGPUData> Density = DensityInputs.Density.IsValid() ? DensityInputs.Density : NoDensity;
+    const TSharedPtr<const FVoxelEditGPUData> Edits = DensityInputs.Edits.IsValid() ? DensityInputs.Edits : NoEdits;
+    ENQUEUE_RENDER_COMMAND(VoxelOceanClipmap)([Job, State = ClipState, Displace = DisplaceState, Cache = InputCache, Density, Edits,
+        Shore = DensityInputs.Shore, Margin = DensityInputs.ShoreMarginCm, DepthFootprintCm = DensityInputs.DepthFootprintCm, LandCache = DensityInputs.LandCache,
+        DispResource, NormalResource, InfoResource, Foam](FRHICommandListImmediate& RHICmdList)
+        {
+            FGlobalShaderMap* ShaderMap = GetGlobalShaderMap(GMaxRHIFeatureLevel);
+            auto Has = [ShaderMap](FShaderType& Type) { return ShaderMap && ShaderMap->GetShader(&Type, 0).IsValid(); };
+            FRHITexture* DispRHI = DispResource->TextureRHI;
+            FRHITexture* NormalRHI = NormalResource->TextureRHI;
+            FRHITexture* InfoRHI = InfoResource->TextureRHI;
+            if (!Has(FVoxelOceanClipWaveCS::GetStaticType()) || !Has(FVoxelOceanClipStaticCS::GetStaticType()) || !DispRHI || !NormalRHI || !InfoRHI)
+            {
+                // Nothing written this frame: the game thread plans everything again.
+                State->bLost.store(true);
+                Displace->bClip = false;
+                return;
+            }
+            const int32 Size = Job->Size;
+            const FVoxelOceanDisplaceFrame& W = Job->Waves;
+            auto RHIOf = [](FTextureResource* Resource) { return Resource ? Resource->TextureRHI : FTextureRHIRef(); };
+            const FTextureRHIRef Displacement = RHIOf(W.Displacement);
+            const FTextureRHIRef Derivatives = RHIOf(W.Derivatives);
+            const FTextureRHIRef Charts = RHIOf(W.Charts);
+            const FTextureRHIRef ShoreTexture = RHIOf(W.Shore);
+            const FTextureRHIRef FoamTexture = RHIOf(Foam);
+            const bool bFFT = W.FFT.X > 0.5f && Displacement && Derivatives && Charts;
+            FVector4f States = W.States;
+            if (!ShoreTexture) States.X = 0.0f;
+            FRHITexture* ChartsRHI = Charts ? Charts.GetReference() : GBlackTexture->TextureRHI.GetReference();
+            FRHITexture* ShoreRHI = ShoreTexture ? ShoreTexture.GetReference() : GBlackArrayTexture->TextureRHI.GetReference();
+
+            FRDGBuilder GraphBuilder(RHICmdList);
+            {
+                RDG_EVENT_SCOPE_STAT(GraphBuilder, VoxelOceanClipmap, "VoxelOceanClipmap");
+                // The textures kept between frames (made again for another size: then written whole).
+                const bool bNew = !State->Static.IsValid() || !State->DisplacementWork.IsValid() || !State->NormalWork.IsValid()
+                    || State->Size != Size || State->Slots != Job->Slots;
+                FRDGTextureRef StaticTex;
+                FRDGTextureRef DispWork;
+                FRDGTextureRef NormalWork;
+                if (bNew)
+                {
+                    StaticTex = GraphBuilder.CreateTexture(FRDGTextureDesc::Create2DArray(FIntPoint(Size, Size), PF_A32B32G32R32F, FClearValueBinding::Black,
+                        TexCreate_ShaderResource | TexCreate_UAV, 4 * Job->Slots), TEXT("Voxel.OceanClipStatic"));
+                    DispWork = GraphBuilder.CreateTexture(FRDGTextureDesc::Create2DArray(FIntPoint(Size, Size), PF_A32B32G32R32F, FClearValueBinding::Black,
+                        TexCreate_ShaderResource | TexCreate_UAV, Job->Slots), TEXT("Voxel.OceanClipDisplacementWork"));
+                    NormalWork = GraphBuilder.CreateTexture(FRDGTextureDesc::Create2DArray(FIntPoint(Size, Size), PF_FloatRGBA, FClearValueBinding::Black,
+                        TexCreate_ShaderResource | TexCreate_UAV, Job->Slots), TEXT("Voxel.OceanClipNormalWork"));
+                    AddClearUAVPass(GraphBuilder, GraphBuilder.CreateUAV(StaticTex), FVector4f(0.0f, 0.0f, 0.0f, 0.0f));
+                    AddClearUAVPass(GraphBuilder, GraphBuilder.CreateUAV(DispWork), FVector4f(0.0f, 0.0f, 0.0f, 0.0f));
+                    AddClearUAVPass(GraphBuilder, GraphBuilder.CreateUAV(NormalWork), FVector4f(0.0f, 0.0f, 0.0f, 0.0f));
+                    State->Static = GraphBuilder.ConvertToExternalTexture(StaticTex);
+                    State->DisplacementWork = GraphBuilder.ConvertToExternalTexture(DispWork);
+                    State->NormalWork = GraphBuilder.ConvertToExternalTexture(NormalWork);
+                    State->Size = Size;
+                    State->Slots = Job->Slots;
+                    // Planned only in part (the plan's slots outlived the textures): nothing shown
+                    // this frame, everything written again from the next.
+                    if (!Job->bAllWhole)
+                    {
+                        State->bLost.store(true);
+                        GraphBuilder.Execute();
+                        Displace->bClip = false;
+                        return;
+                    }
+                }
+                else
+                {
+                    StaticTex = GraphBuilder.RegisterExternalTexture(State->Static);
+                    DispWork = GraphBuilder.RegisterExternalTexture(State->DisplacementWork);
+                    NormalWork = GraphBuilder.RegisterExternalTexture(State->NormalWork);
+                }
+
+                // The static layer's rectangles.
+                if (Job->Static.Num() > 0)
+                {
+                    FVoxelOceanDensityParameters DensityP;
+                    VOP::FillDensity(GraphBuilder, *Cache, Density, Edits, Job->HalfFinest, Shore, Margin, DepthFootprintCm, Job->Radius, LandCache, DensityP);
+                    FRDGTextureUAVRef StaticUAV = GraphBuilder.CreateUAV(StaticTex);
+                    for (const auto& SJ : Job->Static)
+                    {
+                        const VoxelOceanClipmap::FRect& R = SJ.Rect;
+                        if (R.IsEmpty()) continue;
+                        const FVector4f& Window = Job->Window[SJ.Level];
+                        const FIntVector4& Mod = Job->WindowMod[SJ.Level];
+                        FVoxelOceanClipStaticParameters* P = GraphBuilder.AllocParameters<FVoxelOceanClipStaticParameters>();
+                        P->StaticOut = StaticUAV;
+                        P->StaticSlot = (uint32)FMath::RoundToInt(Window.W);
+                        P->StaticRectMin = FIntPoint(R.I0, R.J0);
+                        P->StaticRectSize = FIntPoint(R.Width, R.Height);
+                        P->StaticOriginMod = FIntPoint(Mod.X, Mod.Y);
+                        P->StaticInWindow = FVector2f(Window.X, Window.Y);
+                        P->StaticSpacing = Window.Z;
+                        for (int32 r = 0; r < VoxelOceanClipmap::SharedRows; r++) P->StaticFrame[r] = Job->Rows[r];
+                        P->StaticCameraLattice = Job->CameraLattice;
+                        P->StaticCameraFrac = Job->CameraFrac;
+                        P->StaticParams = W.Params;
+                        P->StaticWave0 = W.Wave[0];
+                        P->StaticWave1 = W.Wave[1];
+                        P->StaticWave2 = W.Wave[2];
+                        P->StaticCenter = W.Center;
+                        P->StaticShape = W.Shape;
+                        P->StaticFFT = bFFT ? W.FFT : FVector4f(0.0f, W.FFT.Y, 0.0f, 0.0f);
+                        P->StaticRefHigh = W.RefHigh;
+                        P->StaticRefLow = W.RefLow;
+                        P->StaticRotation = W.Rotation;
+                        P->StaticTiles = W.Tiles;
+                        P->StaticStates = States;
+                        P->StaticSlopeVar = W.SlopeVar;
+                        P->StaticCharts = ChartsRHI;
+                        P->StaticShore = ShoreRHI;
+                        P->Density = DensityP;
+                        FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("VoxelOceanClip static L%d %dx%d", SJ.Level, R.Width, R.Height),
+                            TShaderMapRef<FVoxelOceanClipStaticCS>(ShaderMap), P,
+                            FIntVector(FMath::DivideAndRoundUp(R.Width, 8), FMath::DivideAndRoundUp(R.Height, 8), 1));
+                    }
+                }
+
+                // The waves of the levels due, into their slots; the info.
+                FRDGTextureRef InfoWork = GraphBuilder.CreateTexture(FRDGTextureDesc::Create2D(FIntPoint(VoxelOceanClipmap::InfoRows, 1), PF_A32B32G32R32F,
+                    FClearValueBinding::Black, TexCreate_ShaderResource | TexCreate_UAV), TEXT("Voxel.OceanClipInfoWork"));
+                {
+                    FVoxelOceanClipWaveParameters* P = GraphBuilder.AllocParameters<FVoxelOceanClipWaveParameters>();
+                    for (int32 i = 0; i < VoxelOceanClipmap::InfoRows; i++) P->ClipInfoRows[i] = Job->Rows[i];
+                    for (int32 i = 0; i < VoxelOceanClipmap::MaxLevels / 4; i++)
+                    {
+                        auto At = [&](int32 j) { return j < Job->NumDue ? (uint32)Job->Due[j] : (uint32)VoxelOceanClipmap::MaxLevels; };
+                        P->ClipDue[i] = FUintVector4(At(4 * i), At(4 * i + 1), At(4 * i + 2), At(4 * i + 3));
+                    }
+                    P->ClipDueCount = (uint32)Job->NumDue;
+                    for (int32 i = 0; i < VoxelOceanClipmap::MaxLevels; i++)
+                    {
+                        P->ClipWindow[i] = Job->Window[i];
+                        P->ClipWindowMod[i] = Job->WindowMod[i];
+                    }
+                    P->ClipStatic = StaticTex;
+                    P->ClipDisplacementOut = GraphBuilder.CreateUAV(DispWork);
+                    P->ClipNormalOut = GraphBuilder.CreateUAV(NormalWork);
+                    P->ClipInfoOut = GraphBuilder.CreateUAV(InfoWork);
+                    P->ClipParams = W.Params;
+                    P->ClipWave0 = W.Wave[0];
+                    P->ClipWave1 = W.Wave[1];
+                    P->ClipWave2 = W.Wave[2];
+                    P->ClipCenter = W.Center;
+                    P->ClipShape = W.Shape;
+                    P->ClipFFT = bFFT ? W.FFT : FVector4f(0.0f, 0.0f, 0.0f, 0.0f);
+                    P->ClipRefHigh = W.RefHigh;
+                    P->ClipRefLow = W.RefLow;
+                    P->ClipRotation = W.Rotation;
+                    P->ClipTiles = W.Tiles;
+                    P->ClipStates = States;
+                    P->ClipSlopeVar = W.SlopeVar;
+                    P->ClipDisplacement = bFFT ? Displacement.GetReference() : GBlackArrayTexture->TextureRHI.GetReference();
+                    P->ClipDerivatives = bFFT ? Derivatives.GetReference() : GBlackArrayTexture->TextureRHI.GetReference();
+                    P->ClipCharts = ChartsRHI;
+                    P->ClipFoam = bFFT && FoamTexture ? FoamTexture.GetReference() : GBlackArrayTexture->TextureRHI.GetReference();
+                    P->ClipFoamOn = bFFT && FoamTexture ? 1u : 0u;
+                    P->ClipDisplacementSampler = TStaticSamplerState<SF_Trilinear, AM_Wrap, AM_Wrap, AM_Clamp>::GetRHI();
+                    P->ClipDerivativesSampler = TStaticSamplerState<SF_Trilinear, AM_Wrap, AM_Wrap, AM_Clamp>::GetRHI();
+                    P->ClipFoamSampler = TStaticSamplerState<SF_Trilinear, AM_Wrap, AM_Wrap, AM_Clamp>::GetRHI();
+                    // (One layer at least: its first threads write the info.)
+                    FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("VoxelOceanClip waves %d levels of %d", Job->NumDue, Size),
+                        TShaderMapRef<FVoxelOceanClipWaveCS>(ShaderMap), P,
+                        FIntVector(FMath::DivideAndRoundUp(Size, 8), FMath::DivideAndRoundUp(Size, 8), FMath::Max(Job->NumDue, 1)));
+                }
+                // Into the textures the material and the vertices read: every slot.
+                FRDGTextureRef DispDest = RegisterExternalTexture(GraphBuilder, DispRHI, TEXT("Voxel.OceanClipDisplacement"));
+                FRDGTextureRef NormalDest = RegisterExternalTexture(GraphBuilder, NormalRHI, TEXT("Voxel.OceanClipNormal"));
+                FRDGTextureRef InfoDest = RegisterExternalTexture(GraphBuilder, InfoRHI, TEXT("Voxel.OceanClipInfo"));
+                const bool bArraysMatch = DispDest->Desc.Format == PF_A32B32G32R32F && NormalDest->Desc.Format == PF_FloatRGBA
+                    && DispDest->Desc.Extent == FIntPoint(Size, Size) && NormalDest->Desc.Extent == FIntPoint(Size, Size)
+                    && (int32)DispDest->Desc.ArraySize >= Job->Slots && (int32)NormalDest->Desc.ArraySize >= Job->Slots;
+                if (bArraysMatch)
+                {
+                    FRHICopyTextureInfo Copy;
+                    Copy.Size = FIntVector(Size, Size, 1);
+                    Copy.NumSlices = (uint32)Job->Slots;
+                    AddCopyTexturePass(GraphBuilder, DispWork, DispDest, Copy);
+                    AddCopyTexturePass(GraphBuilder, NormalWork, NormalDest, Copy);
+                }
+                if (InfoDest->Desc.Format == PF_A32B32G32R32F && InfoDest->Desc.Extent == FIntPoint(VoxelOceanClipmap::InfoRows, 1))
+                {
+                    FRHICopyTextureInfo Copy;
+                    Copy.Size = FIntVector(VoxelOceanClipmap::InfoRows, 1, 1);
+                    AddCopyTexturePass(GraphBuilder, InfoWork, InfoDest, Copy);
+                }
+                GraphBuilder.SetTextureAccessFinal(DispDest, ERHIAccess::SRVMask);
+                GraphBuilder.SetTextureAccessFinal(NormalDest, ERHIAccess::SRVMask);
+                GraphBuilder.SetTextureAccessFinal(InfoDest, ERHIAccess::SRVMask);
+                // A destination of another shape (being made again): the vertices don't sample it.
+                if (!bArraysMatch)
+                {
+                    GraphBuilder.Execute();
+                    Displace->bClip = false;
+                    return;
+                }
+            }
+            GraphBuilder.Execute();
+            // The pages' vertices sample the levels this frame, and the rings draw from them.
+            for (int32 i = 0; i < VoxelOceanClipmap::InfoRows; i++) Displace->ClipRows[i] = Job->Rows[i];
+            Displace->ClipDisplacement = DispRHI;
+            Displace->bClip = true;
+            Displace->bRings = Job->bRings;
+            Displace->RingCount = Job->RingCount;
+            for (int32 i = 0; i < VoxelOceanClipmap::MaxLevels; i++)
+            {
+                Displace->RingLevel[i] = Job->RingLevel[i];
+                Displace->RingInts[i] = Job->RingInts[i];
+            }
+
+        });
+}
+
+void FVoxelOceanPages::NotifyClipEdit(const FVector& Center, double Reach)
+{
+    check(IsInGameThread());
+    if (!ClipPlan.IsValid() || Reach <= 0.0) return;
+    // Many at once (a long stroke): one sphere around them all.
+    if (ClipPlan->Edits.Num() >= 64)
+    {
+        FBox Box(ForceInit);
+        for (const FVoxelOceanClipPlan::FEdit& E : ClipPlan->Edits) Box += FBox(E.Center - FVector(E.Reach), E.Center + FVector(E.Reach));
+        Box += FBox(Center - FVector(Reach), Center + FVector(Reach));
+        ClipPlan->Edits.Reset();
+        ClipPlan->Edits.Add({ Box.GetCenter(), Box.GetExtent().Size() });
+        return;
+    }
+    ClipPlan->Edits.Add({ Center, Reach });
+}
+
+void FVoxelOceanPages::InvalidateClip()
+{
+    check(IsInGameThread());
+    if (!ClipPlan.IsValid()) return;
+    for (FVoxelOceanClipPlan::FSlot& Slot : ClipPlan->Slots) Slot = FVoxelOceanClipPlan::FSlot();
+    ClipPlan->Edits.Reset();
+}
+
+FString FVoxelOceanPages::TakeClipPerf()
+{
+    if (!ClipPlan.IsValid() || !ClipPlan->bHasFrame) return FString();
+    const VoxelOceanClipmap::FFrame& F = ClipPlan->Frame;
+    const FString Out = FString::Printf(TEXT("Clipmap: %d levels (spacing %.2f to %.0f m), %lld static texels written, %d re-anchors."), F.Count,
+        F.Count > 0 ? F.Levels[0].Spacing * 0.01 : 0.0, F.Count > 0 ? F.Levels[F.Count - 1].Spacing * 0.01 : 0.0, (long long)ClipPlan->StaticTexels,
+        ClipPlan->Reanchors);
+    ClipPlan->StaticTexels = 0;
+    ClipPlan->Reanchors = 0;
+    if (Rings.IsValid() && Rings->Provider.IsValid())
+    {
+        // The rings' runs in the last second: drawn, and waiting for the clipmap or a stream.
+        const uint32 Runs = Rings->Provider->Runs.exchange(0, std::memory_order_relaxed);
+        const uint32 Drawn = Rings->Provider->DrawnRuns.exchange(0, std::memory_order_relaxed);
+        const uint32 Skipped = Rings->Provider->SkippedRuns.exchange(0, std::memory_order_relaxed);
+        return Out + FString::Printf(TEXT(" Rings: %u runs drew, %u waited for the clipmap, %u skipped (a stream or a shader missing)%s."), Drawn, Runs - Drawn, Skipped,
+            Rings->Handle == 0 ? TEXT(", not registered yet") : TEXT(""));
+    }
+    return Out;
+}
+
+bool FVoxelOceanPages::CanDrawRings() const
+{
+    return ClipSettings.bRings && IsClipmapOn() && bWavesInCompute && VOP::RingHalf(ClipSettings.Size) > 0;
+}
+
+bool FVoxelOceanPages::IsRingsOn() const
+{
+    return Rings.IsValid();
+}
+
+void FVoxelOceanPages::SetRings(bool bOn)
+{
+    check(IsInGameThread());
+    if (!bOn || !CanDrawRings())
+    {
+        DestroyRings();
+        return;
+    }
+    if (Rings.IsValid()) return;
+    AActor* OwnerActor = Owner.Get();
+    USceneComponent* Root = AttachRoot.Get();
+    if (!OwnerActor || !Root || !FApp::CanEverRender()) return;
+
+    TUniquePtr<FVoxelOceanRingSet> Set = MakeUnique<FVoxelOceanRingSet>();
+    Set->Half = VOP::RingHalf(ClipSettings.Size);
+    Set->Slots = ClipSettings.Levels;
+    Set->FarCells = FMath::Clamp(ClipSettings.FarCells, 4, 256);
+    const int32 Side = VOP::RingSide(Set->Half);
+    const int32 RingVertices = Set->Slots * Side * Side;
+    VOP::FarDirections(Set->FarCells, Set->FarDirections);
+    Set->FarCellCm = Radius * UE_DOUBLE_PI * 0.5 / Set->FarCells;
+    const int32 FarSide = Set->FarCells + 1;
+    const int32 Vertices = RingVertices + Set->FarDirections.Num();
+
+    // The triangles, fixed: each level's square, then the far sphere's faces.
+    TArray<uint32> Indices;
+    Indices.Reserve(6 * (Set->Slots * 4 * Set->Half * Set->Half + 6 * Set->FarCells * Set->FarCells));
+    for (int32 Level = 0; Level < Set->Slots; Level++)
+    {
+        const uint32 Base = (uint32)(Level * Side * Side);
+        auto Index = [&](int32 X, int32 Y) { return Base + (uint32)((Y + Set->Half) * Side + (X + Set->Half)); };
+        for (int32 Y = -Set->Half; Y < Set->Half; Y++)
+            for (int32 X = -Set->Half; X < Set->Half; X++)
+                VOP::CellTriangles(Index(X, Y), Index(X + 1, Y), Index(X, Y + 1), Index(X + 1, Y + 1), (X >= 0) == (Y >= 0), bFlipWinding, Indices);
+    }
+    for (int32 Face = 0; Face < 6; Face++)
+    {
+        const uint32 Base = (uint32)(RingVertices + Face * FarSide * FarSide);
+        auto Index = [&](int32 I, int32 J) { return Base + (uint32)(J * FarSide + I); };
+        for (int32 J = 0; J < Set->FarCells; J++)
+            for (int32 I = 0; I < Set->FarCells; I++)
+                VOP::CellTriangles(Index(I, J), Index(I + 1, J), Index(I, J + 1), Index(I + 1, J + 1), true, bFlipWinding, Indices);
+    }
+    TArray<FVector4f> FarWords;
+    FarWords.SetNum(Set->FarDirections.Num());
+    for (int32 i = 0; i < FarWords.Num(); i++)
+        FarWords[i] = FVector4f((float)Set->FarDirections[i].X, (float)Set->FarDirections[i].Y, (float)Set->FarDirections[i].Z, 0.0f);
+
+    URealtimeMeshSimple* Mesh = NewObject<URealtimeMeshSimple>(OwnerActor, NAME_None, RF_Transient);
+    Mesh->SetupMaterialSlot(0, "Ocean Material");
+    URealtimeMeshComponent* Component = NewObject<URealtimeMeshComponent>(OwnerActor, URealtimeMeshComponent::StaticClass(), NAME_None, RF_Transient);
+    Component->bHiddenInSceneCapture = true;
+    Component->SetCanEverAffectNavigation(false);
+    Component->SetGenerateOverlapEvents(false);
+    Component->SetCastShadow(false);
+    Component->RegisterComponent();
+    Component->SetMaterial(0, Material.Get());
+    Component->AttachToComponent(Root, FAttachmentTransformRules::KeepRelativeTransform);
+    Component->SetMobility(EComponentMobility::Movable);
+    Component->SetCollisionEnabled(ECollisionEnabled::NoCollision);
+    Component->SetRealtimeMesh(Mesh);
+    Component->SetVisibleInRayTracing(false);
+    Component->SetCustomPrimitiveDataFloat(0, 0.0f);
+    Component->SetCustomPrimitiveDataFloat(1, (float)MorphEnd0);
+
+    // The uploaded positions only size the buffers and give the bounds: the whole planet around
+    // the origin (the provider writes them every frame).
+    FRealtimeMeshStreamSet Streams;
+    FRealtimeMeshStream& Positions = Streams.AddStream(FRealtimeMeshStreams::Position, GetRealtimeMeshBufferLayout<FVector3f>());
+    Positions.SetNumZeroed(Vertices);
+    TArrayView<FVector3f> PositionView = Positions.GetArrayView<FVector3f>();
+    PositionView[0] = FVector3f((float)(-2.0 * Radius));
+    PositionView[1] = FVector3f((float)(2.0 * Radius));
+    Streams.AddStream(FRealtimeMeshStreams::Tangents, GetRealtimeMeshBufferLayout<FRealtimeMeshTangentsNormalPrecision>()).SetNumZeroed(Vertices);
+    Streams.AddStream(FRealtimeMeshStreams::TexCoords, GetRealtimeMeshBufferLayout<TRealtimeMeshTexCoords<FVector2f, VOP::TexCoordChannels>>()).SetNumZeroed(Vertices);
+    Streams.AddStream(FRealtimeMeshStreams::Color, GetRealtimeMeshBufferLayout<FColor>()).SetNumZeroed(Vertices);
+    FRealtimeMeshStream& Triangles = Streams.AddStream(FRealtimeMeshStreams::Triangles, GetRealtimeMeshBufferLayout<TIndex3<uint32>>());
+    Triangles.SetNumUninitialized(Indices.Num() / 3);
+    TArrayView<TIndex3<uint32>> TriangleView = Triangles.GetArrayView<TIndex3<uint32>>();
+    for (int32 t = 0; t < TriangleView.Num(); t++)
+        TriangleView[t] = TIndex3<uint32>(Indices[3 * t], Indices[3 * t + 1], Indices[3 * t + 2]);
+
+    Set->bBuffersReady = MakeShared<std::atomic<bool>, ESPMode::ThreadSafe>(false);
+    const TSharedPtr<std::atomic<bool>, ESPMode::ThreadSafe> Ready = Set->bBuffersReady;
+    Mesh->CreateBufferSet(VOP::GroupKey(), MoveTemp(Streams), FRealtimeMeshBufferSetConfig(ERealtimeMeshSectionDrawType::Static, true))
+        .Next([Ready](ERealtimeMeshProxyUpdateStatus) { Ready->store(true, std::memory_order_release); });
+    Mesh->UpdateSectionConfig(VOP::SectionKey(), FRealtimeMeshSectionConfig(0), false);
+    // Hidden until the provider is registered (as the pages: CreateInstance).
+    Mesh->SetSectionVisibility(VOP::SectionKey(), false);
+
+    Set->Mesh = Mesh;
+    Set->Component = Component;
+    Set->Provider = MakeShared<FVoxelOceanRingProvider, ESPMode::ThreadSafe>(InputCache, DisplaceState, ClipState, Set->Half, Set->Slots, Set->FarCells,
+        MoveTemp(FarWords), (uint32)Indices.Num());
+    Set->CreatedFrame = GFrameCounter;
+    Rings = MoveTemp(Set);
+    UE_LOG(LogVoxelPlugin, Log, TEXT("[VoxelOcean] Rings: %d levels of %d x %d cells, a far sphere of %d cells a face edge (%d vertices, %d triangles)."),
+        Rings->Slots, 2 * Rings->Half, 2 * Rings->Half, Rings->FarCells, Vertices, Indices.Num() / 3);
+}
+
+void FVoxelOceanPages::DestroyRings()
+{
+    if (!Rings.IsValid()) return;
+    if (Rings->Handle != 0)
+        UnregisterRealtimeMeshComputeProvider(Rings->Handle);
+    if (URealtimeMeshComponent* Component = Rings->Component.Get())
+        Component->DestroyComponent();
+    // Its GPU buffers are released on the render thread, after any run already queued.
+    if (Rings->Provider.IsValid())
+    {
+        ENQUEUE_RENDER_COMMAND(VoxelOceanRingsRelease)([Provider = MoveTemp(Rings->Provider)](FRHICommandListImmediate&) mutable
+            {
+                Provider.Reset();
+            });
+    }
+    Rings.Reset();
+}
+
+FVector FVoxelOceanPages::AdvanceRings(const FVector& CameraPlanet)
+{
+    check(IsInGameThread() && Rings.IsValid());
+    FVoxelOceanRingSet& Set = *Rings;
+    URealtimeMeshSimple* Mesh = Set.Mesh.Get();
+    URealtimeMeshComponent* Component = Set.Component.Get();
+    if (!Mesh || !Component) return FVector::ZeroVector;
+    // Registered once the buffers exist and the component has a proxy (as the pages: Advance);
+    // every frame from then.
+    if (Set.Handle == 0 && Set.bBuffersReady->load(std::memory_order_acquire) && GFrameCounter >= Set.CreatedFrame + 2)
+    {
+        Mesh->SetSectionVisibility(VOP::SectionKey(), true);
+        FRealtimeMeshComputeRegistration Registration;
+        Registration.Mesh = Mesh->GetMesh();
+        Registration.BufferSetKey = VOP::GroupKey();
+        Registration.SectionKey = VOP::SectionKey();
+        Registration.Provider = Set.Provider;
+        Registration.Trigger = ERealtimeMeshComputeTrigger::EveryFrame;
+        Registration.bUseIndirect = true;
+        Set.Handle = RegisterRealtimeMeshComputeProvider(Registration);
+    }
+    // The origin near the camera, so the positions are small floats: moved when the camera is more
+    // than 2 km from it (the velocity reset: the move isn't motion).
+    constexpr double RebaseCm = 200000.0;
+    if (!Set.bHasOrigin || FVector::DistSquared(CameraPlanet, Set.Origin) > RebaseCm * RebaseCm)
+    {
+        Set.Origin = CameraPlanet;
+        Set.bHasOrigin = true;
+        Component->SetRelativeTransform(FTransform(FQuat::Identity, Set.Origin, FVector::OneVector));
+        Component->ResetSceneVelocity();
+    }
+    // The far sphere's land: again when the terrain's inputs (or their lattice) changed.
+    const double HalfFinest = FMath::Max(DensityInputs.HalfFinest, 1.0e-3);
+    if (Set.Provider.IsValid() && (Set.FarVersion != DensityVersion || Set.FarHalfFinest != HalfFinest) && DensityInputs.Density.IsValid())
+    {
+        FVoxelOceanRingProvider::FFarJob Job;
+        Job.Density = DensityInputs.Density;
+        Job.Edits = DensityInputs.Edits.IsValid() ? DensityInputs.Edits : NoEdits;
+        Job.HalfFinest = HalfFinest;
+        Job.Shore = DensityInputs.Shore;
+        Job.ShoreMarginCm = DensityInputs.ShoreMarginCm;
+        Job.DepthFootprintCm = DensityInputs.DepthFootprintCm;
+        Job.SeaRadiusCm = Radius;
+        Job.LandCache = DensityInputs.LandCache;
+        Job.FootprintCm = (float)Set.FarCellCm;
+        Job.Lattice.SetNum(3 * Set.FarDirections.Num());
+        for (int32 i = 0; i < Set.FarDirections.Num(); i++)
+        {
+            const FVector P = Set.FarDirections[i] * (Radius / HalfFinest);
+            Job.Lattice[3 * i] = (int32)FMath::RoundToDouble(P.X);
+            Job.Lattice[3 * i + 1] = (int32)FMath::RoundToDouble(P.Y);
+            Job.Lattice[3 * i + 2] = (int32)FMath::RoundToDouble(P.Z);
+        }
+        ENQUEUE_RENDER_COMMAND(VoxelOceanFarJob)([Provider = Set.Provider, Job = MoveTemp(Job)](FRHICommandListImmediate&) mutable
+            {
+                Provider->SetFarJob_RenderThread(MoveTemp(Job));
+            });
+        Set.FarVersion = DensityVersion;
+        Set.FarHalfFinest = HalfFinest;
+    }
+    return CameraPlanet - Set.Origin;
+}
+
+void FVoxelOceanPages::UpdateRings(const FVector& CameraPlanet, const FVector4f& Cull)
+{
+    check(IsInGameThread());
+    if (!Rings.IsValid()) return;
+    const FVector CamToOrigin = AdvanceRings(CameraPlanet);
+    const bool bLevelColor = CVarVoxelDebugLevelColor.GetValueOnGameThread() > 0;
+    // The camera as a float and the rest: the far sphere's points from it stay precise.
+    const FVector3f High(CameraPlanet);
+    const FVector Low = CameraPlanet - FVector(High);
+    const FVector4f Frame0(FVector3f(CamToOrigin), bLevelColor ? 1.0f : 0.0f);
+    const FVector4f Frame1(High, FMath::Max(Cull.W, 0.0f));
+    const FVector4f Frame2(FVector3f(Low), (float)Radius);
+    // The far sphere's cell for its own cull.
+    const FVector4f RingCull(Cull.X, Cull.Y, Cull.Z, (float)Rings->FarCellCm);
+    ENQUEUE_RENDER_COMMAND(VoxelOceanRingsFrame)([State = DisplaceState, Frame0, Frame1, Frame2, RingCull](FRHICommandListImmediate&)
+        {
+            State->bRingsFar = true;
+            State->RingFrame0 = Frame0;
+            State->RingFrame1 = Frame1;
+            State->RingFrame2 = Frame2;
+            State->RingCull = RingCull;
+        });
+}
+
+TSharedPtr<FVoxelOceanLandCacheRHI, ESPMode::ThreadSafe> FVoxelOceanLandCacheRHI::Make(const FVoxelLandCacheTextures& Textures, double LandSeaRadiusCm,
+    double OceanRadiusCm)
+{
+    if (!Textures.IsValid()) return nullptr;
+    FTextureResource* Resources[4] = { Textures.Height->GameThread_GetRenderTargetResource(), Textures.Slope->GameThread_GetRenderTargetResource(),
+        Textures.Fields->GameThread_GetRenderTargetResource(), Textures.State->GetResource() };
+    for (FTextureResource* Resource : Resources)
+        if (!Resource) return nullptr;
+    const TSharedPtr<FVoxelOceanLandCacheRHI, ESPMode::ThreadSafe> Out = MakeShared<FVoxelOceanLandCacheRHI, ESPMode::ThreadSafe>();
+    Out->LandSeaRadiusCm = LandSeaRadiusCm;
+    Out->SeaOffsetCm = OceanRadiusCm - LandSeaRadiusCm;
+    Out->Sources[0] = Textures.Height;
+    Out->Sources[1] = Textures.Slope;
+    Out->Sources[2] = Textures.Fields;
+    Out->Sources[3] = Textures.State;
+    // After the resources' own initialization (render commands run in order).
+    ENQUEUE_RENDER_COMMAND(VoxelOceanLandCacheRHI)([Out, H = Resources[0], S = Resources[1], F = Resources[2], T = Resources[3]](FRHICommandListImmediate&)
+        {
+            Out->Height = H->TextureRHI;
+            Out->Slope = S->TextureRHI;
+            Out->Fields = F->TextureRHI;
+            Out->State = T->TextureRHI;
+        });
+    return Out;
+}
+
+bool FVoxelOceanLandCacheRHI::IsFor(const FVoxelLandCacheTextures& Textures, double InLandSeaRadiusCm, double OceanRadiusCm) const
+{
+    // Weak: a texture made again at a freed one's address is another texture.
+    return Sources[0].Get() == Textures.Height && Sources[1].Get() == Textures.Slope && Sources[2].Get() == Textures.Fields
+        && Sources[3].Get() == Textures.State && Textures.IsValid() && LandSeaRadiusCm == InLandSeaRadiusCm && SeaOffsetCm == OceanRadiusCm - InLandSeaRadiusCm;
 }
 
 void FVoxelOceanPages::Initialize(AActor* InOwner, USceneComponent* InAttachRoot, UMaterialInterface* InMaterial, double InRadius, int32 InTileQuads,
     double InMorphEnd0, bool bInFlipWinding)
 {
     Reset();
+    DestroyRings();
     Owner = InOwner;
     AttachRoot = InAttachRoot;
     Material = InMaterial;
@@ -558,6 +2218,9 @@ void FVoxelOceanPages::SetMaterial(UMaterialInterface* InMaterial)
         Apply(Instance);
     for (const FReleasing& Entry : Releasing)
         Apply(Entry.Instance);
+    if (Rings.IsValid())
+        if (URealtimeMeshComponent* Component = Rings->Component.Get())
+            Component->SetMaterial(0, InMaterial);
 }
 
 void FVoxelOceanPages::SetWaveReach(double InReach)
@@ -670,7 +2333,7 @@ FVoxelOceanPages::FInstance FVoxelOceanPages::CreateInstance()
 
     Instance.Mesh = Mesh;
     Instance.Component = Component;
-    Instance.Provider = MakeShared<FVoxelOceanPageProvider, ESPMode::ThreadSafe>(InputCache);
+    Instance.Provider = MakeShared<FVoxelOceanPageProvider, ESPMode::ThreadSafe>(InputCache, DisplaceState, bWavesInCompute);
     Instance.CreatedFrame = GFrameCounter;
     return Instance;
 }
@@ -681,6 +2344,15 @@ void FVoxelOceanPages::DestroyInstance(FInstance& Instance)
         UnregisterRealtimeMeshComputeProvider(Instance.Handle);
     if (URealtimeMeshComponent* Component = Instance.Component.Get())
         Component->DestroyComponent();
+    // The provider's GPU buffers (the static copy, stage O9j) are released on the render thread:
+    // this reference is dropped there, after any run already queued.
+    if (Instance.Provider.IsValid())
+    {
+        ENQUEUE_RENDER_COMMAND(VoxelOceanPageRelease)([Provider = MoveTemp(Instance.Provider)](FRHICommandListImmediate&) mutable
+            {
+                Provider.Reset();
+            });
+    }
     Instance = FInstance();
 }
 
@@ -693,6 +2365,14 @@ void FVoxelOceanPages::PlaceInstance(const FVoxelOceanTileKey& PageKey, FInstanc
     VoxelOceanTiles::PageFrame(PageKey, Radius, Origin, Unit);
     Component->SetRelativeTransform(FTransform(FQuat::Identity, Origin, FVector(Unit)));
     Component->SetCustomPrimitiveDataFloat(0, (float)PageKey.Level);
+    // The displacement's page (stage O9j): its origin, unit and level, before its next run.
+    if (bWavesInCompute && Instance.Provider.IsValid())
+    {
+        ENQUEUE_RENDER_COMMAND(VoxelOceanPagePlace)([Provider = Instance.Provider, Origin, Unit, Level = (int32)PageKey.Level](FRHICommandListImmediate&)
+            {
+                Provider->SetPlacement_RenderThread(Origin, Unit, Level);
+            });
+    }
     // The node and its sag reach 0.77 of the unit cube's half-width (CreateInstance), leaving
     // 0.23 of a unit around them; the waves may need more.
     const float BoundsScale = (float)FMath::Max(1.0, (0.77 * Unit + WaveReach) / Unit);
@@ -889,6 +2569,7 @@ void FVoxelOceanPages::Push(const FVoxelOceanTileKey& PageKey, FInstance& Instan
     State.ShoreMarginCm = DensityInputs.ShoreMarginCm;
     State.DepthFootprintCm = DensityInputs.DepthFootprintCm;
     State.SeaRadiusCm = Radius;
+    State.LandCache = DensityInputs.LandCache;
     State.Version = NextVersion++;
     Instance.PushedVersion = State.Version;
     // The state reaches the provider before the dirty mark: both are render commands.
@@ -923,7 +2604,9 @@ void FVoxelOceanPages::Advance(FInstance& Instance) const
         Registration.BufferSetKey = VOP::GroupKey();
         Registration.SectionKey = VOP::SectionKey();
         Registration.Provider = Instance.Provider;
-        Registration.Trigger = ERealtimeMeshComputeTrigger::OnDemand;
+        // With the waves in compute (stage O9j) the provider runs every frame: its writes, then
+        // the displacement.
+        Registration.Trigger = bWavesInCompute ? ERealtimeMeshComputeTrigger::EveryFrame : ERealtimeMeshComputeTrigger::OnDemand;
         Registration.bUseIndirect = true;
         Instance.Handle = RegisterRealtimeMeshComputeProvider(Registration);
         Instance.LastKickFrame = GFrameCounter;
@@ -1049,5 +2732,6 @@ FString FVoxelOceanPages::TakePerf()
         Perf.Calls * PerFrame, Perf.IdleCalls * PerFrame, Perf.Runs * PerFrame, Perf.RenderMicros * PerFrame / 1000.0,
         Perf.Created * PerFrame, Perf.Created > 0 ? Perf.CreateMs / Perf.Created : 0.0, Perf.MaxCreateMs, Perf.Recycled * PerFrame);
     Perf = FPerf();
-    return Out;
+    const FString Clip = TakeClipPerf();
+    return Clip.IsEmpty() ? Out : Out + TEXT(" ") + Clip;
 }

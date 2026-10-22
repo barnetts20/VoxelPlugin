@@ -19,8 +19,9 @@
 // - the fade: within Fade metres of the coast (d / slope, the slope the shore field's) the bands
 //   fade out (0 by default since stage O9a: the surf's handover does it);
 // - the handover (stage O9a, VoxelOceanSurf.ush): the long bands keep LongKeep of their amplitude
-//   near the coast, the surf trains carrying the rest; applied before the breaking cap, so the
-//   short bands aren't capped for energy the trains took.
+//   near the coast, the surf trains carrying the rest (stage O9i: never under the FFT's floor,
+//   the coastal field's trains on top); applied before the breaking cap, so the short bands
+//   aren't capped for energy the trains took.
 // No effect where the band is deep (k d beyond VOXEL_OCEAN_SHOAL_DEEP).
 //
 // SLOWING (from the shore field): the waves shorten and slow toward the coast. A band's lookup is
