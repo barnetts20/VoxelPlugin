@@ -155,6 +155,17 @@ VOXEL_FUNC float VoxelOceanWaterBody(float Scattering, float Extinction, float P
     return Sun + Sky + Through;
 }
 
+/** The light through a thin crest (stage W3h): the sun enters the wave's back face (whole: its
+ *  Fresnel there is small and left out), is scattered once toward the eye along a path Thickness
+ *  (cm) and attenuated over it: E s p t e^(-sigma t), per channel (s and sigma per cm), the phase
+ *  p for the angle between the sun's beam and the way to the eye. The water's own colour (red
+ *  taken first) makes the glow teal. Out through the front surface as the water's body. */
+VOXEL_FUNC float VoxelOceanCrestGlow(float Scattering, float Extinction, float Thickness, float Phase, float SunIrradiance)
+{
+    const float T = max(Thickness, 0.0f);
+    return SunIrradiance * Scattering * Phase * T * exp(-Extinction * T);
+}
+
 /** The stand-in sky (until the atmosphere's is connected): radiance per unit of the sun's
  *  illuminance from the horizon's colour to the zenith's; below the horizon, the horizon's. */
 VOXEL_FUNC float3 VoxelOceanStandInSky(float3 Dir, float3 Up, float3 Zenith, float3 Horizon)

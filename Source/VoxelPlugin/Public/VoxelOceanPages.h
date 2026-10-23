@@ -358,6 +358,8 @@ private:
     FVoxelOceanClipSettings ClipSettings;
     TStrongObjectPtr<UTexture2DArray> ClipDisplacement;
     TStrongObjectPtr<UTexture2DArray> ClipNormal;
+    /** Stage W3h: the whitecaps' density per level (PF_G16R16F; the own pass reads it). */
+    TStrongObjectPtr<UTexture2DArray> ClipWhitecap;
     TStrongObjectPtr<UTexture2D> ClipInfo;
     TUniquePtr<FVoxelOceanClipPlan> ClipPlan;
     /** The rings (stage W2; null: off). */

@@ -21,6 +21,7 @@ struct FVoxelOceanPixelClipOut
     float Foam;
     float Spacing;
     float Valid;
+    float Height;       // stage W3h: the surface's height over the sea sphere there (cm; the levels' blend)
 };
 
 FVoxelOceanPixelClipOut VoxelOceanPixelClipOf(float3 X, float3 UpP, float Footprint, Texture2DArray ClipDisplacement, Texture2DArray ClipNormal,
@@ -32,6 +33,7 @@ FVoxelOceanPixelClipOut VoxelOceanPixelClipOf(float3 X, float3 UpP, float Footpr
     O.Foam = 0.0f;
     O.Spacing = 0.0f;
     O.Valid = 0.0f;
+    O.Height = 0.0f;
     const FVoxelOceanClipPick Pick = VoxelOceanClipPickOfTexture(ClipInfo, X, Footprint);
     const FVoxelOceanClipFrame F = VoxelOceanClipFrameOfTexture(ClipInfo);
     const int Count = clamp(int(F.Count + 0.5f), 0, VOXEL_OCEAN_CLIP_MAX_LEVELS);
@@ -56,9 +58,23 @@ FVoxelOceanPixelClipOut VoxelOceanPixelClipOf(float3 X, float3 UpP, float Footpr
     O.Normal = normalize(N.xyz + UpP * Missing);
     O.SlopeVariance = N.w;
     O.Foam = saturate(D.w);
+    // (VoxelOceanClipSample already weighs a missing next level out.)
+    O.Height = dot(D.xyz, UpP);
     O.Spacing = L0.Spacing * exp2(float(Pick.Level) + 1.0f - Pick.Weight);
     O.Valid = 1.0f;
     return O;
+}
+
+// The whitecaps' density at a pixel (stage W3h; VoxelOceanWhitecapOf, the clipmap's whitecap
+// texture): the levels of the footprint blended as the foam's are; past the outermost level, none
+// (its density there is the foam's job). X: the point (planet frame).
+float VoxelOceanPixelWhitecapOf(float3 X, float Footprint, Texture2DArray ClipWhitecap, SamplerState ClipSampler, Texture2D ClipInfo)
+{
+    const FVoxelOceanClipFrame F = VoxelOceanClipFrameOfTexture(ClipInfo);
+    if (int(F.Count + 0.5f) <= 0) return 0.0f;
+    const FVoxelOceanClipPick Pick = VoxelOceanClipPickOfTexture(ClipInfo, X, Footprint);
+    if (Pick.Level < 0) return 0.0f;
+    return saturate(VoxelOceanClipSample(ClipWhitecap, ClipSampler, Pick).x);
 }
 
 // The surface at a pixel in world axes: the clipmap's normal, slope variance and foam, plus the

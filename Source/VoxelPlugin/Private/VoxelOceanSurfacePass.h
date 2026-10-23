@@ -31,6 +31,7 @@
 #include <atomic>
 
 class IVoxelOceanRingDraw;
+struct FVoxelOceanFoamTexture;
 class IRendererModule;
 class FPostOpaqueRenderParameters;
 
@@ -59,6 +60,12 @@ struct FVoxelOceanShadingParams
     float Refraction = 1.0f;
     bool bFoam = true;
     FVector3f FoamAlbedo = FVector3f(0.85f, 0.85f, 0.85f);
+    /** The foam's texture set (stage W3g; null or not ready: the procedural lace) and its tile (m). */
+    TSharedPtr<FVoxelOceanFoamTexture, ESPMode::ThreadSafe> FoamTexture;
+    float FoamTileM = 12.0f;
+    /** Stage W3h: the light through thin crests (0: none) and the whitecaps' relief (1: the lace's). */
+    float CrestGlow = 1.0f;
+    float WhitecapRelief = 3.0f;
 };
 
 class FVoxelOceanSurfacePass : public FWorldSceneViewExtension

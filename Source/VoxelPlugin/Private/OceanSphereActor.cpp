@@ -8,6 +8,7 @@
 #include "VoxelUnderwaterViewExtension.h"
 #include "VoxelOceanSurfacePass.h"
 #include "VoxelOceanRingDraw.h"
+#include "VoxelOceanFoamTexture.h"
 #include "Components/DirectionalLightComponent.h"
 #include "UObject/UObjectIterator.h"
 #include "VoxelOceanCascades.h"
@@ -453,10 +454,36 @@ void AOceanSphereActor::UpdateSurfacePass()
             *GetName());
         bWarnedNoSun = true;
     }
-    Params.ShortWaveSlopeVariance = S.ShortWaveSlopeVariance;
+    // The sub-mesh roughness is the waves below the shortest band (21 cm): the equalizer's
+    // shortest gain scales it (on the height, so squared on the slope variance).
+    Params.ShortWaveSlopeVariance = S.ShortWaveSlopeVariance * FMath::Square(S.WaveEqualizer.Gain25cm);
     Params.Refraction = S.Refraction;
     Params.bFoam = S.bFoam;
     Params.FoamAlbedo = FVector3f(S.FoamAlbedo.R, S.FoamAlbedo.G, S.FoamAlbedo.B);
+    // The foam's set (stage W3g): read once a name (tried once; a failure says why, and the
+    // procedural lace stands in).
+    // (Tried again when the name changes, or the foam is turned on after starting off.)
+    if (!bFoamTextureTried || FoamTextureName != S.FoamSet || (S.bFoam && !bFoamTextureForFoam))
+    {
+        bFoamTextureTried = true;
+        bFoamTextureForFoam = S.bFoam;
+        FoamTextureName = S.FoamSet;
+        FoamTexture.Reset();
+        if (!FoamTextureName.IsEmpty() && S.bFoam)
+        {
+            FString Error;
+            FoamTexture = VoxelOceanFoamTexture::Load(FoamTextureName, Error);
+            if (!FoamTexture.IsValid())
+            {
+                UE_LOG(LogVoxelPlugin, Warning, TEXT("[VoxelOcean] %s: the foam set couldn't be read (%s); the procedural lace stands in."), *GetName(), *Error);
+            }
+            // (Else it reads in the background; the procedural lace until its textures exist.)
+        }
+    }
+    Params.FoamTexture = FoamTexture;
+    Params.FoamTileM = S.FoamTile;
+    Params.CrestGlow = S.CrestGlow;
+    Params.WhitecapRelief = S.WhitecapRelief;
     SurfacePass->SetFrame_GameThread(Params);
 }
 
@@ -1077,6 +1104,9 @@ FVoxelOceanSurfaceInputs AOceanSphereActor::GatherInputs(const AAdaptiveVoxelAct
     Inputs.Waves.FetchKm = S.WaveFetch;
     Inputs.Waves.Chop = S.WaveChop;
     Inputs.Waves.Swell = S.WaveSwell;
+    static_assert(FVoxelOceanWaveEqualizer::Knots == FVoxelOceanFFTSettings::EqualizerKnots, "the equalizer's settings and the wave model's must match");
+    for (int32 i = 0; i < FVoxelOceanFFTSettings::EqualizerKnots; i++)
+        Inputs.Waves.Gain[i] = S.WaveEqualizer.Get(i);
     Inputs.Waves.DetileCell = S.WaveDetileCell;
     Inputs.Waves.bQueryShortWaves = S.bQueryShortWaves;
     Inputs.Waves.MipBias = S.WaveMipBias;
@@ -1085,6 +1115,7 @@ FVoxelOceanSurfaceInputs AOceanSphereActor::GatherInputs(const AAdaptiveVoxelAct
     Inputs.Waves.ShoreChopGrowth = S.ShoreChopGrowth;
     Inputs.Waves.ShoreWarp = S.ShoreWarp;
     Inputs.Waves.ShoreFade = S.ShoreFadeDistance;
+    Inputs.Waves.ShoreWaveFloor = S.ShoreWaveFloor;
     Inputs.Waves.ShoreMinSlope = S.ShoreMinSlope;
     // The surf (stage O9a): a strength of 0 turns it off.
     Inputs.Waves.SurfStrength = S.bShoaling && S.bSurf ? S.SurfStrength : 0.0;

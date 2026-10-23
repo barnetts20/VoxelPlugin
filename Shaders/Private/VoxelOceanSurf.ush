@@ -72,9 +72,10 @@
 // driven by the larger of its saturation (H / Index d past 0.4, within 2.5 breaking depths of the
 // shallows) and its steepness (whitecaps on the trains' crests from a wave slope Hc k / 2 of 0.1,
 // fully at 0.25, wherever they steepen as they shoal); where the footprint doesn't resolve the
-// wave, its cycle's mean. The swash's sheet is foamy where it runs thin. The trains' slope variance
-// (SteepVar) also goes into the open sea's foam with the long bands' (VoxelOceanFoam.ush), so its
-// whitecaps grow where the composed sea steepens.
+// wave, its cycle's mean. The swash's sheet is foamy where it runs thin. Stage W3n: the whitecaps
+// (Breaking) are the white water on the bores' faces and the steep crests, moving with them; the
+// trains' slope variance (SteepVar) no longer raises the open sea's foam (the trains' own crests
+// whiten instead; it counted the shoaling's steepness twice).
 //
 // GRADIENT: the phase's part along grad Phi (GradientPhase, in the caller's frame: the coastal
 // field's gradients'); the depth's part (the gain, the cap, the setup, the blend into the swash)
@@ -117,6 +118,14 @@
 #define VOXEL_OCEAN_SURF_WHITECAP0 0.1f
 #define VOXEL_OCEAN_SURF_WHITECAP1 0.25f
 #define VOXEL_OCEAN_SURF_WHITECAP_SHARE 0.6f
+// Stage W3n: the surf's whitecaps (the breaking now) are the white water on a bore's face and just
+// behind its crest (e^(-u / BORE_TRAIL) over the cycle), and on a steep train's crest either side
+// (e^(-|u| / CREST_WIDTH)); the foam's carpet between the bores is FOAM_FLOOR of the drive, the
+// trail on top of it (until W3n the whitecaps were the bores' saturation, smooth over the whole
+// zone: whitecaps everywhere in it, all the time, and a carpet of a quarter).
+#define VOXEL_OCEAN_SURF_BORE_TRAIL 0.06f
+#define VOXEL_OCEAN_SURF_CREST_WIDTH 0.05f
+#define VOXEL_OCEAN_SURF_FOAM_FLOOR 0.1f
 // The bores' carpet (by the real depth, in breaking depths of the significant height): fully
 // within the first, none past the second.
 #define VOXEL_OCEAN_SURF_CARPET0 1.25f
@@ -371,7 +380,7 @@ struct FVoxelOceanSurf
     float3 GradientPhase; // the phase's part (the caller's frame, m per m)
     float Rate;         // d height / d t (m/s)
     float LongKeep;     // the long bands' amplitude factor
-    float Breaking;     // the bores' saturation (0 to 1)
+    float Breaking;     // the surf's whitecaps: the bores' white water and steep crests (0 to 1; stage W3n)
     float Foam;         // the trains' and the swash's foam (0 to 1)
     float SteepVar;     // the trains' slope variance (for the open sea's foam; stage O9i)
     float Active;
@@ -479,6 +488,7 @@ struct FVoxelOceanSurfTrain
     float Saturation;   // H / (Index d)
     float Steep;        // Hc k / 2
     float Foam;         // the bore's and the crest's foam at the point (0 to 1)
+    float Bore;         // stage W3n: its whitecaps, the white water on the bore's face and crest (0 to 1)
 };
 
 VOXEL_FUNC FVoxelOceanSurfTrain VoxelOceanSurfTrainNone()
@@ -500,6 +510,7 @@ VOXEL_FUNC FVoxelOceanSurfTrain VoxelOceanSurfTrainNone()
     T.Saturation = 0.0f;
     T.Steep = 0.0f;
     T.Foam = 0.0f;
+    T.Bore = 0.0f;
     return T;
 }
 
@@ -655,7 +666,8 @@ VOXEL_FUNC FVoxelOceanSurfTrain VoxelOceanSurfTrainOf(int I, FVoxelOceanSurfInpu
         // the face's begins), a carpet (VOXEL_OCEAN_SURF_FOAM_TRAIL). Where the footprint doesn't
         // resolve the wave, its cycle's mean (no stripes).
         const float Whitecap = smoothstep(VOXEL_OCEAN_SURF_WHITECAP0, VOXEL_OCEAN_SURF_WHITECAP1, Out.Steep) * VOXEL_OCEAN_SURF_WHITECAP_SHARE;
-        const float Drive = max(Sat * Carpet, Whitecap);
+        const float Breaks = Sat * Carpet;
+        const float Drive = max(Breaks, Whitecap);
         const float U = VoxelOceanSurfFrac(Theta * (1.0f / VOXEL_OCEAN_SURF_TWO_PI));
         const float Back = 1.0f - Front;
         const float Tail = exp(-Back * (1.0f / VOXEL_OCEAN_SURF_FOAM_TRAIL));
@@ -663,7 +675,15 @@ VOXEL_FUNC FVoxelOceanSurfTrain VoxelOceanSurfTrainOf(int I, FVoxelOceanSurfInpu
         const float Face = U >= Back ? smoothstep(Back, 1.0f, U) : (exp(-U * (1.0f / VOXEL_OCEAN_SURF_FOAM_TRAIL)) - Tail) * TrailScale;
         const float FaceMean = 0.5f * Front + (VOXEL_OCEAN_SURF_FOAM_TRAIL * (1.0f - Tail) - Back * Tail) * TrailScale;
         const float FaceSeen = FaceMean + (Face - FaceMean) * VoxelOceanSurfResolved(Wavelength, In.FootprintM);
-        Out.Foam = Drive * saturate(0.25f + 0.75f * FaceSeen);
+        Out.Foam = Drive * saturate(VOXEL_OCEAN_SURF_FOAM_FLOOR + (1.0f - VOXEL_OCEAN_SURF_FOAM_FLOOR) * FaceSeen);
+        // Stage W3n: the whitecaps, where the water is breaking now. A bore's: its face and just
+        // behind its crest; a steep train's: its crest. Unresolved, their cycle's means.
+        const float Seen = VoxelOceanSurfResolved(Wavelength, In.FootprintM);
+        const float BoreShape = U >= Back ? smoothstep(Back, 1.0f, U) : exp(-U * (1.0f / VOXEL_OCEAN_SURF_BORE_TRAIL));
+        const float BoreMean = 0.5f * Front + VOXEL_OCEAN_SURF_BORE_TRAIL * (1.0f - exp(-Back * (1.0f / VOXEL_OCEAN_SURF_BORE_TRAIL)));
+        const float CrestShape = exp(-min(U, 1.0f - U) * (1.0f / VOXEL_OCEAN_SURF_CREST_WIDTH));
+        const float CrestMean = 2.0f * VOXEL_OCEAN_SURF_CREST_WIDTH * (1.0f - exp(-0.5f * (1.0f / VOXEL_OCEAN_SURF_CREST_WIDTH)));
+        Out.Bore = max(Breaks * (BoreMean + (BoreShape - BoreMean) * Seen), Whitecap * (CrestMean + (CrestShape - CrestMean) * Seen));
     }
     return Out;
 }
@@ -784,7 +804,8 @@ VOXEL_FUNC FVoxelOceanSurf VoxelOceanSurfOf(FVoxelOceanSurfInput In, FVoxelOcean
     const float Setup = (WA * A.Setup + WB * B.Setup) * SheetSeen * SwashCover;
     const float SetupRate = (WA * A.SetupRate + WB * B.SetupRate) * SheetSeen * SwashCover;
     const float Swing = WA * A.Swing + WB * B.Swing;
-    Out.Breaking = saturate(saturate(WA * A.Saturation + WB * B.Saturation) * Amp);
+    // Stage W3n: on the bores' faces and crests, where the trains are (as their foam).
+    Out.Breaking = saturate(Presence * (WA * A.Bore + WB * B.Bore));
     Out.SteepVar = Share * 0.5f * (WA * SeenA * SeenA * A.Steep * A.Steep + WB * SeenB * SeenB * B.Steep * B.Steep);
     // The swash's foam: where its sheet runs thin (the level less the terrain's own bed, so the
     // foamy edge follows the visible waterline: past the thin water's sinking, stage O9f), a

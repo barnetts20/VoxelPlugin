@@ -64,6 +64,9 @@ namespace VoxelOceanSpectrum
         double Gamma = 3.3;             // JONSWAP peak enhancement
         double Swell = 0.3;             // Horvath's swell, 0-1
         double Chop[BandCount] = { 0.9, 0.9, 0.9, 0.9 };              // horizontal displacement per D
+        /** The wave equalizer (stage W3k): gains on the height at the wavelengths 2^n m, n from
+         *  VOXEL_OCEAN_EQ_LOW (25 cm) up, one per octave (1: as the spectrum). */
+        double Gain[VOXEL_OCEAN_EQ_KNOTS] = { 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0 };
         uint32_t PlanetSeed = 1u;
     };
 
@@ -84,8 +87,10 @@ namespace VoxelOceanSpectrum
         float A[4];     // tile length, wind speed, fetch, gamma
         float B[4];     // swell, scale, 0, chop
         uint32_t C[4];  // MMin, MMax, seed, dispersion C2 (packed)
+        float G[16];    // the equalizer's gains, knots 0-12 (13-15 unused, 0)
     };
-    static_assert(sizeof(FSlotGPU) == 48, "FSlotGPU must match the shader's struct");
+    static_assert(sizeof(FSlotGPU) == 112, "FSlotGPU must match the shader's struct");
+    static_assert(VOXEL_OCEAN_EQ_KNOTS <= 16, "the slot table holds 16 gains");
 
     inline double BoundaryK(const FLayoutSettings& S, int Band)
     {
@@ -147,6 +152,8 @@ namespace VoxelOceanSpectrum
         if (MMax < MMin) MMax = MMin;
         Slot.Params = VoxelShader::VoxelOceanMakeSlot(float(L), float(Wind), float(S.Fetch), float(S.Gamma),
             float(S.Swell), 1.0f, C2, MMin, MMax, BandSeed(S.PlanetSeed, Band));
+        for (int i = 0; i < VOXEL_OCEAN_EQ_KNOTS; i++)
+            Slot.Params.Gain[i] = float(std::max(S.Gain[i], 0.0));
         return Slot;
     }
 
@@ -170,6 +177,7 @@ namespace VoxelOceanSpectrum
         // B[2]: the foam's spread (sigma_J), filled by the FFT model from the slot's statistics.
         G.B[0] = P.Swell; G.B[1] = P.Scale; G.B[2] = 0.0f; G.B[3] = Slot.Chop;
         G.C[0] = P.MMin; G.C[1] = P.MMax; G.C[2] = P.Seed; G.C[3] = P.DispersionC2;
+        for (int i = 0; i < 16; i++) G.G[i] = i < VOXEL_OCEAN_EQ_KNOTS ? P.Gain[i] : 0.0f;
         return G;
     }
 

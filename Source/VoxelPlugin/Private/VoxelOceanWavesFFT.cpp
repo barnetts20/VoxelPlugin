@@ -40,15 +40,17 @@ namespace VoxelOceanWavesFFTDetail
     }
 
     /** The surf's settings as the shaders get them (VoxelOceanSurfSettingsOf; the chart table's
-     *  constants rows 15, 16 and 18): strength (0 off), sets, swash, skew; -, surf foam, foam
+     *  constants rows 15, 16 and 18): strength (0 off), sets, swash, skew; the waves' chop (stage W3h), surf foam, foam
      *  coverage, the swash's reach (m); the directed trains' cutoff (deep wavelengths) and the
-     *  FFT's floor (stage O9i; the debug view in w, the surface's). */
+     *  FFT's floor (stage O9i), the waves' floor (stage W3g; the debug view in w, the surface's). */
     void SurfRows(const FVoxelOceanFFTSettings& Settings, VoxelShader::float4& Row0, VoxelShader::float4& Row1, VoxelShader::float4& Row2)
     {
-        Row2 = VoxelShader::float4((float)FMath::Clamp(Settings.SurfCutoff, 0.0, 0.5), (float)FMath::Clamp(Settings.SurfFFTFloor, 0.0, 1.0), 0.0f, 0.0f);
+        Row2 = VoxelShader::float4((float)FMath::Clamp(Settings.SurfCutoff, 0.0, 0.5), (float)FMath::Clamp(Settings.SurfFFTFloor, 0.0, 1.0),
+            (float)FMath::Clamp(Settings.ShoreWaveFloor, 0.0, 1.0), 0.0f);
         Row0 = VoxelShader::float4((float)FMath::Max(Settings.SurfStrength, 0.0), (float)FMath::Clamp(Settings.SurfSets, 0.0, 1.0),
             (float)FMath::Max(Settings.SurfSwash, 0.0), (float)FMath::Clamp(Settings.SurfSkew, 0.0, 0.95));
-        Row1 = VoxelShader::float4(0.0f, (float)FMath::Max(Settings.SurfFoam, 0.0),
+        // (Stage W3h: x the waves' chop, for the whitecaps' compression.)
+        Row1 = VoxelShader::float4((float)FMath::Max(Settings.Chop, 0.0), (float)FMath::Max(Settings.SurfFoam, 0.0),
             (float)FMath::Max(Settings.FoamCoverage, 0.0), (float)FMath::Max(Settings.SurfSwashReach, 1.0));
     }
 
@@ -81,6 +83,9 @@ FVoxelOceanWavesFFT::FVoxelOceanWavesFFT(const FVoxelOceanFFTSettings& InSetting
     Layout.Swell = FMath::Clamp(Settings.Swell, 0.0, 1.0);
     for (int32 b = 0; b < BandCount; b++)
         Layout.Chop[b] = FMath::Max(Settings.Chop, 0.0);
+    static_assert(FVoxelOceanFFTSettings::EqualizerKnots == VOXEL_OCEAN_EQ_KNOTS, "the equalizer's knots must match the shaders'");
+    for (int32 i = 0; i < VOXEL_OCEAN_EQ_KNOTS; i++)
+        Layout.Gain[i] = FMath::Max(Settings.Gain[i], 0.0);
     Layout.ShortWind = ShortReferenceWind;
     Tiles = FVector4f((float)Layout.TileLength[0], (float)Layout.TileLength[1], (float)Layout.TileLength[2], (float)Layout.TileLength[3]);
 
@@ -312,6 +317,7 @@ void FVoxelOceanWavesFFT::Evaluate(const FVoxelOceanWaveContext& Context, TConst
     ShoalSettings.Fade = (float)FMath::Max(Settings.ShoreFade, 0.0);
     ShoalSettings.MinSlope = (float)FMath::Max(Settings.ShoreMinSlope, 1.0e-4);
     ShoalSettings.LongKeep = 1.0f;
+    ShoalSettings.Floor = (float)FMath::Clamp(Settings.ShoreWaveFloor, 0.0, 1.0);
     const float4 BandTiles(Tiles.X, Tiles.Y, Tiles.Z, Tiles.W);
     // The surf's settings (as the shaders get them, VOF::SurfRows) and the clock it runs on.
     float4 SurfRow0, SurfRow1, SurfRow2;
@@ -355,7 +361,8 @@ void FVoxelOceanWavesFFT::Evaluate(const FVoxelOceanWaveContext& Context, TConst
             if (L > 1.0e-6)
                 DrainDir = float3((float)(Site.Shore.Direction.X / L), (float)(Site.Shore.Direction.Y / L), (float)(Site.Shore.Direction.Z / L));
         }
-        const bool bStill = Drain.Keep <= 0.0f;
+        // (Stage W3g: the drain sinks the sea but no longer stills it, as the hook.)
+        const bool bStill = false;
         if (ShoalSettings.Breaking > 0.0f)
         {
             const bool bField = Context.ShoreCells > 0 && Site.Shore.HasField();
@@ -522,7 +529,6 @@ void FVoxelOceanWavesFFT::Evaluate(const FVoxelOceanWaveContext& Context, TConst
         // The drain toward inland basins (stage O9b3), as the hook.
         if (Drain.Keep < 1.0f)
         {
-            Sum = VoxelOceanFFTAccumScale(Sum, Drain.Keep);
             Sum.Height -= Drain.Drop * 100.0f;
             Sum.Gradient = Sum.Gradient - DrainDir * Drain.Slope - (bRise ? Rise : DrainDir) * Drain.SlopeBed;
         }

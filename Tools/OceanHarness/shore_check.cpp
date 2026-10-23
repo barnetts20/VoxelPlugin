@@ -579,6 +579,7 @@ int main(int Argc, char** Argv)
         const float4 Sigma(0.4f, 0.12f, 0.03f, 0.005f);
         FVoxelOceanShoalSettings St;
         St.LongKeep = 1.0f;
+        St.Floor = 0.0f;
         St.Breaking = 0.78f; St.ChopGrowth = 1.0f; St.Warp = 1.0f; St.Fade = 0.0f; St.MinSlope = 0.005f;
         FVoxelOceanShoreSample Shore;
         Shore.Distance = 1.0e6f; Shore.Slope = 0.02f; Shore.Direction = float3(1, 0, 0); Shore.Weight = 1.0f;
@@ -639,6 +640,43 @@ int main(int Argc, char** Argv)
         const FVoxelOceanShoal Fd = VoxelOceanShoalOf(1.0f, Shore, true, Sea, Tiles, Sigma, Faded);   // d / slope = 50 m
         const FVoxelOceanShoal Nf = VoxelOceanShoalOf(1.0f, Shore, true, Sea, Tiles, Sigma, St);
         Check(std::abs(Fd.Amp.y / Nf.Amp.y - 0.5f) < 0.01f, "the fade at half its distance: one half", Fd.Amp.y / Nf.Amp.y, 0.5);
+        // Stage W3g: with the fade on, the factors stay continuous through the depth where the
+        // longest band starts to shoal (the fade used to switch on there all at once).
+        {
+            FVoxelOceanShoalSettings Far = St;
+            Far.Fade = 1.0e6f;
+            double MaxFadeJump = 0.0;
+            for (float D = 1.0f; D < 3000.0f; D *= 1.001f)
+            {
+                Shore.Distance = 5000.0f;
+                const FVoxelOceanShoal A = VoxelOceanShoalOf(D, Shore, true, Sea, Tiles, Sigma, Far);
+                const FVoxelOceanShoal B = VoxelOceanShoalOf(D * 1.001f, Shore, true, Sea, Tiles, Sigma, Far);
+                for (int k = 0; k < 4; k++)
+                    MaxFadeJump = std::max(MaxFadeJump, double(std::abs(VoxelOceanShoalComponent(A.Amp, k) - VoxelOceanShoalComponent(B.Amp, k))));
+            }
+            Check(MaxFadeJump < 0.01, "with the fade on, continuous where the longest band starts to shoal (0.1% steps)", MaxFadeJump, 0.01);
+        }
+        // Stage W3g: the floor. No band under Floor of its height, on land too; continuous through
+        // the shoreline.
+        {
+            FVoxelOceanShoalSettings Fl = St;
+            Fl.Floor = 0.15f;
+            Shore.Distance = 50.0f;
+            float Least = 1.0f;
+            double MaxFloorJump = 0.0;
+            for (float D = -5.0f; D < 50.0f; D += 0.005f)
+            {
+                const FVoxelOceanShoal A = VoxelOceanShoalOf(D, Shore, true, Sea, Tiles, Sigma, Fl);
+                const FVoxelOceanShoal B = VoxelOceanShoalOf(D + 0.005f, Shore, true, Sea, Tiles, Sigma, Fl);
+                for (int k = 0; k < 4; k++)
+                {
+                    Least = std::min(Least, VoxelOceanShoalComponent(A.Amp, k));
+                    MaxFloorJump = std::max(MaxFloorJump, double(std::abs(VoxelOceanShoalComponent(A.Amp, k) - VoxelOceanShoalComponent(B.Amp, k))));
+                }
+            }
+            Check(std::abs(Least - 0.15f) < 1e-4f, "the floor: no band under 0.15 of its height, on land either", Least, 0.15);
+            Check(MaxFloorJump < 0.02, "with the floor, continuous through the shoreline (5 mm steps)", MaxFloorJump, 0.02);
+        }
 
         // The warp: U(s) = G(k m s) / (m k); its derivative along s is minus the stretch.
         double MaxW = 0.0;

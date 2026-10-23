@@ -38,6 +38,8 @@ struct FVoxelOceanRingDrawFrame
     bool bClip = false;
     FRHITexture* ClipDisplacement = nullptr;
     FRHITexture* ClipNormal = nullptr;
+    /** Stage W3h: the whitecaps' density (null before the first clipmap frame). */
+    FRHITexture* ClipWhitecap = nullptr;
     FRHITexture* ClipInfo = nullptr;
 };
 

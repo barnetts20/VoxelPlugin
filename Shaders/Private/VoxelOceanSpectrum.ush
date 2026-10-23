@@ -50,6 +50,11 @@
 // MakeSlot (VoxelOceanSpectrum.h) caps every band below it (omega < 25 rad/s, wavelengths
 // above 10 cm).
 #define VOXEL_OCEAN_MAX_MULTIPLE 4096
+// The wave equalizer (stage W3k): gains on the waves' height at the wavelengths 2^n m, n from
+// VOXEL_OCEAN_EQ_LOW (25 cm) to VOXEL_OCEAN_EQ_LOW + VOXEL_OCEAN_EQ_KNOTS - 1 (1,024 m), one per
+// octave. Every band's modes lie between them (21 cm to 997 m at the default layout).
+#define VOXEL_OCEAN_EQ_KNOTS 13
+#define VOXEL_OCEAN_EQ_LOW -2
 
 // ---------------------------------------------------------------------------------------------
 // One cascade slot's spectrum
@@ -57,6 +62,8 @@
 
 struct FVoxelOceanSlotParams
 {
+    // The equalizer's gains on the height (1: as the spectrum), per octave (VOXEL_OCEAN_EQ_*).
+    float Gain[VOXEL_OCEAN_EQ_KNOTS];
     float TileLength;       // L (m)
     float WindSpeed;        // U10 (m/s)
     float Fetch;            // m
@@ -71,11 +78,13 @@ struct FVoxelOceanSlotParams
 };
 
 // The params from their parts (HLSL has no constructors). The CPU forms C2 and the band's
-// bounds once, in double (VoxelOceanSpectrum.h), and both sides take the same numbers.
+// bounds once, in double (VoxelOceanSpectrum.h), and both sides take the same numbers. The
+// equalizer starts flat (VoxelOceanSlotWithGains sets it).
 VOXEL_FUNC FVoxelOceanSlotParams VoxelOceanMakeSlot(float TileLength, float WindSpeed, float Fetch, float Gamma,
     float Swell, float Scale, uint DispersionC2, uint MMin, uint MMax, uint Seed)
 {
     FVoxelOceanSlotParams P;
+    for (int i = 0; i < VOXEL_OCEAN_EQ_KNOTS; i++) P.Gain[i] = 1.0f;
     P.TileLength = TileLength;
     P.WindSpeed = WindSpeed;
     P.Fetch = Fetch;
@@ -87,6 +96,32 @@ VOXEL_FUNC FVoxelOceanSlotParams VoxelOceanMakeSlot(float TileLength, float Wind
     P.MMax = MMax;
     P.Seed = Seed;
     return P;
+}
+
+// The params with the equalizer's gains, packed four to a float4 (the GPU's slot table: knots
+// 0-3, 4-7, 8-11 and 12 in G3.x; members, not swizzles, for the shared subset).
+VOXEL_FUNC FVoxelOceanSlotParams VoxelOceanSlotWithGains(FVoxelOceanSlotParams In, float4 G0, float4 G1, float4 G2, float4 G3)
+{
+    FVoxelOceanSlotParams P = In;
+    P.Gain[0] = G0.x; P.Gain[1] = G0.y; P.Gain[2] = G0.z; P.Gain[3] = G0.w;
+    P.Gain[4] = G1.x; P.Gain[5] = G1.y; P.Gain[6] = G1.z; P.Gain[7] = G1.w;
+    P.Gain[8] = G2.x; P.Gain[9] = G2.y; P.Gain[10] = G2.z; P.Gain[11] = G2.w;
+    P.Gain[12] = G3.x;
+    return P;
+}
+
+// The equalizer's gain on the height of a wave of wavenumber K (rad/m): linear in the octave
+// (log2 of the wavelength) between its knots, held past the end ones. Between two equal knots
+// it is that gain exactly, so a flat equalizer at 1 leaves the spectrum bit for bit.
+VOXEL_FUNC float VoxelOceanEqualizerGain(FVoxelOceanSlotParams P, float K)
+{
+    const float Octave = log2(VOXEL_OCEAN_TWO_PI / max(K, 1.0e-6f)) - float(VOXEL_OCEAN_EQ_LOW);
+    const float X = clamp(Octave, 0.0f, float(VOXEL_OCEAN_EQ_KNOTS - 1));
+    const int I = min(int(floor(X)), VOXEL_OCEAN_EQ_KNOTS - 2);
+    const float F = X - float(I);
+    const float A = P.Gain[I];
+    const float B = P.Gain[I + 1];
+    return A == B ? A : A + (B - A) * F;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -190,7 +225,9 @@ VOXEL_FUNC float VoxelOceanSpreading(float Omega, float CosTheta, FVoxelOceanJon
 }
 
 // The directional wavenumber spectrum S(kx, ky) (m^4) in deep water: S(omega) d omega / dk
-// D / k, d omega / dk = g / (2 omega).
+// D / k, d omega / dk = g / (2 omega), times the equalizer's gain squared (a gain on the height
+// is its square on the energy). Everything that measures the sea (the slots' statistics, the
+// foam's calibration, the reach) takes it from here, so it all follows the equalizer.
 VOXEL_FUNC float VoxelOceanSpectrumK(FVoxelOceanSlotParams P, FVoxelOceanJonswap J, float Kx, float Ky)
 {
     const float K = sqrt(Kx * Kx + Ky * Ky);
@@ -198,7 +235,9 @@ VOXEL_FUNC float VoxelOceanSpectrumK(FVoxelOceanSlotParams P, FVoxelOceanJonswap
     const float Omega = sqrt(VOXEL_OCEAN_GRAVITY * K);
     const float S = VoxelOceanJonswapS(Omega, J, P.Gamma);
     const float D = VoxelOceanSpreading(Omega, Kx / K, J, P.WindSpeed, P.Swell);
-    return S * (VOXEL_OCEAN_GRAVITY / (2.0f * Omega)) * D / K;
+    const float Spectrum = S * (VOXEL_OCEAN_GRAVITY / (2.0f * Omega)) * D / K;
+    const float G = VoxelOceanEqualizerGain(P, K);
+    return G == 1.0f ? Spectrum : Spectrum * (G * G);
 }
 
 VOXEL_FUNC bool VoxelOceanInBand(FVoxelOceanSlotParams P, int Ki, int Kj)

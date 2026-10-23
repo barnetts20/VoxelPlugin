@@ -130,12 +130,32 @@ VOXEL_FUNC float VoxelOceanFoamRampStart(float P)
     return Lo;
 }
 
+// The ramp's start for a ramp Ramp sigma wide (as VoxelOceanFoamRampStart).
+VOXEL_FUNC float VoxelOceanFoamRampStartOf(float P, float Ramp)
+{
+    float Lo = VoxelOceanFoamQuantile(min(P, 0.45f)) - 0.5f * Ramp;
+    for (int K = 0; K < 2; K++)
+    {
+        const float F = VoxelOceanFoamRampMean(0.0f, 1.0f, Lo, Ramp) - P;
+        const float D = (VoxelOceanFoamTail(Lo + Ramp) - VoxelOceanFoamTail(Lo)) * (1.0f / Ramp);
+        if (D < -1.0e-6f) Lo -= F / D;
+    }
+    return Lo;
+}
+
 // The share of the sea whitecaps cover at a wind (m/s) and the coverage setting (1 as calibrated).
+// Stage W3i: the power law levels off toward VOXEL_OCEAN_FOAM_COVER_MAX in very high winds (P = p /
+// sqrt(1 + (p / max)^2): within 4% of the law to 20 m/s, 29% at 25 m/s where the law gives 34%, a
+// half at 35 m/s where it gives all of it; the law's data reach about 25 m/s, and measured coverage
+// grows more slowly past gale force).
+#define VOXEL_OCEAN_FOAM_COVER_MAX 0.6f
 VOXEL_FUNC float VoxelOceanFoamCoverage(float Wind, float Coverage)
 {
     if (Coverage <= 0.0f || Wind <= 2.5f) return 0.0f;
     const float Calm = smoothstep(2.5f, 4.5f, Wind);
-    return VOXEL_OCEAN_FOAM_COVER_AT10 * exp(VOXEL_OCEAN_FOAM_COVER_POWER * 0.693147181f * log2(Wind * 0.1f)) * Coverage * Calm;
+    const float P = VOXEL_OCEAN_FOAM_COVER_AT10 * exp(VOXEL_OCEAN_FOAM_COVER_POWER * 0.693147181f * log2(Wind * 0.1f)) * Calm;
+    const float R = P * (1.0f / VOXEL_OCEAN_FOAM_COVER_MAX);
+    return P / sqrt(1.0f + R * R) * Coverage;
 }
 
 // The threshold (sigma) for that coverage; VOXEL_OCEAN_FOAM_NONE: none.
@@ -226,6 +246,44 @@ VOXEL_FUNC float VoxelOceanFoamDensityOf(FVoxelOceanFoamBands B, float Wind, flo
 VOXEL_FUNC float VoxelOceanFoamOf(FVoxelOceanFoamBands B, float Wind, float Coverage)
 {
     return VoxelOceanFoamDensityOf(B, Wind, Coverage, 1.0f);
+}
+
+// THE WHITECAPS (stage W3h). The foam above is the envelope of the compression: it peaks at a
+// crest and lingers behind it for its decay (the trails, the lace). A whitecap is the breaking
+// itself, happening now: on the crest, moving with it. So it comes from the summed surface's own
+// area ratio J at the point (every band together, at the waves' chop), not from the envelope:
+// c = (1 - J) / sigma, sigma = chop sqrt(the bands' slope variance) (the linear part of 1 - J is
+// the chop times the displacement's divergence, whose variance is the slope variance), about
+// N(0, 1) over the sea; what the point's footprint doesn't resolve (the slope variance it leaves
+// out, as a share of the whole) is integrated through the ramp, as the foam's unresolved variance
+// is, so far away the whitecaps' density is their expected share. The share: VOXEL_OCEAN_WHITECAP_
+// SHARE of the foam's calibrated coverage (the active stage of a whitecap, before its trail: about
+// a third of all of it, Monahan's stage A against A + B), ramping from none to solid over
+// VOXEL_OCEAN_WHITECAP_RAMP sigma (a fresh crest solid at its peak compression), placed for that
+// share (VoxelOceanFoamRampStartOf) and moved for the summed J's tail, lighter than a normal's: on
+// the emulated cascades (foam_check) its upper quantiles fall short of the normal's by about
+// VOXEL_OCEAN_WHITECAP_TAIL (z - VOXEL_OCEAN_WHITECAP_TAIL_FROM) at the normal's z (0.07 at 3%,
+// 0.15 at 1%, 0.28 at 0.1%, the same from 7 to 18 m/s; the ramp's own width takes up part of
+// it), for the part the footprint resolves (unresolved, the spread is integrated as a normal's).
+#define VOXEL_OCEAN_WHITECAP_SHARE 0.3f
+#define VOXEL_OCEAN_WHITECAP_RAMP 0.8f
+#define VOXEL_OCEAN_WHITECAP_TAIL 0.12f
+#define VOXEL_OCEAN_WHITECAP_TAIL_FROM 1.5f
+
+// The whitecaps' density at a point (0 to 1): the surface's area ratio J there, the bands' slope
+// variance (the whole, and the part the footprint leaves out), the waves' chop, the wind (m/s),
+// the coverage setting.
+VOXEL_FUNC float VoxelOceanWhitecapOf(float J, float SlopeVar, float Unresolved, float Chop, float Wind, float Coverage)
+{
+    const float P = VOXEL_OCEAN_WHITECAP_SHARE * VoxelOceanFoamCoverage(Wind, Coverage);
+    if (P < 1.0e-7f || Chop <= 0.0f || SlopeVar <= 1.0e-12f) return 0.0f;
+    const float C = (1.0f - J) / (Chop * sqrt(SlopeVar));
+    const float Res = clamp(Unresolved / SlopeVar, 0.0f, 1.0f);
+    const float Z = VoxelOceanFoamQuantile(min(P, 0.45f));
+    // (The tail's correction for the resolved part: unresolved, the spread is integrated as a
+    // normal's, whose share the ramp is placed for.)
+    const float Lo = VoxelOceanFoamRampStartOf(P, VOXEL_OCEAN_WHITECAP_RAMP) - (1.0f - Res) * VOXEL_OCEAN_WHITECAP_TAIL * max(Z - VOXEL_OCEAN_WHITECAP_TAIL_FROM, 0.0f);
+    return VoxelOceanFoamRampMean(C, sqrt(Res + VOXEL_OCEAN_FOAM_EDGE * VOXEL_OCEAN_FOAM_EDGE), Lo, VOXEL_OCEAN_WHITECAP_RAMP);
 }
 
 #endif // VOXEL_OCEAN_FOAM_USH

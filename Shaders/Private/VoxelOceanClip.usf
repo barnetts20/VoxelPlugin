@@ -25,6 +25,8 @@ Texture2DArray<float4> ClipStatic;
 
 RWTexture2DArray<float4> ClipDisplacementOut;
 RWTexture2DArray<float4> ClipNormalOut;
+// Stage W3h: the whitecaps' density (x; y spare), as the foam's in the displacement's w.
+RWTexture2DArray<float2> ClipWhitecapOut;
 RWTexture2D<float4> ClipInfoOut;
 
 // The material's wave parameters for this frame (FVoxelOceanSurface::UpdateMaterial's), from the
@@ -164,4 +166,5 @@ void ClipWaveCS(uint3 Id : SV_DispatchThreadID)
     const int3 C = int3(S, Slot);
     ClipDisplacementOut[C] = float4(VoxelOceanRotateBack(W.Rotation, Out.Displacement), saturate(Out.Foam));
     ClipNormalOut[C] = float4(VoxelOceanRotateBack(W.Rotation, Out.Normal), max(Out.SlopeVariance, 0.0f));
+    ClipWhitecapOut[C] = float2(saturate(Out.Whitecap), 0.0f);
 }

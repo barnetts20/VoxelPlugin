@@ -324,6 +324,8 @@ inline FVoxelOceanShoal ShoalAt(float Depth, const FShore& Shore, const FVoxelOc
 {
     FVoxelOceanShoalSettings Settings = VoxelOceanShoalSettingsOf(float4(W.States.X, W.States.Y, W.States.Z, W.States.W), float4(W.SlopeVar.X, W.SlopeVar.Y, W.SlopeVar.Z, W.SlopeVar.W));
     Settings.LongKeep = LongKeep;
+    // The waves' floor (stage W3g; the table's row 18 z).
+    Settings.Floor = std::min(std::max(W.Surf2.Z, 0.0f), 1.0f);
     if (Settings.Breaking <= 0.0f) return VoxelOceanShoalNone();
     const bool bField = W.States.X > 0.5f && Shore.Distance < 0.5f * Deep;
     FVoxelOceanShoreSample Field;
@@ -430,7 +432,7 @@ inline FPoint HookEvaluate(const FTextures& Tx, float3 P, float3 Up, float Spaci
         {
             const float3 DirP = RotateBack(W.Rotation, Shore.Direction);
             const float L2 = dot(DirP, DirP);
-            A = VoxelOceanFFTAccumScale(A, Drain.Keep);
+            // (Stage W3g: the waves kept, the surface sunk.)
             A.Height -= Drain.Drop * 100.0f;
             const float3 DrainDir = L2 > 1.0e-12f ? DirP * (1.0f / std::sqrt(L2)) : float3(0.0f, 0.0f, 0.0f);
             A.Gradient = A.Gradient - DrainDir * Drain.Slope - BedRiseOf(Shore, W, DrainDir) * Drain.SlopeBed;

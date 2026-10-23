@@ -306,6 +306,10 @@ struct FVoxelOceanFFTSettings
     double FetchKm = 300.0;
     double Chop = 0.9;
     double Swell = 0.3;
+    /** The wave equalizer (stage W3k; FVoxelOceanWaveEqualizer): gains on the height per octave,
+     *  25 cm first, 1,024 m last. */
+    static constexpr int32 EqualizerKnots = 13;
+    double Gain[EqualizerKnots] = { 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0 };
     double DetileCell = 1500.0;     // m; 0 off
     bool bQueryShortWaves = false;
     /** Changes only when edited; a rebuild for it gives the same waves. */
@@ -321,6 +325,8 @@ struct FVoxelOceanFFTSettings
     double ShoreWarp = 0.0;     // stage O9f: off by default (VoxelOceanSettings.h)
     double ShoreFade = 0.0;
     double ShoreMinSlope = 0.005;
+    /** Stage W3g: the least share of their height the waves keep (VoxelOceanShoal.ush's floor). */
+    double ShoreWaveFloor = 0.15;
     /** The surf (stage O9a; VoxelOceanSurf.ush): its strength (0: none), sets, swash, skew
      *  and the swash's reach. */
     double SurfStrength = 1.0;
@@ -344,10 +350,12 @@ struct FVoxelOceanFFTSettings
 
     bool operator==(const FVoxelOceanFFTSettings& Other) const
     {
+        for (int32 i = 0; i < EqualizerKnots; i++)
+            if (Gain[i] != Other.Gain[i]) return false;
         return Seed == Other.Seed && FetchKm == Other.FetchKm && Chop == Other.Chop && Swell == Other.Swell
             && DetileCell == Other.DetileCell && bQueryShortWaves == Other.bQueryShortWaves && MipBias == Other.MipBias
             && WindSpeed == Other.WindSpeed && ShoreBreaking == Other.ShoreBreaking && ShoreChopGrowth == Other.ShoreChopGrowth
-            && ShoreWarp == Other.ShoreWarp && ShoreFade == Other.ShoreFade && ShoreMinSlope == Other.ShoreMinSlope
+            && ShoreWarp == Other.ShoreWarp && ShoreFade == Other.ShoreFade && ShoreMinSlope == Other.ShoreMinSlope && ShoreWaveFloor == Other.ShoreWaveFloor
             && SurfStrength == Other.SurfStrength && SurfSets == Other.SurfSets && SurfSwash == Other.SurfSwash
             && SurfSkew == Other.SurfSkew && SurfSwashReach == Other.SurfSwashReach
             && SurfCutoff == Other.SurfCutoff && SurfFFTFloor == Other.SurfFFTFloor;

@@ -1,0 +1,283 @@
+// VoxelOceanFoamTex.ush - The foam from its texture set (stage W3g; Design/OceanWaves.md section 32):
+// the lace, the streaks and the whitecaps drawn from a tiling foam set (Tools/NoiseTileTool/
+// foam_tile.py, or the noise generator's: NoiseTiles2D_Addendum5.md) for the foam's density, in
+// place of the procedural lace (VoxelOceanFoamLace.ush). The ocean's own pass only
+// (VoxelOceanSurfacePass.usf).
+//
+// THE SET (RGBA16 UNORM, mipped, sampled with hardware trilinear filtering at the pixel's own level;
+// magnified, a cubic B-spline from four taps, stage W3m):
+//   R the lace (bubbles gathered on a turbulent surface's convergence lines), G the bubbles' grain,
+//   B the whitecaps' billowy turbulence, A the streaks (not read since stage W3m: its straight,
+//   evenly spaced strands and their cross links read as hatching; the streaks are the lace
+//   stretched downwind, below).
+// Its table (VoxelOceanFoamTable.h): a row per half level (L = r / 2), each channel's threshold
+// for the cover 1 - q_k, q_k = sin^2(pi k / 128), k = 0 .. 64 (columns 0 .. 64; finest near 0
+// and 1, where thin and solid foam take theirs), solved for the soft edge and for the distribution
+// of what is sampled at that level; column 65 each channel's spread, Q(0.9) - Q(0.1).
+//
+// THE COVER. A channel's cover for a density D is where its value lies above its own quantile at
+// 1 - D, with an edge VOXEL_OCEAN_FOAM_TEX_SOFT of its spread wide, the threshold the table's for
+// the level sampled: its mean over the surface is D, whatever the channel and the level, so the
+// foam's amount is the density's (calibrated in VoxelOceanFoam.ush) and the set decides only where
+// within it the foam lies.
+//   - lace: at the density D; thin, old foam (D under VOXEL_OCEAN_FOAM_TEX_OLD1), and all of it as
+//     the wind rises (stage W3i), turns toward the streaks: the lace sampled again, stretched
+//     STREAK_STRETCH times downwind, and mixed with the first sample by the streaks' share o as
+//     m + ((1 - o)(x1 - m) + o (x2 - m)) / sqrt((1 - o)^2 + o^2) (one pattern drawn out, not two
+//     overlaid), its threshold between the lace's and the table's even mix's (its A channel) by
+//     1 - |2o - 1| (within 2% of the density, 10% at the thinnest);
+//   - whitecaps (stage W3h): their own density from the clipmap, the surface breaking now (on the
+//     crest, moving with it; VoxelOceanWhitecapOf), the trail behind it lace; without it (a
+//     negative Whitecap) the dense part of the foam's, Dw = D smoothstep(CAP0, CAP1, D), as W3g;
+//   - far away (the footprint from FADE0 to FADE1) every layer gives way to its density: the
+//     structure is under a pixel, and the set's tiles would repeat.
+// The coordinates: the charts' downwind frame of the short bands (the waves' own lookups), in
+// tiles of the set's TileM, offset per chart and per orientation by a hash.
+
+#pragma once
+
+// Include after VoxelOceanPixelClip.ush (its includes; glslang doesn't honour #pragma once, so this
+// file doesn't include it again).
+
+#define VOXEL_OCEAN_FOAM_TEX_SPREAD_COLUMN 65
+#define VOXEL_OCEAN_FOAM_TEX_SOFT 0.15f
+// Stage W3m: the streaks are the lace stretched this many times downwind (the chart frame's x).
+#define VOXEL_OCEAN_FOAM_TEX_STREAK_STRETCH 4.0f
+// Stage W3i: storm foam. The whitecaps' channel stretched CREST_STRETCH times along the crests (the
+// downwind frame's y: a breaking crest is a band across the wind, not a round clump); the foam
+// turning to streaks along the wind as the wind rises (from WIND_STREAK0 to WIND_STREAK1 m/s, up to
+// WIND_STREAK of its share: Beaufort's "foam blown in well-marked streaks along the wind").
+#define VOXEL_OCEAN_FOAM_TEX_CREST_STRETCH 3.0f
+#define VOXEL_OCEAN_FOAM_TEX_WIND_STREAK0 12.0f
+#define VOXEL_OCEAN_FOAM_TEX_WIND_STREAK1 22.0f
+#define VOXEL_OCEAN_FOAM_TEX_WIND_STREAK 0.8f
+#define VOXEL_OCEAN_FOAM_TEX_FADE0 0.4f
+#define VOXEL_OCEAN_FOAM_TEX_FADE1 1.6f
+#define VOXEL_OCEAN_FOAM_TEX_CAP0 0.55f
+#define VOXEL_OCEAN_FOAM_TEX_CAP1 0.95f
+#define VOXEL_OCEAN_FOAM_TEX_OLD0 0.08f
+#define VOXEL_OCEAN_FOAM_TEX_OLD1 0.45f
+#define VOXEL_OCEAN_FOAM_TEX_STREAK 0.4f
+// How much the bubbles' grain moves the foam's thickness (in the grain's spreads).
+#define VOXEL_OCEAN_FOAM_TEX_GRAIN 0.2f
+// Stage W3h: the whitecaps churn. Their channel is sampled twice, each drifting downwind at
+// CHURN_SPEED (m/s) through a cycle of CHURN_PERIOD (s), half a cycle apart and jumping to a new
+// place at its cycle's start, crossfaded (each in from its start and out by its end); the blend's
+// deviation from the channel's median rescaled by 1 / sqrt(w1^2 + w2^2), so its spread, which the
+// thresholds are for, holds. The whitecap's thickness (its relief) from its own value above its
+// threshold.
+#define VOXEL_OCEAN_FOAM_TEX_CHURN_PERIOD 1.6f
+#define VOXEL_OCEAN_FOAM_TEX_CHURN_SPEED 0.6f
+
+// The set at UV and level Lod; magnified (bCubic: the footprint under a texel of the finest level),
+// a cubic B-spline over the finest level from four bilinear taps (GPU Gems 2, ch. 20), so a
+// threshold's edge curves smoothly instead of showing the texels' facets up close. Its covers keep
+// the density within 3% of the bilinear's (checked on the set).
+float4 VoxelOceanFoamTexSample(Texture2D Set, SamplerState SetSampler, float2 UV, float Lod, float Texels, bool bCubic)
+{
+    if (!bCubic) return Set.SampleLevel(SetSampler, UV, Lod);
+    const float2 X = UV * Texels - 0.5f;
+    const float2 I = floor(X);
+    const float2 T = X - I;
+    const float2 T2 = T * T;
+    const float2 T3 = T2 * T;
+    const float2 W0 = (1.0f - 3.0f * T + 3.0f * T2 - T3) * (1.0f / 6.0f);
+    const float2 W1 = (4.0f - 6.0f * T2 + 3.0f * T3) * (1.0f / 6.0f);
+    const float2 W2 = (1.0f + 3.0f * T + 3.0f * T2 - 3.0f * T3) * (1.0f / 6.0f);
+    const float2 W3 = T3 * (1.0f / 6.0f);
+    const float2 G0 = W0 + W1;
+    const float2 G1 = W2 + W3;
+    // The taps between texels I - 1 and I, and I + 1 and I + 2 (centres at index + 0.5).
+    const float2 H0 = (I - 0.5f + W1 / G0) / Texels;
+    const float2 H1 = (I + 1.5f + W3 / G1) / Texels;
+    return G0.y * (G0.x * Set.SampleLevel(SetSampler, float2(H0.x, H0.y), 0.0f) + G1.x * Set.SampleLevel(SetSampler, float2(H1.x, H0.y), 0.0f))
+         + G1.y * (G0.x * Set.SampleLevel(SetSampler, float2(H0.x, H1.y), 0.0f) + G1.x * Set.SampleLevel(SetSampler, float2(H1.x, H1.y), 0.0f));
+}
+
+// Each channel's threshold for the cover 1 - Q in the table's row Row.
+float4 VoxelOceanFoamTexQuantile(Texture2D Table, int Row, float Q)
+{
+    const float K = clamp(asin(sqrt(saturate(Q))) * (128.0f / 3.14159265f), 0.0f, 64.0f);
+    const int K0 = min(int(K), 63);
+    return lerp(Table.Load(int3(K0, Row, 0)), Table.Load(int3(K0 + 1, Row, 0)), K - float(K0));
+}
+
+// The same between two rows (half levels).
+float4 VoxelOceanFoamTexThreshold(Texture2D Table, int R0, int R1, float F, float Q)
+{
+    return lerp(VoxelOceanFoamTexQuantile(Table, R0, Q), VoxelOceanFoamTexQuantile(Table, R1, Q), F);
+}
+
+// The foam at a point for a density: its chart coordinates (m; the large part Base and the
+// offset), the pixel's footprint (m), a seed (the chart's and the orientation's). Info: x 1 / the
+// tile (1/m), y the set's mip count. As VoxelOceanLaceAt: Foam (its mean the density), the
+// layers (0 the lace, 1 the streaks, 2 the whitecaps) and the thickness (0 an edge, 1 solid).
+FVoxelOceanLace VoxelOceanFoamTexAt(float2 Base, float2 Offset, float Density, float Whitecap, float FootprintM, float Time, float Wind, uint Seed,
+    Texture2D Set, SamplerState SetSampler, Texture2D Table, float4 Info)
+{
+    FVoxelOceanLace L;
+    L.Foam = 0.0f;
+    L.Layer0 = 0.0f;
+    L.Layer1 = 0.0f;
+    L.Layer2 = 0.0f;
+    L.Thick = 0.5f;
+    const float D = saturate(Density);
+    // Stage W3h: the whitecaps from the breaking now (the clipmap's own density; a negative
+    // Whitecap: none given, the dense part of the foam's as in W3g).
+    const float Dw = Whitecap >= 0.0f ? saturate(Whitecap) : D * smoothstep(VOXEL_OCEAN_FOAM_TEX_CAP0, VOXEL_OCEAN_FOAM_TEX_CAP1, D);
+    if (D <= 0.0f && Dw <= 0.0f) return L;
+    const float Fade = smoothstep(VOXEL_OCEAN_FOAM_TEX_FADE0, VOXEL_OCEAN_FOAM_TEX_FADE1, FootprintM);
+    if (Fade >= 1.0f)
+    {
+        L.Foam = max(D, Dw);
+        L.Layer0 = D;
+        L.Layer1 = D;
+        L.Layer2 = Dw;
+        return L;
+    }
+    // In tiles: the large part wrapped first (precision), then the offset, then the seed's shift.
+    const float InvTile = Info.x;
+    const int Mips = max(int(Info.y + 0.5f), 1);
+    const float2 B = Base * InvTile;
+    const float2 Shift = float2(VoxelOceanLaceUnit(VoxelOceanLaceHash(Seed, 1u, 0x3c6ef372u)), VoxelOceanLaceUnit(VoxelOceanLaceHash(Seed, 2u, 0x3c6ef372u)));
+    const float2 UV = (B - floor(B)) + Offset * InvTile + Shift;
+    // The whitecaps' coordinates, stretched along the crests: y over CREST_STRETCH tiles (wrapped
+    // over that many, so the large part's wrap stays seamless).
+    const float BW = B.y * (1.0f / VOXEL_OCEAN_FOAM_TEX_CREST_STRETCH);
+    const float2 UVW = float2(UV.x, (BW - floor(BW)) + (Offset.y * InvTile + Shift.y) * (1.0f / VOXEL_OCEAN_FOAM_TEX_CREST_STRETCH));
+    // Stage W3m: the streaks' coordinates, the lace's stretched downwind (x over STREAK_STRETCH
+    // tiles, wrapped the same way), shifted apart from the first sample.
+    const float2 ShiftS = float2(VoxelOceanLaceUnit(VoxelOceanLaceHash(Seed, 3u, 0x3c6ef372u)), VoxelOceanLaceUnit(VoxelOceanLaceHash(Seed, 4u, 0x3c6ef372u)));
+    const float BS = B.x * (1.0f / VOXEL_OCEAN_FOAM_TEX_STREAK_STRETCH);
+    const float2 UVS = float2((BS - floor(BS)) + (Offset.x * InvTile + ShiftS.x) * (1.0f / VOXEL_OCEAN_FOAM_TEX_STREAK_STRETCH),
+        (B.y - floor(B.y)) + Offset.y * InvTile + ShiftS.y);
+    // The level whose texel is the footprint (the set's mip 0 has 2^(Mips - 1) texels a tile);
+    // magnified, the cubic filter (stage W3m).
+    const float Texels = exp2(float(Mips - 1));
+    const float LodRaw = log2(max(FootprintM * InvTile * Texels, 1.0e-6f));
+    const bool bCubic = LodRaw < 0.0f;
+    const float Lod = clamp(LodRaw, 0.0f, float(Mips - 1));
+    const int LastRow = 2 * (Mips - 1);
+    const float Row = 2.0f * Lod;
+    const int R0 = min(int(Row), LastRow);
+    const int R1 = min(R0 + 1, LastRow);
+    const float Fr = Row - float(R0);
+    float4 P = VoxelOceanFoamTexSample(Set, SetSampler, UV, Lod, Texels, bCubic);
+    if (Dw > 0.0f)
+    {
+        // The whitecaps' churn (their channel, z).
+        const float Cycle = Time * (1.0f / VOXEL_OCEAN_FOAM_TEX_CHURN_PERIOD);
+        const float C1 = floor(Cycle);
+        const float C2 = floor(Cycle + 0.5f);
+        const float Ph1 = Cycle - C1;
+        const float Ph2 = Cycle + 0.5f - C2;
+        const float W1 = 1.0f - abs(2.0f * Ph1 - 1.0f);
+        const float W2 = 1.0f - W1;
+        const float Drift = VOXEL_OCEAN_FOAM_TEX_CHURN_SPEED * VOXEL_OCEAN_FOAM_TEX_CHURN_PERIOD * InvTile;
+        const uint K1 = uint(int(C1) & 0xffff);
+        const uint K2 = uint(int(C2) & 0xffff);
+        const float2 J1 = float2(VoxelOceanLaceUnit(VoxelOceanLaceHash(K1, Seed, 0x9e3779b9u)), VoxelOceanLaceUnit(VoxelOceanLaceHash(K1, Seed, 0x7f4a7c15u)));
+        const float2 J2 = float2(VoxelOceanLaceUnit(VoxelOceanLaceHash(K2 ^ 0x5555u, Seed, 0x9e3779b9u)), VoxelOceanLaceUnit(VoxelOceanLaceHash(K2 ^ 0x5555u, Seed, 0x7f4a7c15u)));
+        const float Z1 = VoxelOceanFoamTexSample(Set, SetSampler, UVW + J1 + float2(Drift * Ph1, 0.0f), Lod, Texels, bCubic).z;
+        const float Z2 = VoxelOceanFoamTexSample(Set, SetSampler, UVW + J2 + float2(Drift * Ph2, 0.0f), Lod, Texels, bCubic).z;
+        const float Median = VoxelOceanFoamTexThreshold(Table, R0, R1, Fr, 0.5f).z;
+        P.z = Median + (W1 * (Z1 - Median) + W2 * (Z2 - Median)) * rsqrt(max(W1 * W1 + W2 * W2, 1.0e-4f));
+    }
+    const float4 Q = VoxelOceanFoamTexThreshold(Table, R0, R1, Fr, 1.0f - D);
+    const float4 Qw = VoxelOceanFoamTexThreshold(Table, R0, R1, Fr, 1.0f - Dw);
+    const float4 Spread = max(lerp(Table.Load(int3(VOXEL_OCEAN_FOAM_TEX_SPREAD_COLUMN, R0, 0)), Table.Load(int3(VOXEL_OCEAN_FOAM_TEX_SPREAD_COLUMN, R1, 0)), Fr),
+        float4(1.0e-4f, 1.0e-4f, 1.0e-4f, 1.0e-4f));
+    const float4 W = Spread * VOXEL_OCEAN_FOAM_TEX_SOFT;
+    const float CovL = smoothstep(-W.x, W.x, P.x - Q.x);
+    const float CovW = Dw > 0.0f ? smoothstep(-W.z, W.z, P.z - Qw.z) : 0.0f;
+    // The streaks (stage W3m): the stretched lace, mixed in by their share o (see THE COVER).
+    const float Old = max((1.0f - smoothstep(VOXEL_OCEAN_FOAM_TEX_OLD0, VOXEL_OCEAN_FOAM_TEX_OLD1, D)) * VOXEL_OCEAN_FOAM_TEX_STREAK,
+        VOXEL_OCEAN_FOAM_TEX_WIND_STREAK * smoothstep(VOXEL_OCEAN_FOAM_TEX_WIND_STREAK0, VOXEL_OCEAN_FOAM_TEX_WIND_STREAK1, Wind));
+    const float PS = VoxelOceanFoamTexSample(Set, SetSampler, UVS, Lod, Texels, bCubic).x;
+    const float CovS = smoothstep(-W.x, W.x, PS - Q.x);
+    const float MedianL = VoxelOceanFoamTexThreshold(Table, R0, R1, Fr, 0.5f).x;
+    const float Mix = 1.0f - abs(2.0f * Old - 1.0f);
+    const float Zf = MedianL + ((1.0f - Old) * (P.x - MedianL) + Old * (PS - MedianL)) * rsqrt(max((1.0f - Old) * (1.0f - Old) + Old * Old, 1.0e-4f));
+    const float Qf = lerp(Q.x, Q.w, Mix);
+    const float Sf = lerp(Spread.x, Spread.w, Mix);
+    const float CovF = smoothstep(-VOXEL_OCEAN_FOAM_TEX_SOFT * Sf, VOXEL_OCEAN_FOAM_TEX_SOFT * Sf, Zf - Qf);
+    // How far inside: its value above the threshold (in spreads), the bubbles' grain on it; a
+    // whitecap solid.
+    const float Above = (Zf - Qf) / Sf;
+    const float Grain = VOXEL_OCEAN_FOAM_TEX_GRAIN * (P.y - Q.y) / Spread.y;
+    float Thick = saturate(0.6f * Above + 0.2f + Grain);
+    // A whitecap: its billows (its own value above its threshold) and the bubbles.
+    const float ThickW = saturate(0.45f + 0.6f * (P.z - Qw.z) / Spread.z + Grain);
+    Thick = lerp(Thick, ThickW, CovW);
+    L.Layer0 = lerp(CovL, D, Fade);
+    L.Layer1 = lerp(CovS, D, Fade);
+    L.Layer2 = lerp(CovW, Dw, Fade);
+    L.Foam = max(lerp(CovF, D, Fade), L.Layer2);
+    L.Thick = lerp(Thick, 0.5f, Fade);
+    return L;
+}
+
+// The foam at a pixel from the set (as VoxelOceanPixelLaceOf: each chart's downwind frame of its
+// short bands, crossing over with a heading's turn, blended across the charts with the weights
+// summed to 1).
+FVoxelOceanLace VoxelOceanPixelFoamTexOf(float3 SamplePoint, float Footprint, float Density, float Whitecap, FVoxelOceanWaveParams W, Texture2D OceanCharts,
+    Texture2D Set, SamplerState SetSampler, Texture2D Table, float4 Info)
+{
+    FVoxelOceanLace Out;
+    Out.Foam = max(saturate(Density), saturate(Whitecap));
+    Out.Layer0 = saturate(Density);
+    Out.Layer1 = saturate(Density);
+    Out.Layer2 = max(Whitecap, 0.0f);
+    Out.Thick = 0.5f;
+    if ((Density <= 0.0f && Whitecap <= 0.0f) || W.FFT.x < 0.5f) return Out;
+    const float3 D = VoxelOceanRotateBack(W.Rotation, SamplePoint);
+    const float3 UpP = VoxelOceanRotateBack(W.Rotation, normalize(SamplePoint - W.Center));
+    const int N = max(int(W.FFT.y), 1);
+    const FVoxelOceanChartCandidates Cand = VoxelOceanChartCandidatesOf(UpP, N);
+    const FVoxelOceanChartBlend Blend = VoxelOceanChartBlendOf(Cand.Count, VoxelOceanChartDistancesOf(Cand, UpP), N);
+    float Sum = 0.0f;
+    for (int M = 0; M < VOXEL_OCEAN_CHART_MAX; M++)
+    {
+        if (M < Blend.Count) Sum += Blend.Weight[M];
+    }
+    if (Sum <= 0.0f) return Out;
+    Out.Foam = 0.0f;
+    Out.Layer0 = 0.0f;
+    Out.Layer1 = 0.0f;
+    Out.Layer2 = 0.0f;
+    Out.Thick = 0.0f;
+    const float FootprintM = Footprint * 0.01f;
+    // The wind there (stage W3i: storm foam turns to streaks).
+    const float Wind = VoxelOceanSeaStateAt(OceanCharts, UpP, N, W.Shape.y).Wind;
+    [unroll]
+    for (int K = 0; K < VOXEL_OCEAN_CHART_MAX; K++)
+    {
+        if (K >= Blend.Count) continue;
+        const int2 T = Cand.Texel[Blend.Index[K]];
+        const float4 T0 = OceanCharts.Load(int3(T.x, T.y, 0));
+        const float4 T1 = OceanCharts.Load(int3(T.x + 1, T.y, 0));
+        const float4 T2 = OceanCharts.Load(int3(T.x + 2, T.y, 0));
+        const FVoxelOceanChart C = VoxelOceanChartOf(T0.xyz, T1.xyz, T2.xyz, float3(T0.w, T1.w, T2.w));
+        const FVoxelOceanChartHeadings H = VoxelOceanChartHeadingsAt(OceanCharts, T);
+        const FVoxelOceanChartCoords Plane = VoxelOceanChartCoordsOf(C, W.RefHigh.xyz, W.RefLow.xyz, D);
+        const uint Seed = VoxelOceanLaceHash(uint(T.x), uint(T.y), 0x1f123bb5u);
+        const float2 Turn = VoxelOceanTurnWeights(saturate(W.Shape.z), length(Plane.Base + Plane.Offset), H.ShortPrevious, H.ShortCurrent,
+            VOXEL_OCEAN_SHORT_CORRELATION_LENGTH);
+        const float TurnSum = max(Turn.x + Turn.y, 1.0e-6f);
+        for (int O = 0; O < 2; O++)
+        {
+            const float WO = (O == 0 ? Turn.x : Turn.y) / TurnSum;
+            if (WO <= 0.0f) continue;
+            const FVoxelOceanChartCoords Coords = VoxelOceanCoordsToWind(Plane, O == 0 ? H.ShortCurrent : H.ShortPrevious);
+            const FVoxelOceanLace L = VoxelOceanFoamTexAt(Coords.Base, Coords.Offset, Density, Whitecap, FootprintM, W.SlopeVar.w, Wind, Seed ^ (O == 0 ? 0u : 0x6c8e9cf5u),
+                Set, SetSampler, Table, Info);
+            const float Wk = WO * Blend.Weight[K] / Sum;
+            Out.Foam += Wk * L.Foam;
+            Out.Layer0 += Wk * L.Layer0;
+            Out.Layer1 += Wk * L.Layer1;
+            Out.Layer2 += Wk * L.Layer2;
+            Out.Thick += Wk * L.Thick;
+        }
+    }
+    return Out;
+}

@@ -20,7 +20,9 @@ Ocean harnesses (stages O1-O4, O6a, O6b, O7, O8, O9a-O9c). Plain C++20; no engin
                             the 128^2 query cascades, fp16, folding, detiling, determinism, CPU cost
   spectrum_view.cpp         O6a: pictures of the sea from the emulated cascades (perspective from an
                             altitude, top-down relief), with or without detiling
-  ocean_fft_emulation.h     VoxelOceanFFT.usf's passes in float, shared by the two above
+  ocean_fft_emulation.h     VoxelOceanFFT.usf's passes in float, shared by the two above (and eq_check)
+  eq_check.cpp              W3k: the wave equalizer: its gain against a double reference, the GPU slot
+                            table's unpacking bit for bit, the statistics' scaling, the emulated field
       g++ -O2 -std=c++20 -ffp-contract=off -I<plugin>/Source/VoxelPlugin/Public -I<plugin>/Source/VoxelPlugin/Private
           -I<plugin>/Shaders/Private -I. spectrum_check.cpp -o spectrum_check     (same for spectrum_view)
       ./spectrum_view <wind> persp|top <altitude or extent m> <detile cell m, 0 off> <detiled bands> out.ppm
@@ -104,6 +106,13 @@ Ocean harnesses (stages O1-O4, O6a, O6b, O7, O8, O9a-O9c). Plain C++20; no engin
                             the thresholds' tables (--fit writes Shaders/Private/VoxelOceanFoamLaceFit.ush), the structure
                             keeping the density at every footprint, previews (PNG) near and far
       g++ -O2 -std=c++20 -I<plugin>/Source/VoxelPlugin/Public -I<plugin>/Shaders/Private lace_check.cpp -o lace_check
+  foam_set_check.cpp        W3g: a foam texture set (.vxnt; Tools/NoiseTileTool/foam_tile.py makes one) with the
+                            plugin's thresholds (VoxelOceanFoamTable.h) and the shader's cover (VoxelOceanFoamTex.ush,
+                            ported, trilinear sampling emulated): the thresholds rise, the lace's, streaks' and
+                            whitecaps' covers keep the density at every level drawn, previews near and far (PNG)
+      g++ -O2 -std=c++20 -I<plugin>/Source/VoxelPlugin/Public -I<plugin>/Source/VoxelPlugin/Private foam_set_check.cpp
+          -o foam_set_check
+      ./foam_set_check <set.vxnt> [preview folder] [tile m, default 12]
   ClipStandIn/              stand-ins for the engine types VoxelOceanClipmap.h uses
   UEStandIn/                stand-ins for the few engine types the FFT model and the weather use
 

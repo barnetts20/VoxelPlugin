@@ -42,6 +42,10 @@ struct FVoxelOceanSlotGPU
     float4 A;      // tile length (m), wind speed (m/s), fetch (m), gamma
     float4 B;      // swell, amplitude scale, sigma_J (the foam's spread: VOXEL_OCEAN_FOAM_CHOP sqrt(slope variance)), chop
     uint4 C;       // band MMin, band MMax, seed, dispersion C2 (packed, FVoxelOceanSlotParams)
+    float4 G0;     // the equalizer's gains (stage W3k): knots 0-3, 4-7, 8-11, 12 (in G3.x)
+    float4 G1;
+    float4 G2;
+    float4 G3;
 };
 
 StructuredBuffer<FVoxelOceanSlotGPU> Slots;
@@ -49,7 +53,8 @@ uint SlotCount;
 
 FVoxelOceanSlotParams VoxelOceanSlotParamsOf(FVoxelOceanSlotGPU S)
 {
-    return VoxelOceanMakeSlot(S.A.x, S.A.y, S.A.z, S.A.w, S.B.x, S.B.y, S.C.w, S.C.x, S.C.y, S.C.z);
+    return VoxelOceanSlotWithGains(VoxelOceanMakeSlot(S.A.x, S.A.y, S.A.z, S.A.w, S.B.x, S.B.y, S.C.w, S.C.x, S.C.y, S.C.z),
+        S.G0, S.G1, S.G2, S.G3);
 }
 
 // The signed mode of a grid index (the FFT's natural order).

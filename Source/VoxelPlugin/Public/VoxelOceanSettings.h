@@ -9,6 +9,62 @@
 #include "CoreMinimal.h"
 #include "VoxelOceanSettings.generated.h"
 
+/** The wave equalizer (stage W3k; Design/OceanWaves.md section 35): a gain on the waves' height
+ *  per octave of wavelength, on top of the spectrum the wind makes (1: as it is; 0: none of
+ *  those waves; 2: twice as tall). Between two octaves the gain blends smoothly. The foam, the
+ *  whitecaps and the shading measure the sea after it, so they follow. A change rebuilds the
+ *  waves. */
+USTRUCT(BlueprintType)
+struct VOXELPLUGIN_API FVoxelOceanWaveEqualizer
+{
+    GENERATED_BODY()
+
+    static constexpr int32 Knots = 13;
+
+    /** Capillary-gravity ripples, and the sub-mesh roughness the shading adds (its slope
+     *  variance follows this gain squared). */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Equalizer", meta = (DisplayName = "25 cm", ClampMin = "0.0", ClampMax = "8.0", UIMax = "3.0"))
+    float Gain25cm = 1.0f;
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Equalizer", meta = (DisplayName = "50 cm", ClampMin = "0.0", ClampMax = "8.0", UIMax = "3.0"))
+    float Gain50cm = 1.0f;
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Equalizer", meta = (DisplayName = "1 m", ClampMin = "0.0", ClampMax = "8.0", UIMax = "3.0"))
+    float Gain1m = 1.0f;
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Equalizer", meta = (DisplayName = "2 m", ClampMin = "0.0", ClampMax = "8.0", UIMax = "3.0"))
+    float Gain2m = 1.0f;
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Equalizer", meta = (DisplayName = "4 m", ClampMin = "0.0", ClampMax = "8.0", UIMax = "3.0"))
+    float Gain4m = 1.0f;
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Equalizer", meta = (DisplayName = "8 m", ClampMin = "0.0", ClampMax = "8.0", UIMax = "3.0"))
+    float Gain8m = 1.0f;
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Equalizer", meta = (DisplayName = "16 m", ClampMin = "0.0", ClampMax = "8.0", UIMax = "3.0"))
+    float Gain16m = 1.0f;
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Equalizer", meta = (DisplayName = "32 m", ClampMin = "0.0", ClampMax = "8.0", UIMax = "3.0"))
+    float Gain32m = 1.0f;
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Equalizer", meta = (DisplayName = "64 m", ClampMin = "0.0", ClampMax = "8.0", UIMax = "3.0"))
+    float Gain64m = 1.0f;
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Equalizer", meta = (DisplayName = "128 m", ClampMin = "0.0", ClampMax = "8.0", UIMax = "3.0"))
+    float Gain128m = 1.0f;
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Equalizer", meta = (DisplayName = "256 m", ClampMin = "0.0", ClampMax = "8.0", UIMax = "3.0"))
+    float Gain256m = 1.0f;
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Equalizer", meta = (DisplayName = "512 m", ClampMin = "0.0", ClampMax = "8.0", UIMax = "3.0"))
+    float Gain512m = 1.0f;
+    /** The longest swell the waves hold (the 1 km band's longest are 997 m). */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Equalizer", meta = (DisplayName = "1024 m", ClampMin = "0.0", ClampMax = "8.0", UIMax = "3.0"))
+    float Gain1024m = 1.0f;
+
+    /** Knot i's gain, shortest first (25 cm at 0, 1,024 m at 12). */
+    float Get(int32 Knot) const
+    {
+        const float G[Knots] = { Gain25cm, Gain50cm, Gain1m, Gain2m, Gain4m, Gain8m, Gain16m, Gain32m, Gain64m, Gain128m, Gain256m, Gain512m, Gain1024m };
+        return G[FMath::Clamp(Knot, 0, Knots - 1)];
+    }
+
+    void Sanitize()
+    {
+        float* G[Knots] = { &Gain25cm, &Gain50cm, &Gain1m, &Gain2m, &Gain4m, &Gain8m, &Gain16m, &Gain32m, &Gain64m, &Gain128m, &Gain256m, &Gain512m, &Gain1024m };
+        for (float* V : G) *V = FMath::Clamp(*V, 0.0f, 8.0f);
+    }
+};
+
 USTRUCT(BlueprintType)
 struct VOXELPLUGIN_API FVoxelOceanSettings
 {
@@ -100,6 +156,27 @@ struct VOXELPLUGIN_API FVoxelOceanSettings
     /** The foam's albedo, lit by the sun and the sky. */
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Shading", meta = (EditCondition = "bOwnShading"))
     FLinearColor FoamAlbedo = FLinearColor(0.85f, 0.85f, 0.85f);
+
+    /** The foam's texture set (stage W3g): a foam .vxnt in the plugin's NoiseSets folder, without
+     *  the extension (Tools/NoiseTileTool/foam_tile.py makes one). Its lace, streaks and
+     *  whitecaps are drawn where the foam's density puts foam. Empty or missing: the procedural
+     *  lace. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Shading", meta = (EditCondition = "bOwnShading"))
+    FString FoamSet = TEXT("foam_a");
+
+    /** How wide the foam set's tile is on the water (m). Larger: larger holes and strands, and a
+     *  longer repeat. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Shading", meta = (EditCondition = "bOwnShading", ClampMin = "1.0", UIMax = "200.0"))
+    float FoamTile = 12.0f;
+
+    /** How strongly sunlight shines through thin, steep crests toward the eye (stage W3h): the
+     *  teal glow of a wave seen against the sun. 0: none; 1 as the water's scattering gives it. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Shading", meta = (EditCondition = "bOwnShading", ClampMin = "0.0", UIMax = "4.0"))
+    float CrestGlow = 1.0f;
+
+    /** How much higher a whitecap's billows stand than the lace's relief (stage W3h; 1: the same). */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Shading", AdvancedDisplay, meta = (EditCondition = "bOwnShading", ClampMin = "1.0", UIMax = "8.0"))
+    float WhitecapRelief = 3.0f;
 
     /** The stand-in sky until the atmosphere is connected (stage W3b): its radiance at the zenith
      *  and at the horizon per unit of the sun's illuminance (the world's directional light), by
@@ -222,6 +299,12 @@ struct VOXELPLUGIN_API FVoxelOceanSettings
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Waves", meta = (UIMin = "-2.0", UIMax = "2.0"))
     float WaveMipBias = 0.0f;
 
+    /** Per-octave gains on the waves' height (stage W3k): raise the 64-256 m octaves for a
+     *  heavier sea, the 1-4 m ones for a choppier one, lower the shortest for a glassier surface.
+     *  All 1: the spectrum as the wind makes it. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Waves")
+    FVoxelOceanWaveEqualizer WaveEqualizer;
+
     // --- Weather (the procedural wind, storms and swell until the atmosphere; Design/OceanWaves.md section 4) ---
 
     /** The procedural weather: latitude bands, noise and drifting storms, the same on every
@@ -316,6 +399,14 @@ struct VOXELPLUGIN_API FVoxelOceanSettings
      *  itself. */
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Shore", meta = (EditCondition = "bShoaling", ClampMin = "0.0", UIMax = "1000.0"))
     double ShoreFadeDistance = 0.0;
+
+    /** The least share of their open-sea height the FFT waves keep near the coast and under the
+     *  land (stage W3g): the shoaling's breaking and fade stop here, so no part of the ocean mesh
+     *  stands still and a channel dug into the shore has waves at once. The terrain hides them
+     *  elsewhere, and the thin water's drop keeps them under the ground. 0: as before (none at
+     *  the shoreline). */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Shore", meta = (EditCondition = "bShoaling", ClampMin = "0.0", ClampMax = "1.0"))
+    double ShoreWaveFloor = 0.15;
 
     /** The depth the waves feel leaves out terrain features narrower than about twice this (m):
      *  waves don't feel bumps much shorter than themselves, and the surf's timing follows the
@@ -464,6 +555,7 @@ struct VOXELPLUGIN_API FVoxelOceanSettings
         WaveFetch = FMath::Max(WaveFetch, 1.0);
         WaveChop = FMath::Clamp(WaveChop, 0.0, 2.0);
         WaveSwell = FMath::Clamp(WaveSwell, 0.0, 1.0);
+        WaveEqualizer.Sanitize();
         WaveDetileCell = FMath::Max(WaveDetileCell, 0.0);
         TradeWind = FMath::Max(TradeWind, 0.0);
         Westerly = FMath::Max(Westerly, 0.0);
@@ -485,6 +577,7 @@ struct VOXELPLUGIN_API FVoxelOceanSettings
         ShoreChopGrowth = FMath::Clamp(ShoreChopGrowth, 0.0, 2.0);
         ShoreWarp = FMath::Clamp(ShoreWarp, 0.0, 2.0);
         ShoreFadeDistance = FMath::Max(ShoreFadeDistance, 0.0);
+        ShoreWaveFloor = FMath::Clamp(ShoreWaveFloor, 0.0, 1.0);
         ShoreMinSlope = FMath::Max(ShoreMinSlope, 1.0e-4);
         ShoreDetail = FMath::Clamp(ShoreDetail, 1.0, 8.0);
         ShoreDetailBand = FMath::Clamp(ShoreDetailBand, 0.0, 5000.0);
@@ -504,6 +597,9 @@ struct VOXELPLUGIN_API FVoxelOceanSettings
         SurfFoam = FMath::Max(SurfFoam, 0.0);
         ShortWaveSlopeVariance = FMath::Max(ShortWaveSlopeVariance, 0.0f);
         Refraction = FMath::Max(Refraction, 0.0f);
+        FoamTile = FMath::Max(FoamTile, 1.0f);
+        CrestGlow = FMath::Max(CrestGlow, 0.0f);
+        WhitecapRelief = FMath::Max(WhitecapRelief, 1.0f);
     }
 
     /** The fields whose change rebuilds the surface. */

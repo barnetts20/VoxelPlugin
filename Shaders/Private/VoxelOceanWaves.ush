@@ -256,6 +256,7 @@ struct FVoxelOceanWaveOutput
     float SlopeVariance;   // unresolved slope variance at the footprint
     float Jacobian;        // area ratio of the displaced surface: <= 0 folds over (breaking)
     float Foam;            // 0 to 1 (the FFT model with VOXEL_OCEAN_LOOKUP_FOAM; else 0)
+    float Whitecap;        // stage W3h: the whitecaps' density, the breaking now (0 to 1; as Foam)
 };
 
 // The environment at a point: the ocean actor's constants (Shape) until the atmosphere provides
@@ -422,6 +423,7 @@ FVoxelOceanWaveOutput VoxelOceanWaves(FVoxelOceanWaveInput In, FVoxelOceanWavePa
     Out.SlopeVariance = 0.0f;
     Out.Jacobian = 1.0f;
     Out.Foam = 0.0f;
+    Out.Whitecap = 0.0f;
     const float Amplitude = W.Params.z;
     if (Amplitude <= 0.0f) return Out;
 
@@ -827,6 +829,7 @@ struct FVoxelOceanFFTPoint
     FVoxelOceanFFTAccum A;      // its J, for the query's Newton steps
     float4 SlopeVar;            // each band's slope variance at the point (its sea state, shoaled)
     float Foam;                 // with VOXEL_OCEAN_LOOKUP_FOAM: the open sea's and the surf's (0 to 1)
+    float Whitecap;             // with VOXEL_OCEAN_LOOKUP_FOAM and the normals: the whitecaps' density (stage W3h)
 };
 
 // The bands' height deviations at a sea state (the table's constants, rows 6 and 7).
@@ -838,10 +841,12 @@ float4 VoxelOceanFFTBandSigma(FVoxelOceanSeaState Sea, Texture2D OceanCharts, in
 // The bands' shoaling at a point (VoxelOceanShoal.ush): Depth (cm, VOXEL_OCEAN_DEEP unknown) and
 // Shore (world axes) as the wave input carries them, Sea the point's sea state, Sigma its bands'
 // height deviations, LongKeep the long bands' share the surf leaves them.
-FVoxelOceanShoal VoxelOceanFFTShoalAt(float Depth, FVoxelOceanShore Shore, FVoxelOceanSeaState Sea, float4 Sigma, float LongKeep, FVoxelOceanWaveParams W)
+FVoxelOceanShoal VoxelOceanFFTShoalAt(float Depth, FVoxelOceanShore Shore, FVoxelOceanSeaState Sea, float4 Sigma, float LongKeep, float Floor,
+    FVoxelOceanWaveParams W)
 {
     FVoxelOceanShoalSettings Settings = VoxelOceanShoalSettingsOf(W.States, W.SlopeVar);
     Settings.LongKeep = LongKeep;
+    Settings.Floor = Floor;
     if (Settings.Breaking <= 0.0f) return VoxelOceanShoalNone();
     const bool bField = W.States.x > 0.5f && Shore.Distance < 0.5f * VOXEL_OCEAN_DEEP;
     FVoxelOceanShoreSample Field;
@@ -980,14 +985,18 @@ FVoxelOceanFFTPoint VoxelOceanFFTEvaluate(float3 P, float3 Up, float Spacing, fl
         DrainDir = L2 > 1.0e-12f ? DirP * rsqrt(L2) : float3(0.0f, 0.0f, 0.0f);
         DrainBedDir = VoxelOceanBedRiseOf(Shore, W, DrainDir);
     }
-    const bool bStill = Drain.Keep <= 0.0f;
+    // (Stage W3g: the drain sinks the sea out of sight but no longer stills it: a basin dug open
+    // shows waves once the field is baked again.)
+    const bool bStill = false;
     FVoxelOceanFFTSurf Surf;
     Surf.Surf = VoxelOceanSurfNone();
     Surf.Dir = float3(0.0f, 0.0f, 0.0f);
     Surf.BedDir = float3(0.0f, 0.0f, 0.0f);
     if (!bStill)
         Surf = VoxelOceanFFTSurfAt(D, Depth, Shore, Sea, Sigma, W, OceanCharts, N, W.SurfSpacing > 0.0f ? W.SurfSpacing : Spacing, Footprint, Mask);
-    const FVoxelOceanShoal Shoal = VoxelOceanFFTShoalAt(Depth, Shore, Sea, Sigma, Surf.Surf.LongKeep, W);
+    // The waves' floor (stage W3g; the chart table's row 18 z).
+    const float WaveFloor = saturate(OceanCharts.Load(int3(VoxelOceanConstantsX(N), 18, 0)).z);
+    const FVoxelOceanShoal Shoal = VoxelOceanFFTShoalAt(Depth, Shore, Sea, Sigma, Surf.Surf.LongKeep, WaveFloor, W);
     const bool bFoam = (Mask & VOXEL_OCEAN_LOOKUP_FOAM) != 0u;
     FVoxelOceanFoamSlots FoamSlots = VoxelOceanFoamSlotsZero();
     if (bFoam)
@@ -1026,10 +1035,10 @@ FVoxelOceanFFTPoint VoxelOceanFFTEvaluate(float3 P, float3 Up, float Spacing, fl
         A.Gradient += Surf.Dir * Surf.Surf.Gradient + Surf.BedDir * Surf.Surf.GradientBed + Surf.Surf.GradientPhase;
         A.VelocityUp += Surf.Surf.Rate * 100.0f;
     }
-    // The drain: the waves scaled, the surface lowered, its slope landward taken off the gradient.
+    // The drain: the surface lowered (its waves kept, stage W3g), its slope landward taken off the
+    // gradient.
     if (Drain.Keep < 1.0f)
     {
-        A = VoxelOceanFFTAccumScale(A, Drain.Keep);
         A.Height -= Drain.Drop * 100.0f;
         A.Gradient -= DrainDir * Drain.Slope + DrainBedDir * Drain.SlopeBed;
     }
@@ -1048,7 +1057,9 @@ FVoxelOceanFFTPoint VoxelOceanFFTEvaluate(float3 P, float3 Up, float Spacing, fl
     // (Stage W3f: the short bands' part fades out between 1 and 5 m of footprint, before their tiles,
     // 60 and 14 m, repeat across the view.)
     const float ShortKeep = 1.0f - smoothstep(VOXEL_OCEAN_FOAM_SHORT_NEAR, VOXEL_OCEAN_FOAM_SHORT_FAR, Footprint);
-    Out.Foam = bFoam ? Drain.Keep * VoxelOceanFFTFoamOf(Foam, FoamSlots, Sea, Surf.Surf.LongKeep, Surf.Surf.SteepVar, Surf.Surf.Foam, OceanCharts, N, ShortKeep) : 0.0f;
+    // (Stage W3n: the trains' slope variance no longer raises the open sea's foam: their crests
+    // whiten themselves, VoxelOceanSurf.ush.)
+    Out.Foam = bFoam ? Drain.Keep * VoxelOceanFFTFoamOf(Foam, FoamSlots, Sea, Surf.Surf.LongKeep, 0.0f, Surf.Surf.Foam, OceanCharts, N, ShortKeep) : 0.0f;
     // The debug view (stage O9f; voxel.Ocean.DebugSurf, the chart table's row 18 w): one of the
     // surf's and the shore's quantities as the foam (0 to 1), to find where one changes abruptly.
     if (bFoam)
@@ -1105,6 +1116,13 @@ FVoxelOceanFFTPoint VoxelOceanFFTEvaluate(float3 P, float3 Up, float Spacing, fl
             const float K0 = VOXEL_OCEAN_SHORE_TWO_PI / VoxelOceanShoalWavelength(0, max(Sea.Wind, Sea.Swell), W.Tiles);
             V = Depth < 0.5f * VOXEL_OCEAN_DEEP ? K0 * Depth * (0.01f / VOXEL_OCEAN_SHOAL_DEEP) : 0.0f;
         }
+        // Band 0's height gain (18) taken apart: whether the shoaling acts at all, its gain from
+        // the depth (half grey: none), the surf's keep, the breaking cap, the coast's fade.
+        else if (DebugMode == 22) V = Shoal.Active;
+        else if (DebugMode == 23) V = Shoal.Parts.x * 0.5f;
+        else if (DebugMode == 24) V = Shoal.Parts.y;
+        else if (DebugMode == 25) V = Shoal.Parts.z;
+        else if (DebugMode == 26) V = Shoal.Parts.w;
         Out.Foam = saturate(V);
     }
     }
@@ -1116,6 +1134,37 @@ FVoxelOceanFFTPoint VoxelOceanFFTEvaluate(float3 P, float3 Up, float Spacing, fl
         const float4 G = float4(Shoal.Amp.x * (1.0f + Shoal.Stretch.x), Shoal.Amp.y * (1.0f + Shoal.Stretch.y),
             Shoal.Amp.z * (1.0f + Shoal.Stretch.z), Shoal.Amp.w * (1.0f + Shoal.Stretch.w));
         Out.SlopeVar = V * G * G * (Drain.Keep * Drain.Keep);
+    }
+    // The whitecaps (stage W3h; VoxelOceanWhitecapOf): the summed surface breaking now, against the
+    // bands' slope variance and the part the footprint leaves out; the surf's bores where they
+    // break. The waves' chop: the table's row 16 x.
+    Out.Whitecap = 0.0f;
+    if (bFoam && (Mask & 2u) != 0u)
+    {
+        const float4 Row16 = OceanCharts.Load(int3(VoxelOceanConstantsX(N), 16, 0));
+        // The bands' variance as the waves carry it: without the drain's Keep^2 (it lowers the
+        // surface but no longer scales the waves, stage W3g), and the resolved part as the charts'
+        // and the headings' blends leave it (their weights' squares, as the foam's: a blend of
+        // independent fields is narrower), J's deviation rescaled to the unblended spread.
+        const float InvKeep2 = 1.0f / max(Drain.Keep * Drain.Keep, 1.0e-4f);
+        float SlopeVarAll = 0.0f;
+        float Unresolved = 0.0f;
+        float Blended = 0.0f;
+        [unroll]
+        for (int Bw = 0; Bw < 4; Bw++)
+        {
+            const float Var = InvKeep2 * (Bw == 0 ? Out.SlopeVar.x : (Bw == 1 ? Out.SlopeVar.y : (Bw == 2 ? Out.SlopeVar.z : Out.SlopeVar.w)));
+            const float Res = Var * (1.0f - VoxelOceanResolved(VoxelOceanBandMinWavelength(W, Bw) * 100.0f, Footprint));
+            SlopeVarAll += Var;
+            Unresolved += Res;
+            Blended += (Var - Res) * (Bw < 2 ? Foam.LongWeight2 : Foam.ShortWeight2);
+        }
+        const float Resolved = max(SlopeVarAll - Unresolved, 0.0f);
+        const float Widen = Blended > 1.0e-12f ? sqrt(Resolved / Blended) : 1.0f;
+        const float J = 1.0f - (1.0f - Out.R.Jacobian) * Widen;
+        Out.Whitecap = Drain.Keep * VoxelOceanWhitecapOf(J, SlopeVarAll, Unresolved, Row16.x, Sea.Wind, max(Row16.z, 0.0f));
+        if (Surf.Surf.Active > 0.5f)
+            Out.Whitecap = max(Out.Whitecap, saturate(Surf.Surf.Breaking) * saturate(Row16.y));
     }
     return Out;
 }
@@ -1152,6 +1201,7 @@ FVoxelOceanWaveOutput VoxelOceanFFTOutput(FVoxelOceanFFTPoint Pt, FVoxelOceanWav
     Out.SlopeVariance = (Mask & 2u) != 0u ? VoxelOceanFFTSlopeVariance(Pt, W, In.Footprint) : 0.0f;
     Out.Jacobian = (Mask & 2u) != 0u ? Pt.R.Jacobian : 1.0f;
     Out.Foam = (Mask & VOXEL_OCEAN_LOOKUP_FOAM) != 0u ? Pt.Foam : 0.0f;
+    Out.Whitecap = (Mask & VOXEL_OCEAN_LOOKUP_FOAM) != 0u ? Pt.Whitecap : 0.0f;
     return Out;
 }
 

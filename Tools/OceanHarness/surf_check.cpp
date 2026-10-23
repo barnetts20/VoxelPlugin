@@ -497,6 +497,66 @@ int main()
         Check(Sheet > 0.5, "the swash's thin sheet", Sheet, 0.5);
         const FVoxelOceanSurf NoFoam = VoxelOceanSurfOf(Input(Beach, 1.0 / 0.02, 10.0f), Settings(1, 0.85f, 1, 1, 10, 0.2f, 0.25f, 0.0f));
         Check(NoFoam.Foam == 0.0f, "surf foam 0: none", NoFoam.Foam, 0.0);
+
+        // Stage W3n: the whitecaps (Breaking) are on the bores, moving with them: at a point in the
+        // surf zone they come and go with each bore (white a small part of the time, solid when a
+        // bore passes); unresolved, they're their cycle's mean, steady; the carpet between bores
+        // is thin.
+        for (double Depth : { 0.6, 1.0, 1.6 })
+        {
+            const int Steps = 2400;
+            double Max = 0.0, Sum = 0.0, FoamSum = 0.0, FoamMin = 1.0;
+            std::vector<double> V(Steps);
+            for (int k = 0; k < Steps; k++)
+            {
+                const FVoxelOceanSurf R = VoxelOceanSurfOf(Input(Beach, Depth / 0.02, 0.05f * k), S);
+                V[size_t(k)] = R.Breaking;
+                Max = std::max(Max, double(R.Breaking));
+                Sum += R.Breaking;
+                FoamSum += R.Foam;
+                FoamMin = std::min(FoamMin, double(R.Foam));
+            }
+            int White = 0;
+            for (double X : V) if (X > 0.5 * Max) White++;
+            const double Share = double(White) / Steps;
+            std::printf("  %.1f m deep: whitecaps at most %.2f, mean %.3f, white (over half their most) %.0f%% of the time; foam mean %.2f, least %.2f\n",
+                Depth, Max, Sum / Steps, 100.0 * Share, FoamSum / Steps, FoamMin);
+            Check(Max > 0.5, "a passing bore is white", Max, 0.5);
+            Check(Share < 0.4, "white only while a bore passes (share of the time)", Share, 0.4);
+            Check(FoamMin < 0.2, "between the bores the carpet is thin", FoamMin, 0.2);
+        }
+        {
+            // Unresolved (a 200 m footprint): steady, at the cycle's mean.
+            double Lo = 1.0, Hi = 0.0, Sum = 0.0;
+            double SumNear = 0.0;
+            for (int k = 0; k < 2400; k++)
+            {
+                FVoxelOceanSurfInput In = Input(Beach, 1.0 / 0.02, 0.05f * k);
+                SumNear += VoxelOceanSurfOf(In, S).Breaking;
+                In.FootprintM = 200.0f;
+                const double B = VoxelOceanSurfOf(In, S).Breaking;
+                Lo = std::min(Lo, B); Hi = std::max(Hi, B); Sum += B;
+            }
+            std::printf("  unresolved (200 m footprint): %.3f to %.3f (mean %.3f; resolved mean %.3f)\n", Lo, Hi, Sum / 2400, SumNear / 2400);
+            Check(Hi - Lo < 0.25 * std::max(Hi, 1e-6), "unresolved, the whitecaps are steady (their swing under a quarter)", (Hi - Lo) / std::max(Hi, 1e-6), 0.25);
+            Check(std::fabs(Sum - SumNear) < 0.15 * SumNear, "and average what the resolved bores do (15%)", std::fabs(Sum - SumNear) / std::max(SumNear, 1e-9), 0.15);
+        }
+        {
+            // A steep train's whitecaps on its crests only (no bores' carpet: 10 m deep, Hs 4).
+            int White = 0, Count = 0;
+            double Max = 0.0;
+            for (int k = 0; k < 2400; k++)
+            {
+                FVoxelOceanSurfInput In = Input(Beach, 10.0 / 0.02, 0.05f * k);
+                const double B = VoxelOceanSurfTrainOf(0, In, S, 4.0f, 0.0f, 0.0f, 0.0f, 0.02f, 0.0f, 0.0f).Bore;
+                Max = std::max(Max, B);
+                if (B > 0.15) White++;
+                Count++;
+            }
+            std::printf("  a steep train's crests: whitecaps at most %.2f, over 0.15 %.0f%% of the time\n", Max, 100.0 * White / Count);
+            Check(Max > 0.3, "a steep train's crest whitens", Max, 0.3);
+            Check(double(White) / Count < 0.25, "on its crests only", double(White) / Count, 0.25);
+        }
     }
 
     std::printf("\n== the bound\n");

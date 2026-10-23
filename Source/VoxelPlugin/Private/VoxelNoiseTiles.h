@@ -40,6 +40,11 @@ namespace VoxelNoiseTiles
         KindErodedHeight = 7,       // a simulated heightfield, in mip-0 texel units
         KindBlurred = 8,            // a channel blurred (Source)
         KindFlowAccumulation = 9,   // log2 of a heightfield's contributing area (Source)
+        // The ocean's foam set (stage W3g; NoiseTiles2D_Addendum5.md, Tools/NoiseTileTool/foam_tile.py).
+        KindFoamLace = 10,          // bubbles gathered on a turbulent surface's convergence lines
+        KindFoamGrain = 11,         // the bubbles' grain
+        KindFoamWhitecap = 12,      // a whitecap's billowy turbulence
+        KindFoamStreak = 13,        // the lace's flow stretched downwind (x)
     };
 
     struct FChannel
@@ -648,6 +653,20 @@ namespace VoxelNoiseTiles
         return std::string();
     }
 
+    /** A foam set (stage W3g): R lace, G grain, B whitecap, A streak. "" if usable, else why not. */
+    inline std::string CheckFoam(const FSet& Set)
+    {
+        const uint32_t Want[4] = { KindFoamLace, KindFoamGrain, KindFoamWhitecap, KindFoamStreak };
+        const char* Names[4] = { "R", "G", "B", "A" };
+        for (int c = 0; c < 4; c++)
+        {
+            if (Set.Channel[c].Kind != Want[c])
+                return std::string(Names[c]) + " has kind " + std::to_string(Set.Channel[c].Kind) + " (a foam set's is " + std::to_string(Want[c]) + ")";
+        }
+        if (Set.N < 64u) return "size " + std::to_string(Set.N) + " (a foam set needs at least 64)";
+        return std::string();
+    }
+
     // --- The noise generator's files (.vxnt v3) ----------------------------------------------
     //
     // Little-endian throughout (as every platform UE targets). As peaks_a.vxnt (NoiseTile2D 2.0)
@@ -741,7 +760,7 @@ namespace VoxelNoiseTiles
             C.Max = F32(P + 40);
             C.Mean = F32(P + 44);
             C.Std = F32(P + 48);
-            if (C.Kind > KindFlowAccumulation) return "channel " + std::to_string(c) + " has kind " + std::to_string(C.Kind);
+            if (C.Kind > KindFoamStreak) return "channel " + std::to_string(c) + " has kind " + std::to_string(C.Kind);
             if (!(C.Max > C.Min) || !std::isfinite(C.Min) || !std::isfinite(C.Max)) return "channel " + std::to_string(c) + " has no decode range";
         }
         Out = std::move(Set);

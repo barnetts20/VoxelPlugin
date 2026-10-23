@@ -1,5 +1,6 @@
 #include "VoxelOceanSurfacePass.h"
 #include "VoxelOceanRingDraw.h"
+#include "VoxelOceanFoamTexture.h"
 
 #include "CommonRenderResources.h"
 #include "CoreGlobals.h"
@@ -21,7 +22,7 @@ DECLARE_GPU_STAT(VoxelOceanSurface);
 
 static TAutoConsoleVariable<int32> CVarVoxelOceanDebugFoam(
     TEXT("voxel.Ocean.DebugFoam"), 0,
-    TEXT("The ocean's own pass (stage W3f): 1 the foam's density (grey), 2 its structure (the lace drawn for the density), 3 the structure's layers (red the streaks, green the lace, blue the bubbles). 0 off."),
+    TEXT("The ocean's own pass (stage W3f): 1 the foam's density (grey), 2 its structure (the lace drawn for the density), 3 the structure's layers (with a foam set, stage W3g: red the lace, green the streaks, blue the whitecaps; with the procedural lace: red the streaks, green the lace, blue the bubbles), 4 the whitecaps' density (stage W3h: the breaking now). 0 off."),
     ECVF_RenderThreadSafe);
 
 namespace VoxelOceanSurfacePassDetail
@@ -98,6 +99,8 @@ BEGIN_SHADER_PARAMETER_STRUCT(FVoxelOceanSurfaceParameters, )
     SHADER_PARAMETER_SAMPLER(SamplerState, SurfaceClipSampler)
     SHADER_PARAMETER_TEXTURE(Texture2D, SurfaceClipInfo)
     SHADER_PARAMETER(uint32, SurfaceClipOn)
+    SHADER_PARAMETER_TEXTURE(Texture2DArray, SurfaceClipWhitecap)
+    SHADER_PARAMETER(FVector4f, SurfaceCrest)
     SHADER_PARAMETER(FVector3f, SurfaceScattering)
     SHADER_PARAMETER(FVector3f, SurfaceExtinction)
     SHADER_PARAMETER(float, SurfacePhaseG)
@@ -107,6 +110,10 @@ BEGIN_SHADER_PARAMETER_STRUCT(FVoxelOceanSurfaceParameters, )
     SHADER_PARAMETER(FVector3f, SurfaceSkyHorizon)
     SHADER_PARAMETER(FVector4f, SurfaceShading)
     SHADER_PARAMETER(FVector3f, SurfaceFoamAlbedo)
+    SHADER_PARAMETER_TEXTURE(Texture2D, SurfaceFoamSet)
+    SHADER_PARAMETER_SAMPLER(SamplerState, SurfaceFoamSampler)
+    SHADER_PARAMETER_TEXTURE(Texture2D, SurfaceFoamTable)
+    SHADER_PARAMETER(FVector4f, SurfaceFoamInfo)
     RENDER_TARGET_BINDING_SLOTS()
 END_SHADER_PARAMETER_STRUCT()
 
@@ -352,6 +359,8 @@ void FVoxelOceanSurfacePass::Render_RenderThread(FPostOpaqueRenderParameters& Pa
     // (Wrapping: the clipmap's levels are toroidal.)
     P->SurfaceClipSampler = TStaticSamplerState<SF_Bilinear, AM_Wrap, AM_Wrap, AM_Clamp>::GetRHI();
     P->SurfaceClipOn = Rings.bClip ? 1u : 0u;
+    P->SurfaceCrest = FVector4f(FMath::Max(Params.CrestGlow, 0.0f), FMath::Max(Params.WhitecapRelief, 1.0f), 0.0f, 0.0f);
+    P->SurfaceClipWhitecap = Rings.bClip && Rings.ClipWhitecap ? Rings.ClipWhitecap : GBlackArrayTexture->TextureRHI.GetReference();
 
     // The water, per cm.
     const FVector3f Scattering = Params.Scattering * 0.01f;
@@ -365,8 +374,15 @@ void FVoxelOceanSurfacePass::Render_RenderThread(FPostOpaqueRenderParameters& Pa
     P->SurfaceSkyZenith = Params.SkyZenith;
     P->SurfaceSkyHorizon = Params.SkyHorizon;
     P->SurfaceShading = FVector4f(FMath::Max(Params.ShortWaveSlopeVariance, 0.0f), FMath::Max(Params.Refraction, 0.0f), Params.bFoam ? 1.0f : 0.0f,
-        (float)FMath::Clamp(CVarVoxelOceanDebugFoam.GetValueOnRenderThread(), 0, 3));
+        (float)FMath::Clamp(CVarVoxelOceanDebugFoam.GetValueOnRenderThread(), 0, 4));
     P->SurfaceFoamAlbedo = Params.FoamAlbedo;
+    // The foam's set (stage W3g), once its textures exist.
+    const FVoxelOceanFoamTexture* FoamSet = Params.FoamTexture.Get();
+    const bool bFoamSet = FoamSet && FoamSet->bReady && FoamSet->Set.IsValid() && FoamSet->Table.IsValid();
+    P->SurfaceFoamSet = bFoamSet ? FoamSet->Set.GetReference() : GBlackTexture->TextureRHI.GetReference();
+    P->SurfaceFoamTable = bFoamSet ? FoamSet->Table.GetReference() : GBlackTexture->TextureRHI.GetReference();
+    P->SurfaceFoamSampler = TStaticSamplerState<SF_Trilinear, AM_Wrap, AM_Wrap, AM_Clamp>::GetRHI();
+    P->SurfaceFoamInfo = FVector4f(1.0f / FMath::Max(Params.FoamTileM, 1.0f), bFoamSet ? (float)FoamSet->Mips : 1.0f, bFoamSet ? 1.0f : 0.0f, 0.0f);
 
     P->RenderTargets[0] = FRenderTargetBinding(SceneColor, ERenderTargetLoadAction::ELoad);
     if (bVelocity)

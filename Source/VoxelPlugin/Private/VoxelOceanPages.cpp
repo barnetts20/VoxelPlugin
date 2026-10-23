@@ -269,6 +269,8 @@ struct FVoxelOceanDisplaceState
     FTextureRHIRef ClipDisplacement;
     /** The clipmap's normal and info textures (the ocean's own pass shades from them; stage W3). */
     FTextureRHIRef ClipNormal;
+    /** Stage W3h: the whitecaps' density (the own pass). */
+    FTextureRHIRef ClipWhitecap;
     FTextureRHIRef ClipInfo;
     /** The rings this frame (stage W2; UpdateClipmap's command, with the clipmap's levels): per
      *  level (the camera about the square's centre in cells, the cell, unused), (the hole's
@@ -349,6 +351,7 @@ BEGIN_SHADER_PARAMETER_STRUCT(FVoxelOceanClipWaveParameters, )
     SHADER_PARAMETER_RDG_TEXTURE(Texture2DArray<float4>, ClipStatic)
     SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2DArray<float4>, ClipDisplacementOut)
     SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2DArray<float4>, ClipNormalOut)
+    SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2DArray<float2>, ClipWhitecapOut)
     SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2D<float4>, ClipInfoOut)
     SHADER_PARAMETER(FVector4f, ClipParams)
     SHADER_PARAMETER(FVector4f, ClipWave0)
@@ -474,6 +477,7 @@ struct FVoxelOceanClipState
     TRefCountPtr<IPooledRenderTarget> Static;
     TRefCountPtr<IPooledRenderTarget> DisplacementWork;
     TRefCountPtr<IPooledRenderTarget> NormalWork;
+    TRefCountPtr<IPooledRenderTarget> WhitecapWork;
     int32 Size = 0;
     int32 Slots = 0;
     std::atomic<bool> bLost{ false };
@@ -1293,6 +1297,7 @@ bool FVoxelOceanRingProvider::PrepareDraw_RenderThread(FRDGBuilder& GraphBuilder
     Out.bClip = D.bClip && D.ClipDisplacement.IsValid() && D.ClipNormal.IsValid() && D.ClipInfo.IsValid();
     Out.ClipDisplacement = D.ClipDisplacement.GetReference();
     Out.ClipNormal = D.ClipNormal.GetReference();
+    Out.ClipWhitecap = D.ClipWhitecap.GetReference();
     Out.ClipInfo = D.ClipInfo.GetReference();
     return true;
 }
@@ -1552,12 +1557,14 @@ void FVoxelOceanPages::SetClipmap(const FVoxelOceanClipSettings& InSettings)
     {
         ClipDisplacement.Reset();
         ClipNormal.Reset();
+        ClipWhitecap.Reset();
         ClipInfo.Reset();
         return;
     }
     if (bSameTextures) return;
     ClipDisplacement.Reset(VOP::MakeClipArray(TEXT("VoxelOceanClipDisplacement"), S.Size, S.Levels, PF_A32B32G32R32F, 16));
     ClipNormal.Reset(VOP::MakeClipArray(TEXT("VoxelOceanClipNormal"), S.Size, S.Levels, PF_FloatRGBA, 8));
+    ClipWhitecap.Reset(VOP::MakeClipArray(TEXT("VoxelOceanClipWhitecap"), S.Size, S.Levels, PF_G16R16F, 4));
     UTexture2D* Info = UTexture2D::CreateTransient(VoxelOceanClipmap::InfoRows, 1, PF_A32B32G32R32F,
         MakeUniqueObjectName(GetTransientPackage(), UTexture2D::StaticClass(), FName(TEXT("VoxelOceanClipInfo"))));
     if (Info)
@@ -1572,11 +1579,12 @@ void FVoxelOceanPages::SetClipmap(const FVoxelOceanClipSettings& InSettings)
         Info->UpdateResource();
     }
     ClipInfo.Reset(Info);
-    if (!ClipDisplacement.IsValid() || !ClipNormal.IsValid() || !ClipInfo.IsValid())
+    if (!ClipDisplacement.IsValid() || !ClipNormal.IsValid() || !ClipWhitecap.IsValid() || !ClipInfo.IsValid())
     {
         UE_LOG(LogVoxelPlugin, Warning, TEXT("[VoxelOcean] Couldn't create the wave clipmap's textures: the vertices evaluate the waves themselves."));
         ClipDisplacement.Reset();
         ClipNormal.Reset();
+        ClipWhitecap.Reset();
         ClipInfo.Reset();
         return;
     }
@@ -1594,8 +1602,9 @@ void FVoxelOceanPages::UpdateClipmap(const FVector& CameraPlanet, const FVoxelOc
     if (!IsClipmapOn() || !bWavesInCompute) return;
     FTextureResource* DispResource = ClipDisplacement->GetResource();
     FTextureResource* NormalResource = ClipNormal->GetResource();
+    FTextureResource* WhitecapResource = ClipWhitecap.IsValid() ? ClipWhitecap->GetResource() : nullptr;
     FTextureResource* InfoResource = ClipInfo.IsValid() ? ClipInfo->GetResource() : nullptr;
-    if (!DispResource || !NormalResource || !InfoResource) return;
+    if (!DispResource || !NormalResource || !WhitecapResource || !InfoResource) return;
     if (!ClipPlan.IsValid()) ClipPlan = MakeUnique<FVoxelOceanClipPlan>();
     FVoxelOceanClipPlan& Plan = *ClipPlan;
     // A frame whose passes couldn't run: everything is written again.
@@ -1779,14 +1788,15 @@ void FVoxelOceanPages::UpdateClipmap(const FVector& CameraPlanet, const FVoxelOc
     const TSharedPtr<const FVoxelEditGPUData> Edits = DensityInputs.Edits.IsValid() ? DensityInputs.Edits : NoEdits;
     ENQUEUE_RENDER_COMMAND(VoxelOceanClipmap)([Job, State = ClipState, Displace = DisplaceState, Cache = InputCache, Density, Edits,
         Shore = DensityInputs.Shore, Margin = DensityInputs.ShoreMarginCm, DepthFootprintCm = DensityInputs.DepthFootprintCm, LandCache = DensityInputs.LandCache,
-        DispResource, NormalResource, InfoResource, Foam](FRHICommandListImmediate& RHICmdList)
+        DispResource, NormalResource, WhitecapResource, InfoResource, Foam](FRHICommandListImmediate& RHICmdList)
         {
             FGlobalShaderMap* ShaderMap = GetGlobalShaderMap(GMaxRHIFeatureLevel);
             auto Has = [ShaderMap](FShaderType& Type) { return ShaderMap && ShaderMap->GetShader(&Type, 0).IsValid(); };
             FRHITexture* DispRHI = DispResource->TextureRHI;
             FRHITexture* NormalRHI = NormalResource->TextureRHI;
+            FRHITexture* WhitecapRHI = WhitecapResource->TextureRHI;
             FRHITexture* InfoRHI = InfoResource->TextureRHI;
-            if (!Has(FVoxelOceanClipWaveCS::GetStaticType()) || !Has(FVoxelOceanClipStaticCS::GetStaticType()) || !DispRHI || !NormalRHI || !InfoRHI)
+            if (!Has(FVoxelOceanClipWaveCS::GetStaticType()) || !Has(FVoxelOceanClipStaticCS::GetStaticType()) || !DispRHI || !NormalRHI || !WhitecapRHI || !InfoRHI)
             {
                 // Nothing written this frame: the game thread plans everything again.
                 State->bLost.store(true);
@@ -1811,11 +1821,12 @@ void FVoxelOceanPages::UpdateClipmap(const FVector& CameraPlanet, const FVoxelOc
             {
                 RDG_EVENT_SCOPE_STAT(GraphBuilder, VoxelOceanClipmap, "VoxelOceanClipmap");
                 // The textures kept between frames (made again for another size: then written whole).
-                const bool bNew = !State->Static.IsValid() || !State->DisplacementWork.IsValid() || !State->NormalWork.IsValid()
+                const bool bNew = !State->Static.IsValid() || !State->DisplacementWork.IsValid() || !State->NormalWork.IsValid() || !State->WhitecapWork.IsValid()
                     || State->Size != Size || State->Slots != Job->Slots;
                 FRDGTextureRef StaticTex;
                 FRDGTextureRef DispWork;
                 FRDGTextureRef NormalWork;
+                FRDGTextureRef WhitecapWork;
                 if (bNew)
                 {
                     StaticTex = GraphBuilder.CreateTexture(FRDGTextureDesc::Create2DArray(FIntPoint(Size, Size), PF_A32B32G32R32F, FClearValueBinding::Black,
@@ -1824,12 +1835,16 @@ void FVoxelOceanPages::UpdateClipmap(const FVector& CameraPlanet, const FVoxelOc
                         TexCreate_ShaderResource | TexCreate_UAV, Job->Slots), TEXT("Voxel.OceanClipDisplacementWork"));
                     NormalWork = GraphBuilder.CreateTexture(FRDGTextureDesc::Create2DArray(FIntPoint(Size, Size), PF_FloatRGBA, FClearValueBinding::Black,
                         TexCreate_ShaderResource | TexCreate_UAV, Job->Slots), TEXT("Voxel.OceanClipNormalWork"));
+                    WhitecapWork = GraphBuilder.CreateTexture(FRDGTextureDesc::Create2DArray(FIntPoint(Size, Size), PF_G16R16F, FClearValueBinding::Black,
+                        TexCreate_ShaderResource | TexCreate_UAV, Job->Slots), TEXT("Voxel.OceanClipWhitecapWork"));
                     AddClearUAVPass(GraphBuilder, GraphBuilder.CreateUAV(StaticTex), FVector4f(0.0f, 0.0f, 0.0f, 0.0f));
                     AddClearUAVPass(GraphBuilder, GraphBuilder.CreateUAV(DispWork), FVector4f(0.0f, 0.0f, 0.0f, 0.0f));
                     AddClearUAVPass(GraphBuilder, GraphBuilder.CreateUAV(NormalWork), FVector4f(0.0f, 0.0f, 0.0f, 0.0f));
+                    AddClearUAVPass(GraphBuilder, GraphBuilder.CreateUAV(WhitecapWork), FVector4f(0.0f, 0.0f, 0.0f, 0.0f));
                     State->Static = GraphBuilder.ConvertToExternalTexture(StaticTex);
                     State->DisplacementWork = GraphBuilder.ConvertToExternalTexture(DispWork);
                     State->NormalWork = GraphBuilder.ConvertToExternalTexture(NormalWork);
+                    State->WhitecapWork = GraphBuilder.ConvertToExternalTexture(WhitecapWork);
                     State->Size = Size;
                     State->Slots = Job->Slots;
                     // Planned only in part (the plan's slots outlived the textures): nothing shown
@@ -1847,6 +1862,7 @@ void FVoxelOceanPages::UpdateClipmap(const FVector& CameraPlanet, const FVoxelOc
                     StaticTex = GraphBuilder.RegisterExternalTexture(State->Static);
                     DispWork = GraphBuilder.RegisterExternalTexture(State->DisplacementWork);
                     NormalWork = GraphBuilder.RegisterExternalTexture(State->NormalWork);
+                    WhitecapWork = GraphBuilder.RegisterExternalTexture(State->WhitecapWork);
                 }
 
                 // The static layer's rectangles.
@@ -1914,6 +1930,7 @@ void FVoxelOceanPages::UpdateClipmap(const FVector& CameraPlanet, const FVoxelOc
                     P->ClipStatic = StaticTex;
                     P->ClipDisplacementOut = GraphBuilder.CreateUAV(DispWork);
                     P->ClipNormalOut = GraphBuilder.CreateUAV(NormalWork);
+                    P->ClipWhitecapOut = GraphBuilder.CreateUAV(WhitecapWork);
                     P->ClipInfoOut = GraphBuilder.CreateUAV(InfoWork);
                     P->ClipParams = W.Params;
                     P->ClipWave0 = W.Wave[0];
@@ -1946,10 +1963,12 @@ void FVoxelOceanPages::UpdateClipmap(const FVector& CameraPlanet, const FVoxelOc
                 // Into the textures the material and the vertices read: every slot.
                 FRDGTextureRef DispDest = RegisterExternalTexture(GraphBuilder, DispRHI, TEXT("Voxel.OceanClipDisplacement"));
                 FRDGTextureRef NormalDest = RegisterExternalTexture(GraphBuilder, NormalRHI, TEXT("Voxel.OceanClipNormal"));
+                FRDGTextureRef WhitecapDest = RegisterExternalTexture(GraphBuilder, WhitecapRHI, TEXT("Voxel.OceanClipWhitecap"));
                 FRDGTextureRef InfoDest = RegisterExternalTexture(GraphBuilder, InfoRHI, TEXT("Voxel.OceanClipInfo"));
                 const bool bArraysMatch = DispDest->Desc.Format == PF_A32B32G32R32F && NormalDest->Desc.Format == PF_FloatRGBA
                     && DispDest->Desc.Extent == FIntPoint(Size, Size) && NormalDest->Desc.Extent == FIntPoint(Size, Size)
-                    && (int32)DispDest->Desc.ArraySize >= Job->Slots && (int32)NormalDest->Desc.ArraySize >= Job->Slots;
+                    && (int32)DispDest->Desc.ArraySize >= Job->Slots && (int32)NormalDest->Desc.ArraySize >= Job->Slots
+                    && WhitecapDest->Desc.Format == PF_G16R16F && WhitecapDest->Desc.Extent == FIntPoint(Size, Size) && (int32)WhitecapDest->Desc.ArraySize >= Job->Slots;
                 if (bArraysMatch)
                 {
                     FRHICopyTextureInfo Copy;
@@ -1957,6 +1976,7 @@ void FVoxelOceanPages::UpdateClipmap(const FVector& CameraPlanet, const FVoxelOc
                     Copy.NumSlices = (uint32)Job->Slots;
                     AddCopyTexturePass(GraphBuilder, DispWork, DispDest, Copy);
                     AddCopyTexturePass(GraphBuilder, NormalWork, NormalDest, Copy);
+                    AddCopyTexturePass(GraphBuilder, WhitecapWork, WhitecapDest, Copy);
                 }
                 if (InfoDest->Desc.Format == PF_A32B32G32R32F && InfoDest->Desc.Extent == FIntPoint(VoxelOceanClipmap::InfoRows, 1))
                 {
@@ -1966,6 +1986,7 @@ void FVoxelOceanPages::UpdateClipmap(const FVector& CameraPlanet, const FVoxelOc
                 }
                 GraphBuilder.SetTextureAccessFinal(DispDest, ERHIAccess::SRVMask);
                 GraphBuilder.SetTextureAccessFinal(NormalDest, ERHIAccess::SRVMask);
+                GraphBuilder.SetTextureAccessFinal(WhitecapDest, ERHIAccess::SRVMask);
                 GraphBuilder.SetTextureAccessFinal(InfoDest, ERHIAccess::SRVMask);
                 // A destination of another shape (being made again): the vertices don't sample it.
                 if (!bArraysMatch)
@@ -1980,6 +2001,7 @@ void FVoxelOceanPages::UpdateClipmap(const FVector& CameraPlanet, const FVoxelOc
             for (int32 i = 0; i < VoxelOceanClipmap::InfoRows; i++) Displace->ClipRows[i] = Job->Rows[i];
             Displace->ClipDisplacement = DispRHI;
             Displace->ClipNormal = NormalRHI;
+            Displace->ClipWhitecap = WhitecapRHI;
             Displace->ClipInfo = InfoRHI;
             Displace->bClip = true;
             Displace->bRings = Job->bRings;

@@ -50,7 +50,8 @@ static TAutoConsoleVariable<int32> CVarVoxelOceanDebugSurf(
     TEXT("the shoaling (stage W3f): 15 the depth's contours (every 10 m), 16 where the surface folds over itself (white), ")
     TEXT("17 the first long band's horizontal gain (a third grey: none, white: 3x), 18 its height gain (half grey: none), ")
     TEXT("19 the second long band's horizontal gain, 20 the long bands shoaled as swell (white) or wind sea (black), ")
-    TEXT("21 the first long band's k d (white: 6, where its shoaling starts; black: unknown depth). With the ocean's own shading the view is drawn flat."),
+    TEXT("21 the first long band's k d (white: 6, where its shoaling starts; black: unknown depth); ")
+    TEXT("18 taken apart: 22 the shoaling on (white), 23 the gain from the depth (half grey: none), 24 the surf's keep, 25 the breaking cap, 26 the coast's fade. With the ocean's own shading the view is drawn flat."),
     ECVF_Default);
 
 static TAutoConsoleVariable<int32> CVarVoxelOceanFlipWinding(
@@ -921,7 +922,7 @@ void FVoxelOceanSurface::UpdateMaterial()
         Waves.Surf[1].Y = (float)FMath::Max(Inputs.Waves.SurfFoam, 0.0);
         Waves.Surf[1].Z = (float)FMath::Max(Inputs.Waves.FoamCoverage, 0.0);
         // The debug view (stage O9f; row 18 w).
-        Waves.Surf[2].W = (float)FMath::Clamp(CVarVoxelOceanDebugSurf.GetValueOnGameThread(), 0, 21);
+        Waves.Surf[2].W = (float)FMath::Clamp(CVarVoxelOceanDebugSurf.GetValueOnGameThread(), 0, 26);
         // The shore field's expansion around the selection camera (VoxelOceanShore.ush).
         WriteShoreFrame(Waves);
         // The shore field's texture once it exists (until then States.x is 0: no field).

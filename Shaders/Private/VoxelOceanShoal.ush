@@ -18,6 +18,8 @@
 //   0.78, the breaking index);
 // - the fade: within Fade metres of the coast (d / slope, the slope the shore field's) the bands
 //   fade out (0 by default since stage O9a: the surf's handover does it);
+// - the floor (stage W3g): no band keeps less than Floor of its height, at the shoreline and under
+//   the land too (no part of the mesh stands still);
 // - the handover (stage O9a, VoxelOceanSurf.ush): the long bands keep LongKeep of their amplitude
 //   near the coast, the surf trains carrying the rest (stage O9i: never under the FFT's floor,
 //   the coastal field's trains on top); applied before the breaking cap, so the short bands
@@ -54,6 +56,9 @@
 // k d past which a band is deep (tanh 6 = 1 - 1.2e-5).
 #define VOXEL_OCEAN_SHOAL_DEEP 6.0f
 #define VOXEL_OCEAN_SHOAL_MAX_GAIN 2.0f
+// The breaking cap and the coast's fade together under this make the shoaling act (above it the
+// waves are as in deep water to 1e-4).
+#define VOXEL_OCEAN_SHOAL_ACTIVE 0.9999f
 #define VOXEL_OCEAN_SHOAL_MAX_CHOP 2.5f
 // r - 1 at most (the wavelength shortened to a quarter).
 #define VOXEL_OCEAN_SHOAL_MAX_STRETCH 3.0f
@@ -160,6 +165,7 @@ struct FVoxelOceanShoalSettings
     float Fade;         // m
     float MinSlope;
     float LongKeep;     // the long bands' amplitude factor the surf leaves them (stage O9a; 1 without)
+    float Floor;        // the least share of its height a band keeps (stage W3g; 0: none)
 };
 
 VOXEL_FUNC FVoxelOceanShoalSettings VoxelOceanShoalSettingsOf(float4 States, float4 SlopeVar)
@@ -171,6 +177,7 @@ VOXEL_FUNC FVoxelOceanShoalSettings VoxelOceanShoalSettingsOf(float4 States, flo
     S.Fade = SlopeVar.x;
     S.MinSlope = max(SlopeVar.y, 1.0e-4f);
     S.LongKeep = 1.0f;
+    S.Floor = 0.0f;
     return S;
 }
 
@@ -183,6 +190,7 @@ struct FVoxelOceanShoal
     float4 Shift;       // m along Dir
     float3 Dir;         // toward the coast (planet frame, tangent, unit; zero without a field)
     float Active;       // 0: every band as in deep water (skip it all)
+    float4 Parts;       // the debug views' (stage W3f): band 0's gain from the depth, the surf's keep, the breaking cap, the fade
 };
 
 VOXEL_FUNC FVoxelOceanShoal VoxelOceanShoalNone()
@@ -194,6 +202,7 @@ VOXEL_FUNC FVoxelOceanShoal VoxelOceanShoalNone()
     S.Shift = float4(0.0f, 0.0f, 0.0f, 0.0f);
     S.Dir = float3(0.0f, 0.0f, 0.0f);
     S.Active = 0.0f;
+    S.Parts = float4(1.0f, 1.0f, 1.0f, 1.0f);
     return S;
 }
 
@@ -278,15 +287,20 @@ VOXEL_FUNC FVoxelOceanShoal VoxelOceanShoalOf(float DepthM, FVoxelOceanShoreSamp
             }
         }
     }
+    float4 Parts = float4(Amp[0], 1.0f, 1.0f, 1.0f);
     // The surf's handover (VoxelOceanSurf.ush): the long bands keep this much, before the cap
     // weighs them (the energy handed over has its own cap in the surf).
     if (S.LongKeep < 1.0f)
     {
         Amp[0] *= S.LongKeep;
         Amp[1] *= S.LongKeep;
+        Parts.y = S.LongKeep;
         bAny = true;
     }
-    if (!bAny) return Out;
+    // (Stage W3g: the cap and the fade are worked out before deciding whether anything shoals.
+    // Until then they were applied only where some band already felt the bottom, so the fade, a
+    // matter of the distance to the coast, switched on all at once at the depth where the longest
+    // band starts to shoal: a step in the waves' height along that depth's contour.)
     if (bDepth && DepthM > 0.0f)
     {
         // Breaking: Hs = 4 sqrt(sum (A sigma)^2) held under Breaking d, smoothly.
@@ -303,7 +317,23 @@ VOXEL_FUNC FVoxelOceanShoal VoxelOceanShoalOf(float DepthM, FVoxelOceanShoreSamp
         const float Fade = S.Fade > 0.0f ? smoothstep(0.0f, S.Fade, DepthM / Slope) : 1.0f;
         for (int Bc = 0; Bc < 4; Bc++)
             Amp[Bc] *= Cap * Fade;
+        Parts.z = Cap;
+        Parts.w = Fade;
+        if (Cap * Fade < VOXEL_OCEAN_SHOAL_ACTIVE) bAny = true;
     }
+    // The floor (stage W3g): no band's height falls under Floor of its own (the long bands' of what
+    // the surf leaves them), at the shoreline or under the land either. The mesh never stands
+    // still: a channel dug inland, or one narrower than the depth's smoothing, has waves at once
+    // (the terrain hides them elsewhere; the thin water's drop keeps them under the ground).
+    if (S.Floor > 0.0f && bAny)
+    {
+        for (int Bf = 0; Bf < 4; Bf++)
+        {
+            const float Least = S.Floor * (Bf < 2 ? min(S.LongKeep, 1.0f) : 1.0f);
+            Amp[Bf] = max(Amp[Bf], Least);
+        }
+    }
+    if (!bAny) return Out;
     // The warp along the unit direction, weighed by its squared length: where the field's
     // directions disagree (between two coasts, at the reach's edge, across a face blend) the
     // sample's direction shortens, and the warp, which moves the lookup by kilometres, fades
@@ -318,6 +348,7 @@ VOXEL_FUNC FVoxelOceanShoal VoxelOceanShoalOf(float DepthM, FVoxelOceanShoreSamp
     Out.Shift = float4(Shift[0] * Agree, Shift[1] * Agree, Shift[2] * Agree, Shift[3] * Agree);
     Out.Dir = DirLength > 1.0e-6f ? Shore.Direction * (1.0f / DirLength) : float3(0.0f, 0.0f, 0.0f);
     Out.Active = 1.0f;
+    Out.Parts = Parts;
     return Out;
 }
 

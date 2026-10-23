@@ -187,6 +187,34 @@ int main()
         Expect(Worst < 1.0e-3, "the water's light within 0.1% of the march");
     }
 
+    // -- The crest glow (stage W3h) --------------------------------------------------------------
+    // Against a march of single scattering along a straight path of the crest's thickness: E s p
+    // e^{-sigma x} dx from 0 to t, with the beam and the scattered light sharing the path's
+    // attenuation (a thin crest: in and out over the same t), the closed form's t e^{-sigma t} is
+    // the march's when sigma t is small, and the glow peaks at t = 1 / sigma; teal for clear water
+    // (red absorbed first).
+    {
+        double Worst = 0.0;
+        for (double Ext : { 2.0e-4, 7.0e-4, 4.5e-3 })
+            for (double T : { 10.0, 50.0, 150.0 })
+            {
+                const double Sca = 2.0e-4, Phase = 0.3, E = 100.0;
+                const double Shader = VoxelOceanCrestGlow((float)Sca, (float)Ext, (float)T, (float)Phase, (float)E);
+                const double Exact = E * Sca * Phase * T * std::exp(-Ext * T);
+                Worst = std::max(Worst, std::fabs(Shader - Exact) / Exact);
+            }
+        Expect(Worst < 1.0e-5, "the crest glow is E s p t e^(-sigma t)");
+        const float Peak = VoxelOceanCrestGlow(1.0e-4f, 0.01f, 100.0f, 1.0f, 1.0f);
+        Expect(Peak > VoxelOceanCrestGlow(1.0e-4f, 0.01f, 60.0f, 1.0f, 1.0f) && Peak > VoxelOceanCrestGlow(1.0e-4f, 0.01f, 160.0f, 1.0f, 1.0f),
+            "the glow peaks at the thickness 1 / sigma");
+        Expect(VoxelOceanCrestGlow(1.0e-4f, 0.01f, 0.0f, 1.0f, 1.0f) == 0.0f, "no glow without a crest");
+        // Clear water's extinction per cm (red, green, blue: 0.45, 0.07, 0.05 per m) at 150 cm.
+        const float Red = VoxelOceanCrestGlow(2.0e-4f, 4.5e-3f, 150.0f, 1.0f, 1.0f);
+        const float Green = VoxelOceanCrestGlow(2.0e-4f, 7.0e-4f, 150.0f, 1.0f, 1.0f);
+        Expect(Green > 1.5f * Red, "the glow is teal (red taken first)");
+        std::printf("crest glow: worst error %.2g; red / green at 150 cm %.2f\n", Worst, Red / Green);
+    }
+
     std::printf(Failures == 0 ? "shading_check: all passed\n" : "shading_check: %d failed\n", Failures);
     return Failures == 0 ? 0 : 1;
 }

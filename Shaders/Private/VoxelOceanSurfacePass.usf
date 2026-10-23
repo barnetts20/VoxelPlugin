@@ -24,6 +24,7 @@
 
 #include "/Engine/Private/Common.ush"
 #include "/Plugin/VoxelPlugin/Private/VoxelOceanPixelClip.ush"
+#include "/Plugin/VoxelPlugin/Private/VoxelOceanFoamTex.ush"
 #include "/Plugin/VoxelPlugin/Private/VoxelOceanShading.ush"
 
 #ifndef VOXEL_OCEAN_SURFACE_VELOCITY
@@ -100,6 +101,10 @@ Texture2DArray SurfaceClipNormal;
 SamplerState SurfaceClipSampler;
 Texture2D SurfaceClipInfo;
 uint SurfaceClipOn;
+// Stage W3h: the whitecaps' density per level (x).
+Texture2DArray SurfaceClipWhitecap;
+// Stage W3h: x the crest glow's strength (0 none), y the whitecaps' relief gain.
+float4 SurfaceCrest;
 
 // The water (per cm): scattering, extinction; the scattering phase's g.
 float3 SurfaceScattering;
@@ -116,6 +121,12 @@ float3 SurfaceSkyHorizon;
 // foam's albedo.
 float4 SurfaceShading;
 float3 SurfaceFoamAlbedo;
+// The foam's texture set (stage W3g; VoxelOceanFoamTex.ush), its quantiles' table, and x: 1 / its
+// tile (1/m), y: its mips, z: on (else the procedural lace).
+Texture2D SurfaceFoamSet;
+SamplerState SurfaceFoamSampler;
+Texture2D SurfaceFoamTable;
+float4 SurfaceFoamInfo;
 
 // The foam's look (stage W3f): its relief's height (cm, for its normal), how far the light wraps
 // round it (a thin scattering layer), its gaps' darkening, the thinnest foam's opacity.
@@ -123,6 +134,20 @@ float3 SurfaceFoamAlbedo;
 #define VOXEL_OCEAN_SURFACE_FOAM_WRAP 0.35f
 #define VOXEL_OCEAN_SURFACE_FOAM_GAPS 0.7f
 #define VOXEL_OCEAN_SURFACE_FOAM_THIN 0.55f
+// Stage W3g: the milky water under foam (the bubbles just under the surface), as a share of the
+// foam's own light at full density; the whitecaps' light over the lace's (denser, more of it
+// scattered back).
+#define VOXEL_OCEAN_SURFACE_FOAM_HAZE 0.3f
+#define VOXEL_OCEAN_SURFACE_WHITECAP_GAIN 1.15f
+// Stage W3h: the crest glow. A crest's thickness for the light through it: CREST_PATH (cm) at a
+// crest standing CREST_HEIGHT of the sea's height deviation over the mean, where the surface
+// slopes by CREST_SLOPE (sine) or more; less on a lower or flatter one.
+#define VOXEL_OCEAN_SURFACE_CREST_PATH 150.0f
+#define VOXEL_OCEAN_SURFACE_CREST_HEIGHT 2.0f
+#define VOXEL_OCEAN_SURFACE_CREST_SLOPE 0.35f
+// The glow's phase: broader than the water's single scattering (CREST_G against PhaseG), for the
+// light scattered more than once in a crest; seen over a wide cone round the sun's direction.
+#define VOXEL_OCEAN_SURFACE_CREST_G 0.45f
 
 // How a quantity rises along the surface (world axes, per cm), from its screen derivatives against
 // the point's (as VoxelOcean.ush's VoxelOceanBedRiseAt): zero at grazing views, where the solve
@@ -198,6 +223,8 @@ void SurfacePS(float4 SvPosition : SV_POSITION,
     float3 N = Up;
     float SlopeVariance = 0.0f;
     float Foam = 0.0f;
+    float Whitecap = 0.0f;
+    float Height = 0.0f;
     const FVoxelOceanWaveParams W = VoxelOceanMakeWaveParamsFFT(SurfaceParams, SurfaceWave0, SurfaceWave1, SurfaceWave2, SurfaceCenter, SurfaceShape,
         SurfaceFFT, SurfaceRefHigh, SurfaceRefLow, SurfaceRotation, SurfaceTiles, SurfaceStates, SurfaceSlopeVar);
     if (SurfaceClipOn != 0u)
@@ -208,6 +235,8 @@ void SurfacePS(float4 SvPosition : SV_POSITION,
         N = C.Normal;
         SlopeVariance = C.SlopeVariance;
         Foam = C.Foam;
+        Height = C.Height;
+        Whitecap = VoxelOceanPixelWhitecapOf(VoxelOceanRotateBack(W.Rotation, SamplePoint), Footprint, SurfaceClipWhitecap, SurfaceClipSampler, SurfaceClipInfo);
     }
     const float3 V = normalize(-Rel);
     // A resolved normal facing away from the eye (a wave's back seen at grazing) is turned just
@@ -293,8 +322,31 @@ void SurfacePS(float4 SvPosition : SV_POSITION,
         VoxelOceanWaterBody(SurfaceScattering.x, SurfaceExtinction.x, Path, MuView, MuSun, SunPhase, SunWater.x, SkyWater.x, Bed.x),
         VoxelOceanWaterBody(SurfaceScattering.y, SurfaceExtinction.y, Path, MuView, MuSun, SunPhase, SunWater.y, SkyWater.y, Bed.y),
         VoxelOceanWaterBody(SurfaceScattering.z, SurfaceExtinction.z, Path, MuView, MuSun, SunPhase, SunWater.z, SkyWater.z, Bed.z));
+    // The light through a thin crest (stage W3h; VoxelOceanCrestGlow): the sun behind a wave, through
+    // its crest toward the eye. The crest's thickness by its height over the mean (in the sea's own
+    // height deviation, from the point's sea state) and its slope.
+    float3 Glow = float3(0.0f, 0.0f, 0.0f);
+    if (SurfaceCrest.x > 0.0f && SunAbove > 0.0f && Height > 0.0f && W.FFT.x > 0.5f)
+    {
+        const int NC = max(int(W.FFT.y), 1);
+        const float3 UpP = VoxelOceanRotateBack(W.Rotation, Up);
+        const float4 Sigma = VoxelOceanFFTBandSigma(VoxelOceanSeaStateAt(SurfaceCharts, UpP, NC, W.Shape.y), SurfaceCharts, NC);
+        const float SigmaH = 100.0f * sqrt(max(dot(Sigma, Sigma), 1.0e-8f));
+        const float Rise = saturate(Height / (VOXEL_OCEAN_SURFACE_CREST_HEIGHT * SigmaH));
+        const float Slope = saturate(sqrt(max(1.0f - dot(N, Up) * dot(N, Up), 0.0f)) / VOXEL_OCEAN_SURFACE_CREST_SLOPE);
+        const float Thickness = VOXEL_OCEAN_SURFACE_CREST_PATH * Rise * Slope;
+        if (Thickness > 0.0f)
+        {
+            const float Phase = VoxelOceanPhaseHG(dot(-L, V), VOXEL_OCEAN_SURFACE_CREST_G);
+            const float3 E = SurfaceSunIlluminance * SunAbove;
+            Glow = SurfaceCrest.x * float3(
+                VoxelOceanCrestGlow(SurfaceScattering.x, SurfaceExtinction.x, Thickness, Phase, E.x),
+                VoxelOceanCrestGlow(SurfaceScattering.y, SurfaceExtinction.y, Thickness, Phase, E.y),
+                VoxelOceanCrestGlow(SurfaceScattering.z, SurfaceExtinction.z, Thickness, Phase, E.z));
+        }
+    }
     // Out through the surface: past its reflection, and radiance divides by n^2.
-    float3 Color = Reflected + Body * ((1.0f - Fresnel) / (VOXEL_OCEAN_WATER_IOR * VOXEL_OCEAN_WATER_IOR));
+    float3 Color = Reflected + (Body + Glow) * ((1.0f - Fresnel) / (VOXEL_OCEAN_WATER_IOR * VOXEL_OCEAN_WATER_IOR));
 
     // -- The foam on top (stage W3f) ------------------------------------------------------------------
     // Its structure for the density (VoxelOceanFoamLace.ush: where, inside the pixel's share, the
@@ -308,10 +360,18 @@ void SurfacePS(float4 SvPosition : SV_POSITION,
     Lace.Layer1 = 0.0f;
     Lace.Layer2 = 0.0f;
     Lace.Thick = 0.5f;
-    if (bFoam && Foam > 0.0f)
-        Lace = VoxelOceanPixelLaceOf(SamplePoint, Footprint, saturate(Foam), W, SurfaceCharts);
+    if (bFoam && (Foam > 0.0f || Whitecap > 0.0f))
+    {
+        if (SurfaceFoamInfo.z > 0.5f)
+            Lace = VoxelOceanPixelFoamTexOf(SamplePoint, Footprint, saturate(Foam), Whitecap, W, SurfaceCharts, SurfaceFoamSet, SurfaceFoamSampler, SurfaceFoamTable,
+                SurfaceFoamInfo);
+        else
+            Lace = VoxelOceanPixelLaceOf(SamplePoint, Footprint, saturate(Foam), W, SurfaceCharts);
+    }
     // (The derivatives outside the branch: every lane of the quad has its value.)
-    const float Relief = Lace.Foam * (0.5f + 0.5f * Lace.Thick);
+    // (Stage W3h: a whitecap stands higher, its billows SurfaceCrest.y times the lace's relief.)
+    const float WhitecapRelief = SurfaceFoamInfo.z > 0.5f ? saturate(Lace.Layer2) : 0.0f;
+    const float Relief = Lace.Foam * (0.5f + 0.5f * Lace.Thick) * (1.0f + max(SurfaceCrest.y - 1.0f, 0.0f) * WhitecapRelief);
     const float3 FoamRise = VoxelOceanSurfaceRiseOf(SamplePoint, Relief, Up);
     if (bFoam && Lace.Foam > 0.0f)
     {
@@ -319,9 +379,15 @@ void SurfacePS(float4 SvPosition : SV_POSITION,
         const float Wrap = saturate((dot(NF, L) + VOXEL_OCEAN_SURFACE_FOAM_WRAP) / (1.0f + VOXEL_OCEAN_SURFACE_FOAM_WRAP));
         const float Gaps = lerp(VOXEL_OCEAN_SURFACE_FOAM_GAPS, 1.0f, Lace.Thick);
         const float3 FoamLight = SurfaceFoamAlbedo * (SurfaceSunIlluminance * (SunAbove * Wrap) + SkyIrradiance * Gaps) * (1.0f / VOXEL_OCEAN_SHADING_PI);
-        // Thin foam (a wall's edge, a fading trail) lets some of the water through.
-        const float Opacity = Lace.Foam * lerp(VOXEL_OCEAN_SURFACE_FOAM_THIN, 1.0f, smoothstep(0.0f, 0.6f, Lace.Thick)) * lerp(0.8f, 1.0f, saturate(Foam));
-        Color = lerp(Color, FoamLight, saturate(Opacity));
+        // The milky water under it (stage W3g): by the density, where the foam itself doesn't cover.
+        Color = lerp(Color, FoamLight, VOXEL_OCEAN_SURFACE_FOAM_HAZE * saturate(Foam) * (1.0f - Lace.Foam));
+        // Thin foam (a wall's edge, a fading trail) lets some of the water through; a whitecap
+        // doesn't, and is brighter.
+        float Opacity = Lace.Foam * lerp(VOXEL_OCEAN_SURFACE_FOAM_THIN, 1.0f, smoothstep(0.0f, 0.6f, Lace.Thick)) * lerp(0.8f, 1.0f, saturate(Foam));
+        // (The procedural lace's third layer is its bubbles, not whitecaps.)
+        const float LaceWhitecap = SurfaceFoamInfo.z > 0.5f ? saturate(Lace.Layer2) : 0.0f;
+        Opacity = max(Opacity, LaceWhitecap);
+        Color = lerp(Color, FoamLight * lerp(1.0f, VOXEL_OCEAN_SURFACE_WHITECAP_GAIN, LaceWhitecap), saturate(Opacity));
     }
 
     // The foam's debug views (voxel.Ocean.DebugFoam): its density, its structure, the structure's
@@ -329,6 +395,7 @@ void SurfacePS(float4 SvPosition : SV_POSITION,
     const int DebugFoam = int(SurfaceShading.w + 0.5f);
     if (DebugFoam == 1) Color = saturate(Foam) * SkyIrradiance * (1.0f / VOXEL_OCEAN_SHADING_PI) + float3(1.0e-3f, 1.0e-3f, 1.0e-3f);
     else if (DebugFoam == 2) Color = Lace.Foam * SkyIrradiance * (1.0f / VOXEL_OCEAN_SHADING_PI) + float3(1.0e-3f, 1.0e-3f, 1.0e-3f);
+    else if (DebugFoam == 4) Color = saturate(Whitecap) * SkyIrradiance * (1.0f / VOXEL_OCEAN_SHADING_PI) + float3(1.0e-3f, 1.0e-3f, 1.0e-3f);
     else if (DebugFoam == 3) Color = float3(Lace.Layer0, Lace.Layer1, Lace.Layer2) * dot(SkyIrradiance, float3(0.3f, 0.6f, 0.1f)) * (1.0f / VOXEL_OCEAN_SHADING_PI);
     // The surf's and the shore's debug views (voxel.Ocean.DebugSurf, carried as the foam): flat
     // grey, not through the foam's structure or its light.

@@ -31,6 +31,7 @@ class UTexture2DArray;
 class AAdaptiveVoxelActor;
 class FVoxelUnderwaterViewExtension;
 class FVoxelOceanSurfacePass;
+struct FVoxelOceanFoamTexture;
 class UDirectionalLightComponent;
 struct FVoxelDensityGPUData;
 struct FVoxelOceanSurfaceInputs;
@@ -253,6 +254,11 @@ private:
     /** The ocean's own pass (stage W3): one per ocean, fed every tick while the rings draw for it. */
     TSharedPtr<FVoxelOceanSurfacePass, ESPMode::ThreadSafe> SurfacePass;
     bool bSurfacePassOn = false;
+    /** The foam's texture set (stage W3g; OceanSettings.FoamSet), read when its name changes. */
+    TSharedPtr<FVoxelOceanFoamTexture, ESPMode::ThreadSafe> FoamTexture;
+    FString FoamTextureName;
+    bool bFoamTextureTried = false;
+    bool bFoamTextureForFoam = false;
     /** The stand-in sun: the world's directional light (looked for again every second). */
     TWeakObjectPtr<UDirectionalLightComponent> SunLight;
     double SunLightSearchTime = -1.0e9;
