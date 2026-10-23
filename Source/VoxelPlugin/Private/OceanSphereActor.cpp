@@ -1175,6 +1175,8 @@ FVoxelOceanSurfaceInputs AOceanSphereActor::GatherInputs(const AAdaptiveVoxelAct
     Inputs.Waves.FineFoamAmount = S.FineFoamAmount;
     Inputs.Waves.UpdateRate = S.WaveUpdateRate;
     Inputs.Waves.FoamDetailLevels = S.FoamDetailLevels;
+    Inputs.Waves.SurfFoamLinger = S.SurfFoamLinger;
+    Inputs.Waves.FoamBreakup = S.FoamBreakup;
     Inputs.Waves.SurfFoam = S.bFoam ? S.SurfFoam : 0.0;
     // The field reaches the queries wherever it exists (a server builds it on the CPU, and has
     // no texture); its texture and the pages' cull only where it was made.

@@ -216,7 +216,7 @@ public:
      *  (VoxelOceanClip.usf, ClipFineFoamCS; 0: none, at most VoxelOceanClipmap::FineMaxLevels). */
     void UpdateClipmap(const FVector& CameraPlanet, const FVoxelOceanDisplaceFrame& Waves, FTextureResource* Foam,
         double OceanTime = 0.0, double FoamDecayPerSecond = 0.0, double FoamGrowthPerSecond = 0.0, bool bWavesStepped = true,
-        int32 FoamDetailLevels = 0);
+        int32 FoamDetailLevels = 0, double SurfFoamDecayPerSecond = 0.4, double FoamBreakup = 0.0);
 
     /** Game thread (stage W1). An edit's sphere (planet frame, cm) that the depths now carry (the
      *  surface's: once the terrain's edit data, and the land surface cache, hold it): the static

@@ -112,6 +112,18 @@ int main()
         const double R30 = RunPulse(30.0, 0.3, 0.7, 0.05, 8.0), R60 = RunPulse(60.0, 0.3, 0.7, 0.05, 8.0), R144 = RunPulse(144.0, 0.3, 0.7, 0.05, 8.0);
         const double Spread = std::max({ R30, R60, R144 }) - std::min({ R30, R60, R144 });
         Check(Spread < 0.03 * R60, "the same at 30, 60 and 144 Hz (a crest of 0.3 s, then 0.7 s: within 3%)", Spread / R60, 0.03);
+        // Stage W5a: the surf's foam a density with its own decay; the breakup.
+        {
+            const float KS = float(std::exp(-0.4 / 60.0));
+            float F = 0.0f;
+            for (int k = 0; k < 60 * 20; k++) F = VoxelOceanFoamStepSurf(F, 0.0f, 0.0f, 0.5f, 0.6f, KS, 1.0f);
+            Check(std::abs(F - 0.6f) < 1e-3f, "the surf's foam settles at its density (0.6), whatever the open sea's gain", F, 0.6);
+            float G = 0.6f;
+            for (int k = 0; k < 60 * 2; k++) G = VoxelOceanFoamStepSurf(G, 0.0f, 0.0f, 0.5f, 0.0f, KS, 1.0f);
+            Check(std::abs(G - 0.6f * std::exp(-0.8f)) < 1e-3f, "and lingers by its own decay (2.5 s: e^(-0.8) after 2 s)", G, 0.6f * std::exp(-0.8f));
+            Check(VoxelOceanFoamKeepAt(0.9f, 0.95f, 6.0f) == 0.9f && std::abs(VoxelOceanFoamKeepAt(0.9f, 1.2f, 6.0f) - std::pow(0.9f, 2.2f)) < 1e-6f,
+                "the breakup: a compressed texel's keep as it was, a stretched one's raised to 1 + 6 (J - 1)", VoxelOceanFoamKeepAt(0.9f, 1.2f, 6.0f), std::pow(0.9, 2.2));
+        }
     }
 
     // The emulated cascades: the runtime's layout at the waves' chop (0.9).

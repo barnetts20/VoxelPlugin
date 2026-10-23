@@ -64,7 +64,11 @@
 //
 // THE SETS: per wave a group factor 1 + 0.4 Sets cos(group phase), the group phase theta / GROUP
 // plus a 1.6 km noise, a 410 m noise drifting over 2 minutes on the heights (up to 30% either
-// way), and a 610 m noise on the phase (up to half a period either way). The noises' point comes as
+// way), and a 610 m noise on the phase (up to half a period either way). Stage W5a, THE PEAKS: a
+// 123 m noise drifting over 40 s on the heights (up to PEAKS either way) and a 164 m noise on the
+// phase (up to PEAK_JITTER of a period either way), so a crest saturates and breaks in sections
+// along its length, its line wavers, rather than all at once along the coast (real surf breaks in
+// peaks: crossing swells and short-crested groups). The noises' point comes as
 // whole units of 4096 cm and the rest (cm), exact to a fraction of a millimetre anywhere.
 //
 // FOAM (stages O9b, O9i): a bore makes white water on its face and leaves a trail behind its
@@ -136,6 +140,10 @@
 // The groups' weight per Sets; the heights' drift along the coast per Sets (either way).
 #define VOXEL_OCEAN_SURF_GROUP_WEIGHT 0.4f
 #define VOXEL_OCEAN_SURF_DRIFT 0.3f
+// Stage W5a: the peaks' share of the height (either way) and their phase's (of a period, either way),
+// per Sets.
+#define VOXEL_OCEAN_SURF_PEAKS 0.3f
+#define VOXEL_OCEAN_SURF_PEAK_JITTER 0.12f
 // The trains' deep height per significant height (root mean square: the long bands' energy).
 #define VOXEL_OCEAN_SURF_RMS 0.70710678f
 // The bores' height index per breaking index (a broken wave's height over the depth).
@@ -753,9 +761,15 @@ VOXEL_FUNC FVoxelOceanSurf VoxelOceanSurfOf(FVoxelOceanSurfInput In, FVoxelOcean
     // The sets' noises (cells of 40, 10 and 15 units: 1.6 km, 410 m, 610 m).
     const float GroupShift = VOXEL_OCEAN_SURF_TWO_PI * VoxelOceanSurfNoise2(In.Units, In.Low, 40, 0x51u, 0x2c9u).x;
     const float2 Drift = VoxelOceanSurfNoiseTime(In.Units, In.Low, 10, In.Time * (1.0f / 120.0f), 30u, 0x7a3u);
-    const float Jitter = VOXEL_OCEAN_SURF_TWO_PI * S.Sets * (VoxelOceanSurfNoise2(In.Units, In.Low, 15, 0x2c9u, 0x51u).x - 0.5f);
-    const float Height = Hs * (1.0f + VOXEL_OCEAN_SURF_DRIFT * S.Sets * (2.0f * Drift.x - 1.0f));
-    const float HeightRate = Hs * 2.0f * VOXEL_OCEAN_SURF_DRIFT * S.Sets * Drift.y * (1.0f / 120.0f);
+    // (Stage W5a: the peaks, 123 m over 40 s and 164 m.)
+    const float2 Peaks = VoxelOceanSurfNoiseTime(In.Units, In.Low, 3, In.Time * (1.0f / 40.0f), 90u, 0x3e1u);
+    const float Jitter = VOXEL_OCEAN_SURF_TWO_PI * S.Sets * (VoxelOceanSurfNoise2(In.Units, In.Low, 15, 0x2c9u, 0x51u).x - 0.5f
+        + 2.0f * VOXEL_OCEAN_SURF_PEAK_JITTER * (VoxelOceanSurfNoise2(In.Units, In.Low, 4, 0x6b7u, 0x1d3u).x - 0.5f));
+    const float DriftFactor = 1.0f + VOXEL_OCEAN_SURF_DRIFT * S.Sets * (2.0f * Drift.x - 1.0f);
+    const float PeakFactor = 1.0f + VOXEL_OCEAN_SURF_PEAKS * S.Sets * (2.0f * Peaks.x - 1.0f);
+    const float Height = Hs * DriftFactor * PeakFactor;
+    const float HeightRate = Hs * (2.0f * VOXEL_OCEAN_SURF_DRIFT * S.Sets * Drift.y * (1.0f / 120.0f) * PeakFactor
+        + DriftFactor * 2.0f * VOXEL_OCEAN_SURF_PEAKS * S.Sets * Peaks.y * (1.0f / 40.0f));
 
     // The trains.
     const float UpBeach = D < 0.0f ? -D / BedHeld : 0.0f;

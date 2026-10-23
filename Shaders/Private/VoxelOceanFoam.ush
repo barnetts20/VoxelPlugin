@@ -108,6 +108,28 @@ VOXEL_FUNC float VoxelOceanFoamStep(float Foam, float Source, float GrowDt, floa
     return clamp(Foam * Keep + max(Source, 0.0f) * GrowDt, 0.0f, VOXEL_OCEAN_FOAM_MAX);
 }
 
+// Stage W5a: THE SURF'S FOAM IN THE BUFFER is a density (the bores' white water, 0 to 1: its steady
+// state is itself, not the open sea's gain times it; at Godot's gain, about 26, the surf's trail and
+// carpet saturated the whole breaking zone white), with its own decay (white water lingers seconds
+// behind a bore; the open sea's whitecaps, Godot's 0.4 s at amount 8), the zone's share taking it.
+// THE BREAKUP: the foam fades faster where its water stretches (J over 1: the bubbles spread and
+// burst; foam thins where the surface diverges and gathers where it converges, as Crest's and the
+// real sea's do), so a trail breaks into the lacy patches of the short waves riding through it
+// instead of fading as one smooth sheet: each step's keep raised to 1 + Breakup (J - 1)+.
+VOXEL_FUNC float VoxelOceanFoamKeepAt(float Keep, float J, float Breakup)
+{
+    return pow(max(Keep, 1.0e-6f), 1.0f + max(Breakup, 0.0f) * max(J - 1.0f, 0.0f));
+}
+
+// One step with the surf apart (stage W5a): Open the open sea's source (its growth per unit GrowDt,
+// as VoxelOceanFoamStep), Surf the surf's foam density, KeepOpen and KeepSurf their steps' keeps
+// (VoxelOceanFoamKeepAt's), Zone the surf's breaking zone (0 to 1: whose decay the texel's is).
+VOXEL_FUNC float VoxelOceanFoamStepSurf(float Foam, float Open, float GrowDt, float KeepOpen, float Surf, float KeepSurf, float Zone)
+{
+    const float Keep = KeepOpen + (KeepSurf - KeepOpen) * clamp(Zone, 0.0f, 1.0f);
+    return clamp(Foam * Keep + max(Open, 0.0f) * GrowDt + max(Surf, 0.0f) * (1.0f - KeepSurf), 0.0f, VOXEL_OCEAN_FOAM_MAX);
+}
+
 // The rule's steady state under a constant source (Source Grow / Decay, at most 1): the fresh foam
 // where there is no buffer, a new texel's start, the whitecaps (the breaking now). FreshGain: Grow /
 // Decay.

@@ -692,9 +692,21 @@ struct VOXELPLUGIN_API FVoxelOceanSettings
 
     /** The surf's foam (0: none): the bores' white water, their short wake and the swash's foamy
      *  edge, fed into the same foam as the open sea's (stage W3v), so it builds and lingers there
-     *  as the crests' does. */
+     *  as the crests' does. Stage W5a: a density (1: a breaking face solid white), no longer times
+     *  the open sea's gain; the default 1 (was 0.5). */
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Foam", meta = (EditCondition = "bFoam", ClampMin = "0.0", UIMax = "2.0"))
-    double SurfFoam = 0.5;
+    double SurfFoam = 1.0;
+
+    /** How long the surf's white water lingers behind a bore (stage W5a; s, its fade's time
+     *  constant; the open sea's whitecaps fade by FoamAmount). */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Foam", meta = (EditCondition = "bFoam", ClampMin = "0.05", UIMax = "10.0"))
+    double SurfFoamLinger = 2.5;
+
+    /** How much faster foam fades where its water stretches (stage W5a; 0: evenly): trails break
+     *  into lacy patches along the short waves riding through them, as real foam gathers where the
+     *  surface converges and thins where it spreads, rather than fading as one smooth sheet. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Foam", meta = (EditCondition = "bFoam", ClampMin = "0.0", UIMax = "20.0"))
+    double FoamBreakup = 6.0;
 
     /** TileQuads snapped to 8, 16 or 32 and the other fields to their limits. */
     void Sanitize()
@@ -756,6 +768,8 @@ struct VOXELPLUGIN_API FVoxelOceanSettings
         FoamDetailLevels = FMath::Clamp(FoamDetailLevels, 0, 4);
         WaveUpdateRate = FMath::Max(WaveUpdateRate, 0.0);
         SurfFoam = FMath::Max(SurfFoam, 0.0);
+        SurfFoamLinger = FMath::Max(SurfFoamLinger, 0.05);
+        FoamBreakup = FMath::Max(FoamBreakup, 0.0);
         ShortWaveSlopeVariance = FMath::Max(ShortWaveSlopeVariance, 0.0f);
         Refraction = FMath::Max(Refraction, 0.0f);
         FoamTile = FMath::Max(FoamTile, 1.0f);

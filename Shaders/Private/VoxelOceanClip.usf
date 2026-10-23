@@ -43,6 +43,8 @@ RWTexture2DArray<float> ClipFoamHistory;
 Texture2DArray<float4> ClipWhitecapPrev;
 float4 ClipFoamStep[VOXEL_OCEAN_CLIP_MAX_LEVELS];
 uint ClipFoamHistoryOn;
+// Stage W5a: x the surf's foam's decay (per second), y the breakup (VoxelOceanFoam.ush).
+float4 ClipFoamSurf;
 RWTexture2D<float4> ClipInfoOut;
 
 // The material's wave parameters for this frame (FVoxelOceanSurface::UpdateMaterial's), from the
@@ -194,13 +196,16 @@ void ClipWaveCS(uint3 Id : SV_DispatchThreadID)
     // Godot's smoothstep; the whitecaps, the breaking now.
     const float4 Row16 = ClipCharts.Load(int3(VoxelOceanConstantsX(max(int(W.FFT.y), 1)), 16, 0));
     const float FreshGain = max(Row16.x, 0.0f);
-    const float Source = OpenSource + SurfFoam;
-    float Foam = VoxelOceanFoamFresh(Source, FreshGain);
+    // (Stage W5a: the surf's foam a density, with its own decay; the keeps by the water's stretch.)
+    float Foam = min(VoxelOceanFoamFresh(OpenSource, FreshGain) + SurfFoam, VOXEL_OCEAN_FOAM_MAX);
     if (ClipFoamHistoryOn != 0u)
     {
         const float Prev = ClipFoamHistory[C];
         const float4 Step = ClipFoamStep[Index];
-        if (Prev >= 0.0f) Foam = VoxelOceanFoamStep(Prev, Source, Step.z, Step.y);
+        const float J = W.FFT.x > 0.5f ? Out.Jacobian : 1.0f;
+        const float KeepOpen = VoxelOceanFoamKeepAt(Step.y, J, ClipFoamSurf.y);
+        const float KeepSurf = VoxelOceanFoamKeepAt(exp(-Step.x * max(ClipFoamSurf.x, 0.0f)), J, ClipFoamSurf.y);
+        if (Prev >= 0.0f) Foam = VoxelOceanFoamStepSurf(Prev, OpenSource, Step.z, KeepOpen, SurfFoam, KeepSurf, SurfZone);
         ClipFoamHistory[C] = Foam;
     }
     // (Stage W3w: with the fine foam, the shortest band's own, added as Godot sums its cascades'.)
@@ -232,7 +237,7 @@ void ClipWaveCS(uint3 Id : SV_DispatchThreadID)
 
 float4 FineWindow;              // the level's window: the camera in it (its texels), its spacing (cm)
 int4 FineWindowMod;             // its origin mod Size, its slot, its index (the fine slice)
-float4 FineStep;                // x e^(-Decay dt), y the growth per unit of source over dt, z the factor
+float4 FineStep;                // x e^(-Decay dt), y the growth per unit of source over dt, z the factor, w the breakup (stage W5a)
 int4 FineRect0;                 // window texels (x, y, width, height; width 0: none) new since its last step
 int4 FineRect1;
 uint FineWhole;                 // 1: the whole level is new
@@ -270,7 +275,9 @@ void ClipFineFoamCS(uint3 Id : SV_DispatchThreadID)
         max(FineCoarseWhitecap.Load(int4(CoarseAt.x, (CoarseAt.y + Step.y) % Size, Slot, 0)).w,
             FineCoarseWhitecap.Load(int4((CoarseAt.x + Step.x) % Size, (CoarseAt.y + Step.y) % Size, Slot, 0)).w));
     float Source = 0.0f;
-    if (ClipFFT.x > 0.5f && Mean > 1.0e-5f)
+    float J = 1.0f;
+    // (Stage W5a: where foam lingers too, for the breakup's stretch.)
+    if (ClipFFT.x > 0.5f && (Mean > 1.0e-5f || (FineStep.w > 0.0f && Prev > 0.01f)))
     {
         const FVoxelOceanWaveParams W = VoxelOceanMakeWaveParamsFFT(ClipParams, ClipWave0, ClipWave1, ClipWave2, ClipCenter, ClipShape, ClipFFT,
             ClipRefHigh, ClipRefLow, ClipRotation, ClipTiles, ClipStates, ClipSlopeVar);
@@ -283,6 +290,7 @@ void ClipFineFoamCS(uint3 Id : SV_DispatchThreadID)
             ClipDisplacement, ClipDisplacementSampler, ClipDerivatives, ClipDerivativesSampler, ClipCharts, ClipFoam, ClipFoamSampler,
             2u | (ClipFoamOn != 0u ? VOXEL_OCEAN_LOOKUP_FOAM : 0u));
         Source = Pt.FoamSource * (1.0f - saturate(Caps.z));
+        J = Pt.R.Jacobian;
     }
-    FineHistory[At] = VoxelOceanFoamStep(Prev, Source, FineStep.y, FineStep.x);
+    FineHistory[At] = VoxelOceanFoamStep(Prev, Source, FineStep.y, VoxelOceanFoamKeepAt(FineStep.x, J, FineStep.w));
 }

@@ -337,7 +337,9 @@ int main()
             const double X = (0.1 + 0.1 * i) / 0.02;
             const FVoxelOceanSurf A = VoxelOceanSurfOf(Input(Beach, X, VOXEL_OCEAN_SURF_WRAP - 0.001f), S);
             const FVoxelOceanSurf B = VoxelOceanSurfOf(Input(Beach, X, 0.0f), S);
-            Wrap = std::max(Wrap, std::abs(double(A.Height) - B.Height - 0.001 * A.Rate));
+            // (A is 1 ms before B: A + 1 ms of its rate is B. Stage W5a: the sign was wrong, a bound
+            // of 2 ms of the rate that the taller peaks passed.)
+            Wrap = std::max(Wrap, std::abs(double(A.Height) - B.Height + 0.001 * A.Rate));
         }
         Check(Wrap < 0.003, "across the clock's wrap", Wrap, 0.003);
     }

@@ -367,6 +367,7 @@ BEGIN_SHADER_PARAMETER_STRUCT(FVoxelOceanClipWaveParameters, )
     SHADER_PARAMETER_RDG_TEXTURE(Texture2DArray<float4>, ClipWhitecapPrev)
     SHADER_PARAMETER_ARRAY(FVector4f, ClipFoamStep, [VoxelOceanClipmap::MaxLevels])
     SHADER_PARAMETER(uint32, ClipFoamHistoryOn)
+    SHADER_PARAMETER(FVector4f, ClipFoamSurf)
     SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2D<float4>, ClipInfoOut)
     SHADER_PARAMETER(FVector4f, ClipParams)
     SHADER_PARAMETER(FVector4f, ClipWave0)
@@ -1697,7 +1698,8 @@ void FVoxelOceanPages::SetClipmap(const FVoxelOceanClipSettings& InSettings)
 }
 
 void FVoxelOceanPages::UpdateClipmap(const FVector& CameraPlanet, const FVoxelOceanDisplaceFrame& Waves, FTextureResource* Foam,
-    double OceanTime, double FoamDecayPerSecond, double FoamGrowthPerSecond, bool bWavesStepped, int32 FoamDetailLevels)
+    double OceanTime, double FoamDecayPerSecond, double FoamGrowthPerSecond, bool bWavesStepped, int32 FoamDetailLevels,
+    double SurfFoamDecayPerSecond, double FoamBreakup)
 {
     // (Aliased: UE has a global FFrame.)
     using namespace VoxelOceanClipmap;
@@ -1853,6 +1855,9 @@ void FVoxelOceanPages::UpdateClipmap(const FVector& CameraPlanet, const FVoxelOc
         double FoamDecay = 0.0;
         double FoamGrowth = 0.0;
         int32 FoamShift[MaxLevels] = {};
+        /** Stage W5a: the surf's foam's decay (per second) and the foam's breakup. */
+        double SurfFoamDecay = 0.4;
+        double FoamBreakup = 0.0;
         /** Stage W4c: the foam's fine history: its levels (the first FineCount in use), and those
          *  stepped this frame with the window strips new to them since their last step. */
         int32 FineCount = 0;
@@ -1888,6 +1893,8 @@ void FVoxelOceanPages::UpdateClipmap(const FVector& CameraPlanet, const FVoxelOc
     Job->OceanTime = OceanTime;
     Job->FoamDecay = FMath::Max(FoamDecayPerSecond, 0.0);
     Job->FoamGrowth = FMath::Max(FoamGrowthPerSecond, 0.0);
+    Job->SurfFoamDecay = FMath::Max(SurfFoamDecayPerSecond, 0.0);
+    Job->FoamBreakup = FMath::Max(FoamBreakup, 0.0);
     for (int32 i = 0; i < MaxLevels; i++) Job->FoamShift[i] = FMath::Clamp(Shift[i], 0, 64);
     // Stage W4c: the foam's fine history: every level each wave step (stage W4d: W4c stepped one a
     // step in turn, 12.5 Hz each, and the foam moved in visible increments), any whose window moved
@@ -2160,6 +2167,7 @@ void FVoxelOceanPages::UpdateClipmap(const FVector& CameraPlanet, const FVoxelOc
                     for (int32 i = 0; i < VoxelOceanClipmap::MaxLevels; i++) P->ClipFoamStep[i] = FoamStep[i];
                     // (Its neighbours from the last frame's copy: only where that copy is this shape.)
                     P->ClipFoamHistoryOn = bHistoryStep ? 1u : 0u;
+                    P->ClipFoamSurf = FVector4f((float)Job->SurfFoamDecay, (float)Job->FoamBreakup, 0.0f, 0.0f);
                     P->ClipInfoOut = GraphBuilder.CreateUAV(InfoWork);
                     P->ClipParams = W.Params;
                     P->ClipWave0 = W.Wave[0];
@@ -2233,7 +2241,7 @@ void FVoxelOceanPages::UpdateClipmap(const FVector& CameraPlanet, const FVoxelOc
                         for (int32 i = 0; i < VoxelOceanClipmap::InfoRows; i++) P->ClipInfoRows[i] = Job->Rows[i];
                         P->FineWindow = Job->Window[Level];
                         P->FineWindowMod = FIntVector4(Job->WindowMod[Level].X, Job->WindowMod[Level].Y, FMath::RoundToInt(Job->Window[Level].W), Level);
-                        P->FineStep = FVector4f((float)Keep, (float)GrowDt, (float)VoxelOceanClipmap::FineFactor, 0.0f);
+                        P->FineStep = FVector4f((float)Keep, (float)GrowDt, (float)VoxelOceanClipmap::FineFactor, (float)Job->FoamBreakup);
                         auto RectOf = [](const VoxelOceanClipmap::FRect& R) { return FIntVector4(R.I0, R.J0, R.IsEmpty() ? 0 : R.Width, R.Height); };
                         P->FineRect0 = RectOf(Step.Rect[0]);
                         P->FineRect1 = RectOf(Step.Rect[1]);
