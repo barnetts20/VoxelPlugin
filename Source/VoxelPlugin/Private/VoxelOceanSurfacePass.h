@@ -68,6 +68,15 @@ struct FVoxelOceanShadingParams
     float FoamOpacity = 1.0f;
     float FoamThinOpacity = 0.55f;
     float FoamFalloff = 0.6f;
+    /** Stage W3t: the foam drawn as its smooth density (1; stage W3v: GodotOceanWaves' look) rather
+     *  than through its texture's cover (0). */
+    float FoamSoftness = 1.0f;
+    /** Stage W3u: the foam per pixel near the camera (as GodotOceanWaves: the cascades' own foam and
+     *  whitecaps at each pixel; 0: the wave clipmap's), how far from the camera it reaches (m), and
+     *  the waves' and the clipmap's lookups as cubic B-splines where their texels are magnified. */
+    float FoamDetail = 1.0f;
+    float FoamDetailDistanceM = 250.0f;
+    bool bCubicFiltering = true;
     /** The foam's texture set (stage W3g; null or not ready: the procedural lace) and its tile (m). */
     TSharedPtr<FVoxelOceanFoamTexture, ESPMode::ThreadSafe> FoamTexture;
     float FoamTileM = 12.0f;

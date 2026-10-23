@@ -1,39 +1,32 @@
-// VoxelOceanFoam.ush - Open-water foam (Design/OceanWaves.md sections 6 and 15; stage O9b). Shared
-// subset (VoxelShaderCompat.h): the FFT's assembly (VoxelOceanFFT.usf) runs the per-slot step, the
-// wave hook (VoxelOceanWaves.ush) the per-point combination, the checks both.
+// VoxelOceanFoam.ush - The ocean's foam (stage W3v; Design/OceanWaves.md section 47): GodotOceanWaves'
+// foam (2Retr0, its fft_unpack.glsl, water.gdshader and wave_generator.gd; Tessendorf's foam), run
+// where a clipmap ocean runs it (Crest: a foam simulation on the wave clipmap's levels). Shared
+// subset (VoxelShaderCompat.h): the wave clipmap's step (VoxelOceanClip.usf), the waves' evaluation
+// (VoxelOceanWaves.ush: the fresh foam without a history), the own pass (VoxelOceanPixelClip.ush,
+// VoxelOceanSurfacePass.usf) and the checks (Tools/OceanHarness/foam_check.cpp) run it.
 //
-// PER SLOT (in each slot's texture space, every frame): the slot's own area ratio J = (1 + Dxx)
-// (1 + Dyy) - Dxy^2, measured at the calibration's chop VOXEL_OCEAN_FOAM_CHOP whatever the waves'
-// (so the foam doesn't depend on the chop), against its spread: the compression c = (1 - J) /
-// sigma_J, sigma_J = VOXEL_OCEAN_FOAM_CHOP sqrt(the slot's slope variance) (the linear part of
-// J - 1 is the chop times the displacement's divergence, whose variance is the slope variance).
-// The slot keeps the envelope of c: Z = max(c, Z - dt / Decay), so where a crest compressed the
-// surface Z stays high and falls one sigma per Decay seconds as the crest moves on (the FFT's
-// waves don't travel in texture space: they rise and fall in place as their phases turn): the
-// trails. Z is continuous and nearly Gaussian (unlike the foam itself, which is sparse), so it
-// blends and mips as the waves do: the texture holds (Z, Z^2), whose mips give each texel's mean
-// and the variance within it.
+// THE RULE (Godot's, per texel and frame): where the surface is compressed past the whitecap
+// threshold (its area ratio J = det(I + chop grad D) under Whitecap), foam grows by how far past it
+// is; everywhere it decays exponentially; it stays within 0 and 1 / 0.75:
+//   dFoam/dt = max(Whitecap - J, 0) Grow - Decay Foam,
+// integrated exactly over each step (Godot adds Grow dt and multiplies by e^(-Decay dt): the same to
+// first order, but its steady state moves with the frame rate; this one's doesn't):
+//   Foam' = Foam e^(-Decay dt) + Source (Grow / Decay) (1 - e^(-Decay dt)),
+// with Godot's rates from its one handle, the foam amount A (wave_generator.gd): Grow = 7.5 A and
+// Decay = 1.15 max(0.5, 10 - A) per second. A crest breaking again and again builds a patch that
+// thins as it fades; a single one leaves a trail.
+// DRAWN (water.gdshader): smoothstep(0, 1, 0.75 Foam), the share of the surface white.
 //
-// PER POINT (the pixel shader; VoxelOceanFoamOf): the slots' Z looked up as their waves are (the
-// same charts, sea states, detiling copies and warp), each lookup's deviation from its slot's mean
-// (the last mip) weighed as the waves are (the long bands' sea states normalised, the short
-// bands' amplitude scale left out: the steepness below carries both), with the variance the
-// lookup leaves unresolved (its mip's). Per band: the deviations summed (Dev), the unresolved
-// variances by the squared weights (Res), the band's own spread (Sigma). The bands are weighed by
-// their steepness (the slope deviation at the point's sea state, the long bands' times the share
-// the surf leaves them), as their compressions add in the summed surface's J, and standardised:
-// the long bands' L, the short bands' Sh, each about N(0, 1). The short bands aren't detiled (as
-// the waves), so they shape the foam only where the long bands nearly make it (their whitecaps
-// would repeat every tile otherwise): S = L + KAPPA g Sh, g rising from 0 to 1 over GATE sigma
-// below the threshold. The foam is the share of the footprint above the threshold T, through the
-// variance the mips leave unresolved: Phi((S - T) / sqrt(Res + EDGE^2)), so near the camera a
-// whitecap's edge is EDGE sigma soft, and far away (S at its mean, Res its whole variance) the
-// foam is the expected coverage instead of vanishing.
-//
-// THE THRESHOLD: the coverage of whitecaps grows as U^3.41 (Monahan and O'Muircheartaigh 1980);
-// here half as much again (the trails), 1.48% at 10 m/s, 4.7% at 14, 11% at 18, none below 3 m/s,
-// times the coverage setting. T is the standard normal's quantile of that share, corrected for
-// the envelope's skew where foam is rare (calibrated on the emulated cascades, foam_check).
+// WHERE (unlike Godot): Godot keeps the foam in each cascade's own tile, from that cascade's own J:
+// its cascades each hold the whole spectrum from their tile down, so each one's J is nearly the
+// surface's. Ours split the spectrum into four bands of wavelength (each holds its own, so their sum
+// is the sea): a band's J alone seldom comes near the threshold (on the emulated cascades under 1%
+// of any band's texels fall under 0.75, against a few percent of the summed surface's; foam_check),
+// and where it does it isn't where the sea's crests break. So the rule runs on the wave clipmap's levels
+// (world space: the composed sea's J at each texel, as Crest's foam does), the surf's breaking fed
+// into the same buffer (the bores' faces, their short wake and the swash's edge: Source below).
+// Without a buffer (the material without the clipmap, the underwater pass), the fresh foam: the
+// rule's steady state for the compression now, Source Grow / Decay.
 
 #ifndef VOXEL_OCEAN_FOAM_USH
 #define VOXEL_OCEAN_FOAM_USH
@@ -42,248 +35,56 @@
 #define VOXEL_FUNC
 #endif
 
-// The chop the compression is measured at (the calibration's).
-#define VOXEL_OCEAN_FOAM_CHOP 0.9f
-// The envelope's range (sigma_J).
-#define VOXEL_OCEAN_FOAM_LOW (-6.0f)
-#define VOXEL_OCEAN_FOAM_HIGH 8.0f
-// The coverage at 10 m/s and its growth with the wind (a power).
-#define VOXEL_OCEAN_FOAM_COVER_AT10 0.0148f
-#define VOXEL_OCEAN_FOAM_COVER_POWER 3.41f
-// The short bands' share in the foam's shape, the gate's width below the threshold (sigma), a
-// whitecap's edge near the camera (sigma).
-#define VOXEL_OCEAN_FOAM_KAPPA 0.7f
-#define VOXEL_OCEAN_FOAM_GATE 1.0f
-#define VOXEL_OCEAN_FOAM_EDGE 0.15f
-// The quantile's correction where foam is rare (sigma), and over which coverages it goes.
-#define VOXEL_OCEAN_FOAM_SKEW 0.22f
-#define VOXEL_OCEAN_FOAM_SKEW_LOW 0.015f
-#define VOXEL_OCEAN_FOAM_SKEW_HIGH 0.05f
-// No threshold (no foam).
-#define VOXEL_OCEAN_FOAM_NONE 1.0e30f
-// Stage W3f: the density's ramp (sigma): from none to solid over this much of the envelope, so a
-// trail thins out over about this many decay times (its envelope falls a sigma per decay).
-#define VOXEL_OCEAN_FOAM_RAMP 1.2f
-// The footprints (cm) over which the short bands' part of the foam fades out.
-#define VOXEL_OCEAN_FOAM_SHORT_NEAR 100.0f
-#define VOXEL_OCEAN_FOAM_SHORT_FAR 500.0f
+// Godot's gain on the foam before its smoothstep (water.gdshader's foam_factor).
+#define VOXEL_OCEAN_FOAM_GAIN 0.75f
+// Godot's rates per unit of the foam amount (wave_generator.gd: foam_grow_rate, foam_decay_rate).
+#define VOXEL_OCEAN_FOAM_GROW_PER_AMOUNT 7.5f
+#define VOXEL_OCEAN_FOAM_DECAY_SCALE 1.15f
+#define VOXEL_OCEAN_FOAM_DECAY_FROM 10.0f
+#define VOXEL_OCEAN_FOAM_DECAY_LEAST 0.5f
+// The most foam a texel holds: 1 / GAIN, so foam built up all the way draws solid. (Godot clamps
+// each cascade's foam to 1 and sums its foamy cascades, which reach past 1 / 0.75 together; ours is
+// one buffer.)
+#define VOXEL_OCEAN_FOAM_MAX (1.0f / VOXEL_OCEAN_FOAM_GAIN)
 
-// A slot's compression at a texel: its area ratio J (at VOXEL_OCEAN_FOAM_CHOP), its spread sigma_J.
-VOXEL_FUNC float VoxelOceanFoamCompression(float J, float SigmaJ)
+// The rule's rates (per second) for a foam amount (Godot's 0 to 10).
+VOXEL_FUNC float VoxelOceanFoamGrowRate(float Amount)
 {
-    return clamp((1.0f - J) / max(SigmaJ, 1.0e-6f), VOXEL_OCEAN_FOAM_LOW, VOXEL_OCEAN_FOAM_HIGH);
+    return VOXEL_OCEAN_FOAM_GROW_PER_AMOUNT * max(Amount, 0.0f);
 }
 
-// One frame's step of the envelope: Z before, the compression now, the fall (dt / Decay).
-VOXEL_FUNC float VoxelOceanFoamStep(float Before, float Compression, float Fall)
+VOXEL_FUNC float VoxelOceanFoamDecayRate(float Amount)
 {
-    return max(Compression, max(Before - Fall, VOXEL_OCEAN_FOAM_LOW));
+    return VOXEL_OCEAN_FOAM_DECAY_SCALE * max(VOXEL_OCEAN_FOAM_DECAY_LEAST, VOXEL_OCEAN_FOAM_DECAY_FROM - max(Amount, 0.0f));
 }
 
-// The standard normal's upper quantile: x with P(X > x) = P, for P in (0, 0.5] (Abramowitz and
-// Stegun 26.2.23; within 5e-4).
-VOXEL_FUNC float VoxelOceanFoamQuantile(float P)
+// The compression past the threshold (Godot's foam_factor before its rate): J the area ratio.
+VOXEL_FUNC float VoxelOceanFoamSource(float J, float Whitecap)
 {
-    const float T = sqrt(-2.0f * 0.693147181f * log2(clamp(P, 1.0e-12f, 0.5f)));
-    return T - (2.515517f + T * (0.802853f + T * 0.010328f)) / (1.0f + T * (1.432788f + T * (0.189269f + T * 0.001308f)));
+    return max(Whitecap - J, 0.0f);
 }
 
-// The standard normal's distribution function, P(X < x) (the logistic approximation, within 0.01).
-VOXEL_FUNC float VoxelOceanFoamNormal(float X)
+// One step: Keep = e^(-Decay dt), GrowDt = (Grow / Decay) (1 - Keep) (the exact step's growth per
+// unit of source; Grow dt to first order, Godot's); Source the open sea's compression past the
+// threshold plus the surf's foam (0 to 1). Within 0 and VOXEL_OCEAN_FOAM_MAX.
+VOXEL_FUNC float VoxelOceanFoamStep(float Foam, float Source, float GrowDt, float Keep)
 {
-    return 1.0f / (1.0f + exp(-1.702f * X));
+    return clamp(Foam * Keep + max(Source, 0.0f) * GrowDt, 0.0f, VOXEL_OCEAN_FOAM_MAX);
 }
 
-// The standard normal's upper tail, P(X > x) (Abramowitz and Stegun 7.1.26 for erfc; within 2e-7).
-VOXEL_FUNC float VoxelOceanFoamTail(float X)
+// The rule's steady state under a constant source (Source Grow / Decay, at most 1): the fresh foam
+// where there is no buffer, a new texel's start, the whitecaps (the breaking now). FreshGain: Grow /
+// Decay.
+VOXEL_FUNC float VoxelOceanFoamFresh(float Source, float FreshGain)
 {
-    const float Z = abs(X) * 0.707106781f;
-    const float T = 1.0f / (1.0f + 0.3275911f * Z);
-    const float Erfc = T * (0.254829592f + T * (-0.284496736f + T * (1.421413741f + T * (-1.453152027f + T * 1.061405429f)))) * exp(-Z * Z);
-    return X >= 0.0f ? 0.5f * Erfc : 1.0f - 0.5f * Erfc;
+    return clamp(max(Source, 0.0f) * FreshGain, 0.0f, VOXEL_OCEAN_FOAM_MAX);
 }
 
-// The standard normal's partial expectation past x, E[max(X - x, 0)] = phi(x) - x P(X > x).
-VOXEL_FUNC float VoxelOceanFoamExcess(float X)
+// The drawn foam (0 to 1): Godot's smoothstep(0, 1, 0.75 Foam).
+VOXEL_FUNC float VoxelOceanFoamDrawn(float Foam)
 {
-    return max(0.398942280f * exp(-0.5f * X * X) - X * VoxelOceanFoamTail(X), 0.0f);
-}
-
-// The mean of the ramp from Lo to Lo + Ramp (0 below, 1 above) over X ~ N(S, Sigma^2).
-VOXEL_FUNC float VoxelOceanFoamRampMean(float S, float Sigma, float Lo, float Ramp)
-{
-    const float Sg = max(Sigma, 1.0e-4f);
-    return saturate((Sg / Ramp) * (VoxelOceanFoamExcess((Lo - S) / Sg) - VoxelOceanFoamExcess((Lo + Ramp - S) / Sg)));
-}
-
-// The ramp's start (sigma) whose mean over a standard normal is the share P (two Newton steps from
-// the ramp centred on P's quantile: E' = (P(X > Lo + Ramp) - P(X > Lo)) / Ramp).
-VOXEL_FUNC float VoxelOceanFoamRampStart(float P)
-{
-    float Lo = VoxelOceanFoamQuantile(min(P, 0.45f)) - 0.5f * VOXEL_OCEAN_FOAM_RAMP;
-    for (int K = 0; K < 2; K++)
-    {
-        const float F = VoxelOceanFoamRampMean(0.0f, 1.0f, Lo, VOXEL_OCEAN_FOAM_RAMP) - P;
-        const float D = (VoxelOceanFoamTail(Lo + VOXEL_OCEAN_FOAM_RAMP) - VoxelOceanFoamTail(Lo)) * (1.0f / VOXEL_OCEAN_FOAM_RAMP);
-        if (D < -1.0e-6f) Lo -= F / D;
-    }
-    return Lo;
-}
-
-// The ramp's start for a ramp Ramp sigma wide (as VoxelOceanFoamRampStart).
-VOXEL_FUNC float VoxelOceanFoamRampStartOf(float P, float Ramp)
-{
-    float Lo = VoxelOceanFoamQuantile(min(P, 0.45f)) - 0.5f * Ramp;
-    for (int K = 0; K < 2; K++)
-    {
-        const float F = VoxelOceanFoamRampMean(0.0f, 1.0f, Lo, Ramp) - P;
-        const float D = (VoxelOceanFoamTail(Lo + Ramp) - VoxelOceanFoamTail(Lo)) * (1.0f / Ramp);
-        if (D < -1.0e-6f) Lo -= F / D;
-    }
-    return Lo;
-}
-
-// The share of the sea whitecaps cover at a wind (m/s) and the coverage setting (1 as calibrated).
-// Stage W3i: the power law levels off toward VOXEL_OCEAN_FOAM_COVER_MAX in very high winds (P = p /
-// sqrt(1 + (p / max)^2): within 4% of the law to 20 m/s, 29% at 25 m/s where the law gives 34%, a
-// half at 35 m/s where it gives all of it; the law's data reach about 25 m/s, and measured coverage
-// grows more slowly past gale force).
-#define VOXEL_OCEAN_FOAM_COVER_MAX 0.6f
-VOXEL_FUNC float VoxelOceanFoamCoverage(float Wind, float Coverage)
-{
-    if (Coverage <= 0.0f || Wind <= 2.5f) return 0.0f;
-    const float Calm = smoothstep(2.5f, 4.5f, Wind);
-    const float P = VOXEL_OCEAN_FOAM_COVER_AT10 * exp(VOXEL_OCEAN_FOAM_COVER_POWER * 0.693147181f * log2(Wind * 0.1f)) * Calm;
-    const float R = P * (1.0f / VOXEL_OCEAN_FOAM_COVER_MAX);
-    return P / sqrt(1.0f + R * R) * Coverage;
-}
-
-// The threshold (sigma) for that coverage; VOXEL_OCEAN_FOAM_NONE: none.
-VOXEL_FUNC float VoxelOceanFoamThreshold(float Wind, float Coverage)
-{
-    const float P = VoxelOceanFoamCoverage(Wind, Coverage);
-    if (P < 1.0e-7f) return VOXEL_OCEAN_FOAM_NONE;
-    const float Q = min(P, 0.45f);
-    return VoxelOceanFoamQuantile(Q) + VOXEL_OCEAN_FOAM_SKEW * (1.0f - smoothstep(VOXEL_OCEAN_FOAM_SKEW_LOW, VOXEL_OCEAN_FOAM_SKEW_HIGH, Q));
-}
-
-// A point's lookups, per band (x to w: bands 0 to 3): the weighed deviations from the slots' means,
-// the variance they leave unresolved, the bands' own spread (their slots' by the normalised
-// weights), their steepness; the long and the short groups' squared weights summed (the charts'
-// and the headings' blends).
-struct FVoxelOceanFoamBands
-{
-    float4 Dev;
-    float4 Res;
-    float4 Sigma;
-    float4 Steep;
-    float LongWeight2;
-    float ShortWeight2;
-};
-
-VOXEL_FUNC FVoxelOceanFoamBands VoxelOceanFoamBandsZero()
-{
-    FVoxelOceanFoamBands B;
-    B.Dev = float4(0.0f, 0.0f, 0.0f, 0.0f);
-    B.Res = float4(0.0f, 0.0f, 0.0f, 0.0f);
-    B.Sigma = float4(0.0f, 0.0f, 0.0f, 0.0f);
-    B.Steep = float4(0.0f, 0.0f, 0.0f, 0.0f);
-    B.LongWeight2 = 0.0f;
-    B.ShortWeight2 = 0.0f;
-    return B;
-}
-
-// The open sea's foam density at a point (0 to 1: the share of the surface the foam covers; stage
-// W3f): its bands, the wind (m/s), the coverage setting, how much of their part the short bands keep
-// (0 to 1: they aren't detiled, so they fade out with the footprint before their tiles repeat).
-//
-// THE DENSITY (stage W3f). Not the share of the footprint above a threshold (a whitecap all or
-// nothing within a few hundredths of a sigma) but a ramp over VOXEL_OCEAN_FOAM_RAMP sigma of the
-// envelope: solid in a fresh crest, thinning as the trail's envelope falls, so the foam's
-// structure (VoxelOceanFoamLace.ush) can show it dissolving. The ramp sits where its mean over the
-// sea is the calibrated coverage (VoxelOceanFoamRampStart; the threshold's skew correction kept),
-// and the unresolved variance is integrated through it (VoxelOceanFoamRampMean): far away the
-// density is the expected share, as before.
-VOXEL_FUNC float VoxelOceanFoamDensityOf(FVoxelOceanFoamBands B, float Wind, float Coverage, float ShortKeep)
-{
-    const float T = VoxelOceanFoamThreshold(Wind, Coverage);
-    if (T >= VOXEL_OCEAN_FOAM_NONE) return 0.0f;
-    // The long bands standardised (their spread, the blends' weights).
-    const float S0 = B.Steep.x * B.Sigma.x;
-    const float S1 = B.Steep.y * B.Sigma.y;
-    const float NL = (S0 * S0 + S1 * S1) * B.LongWeight2;
-    if (NL <= 1.0e-12f) return 0.0f;
-    const float InvNL = 1.0f / NL;
-    const float L = (B.Steep.x * B.Dev.x + B.Steep.y * B.Dev.y) * sqrt(InvNL);
-    const float ResL = (B.Steep.x * B.Steep.x * B.Res.x + B.Steep.y * B.Steep.y * B.Res.y) * InvNL;
-    // The short bands, the same, where the long bands nearly make foam.
-    float S = L;
-    float Res = ResL;
-    const float S2 = B.Steep.z * B.Sigma.z;
-    const float S3 = B.Steep.w * B.Sigma.w;
-    const float NS = (S2 * S2 + S3 * S3) * B.ShortWeight2;
-    const float Gate = saturate((L - T + VOXEL_OCEAN_FOAM_GATE) * (1.0f / VOXEL_OCEAN_FOAM_GATE));
-    if (NS > 1.0e-12f && Gate > 0.0f)
-    {
-        const float InvNS = 1.0f / NS;
-        const float Sh = (B.Steep.z * B.Dev.z + B.Steep.w * B.Dev.w) * sqrt(InvNS);
-        const float ResS = (B.Steep.z * B.Steep.z * B.Res.z + B.Steep.w * B.Steep.w * B.Res.w) * InvNS;
-        // Their faded part (stage W3f) stays as unresolved variance (Sh is about N(0, 1)), so the
-        // threshold's calibration (with them) holds and the mean doesn't change as they fade.
-        const float KFull = VOXEL_OCEAN_FOAM_KAPPA * Gate;
-        const float K = KFull * saturate(ShortKeep);
-        S += K * Sh;
-        Res += K * K * ResS + (KFull * KFull - K * K);
-    }
-    // The ramp, placed for the coverage: the threshold's skew correction (T less the plain quantile)
-    // moves it as it moves the threshold.
-    const float P = VoxelOceanFoamCoverage(Wind, Coverage);
-    const float Lo = VoxelOceanFoamRampStart(P) + (T - VoxelOceanFoamQuantile(min(P, 0.45f)));
-    return VoxelOceanFoamRampMean(S, sqrt(max(Res, 0.0f) + VOXEL_OCEAN_FOAM_EDGE * VOXEL_OCEAN_FOAM_EDGE), Lo, VOXEL_OCEAN_FOAM_RAMP);
-}
-
-// The same with the short bands' full part.
-VOXEL_FUNC float VoxelOceanFoamOf(FVoxelOceanFoamBands B, float Wind, float Coverage)
-{
-    return VoxelOceanFoamDensityOf(B, Wind, Coverage, 1.0f);
-}
-
-// THE WHITECAPS (stage W3h). The foam above is the envelope of the compression: it peaks at a
-// crest and lingers behind it for its decay (the trails, the lace). A whitecap is the breaking
-// itself, happening now: on the crest, moving with it. So it comes from the summed surface's own
-// area ratio J at the point (every band together, at the waves' chop), not from the envelope:
-// c = (1 - J) / sigma, sigma = chop sqrt(the bands' slope variance) (the linear part of 1 - J is
-// the chop times the displacement's divergence, whose variance is the slope variance), about
-// N(0, 1) over the sea; what the point's footprint doesn't resolve (the slope variance it leaves
-// out, as a share of the whole) is integrated through the ramp, as the foam's unresolved variance
-// is, so far away the whitecaps' density is their expected share. The share: VOXEL_OCEAN_WHITECAP_
-// SHARE of the foam's calibrated coverage (the active stage of a whitecap, before its trail: about
-// a third of all of it, Monahan's stage A against A + B), ramping from none to solid over
-// VOXEL_OCEAN_WHITECAP_RAMP sigma (a fresh crest solid at its peak compression), placed for that
-// share (VoxelOceanFoamRampStartOf) and moved for the summed J's tail, lighter than a normal's: on
-// the emulated cascades (foam_check) its upper quantiles fall short of the normal's by about
-// VOXEL_OCEAN_WHITECAP_TAIL (z - VOXEL_OCEAN_WHITECAP_TAIL_FROM) at the normal's z (0.07 at 3%,
-// 0.15 at 1%, 0.28 at 0.1%, the same from 7 to 18 m/s; the ramp's own width takes up part of
-// it), for the part the footprint resolves (unresolved, the spread is integrated as a normal's).
-#define VOXEL_OCEAN_WHITECAP_SHARE 0.3f
-#define VOXEL_OCEAN_WHITECAP_RAMP 0.8f
-#define VOXEL_OCEAN_WHITECAP_TAIL 0.12f
-#define VOXEL_OCEAN_WHITECAP_TAIL_FROM 1.5f
-
-// The whitecaps' density at a point (0 to 1): the surface's area ratio J there, the bands' slope
-// variance (the whole, and the part the footprint leaves out), the waves' chop, the wind (m/s),
-// the coverage setting.
-VOXEL_FUNC float VoxelOceanWhitecapOf(float J, float SlopeVar, float Unresolved, float Chop, float Wind, float Coverage)
-{
-    const float P = VOXEL_OCEAN_WHITECAP_SHARE * VoxelOceanFoamCoverage(Wind, Coverage);
-    if (P < 1.0e-7f || Chop <= 0.0f || SlopeVar <= 1.0e-12f) return 0.0f;
-    const float C = (1.0f - J) / (Chop * sqrt(SlopeVar));
-    const float Res = clamp(Unresolved / SlopeVar, 0.0f, 1.0f);
-    const float Z = VoxelOceanFoamQuantile(min(P, 0.45f));
-    // (The tail's correction for the resolved part: unresolved, the spread is integrated as a
-    // normal's, whose share the ramp is placed for.)
-    const float Lo = VoxelOceanFoamRampStartOf(P, VOXEL_OCEAN_WHITECAP_RAMP) - (1.0f - Res) * VOXEL_OCEAN_WHITECAP_TAIL * max(Z - VOXEL_OCEAN_WHITECAP_TAIL_FROM, 0.0f);
-    return VoxelOceanFoamRampMean(C, sqrt(Res + VOXEL_OCEAN_FOAM_EDGE * VOXEL_OCEAN_FOAM_EDGE), Lo, VOXEL_OCEAN_WHITECAP_RAMP);
+    const float X = clamp(VOXEL_OCEAN_FOAM_GAIN * Foam, 0.0f, 1.0f);
+    return X * X * (3.0f - 2.0f * X);
 }
 
 #endif // VOXEL_OCEAN_FOAM_USH

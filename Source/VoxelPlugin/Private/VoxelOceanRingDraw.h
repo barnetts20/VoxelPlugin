@@ -34,6 +34,8 @@ struct FVoxelOceanRingDrawFrame
     FRHITexture* Displacement = nullptr;
     FRHITexture* Derivatives = nullptr;
     FRHITexture* Charts = nullptr;
+    /** Stage W3u: the cascades' foam envelopes (null: none). */
+    FRHITexture* Foam = nullptr;
     /** The wave clipmap's textures, when it ran this frame (bClip). */
     bool bClip = false;
     FRHITexture* ClipDisplacement = nullptr;

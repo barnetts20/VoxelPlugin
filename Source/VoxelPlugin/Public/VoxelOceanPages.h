@@ -110,6 +110,9 @@ struct FVoxelOceanDisplaceFrame
     FTextureResource* Derivatives = nullptr;
     FTextureResource* Charts = nullptr;
     FTextureResource* Shore = nullptr;
+    /** Stage W3u: the cascades' foam envelopes (VoxelOceanCascades' foam texture; null: none), for
+     *  the ocean's own pass's foam per pixel. */
+    FTextureResource* Foam = nullptr;
 };
 
 /** The wave clipmap (stages O9k, W1; VoxelOceanClip.ush, VoxelOceanClipmap.h): the composed sea
@@ -200,7 +203,10 @@ public:
      *  the selection camera (planet frame) evaluated with Waves (the material's parameters and
      *  textures) and the open sea's foam texture; their beds sampled again where they moved or the
      *  terrain changed. */
-    void UpdateClipmap(const FVector& CameraPlanet, const FVoxelOceanDisplaceFrame& Waves, FTextureResource* Foam);
+    /** OceanTime: the ocean's clock (s); FoamDecayPerSecond and FoamGrowthPerSecond: the foam's
+     *  rates (stage W3v, VoxelOceanFoam.ush: GodotOceanWaves' rule; a decay of 0: no foam buffer). */
+    void UpdateClipmap(const FVector& CameraPlanet, const FVoxelOceanDisplaceFrame& Waves, FTextureResource* Foam,
+        double OceanTime = 0.0, double FoamDecayPerSecond = 0.0, double FoamGrowthPerSecond = 0.0);
 
     /** Game thread (stage W1). An edit's sphere (planet frame, cm) that the depths now carry (the
      *  surface's: once the terrain's edit data, and the land surface cache, hold it): the static

@@ -49,9 +49,10 @@ namespace VoxelOceanWavesFFTDetail
             (float)FMath::Clamp(Settings.ShoreWaveFloor, 0.0, 1.0), 0.0f);
         Row0 = VoxelShader::float4((float)FMath::Max(Settings.SurfStrength, 0.0), (float)FMath::Clamp(Settings.SurfSets, 0.0, 1.0),
             (float)FMath::Max(Settings.SurfSwash, 0.0), (float)FMath::Clamp(Settings.SurfSkew, 0.0, 0.95));
-        // (Stage W3h: x the waves' chop, for the whitecaps' compression.)
-        Row1 = VoxelShader::float4((float)FMath::Max(Settings.Chop, 0.0), (float)FMath::Max(Settings.SurfFoam, 0.0),
-            (float)FMath::Max(Settings.FoamCoverage, 0.0), (float)FMath::Max(Settings.SurfSwashReach, 1.0));
+        // (Stage W3v: x the foam's fresh gain, z its whitecap threshold, both written live by the
+        // surface, VoxelOceanFoam.ush.)
+        Row1 = VoxelShader::float4(0.0f, (float)FMath::Max(Settings.SurfFoam, 0.0), (float)FMath::Clamp(Settings.FoamWhitecap, 0.0, 1.0),
+            (float)FMath::Max(Settings.SurfSwashReach, 1.0));
     }
 
     /** The surf's clock: the ocean clock modulo its wrap (the trains' periods divide it). */
@@ -99,9 +100,8 @@ FVoxelOceanWavesFFT::FVoxelOceanWavesFFT(const FVoxelOceanFFTSettings& InSetting
         const FBandStats Stats = StatsOf(Slots[Slot]);
         SlotSigma[Slot] = FMath::Sqrt(Stats.HeightVariance);
         SlotSlope[Slot] = FMath::Sqrt(Stats.SlopeVarianceX + Stats.SlopeVarianceY);
-        // The foam's spread of the slot's area ratio (VoxelOceanFoam.ush): the calibration's chop
-        // times the slope's.
-        SlotTable[Slot].B[2] = (float)(VOXEL_OCEAN_FOAM_CHOP * SlotSlope[Slot]);
+        // (Stage W3v: unused; the retired per-slot foam's spread.)
+        SlotTable[Slot].B[2] = 0.0f;
     }
     // The table's constants: the slope deviations, and the short bands' height deviation at
     // each knot against their reference's.

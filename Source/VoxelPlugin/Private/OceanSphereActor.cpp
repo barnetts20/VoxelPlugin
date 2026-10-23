@@ -497,6 +497,10 @@ void AOceanSphereActor::UpdateSurfacePass()
     Params.FoamOpacity = S.FoamOpacity;
     Params.FoamThinOpacity = S.FoamThinOpacity;
     Params.FoamFalloff = S.FoamFalloff;
+    Params.FoamSoftness = S.FoamSoftness;
+    Params.FoamDetail = S.FoamDetail;
+    Params.FoamDetailDistanceM = S.FoamDetailDistance;
+    Params.bCubicFiltering = S.bCubicFiltering;
     if (Params.SprayAmount > 0.0f && bHasCamera)
     {
         FVector Wind, Swell;
@@ -1150,9 +1154,9 @@ FVoxelOceanSurfaceInputs AOceanSphereActor::GatherInputs(const AAdaptiveVoxelAct
     Inputs.ShoreDetail.Detail = S.ShoreDetail;
     Inputs.ShoreDetail.BandM = S.ShoreDetailBand;
     Inputs.ShoreDetail.ReachM = S.ShoreDetailReach;
-    // The foam (stage O9b): a decay of 0 makes none.
-    Inputs.Waves.FoamDecay = S.bFoam ? S.FoamDecay : 0.0;
-    Inputs.Waves.FoamCoverage = S.bFoam ? S.FoamCoverage : 0.0;
+    // The foam (stage W3v): a whitecap threshold of 0 makes none.
+    Inputs.Waves.FoamWhitecap = S.bFoam ? S.FoamWhitecap : 0.0;
+    Inputs.Waves.FoamAmount = S.FoamAmount;
     Inputs.Waves.SurfFoam = S.bFoam ? S.SurfFoam : 0.0;
     // The field reaches the queries wherever it exists (a server builds it on the CPU, and has
     // no texture); its texture and the pages' cull only where it was made.

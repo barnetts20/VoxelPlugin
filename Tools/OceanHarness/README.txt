@@ -24,6 +24,10 @@ Ocean harnesses (stages O1-O4, O6a, O6b, O7, O8, O9a-O9c). Plain C++20; no engin
   spray_check.cpp           W3o: the spray's maths (VoxelOceanSpray.ush): the exact step, terminal speeds,
                             trajectories, birth rates, the look, a storm's budget against the ring
       g++ -O2 -std=c++20 -I<plugin>/Source/VoxelPlugin/Public -I<plugin>/Shaders/Private spray_check.cpp -o spray_check
+  cubic_check.cpp           W3u: the cubic B-spline lookups' taps (VoxelOceanCubic.ush): four bilinear taps
+                            against the 16-texel sum (wrapped too), the weights, a ramp reproduced, C2
+                            across texel edges, the share toward the cubic by magnification
+      g++ -O2 -std=c++20 -I<plugin>/Source/VoxelPlugin/Public -I<plugin>/Shaders/Private cubic_check.cpp -o cubic_check
   eq_check.cpp              W3k: the wave equalizer: its gain against a double reference, the GPU slot
                             table's unpacking bit for bit, the statistics' scaling, the emulated field
       g++ -O2 -std=c++20 -ffp-contract=off -I<plugin>/Source/VoxelPlugin/Public -I<plugin>/Source/VoxelPlugin/Private

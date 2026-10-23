@@ -162,6 +162,31 @@ struct VOXELPLUGIN_API FVoxelOceanSettings
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Shading", meta = (EditCondition = "bOwnShading", ClampMin = "0.0", ClampMax = "1.0"))
     float FoamOpacity = 1.0f;
 
+    /** The foam's look (stage W3v): 1, GodotOceanWaves' (its smooth density mixed over the water,
+     *  lit flat with a soft sheen); 0, through the foam texture's lace (crisp patches lit through
+     *  their relief, as before W3t); or between. The amount of foam is the same either way. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Shading", meta = (EditCondition = "bOwnShading", ClampMin = "0.0", ClampMax = "1.0"))
+    float FoamSoftness = 1.0f;
+
+    /** The foam's detail near the camera (stage W3u, as GodotOceanWaves draws its foam): 1, the
+     *  waves' own foam and whitecaps looked up at every pixel (from the wave cascades, a few
+     *  centimetres a texel), where the wave clipmap's texels (20 cm to over a metre) would span
+     *  several pixels and show as blocks; 0, the clipmap's (as before W3u). */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Shading", meta = (EditCondition = "bOwnShading", ClampMin = "0.0", ClampMax = "1.0"))
+    float FoamDetail = 1.0f;
+
+    /** How far from the camera the foam's per-pixel detail reaches (m; stage W3u). Past it (fading
+     *  over its last 30%), the clipmap's foam, which resolves the pixels there anyway. It costs a
+     *  second look at the wave cascades per pixel within it. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Shading", AdvancedDisplay, meta = (EditCondition = "bOwnShading", ClampMin = "10.0", UIMax = "1000.0"))
+    float FoamDetailDistance = 250.0f;
+
+    /** Cubic filtering of the waves' textures where the pixels are finer than their texels (stage
+     *  W3u, as GodotOceanWaves' bicubic lookups): smooth slopes, whitecaps and foam close up instead
+     *  of facets and blocks. Four lookups instead of one there. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Shading", AdvancedDisplay, meta = (EditCondition = "bOwnShading"))
+    bool bCubicFiltering = true;
+
     /** How opaque the foam's thinnest parts are (its edges, fading trails) against its solid
      *  middles (stage W3s). */
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Shading", meta = (EditCondition = "bOwnShading", ClampMin = "0.0", ClampMax = "1.0"))
@@ -589,17 +614,22 @@ struct VOXELPLUGIN_API FVoxelOceanSettings
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Foam")
     bool bFoam = true;
 
-    /** How much of the open sea foams, as a multiple of the calibrated whitecap coverage (0.4% at
-     *  7 m/s, 1.5% at 10, 4.7% at 14, 11% at 18 m/s, none below 3 m/s). 0: none. */
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Foam", meta = (EditCondition = "bFoam", ClampMin = "0.0", UIMax = "8.0"))
-    double FoamCoverage = 1.0;
+    /** Where the sea foams (stage W3v; GodotOceanWaves' "whitecap"): the surface's area ratio J
+     *  (1 flat, lower where a crest squeezes it) under which foam builds, by how far under. Higher:
+     *  more foam, from gentler crests. Our J is the whole surface's (Godot's each cascade's), so the
+     *  same look sits higher than Godot's 0.5: 0.75 foams about 2 to 3% of the sea at 10 m/s. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Foam", meta = (EditCondition = "bFoam", ClampMin = "0.0", ClampMax = "1.0"))
+    double FoamWhitecap = 0.75;
 
-    /** How long a whitecap's trail lingers (s): the foam's envelope falls one standard deviation
-     *  in this time, so a strong whitecap's trail lasts about this long, a weak one's less. */
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Foam", meta = (EditCondition = "bFoam", ClampMin = "0.1", UIMax = "10.0"))
-    double FoamDecay = 2.5;
+    /** How much foam builds and how long it lasts (stage W3v; GodotOceanWaves' "foam amount", 0 to
+     *  10): foam grows at 7.5 x this per second while the surface is squeezed and decays at 1.15 x
+     *  (10 - this) per second (at least 0.575): higher, denser patches and longer trails. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Foam", meta = (EditCondition = "bFoam", ClampMin = "0.0", UIMax = "10.0"))
+    double FoamAmount = 8.0;
 
-    /** The surf's foam: the bores' white water and trails, the swash's foamy edge (0: none). */
+    /** The surf's foam (0: none): the bores' white water, their short wake and the swash's foamy
+     *  edge, fed into the same foam as the open sea's (stage W3v), so it builds and lingers there
+     *  as the crests' does. */
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Foam", meta = (EditCondition = "bFoam", ClampMin = "0.0", UIMax = "2.0"))
     double SurfFoam = 1.0;
 
@@ -655,8 +685,8 @@ struct VOXELPLUGIN_API FVoxelOceanSettings
         SurfSkew = FMath::Clamp(SurfSkew, 0.0, 0.95);
         SurfCutoff = FMath::Clamp(SurfCutoff, 0.0, 0.5);
         SurfFFTFloor = FMath::Clamp(SurfFFTFloor, 0.0, 1.0);
-        FoamCoverage = FMath::Max(FoamCoverage, 0.0);
-        FoamDecay = FMath::Max(FoamDecay, 0.1);
+        FoamWhitecap = FMath::Clamp(FoamWhitecap, 0.0, 1.0);
+        FoamAmount = FMath::Max(FoamAmount, 0.0);
         SurfFoam = FMath::Max(SurfFoam, 0.0);
         ShortWaveSlopeVariance = FMath::Max(ShortWaveSlopeVariance, 0.0f);
         Refraction = FMath::Max(Refraction, 0.0f);
@@ -675,6 +705,9 @@ struct VOXELPLUGIN_API FVoxelOceanSettings
         FoamOpacity = FMath::Clamp(FoamOpacity, 0.0f, 1.0f);
         FoamThinOpacity = FMath::Clamp(FoamThinOpacity, 0.0f, 1.0f);
         FoamFalloff = FMath::Clamp(FoamFalloff, 0.01f, 1.0f);
+        FoamSoftness = FMath::Clamp(FoamSoftness, 0.0f, 1.0f);
+        FoamDetail = FMath::Clamp(FoamDetail, 0.0f, 1.0f);
+        FoamDetailDistance = FMath::Max(FoamDetailDistance, 10.0f);
     }
 
     /** The fields whose change rebuilds the surface. */

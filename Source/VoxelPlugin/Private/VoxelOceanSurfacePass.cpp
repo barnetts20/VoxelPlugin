@@ -22,7 +22,7 @@ DECLARE_GPU_STAT(VoxelOceanSurface);
 
 static TAutoConsoleVariable<int32> CVarVoxelOceanDebugFoam(
     TEXT("voxel.Ocean.DebugFoam"), 0,
-    TEXT("The ocean's own pass (stage W3f): 1 the foam's density (grey), 2 its structure (the lace drawn for the density), 3 the structure's layers (with a foam set, stage W3g: red the lace, green the streaks, blue the whitecaps; with the procedural lace: red the streaks, green the lace, blue the bubbles), 4 the whitecaps' density (stage W3h: the breaking now). 0 off."),
+    TEXT("The ocean's own pass (stage W3f): 1 the foam's density (grey), 2 its structure (the lace drawn for the density), 3 the structure's layers (with a foam set, stage W3g: red the lace, green the streaks, blue the whitecaps; with the procedural lace: red the streaks, green the lace, blue the bubbles), 4 the whitecaps' density (stage W3h: the breaking now), 5 where the foam is the pixel's own (stage W3u: green, FoamDetail) or the wave clipmap's (red). 0 off."),
     ECVF_RenderThreadSafe);
 
 namespace VoxelOceanSurfacePassDetail
@@ -100,6 +100,9 @@ BEGIN_SHADER_PARAMETER_STRUCT(FVoxelOceanSurfaceParameters, )
     SHADER_PARAMETER_TEXTURE(Texture2D, SurfaceClipInfo)
     SHADER_PARAMETER(uint32, SurfaceClipOn)
     SHADER_PARAMETER_TEXTURE(Texture2DArray, SurfaceClipWhitecap)
+    SHADER_PARAMETER_TEXTURE(Texture2DArray, SurfaceCascadeFoam)
+    SHADER_PARAMETER_SAMPLER(SamplerState, SurfaceCascadeFoamSampler)
+    SHADER_PARAMETER(FVector4f, SurfacePixelFoam)
     SHADER_PARAMETER(FVector4f, SurfaceCrest)
     SHADER_PARAMETER(FVector3f, SurfaceScattering)
     SHADER_PARAMETER(FVector3f, SurfaceExtinction)
@@ -468,6 +471,14 @@ void FVoxelOceanSurfacePass::Render_RenderThread(FPostOpaqueRenderParameters& Pa
     P->SurfaceCrest = FVector4f(FMath::Max(Params.CrestGlow, 0.0f), FMath::Max(Params.WhitecapRelief, 1.0f),
         FMath::Max(Params.IntersectionFoam, 0.0f), FMath::Max(Params.IntersectionFoamWidthM, 0.1f) * 100.0f);
     P->SurfaceClipWhitecap = Rings.bClip && Rings.ClipWhitecap ? Rings.ClipWhitecap : GBlackArrayTexture->TextureRHI.GetReference();
+    // Stage W3u: the foam per pixel near the camera; x its strength, y its reach (cm), z foam on, w the
+    // cubic filtering. (Stage W3v: the cascades' foam texture is no longer read; bound for the
+    // evaluation's signature.)
+    const bool bCascadeFoam = bFFT && Params.bFoam;
+    P->SurfaceCascadeFoam = Rings.Foam ? Rings.Foam : GBlackArrayTexture->TextureRHI.GetReference();
+    P->SurfaceCascadeFoamSampler = TStaticSamplerState<SF_Trilinear, AM_Wrap, AM_Wrap, AM_Clamp>::GetRHI();
+    P->SurfacePixelFoam = FVector4f(FMath::Clamp(Params.FoamDetail, 0.0f, 1.0f), FMath::Max(Params.FoamDetailDistanceM, 1.0f) * 100.0f,
+        bCascadeFoam ? 1.0f : 0.0f, Params.bCubicFiltering ? 1.0f : 0.0f);
 
     // The water, per cm.
     const FVector3f Scattering = Params.Scattering * 0.01f;
@@ -481,7 +492,7 @@ void FVoxelOceanSurfacePass::Render_RenderThread(FPostOpaqueRenderParameters& Pa
     P->SurfaceSkyZenith = Params.SkyZenith;
     P->SurfaceSkyHorizon = Params.SkyHorizon;
     P->SurfaceShading = FVector4f(FMath::Max(Params.ShortWaveSlopeVariance, 0.0f), FMath::Max(Params.Refraction, 0.0f), Params.bFoam ? 1.0f : 0.0f,
-        (float)FMath::Clamp(CVarVoxelOceanDebugFoam.GetValueOnRenderThread(), 0, 4));
+        (float)FMath::Clamp(CVarVoxelOceanDebugFoam.GetValueOnRenderThread(), 0, 5));
     P->SurfaceFoamAlbedo = Params.FoamAlbedo;
     // Stage W3s: the foam's opacity, its thinnest edge's and the thickness it is solid from.
     P->SurfaceFoamLook = FVector4f(FMath::Clamp(Params.FoamOpacity, 0.0f, 1.0f), FMath::Clamp(Params.FoamThinOpacity, 0.0f, 1.0f),
@@ -492,7 +503,9 @@ void FVoxelOceanSurfacePass::Render_RenderThread(FPostOpaqueRenderParameters& Pa
     P->SurfaceFoamSet = bFoamSet ? FoamSet->Set.GetReference() : GBlackTexture->TextureRHI.GetReference();
     P->SurfaceFoamTable = bFoamSet ? FoamSet->Table.GetReference() : GBlackTexture->TextureRHI.GetReference();
     P->SurfaceFoamSampler = TStaticSamplerState<SF_Trilinear, AM_Wrap, AM_Wrap, AM_Clamp>::GetRHI();
-    P->SurfaceFoamInfo = FVector4f(1.0f / FMath::Max(Params.FoamTileM, 1.0f), bFoamSet ? (float)FoamSet->Mips : 1.0f, bFoamSet ? 1.0f : 0.0f, 0.0f);
+    // (w: the foam's softness, stage W3t.)
+    P->SurfaceFoamInfo = FVector4f(1.0f / FMath::Max(Params.FoamTileM, 1.0f), bFoamSet ? (float)FoamSet->Mips : 1.0f, bFoamSet ? 1.0f : 0.0f,
+        FMath::Clamp(Params.FoamSoftness, 0.0f, 1.0f));
 
     P->RenderTargets[0] = FRenderTargetBinding(SceneColor, ERenderTargetLoadAction::ELoad);
     if (bVelocity)

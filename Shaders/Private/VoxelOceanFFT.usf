@@ -18,10 +18,8 @@
 //      Derivatives  = (eta_x, eta_y, chop Dxx, chop Dyy)
 //    The displaced surface's tangents are (1 + chop Dxx, chop Dxy, eta_x) and (chop Dxy,
 //    1 + chop Dyy, eta_y); its area ratio (Jacobian) (1 + chop Dxx)(1 + chop Dyy) - (chop Dxy)^2.
-//    And the open sea's foam (stage O9b; VoxelOceanFoam.ush): each slot's compression (its area
-//    ratio J at VOXEL_OCEAN_FOAM_CHOP against its spread, FVoxelOceanSlotGPU B.z, sigma_J) feeds
-//    its envelope Z, which the state buffer FoamState keeps between frames, falling FoamFall
-//    (dt / decay) a frame; FoamOut the texture, (Z, Z^2) (0 with FoamOn 0).
+//    (Stage W3v: the open sea's per-slot foam envelope, O9b to W3u, is retired: FoamState and
+//    FoamOut are written zero; the foam runs on the wave clipmap, VoxelOceanFoam.ush.)
 // 5. MipCS once per mip level: the 2 x 2 average of both textures; FoamMipCS the foam's (so its
 //    mips hold each texel's mean of Z and of Z^2).
 //
@@ -30,7 +28,6 @@
 
 #include "/Engine/Public/Platform.ush"
 #include "/Plugin/VoxelPlugin/Private/VoxelOceanSpectrum.ush"
-#include "/Plugin/VoxelPlugin/Private/VoxelOceanFoam.ush"
 
 #define VOXEL_OCEAN_FFT_SIZE 256
 #define VOXEL_OCEAN_FFT_HALF 128
@@ -40,7 +37,7 @@
 struct FVoxelOceanSlotGPU
 {
     float4 A;      // tile length (m), wind speed (m/s), fetch (m), gamma
-    float4 B;      // swell, amplitude scale, sigma_J (the foam's spread: VOXEL_OCEAN_FOAM_CHOP sqrt(slope variance)), chop
+    float4 B;      // swell, amplitude scale, unused (stage W3v; the retired foam's spread), chop
     uint4 C;       // band MMin, band MMax, seed, dispersion C2 (packed, FVoxelOceanSlotParams)
     float4 G0;     // the equalizer's gains (stage W3k): knots 0-3, 4-7, 8-11, 12 (in G3.x)
     float4 G1;
@@ -201,20 +198,11 @@ void AssembleCS(uint3 Id : SV_DispatchThreadID)
     const float4 F1 = Fields[VoxelOceanElement(2u * Id.z + 1u, Id.y, Id.x)];    // eta_y, Dxx, Dyy, Dxy
     DisplacementOut[Id] = float4(Chop * F0.y, Chop * F0.z, F0.x, Chop * F1.w);
     DerivativesOut[Id] = float4(F0.w, F1.x, Chop * F1.y, Chop * F1.z);
-    // The foam: the envelope of the slot's own compression (at the calibration's chop).
-    const uint Element = VoxelOceanElement(Id.z, Id.y, Id.x);
-    float Z = 0.0f;
-    const float SigmaJ = Slots[Id.z].B.z;
-    if (FoamOn != 0u && SigmaJ > 1.0e-6f)
-    {
-        const float Dxx = VOXEL_OCEAN_FOAM_CHOP * F1.y;
-        const float Dyy = VOXEL_OCEAN_FOAM_CHOP * F1.z;
-        const float Dxy = VOXEL_OCEAN_FOAM_CHOP * F1.w;
-        const float J = (1.0f + Dxx) * (1.0f + Dyy) - Dxy * Dxy;
-        Z = VoxelOceanFoamStep(FoamState[Element], VoxelOceanFoamCompression(J, SigmaJ), FoamFall);
-    }
-    FoamState[Element] = Z;
-    FoamOut[Id] = float2(Z, Z * Z);
+    // (Stage W3v: the per-slot foam envelope is retired: the foam runs on the wave clipmap, from the
+    // summed surface's J, VoxelOceanFoam.ush. The state and the texture stay, zero, for the passes
+    // that still bind them.)
+    FoamState[VoxelOceanElement(Id.z, Id.y, Id.x)] = 0.0f;
+    FoamOut[Id] = float2(0.0f, 0.0f);
 }
 
 // ---------------------------------------------------------------------------------------------

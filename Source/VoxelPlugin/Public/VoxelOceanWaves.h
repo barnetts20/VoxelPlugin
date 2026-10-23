@@ -340,12 +340,13 @@ struct FVoxelOceanFFTSettings
      *  field's depth in; the share of the long bands' energy the FFT always keeps. */
     double SurfCutoff = 0.2;
     double SurfFFTFloor = 0.25;
-    /** The foam (stage O9b; VoxelOceanFoam.ush, VoxelOceanSurf.ush): the open sea's decay (s; 0:
-     *  none made), its coverage (0 none, 1 as calibrated) and the surf's foam. Live: the surface
-     *  reads them every frame, so they aren't compared (a change doesn't rebuild the model or
-     *  wipe the foam). */
-    double FoamDecay = 2.5;
-    double FoamCoverage = 1.0;
+    /** The foam (stage W3v; VoxelOceanFoam.ush: GodotOceanWaves' rule on the wave clipmap): the
+     *  whitecap threshold (the surface's area ratio J under which it foams; 0: no foam), Godot's
+     *  foam amount (its growth and decay rates) and the surf's foam (its source's strength). Live:
+     *  the surface reads them every frame, so they aren't compared (a change doesn't rebuild the
+     *  model or wipe the foam). */
+    double FoamWhitecap = 0.75;
+    double FoamAmount = 8.0;
     double SurfFoam = 1.0;
 
     bool operator==(const FVoxelOceanFFTSettings& Other) const

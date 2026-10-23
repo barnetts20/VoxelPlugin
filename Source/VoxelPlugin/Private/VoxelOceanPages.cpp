@@ -264,6 +264,8 @@ struct FVoxelOceanDisplaceState
     FTextureRHIRef Derivatives;
     FTextureRHIRef Charts;
     FTextureRHIRef Shore;
+    /** Stage W3u: the cascades' foam envelopes (the own pass's foam per pixel). */
+    FTextureRHIRef Foam;
     bool bClip = false;
     FVector4f ClipRows[VoxelOceanClipmap::InfoRows];
     FTextureRHIRef ClipDisplacement;
@@ -293,6 +295,8 @@ struct FVoxelOceanDisplaceState
 // The wave clipmap (stages O9k, W1): the static layer's rectangles (VoxelOceanClipStatic.usf) ...
 BEGIN_SHADER_PARAMETER_STRUCT(FVoxelOceanClipStaticParameters, )
     SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2DArray<float4>, StaticOut)
+    SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2DArray<float>, StaticFoamHistoryOut)
+    SHADER_PARAMETER(uint32, StaticFoamHistoryOn)
     SHADER_PARAMETER(uint32, StaticSlot)
     SHADER_PARAMETER(FIntPoint, StaticRectMin)
     SHADER_PARAMETER(FIntPoint, StaticRectSize)
@@ -351,7 +355,11 @@ BEGIN_SHADER_PARAMETER_STRUCT(FVoxelOceanClipWaveParameters, )
     SHADER_PARAMETER_RDG_TEXTURE(Texture2DArray<float4>, ClipStatic)
     SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2DArray<float4>, ClipDisplacementOut)
     SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2DArray<float4>, ClipNormalOut)
-    SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2DArray<float2>, ClipWhitecapOut)
+    SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2DArray<float4>, ClipWhitecapOut)
+    SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2DArray<float>, ClipFoamHistory)
+    SHADER_PARAMETER_RDG_TEXTURE(Texture2DArray<float4>, ClipWhitecapPrev)
+    SHADER_PARAMETER_ARRAY(FVector4f, ClipFoamStep, [VoxelOceanClipmap::MaxLevels])
+    SHADER_PARAMETER(uint32, ClipFoamHistoryOn)
     SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2D<float4>, ClipInfoOut)
     SHADER_PARAMETER(FVector4f, ClipParams)
     SHADER_PARAMETER(FVector4f, ClipWave0)
@@ -478,9 +486,15 @@ struct FVoxelOceanClipState
     TRefCountPtr<IPooledRenderTarget> DisplacementWork;
     TRefCountPtr<IPooledRenderTarget> NormalWork;
     TRefCountPtr<IPooledRenderTarget> WhitecapWork;
+    // Stage W3t: the foam's history (R32F a slot; -1 a texel to seed) and each slot's last step's
+    // ocean time (s; below 0: never).
+    TRefCountPtr<IPooledRenderTarget> FoamHistory;
+    double SlotTime[VoxelOceanClipmap::MaxLevels];
+    bool bHistoryOn = false;
     int32 Size = 0;
     int32 Slots = 0;
     std::atomic<bool> bLost{ false };
+    FVoxelOceanClipState() { for (double& T : SlotTime) T = -1.0; }
 };
 
 /** The wave clipmap's game-thread plan (stage W1): the last frame's levels, and per slot what its
@@ -1294,6 +1308,7 @@ bool FVoxelOceanRingProvider::PrepareDraw_RenderThread(FRDGBuilder& GraphBuilder
     Out.Displacement = D.Displacement.GetReference();
     Out.Derivatives = D.Derivatives.GetReference();
     Out.Charts = D.Charts.GetReference();
+    Out.Foam = D.Foam.GetReference();
     Out.bClip = D.bClip && D.ClipDisplacement.IsValid() && D.ClipNormal.IsValid() && D.ClipInfo.IsValid();
     Out.ClipDisplacement = D.ClipDisplacement.GetReference();
     Out.ClipNormal = D.ClipNormal.GetReference();
@@ -1366,11 +1381,13 @@ void FVoxelOceanPages::SetDisplaceFrame(const FVoxelOceanDisplaceFrame& InFrame)
             State->Derivatives = RHIOf(Frame.Derivatives);
             State->Charts = RHIOf(Frame.Charts);
             State->Shore = RHIOf(Frame.Shore);
+            State->Foam = RHIOf(Frame.Foam);
             // The resources are only read here.
             State->Frame.Displacement = nullptr;
             State->Frame.Derivatives = nullptr;
             State->Frame.Charts = nullptr;
             State->Frame.Shore = nullptr;
+            State->Frame.Foam = nullptr;
         });
 }
 
@@ -1564,7 +1581,8 @@ void FVoxelOceanPages::SetClipmap(const FVoxelOceanClipSettings& InSettings)
     if (bSameTextures) return;
     ClipDisplacement.Reset(VOP::MakeClipArray(TEXT("VoxelOceanClipDisplacement"), S.Size, S.Levels, PF_A32B32G32R32F, 16));
     ClipNormal.Reset(VOP::MakeClipArray(TEXT("VoxelOceanClipNormal"), S.Size, S.Levels, PF_FloatRGBA, 8));
-    ClipWhitecap.Reset(VOP::MakeClipArray(TEXT("VoxelOceanClipWhitecap"), S.Size, S.Levels, PF_G16R16F, 4));
+    // (Stage W3u: four channels, the surf's zone and own foam besides.)
+    ClipWhitecap.Reset(VOP::MakeClipArray(TEXT("VoxelOceanClipWhitecap"), S.Size, S.Levels, PF_FloatRGBA, 8));
     UTexture2D* Info = UTexture2D::CreateTransient(VoxelOceanClipmap::InfoRows, 1, PF_A32B32G32R32F,
         MakeUniqueObjectName(GetTransientPackage(), UTexture2D::StaticClass(), FName(TEXT("VoxelOceanClipInfo"))));
     if (Info)
@@ -1591,7 +1609,8 @@ void FVoxelOceanPages::SetClipmap(const FVoxelOceanClipSettings& InSettings)
     UE_LOG(LogVoxelPlugin, Log, TEXT("[VoxelOcean] Wave clipmap: %d levels of %d x %d, finest %.0f cm."), S.Levels, S.Size, S.Size, S.FinestCm);
 }
 
-void FVoxelOceanPages::UpdateClipmap(const FVector& CameraPlanet, const FVoxelOceanDisplaceFrame& Waves, FTextureResource* Foam)
+void FVoxelOceanPages::UpdateClipmap(const FVector& CameraPlanet, const FVoxelOceanDisplaceFrame& Waves, FTextureResource* Foam,
+    double OceanTime, double FoamDecayPerSecond, double FoamGrowthPerSecond)
 {
     // (Aliased: UE has a global FFrame.)
     using namespace VoxelOceanClipmap;
@@ -1635,6 +1654,9 @@ void FVoxelOceanPages::UpdateClipmap(const FVector& CameraPlanet, const FVoxelOc
     {
         int32 Level = 0;
         FClipRect Rect;
+        /** Stage W3t: the foam's history starts afresh there (texels new to the window; not an
+         *  edit's rectangle, where the water was already). */
+        bool bReseed = true;
     };
     TArray<FStaticJob> StaticJobs;
     bool bWhole[MaxLevels] = {};
@@ -1668,7 +1690,7 @@ void FVoxelOceanPages::UpdateClipmap(const FVector& CameraPlanet, const FVoxelOc
             {
                 const FClipRect E = RectAround(Frame, L, Edit.Center, Edit.Reach + 2.0 * Footprint, 2.0);
                 if (E.IsEmpty()) continue;
-                StaticJobs.Add({ i, E });
+                StaticJobs.Add({ i, E, false });
                 bEdited[i] = true;
             }
         }
@@ -1687,6 +1709,7 @@ void FVoxelOceanPages::UpdateClipmap(const FVector& CameraPlanet, const FVoxelOc
     const uint64 Turn = Plan.Turn++;
     int32 Due[MaxLevels];
     int32 NumDue = 0;
+    int32 Shift[MaxLevels] = {};
     FIntPoint Evaluated[MaxLevels];
     bool Valid[MaxLevels];
     for (int32 i = 0; i < Frame.Count; i++)
@@ -1698,6 +1721,9 @@ void FVoxelOceanPages::UpdateClipmap(const FVector& CameraPlanet, const FVoxelOc
         const uint64 Period = Stagger == 0 || i < 4 ? 1u : (i < 8 ? 2u : 4u);
         if (bWhole[i] || bEdited[i] || !bNear || Turn % Period == (uint64)i % Period)
         {
+            // (Stage W3t: how far its window moved since its last step, texels: the foam history's
+            // margin of possibly new neighbours.)
+            Shift[i] = bSameLevel ? FMath::Max(FMath::Abs(Slot.EvalOrigin.X - L.Origin.X), FMath::Abs(Slot.EvalOrigin.Y - L.Origin.Y)) : 0;
             Due[NumDue++] = i;
             Slot.bEvaluated = true;
             Slot.EvalPlane = Frame.Plane.Id;
@@ -1731,6 +1757,12 @@ void FVoxelOceanPages::UpdateClipmap(const FVector& CameraPlanet, const FVoxelOc
         FIntVector4 RingInts[MaxLevels];
         /** The rings' half side and morph (VoxelOceanClip.usf's ClipRing). */
         FVector4f RingLayout = FVector4f(0.0f, 0.0f, 0.0f, 0.0f);
+        /** Stage W3t: the ocean's clock (s); stage W3v: the foam's decay and growth rates (per
+         *  second; a decay of 0: no foam buffer). */
+        double OceanTime = 0.0;
+        double FoamDecay = 0.0;
+        double FoamGrowth = 0.0;
+        int32 FoamShift[MaxLevels] = {};
     };
     TSharedRef<FJob> Job = MakeShared<FJob>();
     Job->Waves = Waves;
@@ -1752,6 +1784,10 @@ void FVoxelOceanPages::UpdateClipmap(const FVector& CameraPlanet, const FVoxelOc
     Job->Static = MoveTemp(StaticJobs);
     Job->bAllWhole = bAllWhole;
     Job->Radius = Radius;
+    Job->OceanTime = OceanTime;
+    Job->FoamDecay = FMath::Max(FoamDecayPerSecond, 0.0);
+    Job->FoamGrowth = FMath::Max(FoamGrowthPerSecond, 0.0);
+    for (int32 i = 0; i < MaxLevels; i++) Job->FoamShift[i] = FMath::Clamp(Shift[i], 0, 64);
     Job->HalfFinest = FMath::Max(DensityInputs.HalfFinest, 1.0e-3);
     {
         // The camera's nearest lattice point, in double (the static layer counts from it).
@@ -1822,11 +1858,13 @@ void FVoxelOceanPages::UpdateClipmap(const FVector& CameraPlanet, const FVoxelOc
                 RDG_EVENT_SCOPE_STAT(GraphBuilder, VoxelOceanClipmap, "VoxelOceanClipmap");
                 // The textures kept between frames (made again for another size: then written whole).
                 const bool bNew = !State->Static.IsValid() || !State->DisplacementWork.IsValid() || !State->NormalWork.IsValid() || !State->WhitecapWork.IsValid()
-                    || State->Size != Size || State->Slots != Job->Slots;
+                    || !State->FoamHistory.IsValid() || State->Size != Size || State->Slots != Job->Slots;
+                const bool bHistory = Job->FoamDecay > 0.0;
                 FRDGTextureRef StaticTex;
                 FRDGTextureRef DispWork;
                 FRDGTextureRef NormalWork;
                 FRDGTextureRef WhitecapWork;
+                FRDGTextureRef FoamHistory;
                 if (bNew)
                 {
                     StaticTex = GraphBuilder.CreateTexture(FRDGTextureDesc::Create2DArray(FIntPoint(Size, Size), PF_A32B32G32R32F, FClearValueBinding::Black,
@@ -1835,12 +1873,18 @@ void FVoxelOceanPages::UpdateClipmap(const FVector& CameraPlanet, const FVoxelOc
                         TexCreate_ShaderResource | TexCreate_UAV, Job->Slots), TEXT("Voxel.OceanClipDisplacementWork"));
                     NormalWork = GraphBuilder.CreateTexture(FRDGTextureDesc::Create2DArray(FIntPoint(Size, Size), PF_FloatRGBA, FClearValueBinding::Black,
                         TexCreate_ShaderResource | TexCreate_UAV, Job->Slots), TEXT("Voxel.OceanClipNormalWork"));
-                    WhitecapWork = GraphBuilder.CreateTexture(FRDGTextureDesc::Create2DArray(FIntPoint(Size, Size), PF_G16R16F, FClearValueBinding::Black,
+                    WhitecapWork = GraphBuilder.CreateTexture(FRDGTextureDesc::Create2DArray(FIntPoint(Size, Size), PF_FloatRGBA, FClearValueBinding::Black,
                         TexCreate_ShaderResource | TexCreate_UAV, Job->Slots), TEXT("Voxel.OceanClipWhitecapWork"));
                     AddClearUAVPass(GraphBuilder, GraphBuilder.CreateUAV(StaticTex), FVector4f(0.0f, 0.0f, 0.0f, 0.0f));
                     AddClearUAVPass(GraphBuilder, GraphBuilder.CreateUAV(DispWork), FVector4f(0.0f, 0.0f, 0.0f, 0.0f));
                     AddClearUAVPass(GraphBuilder, GraphBuilder.CreateUAV(NormalWork), FVector4f(0.0f, 0.0f, 0.0f, 0.0f));
                     AddClearUAVPass(GraphBuilder, GraphBuilder.CreateUAV(WhitecapWork), FVector4f(0.0f, 0.0f, 0.0f, 0.0f));
+                    FoamHistory = GraphBuilder.CreateTexture(FRDGTextureDesc::Create2DArray(FIntPoint(Size, Size), PF_R32_FLOAT, FClearValueBinding::Black,
+                        TexCreate_ShaderResource | TexCreate_UAV, Job->Slots), TEXT("Voxel.OceanClipFoamHistory"));
+                    AddClearUAVPass(GraphBuilder, GraphBuilder.CreateUAV(FoamHistory), FVector4f(-1.0f, -1.0f, -1.0f, -1.0f));
+                    State->FoamHistory = GraphBuilder.ConvertToExternalTexture(FoamHistory);
+                    for (double& T : State->SlotTime) T = -1.0;
+                    State->bHistoryOn = false;
                     State->Static = GraphBuilder.ConvertToExternalTexture(StaticTex);
                     State->DisplacementWork = GraphBuilder.ConvertToExternalTexture(DispWork);
                     State->NormalWork = GraphBuilder.ConvertToExternalTexture(NormalWork);
@@ -1863,6 +1907,14 @@ void FVoxelOceanPages::UpdateClipmap(const FVector& CameraPlanet, const FVoxelOc
                     DispWork = GraphBuilder.RegisterExternalTexture(State->DisplacementWork);
                     NormalWork = GraphBuilder.RegisterExternalTexture(State->NormalWork);
                     WhitecapWork = GraphBuilder.RegisterExternalTexture(State->WhitecapWork);
+                    FoamHistory = GraphBuilder.RegisterExternalTexture(State->FoamHistory);
+                    // Stage W3t: the history turned on again: it starts afresh (not a pattern from
+                    // whenever it was turned off).
+                    if (bHistory && !State->bHistoryOn)
+                    {
+                        AddClearUAVPass(GraphBuilder, GraphBuilder.CreateUAV(FoamHistory), FVector4f(-1.0f, -1.0f, -1.0f, -1.0f));
+                        for (double& T : State->SlotTime) T = -1.0;
+                    }
                 }
 
                 // The static layer's rectangles.
@@ -1871,6 +1923,7 @@ void FVoxelOceanPages::UpdateClipmap(const FVector& CameraPlanet, const FVoxelOc
                     FVoxelOceanDensityParameters DensityP;
                     VOP::FillDensity(GraphBuilder, *Cache, Density, Edits, Job->HalfFinest, Shore, Margin, DepthFootprintCm, Job->Radius, LandCache, DensityP);
                     FRDGTextureUAVRef StaticUAV = GraphBuilder.CreateUAV(StaticTex);
+                    FRDGTextureUAVRef HistoryUAV = GraphBuilder.CreateUAV(FoamHistory);
                     for (const auto& SJ : Job->Static)
                     {
                         const VoxelOceanClipmap::FRect& R = SJ.Rect;
@@ -1879,6 +1932,8 @@ void FVoxelOceanPages::UpdateClipmap(const FVector& CameraPlanet, const FVoxelOc
                         const FIntVector4& Mod = Job->WindowMod[SJ.Level];
                         FVoxelOceanClipStaticParameters* P = GraphBuilder.AllocParameters<FVoxelOceanClipStaticParameters>();
                         P->StaticOut = StaticUAV;
+                        P->StaticFoamHistoryOut = HistoryUAV;
+                        P->StaticFoamHistoryOn = SJ.bReseed ? 1u : 0u;
                         P->StaticSlot = (uint32)FMath::RoundToInt(Window.W);
                         P->StaticRectMin = FIntPoint(R.I0, R.J0);
                         P->StaticRectSize = FIntPoint(R.Width, R.Height);
@@ -1910,6 +1965,39 @@ void FVoxelOceanPages::UpdateClipmap(const FVector& CameraPlanet, const FVoxelOc
                     }
                 }
 
+                // The textures the material and the vertices read (the last frame's copy: the foam's
+                // history's neighbours, stage W3t).
+                FRDGTextureRef DispDest = RegisterExternalTexture(GraphBuilder, DispRHI, TEXT("Voxel.OceanClipDisplacement"));
+                FRDGTextureRef NormalDest = RegisterExternalTexture(GraphBuilder, NormalRHI, TEXT("Voxel.OceanClipNormal"));
+                FRDGTextureRef WhitecapDest = RegisterExternalTexture(GraphBuilder, WhitecapRHI, TEXT("Voxel.OceanClipWhitecap"));
+                FRDGTextureRef InfoDest = RegisterExternalTexture(GraphBuilder, InfoRHI, TEXT("Voxel.OceanClipInfo"));
+                const bool bArraysMatch = DispDest->Desc.Format == PF_A32B32G32R32F && NormalDest->Desc.Format == PF_FloatRGBA
+                    && DispDest->Desc.Extent == FIntPoint(Size, Size) && NormalDest->Desc.Extent == FIntPoint(Size, Size)
+                    && (int32)DispDest->Desc.ArraySize >= Job->Slots && (int32)NormalDest->Desc.ArraySize >= Job->Slots
+                    && WhitecapDest->Desc.Format == PF_FloatRGBA && WhitecapDest->Desc.Extent == FIntPoint(Size, Size) && (int32)WhitecapDest->Desc.ArraySize >= Job->Slots;
+
+                // Stage W3t: each due level's step of the foam's history (the time since its slot was
+                // last stepped, on the ocean's clock; its fade).
+                // (Its clock only advances when it steps: a frame without it loses no fading.)
+                const bool bHistoryStep = bHistory && bArraysMatch;
+                FVector4f FoamStep[VoxelOceanClipmap::MaxLevels];
+                for (int32 i = 0; i < VoxelOceanClipmap::MaxLevels; i++) FoamStep[i] = FVector4f(0.0f, 1.0f, 0.0f, 0.0f);
+                for (int32 d = 0; d < Job->NumDue; d++)
+                {
+                    const int32 Level = Job->Due[d];
+                    const int32 Slot = FMath::Clamp(FMath::RoundToInt(Job->Window[Level].W), 0, VoxelOceanClipmap::MaxLevels - 1);
+                    const double Last = State->SlotTime[Slot];
+                    const double Dt = Last < 0.0 ? 0.0 : FMath::Clamp(Job->OceanTime - Last, 0.0, 1.0);
+                    if (bHistoryStep) State->SlotTime[Slot] = Job->OceanTime;
+                    // (Stage W3v: the decay a rate, per second.)
+                    const double Keep = bHistory ? FMath::Exp(-Dt * Job->FoamDecay) : 1.0;
+                    // (Stage W3v: the growth per unit of source over the step, integrated exactly:
+                    // (Grow / Decay) (1 - Keep); VoxelOceanFoam.ush.)
+                    const double GrowDt = bHistory ? Job->FoamGrowth / Job->FoamDecay * (1.0 - Keep) : 0.0;
+                    FoamStep[Level] = FVector4f((float)Dt, (float)Keep, (float)GrowDt, (float)Job->FoamShift[Level]);
+                }
+                State->bHistoryOn = bHistoryStep;
+
                 // The waves of the levels due, into their slots; the info.
                 FRDGTextureRef InfoWork = GraphBuilder.CreateTexture(FRDGTextureDesc::Create2D(FIntPoint(VoxelOceanClipmap::InfoRows, 1), PF_A32B32G32R32F,
                     FClearValueBinding::Black, TexCreate_ShaderResource | TexCreate_UAV), TEXT("Voxel.OceanClipInfoWork"));
@@ -1931,6 +2019,11 @@ void FVoxelOceanPages::UpdateClipmap(const FVector& CameraPlanet, const FVoxelOc
                     P->ClipDisplacementOut = GraphBuilder.CreateUAV(DispWork);
                     P->ClipNormalOut = GraphBuilder.CreateUAV(NormalWork);
                     P->ClipWhitecapOut = GraphBuilder.CreateUAV(WhitecapWork);
+                    P->ClipFoamHistory = GraphBuilder.CreateUAV(FoamHistory);
+                    P->ClipWhitecapPrev = WhitecapDest;
+                    for (int32 i = 0; i < VoxelOceanClipmap::MaxLevels; i++) P->ClipFoamStep[i] = FoamStep[i];
+                    // (Its neighbours from the last frame's copy: only where that copy is this shape.)
+                    P->ClipFoamHistoryOn = bHistoryStep ? 1u : 0u;
                     P->ClipInfoOut = GraphBuilder.CreateUAV(InfoWork);
                     P->ClipParams = W.Params;
                     P->ClipWave0 = W.Wave[0];
@@ -1961,14 +2054,6 @@ void FVoxelOceanPages::UpdateClipmap(const FVector& CameraPlanet, const FVoxelOc
                         FIntVector(FMath::DivideAndRoundUp(Size, 8), FMath::DivideAndRoundUp(Size, 8), FMath::Max(Job->NumDue, 1)));
                 }
                 // Into the textures the material and the vertices read: every slot.
-                FRDGTextureRef DispDest = RegisterExternalTexture(GraphBuilder, DispRHI, TEXT("Voxel.OceanClipDisplacement"));
-                FRDGTextureRef NormalDest = RegisterExternalTexture(GraphBuilder, NormalRHI, TEXT("Voxel.OceanClipNormal"));
-                FRDGTextureRef WhitecapDest = RegisterExternalTexture(GraphBuilder, WhitecapRHI, TEXT("Voxel.OceanClipWhitecap"));
-                FRDGTextureRef InfoDest = RegisterExternalTexture(GraphBuilder, InfoRHI, TEXT("Voxel.OceanClipInfo"));
-                const bool bArraysMatch = DispDest->Desc.Format == PF_A32B32G32R32F && NormalDest->Desc.Format == PF_FloatRGBA
-                    && DispDest->Desc.Extent == FIntPoint(Size, Size) && NormalDest->Desc.Extent == FIntPoint(Size, Size)
-                    && (int32)DispDest->Desc.ArraySize >= Job->Slots && (int32)NormalDest->Desc.ArraySize >= Job->Slots
-                    && WhitecapDest->Desc.Format == PF_G16R16F && WhitecapDest->Desc.Extent == FIntPoint(Size, Size) && (int32)WhitecapDest->Desc.ArraySize >= Job->Slots;
                 if (bArraysMatch)
                 {
                     FRHICopyTextureInfo Copy;

@@ -26,6 +26,10 @@
 #include "/Plugin/VoxelPlugin/Private/VoxelOceanClip.ush"
 
 RWTexture2DArray<float4> StaticOut;
+// Stage W3t: the foam's history (VoxelOceanClip.usf): a texel the window newly holds (or the level
+// written anew) starts afresh (-1: ClipWaveCS seeds it).
+RWTexture2DArray<float> StaticFoamHistoryOut;
+uint StaticFoamHistoryOn;
 // The job: a rectangle of a level's window (window texels), the level's slot, its window's first
 // texel's place in the storage (the origin mod Size), the camera's coordinate in the window, the
 // spacing (cm).
@@ -109,4 +113,5 @@ void ClipStaticCS(uint3 Id : SV_DispatchThreadID)
     StaticOut[int3(S, Base + 1)] = float4(Dir, Rise);
     StaticOut[int3(S, Base + 2)] = float4(Shore.Slope, Shore.Coast.A, Shore.Coast.B, Shore.Coast.Cover);
     StaticOut[int3(S, Base + 3)] = float4(VoxelOceanClipTangentOf(Shore.Coast.GradA, T1, T2), VoxelOceanClipTangentOf(Shore.Coast.GradB, T1, T2));
+    if (StaticFoamHistoryOn != 0u) StaticFoamHistoryOut[int3(S, int(StaticSlot))] = -1.0f;
 }

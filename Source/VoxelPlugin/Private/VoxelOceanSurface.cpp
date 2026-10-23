@@ -100,6 +100,11 @@ namespace VoxelOceanSurfaceDetail
      *  tile spacings: the triangle itself, and its corners' morph to the grandparent grid. */
     constexpr double CullReachSpacings = 6.0;
     constexpr double NoCull = 3.0e38;
+
+    /** GodotOceanWaves' foam rates per second for its foam amount (stage W3v; wave_generator.gd, as
+     *  VoxelOceanFoam.ush's VoxelOceanFoamGrowRate and VoxelOceanFoamDecayRate). */
+    double FoamGrowRate(double Amount) { return 7.5 * FMath::Max(Amount, 0.0); }
+    double FoamDecayRate(double Amount) { return 1.15 * FMath::Max(0.5, 10.0 - FMath::Max(Amount, 0.0)); }
 }
 
 namespace VOS = VoxelOceanSurfaceDetail;
@@ -479,7 +484,8 @@ void FVoxelOceanSurface::Tick(const FVector& Camera)
     if (!bAvailable || !Pages.IsValid()) return;
     // The FFT model's cascades at this tick of the ocean clock, ahead of this frame's drawing.
     if (FFTModel.IsValid() && Cascades.IsValid())
-        Cascades->Update(VoxelOceanSpectrum::TickOf(Inputs.Time), Inputs.Time, FMath::Max(Inputs.Waves.FoamDecay, 0.0));
+        // (Stage W3v: their per-slot foam retired, 0: the foam runs on the wave clipmap.)
+        Cascades->Update(VoxelOceanSpectrum::TickOf(Inputs.Time), Inputs.Time, 0.0);
     const double Now = FPlatformTime::Seconds();
     Perf.Frames++;
 
@@ -918,9 +924,12 @@ void FVoxelOceanSurface::UpdateMaterial()
             bTexturesBound = true;
             BoundShoreTexture = nullptr;
         }
-        // The foam's settings live (the model doesn't rebuild for them): the surf's row 16.
+        // The foam's settings live (the model doesn't rebuild for them): the surf's row 16. Stage
+        // W3v (VoxelOceanFoam.ush): x the fresh gain (Godot's growth over its decay), z the whitecap
+        // threshold.
+        Waves.Surf[1].X = (float)(VOS::FoamGrowRate(Inputs.Waves.FoamAmount) / VOS::FoamDecayRate(Inputs.Waves.FoamAmount));
         Waves.Surf[1].Y = (float)FMath::Max(Inputs.Waves.SurfFoam, 0.0);
-        Waves.Surf[1].Z = (float)FMath::Max(Inputs.Waves.FoamCoverage, 0.0);
+        Waves.Surf[1].Z = (float)FMath::Clamp(Inputs.Waves.FoamWhitecap, 0.0, 1.0);
         // The debug view (stage O9f; row 18 w).
         Waves.Surf[2].W = (float)FMath::Clamp(CVarVoxelOceanDebugSurf.GetValueOnGameThread(), 0, 26);
         // The shore field's expansion around the selection camera (VoxelOceanShore.ush).
@@ -996,6 +1005,7 @@ void FVoxelOceanSurface::UpdateMaterial()
             D.Derivatives = Textures.Derivatives ? Textures.Derivatives->GetResource() : nullptr;
             D.Charts = Textures.Charts ? Textures.Charts->GetResource() : nullptr;
             D.Shore = Inputs.ShoreTexture ? Inputs.ShoreTexture->GetResource() : nullptr;
+            D.Foam = Textures.Foam ? Textures.Foam->GetResource() : nullptr;
         }
         Pages->SetDisplaceFrame(D);
         // The wave clipmap (stage O9k): its levels around the selection camera this frame, and its
@@ -1003,7 +1013,9 @@ void FVoxelOceanSurface::UpdateMaterial()
         if (Pages->IsClipmapOn() && bFFT)
         {
             const FVoxelOceanCascadeTextures& Textures = Cascades->GetTextures();
-            Pages->UpdateClipmap(SelectionCamera, D, Textures.Foam ? Textures.Foam->GetResource() : nullptr);
+            // (Stage W3v: the foam steps on the ocean's clock by Godot's rates for the foam amount.)
+            Pages->UpdateClipmap(SelectionCamera, D, Textures.Foam ? Textures.Foam->GetResource() : nullptr, Inputs.Time,
+                VOS::FoamDecayRate(Inputs.Waves.FoamAmount), VOS::FoamGrowRate(Inputs.Waves.FoamAmount));
             if (!bClipBound)
             {
                 Material->SetTextureParameterValue(VOS::ClipDisplacementName, Pages->GetClipDisplacement());

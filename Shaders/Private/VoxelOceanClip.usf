@@ -25,8 +25,24 @@ Texture2DArray<float4> ClipStatic;
 
 RWTexture2DArray<float4> ClipDisplacementOut;
 RWTexture2DArray<float4> ClipNormalOut;
-// Stage W3h: the whitecaps' density (x; y spare), as the foam's in the displacement's w.
-RWTexture2DArray<float2> ClipWhitecapOut;
+// Stage W3h: the whitecaps (x: the breaking now, drawn), the foam's drawn density in the
+// displacement's w; stage W3v: y the foam itself (the buffer below), z the surf's breaking zone, w
+// the open sea's compression past the whitecap threshold here (the own pass sharpens the foam per
+// pixel from them near the camera, VoxelOceanPixelSurfOf).
+RWTexture2DArray<float4> ClipWhitecapOut;
+// THE FOAM (stage W3v; VoxelOceanFoam.ush: GodotOceanWaves' rule, run on the clipmap as Crest runs
+// its foam): per texel of each level, kept from frame to frame in the levels' own (rest-point)
+// frame, so it rides the water: Foam e^(-Decay dt) plus Grow dt times the source, within 0 and
+// 1 / 0.75. The source: the composed sea's compression past the whitecap threshold (the summed
+// surface's J at the texel, out of the surf's breaking zone) and the surf's own foam (its bores'
+// faces, their short wake, the swash's thin edge), so the bores leave trails as the crests do. A
+// texel new to its window (-1, written by the static layer) starts from the rule's steady state for
+// its source now. ClipFoamStep[level]: x the time since the level was last stepped (s), y e^(-Decay
+// x), z Grow x; ClipFoamHistoryOn 0: no buffer (the steady state each frame).
+RWTexture2DArray<float> ClipFoamHistory;
+Texture2DArray<float4> ClipWhitecapPrev;
+float4 ClipFoamStep[VOXEL_OCEAN_CLIP_MAX_LEVELS];
+uint ClipFoamHistoryOn;
 RWTexture2D<float4> ClipInfoOut;
 
 // The material's wave parameters for this frame (FVoxelOceanSurface::UpdateMaterial's), from the
@@ -152,19 +168,42 @@ void ClipWaveCS(uint3 Id : SV_DispatchThreadID)
     In.Shore = Shore;
 
     FVoxelOceanWaveOutput Out;
+    float SurfFoam = 0.0f;
+    float Wind = 0.0f;
+    float SurfZone = 0.0f;
+    float OpenSource = 0.0f;
     if (W.FFT.x > 0.5f)
     {
         const uint Mask = VOXEL_OCEAN_LOOKUP_ALL | (ClipFoamOn != 0u ? VOXEL_OCEAN_LOOKUP_FOAM : 0u);
         const FVoxelOceanFFTPoint Pt = VoxelOceanFFTEvaluate(P, Up, VertexSpacing, Footprint, Depth, In.Shore, W,
             ClipDisplacement, ClipDisplacementSampler, ClipDerivatives, ClipDerivativesSampler, ClipCharts, ClipFoam, ClipFoamSampler, Mask);
         Out = VoxelOceanFFTOutput(Pt, In, W, Mask);
+        SurfFoam = Pt.SurfFoam;
+        Wind = Pt.Wind;
+        SurfZone = Pt.SurfZone;
+        OpenSource = Pt.FoamSource;
     }
     else
     {
         Out = VoxelOceanWaves(In, W);
     }
     const int3 C = int3(S, Slot);
-    ClipDisplacementOut[C] = float4(VoxelOceanRotateBack(W.Rotation, Out.Displacement), saturate(Out.Foam));
+    // The foam (stage W3v): the rule's step on the open sea's and the surf's sources, drawn through
+    // Godot's smoothstep; the whitecaps, the breaking now.
+    const float4 Row16 = ClipCharts.Load(int3(VoxelOceanConstantsX(max(int(W.FFT.y), 1)), 16, 0));
+    const float FreshGain = max(Row16.x, 0.0f);
+    const float Source = OpenSource + SurfFoam;
+    float Foam = VoxelOceanFoamFresh(Source, FreshGain);
+    if (ClipFoamHistoryOn != 0u)
+    {
+        const float Prev = ClipFoamHistory[C];
+        const float4 Step = ClipFoamStep[Index];
+        if (Prev >= 0.0f) Foam = VoxelOceanFoamStep(Prev, Source, Step.z, Step.y);
+        ClipFoamHistory[C] = Foam;
+    }
+    const float Drawn = VoxelOceanFoamDrawn(Foam);
+    const float Whitecap = saturate(Out.Whitecap);
+    ClipDisplacementOut[C] = float4(VoxelOceanRotateBack(W.Rotation, Out.Displacement), Drawn);
     ClipNormalOut[C] = float4(VoxelOceanRotateBack(W.Rotation, Out.Normal), max(Out.SlopeVariance, 0.0f));
-    ClipWhitecapOut[C] = float2(saturate(Out.Whitecap), 0.0f);
+    ClipWhitecapOut[C] = float4(Whitecap, Foam, SurfZone, OpenSource);
 }

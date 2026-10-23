@@ -1,0 +1,59 @@
+// VoxelOceanCubic.ush - Cubic B-spline filtering from bilinear taps (stage W3u; Design/OceanWaves.md
+// section 46): Sigg and Hadwiger, "Fast Third-Order Texture Filtering" (GPU Gems 2, chapter 20), as
+// GodotOceanWaves samples its cascades (texture_bicubic in its water.gdshader). Where the pixel's
+// footprint is finer than a texture's texels, bilinear filtering shows them: its value is only C0
+// across a texel's edge, so the gradients and the foam built on it are faceted, blocky. The cubic
+// B-spline is C2 and its four weights per axis are positive and sum to 1, so two bilinear taps per
+// axis (four in all) give it: each pair's weights as a bilinear tap's position between its two
+// texels. Shared subset (VoxelShaderCompat.h): the taps per axis here (Tools/OceanHarness/
+// cubic_check.cpp checks them against the 16-texel sum); the samplers in VoxelOceanWaves.ush and
+// VoxelOceanPixelClip.ush.
+
+#ifndef VOXEL_OCEAN_CUBIC_USH
+#define VOXEL_OCEAN_CUBIC_USH
+
+#ifndef VOXEL_FUNC
+#define VOXEL_FUNC
+#endif
+
+// One axis's two taps: their coordinates ([0, 1) of the texture, as a bilinear sample takes them;
+// texel i's centre at (i + 0.5) / Size) and their weights (summing to 1).
+struct FVoxelOceanCubicTaps
+{
+    float P0;
+    float P1;
+    float G0;
+    float G1;
+};
+
+// The taps for coordinate U (the texture's, [0, 1) or wrapped) on Size texels.
+VOXEL_FUNC FVoxelOceanCubicTaps VoxelOceanCubicTapsOf(float U, float Size)
+{
+    const float X = U * Size - 0.5f;
+    const float I = floor(X);
+    const float F = X - I;
+    const float F2 = F * F;
+    const float F3 = F2 * F;
+    // The B-spline's weights for texels I - 1 to I + 2.
+    const float W0 = (1.0f / 6.0f) * (1.0f - 3.0f * F + 3.0f * F2 - F3);
+    const float W1 = (1.0f / 6.0f) * (4.0f - 6.0f * F2 + 3.0f * F3);
+    const float W2 = (1.0f / 6.0f) * (1.0f + 3.0f * F + 3.0f * F2 - 3.0f * F3);
+    const float W3 = (1.0f / 6.0f) * F3;
+    FVoxelOceanCubicTaps T;
+    T.G0 = W0 + W1;
+    T.G1 = W2 + W3;
+    // Texel I - 1's centre lies at I - 0.5 (texels), I + 1's at I + 1.5: each tap between its pair.
+    T.P0 = (I - 0.5f + W1 / T.G0) / Size;
+    T.P1 = (I + 1.5f + W3 / T.G1) / Size;
+    return T;
+}
+
+// How far toward the cubic a lookup goes (0 bilinear, 1 cubic): from a texel per footprint (none)
+// to two (all), so the filter changes over an octave of distance, not at a line on the water.
+// Magnify: the texel's size over the footprint's.
+VOXEL_FUNC float VoxelOceanCubicShareOf(float Magnify)
+{
+    return Magnify > 1.0f ? clamp(log2(Magnify), 0.0f, 1.0f) : 0.0f;
+}
+
+#endif
