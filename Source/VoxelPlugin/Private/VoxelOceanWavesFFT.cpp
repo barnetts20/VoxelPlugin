@@ -552,9 +552,10 @@ void FVoxelOceanWavesFFT::GetShaderParams(const FVoxelOceanWaveContext& Context,
     const FTransform& PlanetToWorld, FVoxelOceanWaveShaderParams& Out) const
 {
     Out = FVoxelOceanWaveShaderParams();
-    // y: the weather's way through its interval, z: the headings' turn (VoxelOceanSeaState.ush).
+    // x: the chop (stage W3z: the foam's unresolved compression, VoxelOceanFoam.ush), y: the weather's
+    // way through its interval, z: the headings' turn (VoxelOceanSeaState.ush).
     const FVoxelOceanWeatherTable* Weather = Context.Weather.Get();
-    Out.Shape = FVector4f(0.0f, Weather ? (float)Weather->Alpha(Context.Time) : 0.0f, Weather ? (float)Weather->Fade(Context.Time) : 1.0f, 0.0f);
+    Out.Shape = FVector4f((float)FMath::Max(Settings.Chop, 0.0), Weather ? (float)Weather->Alpha(Context.Time) : 0.0f, Weather ? (float)Weather->Fade(Context.Time) : 1.0f, 0.0f);
     Out.FFT = FVector4f(1.0f, (float)Charts.N, (float)FMath::Max(Settings.DetileCell, 0.0), (float)DetileSeed);
     Out.RefHigh = FVector4f(VoxelOceanCharts::SplitHigh(Reference.X), VoxelOceanCharts::SplitHigh(Reference.Y), VoxelOceanCharts::SplitHigh(Reference.Z), Settings.MipBias);
     Out.RefLow = FVector4f(VoxelOceanCharts::SplitLow(Reference.X), VoxelOceanCharts::SplitLow(Reference.Y), VoxelOceanCharts::SplitLow(Reference.Z), (float)MaxHeightCm);

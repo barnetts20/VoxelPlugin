@@ -345,8 +345,11 @@ struct FVoxelOceanFFTSettings
      *  foam amount (its growth and decay rates) and the surf's foam (its source's strength). Live:
      *  the surface reads them every frame, so they aren't compared (a change doesn't rebuild the
      *  model or wipe the foam). */
-    double FoamWhitecap = 0.75;
+    double FoamWhitecap = 0.85;
     double FoamAmount = 8.0;
+    /** Stage W3y (live): the span of J under the threshold over which the foam's steady state rises
+     *  from none to all of it (0: Godot's, its growth over its decay). */
+    double FoamRamp = 0.2;
     double SurfFoam = 1.0;
     /** Stage W3w (live): the fine foam (Godot's short cascade's: the shortest band's own, in its
      *  tile; its whitecap threshold, 0 none, and foam amount), and the cascades' update rate (Hz;

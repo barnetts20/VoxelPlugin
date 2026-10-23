@@ -33,17 +33,19 @@ struct FPyramid
 {
     std::vector<std::vector<FMoments>> Levels;
     double Cell = 1.0;
+    int Size = GPUSize;     // the slot's grid (stage W3z: 512 for the shortest band)
     explicit FPyramid(const FGPUSlot& G, double TileLength)
     {
-        Cell = TileLength / GPUSize;
-        std::vector<FMoments> L0(size_t(GPUSize) * GPUSize);
+        Size = G.N;
+        Cell = TileLength / Size;
+        std::vector<FMoments> L0(size_t(Size) * Size);
         for (size_t i = 0; i < L0.size(); i++)
         {
             const float Sx = G.Derivatives[i].x, Sy = G.Derivatives[i].y;
             L0[i] = { Sx, Sy, Sx * Sx, Sy * Sy, Sx * Sy };
         }
         Levels.push_back(L0);
-        for (int N = GPUSize / 2; N >= 1; N /= 2)
+        for (int N = Size / 2; N >= 1; N /= 2)
         {
             const std::vector<FMoments>& P = Levels.back();
             std::vector<FMoments> L(size_t(N) * N);
@@ -64,7 +66,7 @@ struct FPyramid
     }
     FMoments Bilinear(int Level, double U, double V) const
     {
-        const int N = GPUSize >> Level;
+        const int N = Size >> Level;
         const double S = double(1 << Level);
         U = (U + 0.5) / S - 0.5; V = (V + 0.5) / S - 0.5;
         const double FU = std::floor(U), FV = std::floor(V);
@@ -80,8 +82,9 @@ struct FPyramid
     // Trilinear by footprint (m), tile-plane position (m).
     FMoments Sample(double X, double Y, double Footprint) const
     {
-        const double Lod = std::clamp(std::log2(std::max(Footprint / Cell, 1.0)), 0.0, 8.0);
-        const int L0 = int(Lod), L1 = std::min(L0 + 1, 8);
+        const int Top = int(Levels.size()) - 1;
+        const double Lod = std::clamp(std::log2(std::max(Footprint / Cell, 1.0)), 0.0, double(Top));
+        const int L0 = int(Lod), L1 = std::min(L0 + 1, Top);
         const float t = float(Lod - L0);
         const FMoments A = Bilinear(L0, X / Cell, Y / Cell), B = Bilinear(L1, X / Cell, Y / Cell);
         return { A.Sx + t * (B.Sx - A.Sx), A.Sy + t * (B.Sy - A.Sy), A.Sxx + t * (B.Sxx - A.Sxx), A.Syy + t * (B.Syy - A.Syy), A.Sxy + t * (B.Sxy - A.Sxy) };

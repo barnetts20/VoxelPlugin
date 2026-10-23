@@ -124,7 +124,7 @@ FVoxelOceanVertexMorph VoxelOceanVertexMorphOf(float3 ToVertex, float3 Parent, f
 // primitive data 0 and 1); Params (x the morph mode 0 off, 1 by distance, 2 fully morphed).
 FVoxelOceanVertexOut VoxelOceanVertexCore(float3 ToVertex, float3 Parent, float3 Grand, float2 UV1, float2 UV2, float2 UV4, float2 UV5,
     float Level, float MorphEnd0, float4 Params, FVoxelOceanWaveParams Waves, Texture2DArray Displacement, SamplerState DisplacementSampler,
-    Texture2DArray Derivatives, SamplerState DerivativesSampler, Texture2D Charts, Texture2DArray Shore)
+    Texture2DArray Derivatives, SamplerState DerivativesSampler, Texture2D Charts VOXEL_OCEAN_FINE_PARAMS, Texture2DArray Shore)
 {
     const FVoxelOceanVertexMorph M = VoxelOceanVertexMorphOf(ToVertex, Parent, Grand, UV1, UV2, UV4, Level, MorphEnd0, Params, Waves.FFT, Charts);
     FVoxelOceanVertexOut Out;
@@ -141,7 +141,8 @@ FVoxelOceanVertexOut VoxelOceanVertexCore(float3 ToVertex, float3 Parent, float3
         Out.Bed.x = VoxelOceanBedMorph(UV5.x, M.W0, M.W1, max(In.Shore.Slope, max(Waves.SlopeVar.y, 1.0e-4f)));
         In.Shore.BedSlope = Out.Bed.x;
         In.Shore.BedDepth = Out.Bed.y;
-        Out.Offset += VoxelOceanWavesFFT(In, Waves, Displacement, DisplacementSampler, Derivatives, DerivativesSampler, Charts, VOXEL_OCEAN_LOOKUP_DISPLACEMENT).Displacement;
+        Out.Offset += VoxelOceanWavesFFT(In, Waves, Displacement, DisplacementSampler, Derivatives, DerivativesSampler, Charts VOXEL_OCEAN_FINE_ARGS,
+            VOXEL_OCEAN_LOOKUP_DISPLACEMENT).Displacement;
     }
     return Out;
 }

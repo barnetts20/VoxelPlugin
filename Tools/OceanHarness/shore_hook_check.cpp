@@ -338,7 +338,7 @@ int main()
         const uint32_t Tick = VoxelOceanSpectrum::TickOf(Context.Time);
         for (int s = 0; s < VoxelOceanSpectrum::SlotCount; s++)
         {
-            const OceanFFTEmulation::FGPUSlot G = OceanFFTEmulation::EmulateGPU(Model.GetSlots()[s], Tick);
+            const OceanFFTEmulation::FGPUSlot G = OceanFFTEmulation::LongCopy(OceanFFTEmulation::EmulateGPU(Model.GetSlots()[s], Tick));
             Tx.Displacement.Build(s, G.Displacement);
             Tx.Derivatives.Build(s, G.Derivatives);
         }

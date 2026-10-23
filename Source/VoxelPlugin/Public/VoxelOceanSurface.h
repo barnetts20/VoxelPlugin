@@ -58,10 +58,15 @@ struct VOXELPLUGIN_API FVoxelOceanCascadeTextures
     UTexture2DArray* Displacement = nullptr;
     UTexture2DArray* Derivatives = nullptr;
     UTexture2D* Charts = nullptr;
-    /** The open sea's foam per slot (stage O9b). */
+    /** The open sea's foam per slot (stage O9b; W3w: the fine foam in slice 7). */
     UTexture2DArray* Foam = nullptr;
+    /** Stage W3z: the shortest band's own 512^2 cascade, one slice each (its displacement,
+     *  derivatives and fine foam; the arrays above hold its mip 1 in slice 7). */
+    UTexture2DArray* FineDisplacement = nullptr;
+    UTexture2DArray* FineDerivatives = nullptr;
+    UTexture2DArray* FineFoam = nullptr;
 
-    bool IsValid() const { return Displacement && Derivatives && Charts && Foam; }
+    bool IsValid() const { return Displacement && Derivatives && Charts && Foam && FineDisplacement && FineDerivatives && FineFoam; }
 };
 
 /** The split bias near shores (stage O9c; VoxelOceanTiles::FShoreBias): within BandM of the coast
@@ -265,6 +270,8 @@ private:
     /** Stage W3w: the ocean clock's time the cascades were last updated at (their fixed rate). */
     double CascadeTime = 0.0;
     bool bCascadeTime = false;
+    /** Stage W3y: the cascades stepped this tick (the clipmap's regular evaluation follows them). */
+    bool bCascadesStepped = true;
     bool bReportedFFT = false;
     bool bHasInputs = false;
     bool bRewriteAll = false;

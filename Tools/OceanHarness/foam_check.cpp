@@ -48,10 +48,11 @@ static void Check(bool bOk, const char* What, double Value, double Limit)
 
 namespace
 {
-    constexpr int N = GPUSize;
     // The defaults (VoxelOceanSettings.h: FoamWhitecap, FoamAmount).
-    constexpr double DefaultWhitecap = 0.75;
+    constexpr double DefaultWhitecap = 0.85;
     constexpr double DefaultAmount = 8.0;
+    // Stage W3y: the ramp (the span of J under the threshold to all of the foam; VoxelOceanSurface.cpp).
+    constexpr double DefaultRamp = 0.2;
 
     // The long bands' sea-state weights (VoxelOceanSeaState.ush's VoxelOceanStateWeights).
     void StateWeights(double U, double W[3])
@@ -93,7 +94,7 @@ int main()
         Check(std::abs(H - std::exp(-2.3)) < 1e-5, "decays exponentially: e^(-2.3) after 1 s at 60 Hz", H, std::exp(-2.3));
         Check(std::abs(VoxelOceanFoamStep(0.2f, 0.1f, 0.5f, 1.0f) - 0.25f) < 1e-6f, "grows linearly with the source (0.2 + 0.1 x 0.5)", VoxelOceanFoamStep(0.2f, 0.1f, 0.5f, 1.0f), 0.25);
         Check(VoxelOceanFoamStep(1.3f, 1.0f, 1.0f, 1.0f) == VOXEL_OCEAN_FOAM_MAX && VoxelOceanFoamStep(0.1f, -5.0f, 1.0f, 1.0f) == 0.1f,
-            "held within 0 and 1 / 0.75; a negative source adds nothing", VoxelOceanFoamStep(1.3f, 1.0f, 1.0f, 1.0f), VOXEL_OCEAN_FOAM_MAX);
+            "held within 0 and 1 (Godot's clamp per cascade; stage W3z); a negative source adds nothing", VoxelOceanFoamStep(1.3f, 1.0f, 1.0f, 1.0f), VOXEL_OCEAN_FOAM_MAX);
         Check(VoxelOceanFoamSource(0.6f, 0.75f) > 0.1499f && VoxelOceanFoamSource(0.6f, 0.75f) < 0.1501f && VoxelOceanFoamSource(0.9f, 0.75f) == 0.0f && VoxelOceanFoamSource(0.3f, 0.0f) == 0.0f,
             "the source: how far J is under the threshold; none over it, none with the threshold 0", VoxelOceanFoamSource(0.6f, 0.75f), 0.15);
         // The steady state: a constant small source for 10 s (amount 2: 15 /s, 9.2 /s) against the fresh foam.
@@ -103,10 +104,10 @@ int main()
         Check(std::abs(Steady - Fresh) < 1e-3 * Fresh, "a constant source settles at the fresh foam, Source Grow / Decay (the exact step)", std::abs(Steady - Fresh) / Fresh, 1e-3);
         bool bRises = true;
         float Last = -1.0f;
-        for (float F = 0.0f; F <= VOXEL_OCEAN_FOAM_MAX + 1e-4f; F += 0.01f) { bRises = bRises && VoxelOceanFoamDrawn(F) >= Last; Last = VoxelOceanFoamDrawn(F); }
-        Check(bRises && VoxelOceanFoamDrawn(0.0f) == 0.0f && std::abs(VoxelOceanFoamDrawn(VOXEL_OCEAN_FOAM_MAX) - 1.0f) < 1e-5f
-                && std::abs(VoxelOceanFoamDrawn(0.5f) - 0.31640625f) < 1e-5f,
-            "drawn: smoothstep(0, 1, 0.75 foam): none to solid at the most, rising (0.5: 0.316)", VoxelOceanFoamDrawn(0.5f), 0.31640625);
+        for (float F = 0.0f; F <= 2.0f * VOXEL_OCEAN_FOAM_MAX + 1e-4f; F += 0.01f) { bRises = bRises && VoxelOceanFoamDrawn(F) >= Last; Last = VoxelOceanFoamDrawn(F); }
+        Check(bRises && VoxelOceanFoamDrawn(0.0f) == 0.0f && std::abs(VoxelOceanFoamDrawn(VOXEL_OCEAN_FOAM_MAX) - 0.84375f) < 1e-5f
+                && std::abs(VoxelOceanFoamDrawn(2.0f * VOXEL_OCEAN_FOAM_MAX) - 1.0f) < 1e-5f && std::abs(VoxelOceanFoamDrawn(0.5f) - 0.31640625f) < 1e-5f,
+            "drawn: smoothstep(0, 1, 0.75 foam), rising: one full layer 0.84 (Godot's), two solid (0.5: 0.316)", VoxelOceanFoamDrawn(VOXEL_OCEAN_FOAM_MAX), 0.84375);
         // The same at any frame rate: a crest compressing for 0.3 s then gone for 0.7 s.
         const double R30 = RunPulse(30.0, 0.3, 0.7, 0.05, 8.0), R60 = RunPulse(60.0, 0.3, 0.7, 0.05, 8.0), R144 = RunPulse(144.0, 0.3, 0.7, 0.05, 8.0);
         const double Spread = std::max({ R30, R60, R144 }) - std::min({ R30, R60, R144 });
@@ -131,16 +132,20 @@ int main()
             for (size_t i = 0; i < G.Derivatives.size(); i++)
             {
                 const double J = (1.0 + G.Derivatives[i].z) * (1.0 + G.Derivatives[i].w) - double(G.Displacement[i].w) * G.Displacement[i].w;
-                Under += J < DefaultWhitecap;
+                Under += J < 0.75;
             }
             BandShare = std::max(BandShare, double(Under) / G.Derivatives.size());
         }
-        std::printf("  the largest share of any one slot's texels under the threshold (%.2f): %.3f%%\n", DefaultWhitecap, 100.0 * BandShare);
-        Check(BandShare < 0.01, "under 1% of any band's texels: a band's own tile can't hold the sea's foam", BandShare, 0.01);
+        // (At 0.75: where the summed surface foams a few percent of the sea; foam_check section 3's
+        // summed share under it is several times this. Stage W3z: the shortest band, down to 10.7 cm,
+        // dips under it on its own ripples' crests, about 1.2% of its texels: the fine foam's, not
+        // the sea's crests.)
+        std::printf("  the largest share of any one slot's texels under J 0.75: %.3f%%\n", 100.0 * BandShare);
+        Check(BandShare < 0.02, "under 2% of any band's texels: a band's own tile can't hold the sea's foam", BandShare, 0.02);
     }
 
-    std::printf("\n3. The coverage at rest points (world space, as the clipmap's texels), 15 Hz for 20 s, whitecap %.2f, amount %.0f\n",
-        DefaultWhitecap, DefaultAmount);
+    std::printf("\n3. The coverage at rest points (world space, as the clipmap's texels), 15 Hz for 20 s, whitecap %.2f, amount %.0f, ramp %.2f\n",
+        DefaultWhitecap, DefaultAmount, DefaultRamp);
     {
         const double Winds[5] = { 7.0, 10.0, 14.0, 18.0, 25.0 };
         const int M = 20000, Steps = 300;
@@ -152,7 +157,9 @@ int main()
         std::vector<double> PX(M), PY(M);
         for (int n = 0; n < M; n++) { PX[n] = Pos(Rng); PY[n] = Pos(Rng); }
         const float Keep = float(std::exp(-Dt * VoxelOceanFoamDecayRate(float(DefaultAmount))));
-        const float GrowDt = float(VoxelOceanFoamGrowRate(float(DefaultAmount)) / VoxelOceanFoamDecayRate(float(DefaultAmount)) * (1.0 - Keep));
+        // (With the ramp: the steady state all of the foam at DefaultRamp under the threshold.)
+        const float GrowDt = float(VOXEL_OCEAN_FOAM_MAX / DefaultRamp * (1.0 - Keep));
+        double Partial = 0.0, Drawn = 0.0;
         std::vector<float> H(size_t(5) * M, 0.0f);
         double SummedMin10 = 10.0;
         // The trails: at 10 m/s, the points breaking at 10 s, their foam 1 s later against e^(-decay).
@@ -168,14 +175,15 @@ int main()
             for (int s = 0; s < 6; s++) GL[s] = EmulateGPU(Slots[s], Tick);
             for (int w = 0; w < 5; w++)
             {
-                const FGPUSlot G6 = EmulateGPU(Short[w][6], Tick), G7 = EmulateGPU(Short[w][7], Tick);
+                // (Band 3 as the clipmap reads it: the long arrays' copy, stage W3z.)
+                const FGPUSlot G6 = EmulateGPU(Short[w][6], Tick), G7 = LongCopy(EmulateGPU(Short[w][7], Tick));
                 double Wt[3];
                 StateWeights(Winds[w], Wt);
                 for (int n = 0; n < M; n++)
                 {
                     double Jxx = 0.0, Jyy = 0.0, Jxy = 0.0;
                     auto Add = [&](const FGPUSlot& G, double L, double Weight) {
-                        const F4 D = Bilinear(G.Derivatives, PX[n] / L * N, PY[n] / L * N), X = Bilinear(G.Displacement, PX[n] / L * N, PY[n] / L * N);
+                        const F4 D = Bilinear(G.Derivatives, PX[n] / L * G.N, PY[n] / L * G.N), X = Bilinear(G.Displacement, PX[n] / L * G.N, PY[n] / L * G.N);
                         Jxx += Weight * D.z; Jyy += Weight * D.w; Jxy += Weight * X.w;
                     };
                     for (int K = 0; K < 3; K++)
@@ -187,8 +195,13 @@ int main()
                     const float Source = VoxelOceanFoamSource(J, float(DefaultWhitecap));
                     float& Hn = H[size_t(w) * M + n];
                     Hn = VoxelOceanFoamStep(Hn, Source, GrowDt, Keep);
-                    if (Step >= Steps / 2) Coverage[w] += VoxelOceanFoamDrawn(Hn);
-                    if (w == 1 && Step == 150) { Breaking[n] = Source > 0.02f && Hn > 1.0f; At10[n] = Hn; }
+                    if (Step >= Steps / 2)
+                    {
+                        const float Dn = VoxelOceanFoamDrawn(Hn);
+                        Coverage[w] += Dn;
+                        if (w == 1 && Dn > 0.02f) { Drawn += 1.0; Partial += Dn < 0.8f ? 1.0 : 0.0; }
+                    }
+                    if (w == 1 && Step == 150) { Breaking[n] = Source > 0.02f && Hn > 0.5f; At10[n] = Hn; }
                     if (w == 1 && Step == 165 && Breaking[n])
                     {
                         // (Only the points that didn't break again in between: their foam at most the decayed.)
@@ -208,12 +221,96 @@ int main()
         Check(bRising, "it rises with the wind", Coverage[4] / std::max(Coverage[0], 1e-9), 1.0);
         Check(Coverage[1] > 0.005 && Coverage[1] < 0.08, "a few percent at 10 m/s (0.5% to 8%)", Coverage[1], 0.08);
         Check(Coverage[4] > 2.0 * Coverage[1], "a storm (25 m/s) at least twice that", Coverage[4] / Coverage[1], 2.0);
+        // Stage W3y: the ramp: most of the foam's area translucent (drawn under 0.8) at 10 m/s.
+        std::printf("  at 10 m/s, of the sea foamed at all (drawn over 0.02), %.0f%% partly (under 0.8)\n", 100.0 * Partial / std::max(Drawn, 1.0));
+        Check(Partial / std::max(Drawn, 1.0) > 0.9, "the ramp: the foam comes in gradually (most of its area translucent)", Partial / std::max(Drawn, 1.0), 0.9);
         // The trails: 1 s after breaking, at most the decayed foam on average (some break again), and
         // still there (it doesn't vanish at once).
         const double Ratio = TrailCount > 0 ? TrailSum / TrailFresh : 0.0;
         const double Decayed = std::exp(-1.0 * VoxelOceanFoamDecayRate(float(DefaultAmount)));
         std::printf("  breaking points 1 s on (%d of them): foam %.3f of what it was (the decay alone %.3f)\n", TrailCount, Ratio, Decayed);
         Check(TrailCount > 20 && Ratio > 0.5 * Decayed && Ratio < 0.6, "the foam a crest leaves fades as a trail", Ratio, 0.6);
+    }
+
+    std::printf("\n3c. A coarse texel's source (stage W3z; VoxelOceanFoamSourceSpread): the mean of the fine surface's over the\n"
+                "    texel, against the hard rule on the texel's own J (whitecap %.2f, chop 0.9; truth: 5 cm samples, band 3 on 512^2)\n", DefaultWhitecap);
+    {
+        bool bOk = true;
+        double WorstHard = 0.0;
+        for (double U : { 10.0, 18.0 })
+        {
+            FLayoutSettings A = S;
+            A.ShortWind = U;
+            const std::vector<FSlot> Sl = MakeSlots(A);
+            double Wt[3];
+            StateWeights(U, Wt);
+            const int K = U <= 10.0 ? 1 : 2;   // (one state at these winds)
+            const int Use[4] = { 2 * K, 2 * K + 1, 6, 7 };
+            const uint32_t Tick = TickOf(141.0);
+            FGPUSlot G[4];
+            double Var[4], MinL[4];
+            for (int b = 0; b < 4; b++)
+            {
+                G[b] = EmulateGPU(Sl[Use[b]], Tick);
+                const FBandStats St = StatsOf(Sl[Use[b]]);
+                Var[b] = (St.SlopeVarianceX + St.SlopeVarianceY) * (b < 2 ? Wt[K] * Wt[K] : 1.0);
+                MinL[b] = b < 3 ? 0.25 * Sl[Use[b + 1]].Params.TileLength : Sl[Use[3]].Params.TileLength * 4.0 / SizeOfBand(3);
+            }
+            auto JAt = [&](double X, double Y, double& Jxx, double& Jyy, double& Jxy)
+            {
+                Jxx = Jyy = Jxy = 0.0;
+                for (int b = 0; b < 4; b++)
+                {
+                    const double L = Sl[Use[b]].Params.TileLength, Wb = b < 2 ? Wt[K] : 1.0;
+                    const F4 D = Bilinear(G[b].Derivatives, X / L * G[b].N, Y / L * G[b].N), Xd = Bilinear(G[b].Displacement, X / L * G[b].N, Y / L * G[b].N);
+                    Jxx += Wb * D.z; Jyy += Wb * D.w; Jxy += Wb * Xd.w;
+                }
+            };
+            std::printf("  %2.0f m/s:", U);
+            for (double F : { 0.4, 0.8, 1.6, 3.2 })
+            {
+                const int M = std::max(8, int(std::lround(F / 0.05)));
+                double Unresolved = 0.0;
+                for (int b = 0; b < 4; b++) Unresolved += Var[b] * (1.0 - std::clamp(MinL[b] / (2.0 * F) - 1.0, 0.0, 1.0));
+                const double SigmaStats = VOXEL_OCEAN_FOAM_SPREAD_SCALE * 0.9 * std::sqrt(Unresolved);
+                std::mt19937 Rng(91);
+                std::uniform_real_distribution<double> Pos(0.0, 2.0e4);
+                double Truth = 0.0, Hard = 0.0, Spread = 0.0, SigmaSample = 0.0, SpreadCell = 0.0;
+                const int Cells = 300;
+                for (int c = 0; c < Cells; c++)
+                {
+                    const double X0 = Pos(Rng), Y0 = Pos(Rng);
+                    double Sxx = 0, Syy = 0, Sxy = 0, T = 0, J1 = 0, J2 = 0;
+                    for (int j = 0; j < M; j++)
+                        for (int i = 0; i < M; i++)
+                        {
+                            double Jxx, Jyy, Jxy;
+                            JAt(X0 + (i + 0.5) * F / M, Y0 + (j + 0.5) * F / M, Jxx, Jyy, Jxy);
+                            const double J = (1 + Jxx) * (1 + Jyy) - Jxy * Jxy;
+                            T += std::max(DefaultWhitecap - J, 0.0);
+                            J1 += J; J2 += J * J;
+                            Sxx += Jxx; Syy += Jyy; Sxy += Jxy;
+                        }
+                    const double Inv = 1.0 / (double(M) * M);
+                    Sxx *= Inv; Syy *= Inv; Sxy *= Inv;
+                    // (The texel's J: its derivatives' means, as its mips hold them.)
+                    const float JTexel = float((1 + Sxx) * (1 + Syy) - Sxy * Sxy);
+                    Truth += T * Inv;
+                    Hard += VoxelOceanFoamSource(JTexel, float(DefaultWhitecap));
+                    Spread += VoxelOceanFoamSourceSpread(JTexel, float(SigmaStats), float(DefaultWhitecap));
+                    const double SigmaCell = std::sqrt(std::max(J2 * Inv - (J1 * Inv) * (J1 * Inv), 0.0));
+                    SigmaSample += SigmaCell;
+                    SpreadCell += VoxelOceanFoamSourceSpread(JTexel, float(SigmaCell), float(DefaultWhitecap));
+                }
+                Truth /= Cells; Hard /= Cells; Spread /= Cells; SigmaSample /= Cells; SpreadCell /= Cells;
+                std::printf("  %.1f m: truth %.4f, hard %.4f, mean %.4f (sigma %.3f, in the cells %.3f: %.4f) |", F, Truth, Hard, Spread, SigmaStats, SigmaSample, SpreadCell);
+                bOk = bOk && std::abs(Spread - Truth) < 0.25 * Truth && std::abs(SpreadCell - Truth) < 0.08 * Truth;
+                WorstHard = std::max(WorstHard, std::abs(Hard - Truth) / std::max(Truth, 1e-9));
+            }
+            std::printf("\n");
+        }
+        Check(bOk, "the Gaussian mean holds the fine surface's: within 8% with each cell's own deviation, 25% from the bands' statistics", 0.0, 0.25);
+        std::printf("  (the hard rule on a texel's own J errs up to %.0f%%)\n", 100.0 * WorstHard);
     }
 
     std::printf("\n4b. The fine foam (stage W3w; VoxelOceanFFT.usf): Godot's rule in the shortest band's own tile, its J at the\n"
@@ -223,6 +320,7 @@ int main()
         const int Steps = 500, Slot = SlotCount - 1;
         const float Keep = float(std::exp(-Dt * VoxelOceanFoamDecayRate(float(FineAmount))));
         const float GrowDt = float(VoxelOceanFoamGrowRate(float(FineAmount)) / VoxelOceanFoamDecayRate(float(FineAmount)) * (1.0 - Keep));
+        const int N = SizeOfBand(Slots[Slot].Band);   // stage W3z: its own grid
         std::vector<float> F(size_t(N) * N, 0.0f);
         double Cover = 0.0, Mean = 0.0;
         for (int Step = 0; Step < Steps; Step++)

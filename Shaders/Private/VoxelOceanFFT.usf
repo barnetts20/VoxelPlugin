@@ -3,7 +3,11 @@
 // spectrum, the dispersion, the field packing and the butterflies are the shared code of
 // VoxelOceanSpectrum.ush, which the CPU's query cascades run too.
 //
-// THE PASSES (one dispatch each, over every slot at once; N = VOXEL_OCEAN_FFT_SIZE):
+// THE PASSES (one dispatch each, over a grid's slots at once; N = VOXEL_OCEAN_FFT_SIZE). Stage W3z:
+// two grids, the permutation VOXEL_OCEAN_FFT_FINE: 0 the long arrays' 256^2 (slots 0-6), 1 the
+// shortest band's own 512^2 (its slot alone, nine stages; VoxelOceanCascades.cpp copies its mip 1
+// into the long arrays' slice 7, so whatever reads those keeps band 3, at half its resolution).
+// Each dispatch's slot table holds its own slots only (the slot index here local).
 // 1. InitSpectrumCS, once per spectrum change: per slot and mode, h0(k) and conj(h0(-k)) into
 //    Spectrum (float4 per mode) and the mode's frequency multiple into Multiples. GPU-native:
 //    nothing is uploaded but the slot table.
@@ -11,7 +15,7 @@
 //    into Fields, two float4 per mode (slices 2 s and 2 s + 1).
 // 3. FFTCS twice per frame, in place over Fields: once along rows, once along columns (one
 //    thread group per line and slice, the line in groupshared memory). The row pass skips the
-//    rows a band leaves empty (most of them: a band holds |Kj| up to 17 of 128, the last 64);
+//    rows a band leaves empty (most of them: a band holds |Kj| up to 17 of 128, the last 128 of 256);
 //    they are zero and stay zero.
 // 4. AssembleCS: the spatial fields to the slot's output textures, the chop applied:
 //      Displacement = (chop Dx, chop Dy, eta, chop Dxy)      (m)
@@ -28,14 +32,28 @@
 //
 // Buffers, not textures, carry the intermediate data, so nothing needs typed UAV loads.
 // Element (slice, row, column) of Spectrum and Fields is at (slice N + row) N + column.
+//
+// The fine grid's permutation (the checks; the long one's are the plain entries):
+// VOXEL_SHADER_ENTRY cs_6_6 InitSpectrumCS VOXEL_OCEAN_FFT_FINE=1
+// VOXEL_SHADER_ENTRY cs_6_6 TimeStepCS VOXEL_OCEAN_FFT_FINE=1
+// VOXEL_SHADER_ENTRY cs_6_6 FFTCS VOXEL_OCEAN_FFT_FINE=1
+// VOXEL_SHADER_ENTRY cs_6_6 AssembleCS VOXEL_OCEAN_FFT_FINE=1
 
 #include "/Engine/Public/Platform.ush"
 #include "/Plugin/VoxelPlugin/Private/VoxelOceanSpectrum.ush"
 #include "/Plugin/VoxelPlugin/Private/VoxelOceanFoam.ush"
 
-#define VOXEL_OCEAN_FFT_SIZE 256
-#define VOXEL_OCEAN_FFT_HALF 128
+#ifndef VOXEL_OCEAN_FFT_FINE
+#define VOXEL_OCEAN_FFT_FINE 0
+#endif
+#if VOXEL_OCEAN_FFT_FINE
+#define VOXEL_OCEAN_FFT_SIZE VOXEL_OCEAN_FFT_FINE_SIZE
+#define VOXEL_OCEAN_FFT_STAGES 9
+#else
+#define VOXEL_OCEAN_FFT_SIZE VOXEL_OCEAN_FFT_LONG_SIZE
 #define VOXEL_OCEAN_FFT_STAGES 8
+#endif
+#define VOXEL_OCEAN_FFT_HALF (VOXEL_OCEAN_FFT_SIZE / 2)
 
 // One slot as the GPU reads it (FVoxelOceanSlotGPU in VoxelOceanSpectrum.h).
 struct FVoxelOceanSlotGPU
@@ -176,9 +194,10 @@ void FFTCS(uint3 Group : SV_GroupID, uint3 Thread : SV_GroupThreadID)
         Ns *= 2u;
     }
 
-    // Eight stages: the result is back in buffer 0.
-    FFTData[Base + T * FFTElementStride] = FFTShared[0][T];
-    FFTData[Base + (T + VOXEL_OCEAN_FFT_HALF) * FFTElementStride] = FFTShared[0][T + VOXEL_OCEAN_FFT_HALF];
+    // The result in the buffer the last stage wrote: 0 after eight stages, 1 after nine.
+    const uint Out = VOXEL_OCEAN_FFT_STAGES & 1u;
+    FFTData[Base + T * FFTElementStride] = FFTShared[Out][T];
+    FFTData[Base + (T + VOXEL_OCEAN_FFT_HALF) * FFTElementStride] = FFTShared[Out][T + VOXEL_OCEAN_FFT_HALF];
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -214,7 +233,8 @@ void AssembleCS(uint3 Id : SV_DispatchThreadID)
         const float J = (1.0f + Dxx) * (1.0f + Dyy) - Dxy * Dxy;
         F = VoxelOceanFoamStep(FoamState[Element], VoxelOceanFoamSource(J, FoamRule.x), FoamRule.z, FoamRule.y);
     }
-    FoamState[Element] = F;
+    // (Stage W3z: the long grid runs no foam; its state is a stand-in, never written.)
+    if (FoamOn != 0u) FoamState[Element] = F;
     FoamOut[Id] = float2(F, F * F);
 }
 

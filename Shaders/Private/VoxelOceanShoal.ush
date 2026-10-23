@@ -217,7 +217,7 @@ VOXEL_FUNC float VoxelOceanShoalComponent(float4 V, int B)
 VOXEL_FUNC float VoxelOceanShoalWavelength(int B, float Speed, float4 Tiles)
 {
     const float Peak = VOXEL_OCEAN_SHOAL_PEAK_LENGTH * Speed * Speed;
-    const float Shortest = B == 0 ? 0.25f * Tiles.y : (B == 1 ? 0.25f * Tiles.z : (B == 2 ? 0.25f * Tiles.w : Tiles.w * (4.0f / 256.0f)));
+    const float Shortest = B == 0 ? 0.25f * Tiles.y : (B == 1 ? 0.25f * Tiles.z : (B == 2 ? 0.25f * Tiles.w : Tiles.w * (4.0f / 512.0f)));
     const float Longest = B == 0 ? 0.5f * Tiles.x : 0.25f * VoxelOceanShoalComponent(Tiles, B);
     return clamp(Peak, Shortest, Longest);
 }

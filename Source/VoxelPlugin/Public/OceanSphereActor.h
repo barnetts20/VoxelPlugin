@@ -212,6 +212,16 @@ private:
     UPROPERTY(Transient)
     TObjectPtr<UTexture2DArray> WaveFoam;
 
+    /** Stage W3z: the shortest band's own cascade (displacement, derivatives, fine foam). */
+    UPROPERTY(Transient)
+    TObjectPtr<UTexture2DArray> WaveFineDisplacement;
+
+    UPROPERTY(Transient)
+    TObjectPtr<UTexture2DArray> WaveFineDerivatives;
+
+    UPROPERTY(Transient)
+    TObjectPtr<UTexture2DArray> WaveFineFoam;
+
     /** The radius WaveCharts was made for. */
     double WaveChartsRadius = 0.0;
 

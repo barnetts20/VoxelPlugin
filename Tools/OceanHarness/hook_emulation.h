@@ -212,7 +212,7 @@ inline FBands ChartLookups(const FTextures& Tx, FVoxelOceanChartCoords LongCoord
         const float LodD = std::log2(std::max(2.0f * Spacing * TexelsPerCm, 1.0f)) + Bias;   // VOXEL_OCEAN_FFT_MESH_TEXEL (O9b2)
         const float LodN = std::log2(std::max(Footprint * TexelsPerCm, 1.0f)) + Bias;
         if (LodD >= 8.0f && (!(Mask & 2u) || LodN >= 8.0f)) continue;   // VOXEL_OCEAN_FFT_TOP_MIP
-        const float Half = 0.5f * L / 256.0f;
+        const float Half = 0.5f * L / (B == 3 ? 512.0f : 256.0f);   // stage W3z: band 3 on the fine grid's texels
         const float2 E = B < 2 ? LongShore : ShortShore;
         const float Move = bShoal ? VoxelOceanShoalComponent(Shoal.Shift, B) : 0.0f;
         const float2 Warp(E.x * Move, E.y * Move);

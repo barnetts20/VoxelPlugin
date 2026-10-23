@@ -21,6 +21,12 @@ Ocean harnesses (stages O1-O4, O6a, O6b, O7, O8, O9a-O9c). Plain C++20; no engin
   spectrum_view.cpp         O6a: pictures of the sea from the emulated cascades (perspective from an
                             altitude, top-down relief), with or without detiling
   ocean_fft_emulation.h     VoxelOceanFFT.usf's passes in float, shared by the two above (and eq_check)
+  godot_match.cpp           W4a: our foam against GodotOceanWaves' at its demo's defaults: its foamy cascades emulated as
+                            it runs them (1024^2, whole spectra, chop 1, at its height: sqrt(8) the spectrum's), their
+                            coverage, and the whitecap thresholds giving ours the same at the spectrum's height and at
+                            Godot's (the preset's defaults). Informational; about 3 minutes.
+      g++ -O2 -std=c++20 -ffp-contract=off -I<plugin>/Source/VoxelPlugin/Public -I<plugin>/Source/VoxelPlugin/Private
+          -I<plugin>/Shaders/Private -I. godot_match.cpp -o godot_match
   spray_check.cpp           W3x: the spray's maths (VoxelOceanSpray.ush, GodotOceanWaves' sea spray): the
                             birth's thresholds and sizes, the rise, the splash's shape, the fade, the
                             dissolve, a storm's budget against the ring
@@ -88,10 +94,10 @@ Ocean harnesses (stages O1-O4, O6a, O6b, O7, O8, O9a-O9c). Plain C++20; no engin
                             mesh, the trains' fade by the mesh, the bores' least front, the foam, the bound
       g++ -O2 -std=c++20 -ffp-contract=off -I<plugin>/Source/VoxelPlugin/Public -I<plugin>/Source/VoxelPlugin/Private
           -I<plugin>/Shaders/Private surf_check.cpp -o surf_check
-  foam_check.cpp            O9b: the open sea's foam (VoxelOceanFoam.ush: the per-slot envelope, the point's combination) on
-                            the emulated cascades with the runtime's layout and the hook's detiling, weights and mips (the
-                            spread estimate, coverage against the calibration from 5 to 25 m/s, its evenness over the
-                            detiling lattice and with distance, the trails, the coverage setting) and the surf's foam
+  foam_check.cpp            W3v-W3z: the open sea's foam (VoxelOceanFoam.ush: GodotOceanWaves' rule, its cap of 1 and drawing)
+                            on the emulated cascades with the runtime's layout (why on the clipmap, coverage and trails at the
+                            ramp, a coarse texel's mean source against the fine surface's (3c), the fine foam in the shortest
+                            band's own 512^2 tile) and the surf's foam
                             (VoxelOceanSurf.ush: bores, no step at the trough, the mean unresolved, the swash's edge, off)
       g++ -O2 -std=c++20 -ffp-contract=off -I<plugin>/Source/VoxelPlugin/Public -I<plugin>/Source/VoxelPlugin/Private
           -I<plugin>/Shaders/Private -I. foam_check.cpp -o foam_check

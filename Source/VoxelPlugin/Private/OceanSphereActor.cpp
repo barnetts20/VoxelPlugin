@@ -501,6 +501,7 @@ void AOceanSphereActor::UpdateSurfacePass()
     Params.FoamDetail = S.FoamDetail;
     Params.FoamDetailDistanceM = S.FoamDetailDistance;
     Params.bCubicFiltering = S.bCubicFiltering;
+    Params.Anisotropy = S.WaveAnisotropy;
     if (Params.SprayAmount > 0.0f && bHasCamera)
     {
         FVector Wind, Swell;
@@ -990,17 +991,24 @@ void AOceanSphereActor::InitializeInternal(TSharedPtr<FDensitySampleCompositor> 
 
     // The FFT cascades' textures: the arrays once, the chart table again for a new radius (the
     // underwater pass keeps its own references to the old one's RHI texture until replaced).
-    if (FApp::CanEverRender() && (!WaveDisplacement || !WaveDerivatives || !WaveFoam || !WaveCharts || WaveChartsRadius != OceanRadius))
+    if (FApp::CanEverRender() && (!WaveDisplacement || !WaveDerivatives || !WaveFoam || !WaveCharts || !WaveFineDisplacement
+        || !WaveFineDerivatives || !WaveFineFoam || WaveChartsRadius != OceanRadius))
     {
         FVoxelOceanCascadeTextures Made;
         Made.Displacement = WaveDisplacement.Get();
         Made.Derivatives = WaveDerivatives.Get();
         Made.Foam = WaveFoam.Get();
+        Made.FineDisplacement = WaveFineDisplacement.Get();
+        Made.FineDerivatives = WaveFineDerivatives.Get();
+        Made.FineFoam = WaveFineFoam.Get();
         if (VoxelOceanCascades::MakeTextures(this, VoxelOceanCharts::Build(OceanRadius), Made))
         {
             WaveDisplacement = Made.Displacement;
             WaveDerivatives = Made.Derivatives;
             WaveFoam = Made.Foam;
+            WaveFineDisplacement = Made.FineDisplacement;
+            WaveFineDerivatives = Made.FineDerivatives;
+            WaveFineFoam = Made.FineFoam;
             WaveCharts = Made.Charts;
             WaveChartsRadius = OceanRadius;
         }
@@ -1027,6 +1035,9 @@ void AOceanSphereActor::InitializeInternal(TSharedPtr<FDensitySampleCompositor> 
         Settings.CascadeTextures.Derivatives = WaveDerivatives.Get();
         Settings.CascadeTextures.Charts = WaveCharts.Get();
         Settings.CascadeTextures.Foam = WaveFoam.Get();
+        Settings.CascadeTextures.FineDisplacement = WaveFineDisplacement.Get();
+        Settings.CascadeTextures.FineDerivatives = WaveFineDerivatives.Get();
+        Settings.CascadeTextures.FineFoam = WaveFineFoam.Get();
     }
     if (!Surface.IsValid())
         Surface = MakeShared<FVoxelOceanSurface>();
@@ -1157,6 +1168,7 @@ FVoxelOceanSurfaceInputs AOceanSphereActor::GatherInputs(const AAdaptiveVoxelAct
     // The foam (stage W3v): a whitecap threshold of 0 makes none.
     Inputs.Waves.FoamWhitecap = S.bFoam ? S.FoamWhitecap : 0.0;
     Inputs.Waves.FoamAmount = S.FoamAmount;
+    Inputs.Waves.FoamRamp = S.FoamRamp;
     Inputs.Waves.FineFoamWhitecap = S.bFoam ? S.FineFoamWhitecap : 0.0;
     Inputs.Waves.FineFoamAmount = S.FineFoamAmount;
     Inputs.Waves.UpdateRate = S.WaveUpdateRate;

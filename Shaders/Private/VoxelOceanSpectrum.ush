@@ -50,9 +50,16 @@
 // MakeSlot (VoxelOceanSpectrum.h) caps every band below it (omega < 25 rad/s, wavelengths
 // above 10 cm).
 #define VOXEL_OCEAN_MAX_MULTIPLE 4096
+// The cascades' grids (stage W3z): the long bands' and band 2's slots on 256^2 (they hold modes
+// up to about 17 grid steps), the shortest band's on its own 512^2 (as GodotOceanWaves' finest
+// cascade has its own map), its spectrum reaching TopSamples (4) texels of it: 10.7 cm on the
+// default 13.7 m tile, its fine foam 2.7 cm a texel.
+#define VOXEL_OCEAN_FFT_LONG_SIZE 256
+#define VOXEL_OCEAN_FFT_FINE_SIZE 512
 // The wave equalizer (stage W3k): gains on the waves' height at the wavelengths 2^n m, n from
 // VOXEL_OCEAN_EQ_LOW (25 cm) to VOXEL_OCEAN_EQ_LOW + VOXEL_OCEAN_EQ_KNOTS - 1 (1,024 m), one per
-// octave. Every band's modes lie between them (21 cm to 997 m at the default layout).
+// octave. The bands' modes lie between them (10.7 cm to 997 m at the default layout; under 25 cm
+// the first knot's gain).
 #define VOXEL_OCEAN_EQ_KNOTS 13
 #define VOXEL_OCEAN_EQ_LOW -2
 

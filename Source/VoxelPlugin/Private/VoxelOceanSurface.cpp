@@ -105,6 +105,12 @@ namespace VoxelOceanSurfaceDetail
      *  VoxelOceanFoam.ush's VoxelOceanFoamGrowRate and VoxelOceanFoamDecayRate). */
     double FoamGrowRate(double Amount) { return 7.5 * FMath::Max(Amount, 0.0); }
     double FoamDecayRate(double Amount) { return 1.15 * FMath::Max(0.5, 10.0 - FMath::Max(Amount, 0.0)); }
+    /** The most foam a texel holds (VOXEL_OCEAN_FOAM_MAX: 1, Godot's per cascade; stage W3z). */
+    constexpr double FoamMax = 1.0;
+    /** Stage W3y: the foam's steady state per unit of compression past the threshold (its fresh
+     *  gain): with a ramp, all of it (FoamMax) the ramp's span of J under the threshold; 0, Godot's
+     *  (its growth over its decay). */
+    double FoamGainOf(double Ramp, double Amount) { return Ramp > 0.0 ? FoamMax / Ramp : FoamGrowRate(Amount) / FoamDecayRate(Amount); }
 }
 
 namespace VOS = VoxelOceanSurfaceDetail;
@@ -486,6 +492,7 @@ void FVoxelOceanSurface::Tick(const FVector& Camera)
     // Stage W3w: at a fixed rate (GodotOceanWaves updates its cascades at 50 Hz): the clock held to
     // the rate's steps, the FFTs run only when it reaches the next; with the fine foam (the
     // shortest band's own: its threshold, Godot's rates for its amount, its slot).
+    bCascadesStepped = false;
     if (FFTModel.IsValid() && Cascades.IsValid())
     {
         const double Rate = FMath::Max(Inputs.Waves.UpdateRate, 0.0);
@@ -497,6 +504,7 @@ void FVoxelOceanSurface::Tick(const FVector& Camera)
             Cascades->Update(VoxelOceanSpectrum::TickOf(WaveTime), WaveTime, FineFoam);
             CascadeTime = WaveTime;
             bCascadeTime = true;
+            bCascadesStepped = true;
         }
     }
     const double Now = FPlatformTime::Seconds();
@@ -940,7 +948,8 @@ void FVoxelOceanSurface::UpdateMaterial()
         // The foam's settings live (the model doesn't rebuild for them): the surf's row 16. Stage
         // W3v (VoxelOceanFoam.ush): x the fresh gain (Godot's growth over its decay), z the whitecap
         // threshold.
-        Waves.Surf[1].X = (float)(VOS::FoamGrowRate(Inputs.Waves.FoamAmount) / VOS::FoamDecayRate(Inputs.Waves.FoamAmount));
+        // (Stage W3y: its gain by the ramp, VOS::FoamGainOf.)
+        Waves.Surf[1].X = (float)VOS::FoamGainOf(Inputs.Waves.FoamRamp, Inputs.Waves.FoamAmount);
         Waves.Surf[1].Y = (float)FMath::Max(Inputs.Waves.SurfFoam, 0.0);
         Waves.Surf[1].Z = (float)FMath::Clamp(Inputs.Waves.FoamWhitecap, 0.0, 1.0);
         // The debug view (stage O9f; row 18 w).
@@ -1019,6 +1028,9 @@ void FVoxelOceanSurface::UpdateMaterial()
             D.Charts = Textures.Charts ? Textures.Charts->GetResource() : nullptr;
             D.Shore = Inputs.ShoreTexture ? Inputs.ShoreTexture->GetResource() : nullptr;
             D.Foam = Textures.Foam ? Textures.Foam->GetResource() : nullptr;
+            D.FineDisplacement = Textures.FineDisplacement ? Textures.FineDisplacement->GetResource() : nullptr;
+            D.FineDerivatives = Textures.FineDerivatives ? Textures.FineDerivatives->GetResource() : nullptr;
+            D.FineFoam = Textures.FineFoam ? Textures.FineFoam->GetResource() : nullptr;
         }
         Pages->SetDisplaceFrame(D);
         // The wave clipmap (stage O9k): its levels around the selection camera this frame, and its
@@ -1028,7 +1040,9 @@ void FVoxelOceanSurface::UpdateMaterial()
             const FVoxelOceanCascadeTextures& Textures = Cascades->GetTextures();
             // (Stage W3v: the foam steps on the ocean's clock by Godot's rates for the foam amount.)
             Pages->UpdateClipmap(SelectionCamera, D, Textures.Foam ? Textures.Foam->GetResource() : nullptr, Inputs.Time,
-                VOS::FoamDecayRate(Inputs.Waves.FoamAmount), VOS::FoamGrowRate(Inputs.Waves.FoamAmount));
+                VOS::FoamDecayRate(Inputs.Waves.FoamAmount), VOS::FoamGainOf(Inputs.Waves.FoamRamp, Inputs.Waves.FoamAmount) * VOS::FoamDecayRate(Inputs.Waves.FoamAmount),
+                bCascadesStepped || !bCascadeTime);
+            bCascadesStepped = false;
             if (!bClipBound)
             {
                 Material->SetTextureParameterValue(VOS::ClipDisplacementName, Pages->GetClipDisplacement());

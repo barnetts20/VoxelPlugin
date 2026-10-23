@@ -177,7 +177,7 @@ int main()
                 for (int i = -R; i <= R; i++)
                     if (VoxelShader::VoxelOceanInBand(S.Params, i, j)) { const double K = std::hypot(i, j) * Dk; KLo = std::min(KLo, K); KHi = std::max(KHi, K); }
             const bool In = KLo >= S.KMin * (1 - 1e-6) && KHi < S.KMax;
-            const bool NoNyquist = R < GPUSize / 2;
+            const bool NoNyquist = R < SizeOfBand(S.Band) / 2;
             std::printf("  slot %d: modes |k| %.5f .. %.5f within [%.5f, %.5f)  %s\n", s, KLo, KHi, S.KMin, S.KMax, In && NoNyquist ? "" : "<-");
             Ok = Ok && In && NoNyquist;
         }
@@ -282,9 +282,10 @@ int main()
             double Err[8] = {}, Mag[8] = {};
             for (int k = 0; k < 40; k++)
             {
-                const int i = Rng() % GPUSize, j = Rng() % GPUSize;
-                const FTruth R = T.At(i * L / GPUSize, j * L / GPUSize, Tick);
-                const F4 D = GPU[s].Displacement[size_t(j) * GPUSize + i], G = GPU[s].Derivatives[size_t(j) * GPUSize + i];
+                const int N = GPU[s].N;
+                const int i = Rng() % N, j = Rng() % N;
+                const FTruth R = T.At(i * L / N, j * L / N, Tick);
+                const F4 D = GPU[s].Displacement[size_t(j) * N + i], G = GPU[s].Derivatives[size_t(j) * N + i];
                 const double Got[8] = { D.z, D.x / Chop, D.y / Chop, G.x, G.y, G.z / Chop, G.w / Chop, D.w / Chop };
                 const double Want[8] = { R.Eta, R.Dx, R.Dy, R.EtaX, R.EtaY, R.Dxx, R.Dyy, R.Dxy };
                 for (int f = 0; f < 8; f++) { Err[f] = std::max(Err[f], std::fabs(Got[f] - Want[f])); Mag[f] = std::max(Mag[f], std::fabs(Want[f])); }
@@ -405,7 +406,7 @@ int main()
                 MH = std::max(MH, std::fabs(R.Eta)); MG = std::max(MG, std::hypot(R.EtaX, R.EtaY)); MV = std::max(MV, std::fabs(R.EtaT));
                 MDG = std::max({ MDG, std::fabs(Chop * R.Dxx), std::fabs(Chop * R.Dyy) });
                 MVH = std::max(MVH, std::hypot(Chop * R.DxT, Chop * R.DyT));
-                const F4 B = Bilinear(GPU[s].Displacement, X / L * GPUSize, Y / L * GPUSize);
+                const F4 B = Bilinear(GPU[s].Displacement, X / L * GPU[s].N, Y / L * GPU[s].N);
                 GH = std::max(GH, double(std::fabs(B.z - S.Height)));
                 GD = std::max(GD, double(std::hypot(B.x - S.DisplacementX, B.y - S.DisplacementY)));
             }
@@ -455,7 +456,7 @@ int main()
             for (int b = 0; b < 4; b++)
             {
                 const double L = S2[Use[b]].Params.TileLength;
-                const F4 D = Bilinear(G[b].Displacement, X / L * GPUSize, Y / L * GPUSize), R = Bilinear(G[b].Derivatives, X / L * GPUSize, Y / L * GPUSize);
+                const F4 D = Bilinear(G[b].Displacement, X / L * G[b].N, Y / L * G[b].N), R = Bilinear(G[b].Derivatives, X / L * G[b].N, Y / L * G[b].N);
                 Dxx += R.z; Dyy += R.w; Dxy += D.w; H += D.z;
             }
             const double J = (1 + Dxx) * (1 + Dyy) - Dxy * Dxy;
@@ -490,14 +491,14 @@ int main()
                     const float Wt[3] = { T.Weight.x, T.Weight.y, T.Weight.z };
                     for (int c = 0; c < 3; c++)
                     {
-                        H += Wt[c] * Bilinear(GPU[Use[b]].Displacement, (X + O[c].x) / L * GPUSize, (Y + O[c].y) / L * GPUSize).z;
-                        Sx += Wt[c] * Bilinear(GPU[Use[b]].Derivatives, (X + O[c].x) / L * GPUSize, (Y + O[c].y) / L * GPUSize).x;
+                        H += Wt[c] * Bilinear(GPU[Use[b]].Displacement, (X + O[c].x) / L * GPU[Use[b]].N, (Y + O[c].y) / L * GPU[Use[b]].N).z;
+                        Sx += Wt[c] * Bilinear(GPU[Use[b]].Derivatives, (X + O[c].x) / L * GPU[Use[b]].N, (Y + O[c].y) / L * GPU[Use[b]].N).x;
                     }
                 }
                 else
                 {
-                    H += Bilinear(GPU[Use[b]].Displacement, X / L * GPUSize, Y / L * GPUSize).z;
-                    Sx += Bilinear(GPU[Use[b]].Derivatives, X / L * GPUSize, Y / L * GPUSize).x;
+                    H += Bilinear(GPU[Use[b]].Displacement, X / L * GPU[Use[b]].N, Y / L * GPU[Use[b]].N).z;
+                    Sx += Bilinear(GPU[Use[b]].Derivatives, X / L * GPU[Use[b]].N, Y / L * GPU[Use[b]].N).x;
                 }
             }
             if (SlopeX) *SlopeX = Sx;

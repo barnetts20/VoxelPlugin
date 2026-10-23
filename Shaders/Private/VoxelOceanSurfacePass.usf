@@ -23,6 +23,8 @@
 // VOXEL_SHADER_ENTRY ps_6_6 SurfacePS VOXEL_OCEAN_SURFACE_VELOCITY=1
 
 #include "/Engine/Private/Common.ush"
+// Stage W3z: the shortest band from its own 512^2 cascade near the camera (VoxelOceanWaves.ush).
+#define VOXEL_OCEAN_FINE_CASCADE 1
 #include "/Plugin/VoxelPlugin/Private/VoxelOceanPixelClip.ush"
 #include "/Plugin/VoxelPlugin/Private/VoxelOceanFoamTex.ush"
 #include "/Plugin/VoxelPlugin/Private/VoxelOceanShading.ush"
@@ -111,6 +113,13 @@ Texture2DArray SurfaceClipWhitecap;
 Texture2DArray SurfaceCascadeFoam;
 SamplerState SurfaceCascadeFoamSampler;
 float4 SurfacePixelFoam;
+// Stage W3z: the fine cascade (the shortest band's own 512^2 grid, one slice each; read with the
+// displacement's, the derivatives' and the cascade foam's samplers).
+Texture2DArray SurfaceFineDisplacement;
+Texture2DArray SurfaceFineDerivatives;
+Texture2DArray SurfaceFineFoam;
+// Stage W3y: x the anisotropic filter's most lookups along a pixel's longer axis (1: none).
+float4 SurfaceFilter;
 // Stage W3h: x the crest glow's strength (0 none), y the whitecaps' relief gain; stage W3l: z the
 // intersection foam's strength (0 none), w its reach (cm).
 float4 SurfaceCrest;
@@ -233,8 +242,10 @@ void SurfacePS(float4 SvPosition : SV_POSITION,
     // -- The surface ---------------------------------------------------------------------------
     const float3 Up = normalize(SamplePoint - SurfaceCenter);
     const float Footprint = max(length(ddx(SamplePoint)), length(ddy(SamplePoint)));
-    // (Stage W3u: the narrower axis too, for the cubic filter: across a grazing view.)
+    // (Stage W3u: the narrower axis too, for the cubic filter: across a grazing view; stage W3y: the
+    // longer one's vector, for the anisotropic filter.)
     const float FootprintAcross = min(length(ddx(SamplePoint)), length(ddy(SamplePoint)));
+    const float3 FootprintMajor = length(ddx(SamplePoint)) >= length(ddy(SamplePoint)) ? ddx(SamplePoint) : ddy(SamplePoint);
     float3 N = Up;
     float SlopeVariance = 0.0f;
     float Foam = 0.0f;
@@ -249,9 +260,9 @@ void SurfacePS(float4 SvPosition : SV_POSITION,
         // The clipmap's normal with the FFT's detail, its foam and whitecaps; near the camera the
         // waves' own foam and whitecaps at the pixel (stage W3u: as GodotOceanWaves looks its
         // cascades' foam up per pixel), the lookups cubic where magnified.
-        const FVoxelOceanPixelSurf C = VoxelOceanPixelSurfOf(SamplePoint, Footprint, FootprintAcross, DepthLand.x, length(Rel), W, SurfaceDisplacement,
-            SurfaceDisplacementSampler, SurfaceDerivatives, SurfaceDerivativesSampler, SurfaceCharts, SurfaceCascadeFoam, SurfaceCascadeFoamSampler,
-            SurfaceClipDisplacement, SurfaceClipNormal, SurfaceClipWhitecap, SurfaceClipSampler, SurfaceClipInfo, SurfacePixelFoam);
+        const FVoxelOceanPixelSurf C = VoxelOceanPixelSurfOf(SamplePoint, Footprint, FootprintAcross, FootprintMajor, SurfaceFilter.x, DepthLand.x, length(Rel), W, SurfaceDisplacement,
+            SurfaceDisplacementSampler, SurfaceDerivatives, SurfaceDerivativesSampler, SurfaceCharts, SurfaceFineDisplacement, SurfaceFineDerivatives,
+            SurfaceCascadeFoam, SurfaceCascadeFoamSampler, SurfaceFineFoam, SurfaceClipDisplacement, SurfaceClipNormal, SurfaceClipWhitecap, SurfaceClipSampler, SurfaceClipInfo, SurfacePixelFoam);
         N = C.Normal;
         SlopeVariance = C.SlopeVariance;
         Foam = C.Foam;

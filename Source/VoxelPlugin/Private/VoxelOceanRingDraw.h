@@ -36,6 +36,10 @@ struct FVoxelOceanRingDrawFrame
     FRHITexture* Charts = nullptr;
     /** Stage W3u: the cascades' foam envelopes (null: none). */
     FRHITexture* Foam = nullptr;
+    /** Stage W3z: the shortest band's own cascade (VoxelOceanCascades' fine arrays; null: none). */
+    FRHITexture* FineDisplacement = nullptr;
+    FRHITexture* FineDerivatives = nullptr;
+    FRHITexture* FineFoam = nullptr;
     /** The wave clipmap's textures, when it ran this frame (bClip). */
     bool bClip = false;
     FRHITexture* ClipDisplacement = nullptr;

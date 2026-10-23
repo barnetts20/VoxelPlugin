@@ -113,6 +113,11 @@ struct FVoxelOceanDisplaceFrame
     /** Stage W3u: the cascades' foam envelopes (VoxelOceanCascades' foam texture; null: none), for
      *  the ocean's own pass's foam per pixel. */
     FTextureResource* Foam = nullptr;
+    /** Stage W3z: the shortest band's own cascade (VoxelOceanCascades' fine arrays; null: none),
+     *  for the ocean's own pass. */
+    FTextureResource* FineDisplacement = nullptr;
+    FTextureResource* FineDerivatives = nullptr;
+    FTextureResource* FineFoam = nullptr;
 };
 
 /** The wave clipmap (stages O9k, W1; VoxelOceanClip.ush, VoxelOceanClipmap.h): the composed sea
@@ -204,9 +209,11 @@ public:
      *  textures) and the open sea's foam texture; their beds sampled again where they moved or the
      *  terrain changed. */
     /** OceanTime: the ocean's clock (s); FoamDecayPerSecond and FoamGrowthPerSecond: the foam's
-     *  rates (stage W3v, VoxelOceanFoam.ush: GodotOceanWaves' rule; a decay of 0: no foam buffer). */
+     *  rates (stage W3v, VoxelOceanFoam.ush: GodotOceanWaves' rule; a decay of 0: no foam buffer).
+     *  bWavesStepped (stage W3y): the cascades stepped this frame; else only the levels that must
+     *  be (new, edited, moved past their slack) are evaluated, the others wait for the next step. */
     void UpdateClipmap(const FVector& CameraPlanet, const FVoxelOceanDisplaceFrame& Waves, FTextureResource* Foam,
-        double OceanTime = 0.0, double FoamDecayPerSecond = 0.0, double FoamGrowthPerSecond = 0.0);
+        double OceanTime = 0.0, double FoamDecayPerSecond = 0.0, double FoamGrowthPerSecond = 0.0, bool bWavesStepped = true);
 
     /** Game thread (stage W1). An edit's sphere (planet frame, cm) that the depths now carry (the
      *  surface's: once the terrain's edit data, and the land surface cache, hold it): the static
@@ -364,7 +371,8 @@ private:
     FVoxelOceanClipSettings ClipSettings;
     TStrongObjectPtr<UTexture2DArray> ClipDisplacement;
     TStrongObjectPtr<UTexture2DArray> ClipNormal;
-    /** Stage W3h: the whitecaps' density per level (PF_G16R16F; the own pass reads it). */
+    /** Stage W3h: the whitecaps' density per level; stage W3u: PF_FloatRGBA, with the foam, the
+     *  surf's zone and the open sea's source (VoxelOceanClip.usf; the own pass reads it). */
     TStrongObjectPtr<UTexture2DArray> ClipWhitecap;
     TStrongObjectPtr<UTexture2D> ClipInfo;
     TUniquePtr<FVoxelOceanClipPlan> ClipPlan;

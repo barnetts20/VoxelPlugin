@@ -103,6 +103,10 @@ BEGIN_SHADER_PARAMETER_STRUCT(FVoxelOceanSurfaceParameters, )
     SHADER_PARAMETER_TEXTURE(Texture2DArray, SurfaceCascadeFoam)
     SHADER_PARAMETER_SAMPLER(SamplerState, SurfaceCascadeFoamSampler)
     SHADER_PARAMETER(FVector4f, SurfacePixelFoam)
+    SHADER_PARAMETER_TEXTURE(Texture2DArray, SurfaceFineDisplacement)
+    SHADER_PARAMETER_TEXTURE(Texture2DArray, SurfaceFineDerivatives)
+    SHADER_PARAMETER_TEXTURE(Texture2DArray, SurfaceFineFoam)
+    SHADER_PARAMETER(FVector4f, SurfaceFilter)
     SHADER_PARAMETER(FVector4f, SurfaceCrest)
     SHADER_PARAMETER(FVector3f, SurfaceScattering)
     SHADER_PARAMETER(FVector3f, SurfaceExtinction)
@@ -478,13 +482,20 @@ void FVoxelOceanSurfacePass::Render_RenderThread(FPostOpaqueRenderParameters& Pa
         FMath::Max(Params.IntersectionFoam, 0.0f), FMath::Max(Params.IntersectionFoamWidthM, 0.1f) * 100.0f);
     P->SurfaceClipWhitecap = Rings.bClip && Rings.ClipWhitecap ? Rings.ClipWhitecap : GBlackArrayTexture->TextureRHI.GetReference();
     // Stage W3u: the foam per pixel near the camera; x its strength, y its reach (cm), z foam on, w the
-    // cubic filtering. (Stage W3v: the cascades' foam texture is no longer read; bound for the
-    // evaluation's signature.)
+    // cubic filtering. (Stage W3w: the cascades' foam texture holds the fine foam, slice 7.)
     const bool bCascadeFoam = bFFT && Params.bFoam;
     P->SurfaceCascadeFoam = Rings.Foam ? Rings.Foam : GBlackArrayTexture->TextureRHI.GetReference();
+    // Stage W3z: the shortest band's own 512^2 cascade (the pass reads band 3 from it; without it,
+    // none of band 3 near the camera: the cascades make it with the others).
+    const bool bFine = bFFT && Rings.FineDisplacement && Rings.FineDerivatives && Rings.FineFoam;
+    P->SurfaceFineDisplacement = bFine ? Rings.FineDisplacement : GBlackArrayTexture->TextureRHI.GetReference();
+    P->SurfaceFineDerivatives = bFine ? Rings.FineDerivatives : GBlackArrayTexture->TextureRHI.GetReference();
+    P->SurfaceFineFoam = bFine ? Rings.FineFoam : GBlackArrayTexture->TextureRHI.GetReference();
     P->SurfaceCascadeFoamSampler = TStaticSamplerState<SF_Trilinear, AM_Wrap, AM_Wrap, AM_Clamp>::GetRHI();
     P->SurfacePixelFoam = FVector4f(FMath::Clamp(Params.FoamDetail, 0.0f, 1.0f), FMath::Max(Params.FoamDetailDistanceM, 1.0f) * 100.0f,
         bCascadeFoam ? 1.0f : 0.0f, Params.bCubicFiltering ? 1.0f : 0.0f);
+    // Stage W3y: the anisotropic filter's most lookups along a pixel's longer axis.
+    P->SurfaceFilter = FVector4f((float)FMath::Clamp(Params.Anisotropy, 1, 16), 0.0f, 0.0f, 0.0f);
 
     // The water, per cm.
     const FVector3f Scattering = Params.Scattering * 0.01f;

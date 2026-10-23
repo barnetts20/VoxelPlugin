@@ -59,7 +59,7 @@ struct FVoxelOceanShadingParams
 
     /** The short waves' slope variance (both axes) the wave bands don't hold; the refraction's
      *  strength (0: none); the foam on and its albedo. */
-    float ShortWaveSlopeVariance = 0.004f;
+    float ShortWaveSlopeVariance = 0.001f;
     float Refraction = 1.0f;
     bool bFoam = true;
     FVector3f FoamAlbedo = FVector3f(0.85f, 0.85f, 0.85f);
@@ -77,6 +77,8 @@ struct FVoxelOceanShadingParams
     float FoamDetail = 1.0f;
     float FoamDetailDistanceM = 250.0f;
     bool bCubicFiltering = true;
+    /** Stage W3y: the clipmap's lookups along a pixel's longer axis at grazing views (1: none). */
+    int32 Anisotropy = 4;
     /** The foam's texture set (stage W3g; null or not ready: the procedural lace) and its tile (m). */
     TSharedPtr<FVoxelOceanFoamTexture, ESPMode::ThreadSafe> FoamTexture;
     float FoamTileM = 12.0f;

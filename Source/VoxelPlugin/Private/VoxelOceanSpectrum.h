@@ -4,12 +4,14 @@
 // of VoxelOceanSpectrum.ush, which the GPU passes (VoxelOceanFFT.usf) run too, so the CPU
 // evolves the same numbers the GPU draws.
 //
-// THE LAYOUT (MakeSlots): eight slots of 256^2 on the GPU.
+// THE LAYOUT (MakeSlots): eight slots on the GPU, seven of 256^2 and the shortest band's of 512^2
+// (stage W3z: SizeOfBand; VOXEL_OCEAN_FFT_LONG_SIZE and _FINE_SIZE, VoxelOceanSpectrum.ush).
 // - Four bands with tile sides about 1,000, 250, 60 and 14 m, chosen non-commensurate (997,
 //   241, 59, 13.7 by default). Band b keeps the modes with BoundaryK(b) <= |k| < BoundaryK(b+1):
 //   the lower edge is BoundaryModes (4) times the band's own fundamental, so a band never uses
 //   its sparse first rings, which the longer band covers; the top of the last band keeps
-//   TopSamples (4) grid samples per wavelength. The bottom of band 0 is its fundamental.
+//   TopSamples (4) samples of its own grid per wavelength (10.7 cm on 512^2). The bottom of band
+//   0 is its fundamental.
 // - The two long bands (0, 1) at three sea states (winds of 5, 10 and 18 m/s by default): slots
 //   0-5, state-major (slot = 2 state + band). The short bands (2, 3) once, at ShortWind: slots
 //   6 and 7. Sea states of one band share its seed, so they hold the same waves at different
@@ -43,7 +45,10 @@ namespace VoxelShader
 
 namespace VoxelOceanSpectrum
 {
-    constexpr int GPUSize = 256;
+    /** The long arrays' grid (slots 0-6, and the shortest band's copy at half its resolution in
+     *  slice 7); the shortest band's own (stage W3z). */
+    constexpr int GPUSize = VOXEL_OCEAN_FFT_LONG_SIZE;
+    constexpr int FineSize = VOXEL_OCEAN_FFT_FINE_SIZE;
     constexpr int SlotCount = 8;
     constexpr int BandCount = 4;
     constexpr int StateCount = 3;
@@ -51,6 +56,10 @@ namespace VoxelOceanSpectrum
     constexpr double Gravity = 9.80665;
     constexpr double LoopPeriod = 1024.0;
     constexpr double Omega0 = 2.0 * Pi / LoopPeriod;
+    static_assert(FineSize == 2 * GPUSize, "the long arrays' slice 7 is the fine grid's mip 1");
+
+    /** A band's grid on the GPU (stage W3z): the shortest band's its own, finer. */
+    inline constexpr int SizeOfBand(int Band) { return Band == BandCount - 1 ? FineSize : GPUSize; }
 
     /** The layout's settings (FVoxelOceanSettings feeds them in O6b). */
     struct FLayoutSettings
@@ -95,7 +104,7 @@ namespace VoxelOceanSpectrum
     inline double BoundaryK(const FLayoutSettings& S, int Band)
     {
         if (Band <= 0) return 2.0 * Pi / S.TileLength[0];
-        if (Band >= BandCount) return 2.0 * Pi * double(GPUSize) / (S.TileLength[BandCount - 1] * S.TopSamples);
+        if (Band >= BandCount) return 2.0 * Pi * double(SizeOfBand(BandCount - 1)) / (S.TileLength[BandCount - 1] * S.TopSamples);
         return S.BoundaryModes * 2.0 * Pi / S.TileLength[Band];
     }
 
@@ -146,7 +155,8 @@ namespace VoxelOceanSpectrum
         // (n + 1/2)^4). An inverted band is empty (MMax = MMin).
         uint32_t MMin = BandBound(Slot.KMin, L);
         uint32_t MMax = BandBound(Slot.KMax, L);
-        MMax = std::min(MMax, uint32_t((GPUSize / 2) * (GPUSize / 2)));
+        const uint32_t Half = uint32_t(SizeOfBand(Band) / 2);
+        MMax = std::min(MMax, Half * Half);
         const double Top = std::pow(double(VOXEL_OCEAN_MAX_MULTIPLE) + 0.5, 4.0) / UnpackDispersion(C2);
         MMax = uint32_t(std::min(double(MMax), std::floor(Top)));
         if (MMax < MMin) MMax = MMin;

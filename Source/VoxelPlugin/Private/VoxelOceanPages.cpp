@@ -266,6 +266,10 @@ struct FVoxelOceanDisplaceState
     FTextureRHIRef Shore;
     /** Stage W3u: the cascades' foam envelopes (the own pass's foam per pixel). */
     FTextureRHIRef Foam;
+    /** Stage W3z: the shortest band's own cascade (the own pass). */
+    FTextureRHIRef FineDisplacement;
+    FTextureRHIRef FineDerivatives;
+    FTextureRHIRef FineFoam;
     bool bClip = false;
     FVector4f ClipRows[VoxelOceanClipmap::InfoRows];
     FTextureRHIRef ClipDisplacement;
@@ -1309,6 +1313,9 @@ bool FVoxelOceanRingProvider::PrepareDraw_RenderThread(FRDGBuilder& GraphBuilder
     Out.Derivatives = D.Derivatives.GetReference();
     Out.Charts = D.Charts.GetReference();
     Out.Foam = D.Foam.GetReference();
+    Out.FineDisplacement = D.FineDisplacement.GetReference();
+    Out.FineDerivatives = D.FineDerivatives.GetReference();
+    Out.FineFoam = D.FineFoam.GetReference();
     Out.bClip = D.bClip && D.ClipDisplacement.IsValid() && D.ClipNormal.IsValid() && D.ClipInfo.IsValid();
     Out.ClipDisplacement = D.ClipDisplacement.GetReference();
     Out.ClipNormal = D.ClipNormal.GetReference();
@@ -1382,12 +1389,18 @@ void FVoxelOceanPages::SetDisplaceFrame(const FVoxelOceanDisplaceFrame& InFrame)
             State->Charts = RHIOf(Frame.Charts);
             State->Shore = RHIOf(Frame.Shore);
             State->Foam = RHIOf(Frame.Foam);
+            State->FineDisplacement = RHIOf(Frame.FineDisplacement);
+            State->FineDerivatives = RHIOf(Frame.FineDerivatives);
+            State->FineFoam = RHIOf(Frame.FineFoam);
             // The resources are only read here.
             State->Frame.Displacement = nullptr;
             State->Frame.Derivatives = nullptr;
             State->Frame.Charts = nullptr;
             State->Frame.Shore = nullptr;
             State->Frame.Foam = nullptr;
+            State->Frame.FineDisplacement = nullptr;
+            State->Frame.FineDerivatives = nullptr;
+            State->Frame.FineFoam = nullptr;
         });
 }
 
@@ -1610,7 +1623,7 @@ void FVoxelOceanPages::SetClipmap(const FVoxelOceanClipSettings& InSettings)
 }
 
 void FVoxelOceanPages::UpdateClipmap(const FVector& CameraPlanet, const FVoxelOceanDisplaceFrame& Waves, FTextureResource* Foam,
-    double OceanTime, double FoamDecayPerSecond, double FoamGrowthPerSecond)
+    double OceanTime, double FoamDecayPerSecond, double FoamGrowthPerSecond, bool bWavesStepped)
 {
     // (Aliased: UE has a global FFrame.)
     using namespace VoxelOceanClipmap;
@@ -1706,7 +1719,9 @@ void FVoxelOceanPages::UpdateClipmap(const FVector& CameraPlanet, const FVoxelOc
     // The waves due: every level whose static layer is new, or whose window has moved on from
     // the one its waves were evaluated for; the fine ones every frame, the coarse ones in turn.
     const int32 Stagger = FMath::Clamp(CVarVoxelOceanClipStagger.GetValueOnGameThread(), 0, 1);
-    const uint64 Turn = Plan.Turn++;
+    // (Stage W3y: the turns, and the levels' regular evaluation, only with the cascades' steps:
+    // between them the waves are the same.)
+    const uint64 Turn = bWavesStepped ? Plan.Turn++ : Plan.Turn;
     int32 Due[MaxLevels];
     int32 NumDue = 0;
     int32 Shift[MaxLevels] = {};
@@ -1719,7 +1734,7 @@ void FVoxelOceanPages::UpdateClipmap(const FVector& CameraPlanet, const FVoxelOc
         const bool bSameLevel = Slot.bEvaluated && Slot.EvalPlane == Frame.Plane.Id && Slot.EvalK == L.K;
         const bool bNear = bSameLevel && FMath::Abs(Slot.EvalOrigin.X - L.Origin.X) <= EvaluatedSlack && FMath::Abs(Slot.EvalOrigin.Y - L.Origin.Y) <= EvaluatedSlack;
         const uint64 Period = Stagger == 0 || i < 4 ? 1u : (i < 8 ? 2u : 4u);
-        if (bWhole[i] || bEdited[i] || !bNear || Turn % Period == (uint64)i % Period)
+        if (bWhole[i] || bEdited[i] || !bNear || (bWavesStepped && Turn % Period == (uint64)i % Period))
         {
             // (Stage W3t: how far its window moved since its last step, texels: the foam history's
             // margin of possibly new neighbours.)
@@ -2053,8 +2068,9 @@ void FVoxelOceanPages::UpdateClipmap(const FVector& CameraPlanet, const FVoxelOc
                         TShaderMapRef<FVoxelOceanClipWaveCS>(ShaderMap), P,
                         FIntVector(FMath::DivideAndRoundUp(Size, 8), FMath::DivideAndRoundUp(Size, 8), FMath::Max(Job->NumDue, 1)));
                 }
-                // Into the textures the material and the vertices read: every slot.
-                if (bArraysMatch)
+                // Into the textures the material and the vertices read: every slot (stage W3y: only
+                // when a level was evaluated; else they hold what they did).
+                if (bArraysMatch && Job->NumDue > 0)
                 {
                     FRHICopyTextureInfo Copy;
                     Copy.Size = FIntVector(Size, Size, 1);
