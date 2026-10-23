@@ -212,8 +212,11 @@ public:
      *  rates (stage W3v, VoxelOceanFoam.ush: GodotOceanWaves' rule; a decay of 0: no foam buffer).
      *  bWavesStepped (stage W3y): the cascades stepped this frame; else only the levels that must
      *  be (new, edited, moved past their slack) are evaluated, the others wait for the next step. */
+    /** FoamDetailLevels (stage W4c): how many levels around the camera keep the foam's fine history
+     *  (VoxelOceanClip.usf, ClipFineFoamCS; 0: none, at most VoxelOceanClipmap::FineMaxLevels). */
     void UpdateClipmap(const FVector& CameraPlanet, const FVoxelOceanDisplaceFrame& Waves, FTextureResource* Foam,
-        double OceanTime = 0.0, double FoamDecayPerSecond = 0.0, double FoamGrowthPerSecond = 0.0, bool bWavesStepped = true);
+        double OceanTime = 0.0, double FoamDecayPerSecond = 0.0, double FoamGrowthPerSecond = 0.0, bool bWavesStepped = true,
+        int32 FoamDetailLevels = 0);
 
     /** Game thread (stage W1). An edit's sphere (planet frame, cm) that the depths now carry (the
      *  surface's: once the terrain's edit data, and the land surface cache, hold it): the static

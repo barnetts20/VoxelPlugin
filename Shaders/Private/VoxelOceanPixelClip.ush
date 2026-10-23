@@ -251,10 +251,32 @@ FVoxelOceanPixelClipAniso VoxelOceanPixelClipAnisoOf(float3 X, float3 UpP, float
     return A;
 }
 
+// Stage W4c: the foam's fine history at a pixel (VoxelOceanClip.usf, ClipFineFoamCS): its levels
+// picked as the clipmap's for a footprint FineInfo.y (the factor) times the pixel's, so its texels
+// are the pixel's; sampled at the levels' own storage UV, in the slice of the level's index. x the
+// history's foam, y the share it holds (its levels' weights and fades; the rest the buffer's).
+float2 VoxelOceanPixelFineHistoryOf(float3 X, float Footprint, Texture2DArray FineHistory, SamplerState Sampler, Texture2D ClipInfo, float2 FineInfo)
+{
+    const int Count = int(FineInfo.x + 0.5f);
+    if (Count <= 0) return float2(0.0f, 0.0f);
+    const FVoxelOceanClipPick P = VoxelOceanClipPickOfTexture(ClipInfo, X, Footprint * max(FineInfo.y, 1.0f));
+    if (P.Level < 0 || P.Level >= Count) return float2(0.0f, 0.0f);
+    const float A = max(FineHistory.SampleLevel(Sampler, float3(P.UV.x, P.UV.y, float(P.Level)), 0.0f).x, 0.0f);
+    float B = 0.0f;
+    float WB = 0.0f;
+    if (P.Weight < 1.0f && P.NextValid > 0.5f && P.Level + 1 < Count)
+    {
+        B = max(FineHistory.SampleLevel(Sampler, float3(P.UVNext.x, P.UVNext.y, float(P.Level + 1)), 0.0f).x, 0.0f);
+        WB = 1.0f - P.Weight;
+    }
+    return float2(A * P.Weight + B * WB, P.Weight + WB);
+}
+
 FVoxelOceanPixelSurf VoxelOceanPixelSurfOf(float3 SamplePoint, float Footprint, float Across, float3 Major, float MaxTaps, float Depth, float Distance,
     FVoxelOceanWaveParams W, Texture2DArray Displacement, SamplerState DisplacementSampler, Texture2DArray Derivatives, SamplerState DerivativesSampler,
     Texture2D Charts VOXEL_OCEAN_FINE_PARAMS, Texture2DArray Foam, SamplerState FoamSampler VOXEL_OCEAN_FINE_FOAM_PARAMS, Texture2DArray ClipDisplacement,
-    Texture2DArray ClipNormal, Texture2DArray ClipWhitecap, SamplerState ClipSampler, Texture2D ClipInfo, float4 Settings)
+    Texture2DArray ClipNormal, Texture2DArray ClipWhitecap, SamplerState ClipSampler, Texture2D ClipInfo, float4 Settings,
+    Texture2DArray FineHistory, float2 FineInfo)
 {
     const float3 Up = normalize(SamplePoint - W.Center);
     const float3 UpP = VoxelOceanRotateBack(W.Rotation, Up);
@@ -313,7 +335,11 @@ FVoxelOceanPixelSurf VoxelOceanPixelSurfOf(float3 SamplePoint, float Footprint, 
             // whitecap, the crest's own foam on top.
             const float TexelFresh = VoxelOceanFoamFresh(Caps.w, FreshGain);
             const float Grown = TexelFresh > 1.0e-4f ? saturate(Caps.y / TexelFresh) : 1.0f;
-            O.Foam = lerp(C.Foam, VoxelOceanFoamDrawn(max(Caps.y, Fresh * Grown) + Fine), Own);
+            // Stage W4c: the history at the fine levels' resolution where they hold the point (the
+            // buffer's past them), the surf's foam from the buffer in its zone.
+            const float2 FineHist = VoxelOceanPixelFineHistoryOf(X, sqrt(Footprint * Narrow), FineHistory, ClipSampler, ClipInfo, FineInfo);
+            const float History = max(FineHist.x + (1.0f - FineHist.y) * Caps.y, Caps.y * saturate(Caps.z));
+            O.Foam = lerp(C.Foam, VoxelOceanFoamDrawn(max(History, Fresh * Grown) + Fine), Own);
             O.Whitecap = lerp(Caps.x, max(VoxelOceanFoamDrawn(Fresh), Caps.x * Caps.z), Own);
             O.Own = Own;
         }

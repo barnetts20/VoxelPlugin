@@ -62,7 +62,7 @@ struct FVoxelOceanShadingParams
     float ShortWaveSlopeVariance = 0.001f;
     float Refraction = 1.0f;
     bool bFoam = true;
-    FVector3f FoamAlbedo = FVector3f(0.85f, 0.85f, 0.85f);
+    FVector3f FoamAlbedo = FVector3f(0.492f, 0.407f, 0.342f);
     /** Stage W3s: the foam's opacity overall, at its thinnest edges, and the thickness (0 to 1 of
      *  the foam's structure) it is solid from. */
     float FoamOpacity = 1.0f;
@@ -84,6 +84,9 @@ struct FVoxelOceanShadingParams
     float FoamTileM = 12.0f;
     /** Stage W3h: the light through thin crests (0: none) and the whitecaps' relief (1: the lace's). */
     float CrestGlow = 1.0f;
+    /** Stage W4d: Godot's water light's share, and its water colour (linear). */
+    float GodotWaterLight = 1.0f;
+    FVector3f GodotWaterColor = FVector3f(0.0103f, 0.0194f, 0.0273f);
     float WhitecapRelief = 3.0f;
     /** Stage W3l: the intersection foam's strength (0: none) and reach (m). */
     float IntersectionFoam = 1.0f;

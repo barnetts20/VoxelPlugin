@@ -357,6 +357,8 @@ struct FVoxelOceanFFTSettings
     double FineFoamWhitecap = 0.9;
     double FineFoamAmount = 5.0;
     double UpdateRate = 50.0;
+    /** Stage W4c (live): the levels keeping the foam's fine history (FVoxelOceanPages::UpdateClipmap). */
+    int32 FoamDetailLevels = 4;
 
     bool operator==(const FVoxelOceanFFTSettings& Other) const
     {

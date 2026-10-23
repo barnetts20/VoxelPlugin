@@ -210,3 +210,79 @@ void ClipWaveCS(uint3 Id : SV_DispatchThreadID)
     ClipNormalOut[C] = float4(VoxelOceanRotateBack(W.Rotation, Out.Normal), max(Out.SlopeVariance, 0.0f));
     ClipWhitecapOut[C] = float4(Whitecap, Foam, SurfZone, OpenSource);
 }
+
+// ---------------------------------------------------------------------------------------------
+// THE FOAM'S FINE HISTORY (stage W4c; Design/OceanWaves.md section 54). GodotOceanWaves keeps its
+// foam per cascade texel (8.6 cm on its 88 m cascade), so a trail keeps the shape of the crest that
+// left it; the buffer above holds it per clipmap texel (20 cm to metres, the mean foam of the
+// surface a texel covers: VoxelOceanFoamSourceSpread). The first levels around the camera (up to
+// VOXEL_OCEAN_CLIP_FINE_MAX) keep a second buffer at FineStep.z (4) times their resolution, in the
+// same windows and the same toroidal storage at that many times the texels (so it is sampled at
+// the very UV of its level's), one slice per level in use (its index, not its slot): Godot's rule
+// on the J at its own texel (the hard rule there: the bands' waves under it are few). A texel
+// whose coarse neighbourhood's mean source is nil (nothing breaks within its clipmap texels) only
+// fades, unevaluated; one new to its window (a strip the window gained since the level's last step,
+// FineRect0/1 in window texels, or the whole level, FineWhole) starts from the buffer's open-sea
+// foam at its clipmap texel. Every level steps each wave step (stage W4d; and a moved one at once),
+// its time step exact (FineStep: x e^(-Decay dt), y the growth per unit of source over dt). The
+// surf's foam stays in the buffer above (the own pass takes the larger in the surf's zone).
+// ---------------------------------------------------------------------------------------------
+
+#define VOXEL_OCEAN_CLIP_FINE_MAX 4
+
+float4 FineWindow;              // the level's window: the camera in it (its texels), its spacing (cm)
+int4 FineWindowMod;             // its origin mod Size, its slot, its index (the fine slice)
+float4 FineStep;                // x e^(-Decay dt), y the growth per unit of source over dt, z the factor
+int4 FineRect0;                 // window texels (x, y, width, height; width 0: none) new since its last step
+int4 FineRect1;
+uint FineWhole;                 // 1: the whole level is new
+RWTexture2DArray<float> FineHistory;
+Texture2DArray<float> FineCoarseHistory;    // the buffer above (this frame's)
+Texture2DArray<float4> FineCoarseWhitecap;  // the whitecap levels (this frame's: z the surf's zone, w the open sea's mean source)
+
+bool VoxelOceanClipFineInRect(int4 R, int2 C)
+{
+    return R.z > 0 && C.x >= R.x && C.x < R.x + R.z && C.y >= R.y && C.y < R.y + R.w;
+}
+
+[numthreads(8, 8, 1)]
+void ClipFineFoamCS(uint3 Id : SV_DispatchThreadID)
+{
+    const FVoxelOceanClipFrame F = VoxelOceanClipFrameOf(ClipInfoRows[0], ClipInfoRows[1], ClipInfoRows[2], ClipInfoRows[3]);
+    const int Size = int(F.Size + 0.5f);
+    const int Factor = max(int(FineStep.z + 0.5f), 1);
+    const int FineSize = Size * Factor;
+    if (int(Id.x) >= FineSize || int(Id.y) >= FineSize) return;
+    const int2 Window = int2(Id.xy) / Factor;
+    const int2 OriginMod = FineWindowMod.xy;
+    const int Slot = FineWindowMod.z;
+    const int2 CoarseAt = int2((OriginMod.x + Window.x) % Size, (OriginMod.y + Window.y) % Size);
+    const int3 At = int3((OriginMod.x * Factor + int(Id.x)) % FineSize, (OriginMod.y * Factor + int(Id.y)) % FineSize, FineWindowMod.w);
+    const float4 Caps = FineCoarseWhitecap.Load(int4(CoarseAt, Slot, 0));
+    float Prev = FineHistory[At];
+    if (FineWhole != 0u || VoxelOceanClipFineInRect(FineRect0, Window) || VoxelOceanClipFineInRect(FineRect1, Window)) Prev = -1.0f;
+    if (Prev < 0.0f) Prev = max(FineCoarseHistory.Load(int4(CoarseAt, Slot, 0)), 0.0f) * (1.0f - saturate(Caps.z));
+    // The gate: the mean source of the clipmap texels it lies between (the fine texel's position
+    // in its clipmap texel picks the other three).
+    const int2 Sub = int2(Id.xy) - Window * Factor;
+    const int2 Step = int2(2 * Sub.x >= Factor ? 1 : Size - 1, 2 * Sub.y >= Factor ? 1 : Size - 1);
+    const float Mean = max(max(Caps.w, FineCoarseWhitecap.Load(int4((CoarseAt.x + Step.x) % Size, CoarseAt.y, Slot, 0)).w),
+        max(FineCoarseWhitecap.Load(int4(CoarseAt.x, (CoarseAt.y + Step.y) % Size, Slot, 0)).w,
+            FineCoarseWhitecap.Load(int4((CoarseAt.x + Step.x) % Size, (CoarseAt.y + Step.y) % Size, Slot, 0)).w));
+    float Source = 0.0f;
+    if (ClipFFT.x > 0.5f && Mean > 1.0e-5f)
+    {
+        const FVoxelOceanWaveParams W = VoxelOceanMakeWaveParamsFFT(ClipParams, ClipWave0, ClipWave1, ClipWave2, ClipCenter, ClipShape, ClipFFT,
+            ClipRefHigh, ClipRefLow, ClipRotation, ClipTiles, ClipStates, ClipSlopeVar);
+        const float Spacing = FineWindow.z / float(Factor);
+        const float2 Offset = VoxelOceanClipTexelOffset(FineWindow.xy * float(Factor), Spacing, float(Id.x), float(Id.y));
+        const float3 P = VoxelOceanRotate(W.Rotation, VoxelOceanClipPointOf(F, Offset));
+        const float3 Up = normalize(P - W.Center);
+        // The open sea's compression at the texel's own footprint (the displacement's mip past use).
+        const FVoxelOceanFFTPoint Pt = VoxelOceanFFTEvaluate(P, Up, 1.0e9f, Spacing, VOXEL_OCEAN_DEEP, VoxelOceanShoreNone(), W,
+            ClipDisplacement, ClipDisplacementSampler, ClipDerivatives, ClipDerivativesSampler, ClipCharts, ClipFoam, ClipFoamSampler,
+            2u | (ClipFoamOn != 0u ? VOXEL_OCEAN_LOOKUP_FOAM : 0u));
+        Source = Pt.FoamSource * (1.0f - saturate(Caps.z));
+    }
+    FineHistory[At] = VoxelOceanFoamStep(Prev, Source, FineStep.y, FineStep.x);
+}

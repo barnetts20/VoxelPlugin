@@ -106,6 +106,8 @@ BEGIN_SHADER_PARAMETER_STRUCT(FVoxelOceanSurfaceParameters, )
     SHADER_PARAMETER_TEXTURE(Texture2DArray, SurfaceFineDisplacement)
     SHADER_PARAMETER_TEXTURE(Texture2DArray, SurfaceFineDerivatives)
     SHADER_PARAMETER_TEXTURE(Texture2DArray, SurfaceFineFoam)
+    SHADER_PARAMETER_TEXTURE(Texture2DArray, SurfaceClipFineHistory)
+    SHADER_PARAMETER(FVector4f, SurfaceClipFineInfo)
     SHADER_PARAMETER(FVector4f, SurfaceFilter)
     SHADER_PARAMETER(FVector4f, SurfaceCrest)
     SHADER_PARAMETER(FVector3f, SurfaceScattering)
@@ -117,6 +119,7 @@ BEGIN_SHADER_PARAMETER_STRUCT(FVoxelOceanSurfaceParameters, )
     SHADER_PARAMETER(FVector3f, SurfaceSkyHorizon)
     SHADER_PARAMETER(FVector4f, SurfaceShading)
     SHADER_PARAMETER(FVector3f, SurfaceFoamAlbedo)
+    SHADER_PARAMETER(FVector4f, SurfaceGodotWater)
     SHADER_PARAMETER(FVector4f, SurfaceFoamLook)
     SHADER_PARAMETER_TEXTURE(Texture2D, SurfaceFoamSet)
     SHADER_PARAMETER_SAMPLER(SamplerState, SurfaceFoamSampler)
@@ -491,6 +494,10 @@ void FVoxelOceanSurfacePass::Render_RenderThread(FPostOpaqueRenderParameters& Pa
     P->SurfaceFineDisplacement = bFine ? Rings.FineDisplacement : GBlackArrayTexture->TextureRHI.GetReference();
     P->SurfaceFineDerivatives = bFine ? Rings.FineDerivatives : GBlackArrayTexture->TextureRHI.GetReference();
     P->SurfaceFineFoam = bFine ? Rings.FineFoam : GBlackArrayTexture->TextureRHI.GetReference();
+    // Stage W4c: the foam's fine history (VoxelOceanClip.usf, ClipFineFoamCS; none: 0 levels).
+    const bool bFineHistory = Rings.bClip && Rings.ClipFineHistory && Rings.ClipFineInfo.X > 0.5f;
+    P->SurfaceClipFineHistory = bFineHistory ? Rings.ClipFineHistory : GBlackArrayTexture->TextureRHI.GetReference();
+    P->SurfaceClipFineInfo = bFineHistory ? FVector4f(Rings.ClipFineInfo.X, Rings.ClipFineInfo.Y, 0.0f, 0.0f) : FVector4f(0.0f, 1.0f, 0.0f, 0.0f);
     P->SurfaceCascadeFoamSampler = TStaticSamplerState<SF_Trilinear, AM_Wrap, AM_Wrap, AM_Clamp>::GetRHI();
     P->SurfacePixelFoam = FVector4f(FMath::Clamp(Params.FoamDetail, 0.0f, 1.0f), FMath::Max(Params.FoamDetailDistanceM, 1.0f) * 100.0f,
         bCascadeFoam ? 1.0f : 0.0f, Params.bCubicFiltering ? 1.0f : 0.0f);
@@ -511,6 +518,8 @@ void FVoxelOceanSurfacePass::Render_RenderThread(FPostOpaqueRenderParameters& Pa
     P->SurfaceShading = FVector4f(FMath::Max(Params.ShortWaveSlopeVariance, 0.0f), FMath::Max(Params.Refraction, 0.0f), Params.bFoam ? 1.0f : 0.0f,
         (float)FMath::Clamp(CVarVoxelOceanDebugFoam.GetValueOnRenderThread(), 0, 5));
     P->SurfaceFoamAlbedo = Params.FoamAlbedo;
+    // Stage W4d: Godot's water light (its colour, its share).
+    P->SurfaceGodotWater = FVector4f(Params.GodotWaterColor.X, Params.GodotWaterColor.Y, Params.GodotWaterColor.Z, FMath::Clamp(Params.GodotWaterLight, 0.0f, 1.0f));
     // Stage W3s: the foam's opacity, its thinnest edge's and the thickness it is solid from.
     P->SurfaceFoamLook = FVector4f(FMath::Clamp(Params.FoamOpacity, 0.0f, 1.0f), FMath::Clamp(Params.FoamThinOpacity, 0.0f, 1.0f),
         FMath::Max(Params.FoamFalloff, 0.01f), 0.0f);

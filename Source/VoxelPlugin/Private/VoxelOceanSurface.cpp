@@ -1041,7 +1041,7 @@ void FVoxelOceanSurface::UpdateMaterial()
             // (Stage W3v: the foam steps on the ocean's clock by Godot's rates for the foam amount.)
             Pages->UpdateClipmap(SelectionCamera, D, Textures.Foam ? Textures.Foam->GetResource() : nullptr, Inputs.Time,
                 VOS::FoamDecayRate(Inputs.Waves.FoamAmount), VOS::FoamGainOf(Inputs.Waves.FoamRamp, Inputs.Waves.FoamAmount) * VOS::FoamDecayRate(Inputs.Waves.FoamAmount),
-                bCascadesStepped || !bCascadeTime);
+                bCascadesStepped || !bCascadeTime, Inputs.Waves.FoamDetailLevels);
             bCascadesStepped = false;
             if (!bClipBound)
             {

@@ -56,6 +56,10 @@ namespace VoxelOceanClipmap
     constexpr int32 SharedRows = 4;
     constexpr int32 LevelRows = 2;
     constexpr int32 InfoRows = SharedRows + LevelRows * MaxLevels;
+    /** Stage W4c: the foam's fine history (VoxelOceanClip.usf, ClipFineFoamCS): at most this many
+     *  levels (VOXEL_OCEAN_CLIP_FINE_MAX), at FineFactor times their resolution. */
+    constexpr int32 FineMaxLevels = 4;
+    constexpr int32 FineFactor = 4;
 
     struct FPlane
     {

@@ -483,6 +483,8 @@ void AOceanSphereActor::UpdateSurfacePass()
     Params.FoamTexture = FoamTexture;
     Params.FoamTileM = S.FoamTile;
     Params.CrestGlow = S.CrestGlow;
+    Params.GodotWaterLight = S.GodotWaterLight;
+    Params.GodotWaterColor = FVector3f(S.GodotWaterColor.R, S.GodotWaterColor.G, S.GodotWaterColor.B);
     Params.WhitecapRelief = S.WhitecapRelief;
     Params.IntersectionFoam = S.IntersectionFoam;
     Params.IntersectionFoamWidthM = S.IntersectionFoamWidth;
@@ -1172,6 +1174,7 @@ FVoxelOceanSurfaceInputs AOceanSphereActor::GatherInputs(const AAdaptiveVoxelAct
     Inputs.Waves.FineFoamWhitecap = S.bFoam ? S.FineFoamWhitecap : 0.0;
     Inputs.Waves.FineFoamAmount = S.FineFoamAmount;
     Inputs.Waves.UpdateRate = S.WaveUpdateRate;
+    Inputs.Waves.FoamDetailLevels = S.FoamDetailLevels;
     Inputs.Waves.SurfFoam = S.bFoam ? S.SurfFoam : 0.0;
     // The field reaches the queries wherever it exists (a server builds it on the CPU, and has
     // no texture); its texture and the pages' cull only where it was made.

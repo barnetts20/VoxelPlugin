@@ -158,9 +158,10 @@ struct VOXELPLUGIN_API FVoxelOceanSettings
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Shading", meta = (EditCondition = "bOwnShading", ClampMin = "0.0", UIMax = "2.0"))
     float Refraction = 1.0f;
 
-    /** The foam's albedo, lit by the sun and the sky. */
+    /** The foam's albedo, lit by the sun and the sky. Stage W4d: GodotOceanWaves' foam colour, sRGB
+     *  (0.73, 0.67, 0.62) in linear (was a neutral 0.85). */
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Shading", meta = (EditCondition = "bOwnShading"))
-    FLinearColor FoamAlbedo = FLinearColor(0.85f, 0.85f, 0.85f);
+    FLinearColor FoamAlbedo = FLinearColor(0.492f, 0.407f, 0.342f);
 
     /** How opaque the foam is overall (stage W3s; 1: solid where it is thick, lower to let the
      *  water show through all of it). Stage W4a: 1, GodotOceanWaves' (its foam's density alone). */
@@ -224,6 +225,19 @@ struct VOXELPLUGIN_API FVoxelOceanSettings
      *  teal glow of a wave seen against the sun. 0: none; 1 as the water's scattering gives it. */
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Shading", meta = (EditCondition = "bOwnShading", ClampMin = "0.0", UIMax = "4.0"))
     float CrestGlow = 1.0f;
+
+    /** How much of the water's own light (what comes up through the surface) is GodotOceanWaves'
+     *  (stage W4d; its water.gdshader, after Atlas' GDC 2019 water: a crest's glow by its height and
+     *  the sun behind it, the water seen head on brighter, a half Lambert, all tinted by its water
+     *  colour) against ours (the water's single scattering and the crest glow above). 1: Godot's,
+     *  0: ours. The bed seen through shallow water stays ours either way. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Shading", meta = (EditCondition = "bOwnShading", ClampMin = "0.0", ClampMax = "1.0"))
+    float GodotWaterLight = 1.0f;
+
+    /** The water's colour in Godot's light (GodotWaterLight; linear): GodotOceanWaves' water_color,
+     *  sRGB (0.1, 0.15, 0.18). */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Shading", meta = (EditCondition = "bOwnShading"))
+    FLinearColor GodotWaterColor = FLinearColor(0.0103f, 0.0194f, 0.0273f);
 
     /** How much higher a whitecap's billows stand than the lace's relief (stage W3h; 1: the same). */
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Shading", AdvancedDisplay, meta = (EditCondition = "bOwnShading", ClampMin = "1.0", UIMax = "8.0"))
@@ -668,6 +682,14 @@ struct VOXELPLUGIN_API FVoxelOceanSettings
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Foam", meta = (EditCondition = "bFoam", ClampMin = "0.0", UIMax = "10.0"))
     double FineFoamAmount = 3.0;
 
+    /** How many of the wave clipmap's levels around the camera keep the foam's history at four
+     *  times their resolution (stage W4c; 0 to 4): the trails keep the shape of the crests that left
+     *  them, as GodotOceanWaves' per-cascade foam does, instead of the clipmap texel's (20 cm and up,
+     *  coarser with height). Past them, and on the surf's foam, the clipmap's own history. Each level
+     *  is 4 MB at the default clipmap size; all are stepped each wave update. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Foam", meta = (EditCondition = "bFoam", ClampMin = "0", ClampMax = "4"))
+    int32 FoamDetailLevels = 4;
+
     /** The surf's foam (0: none): the bores' white water, their short wake and the swash's foamy
      *  edge, fed into the same foam as the open sea's (stage W3v), so it builds and lingers there
      *  as the crests' does. */
@@ -731,12 +753,14 @@ struct VOXELPLUGIN_API FVoxelOceanSettings
         FoamRamp = FMath::Max(FoamRamp, 0.0);
         FineFoamWhitecap = FMath::Clamp(FineFoamWhitecap, 0.0, 1.0);
         FineFoamAmount = FMath::Max(FineFoamAmount, 0.0);
+        FoamDetailLevels = FMath::Clamp(FoamDetailLevels, 0, 4);
         WaveUpdateRate = FMath::Max(WaveUpdateRate, 0.0);
         SurfFoam = FMath::Max(SurfFoam, 0.0);
         ShortWaveSlopeVariance = FMath::Max(ShortWaveSlopeVariance, 0.0f);
         Refraction = FMath::Max(Refraction, 0.0f);
         FoamTile = FMath::Max(FoamTile, 1.0f);
         CrestGlow = FMath::Max(CrestGlow, 0.0f);
+        GodotWaterLight = FMath::Clamp(GodotWaterLight, 0.0f, 1.0f);
         WhitecapRelief = FMath::Max(WhitecapRelief, 1.0f);
         IntersectionFoam = FMath::Max(IntersectionFoam, 0.0f);
         IntersectionFoamWidth = FMath::Max(IntersectionFoamWidth, 0.1f);

@@ -118,6 +118,10 @@ float4 SurfacePixelFoam;
 Texture2DArray SurfaceFineDisplacement;
 Texture2DArray SurfaceFineDerivatives;
 Texture2DArray SurfaceFineFoam;
+// Stage W4c: the foam's fine history (VoxelOceanClip.usf, ClipFineFoamCS): its levels; x their
+// count (0: none), y their resolution's factor over the clipmap's.
+Texture2DArray SurfaceClipFineHistory;
+float4 SurfaceClipFineInfo;
 // Stage W3y: x the anisotropic filter's most lookups along a pixel's longer axis (1: none).
 float4 SurfaceFilter;
 // Stage W3h: x the crest glow's strength (0 none), y the whitecaps' relief gain; stage W3l: z the
@@ -139,6 +143,8 @@ float3 SurfaceSkyHorizon;
 // foam's albedo.
 float4 SurfaceShading;
 float3 SurfaceFoamAlbedo;
+// Stage W4d: GodotOceanWaves' water light: its water colour (linear), w its share against ours.
+float4 SurfaceGodotWater;
 // Stage W3s: x the foam's opacity overall, y its thinnest parts' (VOXEL_OCEAN_SURFACE_FOAM_THIN until
 // then), z the thickness it is solid from (0.6 until then); w unused (stage W3t's history switch).
 float4 SurfaceFoamLook;
@@ -262,7 +268,8 @@ void SurfacePS(float4 SvPosition : SV_POSITION,
         // cascades' foam up per pixel), the lookups cubic where magnified.
         const FVoxelOceanPixelSurf C = VoxelOceanPixelSurfOf(SamplePoint, Footprint, FootprintAcross, FootprintMajor, SurfaceFilter.x, DepthLand.x, length(Rel), W, SurfaceDisplacement,
             SurfaceDisplacementSampler, SurfaceDerivatives, SurfaceDerivativesSampler, SurfaceCharts, SurfaceFineDisplacement, SurfaceFineDerivatives,
-            SurfaceCascadeFoam, SurfaceCascadeFoamSampler, SurfaceFineFoam, SurfaceClipDisplacement, SurfaceClipNormal, SurfaceClipWhitecap, SurfaceClipSampler, SurfaceClipInfo, SurfacePixelFoam);
+            SurfaceCascadeFoam, SurfaceCascadeFoamSampler, SurfaceFineFoam, SurfaceClipDisplacement, SurfaceClipNormal, SurfaceClipWhitecap, SurfaceClipSampler, SurfaceClipInfo, SurfacePixelFoam,
+            SurfaceClipFineHistory, SurfaceClipFineInfo.xy);
         N = C.Normal;
         SlopeVariance = C.SlopeVariance;
         Foam = C.Foam;
@@ -379,6 +386,32 @@ void SurfacePS(float4 SvPosition : SV_POSITION,
     }
     // Out through the surface: past its reflection, and radiance divides by n^2.
     float3 Color = Reflected + (Body + Glow) * ((1.0f - Fresnel) / (VOXEL_OCEAN_WATER_IOR * VOXEL_OCEAN_WATER_IOR));
+    // Stage W4d: GodotOceanWaves' water light (its water.gdshader's light(), after Atlas' GDC 2019
+    // water), toward it by SurfaceGodotWater.w in place of our scattering and crest glow (the bed seen
+    // through the water stays ours): the crest's glow, its height over the sea plus 2.5 m (m) times
+    // the sun behind the wave toward the eye, (-L . V)^4, and the face turned from the sun,
+    // ((1 - N . L) / 2)^3; the water seen head on, (N . V)^2 / 2; greened (0.9, 1.15, 0.85), over
+    // 1 + its view mask (Godot's Smith term at its roughness 0.4, its arguments as Godot passes
+    // them); a half Lambert; the sky's light as ambient. Tinted by its water colour, past the
+    // surface's reflection. (Godot's light colour carries pi: its terms are radiance per its
+    // irradiance.)
+    if (SurfaceGodotWater.w > 0.0f)
+    {
+        const float NV = max(dot(N, V), 2.0e-5f);
+        const float NL = max(dot(N, L), 2.0e-5f);
+        const float MaskA = 0.4f / (NV * sqrt(1.0f - 0.16f));
+        const float LightMask = MaskA < 1.6f ? (1.0f - 1.259f * MaskA + 0.396f * MaskA * MaskA) / (3.535f * MaskA + 2.181f * MaskA * MaskA) : 0.0f;
+        const float Back = max(dot(L, -V), 0.0f);
+        const float Away = 0.5f - 0.5f * dot(L, N);
+        const float SssHeight = max(0.0f, Height * 0.01f + 2.5f) * (Back * Back) * (Back * Back) * (Away * Away * Away);
+        const float SssNear = 0.5f * NV * NV;
+        const float3 Sss = (SssHeight + SssNear) * float3(0.9f, 1.15f, 0.85f) / (1.0f + LightMask);
+        const float3 GodotLight = SurfaceGodotWater.rgb * (SurfaceSunIlluminance * SunAbove * (Sss + 0.5f * NL) + SkyIrradiance * (1.0f / VOXEL_OCEAN_SHADING_PI));
+        // Ours without the bed's light (the deep part: the scattering, the crest glow).
+        const float3 Through = Path >= 0.0f ? Bed * exp(-SurfaceExtinction * Path * (1.0f + max(MuView, 0.05f) / max(MuSun, 0.05f))) : float3(0.0f, 0.0f, 0.0f);
+        const float3 OursDeep = (Body - Through + Glow) * ((1.0f - Fresnel) / (VOXEL_OCEAN_WATER_IOR * VOXEL_OCEAN_WATER_IOR));
+        Color += SurfaceGodotWater.w * (GodotLight * (1.0f - Fresnel) - OursDeep);
+    }
 
     // -- Where the water meets something standing in it (stage W3l) -----------------------------
     // The scene's point behind the water at this pixel (unrefracted), how far it lies along the

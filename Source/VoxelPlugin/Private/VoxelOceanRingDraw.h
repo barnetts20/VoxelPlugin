@@ -47,6 +47,9 @@ struct FVoxelOceanRingDrawFrame
     /** Stage W3h: the whitecaps' density (null before the first clipmap frame). */
     FRHITexture* ClipWhitecap = nullptr;
     FRHITexture* ClipInfo = nullptr;
+    /** Stage W4c: the foam's fine history (null: none), its levels and its factor. */
+    FRHITexture* ClipFineHistory = nullptr;
+    FVector2f ClipFineInfo = FVector2f(0.0f, 0.0f);
 };
 
 /** The rings' side of the own pass (FVoxelOceanPages; render thread). */
