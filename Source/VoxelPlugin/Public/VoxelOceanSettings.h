@@ -30,19 +30,19 @@ struct VOXELPLUGIN_API FVoxelOceanWaveEqualizer
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Equalizer", meta = (DisplayName = "1 m", ClampMin = "0.0", ClampMax = "8.0", UIMax = "3.0"))
     float Gain1m = 1.0f;
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Equalizer", meta = (DisplayName = "2 m", ClampMin = "0.0", ClampMax = "8.0", UIMax = "3.0"))
-    float Gain2m = 1.0f;
+    float Gain2m = 1.3f;
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Equalizer", meta = (DisplayName = "4 m", ClampMin = "0.0", ClampMax = "8.0", UIMax = "3.0"))
-    float Gain4m = 1.0f;
+    float Gain4m = 1.6f;
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Equalizer", meta = (DisplayName = "8 m", ClampMin = "0.0", ClampMax = "8.0", UIMax = "3.0"))
-    float Gain8m = 1.0f;
+    float Gain8m = 1.9f;
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Equalizer", meta = (DisplayName = "16 m", ClampMin = "0.0", ClampMax = "8.0", UIMax = "3.0"))
-    float Gain16m = 1.0f;
+    float Gain16m = 2.2f;
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Equalizer", meta = (DisplayName = "32 m", ClampMin = "0.0", ClampMax = "8.0", UIMax = "3.0"))
-    float Gain32m = 1.0f;
+    float Gain32m = 1.9f;
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Equalizer", meta = (DisplayName = "64 m", ClampMin = "0.0", ClampMax = "8.0", UIMax = "3.0"))
-    float Gain64m = 1.0f;
+    float Gain64m = 1.6f;
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Equalizer", meta = (DisplayName = "128 m", ClampMin = "0.0", ClampMax = "8.0", UIMax = "3.0"))
-    float Gain128m = 1.0f;
+    float Gain128m = 1.3f;
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Equalizer", meta = (DisplayName = "256 m", ClampMin = "0.0", ClampMax = "8.0", UIMax = "3.0"))
     float Gain256m = 1.0f;
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Equalizer", meta = (DisplayName = "512 m", ClampMin = "0.0", ClampMax = "8.0", UIMax = "3.0"))
@@ -160,7 +160,7 @@ struct VOXELPLUGIN_API FVoxelOceanSettings
     /** How opaque the foam is overall (stage W3s; 1: solid where it is thick, lower to let the
      *  water show through all of it). */
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Shading", meta = (EditCondition = "bOwnShading", ClampMin = "0.0", ClampMax = "1.0"))
-    float FoamOpacity = 1.0f;
+    float FoamOpacity = 0.5f;
 
     /** The foam's look (stage W3v): 1, GodotOceanWaves' (its smooth density mixed over the water,
      *  lit flat with a soft sheen); 0, through the foam texture's lace (crisp patches lit through
@@ -179,7 +179,7 @@ struct VOXELPLUGIN_API FVoxelOceanSettings
      *  over its last 30%), the clipmap's foam, which resolves the pixels there anyway. It costs a
      *  second look at the wave cascades per pixel within it. */
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Shading", AdvancedDisplay, meta = (EditCondition = "bOwnShading", ClampMin = "10.0", UIMax = "1000.0"))
-    float FoamDetailDistance = 250.0f;
+    float FoamDetailDistance = 500.0f;
 
     /** Cubic filtering of the waves' textures where the pixels are finer than their texels (stage
      *  W3u, as GodotOceanWaves' bicubic lookups): smooth slopes, whitecaps and foam close up instead
@@ -190,7 +190,7 @@ struct VOXELPLUGIN_API FVoxelOceanSettings
     /** How opaque the foam's thinnest parts are (its edges, fading trails) against its solid
      *  middles (stage W3s). */
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Shading", meta = (EditCondition = "bOwnShading", ClampMin = "0.0", ClampMax = "1.0"))
-    float FoamThinOpacity = 0.55f;
+    float FoamThinOpacity = 0.25f;
 
     /** How far into the foam (0 to 1 of its thickness) it turns from its thin opacity to solid
      *  (stage W3s): higher, a wider translucent falloff at its edges. */
@@ -202,12 +202,12 @@ struct VOXELPLUGIN_API FVoxelOceanSettings
      *  whitecaps are drawn where the foam's density puts foam. Empty or missing: the procedural
      *  lace. */
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Shading", meta = (EditCondition = "bOwnShading"))
-    FString FoamSet = TEXT("foam_a");
+    FString FoamSet = TEXT("foam_b");
 
     /** How wide the foam set's tile is on the water (m). Larger: larger holes and strands, and a
      *  longer repeat. */
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Shading", meta = (EditCondition = "bOwnShading", ClampMin = "1.0", UIMax = "200.0"))
-    float FoamTile = 12.0f;
+    float FoamTile = 32.0f;
 
     /** How strongly sunlight shines through thin, steep crests toward the eye (stage W3h): the
      *  teal glow of a wave seen against the sun. 0: none; 1 as the water's scattering gives it. */
@@ -230,39 +230,40 @@ struct VOXELPLUGIN_API FVoxelOceanSettings
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Shading", meta = (EditCondition = "bOwnShading", ClampMin = "0.1", UIMax = "10.0"))
     float IntersectionFoamWidth = 1.5f;
 
-    /** Spray (stage W3o): mist the wind tears off breaking crests (from about 8 m/s, fully at 20)
-     *  and splashes thrown up where crests hit rocks and hulls, as GPU particles near the camera. */
+    /** Spray (stage W3x; GodotOceanWaves' sea spray): large soft splashes rising off the dense foam
+     *  near the camera, riding the waves, sinking back and dissolving; GPU billboards. */
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Spray", meta = (EditCondition = "bOwnShading"))
     bool bSpray = true;
 
-    /** How much spray is born (1: as designed; 0: none). */
+    /** How many splashes are born (1: Godot's, 0.24 candidates per square metre of dense foam per
+     *  second; 0: none). */
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Spray", meta = (EditCondition = "bOwnShading && bSpray", ClampMin = "0.0", UIMax = "4.0"))
     float SprayAmount = 1.0f;
 
     /** How far from the camera spray lives (m); it's born within half of it. */
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Spray", meta = (EditCondition = "bOwnShading && bSpray", ClampMin = "10.0", UIMax = "2000.0"))
-    float SprayDistance = 600.0f;
+    float SprayDistance = 300.0f;
 
-    /** The most spray particles alive at once (each 48 bytes on the GPU; up to an eighth of them are
-     *  born a frame). */
+    /** The most splashes alive at once (each 48 bytes on the GPU; up to an eighth of them are born
+     *  a frame). */
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Spray", AdvancedDisplay, meta = (EditCondition = "bOwnShading && bSpray", ClampMin = "1024", ClampMax = "262144"))
-    int32 SprayParticles = 65536;
+    int32 SprayParticles = 64000;
 
-    /** The whitecaps' density spray rises from (stage W3s; 0 to 1): lower spawns over more of the
-     *  whitecaps and the breakers' faces, higher only from their very cores. */
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Spray", meta = (EditCondition = "bOwnShading && bSpray", ClampMin = "0.0", ClampMax = "0.95"))
-    float SprayCore = 0.2f;
+    /** The foam splashes rise from (stage W3x; Godot's 0.9; the foam's own value, 1 / 0.75 at its
+     *  most): lower, from thinner foam too. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Spray", meta = (EditCondition = "bOwnShading && bSpray", ClampMin = "0.0", ClampMax = "1.3"))
+    float SprayFoam = 0.9f;
 
-    /** The puffs' size (1: 4 to 12 cm, spreading half as much again). */
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Spray", meta = (EditCondition = "bOwnShading && bSpray", ClampMin = "0.05", UIMax = "5.0"))
+    /** The splashes' size (1: Godot's, up to 20 m wide and 8.5 m tall on the densest foam). */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Spray", meta = (EditCondition = "bOwnShading && bSpray", ClampMin = "0.05", UIMax = "3.0"))
     float SpraySize = 1.0f;
 
-    /** Each puff's opacity (1: a fifth at its most, many adding up). */
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Spray", meta = (EditCondition = "bOwnShading && bSpray", ClampMin = "0.0", UIMax = "4.0"))
+    /** The splashes' opacity (1: Godot's, two thirds at their most, before their dissolve). */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Spray", meta = (EditCondition = "bOwnShading && bSpray", ClampMin = "0.0", UIMax = "1.5"))
     float SprayOpacity = 1.0f;
 
-    /** How far each puff is broken up into droplets by the foam texture (0: a soft blob; 1: as
-     *  designed; up to 3: sparser, more scattered droplets, for bigger puffs). */
+    /** How far each splash is broken up by the foam texture's billows (0: a soft blob; 1: as
+     *  designed; up to 3: sparser), besides its dissolve. */
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Spray", meta = (EditCondition = "bOwnShading && bSpray", ClampMin = "0.0", ClampMax = "3.0"))
     float SprayBreakup = 1.0f;
 
@@ -284,7 +285,7 @@ struct VOXELPLUGIN_API FVoxelOceanSettings
      *  terrain's slope bound and the waves' reach allow for, before it is left out. Covers the
      *  terrain mesh's error. */
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Depth", meta = (ClampMin = "0.0", UIMax = "5000.0", EditCondition = "bCullUnderLand"))
-    double LandCullMargin = 500.0;
+    double LandCullMargin = 498.0;
 
     // --- Underwater ---
 
@@ -345,7 +346,7 @@ struct VOXELPLUGIN_API FVoxelOceanSettings
 
     /** Storm intensity, 0-1, with the procedural weather off. */
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Environment", meta = (ClampMin = "0.0", ClampMax = "1.0"))
-    double StormIntensity = 0.0;
+    double StormIntensity = 1.0;
 
     /** The ocean clock's rate against the game's (server) time. */
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Environment", meta = (ClampMin = "0.0", UIMax = "4.0"))
@@ -382,6 +383,11 @@ struct VOXELPLUGIN_API FVoxelOceanSettings
      *  update). */
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Waves")
     bool bQueryShortWaves = false;
+
+    /** How often the wave cascades update (Hz; stage W3w, as GodotOceanWaves: 50): their FFTs run
+     *  at this rate whatever the frame rate, the waves stepping at it. 0: every frame. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Waves", meta = (ClampMin = "0.0", UIMax = "120.0"))
+    double WaveUpdateRate = 50.0;
 
     /** Mip bias of the wave lookups: above 0 blurs sooner (cheaper, softer), below sharpens. */
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Waves", meta = (UIMin = "-2.0", UIMax = "2.0"))
@@ -430,7 +436,7 @@ struct VOXELPLUGIN_API FVoxelOceanSettings
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Weather", meta = (EditCondition = "bProceduralWeather", ClampMin = "0.0", UIMax = "40.0"))
     double StormWind = 22.0;
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Weather", meta = (EditCondition = "bProceduralWeather", ClampMin = "10.0", UIMax = "1000.0"))
-    double StormRadius = 220.0;
+    double StormRadius = 500.0;
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Weather", meta = (EditCondition = "bProceduralWeather", ClampMin = "0.1", UIMax = "24.0"))
     double StormHours = 3.0;
 
@@ -438,7 +444,7 @@ struct VOXELPLUGIN_API FVoxelOceanSettings
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Weather", meta = (EditCondition = "bProceduralWeather", ClampMin = "0.0", ClampMax = "1.0"))
     double SwellStrength = 0.6;
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Weather", meta = (EditCondition = "bProceduralWeather", ClampMin = "10.0", UIMax = "5000.0"))
-    double SwellRange = 1500.0;
+    double SwellRange = 100000.0;
 
     /** The weather clock against the ocean's (above 1 to watch storms move) and its offset (s:
      *  where in the weather a level starts). */
@@ -486,7 +492,7 @@ struct VOXELPLUGIN_API FVoxelOceanSettings
      *  slope). 0: no fade; the surf (Surf category) takes the long waves over near the coast by
      *  itself. */
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Shore", meta = (EditCondition = "bShoaling", ClampMin = "0.0", UIMax = "1000.0"))
-    double ShoreFadeDistance = 0.0;
+    double ShoreFadeDistance = 999.0;
 
     /** The least share of their open-sea height the FFT waves keep near the coast and under the
      *  land (stage W3g): the shoaling's breaking and fade stop here, so no part of the ocean mesh
@@ -519,18 +525,18 @@ struct VOXELPLUGIN_API FVoxelOceanSettings
     /** The band of finer mesh (m from the coastline, the shore field's zero line: either side);
      *  outside it the refinement fades over the camera's own distance. */
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Shore", AdvancedDisplay, meta = (ClampMin = "0.0", UIMax = "2000.0"))
-    double ShoreDetailBand = 300.0;
+    double ShoreDetailBand = 1000.0;
 
     /** How far the finer mesh reaches from the camera (m, up to 2 km): it saves at most
      *  (1 - 1 / ShoreDetail) of this distance, so far coasts stay nearly as coarse as without it.
      *  The coast is measured to 10 km: past that, every point saves the same little (a third of a
      *  kilometre at the defaults, from 10 km out: a percent or two more tiles there). */
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Shore", AdvancedDisplay, meta = (ClampMin = "0.0", ClampMax = "2000.0"))
-    double ShoreDetailReach = 500.0;
+    double ShoreDetailReach = 1000.0;
 
     /** The shore field holds distances up to this (km); the slowing reaches no farther. */
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Shore", AdvancedDisplay, meta = (ClampMin = "1.0", UIMax = "200.0"))
-    double ShoreFieldReach = 40.0;
+    double ShoreFieldReach = 1000.0;
 
     /** Inland basins below sea level lose their ocean water beyond this many land bake cells from
      *  the sea (the bake's coast is a cell or so from the terrain's own): from here to 1.5 times it
@@ -583,13 +589,13 @@ struct VOXELPLUGIN_API FVoxelOceanSettings
     /** The swash's run-up against Stockdon's (2006) estimate for the waves and the beach slope
      *  (0: the waterline stays put). */
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Surf", meta = (EditCondition = "bSurf", ClampMin = "0.0", UIMax = "3.0"))
-    double SurfSwash = 1.0;
+    double SurfSwash = 0.33;
 
     /** The swash's swing either side of its mean is held within this distance up and down the
      *  beach (m, at the shore field's beach slope): on a gentle beach Stockdon's infragravity
      *  swash alone would sweep tens of metres. */
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Surf", meta = (EditCondition = "bSurf", ClampMin = "1.0", UIMax = "50.0"))
-    double SurfSwashReach = 10.0;
+    double SurfSwashReach = 1000.0;
 
     /** How far a breaking wave's landward face steepens: its front grows 1 / (1 - this) times as
      *  steep as its back once the wave is saturated (0: symmetric). */
@@ -627,11 +633,22 @@ struct VOXELPLUGIN_API FVoxelOceanSettings
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Foam", meta = (EditCondition = "bFoam", ClampMin = "0.0", UIMax = "10.0"))
     double FoamAmount = 8.0;
 
+    /** The fine foam (stage W3w; GodotOceanWaves' short cascade, its own whitecap threshold): the
+     *  shortest waves' own foam (crests a few metres long and under), built in their own tile at a
+     *  few centimetres a texel and added to the sea's. 0: none. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Foam", meta = (EditCondition = "bFoam", ClampMin = "0.0", ClampMax = "1.0"))
+    double FineFoamWhitecap = 0.9;
+
+    /** The fine foam's amount (stage W3w; Godot's foam amount for its short cascade, 3 in its
+     *  demo): quick specks at low values, denser and lasting at high. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Foam", meta = (EditCondition = "bFoam", ClampMin = "0.0", UIMax = "10.0"))
+    double FineFoamAmount = 5.0;
+
     /** The surf's foam (0: none): the bores' white water, their short wake and the swash's foamy
      *  edge, fed into the same foam as the open sea's (stage W3v), so it builds and lingers there
      *  as the crests' does. */
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Foam", meta = (EditCondition = "bFoam", ClampMin = "0.0", UIMax = "2.0"))
-    double SurfFoam = 1.0;
+    double SurfFoam = 0.5;
 
     /** TileQuads snapped to 8, 16 or 32 and the other fields to their limits. */
     void Sanitize()
@@ -687,6 +704,9 @@ struct VOXELPLUGIN_API FVoxelOceanSettings
         SurfFFTFloor = FMath::Clamp(SurfFFTFloor, 0.0, 1.0);
         FoamWhitecap = FMath::Clamp(FoamWhitecap, 0.0, 1.0);
         FoamAmount = FMath::Max(FoamAmount, 0.0);
+        FineFoamWhitecap = FMath::Clamp(FineFoamWhitecap, 0.0, 1.0);
+        FineFoamAmount = FMath::Max(FineFoamAmount, 0.0);
+        WaveUpdateRate = FMath::Max(WaveUpdateRate, 0.0);
         SurfFoam = FMath::Max(SurfFoam, 0.0);
         ShortWaveSlopeVariance = FMath::Max(ShortWaveSlopeVariance, 0.0f);
         Refraction = FMath::Max(Refraction, 0.0f);
@@ -698,7 +718,7 @@ struct VOXELPLUGIN_API FVoxelOceanSettings
         SprayAmount = FMath::Max(SprayAmount, 0.0f);
         SprayDistance = FMath::Max(SprayDistance, 10.0f);
         SprayParticles = FMath::Clamp(SprayParticles, 1024, 262144);
-        SprayCore = FMath::Clamp(SprayCore, 0.0f, 0.95f);
+        SprayFoam = FMath::Clamp(SprayFoam, 0.0f, 1.3f);
         SpraySize = FMath::Max(SpraySize, 0.05f);
         SprayOpacity = FMath::Max(SprayOpacity, 0.0f);
         SprayBreakup = FMath::Clamp(SprayBreakup, 0.0f, 3.0f);

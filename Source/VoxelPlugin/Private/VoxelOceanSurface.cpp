@@ -483,9 +483,22 @@ void FVoxelOceanSurface::Tick(const FVector& Camera)
     UpdateWaveModel();
     if (!bAvailable || !Pages.IsValid()) return;
     // The FFT model's cascades at this tick of the ocean clock, ahead of this frame's drawing.
+    // Stage W3w: at a fixed rate (GodotOceanWaves updates its cascades at 50 Hz): the clock held to
+    // the rate's steps, the FFTs run only when it reaches the next; with the fine foam (the
+    // shortest band's own: its threshold, Godot's rates for its amount, its slot).
     if (FFTModel.IsValid() && Cascades.IsValid())
-        // (Stage W3v: their per-slot foam retired, 0: the foam runs on the wave clipmap.)
-        Cascades->Update(VoxelOceanSpectrum::TickOf(Inputs.Time), Inputs.Time, 0.0);
+    {
+        const double Rate = FMath::Max(Inputs.Waves.UpdateRate, 0.0);
+        const double WaveTime = Rate > 0.0 ? FMath::FloorToDouble(Inputs.Time * Rate) / Rate : Inputs.Time;
+        if (!bCascadeTime || WaveTime != CascadeTime)
+        {
+            const FVector4f FineFoam((float)FMath::Clamp(Inputs.Waves.FineFoamWhitecap, 0.0, 1.0), (float)VOS::FoamDecayRate(Inputs.Waves.FineFoamAmount),
+                (float)VOS::FoamGrowRate(Inputs.Waves.FineFoamAmount), (float)(VoxelOceanSpectrum::SlotCount - 1));
+            Cascades->Update(VoxelOceanSpectrum::TickOf(WaveTime), WaveTime, FineFoam);
+            CascadeTime = WaveTime;
+            bCascadeTime = true;
+        }
+    }
     const double Now = FPlatformTime::Seconds();
     Perf.Frames++;
 

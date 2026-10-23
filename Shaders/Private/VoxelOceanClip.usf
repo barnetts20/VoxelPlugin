@@ -172,6 +172,7 @@ void ClipWaveCS(uint3 Id : SV_DispatchThreadID)
     float Wind = 0.0f;
     float SurfZone = 0.0f;
     float OpenSource = 0.0f;
+    float FineFoam = 0.0f;
     if (W.FFT.x > 0.5f)
     {
         const uint Mask = VOXEL_OCEAN_LOOKUP_ALL | (ClipFoamOn != 0u ? VOXEL_OCEAN_LOOKUP_FOAM : 0u);
@@ -182,6 +183,7 @@ void ClipWaveCS(uint3 Id : SV_DispatchThreadID)
         Wind = Pt.Wind;
         SurfZone = Pt.SurfZone;
         OpenSource = Pt.FoamSource;
+        FineFoam = Pt.FineFoam;
     }
     else
     {
@@ -201,7 +203,8 @@ void ClipWaveCS(uint3 Id : SV_DispatchThreadID)
         if (Prev >= 0.0f) Foam = VoxelOceanFoamStep(Prev, Source, Step.z, Step.y);
         ClipFoamHistory[C] = Foam;
     }
-    const float Drawn = VoxelOceanFoamDrawn(Foam);
+    // (Stage W3w: with the fine foam, the shortest band's own, added as Godot sums its cascades'.)
+    const float Drawn = VoxelOceanFoamDrawn(Foam + FineFoam);
     const float Whitecap = saturate(Out.Whitecap);
     ClipDisplacementOut[C] = float4(VoxelOceanRotateBack(W.Rotation, Out.Displacement), Drawn);
     ClipNormalOut[C] = float4(VoxelOceanRotateBack(W.Rotation, Out.Normal), max(Out.SlopeVariance, 0.0f));

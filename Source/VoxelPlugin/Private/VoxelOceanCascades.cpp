@@ -119,6 +119,7 @@ public:
         SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2DArray<float2>, FoamOut)
         SHADER_PARAMETER(float, FoamFall)
         SHADER_PARAMETER(uint32, FoamOn)
+        SHADER_PARAMETER(FVector4f, FoamRule)
     END_SHADER_PARAMETER_STRUCT()
 
     VOXEL_OCEAN_FFT_SHADER_COMMON(FVoxelOceanAssembleCS)
@@ -302,7 +303,7 @@ void FVoxelOceanCascades::SetSlots(TConstArrayView<VoxelOceanSpectrum::FSlotGPU>
     Generation++;
 }
 
-void FVoxelOceanCascades::Update(uint32 Tick, double Time, double FoamDecaySeconds)
+void FVoxelOceanCascades::Update(uint32 Tick, double Time, const FVector4f& FineFoam)
 {
     check(IsInGameThread());
     if (!Textures.IsValid() || Slots.Num() != VoxelOceanSpectrum::SlotCount) return;
@@ -317,11 +318,16 @@ void FVoxelOceanCascades::Update(uint32 Tick, double Time, double FoamDecaySecon
     const double Step = bHasTime ? FMath::Clamp(Time - LastTime, 0.0, 0.25) : 0.0;
     LastTime = Time;
     bHasTime = true;
-    const bool bFoam = FoamDecaySeconds > 0.0;
-    const float FoamFall = bFoam ? (float)(Step / FoamDecaySeconds) : 0.0f;
+    // Stage W3w: the fine foam's step (VoxelOceanFoam.ush: e^(-Decay dt), and the growth per unit
+    // of source over it, (Grow / Decay) (1 - e^(-Decay dt))).
+    const bool bFoam = FineFoam.X > 0.0f && FineFoam.Y > 0.0f && FineFoam.W >= 0.0f;
+    const float FoamFall = 0.0f;
+    const double FoamKeep = bFoam ? FMath::Exp(-Step * (double)FineFoam.Y) : 1.0;
+    const FVector4f FoamRule = bFoam ? FVector4f(FineFoam.X, (float)FoamKeep, (float)((double)FineFoam.Z / (double)FineFoam.Y * (1.0 - FoamKeep)), FineFoam.W)
+        : FVector4f(0.0f, 1.0f, 0.0f, -1.0f);
 
     ENQUEUE_RENDER_COMMAND(VoxelOceanCascades)(
-        [RenderState = State, SlotTable = Slots, Gen = Generation, Tick, DisplacementResource, DerivativesResource, FoamResource, bFoam, FoamFall](FRHICommandListImmediate& RHICmdList)
+        [RenderState = State, SlotTable = Slots, Gen = Generation, Tick, DisplacementResource, DerivativesResource, FoamResource, bFoam, FoamFall, FoamRule](FRHICommandListImmediate& RHICmdList)
         {
             FRHITexture* DisplacementRHI = DisplacementResource->TextureRHI;
             FRHITexture* DerivativesRHI = DerivativesResource->TextureRHI;
@@ -433,6 +439,7 @@ void FVoxelOceanCascades::Update(uint32 Tick, double Time, double FoamDecaySecon
                     P->FoamOut = GraphBuilder.CreateUAV(FRDGTextureUAVDesc(Foam, 0));
                     P->FoamFall = FoamFall;
                     P->FoamOn = bFoam ? 1u : 0u;
+                    P->FoamRule = FoamRule;
                     FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("VoxelOcean Assemble"), TShaderMapRef<FVoxelOceanAssembleCS>(ShaderMap), P, Grid2D);
                 }
                 for (int32 Mip = 1; Mip < VOC::Mips; Mip++)

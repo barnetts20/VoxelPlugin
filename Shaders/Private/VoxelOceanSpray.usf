@@ -1,20 +1,22 @@
-// VoxelOceanSpray.usf - The ocean's spray (stage W3o; Design/OceanWaves.md section 39; the
-// particles' maths in VoxelOceanSpray.ush), run by the ocean's own pass (VoxelOceanSurfacePass.cpp)
-// after the sea is drawn:
-// - SprayUpdateCS, once a frame: every particle stepped (the wind, gravity), moved into the frame's
-//   new anchor (the frame's first view's camera), dropped when its life is out or too far away;
+// VoxelOceanSpray.usf - The ocean's spray (stage W3x: GodotOceanWaves' sea spray; Design/OceanWaves.md
+// section 49; the splashes' maths in VoxelOceanSpray.ush), run by the ocean's own pass
+// (VoxelOceanSurfacePass.cpp) after the sea is drawn:
+// - SprayUpdateCS, once a frame: every splash aged, moved into the frame's new anchor (the frame's
+//   first view's camera), and placed where it rides the wave: its birth point at rest displaced as
+//   the clipmap displaces it now (the horizontal three quarters, as Godot), plus its rise; dropped
+//   when its life is out or too far away;
 // - SpraySpawnCS, once a frame, over the first view in cells of SPAWN_CELL pixels: where the sea
 //   was drawn (the depth closer than what lay behind it), the water's point; its point at rest (the
-//   clipmap's displacement inverted), the whitecaps' density there and the contact with anything
-//   standing in the water (stage W3o; none since W3r: the spray is the whitecaps' and the bores');
-//   puffs born by
-//   their rates times the cell's area on the water times the step, into a ring of particles (the
-//   oldest overwritten), at most SprayInfo.w a frame;
-// - SprayVS / SprayPS, every view: each particle a camera-facing quad (6 vertices from its index;
-//   a dead one NaN, culled), streaked along its motion across the view (stage W3q), a puff broken up
-//   by the foam set's billows and grain (stage W3q; a value noise without the set) lit by the sun
-//   (forward scattering and a diffuse share) and the sky, faded against the scene's depth, blended
-//   over the scene's colour (premultiplied).
+//   clipmap's displacement inverted), the foam there (the clipmap's raw foam) and the surface's
+//   normal: Godot's candidates (0.243 per m^2 per s) times the cell's area on the water and the
+//   step, born where the foam is dense and the surface flat enough, into a ring (the oldest
+//   overwritten), at most SprayInfo.w a frame;
+// - SprayVS / SprayPS, every view: each splash a camera-facing quad (6 vertices from its index; a
+//   dead one NaN, culled), its height along the view's projection of the radial; a soft blob broken
+//   up by the foam set's billows (a value noise without the set), dissolving through a scrolling
+//   value noise (Godot's dissolve texture) by its fade and its seed, faded near the camera (Godot's
+//   distance fade) and against the scene's depth (so it sinks into the water), lit by the sun and the
+//   sky, blended over the scene's colour (premultiplied).
 //
 // Parameter names must match FVoxelOceanSpray*Parameters (VoxelOceanSurfacePass.cpp) exactly.
 //
@@ -39,6 +41,9 @@ RWStructuredBuffer<uint> SprayBorn;
 // x: the ring's size, y: unused, z: the frame's number, w: the most born a frame. The step (s).
 uint4 SprayInfo;
 float SprayDt;
+// Stage W3x: the anchor to the waves' sample frame (cm, world axes: the clipmap's points are from
+// the selection camera, VoxelOceanClip.ush).
+float3 SprayAnchorToSample;
 // The planet's centre from the anchor (cm, world axes); the sea sphere's radius (cm); how far from
 // the anchor a particle lives (cm).
 float3 SprayCenter;
@@ -48,9 +53,14 @@ float SprayReach;
 float3 SprayShift;
 // The wind at the camera (world axes, cm/s): the spray's (the weather varies over kilometres).
 float3 SprayWind;
-// x: the amount (0 none), y: the wind (m/s), z: the whitecaps' density spray rises from (stage W3s),
-// w: the puffs' size (1: as designed).
+// x: the amount (0 none; 1 Godot's candidates), y: unused, z: the foam the splashes rise from (Godot's
+// 0.9), w: their size (1: Godot's).
 float4 SprayAmount;
+// The waves' rotation to world and the clipmap (the step's and the births').
+float4 SurfaceRotation;
+Texture2DArray SurfaceClipDisplacement;
+SamplerState SurfaceClipSampler;
+Texture2D SurfaceClipInfo;
 
 FVoxelOceanSprayParticle VoxelOceanSprayLoad(uint I)
 {
@@ -58,22 +68,22 @@ FVoxelOceanSprayParticle VoxelOceanSprayLoad(uint I)
     const float4 B = SprayParticles[3u * I + 1u];
     const float4 C = SprayParticles[3u * I + 2u];
     FVoxelOceanSprayParticle P;
-    P.Position = A.xyz;
+    P.Rest = A.xyz;
     P.Age = A.w;
-    P.Velocity = B.xyz;
+    P.Drawn = B.xyz;
     P.Life = B.w;
-    P.Size = C.x;
-    P.Kind = C.y;
+    P.Width = C.x;
+    P.Height = C.y;
     P.Seed = C.z;
-    P.Spare = C.w;
+    P.Arc = C.w;
     return P;
 }
 
 void VoxelOceanSprayStore(uint I, FVoxelOceanSprayParticle P)
 {
-    SprayParticles[3u * I] = float4(P.Position, P.Age);
-    SprayParticles[3u * I + 1u] = float4(P.Velocity, P.Life);
-    SprayParticles[3u * I + 2u] = float4(P.Size, P.Kind, P.Seed, P.Spare);
+    SprayParticles[3u * I] = float4(P.Rest, P.Age);
+    SprayParticles[3u * I + 1u] = float4(P.Drawn, P.Life);
+    SprayParticles[3u * I + 2u] = float4(P.Width, P.Height, P.Seed, P.Arc);
 }
 
 uint VoxelOceanSprayHash(uint X)
@@ -102,12 +112,19 @@ void SprayUpdateCS(uint3 Id : SV_DispatchThreadID)
     if (I >= SprayInfo.x) return;
     FVoxelOceanSprayParticle P = VoxelOceanSprayLoad(I);
     if (P.Life <= 0.0f) return;
-    P.Position = P.Position + SprayShift;
-    const float3 FromCenter = P.Position - SprayCenter;
-    const float3 Down = -normalize(FromCenter);
-    P = VoxelOceanSprayStep(P, SprayWind, Down, SprayDt);
-    // Gone far from the camera, or well under the sea.
-    if (length(P.Position) > SprayReach || length(FromCenter) < SpraySeaRadius - 1000.0f) P.Life = 0.0f;
+    P.Rest = P.Rest + SprayShift;
+    P = VoxelOceanSprayAge(P, SprayDt);
+    const float3 FromCenter = P.Rest - SprayCenter;
+    const float3 Up = normalize(FromCenter);
+    // Riding the wave (Godot's): the surface's displacement at its rest point now (the clipmap's, at
+    // a metre's footprint), its horizontal part three quarters; its rise along the radial.
+    const float3 X = VoxelOceanRotateBack(SurfaceRotation, P.Rest + SprayAnchorToSample);
+    const float4 D = VoxelOceanClipSample(SurfaceClipDisplacement, SurfaceClipSampler, VoxelOceanClipPickOfTexture(SurfaceClipInfo, X, 100.0f));
+    const float3 DW = VoxelOceanRotate(SurfaceRotation, D.xyz);
+    const float Vertical = dot(DW, Up);
+    P.Drawn = P.Rest + (DW - Up * Vertical) * 0.75f + Up * (Vertical + VoxelOceanSprayRise(P));
+    // Gone far from the camera, or its rest point well under the sea.
+    if (length(P.Rest) > SprayReach || length(FromCenter) < SpraySeaRadius - 1000.0f) P.Life = 0.0f;
     VoxelOceanSprayStore(I, P);
 }
 
@@ -138,14 +155,11 @@ float4 SurfaceShape;
 float4 SurfaceFFT;
 float4 SurfaceRefHigh;
 float4 SurfaceRefLow;
-float4 SurfaceRotation;
 float4 SurfaceTiles;
 float4 SurfaceStates;
 float4 SurfaceSlopeVar;
 Texture2D SurfaceCharts;
-Texture2DArray SurfaceClipDisplacement;
-SamplerState SurfaceClipSampler;
-Texture2D SurfaceClipInfo;
+Texture2DArray SurfaceClipNormal;
 Texture2DArray SurfaceClipWhitecap;
 
 float3 VoxelOceanSprayRelOf(float2 UV, float DeviceZ)
@@ -192,39 +206,36 @@ void SpraySpawnCS(uint3 Id : SV_DispatchThreadID)
         D = VoxelOceanClipSample(SurfaceClipDisplacement, SurfaceClipSampler, VoxelOceanClipPickOfTexture(SurfaceClipInfo, X, Side));
         X = XD - D.xyz;
     }
-    // (Stage W3s: at the pixel's own footprint, as the surface draws them; at the cell's, the breakers'
-    // narrow faces averaged away below any core.)
-    const float Whitecap = VoxelOceanPixelWhitecapOf(X, Side / float(VOXEL_OCEAN_SPRAY_SPAWN_CELL), SurfaceClipWhitecap, SurfaceClipSampler, SurfaceClipInfo);
-    float Rate = VoxelOceanSpraySpumeRate(Whitecap, SprayAmount.y, SprayAmount.z);
+    // Stage W3x: the foam there (the clipmap's raw foam, Godot's summed foam before its drawing) at the
+    // pixel's own footprint, and the surface's normal.
+    const float PixelSide = Side / float(VOXEL_OCEAN_SPRAY_SPAWN_CELL);
+    const float Foam = VoxelOceanPixelWhitecapAllOf(X, PixelSide, PixelSide, SurfaceClipWhitecap, SurfaceClipSampler, SurfaceClipInfo, 0.0f).y;
+    if (Foam <= SprayAmount.z) return;
+    const FVoxelOceanPixelClipOut C = VoxelOceanPixelClipOf(X, UpP, PixelSide, SurfaceClipDisplacement, SurfaceClipNormal, SurfaceClipSampler, SurfaceClipInfo);
+    const float NormalUp = dot(C.Normal, UpP);
 
-    // (Stage W3r: no splashes from contacts; the spray is the whitecaps' and the bores'.)
-    const float Core = 0.0f;
-    const float3 Away = float3(0.0f, 0.0f, 0.0f);
-    const float SplashRate = VoxelOceanSpraySplashRate(Core);
-
-    // How many: the expected count, its fraction by chance.
-    const float Expected = (Rate + SplashRate) * SprayAmount.x * AreaM2 * SprayDt;
+    // How many: Godot's candidates over the cell's area and the step, the fraction by chance.
+    const float Expected = VOXEL_OCEAN_SPRAY_CANDIDATES * SprayAmount.x * AreaM2 * SprayDt;
     const uint Count = min(uint(Expected) + (VoxelOceanSprayUnit(H0 ^ 0x51ed27u) < frac(Expected) ? 1u : 0u), uint(VOXEL_OCEAN_SPRAY_CELL_MAX));
     if (Count == 0u) return;
-    const float SplashShare = SplashRate / max(Rate + SplashRate, 1.0e-6f);
+    // The rest point from the anchor (world axes).
+    const float3 RestRel = VoxelOceanRotate(W.Rotation, X) - SprayViewToSample + SprayViewToAnchor;
+    const float3 T1 = normalize(cross(Up, abs(Up.z) < 0.9f ? float3(0.0f, 0.0f, 1.0f) : float3(1.0f, 0.0f, 0.0f)));
+    const float3 T2 = cross(Up, T1);
     for (uint K = 0u; K < Count; K++)
     {
+        const uint HK = VoxelOceanSprayHash(H0 + K * 0x632be5abu);
+        // Anywhere in the cell's middle pixel's footprint along the surface.
+        const float3 Jitter = (T1 * (VoxelOceanSprayUnit(HK ^ 0x1u) - 0.5f) + T2 * (VoxelOceanSprayUnit(HK ^ 0x2u) - 0.5f)) * PixelSide;
+        FVoxelOceanSprayParticle P = VoxelOceanSprayBirth(RestRel + Jitter, Foam, NormalUp, SprayAmount.z, SprayAmount.w,
+            VoxelOceanSprayUnit(HK ^ 0x3u), VoxelOceanSprayUnit(HK ^ 0x4u));
+        if (P.Life <= 0.0f) return;
         uint Born;
         InterlockedAdd(SprayBorn[0], 1u, Born);
         if (Born >= SprayInfo.w) return;
         uint Head;
         InterlockedAdd(SprayCounters[0], 1u, Head);
-        const uint Index = Head % SprayInfo.x;
-        const uint HK = VoxelOceanSprayHash(H0 + K * 0x632be5abu);
-        const float Kind = VoxelOceanSprayUnit(HK) < SplashShare ? 1.0f : 0.0f;
-        // Anywhere in the cell's middle pixel's footprint along the surface.
-        const float3 T1 = normalize(cross(Up, abs(Up.z) < 0.9f ? float3(0.0f, 0.0f, 1.0f) : float3(1.0f, 0.0f, 0.0f)));
-        const float3 T2 = cross(Up, T1);
-        const float3 Jitter = (T1 * (VoxelOceanSprayUnit(HK ^ 0x1u) - 0.5f) + T2 * (VoxelOceanSprayUnit(HK ^ 0x2u) - 0.5f)) * Side;
-        FVoxelOceanSprayParticle P = VoxelOceanSprayBirth(Rel + SprayViewToAnchor + Jitter * (Kind > 0.5f ? 0.2f : 1.0f), Up, SprayWind,
-            Away, Kind, VoxelOceanSprayUnit(HK ^ 0x3u), VoxelOceanSprayUnit(HK ^ 0x4u), VoxelOceanSprayUnit(HK ^ 0x5u), VoxelOceanSprayUnit(HK ^ 0x6u));
-        P.Size *= max(SprayAmount.w, 0.05f);
-        VoxelOceanSprayStore(Index, P);
+        VoxelOceanSprayStore(Head % SprayInfo.x, P);
     }
 }
 
@@ -244,10 +255,7 @@ SamplerState SprayFoamSampler;
 Texture2D SprayFoamTable;
 float4 SprayFoamInfo;
 
-// Stage W3q: a puff's streak along its motion across the view (the distance it moves in this long,
-// s; at most STREAK_MAX times its size); the share of the set's tile across a puff.
-#define VOXEL_OCEAN_SPRAY_STREAK_TIME 0.04f
-#define VOXEL_OCEAN_SPRAY_STREAK_MAX 3.0f
+// The share of the foam set's tile across a splash.
 #define VOXEL_OCEAN_SPRAY_TEX_SPAN 0.05f
 // The light (the surface pass's stand-in).
 float3 SurfaceSunDirection;
@@ -259,7 +267,8 @@ void SprayVS(uint VertexId : SV_VertexID,
     out float4 OutPosition : SV_POSITION,
     out float3 OutRel : TEXCOORD0,
     out float4 OutPuff : TEXCOORD1,
-    out float3 OutUp : TEXCOORD2)
+    out float3 OutUp : TEXCOORD2,
+    out float2 OutFade : TEXCOORD3)
 {
     const uint I = VertexId / 6u;
     const uint Corner = VertexId - I * 6u;
@@ -267,18 +276,18 @@ void SprayVS(uint VertexId : SV_VertexID,
     const float4 B = SprayParticlesIn[3u * I + 1u];
     const float4 C = SprayParticlesIn[3u * I + 2u];
     FVoxelOceanSprayParticle P;
-    P.Position = A.xyz;
+    P.Rest = A.xyz;
     P.Age = A.w;
-    P.Velocity = B.xyz;
+    P.Drawn = B.xyz;
     P.Life = B.w;
-    P.Size = C.x;
-    P.Kind = C.y;
+    P.Width = C.x;
+    P.Height = C.y;
     P.Seed = C.z;
-    P.Spare = C.w;
+    P.Arc = C.w;
     // The quad's corner: (-1, -1), (1, -1), (1, 1); (-1, -1), (1, 1), (-1, 1).
     const float2 Q = Corner == 0u || Corner == 3u ? float2(-1.0f, -1.0f)
         : (Corner == 1u ? float2(1.0f, -1.0f) : (Corner == 2u || Corner == 4u ? float2(1.0f, 1.0f) : float2(-1.0f, 1.0f)));
-    const float3 Centre = P.Position + SprayAnchorFromView;
+    const float3 Centre = P.Drawn + SprayAnchorFromView;
     const float Distance = max(length(Centre), 1.0f);
     const float3 Forward = Centre / Distance;
     const float3 Up = normalize(Centre - (SprayCenter + SprayAnchorFromView));
@@ -286,35 +295,46 @@ void SprayVS(uint VertexId : SV_VertexID,
     const float3 Across = abs(dot(Up, Forward)) < 0.99f ? Up : (abs(Forward.z) < 0.9f ? float3(0.0f, 0.0f, 1.0f) : float3(1.0f, 0.0f, 0.0f));
     const float3 Right = normalize(cross(Across, Forward));
     const float3 Top = cross(Forward, Right);
-    const float Radius = 0.5f * VoxelOceanSpraySize(P);
-    // Streaked along its motion across the view (stage W3q): the quad's first axis along it,
-    // stretched by the distance it moves in STREAK_TIME, its opacity spread over the longer quad.
-    const float3 Side = P.Velocity - Forward * dot(P.Velocity, Forward);
-    const float SideSpeed = length(Side);
-    float3 AxisU = Right;
-    float3 AxisV = Top;
-    float Stretch = 1.0f;
-    if (SideSpeed > 1.0f)
-    {
-        AxisU = Side / SideSpeed;
-        AxisV = cross(Forward, AxisU);
-        Stretch = 1.0f + min(SideSpeed * VOXEL_OCEAN_SPRAY_STREAK_TIME / Radius, VOXEL_OCEAN_SPRAY_STREAK_MAX);
-    }
-    // Its opacity: its own, faded within two sizes of the camera and over the last tenth of the
-    // reach (where it is dropped).
-    const float Opacity = saturate(VoxelOceanSprayOpacity(P) * SprayLook.x) * saturate((Distance - Radius) / (2.0f * Radius))
-        * saturate((SprayReach - length(P.Position)) / (0.1f * SprayReach)) * rsqrt(Stretch);
-    OutRel = Centre + (AxisU * (Q.x * Stretch) + AxisV * Q.y) * Radius;
+    // Its size now (Godot's splash: wide by log(1 + t), tall by an impulse), the quad's half sides.
+    const float2 Size = VoxelOceanSpraySizeNow(P) * 0.5f;
+    // Its opacity: Godot's most, faded near the camera (Godot's) and over the last tenth of the reach
+    // (where it is dropped).
+    const float Opacity = saturate(VOXEL_OCEAN_SPRAY_MAX_ALPHA * SprayLook.x) * VoxelOceanSprayNear(Distance)
+        * saturate((SprayReach - length(P.Rest)) / (0.1f * SprayReach));
+    OutRel = Centre + Right * (Q.x * Size.x) + Top * (Q.y * Size.y);
     OutPuff = float4(Q, Opacity, P.Seed);
     OutUp = Up;
+    OutFade = float2(VoxelOceanSprayFade(P), P.Age);
     OutPosition = mul(float4(OutRel, 1.0f), SurfaceRelToClip);
-    if (P.Life <= 0.0f || Opacity <= 0.0f) OutPosition = asfloat(0x7fc00000u).xxxx;
+    if (P.Life <= 0.0f || Opacity <= 0.0f || Size.x <= 0.0f || Size.y <= 0.0f) OutPosition = asfloat(0x7fc00000u).xxxx;
+}
+
+// A value noise in [0, 1] (two octaves), Godot's dissolve texture's stand-in.
+float VoxelOceanSprayNoise(float2 G0)
+{
+    float Noise = 0.0f;
+    [unroll]
+    for (int O = 0; O < 2; O++)
+    {
+        const float2 G = G0 * (O == 0 ? 1.0f : 2.4f) + (O == 0 ? 0.0f : 17.3f);
+        const float2 Cell = floor(G);
+        const float2 F = G - Cell;
+        const float2 S = F * F * (3.0f - 2.0f * F);
+        const int2 Ci = int2(Cell);
+        const float N00 = VoxelOceanSprayUnit(uint(Ci.x) * 0x9e3779b9u ^ uint(Ci.y) * 0x85ebca6bu);
+        const float N10 = VoxelOceanSprayUnit(uint(Ci.x + 1) * 0x9e3779b9u ^ uint(Ci.y) * 0x85ebca6bu);
+        const float N01 = VoxelOceanSprayUnit(uint(Ci.x) * 0x9e3779b9u ^ uint(Ci.y + 1) * 0x85ebca6bu);
+        const float N11 = VoxelOceanSprayUnit(uint(Ci.x + 1) * 0x9e3779b9u ^ uint(Ci.y + 1) * 0x85ebca6bu);
+        Noise += (O == 0 ? 0.65f : 0.35f) * lerp(lerp(N00, N10, S.x), lerp(N01, N11, S.x), S.y);
+    }
+    return Noise;
 }
 
 void SprayPS(float4 SvPosition : SV_POSITION,
     float3 Rel : TEXCOORD0,
     float4 Puff : TEXCOORD1,
     float3 Up : TEXCOORD2,
+    float2 Fade : TEXCOORD3,
     out float4 OutColor : SV_Target0)
 {
     // The set's coordinates across the puff (a seeded place in the tile) and the level its texels
@@ -351,26 +371,16 @@ void SprayPS(float4 SvPosition : SV_POSITION,
     }
     else
     {
-        // Without the set: two octaves of value noise turning with its seed, over the cover.
-        float Noise = 0.0f;
-        [unroll]
-        for (int O = 0; O < 2; O++)
-        {
-            const float2 G = Puff.xy * (O == 0 ? 2.5f : 6.0f) + Puff.w * (O == 0 ? 37.0f : 91.0f);
-            const float2 Cell = floor(G);
-            const float2 F = G - Cell;
-            const float2 S = F * F * (3.0f - 2.0f * F);
-            const float N00 = VoxelOceanSprayUnit(asuint(Cell.x) * 0x9e3779b9u ^ asuint(Cell.y) * 0x85ebca6bu);
-            const float N10 = VoxelOceanSprayUnit(asuint(Cell.x + 1.0f) * 0x9e3779b9u ^ asuint(Cell.y) * 0x85ebca6bu);
-            const float N01 = VoxelOceanSprayUnit(asuint(Cell.x) * 0x9e3779b9u ^ asuint(Cell.y + 1.0f) * 0x85ebca6bu);
-            const float N11 = VoxelOceanSprayUnit(asuint(Cell.x + 1.0f) * 0x9e3779b9u ^ asuint(Cell.y + 1.0f) * 0x85ebca6bu);
-            Noise += (O == 0 ? 0.65f : 0.35f) * lerp(lerp(N00, N10, S.x), lerp(N01, N11, S.x), S.y);
-        }
+        // Without the set: the value noise turning with its seed, over the cover.
+        const float Noise = VoxelOceanSprayNoise(Puff.xy * 2.5f + Puff.w * 37.0f);
         Body = smoothstep(0.08f, 0.0f, (1.0f - Cover) - Noise + 0.04f) * (0.6f + 0.4f * Cover);
     }
     // (Breakup 0: the plain blob; 1: the texture's breakup as designed.)
     Body = lerp(Cover, Body, saturate(Breakup));
-    float Alpha = Puff.z * Body;
+    // Stage W3x: Godot's dissolve: its fade and its seed against a noise scrolling across it (its
+    // dissolve texture's, UV + 0.35 t), a few cells over the splash.
+    const float DissolveNoise = VoxelOceanSprayNoise((Puff.xy * 0.5f + 0.5f) * 4.0f + Fade.y * 0.35f * 4.0f + Puff.w * 91.0f);
+    float Alpha = Puff.z * Body * VoxelOceanSprayDissolve(Fade.x, Puff.w, DissolveNoise);
     // Faded where the scene (the sea, the shore) lies just behind it, and hidden behind it.
     const int2 Pixel = clamp(int2(SvPosition.xy) - int2(SurfaceViewMin), int2(0, 0), int2(SurfaceViewSize) - 1);
     const float Depth = SpraySceneDepth.Load(int3(int2(SvPosition.xy), 0));

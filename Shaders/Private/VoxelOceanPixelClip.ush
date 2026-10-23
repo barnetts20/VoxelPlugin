@@ -246,7 +246,9 @@ FVoxelOceanPixelSurf VoxelOceanPixelSurfOf(float3 SamplePoint, float Footprint, 
             // drawn as the clipmap draws it; the whitecaps likewise, the bores' kept in the zone.
             const float FreshGain = max(Charts.Load(int3(VoxelOceanConstantsX(max(int(W.FFT.y), 1)), 16, 0)).x, 0.0f);
             const float Fresh = VoxelOceanFoamFresh(Pt.FoamSource * Keep * (1.0f - Caps.z), FreshGain);
-            O.Foam = VoxelOceanFoamDrawn(lerp(Caps.y, max(Caps.y, Fresh), Own));
+            // (Stage W3w: the fine foam at the pixel added, as the clipmap adds it at its texels.)
+            const float Fine = Pt.FineFoam * Keep * (1.0f - Caps.z);
+            O.Foam = lerp(C.Foam, VoxelOceanFoamDrawn(max(Caps.y, Fresh) + Fine), Own);
             O.Whitecap = lerp(Caps.x, max(VoxelOceanFoamDrawn(Fresh), Caps.x * Caps.z), Own);
             O.Own = Own;
         }

@@ -10,6 +10,7 @@
 // 3. the coverage at rest points (as the clipmap's texels: world space) over 20 s at 15 Hz, from 7
 //    to 25 m/s, at the default whitecap threshold and foam amount: rising with the wind, a few
 //    percent at 10 m/s; and the trails: foam left where a crest broke fades by the decay;
+// 4b. the fine foam (stage W3w): the rule in the shortest band's own tile, its share at the defaults;
 // 4. the surf's foam (VoxelOceanSurf.ush; the source fed into the same buffer): the bores' faces
 //    and short wake, no step at the trough, the mean where unresolved, the swash's thin edge, off
 //    when off.
@@ -213,6 +214,31 @@ int main()
         const double Decayed = std::exp(-1.0 * VoxelOceanFoamDecayRate(float(DefaultAmount)));
         std::printf("  breaking points 1 s on (%d of them): foam %.3f of what it was (the decay alone %.3f)\n", TrailCount, Ratio, Decayed);
         Check(TrailCount > 20 && Ratio > 0.5 * Decayed && Ratio < 0.6, "the foam a crest leaves fades as a trail", Ratio, 0.6);
+    }
+
+    std::printf("\n4b. The fine foam (stage W3w; VoxelOceanFFT.usf): Godot's rule in the shortest band's own tile, its J at the\n"
+                "    waves' chop, at the defaults (whitecap 0.9, amount 5), 10 s at 50 Hz (the cascades' rate)\n");
+    {
+        const double FineWhitecap = 0.9, FineAmount = 5.0, Dt = 1.0 / 50.0;
+        const int Steps = 500, Slot = SlotCount - 1;
+        const float Keep = float(std::exp(-Dt * VoxelOceanFoamDecayRate(float(FineAmount))));
+        const float GrowDt = float(VoxelOceanFoamGrowRate(float(FineAmount)) / VoxelOceanFoamDecayRate(float(FineAmount)) * (1.0 - Keep));
+        std::vector<float> F(size_t(N) * N, 0.0f);
+        double Cover = 0.0, Mean = 0.0;
+        for (int Step = 0; Step < Steps; Step++)
+        {
+            const FGPUSlot G = EmulateGPU(Slots[Slot], TickOf(100.0 + Step * Dt));
+            for (size_t i = 0; i < F.size(); i++)
+            {
+                const float J = (1.0f + G.Derivatives[i].z) * (1.0f + G.Derivatives[i].w) - G.Displacement[i].w * G.Displacement[i].w;
+                F[i] = VoxelOceanFoamStep(F[i], VoxelOceanFoamSource(J, float(FineWhitecap)), GrowDt, Keep);
+                if (Step >= Steps / 2) { Cover += VoxelOceanFoamDrawn(F[i]); Mean += F[i]; }
+            }
+        }
+        Cover /= double(F.size()) * (Steps - Steps / 2);
+        Mean /= double(F.size()) * (Steps - Steps / 2);
+        std::printf("  the fine foam's drawn share alone: %.2f%% (its mean %.4f; a texel %.1f cm)\n", 100.0 * Cover, Mean, 100.0 * Slots[Slot].Params.TileLength / N);
+        Check(Cover > 0.003 && Cover < 0.06, "specks on the short waves' crests: 0.3% to 6% of the sea at the reference wind", Cover, 0.06);
     }
 
     std::printf("\n4. The surf's foam (VoxelOceanSurf.ush; a 1:50 beach, 1.5 m waves at 12 m/s)\n");

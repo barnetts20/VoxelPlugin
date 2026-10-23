@@ -54,10 +54,11 @@ public:
      *  start spectrum again on the next update. */
     void SetSlots(TConstArrayView<VoxelOceanSpectrum::FSlotGPU> InSlots);
 
-    /** Game thread, once per tick: the cascades at this tick of the ocean clock (TickOf; Time
-     *  the clock itself, s, for the foam's fall between updates); the foam's envelope falls one
-     *  sigma per FoamDecaySeconds (0: no foam). */
-    void Update(uint32 Tick, double Time, double FoamDecaySeconds);
+    /** Game thread, at each wave update: the cascades at this tick of the ocean clock (TickOf;
+     *  Time the clock itself, s, for the foam's step between updates). Stage W3w: the fine foam
+     *  (GodotOceanWaves' rule in one slot's own tile, VoxelOceanFoam.ush): x its whitecap
+     *  threshold (0: none), y its decay and z its growth (per second), w the slot it runs on. */
+    void Update(uint32 Tick, double Time, const FVector4f& FineFoam);
 
     const FVoxelOceanCascadeTextures& GetTextures() const { return Textures; }
 

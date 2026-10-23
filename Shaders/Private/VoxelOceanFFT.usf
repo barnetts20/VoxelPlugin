@@ -18,8 +18,11 @@
 //      Derivatives  = (eta_x, eta_y, chop Dxx, chop Dyy)
 //    The displaced surface's tangents are (1 + chop Dxx, chop Dxy, eta_x) and (chop Dxy,
 //    1 + chop Dyy, eta_y); its area ratio (Jacobian) (1 + chop Dxx)(1 + chop Dyy) - (chop Dxy)^2.
-//    (Stage W3v: the open sea's per-slot foam envelope, O9b to W3u, is retired: FoamState and
-//    FoamOut are written zero; the foam runs on the wave clipmap, VoxelOceanFoam.ush.)
+//    (Stage W3v: the open sea's per-slot foam envelope, O9b to W3u, is retired; the foam runs on
+//    the wave clipmap, VoxelOceanFoam.ush.) Stage W3w: THE FINE FOAM, GodotOceanWaves' rule in one
+//    slot's own tile (FoamRule.w: the shortest band's, as Godot's short normal-only cascade with its
+//    own threshold and amount), from that slot's own J at the waves' chop: the fine, quick foam of
+//    the short waves' crests; FoamState keeps it, FoamOut (F, F^2); the other slots zero.
 // 5. MipCS once per mip level: the 2 x 2 average of both textures; FoamMipCS the foam's (so its
 //    mips hold each texel's mean of Z and of Z^2).
 //
@@ -28,6 +31,7 @@
 
 #include "/Engine/Public/Platform.ush"
 #include "/Plugin/VoxelPlugin/Private/VoxelOceanSpectrum.ush"
+#include "/Plugin/VoxelPlugin/Private/VoxelOceanFoam.ush"
 
 #define VOXEL_OCEAN_FFT_SIZE 256
 #define VOXEL_OCEAN_FFT_HALF 128
@@ -188,6 +192,7 @@ RWStructuredBuffer<float> FoamState;        // per slot and texel: the foam's en
 RWTexture2DArray<float2> FoamOut;           // per slot: (Z, Z^2)
 float FoamFall;                             // dt / decay: Z's fall this frame (sigma)
 uint FoamOn;                                // 0: no foam (the state and the texture zero)
+float4 FoamRule;                            // stage W3w: the fine foam: x the threshold, y e^(-Decay dt), z the growth per unit of source over the step, w its slot (-1 none)
 
 [numthreads(8, 8, 1)]
 void AssembleCS(uint3 Id : SV_DispatchThreadID)
@@ -198,11 +203,19 @@ void AssembleCS(uint3 Id : SV_DispatchThreadID)
     const float4 F1 = Fields[VoxelOceanElement(2u * Id.z + 1u, Id.y, Id.x)];    // eta_y, Dxx, Dyy, Dxy
     DisplacementOut[Id] = float4(Chop * F0.y, Chop * F0.z, F0.x, Chop * F1.w);
     DerivativesOut[Id] = float4(F0.w, F1.x, Chop * F1.y, Chop * F1.z);
-    // (Stage W3v: the per-slot foam envelope is retired: the foam runs on the wave clipmap, from the
-    // summed surface's J, VoxelOceanFoam.ush. The state and the texture stay, zero, for the passes
-    // that still bind them.)
-    FoamState[VoxelOceanElement(Id.z, Id.y, Id.x)] = 0.0f;
-    FoamOut[Id] = float2(0.0f, 0.0f);
+    // The fine foam (stage W3w): the rule's step from the slot's own area ratio, the waves' chop.
+    const uint Element = VoxelOceanElement(Id.z, Id.y, Id.x);
+    float F = 0.0f;
+    if (FoamOn != 0u && FoamRule.w >= 0.0f && int(Id.z) == int(FoamRule.w + 0.5f))
+    {
+        const float Dxx = Chop * F1.y;
+        const float Dyy = Chop * F1.z;
+        const float Dxy = Chop * F1.w;
+        const float J = (1.0f + Dxx) * (1.0f + Dyy) - Dxy * Dxy;
+        F = VoxelOceanFoamStep(FoamState[Element], VoxelOceanFoamSource(J, FoamRule.x), FoamRule.z, FoamRule.y);
+    }
+    FoamState[Element] = F;
+    FoamOut[Id] = float2(F, F * F);
 }
 
 // ---------------------------------------------------------------------------------------------

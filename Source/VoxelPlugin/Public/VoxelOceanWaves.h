@@ -348,6 +348,12 @@ struct FVoxelOceanFFTSettings
     double FoamWhitecap = 0.75;
     double FoamAmount = 8.0;
     double SurfFoam = 1.0;
+    /** Stage W3w (live): the fine foam (Godot's short cascade's: the shortest band's own, in its
+     *  tile; its whitecap threshold, 0 none, and foam amount), and the cascades' update rate (Hz;
+     *  0: every frame; GodotOceanWaves updates its at 50). */
+    double FineFoamWhitecap = 0.9;
+    double FineFoamAmount = 5.0;
+    double UpdateRate = 50.0;
 
     bool operator==(const FVoxelOceanFFTSettings& Other) const
     {

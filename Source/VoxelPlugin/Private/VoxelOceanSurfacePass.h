@@ -92,8 +92,9 @@ struct FVoxelOceanShadingParams
     float SprayReachM = 600.0f;
     int32 SprayParticles = 65536;
     FVector3f SprayWind = FVector3f::ZeroVector;
-    /** Stage W3s: the whitecaps' density spray rises from, the puffs' size, opacity and breakup. */
-    float SprayCore = 0.2f;
+    /** Stage W3x (GodotOceanWaves' spray): the foam the splashes rise from, their size, opacity
+     *  and breakup. */
+    float SprayFoam = 0.9f;
     float SpraySize = 1.0f;
     float SprayOpacity = 1.0f;
     float SprayBreakup = 1.0f;

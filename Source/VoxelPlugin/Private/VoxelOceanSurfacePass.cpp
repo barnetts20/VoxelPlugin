@@ -168,6 +168,11 @@ BEGIN_SHADER_PARAMETER_STRUCT(FVoxelOceanSprayUpdateParameters, )
     SHADER_PARAMETER(float, SprayReach)
     SHADER_PARAMETER(FVector3f, SprayShift)
     SHADER_PARAMETER(FVector3f, SprayWind)
+    SHADER_PARAMETER(FVector3f, SprayAnchorToSample)
+    SHADER_PARAMETER(FVector4f, SurfaceRotation)
+    SHADER_PARAMETER_TEXTURE(Texture2DArray, SurfaceClipDisplacement)
+    SHADER_PARAMETER_SAMPLER(SamplerState, SurfaceClipSampler)
+    SHADER_PARAMETER_TEXTURE(Texture2D, SurfaceClipInfo)
 END_SHADER_PARAMETER_STRUCT()
 
 BEGIN_SHADER_PARAMETER_STRUCT(FVoxelOceanSpraySpawnParameters, )
@@ -205,6 +210,7 @@ BEGIN_SHADER_PARAMETER_STRUCT(FVoxelOceanSpraySpawnParameters, )
     SHADER_PARAMETER_TEXTURE(Texture2DArray, SurfaceClipDisplacement)
     SHADER_PARAMETER_SAMPLER(SamplerState, SurfaceClipSampler)
     SHADER_PARAMETER_TEXTURE(Texture2D, SurfaceClipInfo)
+    SHADER_PARAMETER_TEXTURE(Texture2DArray, SurfaceClipNormal)
     SHADER_PARAMETER_TEXTURE(Texture2DArray, SurfaceClipWhitecap)
 END_SHADER_PARAMETER_STRUCT()
 
@@ -625,6 +631,12 @@ void FVoxelOceanSurfacePass::RenderSpray_RenderThread(FRDGBuilder& GraphBuilder,
             U->SprayReach = Reach;
             U->SprayShift = FVector3f(Shift);
             U->SprayWind = Wind;
+            // Stage W3x: the splashes ride the waves (the clipmap's displacement at their rest points).
+            U->SprayAnchorToSample = FVector3f(SprayAnchor - SV.SelectionCamera);
+            U->SurfaceRotation = Surface.SurfaceRotation;
+            U->SurfaceClipDisplacement = Surface.SurfaceClipDisplacement;
+            U->SurfaceClipSampler = Surface.SurfaceClipSampler;
+            U->SurfaceClipInfo = Surface.SurfaceClipInfo;
             FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("VoxelOceanSprayUpdate %u", Pool), UpdateShader, U,
                 FComputeShaderUtils::GetGroupCount((int32)Pool, 64));
         }
@@ -641,8 +653,8 @@ void FVoxelOceanSurfacePass::RenderSpray_RenderThread(FRDGBuilder& GraphBuilder,
             S->SprayDt = Dt;
             S->SprayReach = Reach;
             S->SprayWind = Wind;
-            S->SprayAmount = FVector4f(Params.SprayAmount, Params.SprayWind.Size(), FMath::Clamp(Params.SprayCore, 0.0f, 0.95f),
-                FMath::Max(Params.SpraySize, 0.05f));
+            // (Stage W3x: x the amount, z the foam the splashes rise from, w their size.)
+            S->SprayAmount = FVector4f(Params.SprayAmount, 0.0f, FMath::Clamp(Params.SprayFoam, 0.0f, 1.3f), FMath::Max(Params.SpraySize, 0.05f));
             S->SurfaceViewMin = Surface.SurfaceViewMin;
             S->SurfaceViewSize = Surface.SurfaceViewSize;
             S->SpraySceneDepth = SceneDepth;
@@ -671,6 +683,7 @@ void FVoxelOceanSurfacePass::RenderSpray_RenderThread(FRDGBuilder& GraphBuilder,
             S->SurfaceClipDisplacement = Surface.SurfaceClipDisplacement;
             S->SurfaceClipSampler = Surface.SurfaceClipSampler;
             S->SurfaceClipInfo = Surface.SurfaceClipInfo;
+            S->SurfaceClipNormal = Surface.SurfaceClipNormal;
             S->SurfaceClipWhitecap = Surface.SurfaceClipWhitecap;
             const FIntPoint Size = SV.Rect.Size();
             const FIntPoint Cells((Size.X + 7) / 8, (Size.Y + 7) / 8);

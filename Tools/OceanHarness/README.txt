@@ -21,8 +21,9 @@ Ocean harnesses (stages O1-O4, O6a, O6b, O7, O8, O9a-O9c). Plain C++20; no engin
   spectrum_view.cpp         O6a: pictures of the sea from the emulated cascades (perspective from an
                             altitude, top-down relief), with or without detiling
   ocean_fft_emulation.h     VoxelOceanFFT.usf's passes in float, shared by the two above (and eq_check)
-  spray_check.cpp           W3o: the spray's maths (VoxelOceanSpray.ush): the exact step, terminal speeds,
-                            trajectories, birth rates, the look, a storm's budget against the ring
+  spray_check.cpp           W3x: the spray's maths (VoxelOceanSpray.ush, GodotOceanWaves' sea spray): the
+                            birth's thresholds and sizes, the rise, the splash's shape, the fade, the
+                            dissolve, a storm's budget against the ring
       g++ -O2 -std=c++20 -I<plugin>/Source/VoxelPlugin/Public -I<plugin>/Shaders/Private spray_check.cpp -o spray_check
   cubic_check.cpp           W3u: the cubic B-spline lookups' taps (VoxelOceanCubic.ush): four bilinear taps
                             against the 16-texel sum (wrapped too), the weights, a ramp reproduced, C2

@@ -262,6 +262,9 @@ private:
     bool bProbed = false;
     bool bClipBound = false;
     bool bTexturesBound = false;
+    /** Stage W3w: the ocean clock's time the cascades were last updated at (their fixed rate). */
+    double CascadeTime = 0.0;
+    bool bCascadeTime = false;
     bool bReportedFFT = false;
     bool bHasInputs = false;
     bool bRewriteAll = false;

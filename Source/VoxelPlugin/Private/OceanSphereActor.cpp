@@ -490,7 +490,7 @@ void AOceanSphereActor::UpdateSurfacePass()
     Params.SprayAmount = S.bSpray ? S.SprayAmount : 0.0f;
     Params.SprayReachM = S.SprayDistance;
     Params.SprayParticles = S.SprayParticles;
-    Params.SprayCore = S.SprayCore;
+    Params.SprayFoam = S.SprayFoam;
     Params.SpraySize = S.SpraySize;
     Params.SprayOpacity = S.SprayOpacity;
     Params.SprayBreakup = S.SprayBreakup;
@@ -1157,6 +1157,9 @@ FVoxelOceanSurfaceInputs AOceanSphereActor::GatherInputs(const AAdaptiveVoxelAct
     // The foam (stage W3v): a whitecap threshold of 0 makes none.
     Inputs.Waves.FoamWhitecap = S.bFoam ? S.FoamWhitecap : 0.0;
     Inputs.Waves.FoamAmount = S.FoamAmount;
+    Inputs.Waves.FineFoamWhitecap = S.bFoam ? S.FineFoamWhitecap : 0.0;
+    Inputs.Waves.FineFoamAmount = S.FineFoamAmount;
+    Inputs.Waves.UpdateRate = S.WaveUpdateRate;
     Inputs.Waves.SurfFoam = S.bFoam ? S.SurfFoam : 0.0;
     // The field reaches the queries wherever it exists (a server builds it on the CPU, and has
     // no texture); its texture and the pages' cull only where it was made.
