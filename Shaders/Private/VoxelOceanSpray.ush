@@ -1,0 +1,181 @@
+// VoxelOceanSpray.ush - The ocean's spray (stage W3o; Design/OceanWaves.md section 39): the
+// particles' birth, motion and look, shared by the GPU passes (VoxelOceanSpray.usf) and the harness
+// (Tools/OceanHarness/spray_check.cpp). Shared subset (VoxelShaderCompat.h): no out parameters,
+// f-suffixed literals, members not swizzles, every field set.
+//
+// WHAT IT IS. Two kinds of spray, as puffs (a particle is a soft cloud of droplets, not a drop):
+//   - spume (kind 0): the mist the wind tears off breaking crests. Born on the whitecaps at a rate
+//     per square metre of whitecap that rises from nothing at 8 m/s to its full rate at 20 m/s
+//     (spume drops form from about 9 to 10 m/s up, Monahan; Beaufort's "spray" from force 8), plus a
+//     little at lower winds from the breaking itself (from 4 to 8 m/s). Fine drops: they take the
+//     wind's speed within a quarter second and fall slowly;
+//   - splash (kind 1): thrown up where a crest hits something standing in the water (the
+//     intersection foam's whitened core, VoxelOceanContactOf). Heavier drops: thrown up 4 to 10 m/s,
+//     out from the contact, and falling back.
+// THE MOTION: linear drag toward the wind's velocity with the kind's time constant tau, under
+// gravity scaled by the kind's fall share; integrated exactly over a step (the velocity relaxes to
+// its terminal velocity, wind + tau g' down, as e^(-t / tau)), so any step is stable.
+// THE LOOK: a puff grows as it spreads (its size 1 + SPREAD age / life times its first), fades in
+// over its first 0.05 s and out over its last 40%.
+// STAGE W3r: spume only from the whitecaps' cores (the breaking crests and the bores' faces), no
+// splashes from contacts (none are born; the kind stays for later), 4 to 12 cm puffs living 0.15 to
+// 0.4 s, thrown up 2 to 3.5 m/s and taken by the wind over 1.5 s, a fifth opaque each: many faint
+// puffs composing a cloud, not a few solid ones.
+// STAGE W3q (from W3o's look in game): puffs a third the size (12 to 36 cm spume, 10 to 30 cm
+// splashes), living 0.25 to 0.6 s (spume) or 0.4 to 0.9 s (splashes), thrown a metre at most and carried a few metres by the wind it
+// feels near the waves (WIND_SHARE of the 10 m wind), three times as many; drawn streaked along
+// their motion and broken up by the foam set's billows and grain (VoxelOceanSpray.usf).
+//
+// Lengths: cm; time: s; velocities: cm/s.
+
+#ifndef VOXEL_OCEAN_SPRAY_USH
+#define VOXEL_OCEAN_SPRAY_USH
+
+#ifndef VOXEL_FUNC
+#define VOXEL_FUNC
+#endif
+
+#define VOXEL_OCEAN_SPRAY_GRAVITY 980.665f
+// The spume's rate (puffs per m^2 of whitecap per s): the breaking's own from 4 to 8 m/s, the
+// wind's from 8 to 20 m/s.
+// (Stage W3r: from the whitecaps' cores only, four times W3q's there: many small faint puffs that
+// add up, not a few solid ones. Stage W3s: the core's threshold a setting, SprayCore: the rate
+// rises from that whitecap density over CORE_RAMP more.)
+#define VOXEL_OCEAN_SPRAY_BREAK_RATE 2.0f
+#define VOXEL_OCEAN_SPRAY_SPUME_RATE 12.0f
+#define VOXEL_OCEAN_SPRAY_CORE_RAMP 0.4f
+#define VOXEL_OCEAN_SPRAY_SPUME_WIND0 8.0f
+#define VOXEL_OCEAN_SPRAY_SPUME_WIND1 20.0f
+// The splashes' rate (puffs per m^2 of a contact's whitened core per s).
+#define VOXEL_OCEAN_SPRAY_SPLASH_RATE 18.0f
+// Each kind's drag time constant (s), fall share of gravity, peak opacity.
+// (Stage W3r: spume 1.5 s and falling at 0.7 g: thrown up off the crest first, the wind taking it
+// over gradually; W3q's took the wind within a quarter second, with no uplift to see.)
+#define VOXEL_OCEAN_SPRAY_TAU0 1.5f
+#define VOXEL_OCEAN_SPRAY_TAU1 1.5f
+#define VOXEL_OCEAN_SPRAY_FALL0 0.7f
+#define VOXEL_OCEAN_SPRAY_FALL1 1.0f
+#define VOXEL_OCEAN_SPRAY_OPACITY0 0.2f
+#define VOXEL_OCEAN_SPRAY_OPACITY1 0.6f
+// Stage W3q: the wind the spray feels, a share of the 10 m wind (the log profile half a metre over
+// the waves, and the crest's own sheltering).
+#define VOXEL_OCEAN_SPRAY_WIND_SHARE 0.6f
+// How much a puff spreads over its life (its size times 1 + this at its end).
+#define VOXEL_OCEAN_SPRAY_SPREAD 0.5f
+
+struct FVoxelOceanSprayParticle
+{
+    float3 Position;    // cm (the frame's)
+    float Age;          // s
+    float3 Velocity;    // cm/s
+    float Life;         // s (0: none)
+    float Size;         // cm, the puff's first diameter
+    float Kind;         // 0 spume, 1 splash
+    float Seed;         // 0 to 1 (its look)
+    float Spare;
+};
+
+VOXEL_FUNC FVoxelOceanSprayParticle VoxelOceanSprayNone()
+{
+    FVoxelOceanSprayParticle P;
+    P.Position = float3(0.0f, 0.0f, 0.0f);
+    P.Age = 0.0f;
+    P.Velocity = float3(0.0f, 0.0f, 0.0f);
+    P.Life = 0.0f;
+    P.Size = 0.0f;
+    P.Kind = 0.0f;
+    P.Seed = 0.0f;
+    P.Spare = 0.0f;
+    return P;
+}
+
+VOXEL_FUNC float VoxelOceanSpraySmooth(float A, float B, float X)
+{
+    const float T = saturate((X - A) / (B - A));
+    return T * T * (3.0f - 2.0f * T);
+}
+
+/** The spume's birth rate (puffs per m^2 of sea per s) for a whitecap density at a wind (m/s), from
+ *  the whitecaps' density Core up (stage W3s; 0.2 by default). */
+VOXEL_FUNC float VoxelOceanSpraySpumeRate(float Whitecap, float Wind, float Core)
+{
+    const float Break = VOXEL_OCEAN_SPRAY_BREAK_RATE * VoxelOceanSpraySmooth(4.0f, 8.0f, Wind);
+    const float Spume = VOXEL_OCEAN_SPRAY_SPUME_RATE * VoxelOceanSpraySmooth(VOXEL_OCEAN_SPRAY_SPUME_WIND0, VOXEL_OCEAN_SPRAY_SPUME_WIND1, Wind);
+    // (Stage W3r: from the whitecaps' cores, the breaking crests, not their margins.)
+    const float C0 = clamp(Core, 0.0f, 0.95f);
+    const float C1 = min(C0 + VOXEL_OCEAN_SPRAY_CORE_RAMP, 1.0f);
+    return VoxelOceanSpraySmooth(C0, C1, Whitecap) * (Break + Spume);
+}
+
+/** The splashes' birth rate (puffs per m^2 per s) for a contact's whitened core (0 to 1). */
+VOXEL_FUNC float VoxelOceanSpraySplashRate(float Core)
+{
+    return VOXEL_OCEAN_SPRAY_SPLASH_RATE * saturate(Core);
+}
+
+VOXEL_FUNC float VoxelOceanSprayTau(float Kind) { return Kind < 0.5f ? VOXEL_OCEAN_SPRAY_TAU0 : VOXEL_OCEAN_SPRAY_TAU1; }
+VOXEL_FUNC float VoxelOceanSprayFall(float Kind) { return Kind < 0.5f ? VOXEL_OCEAN_SPRAY_FALL0 : VOXEL_OCEAN_SPRAY_FALL1; }
+
+/** A puff born at Position on the surface (Up: the radial; Wind: the wind's velocity, cm/s; Away:
+ *  out from a splash's contact along the surface, unit or zero; U0 to U3: uniform randoms). */
+VOXEL_FUNC FVoxelOceanSprayParticle VoxelOceanSprayBirth(float3 Position, float3 Up, float3 Wind, float3 Away, float Kind,
+    float U0, float U1, float U2, float U3)
+{
+    FVoxelOceanSprayParticle P = VoxelOceanSprayNone();
+    P.Kind = Kind;
+    P.Seed = U3;
+    if (Kind < 0.5f)
+    {
+        // Thrown up off the crest, 2 to 3.5 m/s, with a little of the wind's speed (stage W3r: the
+        // uplift first, the wind taking it over its life); 4 to 12 cm, 0.15 to 0.4 s.
+        P.Position = Position + Up * (5.0f * U0);
+        P.Velocity = Wind * (VOXEL_OCEAN_SPRAY_WIND_SHARE * 0.1f * U1) + Up * (200.0f + 150.0f * U2);
+        P.Life = 0.15f + 0.25f * U0;
+        P.Size = 4.0f + 8.0f * U3;
+    }
+    else
+    {
+        // Thrown up and out from the contact.
+        // (Stage W3q: up 1.5 to 4 m/s, a metre at most; W3o's threw it four.)
+        P.Position = Position + Up * (10.0f * U0);
+        P.Velocity = Up * (150.0f + 250.0f * U2) + Away * (50.0f + 150.0f * U1) + Wind * 0.1f;
+        P.Life = 0.4f + 0.5f * U0;
+        P.Size = 10.0f + 20.0f * U3;
+    }
+    return P;
+}
+
+/** A step of Dt (s) under the wind (its velocity, cm/s) and gravity along Down (unit): exact for
+ *  linear drag (the velocity relaxes to wind + tau g' Down as e^(-t / tau)). */
+VOXEL_FUNC FVoxelOceanSprayParticle VoxelOceanSprayStep(FVoxelOceanSprayParticle In, float3 Wind, float3 Down, float Dt)
+{
+    FVoxelOceanSprayParticle P = In;
+    if (P.Life <= 0.0f || Dt <= 0.0f) return P;
+    const float Tau = VoxelOceanSprayTau(P.Kind);
+    const float3 Terminal = Wind * VOXEL_OCEAN_SPRAY_WIND_SHARE + Down * (Tau * VOXEL_OCEAN_SPRAY_GRAVITY * VoxelOceanSprayFall(P.Kind));
+    const float E = exp(-Dt / Tau);
+    const float3 Rel = P.Velocity - Terminal;
+    P.Position = P.Position + Terminal * Dt + Rel * (Tau * (1.0f - E));
+    P.Velocity = Terminal + Rel * E;
+    P.Age = P.Age + Dt;
+    if (P.Age >= P.Life) P.Life = 0.0f;
+    return P;
+}
+
+/** The puff's diameter now (cm). */
+VOXEL_FUNC float VoxelOceanSpraySize(FVoxelOceanSprayParticle P)
+{
+    return P.Size * (1.0f + VOXEL_OCEAN_SPRAY_SPREAD * saturate(P.Age / max(P.Life, 1.0e-3f)));
+}
+
+/** Its opacity at its middle now: in over 0.1 s, out over the last 40% of its life. */
+VOXEL_FUNC float VoxelOceanSprayOpacity(FVoxelOceanSprayParticle P)
+{
+    if (P.Life <= 0.0f) return 0.0f;
+    const float Peak = P.Kind < 0.5f ? VOXEL_OCEAN_SPRAY_OPACITY0 : VOXEL_OCEAN_SPRAY_OPACITY1;
+    const float In = saturate(P.Age * 20.0f);
+    const float Out = saturate((P.Life - P.Age) / (0.4f * P.Life));
+    return Peak * In * Out;
+}
+
+#endif

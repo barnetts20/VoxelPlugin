@@ -26,6 +26,7 @@
 #include "/Plugin/VoxelPlugin/Private/VoxelOceanPixelClip.ush"
 #include "/Plugin/VoxelPlugin/Private/VoxelOceanFoamTex.ush"
 #include "/Plugin/VoxelPlugin/Private/VoxelOceanShading.ush"
+#include "/Plugin/VoxelPlugin/Private/VoxelOceanContactSearch.ush"
 
 #ifndef VOXEL_OCEAN_SURFACE_VELOCITY
 #define VOXEL_OCEAN_SURFACE_VELOCITY 0
@@ -103,7 +104,8 @@ Texture2D SurfaceClipInfo;
 uint SurfaceClipOn;
 // Stage W3h: the whitecaps' density per level (x).
 Texture2DArray SurfaceClipWhitecap;
-// Stage W3h: x the crest glow's strength (0 none), y the whitecaps' relief gain.
+// Stage W3h: x the crest glow's strength (0 none), y the whitecaps' relief gain; stage W3l: z the
+// intersection foam's strength (0 none), w its reach (cm).
 float4 SurfaceCrest;
 
 // The water (per cm): scattering, extinction; the scattering phase's g.
@@ -121,6 +123,9 @@ float3 SurfaceSkyHorizon;
 // foam's albedo.
 float4 SurfaceShading;
 float3 SurfaceFoamAlbedo;
+// Stage W3s: x the foam's opacity overall, y its thinnest parts' (VOXEL_OCEAN_SURFACE_FOAM_THIN until
+// then), z the thickness it is solid from (0.6 until then).
+float4 SurfaceFoamLook;
 // The foam's texture set (stage W3g; VoxelOceanFoamTex.ush), its quantiles' table, and x: 1 / its
 // tile (1/m), y: its mips, z: on (else the procedural lace).
 Texture2D SurfaceFoamSet;
@@ -348,6 +353,52 @@ void SurfacePS(float4 SvPosition : SV_POSITION,
     // Out through the surface: past its reflection, and radiance divides by n^2.
     float3 Color = Reflected + (Body + Glow) * ((1.0f - Fresnel) / (VOXEL_OCEAN_WATER_IOR * VOXEL_OCEAN_WATER_IOR));
 
+    // -- Where the water meets something standing in it (stage W3l) -----------------------------
+    // The scene's point behind the water at this pixel (unrefracted), how far it lies along the
+    // surface and under it, and its slope from the quad's derivatives (outside any branch; nothing
+    // behind: far below). Foam and a whitened core where a steep contact is near, surging with the
+    // waves (VoxelOceanContactOf); into the foam's density and the whitecaps', so the foam set draws
+    // it.
+    const float3 PB = Depth0 > 0.0f ? VoxelOceanSurfaceRelOf((float2(Pixel) + 0.5f) / ViewSize, Depth0) : Rel - Up * 1.0e7f;
+    const float3 BedN = cross(ddx(PB), ddy(PB));
+    const float BedN2 = dot(BedN, BedN);
+    const float BedUp = BedN2 > 0.0f ? dot(BedN, Up) * dot(BedN, Up) / BedN2 : 1.0f;
+    const float BedSinSlope = sqrt(saturate(1.0f - BedUp));
+    // (The water's size per pixel across the view, for the search's disc: the smaller footprint.)
+    const float PixelAcross = min(length(ddx(SamplePoint)), length(ddy(SamplePoint)));
+    if (SurfaceCrest.z > 0.0f)
+    {
+        const float Reach = 1.4f * SurfaceCrest.w;
+        // The point straight behind (a steep rock just awash) ...
+        float Across = 1.0e9f;
+        float Below = 1.0e9f;
+        if (Depth0 > 0.0f)
+        {
+            const float3 DB = Rel - PB;
+            Below = max(dot(DB, Up), 0.0f);
+            Across = length(DB - Up * dot(DB, Up));
+        }
+        // ... and anything standing out of the water round the pixel (stage W3p: the ring).
+        const float AcrossRing = VoxelOceanContactSearch(SurfaceBehindDepth, Pixel, int2(SurfaceViewSize), SurfaceClipToRel, Rel, Up, PixelAcross, Reach);
+        if ((Across < Reach && Below < Reach) || AcrossRing < Reach)
+        {
+            // The surge: the pixel's height over the mean in the sea's height deviation (the point's
+            // sea state), from 1.5 deviations down (0) to 1.5 up (1).
+            float Surge = 0.5f;
+            if (W.FFT.x > 0.5f)
+            {
+                const int NS = max(int(W.FFT.y), 1);
+                const float4 SigmaS = VoxelOceanFFTBandSigma(VoxelOceanSeaStateAt(SurfaceCharts, VoxelOceanRotateBack(W.Rotation, Up), NS, W.Shape.y), SurfaceCharts, NS);
+                const float SigmaHS = 100.0f * sqrt(max(dot(SigmaS, SigmaS), 1.0e-8f));
+                Surge = saturate(0.5f + Height / (3.0f * SigmaHS));
+            }
+            const FVoxelOceanContact Own = VoxelOceanContactOf(Across, Below, BedSinSlope, Surge, SurfaceCrest.w, SurfaceCrest.z);
+            const FVoxelOceanContact Ring = VoxelOceanContactOf(AcrossRing, 0.0f, 1.0f, Surge, SurfaceCrest.w, SurfaceCrest.z);
+            Foam = max(Foam, max(Own.Foam, Ring.Foam));
+            Whitecap = max(Whitecap, max(Own.Whitecap, Ring.Whitecap));
+        }
+    }
+
     // -- The foam on top (stage W3f) ------------------------------------------------------------------
     // Its structure for the density (VoxelOceanFoamLace.ush: where, inside the pixel's share, the
     // foam lies), its relief from that structure (the walls' middles stand highest), lit as a thin
@@ -383,10 +434,10 @@ void SurfacePS(float4 SvPosition : SV_POSITION,
         Color = lerp(Color, FoamLight, VOXEL_OCEAN_SURFACE_FOAM_HAZE * saturate(Foam) * (1.0f - Lace.Foam));
         // Thin foam (a wall's edge, a fading trail) lets some of the water through; a whitecap
         // doesn't, and is brighter.
-        float Opacity = Lace.Foam * lerp(VOXEL_OCEAN_SURFACE_FOAM_THIN, 1.0f, smoothstep(0.0f, 0.6f, Lace.Thick)) * lerp(0.8f, 1.0f, saturate(Foam));
+        float Opacity = Lace.Foam * lerp(SurfaceFoamLook.y, 1.0f, smoothstep(0.0f, SurfaceFoamLook.z, Lace.Thick)) * lerp(0.8f, 1.0f, saturate(Foam));
         // (The procedural lace's third layer is its bubbles, not whitecaps.)
         const float LaceWhitecap = SurfaceFoamInfo.z > 0.5f ? saturate(Lace.Layer2) : 0.0f;
-        Opacity = max(Opacity, LaceWhitecap);
+        Opacity = max(Opacity, LaceWhitecap) * SurfaceFoamLook.x;
         Color = lerp(Color, FoamLight * lerp(1.0f, VOXEL_OCEAN_SURFACE_WHITECAP_GAIN, LaceWhitecap), saturate(Opacity));
     }
 

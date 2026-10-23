@@ -1,0 +1,55 @@
+// VoxelOceanContactSearch.ush - Where the water meets something standing in it, around a water
+// pixel (stage W3p; the intersection foam's and the splashes' contact, VoxelOceanContactOf). GPU
+// only: the ocean's own pass (VoxelOceanSurfacePass.usf) and the spray's births (VoxelOceanSpray.usf).
+//
+// WHY A SEARCH. Until W3p the contact was the scene's point straight behind the water pixel: foam
+// only where the object lay under that pixel, so it drew the object's submerged outline (an overlay
+// of the object) instead of a ring on the water round it. Now the pixels around (a disc of 16 taps
+// whose radius is the contact's reach on the water, in pixels, turned per pixel) are looked at in
+// the depth behind the water: any scene point from the surface (CONTACT_BAND under it, for the
+// waterline itself) up to CONTACT_UP above it is something standing out of the water there (a rock,
+// a hull, a body, the beach past the waterline), and the nearest one's distance along the surface
+// is the contact's distance. So the foam rings whatever stands in the water, on the water, as far
+// as the view sees round it; on a beach it is a border along the waterline, as wide as the reach.
+//
+// Points under the surface aren't contacts (a submerged object, a beach's shallows: a gentle beach
+// lies within a few centimetres of the surface for metres): the water over them doesn't foam. The
+// own point straight behind still counts as before (VoxelOceanContactOf with its slope and depth),
+// for a steep rock just awash.
+
+#pragma once
+
+// The band round the surface a contact may lie in (cm): this far under it, this far over it.
+#define VOXEL_OCEAN_CONTACT_BAND 5.0f
+#define VOXEL_OCEAN_CONTACT_UP 400.0f
+#define VOXEL_OCEAN_CONTACT_TAPS 16
+// The disc's largest radius (pixels): farther objects' rings are under a pixel or two anyway.
+#define VOXEL_OCEAN_CONTACT_MAX_PIXELS 48.0f
+
+// The nearest contact's distance along the surface (cm; 1e9: none within the disc) round the water
+// point Rel (from the view's camera, world axes; Up its radial) at Pixel (the view rect's), the
+// water's size per pixel there (cm) and the reach (cm). Behind: the depth before the sea was drawn
+// (the view rect's size); ClipToRel: the view's clip space to its camera-relative world axes.
+float VoxelOceanContactSearch(Texture2D<float> Behind, int2 Pixel, int2 ViewSize, float4x4 ClipToRel, float3 Rel, float3 Up, float PixelSize, float Reach)
+{
+    float Best = 1.0e9f;
+    const float RadiusPx = min(1.2f * Reach / max(PixelSize, 1.0e-3f), VOXEL_OCEAN_CONTACT_MAX_PIXELS);
+    if (RadiusPx < 1.0f) return Best;
+    // The disc turned per pixel (interleaved gradient noise; the temporal filter evens it).
+    const float Turn = 6.28318531f * frac(52.9829189f * frac(dot(float2(Pixel), float2(0.06711056f, 0.00583715f))));
+    [unroll]
+    for (int I = 0; I < VOXEL_OCEAN_CONTACT_TAPS; I++)
+    {
+        const float R = RadiusPx * sqrt((float(I) + 0.5f) / float(VOXEL_OCEAN_CONTACT_TAPS));
+        const float A = Turn + float(I) * 2.39996323f;
+        const int2 Tap = clamp(Pixel + int2(round(float2(cos(A), sin(A)) * R)), int2(0, 0), ViewSize - 1);
+        const float Depth = Behind.Load(int3(Tap, 0));
+        if (Depth <= 0.0f) continue;
+        const float4 H = mul(float4((float(Tap.x) + 0.5f) / float(ViewSize.x) * 2.0f - 1.0f, 1.0f - (float(Tap.y) + 0.5f) / float(ViewSize.y) * 2.0f, Depth, 1.0f), ClipToRel);
+        const float3 D = H.xyz / H.w - Rel;
+        const float Height = dot(D, Up);
+        if (Height < -VOXEL_OCEAN_CONTACT_BAND || Height > VOXEL_OCEAN_CONTACT_UP) continue;
+        Best = min(Best, length(D - Up * Height));
+    }
+    return Best;
+}

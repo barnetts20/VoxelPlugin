@@ -195,15 +195,16 @@ void UnderwaterMapCS(uint3 DispatchThreadId : SV_DispatchThreadID)
     const FVoxelOceanShoreFrame Frame = VoxelOceanShoreFrameFrom(UnderwaterShoreFrame[0], UnderwaterShoreFrame[1], UnderwaterShoreFrame[2],
         UnderwaterShoreFrame[3], UnderwaterShoreFrame[4], UnderwaterShoreFrame[5], UnderwaterShoreFrame[6]);
     // The last lookup reads the foam too (stage O9c): the foam of the surface above X, at the
-    // converged point, with the level's texel as footprint.
-    const uint Mask = UnderwaterFoamOn != 0u ? (VOXEL_OCEAN_LOOKUP_DISPLACEMENT | VOXEL_OCEAN_LOOKUP_FOAM) : VOXEL_OCEAN_LOOKUP_DISPLACEMENT;
+    // converged point, with the level's texel as footprint. Stage W3p: and the whitecaps (the
+    // breaking crests and the surf's bores), which need the surface's slopes (the full lookup).
+    const uint Mask = UnderwaterFoamOn != 0u ? (VOXEL_OCEAN_LOOKUP_ALL | VOXEL_OCEAN_LOOKUP_FOAM) : VOXEL_OCEAN_LOOKUP_DISPLACEMENT;
     FVoxelOceanWaveOutput Surface;
     const float Above = VoxelOceanHeightAtFFTShore(X, UnderwaterSphere, Waves, UnderwaterDisplacement, UnderwaterDisplacementSampler,
         UnderwaterDerivatives, UnderwaterDerivativesSampler, UnderwaterCharts, UnderwaterShore, UnderwaterFoam, UnderwaterFoamSampler, Frame,
         VoxelUnderwaterProbeDepth(X), Mask, Texel, Surface);
     const float Height = VoxelOceanSphereHeight(X, UnderwaterSphere.x, UnderwaterSphere.y, normalize(-Waves.Center));
     UnderwaterMapOut[DispatchThreadId] = Height - Above;
-    UnderwaterFoamMapOut[DispatchThreadId] = UnderwaterFoamOn != 0u ? Surface.Foam : 0.0f;
+    UnderwaterFoamMapOut[DispatchThreadId] = UnderwaterFoamOn != 0u ? max(Surface.Foam, Surface.Whitecap) : 0.0f;
 }
 
 [numthreads(VOXEL_UNDERWATER_THREADS, VOXEL_UNDERWATER_THREADS, 1)]

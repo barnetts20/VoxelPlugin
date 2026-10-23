@@ -166,6 +166,51 @@ VOXEL_FUNC float VoxelOceanCrestGlow(float Scattering, float Extinction, float T
     return SunIrradiance * Scattering * Phase * T * exp(-Extinction * T);
 }
 
+// Stage W3l: the intersection foam's gate on the contact's steepness (the sine of its slope: from
+// 20 to 37 degrees, so beaches are the surf's), its whitened core's share of the reach, and its
+// density in a trough against a crest's.
+#define VOXEL_OCEAN_CONTACT_STEEP0 0.34f
+#define VOXEL_OCEAN_CONTACT_STEEP1 0.6f
+#define VOXEL_OCEAN_CONTACT_CORE 0.3f
+#define VOXEL_OCEAN_CONTACT_BASE 0.35f
+// Stage W3p: how deep under the surface a contact may lie, in shares of the reach (the foam from the
+// first fading out by the second).
+#define VOXEL_OCEAN_CONTACT_DEEP0 0.15f
+#define VOXEL_OCEAN_CONTACT_DEEP1 0.35f
+
+struct FVoxelOceanContact
+{
+    float Foam;         // the foam's density (0 to 1)
+    float Whitecap;     // the whitened core's (0 to 1)
+};
+
+/** The foam where the water meets something standing in it (stage W3l): from the scene's point
+ *  behind the water at the pixel, Across (cm) along the surface and Below (cm) under it, and that
+ *  point's slope (SinSlope: the sine; 1 for a contact found standing out of the water, stage W3p's
+ *  search, VoxelOceanContactSearch.ush, with Below 0); Surge 0 in a trough to 1 on a crest. The reach (cm) grows
+ *  with the surge (the crest runs up and spreads its foam), the density falls off as the square
+ *  of the distance's share of it, and only a contact within the reach under the surface counts (a
+ *  rock deep down under clear water doesn't foam the surface over it). The core next to the
+ *  contact whitens as a crest arrives. Strength: the setting (0 none). */
+VOXEL_FUNC FVoxelOceanContact VoxelOceanContactOf(float Across, float Below, float SinSlope, float Surge, float Reach, float Strength)
+{
+    FVoxelOceanContact C;
+    C.Foam = 0.0f;
+    C.Whitecap = 0.0f;
+    if (Strength <= 0.0f || Reach <= 0.0f) return C;
+    const float S = saturate(Surge);
+    const float R = Reach * (0.6f + 0.8f * S);
+    const float Near = 1.0f - smoothstep(0.0f, R, max(Across, 0.0f));
+    // (Stage W3p: within a third of the reach under the surface, from a sixth; until then half to
+    // all of it, which foamed the water over a submerged body: its outline as an overlay.)
+    const float Shallow = 1.0f - smoothstep(VOXEL_OCEAN_CONTACT_DEEP0 * R, VOXEL_OCEAN_CONTACT_DEEP1 * R, max(Below, 0.0f));
+    const float Steep = smoothstep(VOXEL_OCEAN_CONTACT_STEEP0, VOXEL_OCEAN_CONTACT_STEEP1, SinSlope);
+    C.Foam = saturate(Strength * Near * Near * Shallow * Steep * (VOXEL_OCEAN_CONTACT_BASE + (1.0f - VOXEL_OCEAN_CONTACT_BASE) * S));
+    const float Core = 1.0f - smoothstep(0.0f, VOXEL_OCEAN_CONTACT_CORE * R, max(Across, 0.0f));
+    C.Whitecap = saturate(Strength * Core * Shallow * Steep * smoothstep(0.4f, 0.9f, S));
+    return C;
+}
+
 /** The stand-in sky (until the atmosphere's is connected): radiance per unit of the sun's
  *  illuminance from the horizon's colour to the zenith's; below the horizon, the horizon's. */
 VOXEL_FUNC float3 VoxelOceanStandInSky(float3 Dir, float3 Up, float3 Zenith, float3 Horizon)

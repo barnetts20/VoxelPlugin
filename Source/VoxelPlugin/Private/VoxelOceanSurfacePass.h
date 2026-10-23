@@ -28,12 +28,15 @@
 
 #include "CoreMinimal.h"
 #include "SceneViewExtension.h"
+#include "RenderGraphResources.h"
 #include <atomic>
 
 class IVoxelOceanRingDraw;
 struct FVoxelOceanFoamTexture;
 class IRendererModule;
 class FPostOpaqueRenderParameters;
+class FRDGBuilder;
+class FVoxelOceanSurfaceParameters;
 
 /** What the own pass draws and shades with (game thread snapshot). */
 struct FVoxelOceanShadingParams
@@ -60,12 +63,31 @@ struct FVoxelOceanShadingParams
     float Refraction = 1.0f;
     bool bFoam = true;
     FVector3f FoamAlbedo = FVector3f(0.85f, 0.85f, 0.85f);
+    /** Stage W3s: the foam's opacity overall, at its thinnest edges, and the thickness (0 to 1 of
+     *  the foam's structure) it is solid from. */
+    float FoamOpacity = 1.0f;
+    float FoamThinOpacity = 0.55f;
+    float FoamFalloff = 0.6f;
     /** The foam's texture set (stage W3g; null or not ready: the procedural lace) and its tile (m). */
     TSharedPtr<FVoxelOceanFoamTexture, ESPMode::ThreadSafe> FoamTexture;
     float FoamTileM = 12.0f;
     /** Stage W3h: the light through thin crests (0: none) and the whitecaps' relief (1: the lace's). */
     float CrestGlow = 1.0f;
     float WhitecapRelief = 3.0f;
+    /** Stage W3l: the intersection foam's strength (0: none) and reach (m). */
+    float IntersectionFoam = 1.0f;
+    float IntersectionFoamWidthM = 1.5f;
+    /** Stage W3o: the spray's amount (0: none), how far from the camera it lives (m), its ring of
+     *  particles, and the wind at the camera (world axes, m/s). */
+    float SprayAmount = 1.0f;
+    float SprayReachM = 600.0f;
+    int32 SprayParticles = 65536;
+    FVector3f SprayWind = FVector3f::ZeroVector;
+    /** Stage W3s: the whitecaps' density spray rises from, the puffs' size, opacity and breakup. */
+    float SprayCore = 0.2f;
+    float SpraySize = 1.0f;
+    float SprayOpacity = 1.0f;
+    float SprayBreakup = 1.0f;
 };
 
 class FVoxelOceanSurfacePass : public FWorldSceneViewExtension
@@ -100,6 +122,24 @@ private:
      *  by its matrices); null for any other. */
     const FSceneView* FindView(const FPostOpaqueRenderParameters& Parameters) const;
 
+    /** Stage W3o: the spray, after the sea is drawn for a view (its step and births once a frame,
+     *  from the frame's first view; drawn into every view). */
+    struct FSprayView
+    {
+        FVector ViewOrigin = FVector::ZeroVector;
+        FVector PlanetCenter = FVector::ZeroVector;
+        /** The waves' selection camera (world): their sample frame's origin. */
+        FVector SelectionCamera = FVector::ZeroVector;
+        double SeaRadius = 0.0;
+        FMatrix44f RelToClip = FMatrix44f::Identity;
+        FMatrix44f ClipToRel = FMatrix44f::Identity;
+        FIntRect Rect;
+        float PixelAngle = 1.0e-3f;
+        float DeltaSeconds = 0.0f;
+    };
+    void RenderSpray_RenderThread(FRDGBuilder& GraphBuilder, const FSceneView& View, const FSprayView& SprayView,
+        FRDGTexture* SceneColor, FRDGTexture* SceneDepth, FRDGTexture* BehindDepth, const FVoxelOceanSurfaceParameters& Surface);
+
     std::atomic<bool> bEnabled { false };
     IRendererModule* RendererModule = nullptr;
 
@@ -113,4 +153,15 @@ private:
         uint64 Frame = 0;
     };
     TArray<FViewEntry> Views;
+    // Stage W3o: the spray's ring of particles and its head, kept from frame to frame; the anchor
+    // its positions are from (the last frame's first view's camera, world).
+    TRefCountPtr<FRDGPooledBuffer> SprayParticles;
+    TRefCountPtr<FRDGPooledBuffer> SprayCounters;
+    uint32 SprayPool = 0;
+    uint64 SprayFrame = ~0ull;
+    // The last frame the spray was stepped: after a gap (spray off, or its inputs missing) the ring
+    // is cleared, so stale puffs don't come back mid-life.
+    uint64 SprayStepFrame = 0;
+    FVector SprayAnchor = FVector::ZeroVector;
+    bool bSprayAnchor = false;
 };

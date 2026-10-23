@@ -21,6 +21,9 @@ Ocean harnesses (stages O1-O4, O6a, O6b, O7, O8, O9a-O9c). Plain C++20; no engin
   spectrum_view.cpp         O6a: pictures of the sea from the emulated cascades (perspective from an
                             altitude, top-down relief), with or without detiling
   ocean_fft_emulation.h     VoxelOceanFFT.usf's passes in float, shared by the two above (and eq_check)
+  spray_check.cpp           W3o: the spray's maths (VoxelOceanSpray.ush): the exact step, terminal speeds,
+                            trajectories, birth rates, the look, a storm's budget against the ring
+      g++ -O2 -std=c++20 -I<plugin>/Source/VoxelPlugin/Public -I<plugin>/Shaders/Private spray_check.cpp -o spray_check
   eq_check.cpp              W3k: the wave equalizer: its gain against a double reference, the GPU slot
                             table's unpacking bit for bit, the statistics' scaling, the emulated field
       g++ -O2 -std=c++20 -ffp-contract=off -I<plugin>/Source/VoxelPlugin/Public -I<plugin>/Source/VoxelPlugin/Private

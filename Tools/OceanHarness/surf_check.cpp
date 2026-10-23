@@ -526,6 +526,24 @@ int main()
             Check(FoamMin < 0.2, "between the bores the carpet is thin", FoamMin, 0.2);
         }
         {
+            // Stage W3p: the breaking zone (where the surf's foam replaces the open sea's): all of it
+            // in the surf zone and on the beach, none well out past it.
+            const float InZone = VoxelOceanSurfOf(Input(Beach, 1.0 / 0.02, 10.0f), S).Zone;
+            const float OnBeach = VoxelOceanSurfOf(Input(Beach, -0.05 / 0.02, 10.0f), S).Zone;
+            const float Out = VoxelOceanSurfOf(Input(Beach, 9.0 / 0.02, 10.0f, 0.8f, 8.0f), S).Zone;
+            std::printf("  the breaking zone: %.2f 1 m deep, %.2f on the beach, %.2f 9 m deep (Hs 0.8)\n", InZone, OnBeach, Out);
+            Check(InZone > 0.7f, "the surf zone is the surf's (the open sea's foam faded there)", InZone, 0.7);
+            Check(Out < 0.05f, "well past it, the open sea's", Out, 0.05);
+            // The swash's foam only at its thin edge.
+            double SheetMin = 1.0;
+            for (int k = 0; k < 300; k++)
+            {
+                const FVoxelOceanSurf R = VoxelOceanSurfOf(Input(Beach, -0.02 / 0.02, 1.0f * k), S);
+                SheetMin = std::min(SheetMin, double(R.Foam));
+            }
+            Check(SheetMin < 0.05, "the swash's foam comes and goes with its thin edge (no standing mat)", SheetMin, 0.05);
+        }
+        {
             // Unresolved (a 200 m footprint): steady, at the cycle's mean.
             double Lo = 1.0, Hi = 0.0, Sum = 0.0;
             double SumNear = 0.0;

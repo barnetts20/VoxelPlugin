@@ -157,6 +157,21 @@ struct VOXELPLUGIN_API FVoxelOceanSettings
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Shading", meta = (EditCondition = "bOwnShading"))
     FLinearColor FoamAlbedo = FLinearColor(0.85f, 0.85f, 0.85f);
 
+    /** How opaque the foam is overall (stage W3s; 1: solid where it is thick, lower to let the
+     *  water show through all of it). */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Shading", meta = (EditCondition = "bOwnShading", ClampMin = "0.0", ClampMax = "1.0"))
+    float FoamOpacity = 1.0f;
+
+    /** How opaque the foam's thinnest parts are (its edges, fading trails) against its solid
+     *  middles (stage W3s). */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Shading", meta = (EditCondition = "bOwnShading", ClampMin = "0.0", ClampMax = "1.0"))
+    float FoamThinOpacity = 0.55f;
+
+    /** How far into the foam (0 to 1 of its thickness) it turns from its thin opacity to solid
+     *  (stage W3s): higher, a wider translucent falloff at its edges. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Shading", meta = (EditCondition = "bOwnShading", ClampMin = "0.01", ClampMax = "1.0"))
+    float FoamFalloff = 0.6f;
+
     /** The foam's texture set (stage W3g): a foam .vxnt in the plugin's NoiseSets folder, without
      *  the extension (Tools/NoiseTileTool/foam_tile.py makes one). Its lace, streaks and
      *  whitecaps are drawn where the foam's density puts foam. Empty or missing: the procedural
@@ -177,6 +192,54 @@ struct VOXELPLUGIN_API FVoxelOceanSettings
     /** How much higher a whitecap's billows stand than the lace's relief (stage W3h; 1: the same). */
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Shading", AdvancedDisplay, meta = (EditCondition = "bOwnShading", ClampMin = "1.0", UIMax = "8.0"))
     float WhitecapRelief = 3.0f;
+
+    /** Foam where the water meets anything steep standing in it: rocks, cliffs, piers, hulls
+     *  (stage W3l; from the scene's depth behind the water, so only what the view sees under the
+     *  surface). It surges as a crest arrives and drains in the trough; the very contact whitens.
+     *  Gentle beaches are the surf's (their slope is under the gate). 0: none; 1 as designed. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Shading", meta = (EditCondition = "bOwnShading", ClampMin = "0.0", UIMax = "2.0"))
+    float IntersectionFoam = 1.0f;
+
+    /** How far the intersection foam reaches out from the contact (m), and how deep under the
+     *  surface a contact may lie and still foam it. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Shading", meta = (EditCondition = "bOwnShading", ClampMin = "0.1", UIMax = "10.0"))
+    float IntersectionFoamWidth = 1.5f;
+
+    /** Spray (stage W3o): mist the wind tears off breaking crests (from about 8 m/s, fully at 20)
+     *  and splashes thrown up where crests hit rocks and hulls, as GPU particles near the camera. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Spray", meta = (EditCondition = "bOwnShading"))
+    bool bSpray = true;
+
+    /** How much spray is born (1: as designed; 0: none). */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Spray", meta = (EditCondition = "bOwnShading && bSpray", ClampMin = "0.0", UIMax = "4.0"))
+    float SprayAmount = 1.0f;
+
+    /** How far from the camera spray lives (m); it's born within half of it. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Spray", meta = (EditCondition = "bOwnShading && bSpray", ClampMin = "10.0", UIMax = "2000.0"))
+    float SprayDistance = 600.0f;
+
+    /** The most spray particles alive at once (each 48 bytes on the GPU; up to an eighth of them are
+     *  born a frame). */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Spray", AdvancedDisplay, meta = (EditCondition = "bOwnShading && bSpray", ClampMin = "1024", ClampMax = "262144"))
+    int32 SprayParticles = 65536;
+
+    /** The whitecaps' density spray rises from (stage W3s; 0 to 1): lower spawns over more of the
+     *  whitecaps and the breakers' faces, higher only from their very cores. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Spray", meta = (EditCondition = "bOwnShading && bSpray", ClampMin = "0.0", ClampMax = "0.95"))
+    float SprayCore = 0.2f;
+
+    /** The puffs' size (1: 4 to 12 cm, spreading half as much again). */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Spray", meta = (EditCondition = "bOwnShading && bSpray", ClampMin = "0.05", UIMax = "5.0"))
+    float SpraySize = 1.0f;
+
+    /** Each puff's opacity (1: a fifth at its most, many adding up). */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Spray", meta = (EditCondition = "bOwnShading && bSpray", ClampMin = "0.0", UIMax = "4.0"))
+    float SprayOpacity = 1.0f;
+
+    /** How far each puff is broken up into droplets by the foam texture (0: a soft blob; 1: as
+     *  designed; up to 3: sparser, more scattered droplets, for bigger puffs). */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Spray", meta = (EditCondition = "bOwnShading && bSpray", ClampMin = "0.0", ClampMax = "3.0"))
+    float SprayBreakup = 1.0f;
 
     /** The stand-in sky until the atmosphere is connected (stage W3b): its radiance at the zenith
      *  and at the horizon per unit of the sun's illuminance (the world's directional light), by
@@ -600,6 +663,18 @@ struct VOXELPLUGIN_API FVoxelOceanSettings
         FoamTile = FMath::Max(FoamTile, 1.0f);
         CrestGlow = FMath::Max(CrestGlow, 0.0f);
         WhitecapRelief = FMath::Max(WhitecapRelief, 1.0f);
+        IntersectionFoam = FMath::Max(IntersectionFoam, 0.0f);
+        IntersectionFoamWidth = FMath::Max(IntersectionFoamWidth, 0.1f);
+        SprayAmount = FMath::Max(SprayAmount, 0.0f);
+        SprayDistance = FMath::Max(SprayDistance, 10.0f);
+        SprayParticles = FMath::Clamp(SprayParticles, 1024, 262144);
+        SprayCore = FMath::Clamp(SprayCore, 0.0f, 0.95f);
+        SpraySize = FMath::Max(SpraySize, 0.05f);
+        SprayOpacity = FMath::Max(SprayOpacity, 0.0f);
+        SprayBreakup = FMath::Clamp(SprayBreakup, 0.0f, 3.0f);
+        FoamOpacity = FMath::Clamp(FoamOpacity, 0.0f, 1.0f);
+        FoamThinOpacity = FMath::Clamp(FoamThinOpacity, 0.0f, 1.0f);
+        FoamFalloff = FMath::Clamp(FoamFalloff, 0.01f, 1.0f);
     }
 
     /** The fields whose change rebuilds the surface. */

@@ -484,6 +484,27 @@ void AOceanSphereActor::UpdateSurfacePass()
     Params.FoamTileM = S.FoamTile;
     Params.CrestGlow = S.CrestGlow;
     Params.WhitecapRelief = S.WhitecapRelief;
+    Params.IntersectionFoam = S.IntersectionFoam;
+    Params.IntersectionFoamWidthM = S.IntersectionFoamWidth;
+    // The spray (stage W3o): the wind at the camera drives it (the weather varies over kilometres).
+    Params.SprayAmount = S.bSpray ? S.SprayAmount : 0.0f;
+    Params.SprayReachM = S.SprayDistance;
+    Params.SprayParticles = S.SprayParticles;
+    Params.SprayCore = S.SprayCore;
+    Params.SpraySize = S.SpraySize;
+    Params.SprayOpacity = S.SprayOpacity;
+    Params.SprayBreakup = S.SprayBreakup;
+    Params.FoamOpacity = S.FoamOpacity;
+    Params.FoamThinOpacity = S.FoamThinOpacity;
+    Params.FoamFalloff = S.FoamFalloff;
+    if (Params.SprayAmount > 0.0f && bHasCamera)
+    {
+        FVector Wind, Swell;
+        double Storm = 0.0;
+        const FTransform NoScaleTransform(GetActorRotation(), GetActorLocation());
+        if (GetWeatherAt(NoScaleTransform.TransformPosition(CameraPosition), Wind, Storm, Swell))
+            Params.SprayWind = FVector3f(Wind);
+    }
     SurfacePass->SetFrame_GameThread(Params);
 }
 

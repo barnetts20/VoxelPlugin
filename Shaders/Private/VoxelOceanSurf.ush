@@ -111,7 +111,9 @@
 #define VOXEL_OCEAN_SURF_SWASH_FRONT 0.35f
 #define VOXEL_OCEAN_SURF_SWASH_LAG 2.1991149f
 // The bore's foam trail behind its crest (of the cycle), the swash's foamy thickness (m).
-#define VOXEL_OCEAN_SURF_FOAM_TRAIL 0.25f
+// (Stage W3p: a quarter of the cycle until then. The foam's texture doesn't travel with the bores,
+// so a long trail read as a mat lying still while the bores swept through it.)
+#define VOXEL_OCEAN_SURF_FOAM_TRAIL 0.12f
 #define VOXEL_OCEAN_SURF_FOAM_THIN 0.06f
 // Whitecaps on the trains' crests: from this wave slope (Hc k / 2), fully at the second; their
 // share of the bores' foam.
@@ -125,7 +127,8 @@
 // zone: whitecaps everywhere in it, all the time, and a carpet of a quarter).
 #define VOXEL_OCEAN_SURF_BORE_TRAIL 0.06f
 #define VOXEL_OCEAN_SURF_CREST_WIDTH 0.05f
-#define VOXEL_OCEAN_SURF_FOAM_FLOOR 0.1f
+// (Stage W3p: 0, the carpet between the bores gone with the open sea's foam over the zone.)
+#define VOXEL_OCEAN_SURF_FOAM_FLOOR 0.0f
 // The bores' carpet (by the real depth, in breaking depths of the significant height): fully
 // within the first, none past the second.
 #define VOXEL_OCEAN_SURF_CARPET0 1.25f
@@ -383,6 +386,7 @@ struct FVoxelOceanSurf
     float Breaking;     // the surf's whitecaps: the bores' white water and steep crests (0 to 1; stage W3n)
     float Foam;         // the trains' and the swash's foam (0 to 1)
     float SteepVar;     // the trains' slope variance (for the open sea's foam; stage O9i)
+    float Zone;         // stage W3p: the breaking zone (0 to 1: the trains there, within the bores' carpet's depths, and the beach), where the surf's own foam replaces the open sea's
     float Active;
     float4 Debug;       // for the debug view: the trains' share, the field's depth (50 m: 1), its cover, the ramp
 };
@@ -399,6 +403,7 @@ VOXEL_FUNC FVoxelOceanSurf VoxelOceanSurfNone()
     S.Breaking = 0.0f;
     S.Foam = 0.0f;
     S.SteepVar = 0.0f;
+    S.Zone = 0.0f;
     S.Active = 0.0f;
     S.Debug = float4(0.0f, 0.0f, 0.0f, 0.0f);
     return S;
@@ -811,7 +816,10 @@ VOXEL_FUNC FVoxelOceanSurf VoxelOceanSurfOf(FVoxelOceanSurfInput In, FVoxelOcean
     // foamy edge follows the visible waterline: past the thin water's sinking, stage O9f), a
     // fifth elsewhere.
     const float Thickness = max(Level + (In.BedDepthM < 1.0e20f ? In.BedDepthM : D) - VOXEL_OCEAN_SURF_THIN_SHOWN * VoxelOceanSurfThinBand(In.SpacingM), 0.0f);
-    const float SwashFoam = S.Foam * Inland * Sheet * SheetSeen * SwashCover * (0.2f + 0.8f * exp(-Thickness * (1.0f / VOXEL_OCEAN_SURF_FOAM_THIN)));
+    // (Stage W3p: only the thin edge; until then a fifth over the whole sheet, a mat on the beach.)
+    const float SwashFoam = S.Foam * Inland * Sheet * SheetSeen * SwashCover * exp(-Thickness * (1.0f / VOXEL_OCEAN_SURF_FOAM_THIN));
+    // The breaking zone (stage W3p).
+    Out.Zone = saturate(Presence * Carpet);
 
     float2 HeightP = float2(0.0f, 0.0f);    // by the depth, by the field's distance
     float3 PhaseP = float3(0.0f, 0.0f, 0.0f);

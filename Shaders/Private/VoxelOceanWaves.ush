@@ -928,7 +928,7 @@ FVoxelOceanFFTSurf VoxelOceanFFTSurfAt(float3 D, float Depth, FVoxelOceanShore S
 // slope variance (stage O9i: the composed sea's steepness, so the whitecaps follow the trains);
 // the surf's foam where larger. The coverage is the surf's settings' (the chart table's row 16).
 float VoxelOceanFFTFoamOf(FVoxelOceanFoamBands Foam, FVoxelOceanFoamSlots Slots, FVoxelOceanSeaState Sea, float LongKeep, float SurfSteepVar, float SurfFoam,
-    Texture2D OceanCharts, int N, float ShortKeep)
+    float SurfZone, Texture2D OceanCharts, int N, float ShortKeep)
 {
     const float Coverage = max(OceanCharts.Load(int3(VoxelOceanConstantsX(N), 16, 0)).z, 0.0f);
     float Open = 0.0f;
@@ -947,7 +947,9 @@ float VoxelOceanFFTFoamOf(FVoxelOceanFoamBands Foam, FVoxelOceanFoamSlots Slots,
         Foam.Steep = float4(sqrt(V.x * Keep * Keep + max(SurfSteepVar, 0.0f)), sqrt(V.y) * Keep, sqrt(V.z), sqrt(V.w));
         Open = VoxelOceanFoamDensityOf(Foam, Sea.Wind, Coverage, ShortKeep);
     }
-    return saturate(max(Open, SurfFoam));
+    // Stage W3p: in the breaking zone the surf's foam (on its bores, moving with them) replaces the
+    // open sea's (whose texture lies still while the bores sweep through it).
+    return saturate(max(Open * (1.0f - saturate(SurfZone)), SurfFoam));
 }
 
 // The FFT waves at P (from the reference point, world axes) whose radial is Up, at Depth (cm) by
@@ -1059,7 +1061,7 @@ FVoxelOceanFFTPoint VoxelOceanFFTEvaluate(float3 P, float3 Up, float Spacing, fl
     const float ShortKeep = 1.0f - smoothstep(VOXEL_OCEAN_FOAM_SHORT_NEAR, VOXEL_OCEAN_FOAM_SHORT_FAR, Footprint);
     // (Stage W3n: the trains' slope variance no longer raises the open sea's foam: their crests
     // whiten themselves, VoxelOceanSurf.ush.)
-    Out.Foam = bFoam ? Drain.Keep * VoxelOceanFFTFoamOf(Foam, FoamSlots, Sea, Surf.Surf.LongKeep, 0.0f, Surf.Surf.Foam, OceanCharts, N, ShortKeep) : 0.0f;
+    Out.Foam = bFoam ? Drain.Keep * VoxelOceanFFTFoamOf(Foam, FoamSlots, Sea, Surf.Surf.LongKeep, 0.0f, Surf.Surf.Foam, Surf.Surf.Zone, OceanCharts, N, ShortKeep) : 0.0f;
     // The debug view (stage O9f; voxel.Ocean.DebugSurf, the chart table's row 18 w): one of the
     // surf's and the shore's quantities as the foam (0 to 1), to find where one changes abruptly.
     if (bFoam)
@@ -1163,8 +1165,9 @@ FVoxelOceanFFTPoint VoxelOceanFFTEvaluate(float3 P, float3 Up, float Spacing, fl
         const float Widen = Blended > 1.0e-12f ? sqrt(Resolved / Blended) : 1.0f;
         const float J = 1.0f - (1.0f - Out.R.Jacobian) * Widen;
         Out.Whitecap = Drain.Keep * VoxelOceanWhitecapOf(J, SlopeVarAll, Unresolved, Row16.x, Sea.Wind, max(Row16.z, 0.0f));
+        // (Stage W3p: in the breaking zone, the surf's bores own the whitecaps.)
         if (Surf.Surf.Active > 0.5f)
-            Out.Whitecap = max(Out.Whitecap, saturate(Surf.Surf.Breaking) * saturate(Row16.y));
+            Out.Whitecap = max(Out.Whitecap * (1.0f - saturate(Surf.Surf.Zone)), saturate(Surf.Surf.Breaking) * saturate(Row16.y));
     }
     return Out;
 }

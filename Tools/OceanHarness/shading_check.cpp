@@ -215,6 +215,59 @@ int main()
         std::printf("crest glow: worst error %.2g; red / green at 150 cm %.2f\n", Worst, Red / Green);
     }
 
+    // Stage W3l: the intersection foam (VoxelOceanContactOf) in a scene: a vertical wall at x = 0
+    // (the water at x > 0) over a bed 10 m down, a 2% beach, and a steep rock 8 m down; the camera
+    // 3 m up, 20 m out, looking at the water toward the wall. Each surface point's scene point
+    // behind is where the ray from the camera through it (straight on, as the pass's depth) meets
+    // the scene.
+    {
+        const double Reach = 150.0;
+        struct FHit { double Across, Below, SinSlope; };
+        auto Wall = [](double X) -> FHit
+        {
+            // The camera at (2000, 300) cm (x, height); the ray through (X, 0) goes on down.
+            const double Cx = 2000.0, Cz = 300.0;
+            const double Dx = X - Cx, Dz = -Cz;
+            // The wall's face (x = 0) or the bed (z = -1000), whichever first.
+            const double TWall = (0.0 - Cx) / Dx;
+            const double TBed = (-1000.0 - Cz) / Dz;
+            if (TWall > 1.0 && TWall < TBed)
+            {
+                const double Z = Cz + TWall * Dz;
+                return { X, -Z, 1.0 };
+            }
+            const double Xb = Cx + TBed * Dx;
+            return { std::fabs(Xb - X), 1000.0, 0.0 };
+        };
+        auto FoamAt = [&](FHit H, double Surge) { return VoxelOceanContactOf((float)H.Across, (float)H.Below, (float)H.SinSlope, (float)Surge, (float)Reach, 1.0f); };
+        const float AtWall = FoamAt(Wall(20.0), 0.5).Foam;
+        const float Mid = FoamAt(Wall(80.0), 0.5).Foam;
+        const float Out = FoamAt(Wall(250.0), 1.0).Foam;
+        std::printf("intersection foam by a wall: %.2f at 20 cm, %.2f at 80 cm, %.2f at 2.5 m (crest)\n", AtWall, Mid, Out);
+        Expect(AtWall > 0.5f, "at a wall the water foams");
+        Expect(Mid > 0.0f && Mid < AtWall, "less farther out");
+        Expect(Out == 0.0f, "none past the reach, even on a crest (1.4 x)");
+        const float Trough = FoamAt(Wall(40.0), 0.0).Foam, Crest = FoamAt(Wall(40.0), 1.0).Foam;
+        Expect(Crest > 1.8f * Trough && Trough > 0.0f, "it surges with a crest and drains in the trough");
+        Expect(FoamAt(Wall(20.0), 1.0).Whitecap > 0.5f && FoamAt(Wall(20.0), 0.2).Whitecap == 0.0f, "the contact whitens as a crest arrives, not in the trough");
+        // A 2% beach: the bed 0.02 x deep, x from the waterline; seen from the same camera.
+        float Beach = 0.0f;
+        for (double X = 5.0; X < 5000.0; X += 5.0)
+        {
+            const double Z = 0.02 * X;
+            Beach = std::max(Beach, FoamAt({ 3.0 * Z, Z, 0.02 }, 1.0).Foam);
+        }
+        Expect(Beach == 0.0f, "a gentle beach doesn't (the surf's)");
+        // A steep rock 8 m under clear water.
+        Expect(FoamAt({ 0.0, 800.0, 0.9 }, 1.0).Foam == 0.0f, "a steep rock deep under the surface doesn't");
+        Expect(VoxelOceanContactOf(10.0f, 10.0f, 1.0f, 1.0f, 150.0f, 0.0f).Foam == 0.0f, "strength 0: none");
+        // Stage W3p: the water over a body half a metre under it, straight behind the pixel, doesn't
+        // foam (until W3p it drew the body's submerged outline); a contact the search found standing
+        // out of the water 30 cm away does (Below 0, steep).
+        Expect(FoamAt({ 10.0, 50.0, 1.0 }, 0.5).Foam < 0.05f, "not over a body half a metre under the surface (the overlay)");
+        Expect(VoxelOceanContactOf(30.0f, 0.0f, 1.0f, 0.5f, 150.0f, 1.0f).Foam > 0.5f, "round something standing out of the water, 30 cm off");
+    }
+
     std::printf(Failures == 0 ? "shading_check: all passed\n" : "shading_check: %d failed\n", Failures);
     return Failures == 0 ? 0 : 1;
 }
