@@ -97,6 +97,8 @@ uint FlipWinding;
 // The terrain's depth: the density, the edits, the shore field and (stage O9m) the land
 // surface cache (VoxelOceanTerrainDepth.ush).
 #include "/Plugin/VoxelPlugin/Private/VoxelOceanTerrainDepth.ush"
+// Stage W5f: the felt depth at the coast (the probe's, as the wave hook's).
+#include "/Plugin/VoxelPlugin/Private/VoxelOceanFeltDepth.ush"
 
 // The job's depths per tile vertex: the waves' at the level's footprint, its parent's and its
 // grandparent's (a vertex may be another's target or target's target), the terrain's own at the
@@ -293,7 +295,14 @@ void ProbeCS(uint3 DispatchThreadId : SV_DispatchThreadID)
     const FVoxelOceanPointShore Shore = VoxelOceanPointShoreAt(X, Y, Z);
     const float WaveFootprint = max(Footprint, DepthFootprint);
     const FVoxelOceanWaveDepth Wave = VoxelOceanWaveDepthAt(X, Y, Z, WaveFootprint, Shore, false);
-    ProbeOut[I] = Wave.Depth;
+    // Stage W5f: felt (VoxelOceanFeltDepth.ush), with the terrain's own depth at the level's
+    // footprint (an inland basin's as land, as the clipmap's static layer has it), so the underwater
+    // pass's surface runs on to the terrain's waterline as the drawn one does (stage W5e). The wave
+    // hook takes it as it is there (no bed depth with it: VoxelOceanSurfFeltDepth leaves it).
+    float Land = VoxelOceanDepthAt(X, Y, Z, Footprint, false);
+    if (Shore.bBasin && (Land > 0.0f || Wave.Depth > 0.0f))
+        Land = VOXEL_OCEAN_BASIN_DEPTH;
+    ProbeOut[I] = VoxelOceanSurfFeltDepth(Wave.Depth, Land, 100.0f * VOXEL_OCEAN_SURF_FELT_BLEND);
     ProbeOut[ProbeCount + I] = VoxelOceanBedSlopeOf(Wave.Code);
 }
 

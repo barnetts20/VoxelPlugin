@@ -21,6 +21,7 @@ namespace VoxelShader
 #include "VoxelOceanFFTWaves.ush"
 #include "VoxelOceanShoal.ush"
 #include "VoxelOceanSurf.ush"
+#include "VoxelOceanFeltDepth.ush"
 }
 
 #include <algorithm>
@@ -536,14 +537,53 @@ int main()
             std::printf("  the breaking zone: %.2f 1 m deep, %.2f on the beach, %.2f 9 m deep (Hs 0.8)\n", InZone, OnBeach, Out);
             Check(InZone > 0.7f, "the surf zone is the surf's (the open sea's foam faded there)", InZone, 0.7);
             Check(Out < 0.05f, "well past it, the open sea's", Out, 0.05);
-            // The swash's foam only at its thin edge.
-            double SheetMin = 1.0;
+            // The swash's foam comes and goes (no standing mat): stage W5f, the sheet white as it
+            // rushes up (until then only its thin edge foamed), draining away after its peak.
+            double SheetMin = 1.0, SheetMax = 0.0;
             for (int k = 0; k < 300; k++)
             {
                 const FVoxelOceanSurf R = VoxelOceanSurfOf(Input(Beach, -0.02 / 0.02, 1.0f * k), S);
                 SheetMin = std::min(SheetMin, double(R.Foam));
+                SheetMax = std::max(SheetMax, double(R.Foam));
             }
-            Check(SheetMin < 0.05, "the swash's foam comes and goes with its thin edge (no standing mat)", SheetMin, 0.05);
+            std::printf("  the swash's sheet 2 cm above the still level: foam %.3f to %.3f over 300 s\n", SheetMin, SheetMax);
+            Check(SheetMax > 0.6, "the uprush's sheet is white water", SheetMax, 0.6);
+            Check(SheetMin < 0.15, "it drains away between uprushes (no standing mat)", SheetMin, 0.15);
+            // The thin edge band-limited to the footprint (stage W5f): its mean over a footprint kept,
+            // so a coarse texel holds its share rather than catching it or missing it.
+            {
+                FVoxelOceanSurfSettings SE = S;
+                const FBeach B2(0.05);
+                // At the instant the sheet's white water is least (the edge's foam alone, mostly).
+                float TLeast = 0.0f;
+                double Least = 1.0e9;
+                for (int k = 0; k < 600; k++)
+                {
+                    const double V = VoxelOceanSurfOf(Input(B2, -0.5, 0.5f * k), SE).Foam;
+                    if (V < Least) { Least = V; TLeast = 0.5f * k; }
+                }
+                double Fine = 0.0, Coarse = 0.0;
+                int Wet = 0;
+                const int Points = 2000;
+                for (int i = 0; i < Points; i++)
+                {
+                    // Points across 20 m of beach about the still level, at one instant, where the
+                    // sheet covers the beach (its foam elsewhere is under the terrain).
+                    const double X = -10.0 + 20.0 * (i + 0.5) / Points;
+                    FVoxelOceanSurfInput F = Input(B2, X, TLeast);
+                    FVoxelOceanSurfInput C = F;
+                    C.FootprintM = 4.0f;
+                    const FVoxelOceanSurf RF = VoxelOceanSurfOf(F, SE);
+                    if (RF.Height + F.DepthM <= 0.0f) continue;
+                    Wet++;
+                    Fine += RF.Foam;
+                    Coarse += VoxelOceanSurfOf(C, SE).Foam;
+                }
+                Fine /= std::max(Wet, 1);
+                Coarse /= std::max(Wet, 1);
+                std::printf("  the foam's mean over the wet part of 20 m of a 1:20 beach: %.3f exact, %.3f at a 4 m footprint\n", Fine, Coarse);
+                Check(std::abs(Coarse - Fine) < 0.25 * Fine + 0.02, "a coarse footprint keeps the swash foam's mean", std::abs(Coarse - Fine), 0.25 * Fine + 0.02);
+            }
         }
         {
             // Unresolved (a 200 m footprint): steady, at the cycle's mean.

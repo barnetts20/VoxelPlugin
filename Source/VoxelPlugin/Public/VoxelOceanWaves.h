@@ -362,6 +362,9 @@ struct FVoxelOceanFFTSettings
     /** Stage W5a (live): the surf's foam's linger (s) and the foam's breakup (VoxelOceanFoam.ush). */
     double SurfFoamLinger = 2.5;
     double FoamBreakup = 6.0;
+    /** Stage W5f (live): the clipmap's foam's far cut (m from the camera; 0: none), the own pass's
+     *  FoamFadeDistance. */
+    double FoamFadeDistance = 0.0;
 
     bool operator==(const FVoxelOceanFFTSettings& Other) const
     {

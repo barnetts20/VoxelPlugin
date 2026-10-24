@@ -16,6 +16,7 @@ namespace VoxelShader
 #include "VoxelOceanFFTWaves.ush"
 #include "VoxelOceanShoal.ush"
 #include "VoxelOceanSurf.ush"
+#include "VoxelOceanFeltDepth.ush"
 }
 
 #include <algorithm>

@@ -1042,7 +1042,7 @@ void FVoxelOceanSurface::UpdateMaterial()
             Pages->UpdateClipmap(SelectionCamera, D, Textures.Foam ? Textures.Foam->GetResource() : nullptr, Inputs.Time,
                 VOS::FoamDecayRate(Inputs.Waves.FoamAmount), VOS::FoamGainOf(Inputs.Waves.FoamRamp, Inputs.Waves.FoamAmount) * VOS::FoamDecayRate(Inputs.Waves.FoamAmount),
                 bCascadesStepped || !bCascadeTime, Inputs.Waves.FoamDetailLevels, 1.0 / FMath::Max(Inputs.Waves.SurfFoamLinger, 0.05),
-                Inputs.Waves.FoamBreakup);
+                Inputs.Waves.FoamBreakup, Inputs.Waves.FoamFadeDistance * 100.0);
             bCascadesStepped = false;
             if (!bClipBound)
             {

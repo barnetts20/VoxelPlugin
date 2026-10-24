@@ -507,7 +507,10 @@ void FVoxelOceanSurfacePass::Render_RenderThread(FPostOpaqueRenderParameters& Pa
     P->SurfacePixelFoam = FVector4f(FMath::Clamp(Params.FoamDetail, 0.0f, 1.0f), FMath::Max(Params.FoamDetailDistanceM, 1.0f) * 100.0f,
         bCascadeFoam ? 1.0f : 0.0f, Params.bCubicFiltering ? 1.0f : 0.0f);
     // Stage W3y: the anisotropic filter's most lookups along a pixel's longer axis.
-    P->SurfaceFilter = FVector4f((float)FMath::Clamp(Params.Anisotropy, 1, 16), 0.0f, 0.0f, 0.0f);
+    // Stage W5f: the foam's distance fade (y, z: its start and end, cm; z 0: none).
+    const float FoamFadeEnd = FMath::Max(Params.FoamFadeDistanceM, 0.0f) * 100.0f;
+    const float FoamFadeStart = 0.7f * FMath::Min(FMath::Max(Params.FoamDetailDistanceM, 1.0f) * 100.0f, FoamFadeEnd);
+    P->SurfaceFilter = FVector4f((float)FMath::Clamp(Params.Anisotropy, 1, 16), FoamFadeStart, FoamFadeEnd, 0.0f);
 
     // The water, per cm.
     const FVector3f Scattering = Params.Scattering * 0.01f;

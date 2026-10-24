@@ -131,7 +131,8 @@ float4 SurfaceClipFineInfo;
 // Stage W5c: the clipmap's static layer (VoxelOceanClipStatic.usf: the shore at its texels, 4 slices
 // a slot), the pixels' shore.
 Texture2DArray<float4> SurfaceClipStatic;
-// Stage W3y: x the anisotropic filter's most lookups along a pixel's longer axis (1: none).
+// Stage W3y: x the anisotropic filter's most lookups along a pixel's longer axis (1: none); stage
+// W5f: y and z the foam's distance fade, its start and end (cm from the camera; z 0: none).
 float4 SurfaceFilter;
 // Stage W3h: x the crest glow's strength (0 none), y the whitecaps' relief gain; stage W3l: z the
 // intersection foam's strength (0 none), w its reach (cm).
@@ -281,8 +282,15 @@ void SurfacePS(float4 SvPosition : SV_POSITION,
             SurfaceClipFineHistory, SurfaceClipFineInfo, SurfaceClipStatic);
         N = C.Normal;
         SlopeVariance = C.SlopeVariance;
-        Foam = C.Foam;
-        Whitecap = C.Whitecap;
+        // Stage W5f: THE FOAM'S DISTANCE FADE (as GodotOceanWaves fades its foam with distance:
+        // e^(-0.0075 d)). Past the per-pixel detail's reach (FoamDetailDistance) the foam is the
+        // clipmap's texels alone, metres wide and coarser each level out: a smooth white smear over
+        // anything breaking, which the normals and the displacement draw better on their own. All of
+        // it (whitecaps, trails, the surf's white water) fades out from SurfaceFilter.y to .z (cm from
+        // the camera; .z 0: no fade), and the clipmap skips its foam past .z (ClipWaveCS).
+        const float FoamFar = SurfaceFilter.z > 0.0f ? 1.0f - smoothstep(SurfaceFilter.y, SurfaceFilter.z, length(Rel)) : 1.0f;
+        Foam = C.Foam * FoamFar;
+        Whitecap = C.Whitecap * FoamFar;
         Height = C.Height;
         FoamOwn = C.Own;
     }

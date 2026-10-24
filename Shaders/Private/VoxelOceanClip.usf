@@ -44,7 +44,11 @@ RWTexture2DArray<float> ClipFoamHistory;
 Texture2DArray<float4> ClipWhitecapPrev;
 float4 ClipFoamStep[VOXEL_OCEAN_CLIP_MAX_LEVELS];
 uint ClipFoamHistoryOn;
-// Stage W5a: x the surf's foam's decay (per second), y the breakup (VoxelOceanFoam.ush).
+// Stage W5a: x the surf's foam's decay (per second), y the breakup (VoxelOceanFoam.ush). Stage W5f:
+// z the foam's far cut (cm from the camera on the plane; 0 none): the own pass fades all foam out
+// by FoamFadeDistance (VoxelOceanSurfacePass.usf), so texels further than that (and a margin of
+// two of their own, for the filters' reach) skip the foam's lookups and hold none (their history
+// -1: a texel the camera nears again starts afresh, from the rule's steady state).
 float4 ClipFoamSurf;
 RWTexture2D<float4> ClipInfoOut;
 
@@ -153,9 +157,11 @@ void ClipWaveCS(uint3 Id : SV_DispatchThreadID)
     float SurfZone = 0.0f;
     float OpenSource = 0.0f;
     float FineFoam = 0.0f;
+    // (Stage W5f: past the far cut no foam.)
+    const bool bFoamHere = ClipFoamSurf.z <= 0.0f || length(Offset) <= ClipFoamSurf.z + 2.0f * Spacing;
     if (W.FFT.x > 0.5f)
     {
-        const uint Mask = VOXEL_OCEAN_LOOKUP_ALL | (ClipFoamOn != 0u ? VOXEL_OCEAN_LOOKUP_FOAM : 0u);
+        const uint Mask = VOXEL_OCEAN_LOOKUP_ALL | (ClipFoamOn != 0u && bFoamHere ? VOXEL_OCEAN_LOOKUP_FOAM : 0u);
         const FVoxelOceanFFTPoint Pt = VoxelOceanFFTEvaluate(P, Up, VertexSpacing, Footprint, Depth, In.Shore, W,
             ClipDisplacement, ClipDisplacementSampler, ClipDerivatives, ClipDerivativesSampler, ClipCharts, ClipFoam, ClipFoamSampler, Mask);
         Out = VoxelOceanFFTOutput(Pt, In, W, Mask);
@@ -175,8 +181,20 @@ void ClipWaveCS(uint3 Id : SV_DispatchThreadID)
     const float4 Row16 = ClipCharts.Load(int3(VoxelOceanConstantsX(max(int(W.FFT.y), 1)), 16, 0));
     const float FreshGain = max(Row16.x, 0.0f);
     // (Stage W5a: the surf's foam a density, with its own decay; the keeps by the water's stretch.)
+    if (!bFoamHere)
+    {
+        SurfFoam = 0.0f;
+        SurfZone = 0.0f;
+        OpenSource = 0.0f;
+        FineFoam = 0.0f;
+    }
     float Foam = min(VoxelOceanFoamFresh(OpenSource, FreshGain) + SurfFoam, VOXEL_OCEAN_FOAM_MAX);
-    if (ClipFoamHistoryOn != 0u)
+    if (ClipFoamHistoryOn != 0u && !bFoamHere)
+    {
+        Foam = 0.0f;
+        ClipFoamHistory[C] = -1.0f;
+    }
+    else if (ClipFoamHistoryOn != 0u)
     {
         const float Prev = ClipFoamHistory[C];
         const float4 Step = ClipFoamStep[Index];
@@ -188,7 +206,7 @@ void ClipWaveCS(uint3 Id : SV_DispatchThreadID)
     }
     // (Stage W3w: with the fine foam, the shortest band's own, added as Godot sums its cascades'.)
     const float Drawn = VoxelOceanFoamDrawn(Foam + FineFoam);
-    const float Whitecap = saturate(Out.Whitecap);
+    const float Whitecap = bFoamHere ? saturate(Out.Whitecap) : 0.0f;
     ClipDisplacementOut[C] = float4(VoxelOceanRotateBack(W.Rotation, Out.Displacement), Drawn);
     ClipNormalOut[C] = float4(VoxelOceanRotateBack(W.Rotation, Out.Normal), max(Out.SlopeVariance, 0.0f));
     ClipWhitecapOut[C] = float4(Whitecap, Foam, SurfZone, OpenSource);

@@ -94,6 +94,7 @@
 #include "/Plugin/VoxelPlugin/Private/VoxelOceanCoast.ush"
 #include "/Plugin/VoxelPlugin/Private/VoxelOceanShoal.ush"
 #include "/Plugin/VoxelPlugin/Private/VoxelOceanSurf.ush"
+#include "/Plugin/VoxelPlugin/Private/VoxelOceanFeltDepth.ush"
 #include "/Plugin/VoxelPlugin/Private/VoxelOceanFoam.ush"
 #include "/Plugin/VoxelPlugin/Private/VoxelOceanCubic.ush"
 

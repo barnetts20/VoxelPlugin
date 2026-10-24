@@ -385,7 +385,8 @@ int main()
             return In;
         };
         const FVoxelOceanSurfSettings On = Settings(1.0f), Off = Settings(0.0f);
-        double BoreMax = 0.0, BoreMean = 0.0, OffshoreMax = 0.0, OffMax = 0.0, EdgeMax = 0.0, SheetMin = 1.0, Jump = 0.0;
+        double BoreMax = 0.0, BoreMean = 0.0, OffshoreMax = 0.0, OffMax = 0.0, EdgeMax = 0.0, SheetMin = 1.0, Jump = 0.0, WetMin = 1.0, WetSum = 0.0;
+        int WetCount = 0;
         double FarMean = 0.0, FarMin = 1.0, FarMax = 0.0;
         int BoreCount = 0;
         float Last = VoxelOceanSurfOf(Input(1.2f, 0.0f, 0.0f), On).Foam;
@@ -405,6 +406,7 @@ int main()
             const float Thickness = Sw.Height - 0.1f;
             if (Thickness > 0.0f && Thickness < 0.02f) EdgeMax = std::max(EdgeMax, double(Sw.Foam));
             if (Thickness > 0.3f) SheetMin = std::min(SheetMin, double(Sw.Foam));
+            if (Thickness > 0.02f) { WetMin = std::min(WetMin, double(Sw.Foam)); WetSum += Sw.Foam; WetCount++; }
         }
         // No step through the cycle: fine steps in time at 1.2 m (a 13 s cycle in 0.002 s steps).
         for (int k = 1; k < 20000; k++)
@@ -425,8 +427,13 @@ int main()
         Check(FarMax - FarMin < 0.25 * BoreMax && std::abs(FarMean - BoreMean) < 0.15, "unresolved, the bores' foam is their cycle's mean (no stripes)", FarMax - FarMin, 0.25 * BoreMax);
         std::printf("  the swash 10 cm up the beach: at its thin edge up to %.2f; under 30 cm of it at least %.2f\n", EdgeMax, SheetMin);
         Check(EdgeMax > 0.8, "the swash's thin edge is foamy", EdgeMax, 0.8);
-        // (Stage W3p: only the thin edge; until then a fifth over the whole sheet, a mat on the beach.)
-        Check(SheetMin < 0.05, "a deeper swash sheet clear (no standing mat)", SheetMin, 0.05);
+        // (Stage W3p: only the thin edge; until then a fifth over the whole sheet, a mat on the beach.
+        // Stage W5f: the sheet white water as it rushes up, draining away after the swash's peak: no
+        // standing mat still, its foam comes and goes through the cycle where it covers the beach.)
+        const double WetMean = WetSum / std::max(WetCount, 1);
+        std::printf("  while the sheet covers it: foam %.2f least, %.2f mean (under 30 cm at least %.2f)\n", WetMin, WetMean, SheetMin);
+        Check(WetMin < 0.1, "the swash sheet drains clear (no standing mat)", WetMin, 0.1);
+        Check(WetMean > 0.2 && WetMean < 0.8, "the swash sheet is white water for part of its cycle", WetMean, 0.2);
         Check(OffMax == 0.0, "no surf foam with the setting at 0", OffMax, 0.0);
     }
 

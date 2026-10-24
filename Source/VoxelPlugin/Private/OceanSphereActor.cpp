@@ -502,6 +502,7 @@ void AOceanSphereActor::UpdateSurfacePass()
     Params.FoamSoftness = S.FoamSoftness;
     Params.FoamDetail = S.FoamDetail;
     Params.FoamDetailDistanceM = S.FoamDetailDistance;
+    Params.FoamFadeDistanceM = S.FoamFadeDistance;
     Params.bCubicFiltering = S.bCubicFiltering;
     Params.Anisotropy = S.WaveAnisotropy;
     if (Params.SprayAmount > 0.0f && bHasCamera)
@@ -1177,6 +1178,8 @@ FVoxelOceanSurfaceInputs AOceanSphereActor::GatherInputs(const AAdaptiveVoxelAct
     Inputs.Waves.FoamDetailLevels = S.FoamDetailLevels;
     Inputs.Waves.SurfFoamLinger = S.SurfFoamLinger;
     Inputs.Waves.FoamBreakup = S.FoamBreakup;
+    // (Stage W5f: the clipmap cuts its foam only where the own pass fades it out.)
+    Inputs.Waves.FoamFadeDistance = S.bOwnShading ? S.FoamFadeDistance : 0.0;
     Inputs.Waves.SurfFoam = S.bFoam ? S.SurfFoam : 0.0;
     // The field reaches the queries wherever it exists (a server builds it on the CPU, and has
     // no texture); its texture and the pages' cull only where it was made.

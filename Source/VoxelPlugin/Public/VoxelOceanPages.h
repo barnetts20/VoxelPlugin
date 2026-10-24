@@ -213,10 +213,12 @@ public:
      *  bWavesStepped (stage W3y): the cascades stepped this frame; else only the levels that must
      *  be (new, edited, moved past their slack) are evaluated, the others wait for the next step. */
     /** FoamDetailLevels (stage W4c): how many levels around the camera keep the foam's fine history
-     *  (VoxelOceanClip.usf, ClipFineFoamCS; 0: none, at most VoxelOceanClipmap::FineMaxLevels). */
+     *  (VoxelOceanClip.usf, ClipFineFoamCS; 0: none, at most VoxelOceanClipmap::FineMaxLevels).
+     *  FoamCutCm (stage W5f): texels further than this from the camera (on the plane) skip the
+     *  foam (the own pass has faded it out there; 0: none). */
     void UpdateClipmap(const FVector& CameraPlanet, const FVoxelOceanDisplaceFrame& Waves, FTextureResource* Foam,
         double OceanTime = 0.0, double FoamDecayPerSecond = 0.0, double FoamGrowthPerSecond = 0.0, bool bWavesStepped = true,
-        int32 FoamDetailLevels = 0, double SurfFoamDecayPerSecond = 0.4, double FoamBreakup = 0.0);
+        int32 FoamDetailLevels = 0, double SurfFoamDecayPerSecond = 0.4, double FoamBreakup = 0.0, double FoamCutCm = 0.0);
 
     /** Game thread (stage W1). An edit's sphere (planet frame, cm) that the depths now carry (the
      *  surface's: once the terrain's edit data, and the land surface cache, hold it): the static

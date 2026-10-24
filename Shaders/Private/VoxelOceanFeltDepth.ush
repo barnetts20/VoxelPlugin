@@ -1,0 +1,36 @@
+// VoxelOceanFeltDepth.ush - The depth the waves feel at the coast (stages W5e, W5f; Design/OceanWaves.md
+// section 60). Shared subset (VoxelShaderCompat.h), no includes: the wave hook (VoxelOceanWaves.ush), the
+// depth probe (VoxelOceanPage.usf, ProbeCS: the underwater pass's) and the harnesses.
+
+#ifndef VOXEL_OCEAN_FELT_DEPTH_USH
+#define VOXEL_OCEAN_FELT_DEPTH_USH
+
+#ifndef VOXEL_FUNC
+#define VOXEL_FUNC
+#endif
+
+// THE FELT DEPTH AT THE COAST (stage W5e). The depth the waves feel is the terrain's band-limited
+// to ShoreDepthSmoothing (VoxelOceanTerrainDepth.ush), so the surf's timing doesn't follow every
+// bump. At a coast whose land rises behind the beach, the smoothing averages the high ground into
+// the shallows: the smoothed depth reaches 0 metres to tens of metres out from the terrain's own
+// waterline, and a narrow inlet reads as land. Past that line the waves were capped to nothing
+// (the bores' Index x d, the bands' Breaking x d) and the surf held the swash's flat level, so the
+// waves rolled in and stopped at a jagged line offshore (the smoothed field's texels), with flat
+// water between it and the beach. Within FELT_BLEND of the smoothed depth (and on its land side)
+// the felt depth is now the deeper of the two: the terrain's own wherever it lies lower, so the
+// waves run on to the waterline the terrain draws. Deeper than FELT_BLEND, the smoothed depth
+// alone (the bed's fine detail stays out of the open sea's shoaling). Only deepens: a bump the
+// smoothing left out still pokes through by the thin water's drop. Depth and Bed in one unit
+// (the hook's cm), BlendDepth in that unit; Bed at or past 0.5e30 (or an inland basin's, deeply
+// negative): unknown, the smoothed depth alone. Continuous in both.
+#define VOXEL_OCEAN_SURF_FELT_BLEND 3.0f
+
+VOXEL_FUNC float VoxelOceanSurfFeltDepth(float Depth, float Bed, float BlendDepth)
+{
+    if (Depth >= 0.5e30f || Bed >= 0.5e30f || Bed <= Depth) return Depth;
+    const float X = saturate(Depth / max(BlendDepth, 1.0e-6f));
+    const float W = 1.0f - X * X * (3.0f - 2.0f * X);
+    return Depth + W * (Bed - Depth);
+}
+
+#endif // VOXEL_OCEAN_FELT_DEPTH_USH
