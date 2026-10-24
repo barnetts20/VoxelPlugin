@@ -9,6 +9,7 @@
 #include "/Engine/Public/Platform.ush"
 #include "/Plugin/VoxelPlugin/Private/VoxelOceanWaves.ush"
 #include "/Plugin/VoxelPlugin/Private/VoxelOceanClip.ush"
+#include "/Plugin/VoxelPlugin/Private/VoxelOceanClipShore.ush"
 
 // The info (VoxelOceanClip.ush) as the material and the vertices read it after this pass.
 float4 ClipInfoRows[VOXEL_OCEAN_CLIP_INFO_ROWS];
@@ -134,40 +135,17 @@ void ClipWaveCS(uint3 Id : SV_DispatchThreadID)
     const float3 P = VoxelOceanRotate(W.Rotation, X);
     const float3 Up = normalize(P - W.Center);
     const float3 UpP = VoxelOceanRotateBack(W.Rotation, Up);
-    const float3 T1 = normalize(F.E1 - UpP * dot(F.E1, UpP));
-    const float3 T2 = cross(UpP, T1);
     // As a vertex of twice the spacing (the displacement) and a pixel of the spacing (the normal).
     const float VertexSpacing = 2.0f * Spacing;
     const float Footprint = Spacing;
 
     // The texel's toroidal place, its static layer.
     const int2 S = int2((OriginMod.x + int(Id.x)) % int(Size), (OriginMod.y + int(Id.y)) % int(Size));
-    const float4 S0 = ClipStatic.Load(int4(S, 4 * Slot, 0));
-    const float4 S1 = ClipStatic.Load(int4(S, 4 * Slot + 1, 0));
-    const float4 S2 = ClipStatic.Load(int4(S, 4 * Slot + 2, 0));
-    const float4 S3 = ClipStatic.Load(int4(S, 4 * Slot + 3, 0));
-    const float Depth = S0.x;
+    // (Stage W5c: the shore from the layer, VoxelOceanClipShore.ush, shared with the passes near the camera.)
+    const FVoxelOceanClipStatic St = VoxelOceanClipStaticAt(ClipStatic, S, Slot);
+    const float Depth = St.S0.x;
     FVoxelOceanWaveInput In = VoxelOceanWaveInput(P, VertexSpacing, Footprint, Depth, W);
-    FVoxelOceanShore Shore = VoxelOceanShoreNone();
-    if (W.States.x > 0.5f)
-    {
-        const FVoxelOceanCoastLayout CoastLayout = VoxelOceanCoastLayoutOfTable(ClipCharts, max(int(W.FFT.y), 1));
-        Shore.Distance = S0.w;
-        Shore.Direction = VoxelOceanRotate(W.Rotation, T1 * S1.x + T2 * S1.y);
-        Shore.Slope = S2.x;
-        Shore.Coast.A = S2.y;
-        Shore.Coast.B = S2.z;
-        Shore.Coast.Cover = S2.w;
-        Shore.Coast.GradA = T1 * S3.x + T2 * S3.y;
-        Shore.Coast.GradB = T1 * S3.z + T2 * S3.w;
-        Shore.CoastSeedM = CoastLayout.SeedDepthM;
-        Shore.CoastReachM = CoastLayout.ReachM;
-    }
-    Shore.BedSlope = S0.y;
-    Shore.BedDepth = S0.z;
-    const float2 Rise = float2(S1.z, S1.w);
-    Shore.BedRise = dot(Rise, Rise) > 0.25f ? VoxelOceanRotate(W.Rotation, T1 * Rise.x + T2 * Rise.y) : float3(0.0f, 0.0f, 0.0f);
-    In.Shore = Shore;
+    In.Shore = VoxelOceanClipShoreOf(St, UpP, F.E1, W, ClipCharts);
 
     FVoxelOceanWaveOutput Out;
     float SurfFoam = 0.0f;
@@ -229,8 +207,10 @@ void ClipWaveCS(uint3 Id : SV_DispatchThreadID)
 // fades, unevaluated; one new to its window (a strip the window gained since the level's last step,
 // FineRect0/1 in window texels, or the whole level, FineWhole) starts from the buffer's open-sea
 // foam at its clipmap texel. Every level steps each wave step (stage W4d; and a moved one at once),
-// its time step exact (FineStep: x e^(-Decay dt), y the growth per unit of source over dt). The
-// surf's foam stays in the buffer above (the own pass takes the larger in the surf's zone).
+// its time step exact (FineStep: x e^(-Decay dt), y the growth per unit of source over dt). Stage
+// W5c: the composed sea, as the buffer above evaluates it (the shore from the static layer, bilinear
+// at the fine texel: the shoaling, the surf's trains and their squeeze), the surf's foam in it too
+// (its own linger), so the whole sea, the beaches' surf included, has the fine history near the camera.
 // ---------------------------------------------------------------------------------------------
 
 #define VOXEL_OCEAN_CLIP_FINE_MAX 4
@@ -241,6 +221,7 @@ float4 FineStep;                // x e^(-Decay dt), y the growth per unit of sou
 int4 FineRect0;                 // window texels (x, y, width, height; width 0: none) new since its last step
 int4 FineRect1;
 uint FineWhole;                 // 1: the whole level is new
+float4 FineSurf;                // stage W5c: x the surf's foam's keep over the step (e^(-dt / its linger))
 RWTexture2DArray<float> FineHistory;
 Texture2DArray<float> FineCoarseHistory;    // the buffer above (this frame's)
 Texture2DArray<float4> FineCoarseWhitecap;  // the whitecap levels (this frame's: z the surf's zone, w the open sea's mean source)
@@ -264,33 +245,49 @@ void ClipFineFoamCS(uint3 Id : SV_DispatchThreadID)
     const int2 CoarseAt = int2((OriginMod.x + Window.x) % Size, (OriginMod.y + Window.y) % Size);
     const int3 At = int3((OriginMod.x * Factor + int(Id.x)) % FineSize, (OriginMod.y * Factor + int(Id.y)) % FineSize, FineWindowMod.w);
     const float4 Caps = FineCoarseWhitecap.Load(int4(CoarseAt, Slot, 0));
+    const float Coarse = max(FineCoarseHistory.Load(int4(CoarseAt, Slot, 0)), 0.0f);
     float Prev = FineHistory[At];
     if (FineWhole != 0u || VoxelOceanClipFineInRect(FineRect0, Window) || VoxelOceanClipFineInRect(FineRect1, Window)) Prev = -1.0f;
-    if (Prev < 0.0f) Prev = max(FineCoarseHistory.Load(int4(CoarseAt, Slot, 0)), 0.0f) * (1.0f - saturate(Caps.z));
+    if (Prev < 0.0f) Prev = Coarse;
     // The gate: the mean source of the clipmap texels it lies between (the fine texel's position
-    // in its clipmap texel picks the other three).
+    // in its clipmap texel picks the other three), or foam there or here (stage W5a: the breakup's
+    // stretch; stage W5c: the surf's, now in the fine history too).
     const int2 Sub = int2(Id.xy) - Window * Factor;
     const int2 Step = int2(2 * Sub.x >= Factor ? 1 : Size - 1, 2 * Sub.y >= Factor ? 1 : Size - 1);
     const float Mean = max(max(Caps.w, FineCoarseWhitecap.Load(int4((CoarseAt.x + Step.x) % Size, CoarseAt.y, Slot, 0)).w),
         max(FineCoarseWhitecap.Load(int4(CoarseAt.x, (CoarseAt.y + Step.y) % Size, Slot, 0)).w,
             FineCoarseWhitecap.Load(int4((CoarseAt.x + Step.x) % Size, (CoarseAt.y + Step.y) % Size, Slot, 0)).w));
-    float Source = 0.0f;
+    float Open = 0.0f;
+    float Surf = 0.0f;
+    float Zone = 0.0f;
     float J = 1.0f;
-    // (Stage W5a: where foam lingers too, for the breakup's stretch.)
-    if (ClipFFT.x > 0.5f && (Mean > 1.0e-5f || (FineStep.w > 0.0f && Prev > 0.01f)))
+    if (ClipFFT.x > 0.5f && (Mean > 1.0e-5f || Prev > 0.01f || Coarse > 0.01f || Caps.z > 0.0f))
     {
-        const FVoxelOceanWaveParams W = VoxelOceanMakeWaveParamsFFT(ClipParams, ClipWave0, ClipWave1, ClipWave2, ClipCenter, ClipShape, ClipFFT,
+        FVoxelOceanWaveParams W = VoxelOceanMakeWaveParamsFFT(ClipParams, ClipWave0, ClipWave1, ClipWave2, ClipCenter, ClipShape, ClipFFT,
             ClipRefHigh, ClipRefLow, ClipRotation, ClipTiles, ClipStates, ClipSlopeVar);
         const float Spacing = FineWindow.z / float(Factor);
         const float2 Offset = VoxelOceanClipTexelOffset(FineWindow.xy * float(Factor), Spacing, float(Id.x), float(Id.y));
-        const float3 P = VoxelOceanRotate(W.Rotation, VoxelOceanClipPointOf(F, Offset));
+        const float3 X = VoxelOceanClipPointOf(F, Offset);
+        const float3 P = VoxelOceanRotate(W.Rotation, X);
         const float3 Up = normalize(P - W.Center);
-        // The open sea's compression at the texel's own footprint (the displacement's mip past use).
-        const FVoxelOceanFFTPoint Pt = VoxelOceanFFTEvaluate(P, Up, 1.0e9f, Spacing, VOXEL_OCEAN_DEEP, VoxelOceanShoreNone(), W,
+        const float3 UpP = VoxelOceanRotateBack(W.Rotation, Up);
+        // Stage W5c: the composed sea, as the clipmap's: the shore from its static layer, bilinear at
+        // the fine texel (its storage coordinate in the level's texels), the rings' spacing for the surf.
+        if (ClipRing.w > 0.5f)
+            W.SurfSpacing = max(VoxelOceanClipRingSpacing(F, Offset), FineWindow.z);
+        const float2 CoarseTexel = (float2(OriginMod * Factor + int2(Id.xy)) + 0.5f) / float(Factor);
+        const FVoxelOceanClipStatic St = VoxelOceanClipStaticBilinear(ClipStatic, CoarseTexel, Slot, Size);
+        const FVoxelOceanShore Shore = VoxelOceanClipShoreOf(St, UpP, F.E1, W, ClipCharts);
+        const FVoxelOceanFFTPoint Pt = VoxelOceanFFTEvaluate(P, Up, 2.0f * Spacing, Spacing, St.S0.x, Shore, W,
             ClipDisplacement, ClipDisplacementSampler, ClipDerivatives, ClipDerivativesSampler, ClipCharts, ClipFoam, ClipFoamSampler,
             2u | (ClipFoamOn != 0u ? VOXEL_OCEAN_LOOKUP_FOAM : 0u));
-        Source = Pt.FoamSource * (1.0f - saturate(Caps.z));
+        Open = Pt.FoamSource;
+        Surf = Pt.SurfFoam;
+        Zone = Pt.SurfZone;
         J = Pt.R.Jacobian;
     }
-    FineHistory[At] = VoxelOceanFoamStep(Prev, Source, FineStep.y, VoxelOceanFoamKeepAt(FineStep.x, J, FineStep.w));
+    // The open sea's and the surf's (stage W5c; VoxelOceanFoamStepSurf, as the clipmap's), the keeps
+    // by the water's stretch (stage W5a).
+    FineHistory[At] = VoxelOceanFoamStepSurf(Prev, Open, FineStep.y, VoxelOceanFoamKeepAt(FineStep.x, J, FineStep.w),
+        Surf, VoxelOceanFoamKeepAt(FineSurf.x, J, FineStep.w), Zone);
 }

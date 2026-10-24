@@ -876,6 +876,7 @@ struct FVoxelOceanFFTPoint
     float SurfFoam;             // stage W3t: with VOXEL_OCEAN_LOOKUP_FOAM, the surf's own foam (its bores, trails and swash)
     float Wind;                 // stage W3t: the point's sea state's wind (m/s)
     float SurfZone;             // stage W3u: the surf's breaking zone (0 to 1: where the bores own the foam and the whitecaps)
+    float OpenKeep;             // stage W5b: the open sea's slopes kept here (their variance's share of the deep sea's: the shoaling, the surf's share, the drain; 0 to 1)
     float FoamSource;           // stage W3v: with VOXEL_OCEAN_LOOKUP_FOAM and the normals, the open sea's compression past the whitecap threshold (out of the zone)
     float SurfBreaking;         // stage W3v: the surf's bores breaking now (0 to 1; their whitecaps)
     float FineFoam;             // stage W3w: with VOXEL_OCEAN_LOOKUP_FOAM, the fine foam (the shortest band's own; added before the drawing)
@@ -1083,6 +1084,7 @@ FVoxelOceanFFTPoint VoxelOceanFFTEvaluate(float3 P, float3 Up, float Spacing, fl
     Out.SurfFoam = bFoam ? Drain.Keep * saturate(Surf.Surf.Foam) : 0.0f;
     Out.Wind = Sea.Wind;
     Out.SurfZone = Surf.Surf.Active > 0.5f ? saturate(Surf.Surf.Zone) : 0.0f;
+    Out.OpenKeep = 1.0f;
     Out.DetailGradient = (Mask & VOXEL_OCEAN_LOOKUP_DUAL) != 0u ? Detail.Gradient - UpP * dot(UpP, Detail.Gradient) : float3(0.0f, 0.0f, 0.0f);
     Out.SurfBreaking = 0.0f;
     Out.FoamSource = 0.0f;
@@ -1168,6 +1170,9 @@ FVoxelOceanFFTPoint VoxelOceanFFTEvaluate(float3 P, float3 Up, float Spacing, fl
         const float4 G = float4(Shoal.Amp.x * (1.0f + Shoal.Stretch.x), Shoal.Amp.y * (1.0f + Shoal.Stretch.y),
             Shoal.Amp.z * (1.0f + Shoal.Stretch.z), Shoal.Amp.w * (1.0f + Shoal.Stretch.w));
         Out.SlopeVar = V * G * G * (Drain.Keep * Drain.Keep);
+        // Stage W5b: how much of the deep sea's slopes the shore leaves the open sea's waves (the
+        // passes that evaluate them without the shore, near the camera, take their foam down by it).
+        Out.OpenKeep = saturate(dot(Out.SlopeVar, float4(1.0f, 1.0f, 1.0f, 1.0f)) / max(dot(V, float4(1.0f, 1.0f, 1.0f, 1.0f)), 1.0e-12f));
     }
     // The foam (stage W3v; VoxelOceanFoam.ush, GodotOceanWaves' rule): the summed surface's
     // compression past the whitecap threshold (the chart table's row 16 z), out of the surf's breaking
@@ -1195,7 +1200,9 @@ FVoxelOceanFFTPoint VoxelOceanFFTEvaluate(float3 P, float3 Up, float Spacing, fl
         }
         const float Resolved = max(SlopeVarAll - Unresolved, 0.0f);
         const float Widen = Blended > 1.0e-12f ? sqrt(Resolved / Blended) : 1.0f;
-        const float J = 1.0f - (1.0f - Out.R.Jacobian) * Widen;
+        // (Stage W5c: less the shore's trains' squeeze at the chop: the composed sea's J, the trains
+        // having no horizontal displacement of their own.)
+        const float J = 1.0f - (1.0f - Out.R.Jacobian) * Widen - max(W.Shape.x, 0.0f) * Surf.Surf.Pinch * Drain.Keep;
         const float FreshGain = max(Row16.x, 0.0f);
         // Stage W3z: the mean over the footprint, its unresolved compression's deviation the chop
         // (W.Shape.x) times the unresolved slopes' (VoxelOceanFoam.ush).

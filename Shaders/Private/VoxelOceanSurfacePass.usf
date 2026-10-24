@@ -30,6 +30,11 @@
 #include "/Plugin/VoxelPlugin/Private/VoxelOceanShading.ush"
 #include "/Plugin/VoxelPlugin/Private/VoxelOceanContactSearch.ush"
 
+// Stage W5d: the water's edge fades into what is behind it over this thickness along the view (cm),
+// and this share of the distance (the depth's precision falling with it).
+#define VOXEL_OCEAN_SURFACE_EDGE_FADE 10.0f
+#define VOXEL_OCEAN_SURFACE_EDGE_FADE_PER_CM 0.002f
+
 #ifndef VOXEL_OCEAN_SURFACE_VELOCITY
 #define VOXEL_OCEAN_SURFACE_VELOCITY 0
 #endif
@@ -119,9 +124,13 @@ Texture2DArray SurfaceFineDisplacement;
 Texture2DArray SurfaceFineDerivatives;
 Texture2DArray SurfaceFineFoam;
 // Stage W4c: the foam's fine history (VoxelOceanClip.usf, ClipFineFoamCS): its levels; x their
-// count (0: none), y their resolution's factor over the clipmap's.
+// count (0: none), y their resolution's factor over the clipmap's; stage W5c: z 1 with the static
+// layer (SurfaceClipStatic).
 Texture2DArray SurfaceClipFineHistory;
 float4 SurfaceClipFineInfo;
+// Stage W5c: the clipmap's static layer (VoxelOceanClipStatic.usf: the shore at its texels, 4 slices
+// a slot), the pixels' shore.
+Texture2DArray<float4> SurfaceClipStatic;
 // Stage W3y: x the anisotropic filter's most lookups along a pixel's longer axis (1: none).
 float4 SurfaceFilter;
 // Stage W3h: x the crest glow's strength (0 none), y the whitecaps' relief gain; stage W3l: z the
@@ -269,7 +278,7 @@ void SurfacePS(float4 SvPosition : SV_POSITION,
         const FVoxelOceanPixelSurf C = VoxelOceanPixelSurfOf(SamplePoint, Footprint, FootprintAcross, FootprintMajor, SurfaceFilter.x, DepthLand.x, length(Rel), W, SurfaceDisplacement,
             SurfaceDisplacementSampler, SurfaceDerivatives, SurfaceDerivativesSampler, SurfaceCharts, SurfaceFineDisplacement, SurfaceFineDerivatives,
             SurfaceCascadeFoam, SurfaceCascadeFoamSampler, SurfaceFineFoam, SurfaceClipDisplacement, SurfaceClipNormal, SurfaceClipWhitecap, SurfaceClipSampler, SurfaceClipInfo, SurfacePixelFoam,
-            SurfaceClipFineHistory, SurfaceClipFineInfo.xy);
+            SurfaceClipFineHistory, SurfaceClipFineInfo, SurfaceClipStatic);
         N = C.Normal;
         SlopeVariance = C.SlopeVariance;
         Foam = C.Foam;
@@ -534,8 +543,21 @@ void SurfacePS(float4 SvPosition : SV_POSITION,
     if (VoxelOceanDebugModeOf(SurfaceCharts, max(int(W.FFT.y), 1)) > 0)
         Color = saturate(Foam) * dot(SkyIrradiance, float3(0.3f, 0.6f, 0.1f)) * (1.0f / VOXEL_OCEAN_SHADING_PI) + float3(1.0e-3f, 1.0e-3f, 1.0e-3f);
 
+    // Stage W5d: THE WATER'S EDGE. Where the water lies within a few centimetres of what is behind it
+    // (the flats, a river's outlet, the swash's sheet on the beach), the two surfaces' depths cross
+    // back and forth between their triangles (z-fighting, and the jagged edges of the swash's sheet);
+    // the water fades into what lies behind it over its thickness along the view there (the scene as
+    // it was before the ocean drew), so where the crossing flickers nothing shows.
+    float EdgeFade = 1.0f;
+    if (Depth0 > 0.0f)
+    {
+        const float3 Behind0 = VoxelOceanSurfaceRelOf((float2(Pixel) + 0.5f) / ViewSize, Depth0);
+        const float Distance = length(Rel);
+        const float Thick = length(Behind0) - Distance;
+        EdgeFade = saturate(Thick / max(VOXEL_OCEAN_SURFACE_EDGE_FADE, VOXEL_OCEAN_SURFACE_EDGE_FADE_PER_CM * Distance));
+    }
     // (White, or with voxel.Debug.LevelColor the rings' level.)
-    OutColor = float4(Color * Tint * PreExposure, 1.0f);
+    OutColor = float4(lerp(SurfaceBehindColor.Load(int3(Pixel, 0)).rgb, Color * Tint * PreExposure, EdgeFade), 1.0f);
 #if VOXEL_OCEAN_SURFACE_VELOCITY
     // No motion of its own: the camera's, from the depth.
     OutVelocity = float4(0.0f, 0.0f, 0.0f, 0.0f);

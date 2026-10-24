@@ -108,6 +108,7 @@ BEGIN_SHADER_PARAMETER_STRUCT(FVoxelOceanSurfaceParameters, )
     SHADER_PARAMETER_TEXTURE(Texture2DArray, SurfaceFineFoam)
     SHADER_PARAMETER_TEXTURE(Texture2DArray, SurfaceClipFineHistory)
     SHADER_PARAMETER(FVector4f, SurfaceClipFineInfo)
+    SHADER_PARAMETER_TEXTURE(Texture2DArray<float4>, SurfaceClipStatic)
     SHADER_PARAMETER(FVector4f, SurfaceFilter)
     SHADER_PARAMETER(FVector4f, SurfaceCrest)
     SHADER_PARAMETER(FVector3f, SurfaceScattering)
@@ -497,7 +498,11 @@ void FVoxelOceanSurfacePass::Render_RenderThread(FPostOpaqueRenderParameters& Pa
     // Stage W4c: the foam's fine history (VoxelOceanClip.usf, ClipFineFoamCS; none: 0 levels).
     const bool bFineHistory = Rings.bClip && Rings.ClipFineHistory && Rings.ClipFineInfo.X > 0.5f;
     P->SurfaceClipFineHistory = bFineHistory ? Rings.ClipFineHistory : GBlackArrayTexture->TextureRHI.GetReference();
-    P->SurfaceClipFineInfo = bFineHistory ? FVector4f(Rings.ClipFineInfo.X, Rings.ClipFineInfo.Y, 0.0f, 0.0f) : FVector4f(0.0f, 1.0f, 0.0f, 0.0f);
+    // Stage W5c: the clipmap's static layer (the pixels' shore; SurfaceClipFineInfo.z 1). Without it a
+    // stand-in, not read: deep water at the pixels, the open sea alone.
+    const bool bStatic = Rings.bClip && Rings.ClipStatic;
+    P->SurfaceClipFineInfo = FVector4f(bFineHistory ? Rings.ClipFineInfo.X : 0.0f, bFineHistory ? Rings.ClipFineInfo.Y : 1.0f, bStatic ? 1.0f : 0.0f, 0.0f);
+    P->SurfaceClipStatic = bStatic ? Rings.ClipStatic : GBlackArrayTexture->TextureRHI.GetReference();
     P->SurfaceCascadeFoamSampler = TStaticSamplerState<SF_Trilinear, AM_Wrap, AM_Wrap, AM_Clamp>::GetRHI();
     P->SurfacePixelFoam = FVector4f(FMath::Clamp(Params.FoamDetail, 0.0f, 1.0f), FMath::Max(Params.FoamDetailDistanceM, 1.0f) * 100.0f,
         bCascadeFoam ? 1.0f : 0.0f, Params.bCubicFiltering ? 1.0f : 0.0f);

@@ -636,9 +636,11 @@ struct VOXELPLUGIN_API FVoxelOceanSettings
     double SurfCutoff = 0.2;
 
     /** The share of the long waves' energy the FFT's waves always keep near the coast (stage O9i):
-     *  their irregular crests and chop under the shore's directed waves. 1: no directed waves. */
+     *  their irregular crests and chop under the shore's directed waves. 1: no directed waves.
+     *  Stage W5b: 0.5 (was 0.25), the open sea's waves blended further into the surf, breaking up
+     *  its long straight crests and easing the sea's flattening toward the coast. */
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Surf", meta = (EditCondition = "bSurf", ClampMin = "0.0", ClampMax = "1.0"))
-    double SurfFFTFloor = 0.25;
+    double SurfFFTFloor = 0.5;
 
     // -- Foam (stage O9b; Design/OceanWaves.md section 6) ----------------------------------------
 

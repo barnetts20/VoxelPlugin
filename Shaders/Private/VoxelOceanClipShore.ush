@@ -1,0 +1,82 @@
+// VoxelOceanClipShore.ush - The shore a wave clipmap texel's static layer holds (stage W5c; VoxelOceanClip.ush,
+// VoxelOceanClipStatic.usf writes it): the inputs VoxelOceanFFTEvaluate takes for the shore (its depth, the
+// shore field's distance, direction and slope, the coastal field's integrals and their gradients, the bed's
+// slope, depth and rise), at a texel (VoxelOceanClip.usf's levels, as since W1) or between them, bilinear
+// (stage W5c: the passes near the camera, the foam's fine history and the own pass's pixels, evaluate the
+// composed sea with the shore as the clipmap does, not the open sea alone).
+
+// Include after VoxelOceanWaves.ush and VoxelOceanClip.ush (its includers have them; included
+// again here, the material's compilers that take no #pragma once would see them twice).
+
+#ifndef VOXEL_OCEAN_CLIP_SHORE_USH
+#define VOXEL_OCEAN_CLIP_SHORE_USH
+
+// A texel's static layer: four float4 (VoxelOceanClipStatic.usf), slices 4 Slot to 4 Slot + 3.
+struct FVoxelOceanClipStatic
+{
+    float4 S0;      // depth (cm), the bed's slope, the bed's depth (cm), the shore field's distance
+    float4 S1;      // the shore field's direction (the tangent frame's), the bed's rise (likewise)
+    float4 S2;      // the shore field's slope, the coastal field's A, B and cover
+    float4 S3;      // A's gradient, B's (the tangent frame's)
+};
+
+FVoxelOceanClipStatic VoxelOceanClipStaticAt(Texture2DArray<float4> Static, int2 S, int Slot)
+{
+    FVoxelOceanClipStatic O;
+    O.S0 = Static.Load(int4(S, 4 * Slot, 0));
+    O.S1 = Static.Load(int4(S, 4 * Slot + 1, 0));
+    O.S2 = Static.Load(int4(S, 4 * Slot + 2, 0));
+    O.S3 = Static.Load(int4(S, 4 * Slot + 3, 0));
+    return O;
+}
+
+// Between the texels, bilinear (by loads: the layer is 32-bit float): Texel the storage coordinate
+// (texels; a texel's centre at i + 0.5), wrapped over Size.
+FVoxelOceanClipStatic VoxelOceanClipStaticBilinear(Texture2DArray<float4> Static, float2 Texel, int Slot, int Size)
+{
+    const float2 X = Texel - 0.5f;
+    const float2 B = floor(X);
+    const float2 T = X - B;
+    const int2 I0 = int2((int(B.x) % Size + Size) % Size, (int(B.y) % Size + Size) % Size);
+    const int2 I1 = int2((I0.x + 1) % Size, (I0.y + 1) % Size);
+    const FVoxelOceanClipStatic A = VoxelOceanClipStaticAt(Static, I0, Slot);
+    const FVoxelOceanClipStatic Bx = VoxelOceanClipStaticAt(Static, int2(I1.x, I0.y), Slot);
+    const FVoxelOceanClipStatic By = VoxelOceanClipStaticAt(Static, int2(I0.x, I1.y), Slot);
+    const FVoxelOceanClipStatic C = VoxelOceanClipStaticAt(Static, I1, Slot);
+    FVoxelOceanClipStatic O;
+    O.S0 = lerp(lerp(A.S0, Bx.S0, T.x), lerp(By.S0, C.S0, T.x), T.y);
+    O.S1 = lerp(lerp(A.S1, Bx.S1, T.x), lerp(By.S1, C.S1, T.x), T.y);
+    O.S2 = lerp(lerp(A.S2, Bx.S2, T.x), lerp(By.S2, C.S2, T.x), T.y);
+    O.S3 = lerp(lerp(A.S3, Bx.S3, T.x), lerp(By.S3, C.S3, T.x), T.y);
+    return O;
+}
+
+// The shore the layer gives a point whose radial is UpP (planet frame), E1 the clipmap plane's first
+// axis (its tangent frame's), W the waves (W.States.x 0: no shore field, the bed's alone).
+FVoxelOceanShore VoxelOceanClipShoreOf(FVoxelOceanClipStatic St, float3 UpP, float3 E1, FVoxelOceanWaveParams W, Texture2D Charts)
+{
+    const float3 T1 = normalize(E1 - UpP * dot(E1, UpP));
+    const float3 T2 = cross(UpP, T1);
+    FVoxelOceanShore Shore = VoxelOceanShoreNone();
+    if (W.States.x > 0.5f)
+    {
+        const FVoxelOceanCoastLayout CoastLayout = VoxelOceanCoastLayoutOfTable(Charts, max(int(W.FFT.y), 1));
+        Shore.Distance = St.S0.w;
+        Shore.Direction = VoxelOceanRotate(W.Rotation, T1 * St.S1.x + T2 * St.S1.y);
+        Shore.Slope = St.S2.x;
+        Shore.Coast.A = St.S2.y;
+        Shore.Coast.B = St.S2.z;
+        Shore.Coast.Cover = St.S2.w;
+        Shore.Coast.GradA = T1 * St.S3.x + T2 * St.S3.y;
+        Shore.Coast.GradB = T1 * St.S3.z + T2 * St.S3.w;
+        Shore.CoastSeedM = CoastLayout.SeedDepthM;
+        Shore.CoastReachM = CoastLayout.ReachM;
+    }
+    Shore.BedSlope = St.S0.y;
+    Shore.BedDepth = St.S0.z;
+    const float2 Rise = float2(St.S1.z, St.S1.w);
+    Shore.BedRise = dot(Rise, Rise) > 0.25f ? VoxelOceanRotate(W.Rotation, T1 * Rise.x + T2 * Rise.y) : float3(0.0f, 0.0f, 0.0f);
+    return Shore;
+}
+
+#endif // VOXEL_OCEAN_CLIP_SHORE_USH

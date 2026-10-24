@@ -50,6 +50,8 @@ struct FVoxelOceanRingDrawFrame
     /** Stage W4c: the foam's fine history (null: none), its levels and its factor. */
     FRHITexture* ClipFineHistory = nullptr;
     FVector2f ClipFineInfo = FVector2f(0.0f, 0.0f);
+    /** Stage W5c: the clipmap's static layer (null: none; the pixels then evaluate the open sea alone). */
+    FRHITexture* ClipStatic = nullptr;
 };
 
 /** The rings' side of the own pass (FVoxelOceanPages; render thread). */

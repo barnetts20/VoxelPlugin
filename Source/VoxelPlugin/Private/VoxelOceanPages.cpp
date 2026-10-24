@@ -280,6 +280,8 @@ struct FVoxelOceanDisplaceState
     FTextureRHIRef ClipInfo;
     /** Stage W4c: the foam's fine history, its levels and factor (none: 0 levels). */
     FTextureRHIRef ClipFineHistory;
+    /** Stage W5c: the clipmap's static layer (the own pass's shore at its pixels). */
+    FTextureRHIRef ClipStatic;
     FVector2f ClipFineInfo = FVector2f(0.0f, 0.0f);
     /** The rings this frame (stage W2; UpdateClipmap's command, with the clipmap's levels): per
      *  level (the camera about the square's centre in cells, the cell, unused), (the hole's
@@ -417,6 +419,9 @@ BEGIN_SHADER_PARAMETER_STRUCT(FVoxelOceanClipFineParameters, )
     SHADER_PARAMETER(FIntVector4, FineRect0)
     SHADER_PARAMETER(FIntVector4, FineRect1)
     SHADER_PARAMETER(uint32, FineWhole)
+    SHADER_PARAMETER(FVector4f, FineSurf)
+    SHADER_PARAMETER_RDG_TEXTURE(Texture2DArray<float4>, ClipStatic)
+    SHADER_PARAMETER(FVector4f, ClipRing)
     SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2DArray<float>, FineHistory)
     SHADER_PARAMETER_RDG_TEXTURE(Texture2DArray<float>, FineCoarseHistory)
     SHADER_PARAMETER_RDG_TEXTURE(Texture2DArray<float4>, FineCoarseWhitecap)
@@ -1395,6 +1400,7 @@ bool FVoxelOceanRingProvider::PrepareDraw_RenderThread(FRDGBuilder& GraphBuilder
     Out.ClipWhitecap = D.ClipWhitecap.GetReference();
     Out.ClipInfo = D.ClipInfo.GetReference();
     Out.ClipFineHistory = D.ClipFineHistory.GetReference();
+    Out.ClipStatic = D.ClipStatic.GetReference();
     Out.ClipFineInfo = D.ClipFineHistory.IsValid() ? D.ClipFineInfo : FVector2f(0.0f, 0.0f);
     return true;
 }
@@ -2246,6 +2252,11 @@ void FVoxelOceanPages::UpdateClipmap(const FVector& CameraPlanet, const FVoxelOc
                         P->FineRect0 = RectOf(Step.Rect[0]);
                         P->FineRect1 = RectOf(Step.Rect[1]);
                         P->FineWhole = Step.bWhole ? 1u : 0u;
+                        // Stage W5c: the surf's foam's keep over the step; the shore's static layer and
+                        // the rings' layout (the composed sea, as the clipmap's).
+                        P->FineSurf = FVector4f((float)FMath::Exp(-Dt * Job->SurfFoamDecay), 0.0f, 0.0f, 0.0f);
+                        P->ClipStatic = StaticTex;
+                        P->ClipRing = Job->bRings ? Job->RingLayout : FVector4f(0.0f, 0.0f, 0.0f, 0.0f);
                         P->FineHistory = FineUAV;
                         P->FineCoarseHistory = FoamHistory;
                         P->FineCoarseWhitecap = WhitecapWork;
@@ -2286,6 +2297,8 @@ void FVoxelOceanPages::UpdateClipmap(const FVector& CameraPlanet, const FVoxelOc
                 GraphBuilder.SetTextureAccessFinal(NormalDest, ERHIAccess::SRVMask);
                 GraphBuilder.SetTextureAccessFinal(WhitecapDest, ERHIAccess::SRVMask);
                 GraphBuilder.SetTextureAccessFinal(InfoDest, ERHIAccess::SRVMask);
+                // (Stage W5c: the static layer read outside this graph too, by the own pass.)
+                GraphBuilder.SetTextureAccessFinal(StaticTex, ERHIAccess::SRVMask);
                 // A destination of another shape (being made again): the vertices don't sample it.
                 if (!bArraysMatch)
                 {
@@ -2304,6 +2317,7 @@ void FVoxelOceanPages::UpdateClipmap(const FVector& CameraPlanet, const FVoxelOc
             // Stage W4c: the foam's fine history (its pooled texture outlives the frame: the state holds it).
             const bool bFine = Job->FineCount > 0 && State->FineHistory.IsValid() && State->bHistoryOn;
             Displace->ClipFineHistory = bFine ? State->FineHistory->GetRHI() : nullptr;
+            Displace->ClipStatic = State->Static.IsValid() ? State->Static->GetRHI() : nullptr;
             Displace->ClipFineInfo = bFine ? FVector2f((float)Job->FineCount, (float)VoxelOceanClipmap::FineFactor) : FVector2f(0.0f, 0.0f);
             Displace->bClip = true;
             Displace->bRings = Job->bRings;
