@@ -385,8 +385,10 @@ inline FSurfAt SurfAt(float3 D, float Depth, const FShore& Shore, const FVoxelOc
 }
 
 inline FPoint HookEvaluate(const FTextures& Tx, float3 P, float3 Up, float Spacing, float Footprint, const FParams& W, unsigned Mask,
-    float Depth = Deep, const FShore& Shore = FShore())
+    float SmoothDepth = Deep, const FShore& Shore = FShore())
 {
+    // Stage W5e: the felt depth (VoxelOceanSurfFeltDepth), as the hook.
+    const float Depth = VoxelOceanSurfFeltDepth(SmoothDepth, Shore.BedDepth, 100.0f * VOXEL_OCEAN_SURF_FELT_BLEND);
     const float3 D = RotateBack(W.Rotation, P);
     const float3 UpP = RotateBack(W.Rotation, Up);
     const int N = std::max(int(W.FFT.Y), 1);

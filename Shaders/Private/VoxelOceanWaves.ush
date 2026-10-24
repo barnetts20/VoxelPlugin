@@ -980,9 +980,12 @@ FVoxelOceanFFTSurf VoxelOceanFFTSurfAt(float3 D, float Depth, FVoxelOceanShore S
 // the interval's first seconds (W.Shape.z). With VOXEL_OCEAN_LOOKUP_FOAM in Mask (and the normals),
 // the foam too (stage W3v; VoxelOceanFoam.ush): the summed surface's compression past the whitecap
 // threshold and the fresh foam it makes; the foam texture (OceanFoam) is no longer read.
-FVoxelOceanFFTPoint VoxelOceanFFTEvaluate(float3 P, float3 Up, float Spacing, float Footprint, float Depth, FVoxelOceanShore Shore,
+FVoxelOceanFFTPoint VoxelOceanFFTEvaluate(float3 P, float3 Up, float Spacing, float Footprint, float SmoothDepth, FVoxelOceanShore Shore,
     FVoxelOceanWaveParams W, VOXEL_OCEAN_TEXTURE_PARAMS, VOXEL_OCEAN_FOAM_TEXTURE_PARAMS, uint Mask)
 {
+    // Stage W5e: the felt depth, the terrain's own where it lies lower near the coast
+    // (VoxelOceanSurfFeltDepth): the waves run on to the waterline the terrain draws.
+    const float Depth = VoxelOceanSurfFeltDepth(SmoothDepth, Shore.BedDepth, 100.0f * VOXEL_OCEAN_SURF_FELT_BLEND);
     const float3 D = VoxelOceanRotateBack(W.Rotation, P);
     const float3 UpP = VoxelOceanRotateBack(W.Rotation, Up);
     const int N = max(int(W.FFT.y), 1);
@@ -1071,8 +1074,9 @@ FVoxelOceanFFTPoint VoxelOceanFFTEvaluate(float3 P, float3 Up, float Spacing, fl
     }
     // Thin water (stage O9f; VoxelOceanSurfThinDrop): a film of a few centimetres over the bottom
     // sinks just under it. The bottom: the depth the waves feel (smoothed; morphed with the mesh,
-    // the same in the underwater pass and the query), or the terrain's own where that stands
-    // higher (the mesh's BedDepth: a bump the smoothing left out pokes through cleanly).
+    // the same in the underwater pass and the query; stage W5e: felt, the terrain's own where
+    // that lies lower near the coast), or the terrain's own where that stands higher (the mesh's
+    // BedDepth: a bump the smoothing left out pokes through cleanly).
     if (Depth < 0.5f * VOXEL_OCEAN_DEEP && W.States.x > 0.5f && W.States.y > 0.0f && Shore.Distance < 0.5f * VOXEL_OCEAN_DEEP)
     {
         const float Bottom = Shore.BedDepth < 0.5f * VOXEL_OCEAN_DEEP ? min(Depth, Shore.BedDepth) : Depth;

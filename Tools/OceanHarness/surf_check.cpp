@@ -602,6 +602,78 @@ int main()
         }
     }
 
+    std::printf("\n== the felt depth at the coast (stage W5e; VoxelOceanSurfFeltDepth)\n");
+    {
+        const float Blend = VOXEL_OCEAN_SURF_FELT_BLEND;
+        // Its rule: never shallower than the smoothed depth, never deeper than the deeper of the
+        // two, the terrain's own on the smoothed field's land side, the smoothed past the blend,
+        // unknown beds and basins (deeply negative) ignored; continuous.
+        double Below = 0.0, Above = 0.0, Land = 0.0, Past = 0.0, Unknown = 0.0, Jump = 0.0;
+        for (int b = 0; b < 41; b++)
+        {
+            const float Bed = -2.0f + 0.25f * b;
+            float Prev = VoxelOceanSurfFeltDepth(-6.0f, Bed, Blend);
+            for (int i = 1; i <= 2400; i++)
+            {
+                const float D = -6.0f + 0.005f * i;
+                const float F = VoxelOceanSurfFeltDepth(D, Bed, Blend);
+                Below = std::max(Below, double(D - F));
+                Above = std::max(Above, double(F - std::max(D, Bed)));
+                if (D <= 0.0f) Land = std::max(Land, std::abs(double(F - std::max(D, Bed))));
+                if (D >= Blend) Past = std::max(Past, std::abs(double(F - D)));
+                Jump = std::max(Jump, std::abs(double(F - Prev)));
+                Prev = F;
+                Unknown = std::max(Unknown, std::abs(double(VoxelOceanSurfFeltDepth(D, 1.0e30f, Blend) - D)));
+                Unknown = std::max(Unknown, std::abs(double(VoxelOceanSurfFeltDepth(D, -1.0e6f, Blend) - D)));
+            }
+        }
+        Check(Below <= 0.0, "never shallower than the smoothed depth (m)", Below, 0.0);
+        Check(Above <= 1.0e-6, "never deeper than the deeper of the two (m)", Above, 1.0e-6);
+        Check(Land <= 1.0e-6, "the deeper of the two on the smoothed field's land side (m)", Land, 1.0e-6);
+        Check(Past <= 1.0e-6, "the smoothed depth past the blend (m)", Past, 1.0e-6);
+        Check(Unknown <= 0.0, "an unknown bed or a basin's leaves the smoothed depth (m)", Unknown, 0.0);
+        Check(Jump < 0.02, "continuous: largest step over 5 mm of smoothed depth (m)", Jump, 0.02);
+
+        // A coast whose land rises behind the beach: the smoothed depth 1 m shallower than the
+        // terrain's own near the shore (its 0 line 50 m out on a 1:50 beach). Between that line and
+        // the waterline the waves used to stop (the smoothed depth under 0: the swash's flat
+        // level); with the felt depth they run on to the waterline.
+        const FBeach Bch(0.02);
+        const FVoxelOceanSurfSettings SS = Settings(1.0f, 0.85f, 0.33f, 1.0f, 1000.0f, 0.2f, 0.5f, 1.0f);
+        // The waves' structure along the way (a flat sheet has none): the surface's deviation
+        // across 10 m about the point, averaged over 20 s.
+        auto Structure = [&](double X, bool bFelt)
+        {
+            double Sum = 0.0;
+            for (int k = 0; k < 200; k++)
+            {
+                double M1 = 0.0, M2 = 0.0;
+                for (int j = -10; j <= 10; j++)
+                {
+                    FVoxelOceanSurfInput In = Input(Bch, X + 0.5 * j, 100.0f + 0.1f * k, 2.0f, 10.0f);
+                    const float Own = In.DepthM;
+                    const float Smooth = Own - 1.0f;
+                    In.DepthM = bFelt ? VoxelOceanSurfFeltDepth(Smooth, Own, Blend) : Smooth;
+                    In.BedDepthM = Own;
+                    const double H = VoxelOceanSurfOf(In, SS).Height;
+                    M1 += H;
+                    M2 += H * H;
+                }
+                M1 /= 21.0;
+                Sum += std::sqrt(std::max(M2 / 21.0 - M1 * M1, 0.0));
+            }
+            return Sum / 200.0;
+        };
+        for (int i = 0; i < 3; i++)
+        {
+            const double X = 15.0 + 12.5 * i;     // 0.3 to 0.8 m of the terrain's own depth
+            const double Old = Structure(X, false), New = Structure(X, true);
+            std::printf("  %4.2f m of water (smoothed %+.2f m): the waves' deviation across 10 m %.4f m smoothed, %.4f m felt\n",
+                Bch.M * X, Bch.M * X - 1.0, Old, New);
+            Check(New > 5.0 * Old && New > 0.01, "the waves run on where the smoothed depth reads land (felt, m)", New, std::max(5.0 * Old, 0.01));
+        }
+    }
+
     std::printf("\n%s: %d failure(s)\n", Fails ? "FAILED" : "PASSED", Fails);
     return Fails ? 1 : 0;
 }
