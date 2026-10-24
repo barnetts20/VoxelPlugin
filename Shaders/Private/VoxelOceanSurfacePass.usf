@@ -132,7 +132,8 @@ float4 SurfaceClipFineInfo;
 // a slot), the pixels' shore.
 Texture2DArray<float4> SurfaceClipStatic;
 // Stage W3y: x the anisotropic filter's most lookups along a pixel's longer axis (1: none); stage
-// W5f: y and z the foam's distance fade, its start and end (cm from the camera; z 0: none).
+// W5f: y and z the foam's distance fade, its start and end (cm from the camera; z 0: none); stage
+// W6a: w the shading's debug view (voxel.Ocean.DebugShade, 0 off).
 float4 SurfaceFilter;
 // Stage W3h: x the crest glow's strength (0 none), y the whitecaps' relief gain; stage W3l: z the
 // intersection foam's strength (0 none), w its reach (cm).
@@ -238,6 +239,20 @@ void SurfaceVS(uint VertexId : SV_VertexID,
 }
 
 // A point of the view's rect (its texel in the behind textures) at device z, from the view's camera.
+// Stage W6a: the shading's debug views' ramp (voxel.Ocean.DebugShade) for an albedo (or a slope
+// variance): black at 0, blue at 0.05 (the clear-sky ocean's albedo at a high sun is about 0.06;
+// Cox and Munk's slope variance at 10 m/s 0.054), green 0.10, yellow 0.15, red 0.20, white from 0.25.
+float3 VoxelOceanSurfaceShadeRamp(float A)
+{
+    const float T = max(A, 0.0f) * 20.0f;
+    if (T < 1.0f) return float3(0.0f, 0.0f, T);
+    if (T < 2.0f) return float3(0.0f, T - 1.0f, 2.0f - T);
+    if (T < 3.0f) return float3(T - 2.0f, 1.0f, 0.0f);
+    if (T < 4.0f) return float3(1.0f, 4.0f - T, 0.0f);
+    const float W = saturate(T - 4.0f);
+    return float3(1.0f, W, W);
+}
+
 float3 VoxelOceanSurfaceRelOf(float2 UV, float DeviceZ)
 {
     const float4 H = mul(float4(UV.x * 2.0f - 1.0f, 1.0f - UV.y * 2.0f, DeviceZ, 1.0f), SurfaceClipToRel);
@@ -412,6 +427,10 @@ void SurfacePS(float4 SvPosition : SV_POSITION,
     }
     // Out through the surface: past its reflection, and radiance divides by n^2.
     float3 Color = Reflected + (Body + Glow) * ((1.0f - Fresnel) / (VOXEL_OCEAN_WATER_IOR * VOXEL_OCEAN_WATER_IOR));
+    // (Stage W6a: the terms apart, for voxel.Ocean.DebugShade.)
+    const float3 ShadeSky = Reflected - SurfaceSunIlluminance * Glint;
+    const float3 ShadeGlint = SurfaceSunIlluminance * Glint;
+    const float3 ShadeOurs = Color - Reflected;
     // Stage W4d: GodotOceanWaves' water light (its water.gdshader's light(), after Atlas' GDC 2019
     // water), toward it by SurfaceGodotWater.w in place of our scattering and crest glow (the bed seen
     // through the water stays ours): the crest's glow, its height over the sea plus 2.5 m (m) times
@@ -438,6 +457,7 @@ void SurfacePS(float4 SvPosition : SV_POSITION,
         const float3 OursDeep = (Body - Through + Glow) * ((1.0f - Fresnel) / (VOXEL_OCEAN_WATER_IOR * VOXEL_OCEAN_WATER_IOR));
         Color += SurfaceGodotWater.w * (GodotLight * (1.0f - Fresnel) - OursDeep);
     }
+    const float3 ShadeWater = Color - Reflected;
 
     // -- Where the water meets something standing in it (stage W3l) -----------------------------
     // The scene's point behind the water at this pixel (unrefracted), how far it lies along the
@@ -491,6 +511,7 @@ void SurfacePS(float4 SvPosition : SV_POSITION,
     // scattering layer: the light wraps round it, the gaps between its walls darker, thin foam
     // letting the water through.
     const bool bFoam = SurfaceShading.z > 0.5f;
+    const float3 ShadeUnfoamed = Color;
     FVoxelOceanLace Lace;
     Lace.Foam = 0.0f;
     Lace.Layer0 = 0.0f;
@@ -578,6 +599,36 @@ void SurfacePS(float4 SvPosition : SV_POSITION,
     // grey, not through the foam's structure or its light.
     if (VoxelOceanDebugModeOf(SurfaceCharts, max(int(W.FFT.y), 1)) > 0)
         Color = saturate(Foam) * dot(SkyIrradiance, float3(0.3f, 0.6f, 0.1f)) * (1.0f / VOXEL_OCEAN_SHADING_PI) + float3(1.0e-3f, 1.0e-3f, 1.0e-3f);
+    // Stage W6a: THE SHADING'S TERMS (voxel.Ocean.DebugShade; Design/DistantOcean.md, W6a), each as
+    // the albedo it gives the pixel (pi times its radiance over the irradiance on the horizontal, the
+    // sun's and the sky's) on VoxelOceanSurfaceShadeRamp, drawn as a white Lambertian lit as the
+    // water is: 1 the sky's reflection, 2 the sun's glint, 3 the water's light as drawn (ours or
+    // Godot's, by GodotWaterLight), 4 ours (the body's scattering and the crest glow, whatever
+    // GodotWaterLight), 5 the foam's (its change of the colour), 6 all of it; the slope variance
+    // (both axes) on the same ramp: 7 the roughness (the unresolved and the short waves'), 8 the
+    // resolved normal's (its tilt from the radial, squared: per pixel; its mean over a stretch of sea
+    // the resolved variance), 9 the two together (the ledger: the sea state's total wherever it
+    // holds, ledger_check).
+    const int DebugShade = int(SurfaceFilter.w + 0.5f);
+    if (DebugShade > 0)
+    {
+        const float3 LumaW = float3(0.2126f, 0.7152f, 0.0722f);
+        const float3 Lit = SurfaceSunIlluminance * (SunAbove * max(SunUp, 0.0f)) + SkyIrradiance;
+        const float ToAlbedo = VOXEL_OCEAN_SHADING_PI / max(dot(Lit, LumaW), 1.0e-6f);
+        const float CosT = saturate(dot(N, Up));
+        const float Tilt2 = (1.0f - CosT * CosT) / max(CosT * CosT, 1.0e-4f);
+        float A = 0.0f;
+        if (DebugShade == 1) A = ToAlbedo * dot(ShadeSky, LumaW);
+        else if (DebugShade == 2) A = ToAlbedo * dot(ShadeGlint, LumaW);
+        else if (DebugShade == 3) A = ToAlbedo * dot(ShadeWater, LumaW);
+        else if (DebugShade == 4) A = ToAlbedo * dot(ShadeOurs, LumaW);
+        else if (DebugShade == 5) A = ToAlbedo * dot(Color - ShadeUnfoamed, LumaW);
+        else if (DebugShade == 6) A = ToAlbedo * dot(Color, LumaW);
+        else if (DebugShade == 7) A = 2.0f * S2;
+        else if (DebugShade == 8) A = Tilt2;
+        else A = 2.0f * S2 + Tilt2;
+        Color = VoxelOceanSurfaceShadeRamp(A) * Lit * (1.0f / VOXEL_OCEAN_SHADING_PI) + float3(1.0e-3f, 1.0e-3f, 1.0e-3f);
+    }
 
     // Stage W5d: THE WATER'S EDGE. Where the water lies within a few centimetres of what is behind it
     // (the flats, a river's outlet, the swash's sheet on the beach), the two surfaces' depths cross

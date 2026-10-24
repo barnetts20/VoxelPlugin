@@ -25,6 +25,12 @@ static TAutoConsoleVariable<int32> CVarVoxelOceanDebugFoam(
     TEXT("The ocean's own pass (stage W3f): 1 the foam's density (grey), 2 its structure (the lace drawn for the density), 3 the structure's layers (with a foam set, stage W3g: red the lace, green the streaks, blue the whitecaps; with the procedural lace: red the streaks, green the lace, blue the bubbles), 4 the whitecaps' density (stage W3h: the breaking now), 5 where the foam is the pixel's own (stage W3u: green, FoamDetail) or the wave clipmap's (red); its layers apart (stage W5f): 6 the clipmap's buffer, 7 the fine history (green) over its share (red), 8 the pixel's fresh foam, 9 the surf's foam at the pixel, 10 the fine cascade's foam at the pixel, 11 the clipmap's drawn foam; 12 the clipmap level the pixel reads (stage W5h: a hue per octave). 0 off."),
     ECVF_RenderThreadSafe);
 
+// Stage W6a (Design/DistantOcean.md): the shading's terms, each as the albedo it gives the pixel.
+static TAutoConsoleVariable<int32> CVarVoxelOceanDebugShade(
+    TEXT("voxel.Ocean.DebugShade"), 0,
+    TEXT("The ocean's shading term by term (stage W6a), each as the albedo it gives the pixel (pi radiance over the sun's and the sky's irradiance on the horizontal) on a ramp: black 0, blue 0.05 (a real clear-sky ocean is about 0.06 at a high sun), green 0.10, yellow 0.15, red 0.20, white 0.25 and over. 1 the sky's reflection, 2 the sun's glint, 3 the water's light as drawn (ours or Godot's, by GodotWaterLight), 4 ours (the body's scattering and the crest glow), 5 the foam's, 6 all of it; the slope variance (both axes) on the same ramp: 7 the roughness, 8 the resolved normal's tilt squared, 9 the two together (the ledger). 0 off."),
+    ECVF_RenderThreadSafe);
+
 namespace VoxelOceanSurfacePassDetail
 {
     constexpr int32 ThreadGroupSize = 8;
@@ -510,7 +516,9 @@ void FVoxelOceanSurfacePass::Render_RenderThread(FPostOpaqueRenderParameters& Pa
     // Stage W5f: the foam's distance fade (y, z: its start and end, cm; z 0: none).
     const float FoamFadeEnd = FMath::Max(Params.FoamFadeDistanceM, 0.0f) * 100.0f;
     const float FoamFadeStart = FMath::Max(0.7f * FMath::Min(FMath::Max(Params.FoamDetailDistanceM, 1.0f) * 100.0f, FoamFadeEnd), 0.5f * FoamFadeEnd);
-    P->SurfaceFilter = FVector4f((float)FMath::Clamp(Params.Anisotropy, 1, 16), FoamFadeStart, FoamFadeEnd, 0.0f);
+    // Stage W6a: w the shading's debug view (voxel.Ocean.DebugShade).
+    P->SurfaceFilter = FVector4f((float)FMath::Clamp(Params.Anisotropy, 1, 16), FoamFadeStart, FoamFadeEnd,
+        (float)FMath::Clamp(CVarVoxelOceanDebugShade.GetValueOnRenderThread(), 0, 9));
 
     // The water, per cm.
     const FVector3f Scattering = Params.Scattering * 0.01f;
@@ -524,7 +532,7 @@ void FVoxelOceanSurfacePass::Render_RenderThread(FPostOpaqueRenderParameters& Pa
     P->SurfaceSkyZenith = Params.SkyZenith;
     P->SurfaceSkyHorizon = Params.SkyHorizon;
     P->SurfaceShading = FVector4f(FMath::Max(Params.ShortWaveSlopeVariance, 0.0f), FMath::Max(Params.Refraction, 0.0f), Params.bFoam ? 1.0f : 0.0f,
-        (float)FMath::Clamp(CVarVoxelOceanDebugFoam.GetValueOnRenderThread(), 0, 5));
+        (float)FMath::Clamp(CVarVoxelOceanDebugFoam.GetValueOnRenderThread(), 0, 12));
     P->SurfaceFoamAlbedo = Params.FoamAlbedo;
     // Stage W4d: Godot's water light (its colour, its share).
     P->SurfaceGodotWater = FVector4f(Params.GodotWaterColor.X, Params.GodotWaterColor.Y, Params.GodotWaterColor.Z, FMath::Clamp(Params.GodotWaterLight, 0.0f, 1.0f));
