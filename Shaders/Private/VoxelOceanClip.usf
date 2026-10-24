@@ -304,7 +304,11 @@ void ClipFineFoamCS(uint3 Id : SV_DispatchThreadID)
         const float2 CoarseTexel = (float2(OriginMod * Factor + int2(Id.xy)) + 0.5f) / float(Factor);
         const FVoxelOceanClipStatic St = VoxelOceanClipStaticBilinear(ClipStatic, CoarseTexel, Slot, Size);
         const FVoxelOceanShore Shore = VoxelOceanClipShoreOf(St, UpP, F.E1, W, ClipCharts);
-        const FVoxelOceanFFTPoint Pt = VoxelOceanFFTEvaluate(P, Up, 2.0f * Spacing, Spacing, St.S0.x, Shore, W,
+        // (Stage W6i: the foam needs J and its sources, not the displacement: the lookups' mesh
+        // spacing out of reach (VoxelOceanFFTLookup skips the displacement's fetches), the surf's
+        // spacing kept as it was.)
+        if (W.SurfSpacing <= 0.0f) W.SurfSpacing = 2.0f * Spacing;
+        const FVoxelOceanFFTPoint Pt = VoxelOceanFFTEvaluate(P, Up, 1.0e9f, Spacing, St.S0.x, Shore, W,
             ClipDisplacement, ClipDisplacementSampler, ClipDerivatives, ClipDerivativesSampler, ClipCharts, ClipFoam, ClipFoamSampler,
             2u | (ClipFoamOn != 0u ? VOXEL_OCEAN_LOOKUP_FOAM : 0u));
         Open = Pt.FoamSource;

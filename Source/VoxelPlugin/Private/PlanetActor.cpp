@@ -166,6 +166,22 @@ void APlanetActor::SetOceanSettings(const FVoxelOceanSettings& InSettings)
         OceanActor->SetOceanSettings(OceanSettings);
 }
 
+void APlanetActor::OceanPresetRealistic()
+{
+    Modify();
+    FVoxelOceanSettings S = OceanSettings;
+    S.ApplyRealisticPreset();
+    SetOceanSettings(S);
+}
+
+void APlanetActor::OceanPresetGodot()
+{
+    Modify();
+    FVoxelOceanSettings S = OceanSettings;
+    S.ApplyGodotPreset();
+    SetOceanSettings(S);
+}
+
 void APlanetActor::Tick(float DeltaTime)
 {
     Super::Tick(DeltaTime);

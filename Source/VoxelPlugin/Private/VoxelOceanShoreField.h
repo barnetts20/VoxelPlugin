@@ -28,6 +28,7 @@
 #include <vector>
 
 struct FVoxelLandBake;
+struct FVoxelOceanCoastDepthJob;
 class UTexture2DArray;
 class FTextureResource;
 
@@ -43,6 +44,12 @@ public:
     double BuildSeconds = 0.0;
     /** 6 (N + 2 Pad)^2 texels' bits. */
     TArray<uint32> Texels;
+    /** Stage W7d: the heights it was made from (m about sea level, the bake's layout): the
+     *  terrain's own at each bake cell (sampled on the GPU) rather than the bake's, whose coasts
+     *  the terrain's domain warp moves by kilometres. Empty: the bake's (a server, or the
+     *  sampling off). The coastal field plans from these too. */
+    TArray<float> Height;
+    int32 SeaCells = 0;
 
     /** Any thread. The field at a point (planet frame): distance (cm), direction (planet frame,
      *  tangent, length 1 or less), slope. */
@@ -94,8 +101,13 @@ public:
      *  sea-connected bit's inputs, it is done at once with no field. */
     void Start(const TSharedPtr<const FVoxelLandBake, ESPMode::ThreadSafe>& InBake, double InRadiusCm, double InReachM);
 
-    /** Advances: the GPU's readback, or the CPU's build. */
-    void Tick();
+    /** Enqueues the GPU's sampling of Count cells from First (the terrain's depth at the bake's
+     *  cells: FVoxelOceanPages::SampleCoastDepths, mode 1); false if it can't yet. */
+    using FSampler = TFunction<bool(const TSharedPtr<FVoxelOceanCoastDepthJob, ESPMode::ThreadSafe>& Job, int64 First, int32 Count)>;
+
+    /** Advances: the terrain's heights (stage W7d, with a Sampler), the GPU's readback, or the
+     *  CPU's build. */
+    void Tick(const FSampler& Sampler = nullptr);
 
     bool IsDone() const { return bDone; }
 
@@ -115,6 +127,8 @@ private:
     struct FJob;
     void StartGpu();
     void StartCpu();
+    /** Stage W7d: the heights back: the sea bits from them, then on to the GPU's build. */
+    void FromTerrain();
     void Finish(TSharedPtr<FVoxelOceanShoreField, ESPMode::ThreadSafe> Field);
 
     TSharedPtr<const FVoxelLandBake, ESPMode::ThreadSafe> Bake;
@@ -124,6 +138,10 @@ private:
     int32 WaitFrames = 0;
     bool bDone = true;
     bool bGpu = false;
+    /** Stage W7d: sampling the terrain's heights first, the chunks issued. */
+    bool bSampling = false;
+    int64 Issued = 0;
+    int32 SampleWaitFrames = 0;
     TSharedPtr<FJob, ESPMode::ThreadSafe> Job;
     TSharedPtr<const FVoxelOceanShoreField, ESPMode::ThreadSafe> Result;
 };

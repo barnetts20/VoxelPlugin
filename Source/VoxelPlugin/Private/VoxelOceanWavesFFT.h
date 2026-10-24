@@ -75,6 +75,7 @@ public:
     virtual void Evaluate(const FVoxelOceanWaveContext& Context, TConstArrayView<FVoxelOceanWaveSite> Sites,
         TArrayView<FVoxelOceanWaveResult> Out) const override;
     virtual double MaxHeight() const override { return MaxHeightCm; }
+    virtual double MaxHeightAt(const FVoxelOceanWaveContext& Context, const FVector& PlanetPoint) const override;
     virtual double MaxHorizontal() const override { return MaxHorizontalCm; }
     virtual void GetShaderParams(const FVoxelOceanWaveContext& Context, const FVector& Reference,
         const FTransform& PlanetToWorld, FVoxelOceanWaveShaderParams& Out) const override;
@@ -90,6 +91,8 @@ public:
     const FVoxelOceanTableConstants& GetTableConstants() const { return Constants; }
     /** The sea's height standard deviation (m) for a wind (all bands, the swell aside). */
     double SigmaAt(double Wind) const;
+    /** Stage W6i: the reach (cm) for a sea at this wind: 5 sigma, shoaled and the surf's at most. */
+    double HeightBoundCm(double Wind) const;
 
 private:
     /** One 15 Hz frame's query cascades, per query slot; a slot no query has weighed yet is

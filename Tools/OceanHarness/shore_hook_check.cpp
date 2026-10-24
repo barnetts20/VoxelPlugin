@@ -105,13 +105,15 @@ struct FField
     }
 };
 
-static FVoxelOceanWaveResult EvaluateAt(const FVoxelOceanWavesFFT& Model, const FVoxelOceanWaveContext& Context, const FField& Field, const FVector& Dir)
+static FVoxelOceanWaveResult EvaluateAt(const FVoxelOceanWavesFFT& Model, const FVoxelOceanWaveContext& Context, const FField& Field, const FVector& Dir,
+    double BedDepth = VoxelOceanWaves::Deep)
 {
     FVoxelOceanWaveSite Site;
     Site.Point = Dir * Radius;
     Site.Up = Dir;
     Site.Environment = Context.Environment;
     Site.Depth = DepthAt(Dir);
+    Site.BedDepth = BedDepth;   // (stage W6h: the terrain's own, FillSites')
     Site.Shore = Field.Sample(Site.Point);
     FVoxelOceanWaveResult R;
     Model.Evaluate(Context, TConstArrayView<FVoxelOceanWaveSite>(&Site, 1), TArrayView<FVoxelOceanWaveResult>(&R, 1));
@@ -393,6 +395,40 @@ int main()
         // trains (phased by it) carry the surf wherever the bottom lies below the field's model,
         // breaking fronts included.
         Expect(EH < 6.0 * std::max(1.0, MH / 300.0), "drawn and queried shoaled waves agree within 6 cm per 3 m of waves");
+        // Stage W6h: with the terrain's own depth lower than the smoothed one near the waterline (the
+        // felt depth, VoxelOceanSurfFeltDepth), drawn and queried alike: the query takes the site's
+        // BedDepth (FillSites) as the hook its static layer's.
+        {
+            double EB = 0.0, MB = 0.0, Moved = 0.0;
+            int CountB = 0;
+            for (int k = 0; k < 600; k++)
+            {
+                const double Sd = std::exp(std::uniform_real_distribution<double>(std::log(2.0), std::log(400.0))(Rng));
+                const FVector Dir = CoastPoint(std::uniform_real_distribution<double>(0, 6.2832)(Rng), Sd);
+                const double Smooth = DepthAt(Dir);
+                if (Smooth >= 300.0 || Smooth <= -300.0) continue;
+                const double Bed = Smooth + 150.0;
+                const FVector Ref = (Dir * Radius + FVector(1, 2, 3).GetSafeNormal() * 3000.0).GetSafeNormal() * (Radius + 300.0);
+                FVoxelOceanWaveShaderParams SP;
+                Model.GetShaderParams(Context, Ref, PlanetToWorld, SP);
+                FParams W = ParamsOf(SP);
+                W.bLongOnly = true;
+                const FVector PW = PlanetToWorld.TransformPositionNoScale(Dir * Radius) - PlanetToWorld.TransformPositionNoScale(Ref);
+                const FVector UpW = PlanetToWorld.TransformVectorNoScale(Dir);
+                FShore Sh = ShoreAt(Tx, F3(PW), F3(UpW), W);
+                Sh.BedDepth = float(Bed);
+                const FPoint Hook = HookEvaluate(Tx, F3(PW), F3(UpW), 0.0f, 0.0f, W, 3u, float(Smooth), Sh);
+                const FVoxelOceanWaveResult R = EvaluateAt(Model, Context, Field, Dir, Bed);
+                const FVoxelOceanWaveResult R0 = EvaluateAt(Model, Context, Field, Dir);
+                EB = std::max(EB, std::abs(double(Hook.R.Height) - R.Height));
+                MB = std::max(MB, std::abs(R.Height));
+                Moved = std::max(Moved, std::abs(R.Height - R0.Height));
+                CountB++;
+            }
+            std::printf("  %d points within 3 m of the waterline with the terrain 1.5 m under the smoothed depth: drawn against queried up to %.1f mm "
+                "(the felt depth moves the queried surface up to %.1f cm)\n", CountB, EB * 10.0, Moved);
+            Expect(CountB > 50 && EB < 6.0 * std::max(1.0, MB / 300.0) && Moved > 0.5, "with the felt depth (stage W6h) drawn and queried waves agree at the waterline too");
+        }
         std::printf("  the coastal field, drawn against queried (%d of the points in it): A within %.4f m^0.5, its gradient within %.2f%%, the cover within %.4f\n",
             CoastOn, CoastA, 100.0 * CoastG, CoastC);
         Expect(CoastOn > 300 && CoastA < 0.01 && CoastG < 0.01 && CoastC < 0.01, "the hook reads the coastal field as the queries do");

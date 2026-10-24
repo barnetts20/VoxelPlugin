@@ -16,6 +16,16 @@
 // the basins' margin: a wall of water across the bay) and culls past it. A true inland basin lies
 // farther from the sea than that; one closer is taken as sea (better a basin flooded at the sea's
 // level than a bay drained).
+//
+// Stage W5m, THE SPILL: a below-sea region the sea reaches through ground no higher than
+// SpillLevel (m; 4-connected) is sea too: its spill level is at the sea's, within what one sample a
+// cell can tell (a berm, a beach ridge, a dune line between a lagoon and the sea is narrower and
+// lower than the cells that sample it). And THE LAGOONS: with Water (the bake's kept lakes' levels
+// per cell, -3e38 where none), a cell under a kept lake whose level is at most SpillLevel counts as
+// below sea level: the land fills a coastal depression to its spill, a lagoon at the sea's level
+// whose bed the cells may sample above it, and the ocean drained and culled it (W5l's wall of water
+// along a coast, the land's lake drawn in its place). A true inland basin's rim, or a lake's level,
+// stands higher.
 
 #pragma once
 
@@ -76,7 +86,8 @@ namespace VoxelLandSea
 
     /** Sets Bit in Attr on the sea-connected cells and clears it elsewhere. Height and Attr: 6 faces
      *  of (N + 2 Pad)^2 cells (the bake's layout). */
-    inline FStats Mark(int N, int Pad, const float* Height, uint16_t* Attr, uint16_t Bit, double MinShare, int BridgeCells = 3)
+    inline FStats Mark(int N, int Pad, const float* Height, uint16_t* Attr, uint16_t Bit, double MinShare, int BridgeCells = 3,
+        const float* Water = nullptr, float SpillLevel = 3.0f)
     {
         FStats Stats;
         if (N <= 0 || !Height || !Attr) return Stats;
@@ -110,7 +121,15 @@ namespace VoxelLandSea
         auto IsBelow = [&](int Cell)
             {
                 const int F = Cell / (N * N), J = (Cell / N) % N, I = Cell % N;
-                return Height[Padded(F, I, J)] < 0.0f;
+                const int P = Padded(F, I, J);
+                // (Stage W5m: a lagoon's cells, under a kept lake at the sea's level, too.)
+                return Height[P] < 0.0f || (Water && Water[P] > -1.0e30f && Water[P] <= SpillLevel);
+            };
+        // Stage W5m: ground the sea spills over (the spill's flood passes through it).
+        auto IsLow = [&](int Cell)
+            {
+                const int F = Cell / (N * N), J = (Cell / N) % N, I = Cell % N;
+                return Height[Padded(F, I, J)] <= SpillLevel || IsBelow(Cell);
             };
         for (int Start = 0; Start < Cells; Start++)
         {
@@ -150,12 +169,54 @@ namespace VoxelLandSea
             if (double(Size[size_t(r)]) >= MinShare * double(Below)) IsSea[size_t(r)] = 1;
         }
         if (Largest >= 0) IsSea[size_t(Largest)] = 1;
-        // Stage W5l: the bridge (above), until no region joins (a joined one bridges on).
-        if (BridgeCells > 0)
+        // Stage W5l: the bridge (above), until no region joins (a joined one bridges on); stage W5m:
+        // each pass first the spill (a flood from the sea through low ground).
+        if (BridgeCells > 0 || SpillLevel >= 0.0f)
         {
             std::vector<int> Steps(size_t(Cells), -1);
+            std::vector<unsigned char> Reached(size_t(Cells), 0);
             for (int Pass = 0; Pass < 8; Pass++)
             {
+                bool bSpilled = false;
+                if (SpillLevel >= 0.0f)
+                {
+                    std::fill(Reached.begin(), Reached.end(), 0);
+                    Queue.clear();
+                    for (int Cell = 0; Cell < Cells; Cell++)
+                        if (Label[size_t(Cell)] >= 0 && IsSea[size_t(Label[size_t(Cell)])])
+                        {
+                            Reached[size_t(Cell)] = 1;
+                            Queue.push_back(Cell);
+                        }
+                    for (size_t Head = 0; Head < Queue.size(); Head++)
+                    {
+                        const int Cell = Queue[Head];
+                        const int F = Cell / (N * N), J = (Cell / N) % N, I = Cell % N;
+                        const int Next[4] = {
+                            I + 1 < N ? Cell + 1 : Across[size_t(F * 4 + 0) * N + J],
+                            I > 0 ? Cell - 1 : Across[size_t(F * 4 + 1) * N + J],
+                            J + 1 < N ? Cell + N : Across[size_t(F * 4 + 2) * N + I],
+                            J > 0 ? Cell - N : Across[size_t(F * 4 + 3) * N + I] };
+                        for (int E = 0; E < 4; E++)
+                        {
+                            const int Other = Next[E];
+                            if (Reached[size_t(Other)] || !IsLow(Other)) continue;
+                            Reached[size_t(Other)] = 1;
+                            Queue.push_back(Other);
+                            const int L = Label[size_t(Other)];
+                            if (L >= 0 && !IsSea[size_t(L)])
+                            {
+                                IsSea[size_t(L)] = 1;
+                                bSpilled = true;
+                            }
+                        }
+                    }
+                }
+                if (BridgeCells <= 0)
+                {
+                    if (!bSpilled) break;
+                    continue;
+                }
                 std::fill(Steps.begin(), Steps.end(), -1);
                 Queue.clear();
                 for (int Cell = 0; Cell < Cells; Cell++)
@@ -189,7 +250,7 @@ namespace VoxelLandSea
                         }
                     }
                 }
-                if (!bJoined) break;
+                if (!bJoined && !bSpilled) break;
             }
         }
         for (unsigned char Sea : IsSea)

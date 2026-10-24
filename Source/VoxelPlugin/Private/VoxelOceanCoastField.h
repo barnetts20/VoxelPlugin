@@ -11,6 +11,15 @@
 // queries. Up to a minute or so on a large planet with long coasts (the solve runs on its own
 // thread); the waves carry on without it meanwhile.
 //
+// STAGE W7a: THE WINDOW. By default the field covers only the coasts round the camera
+// (VoxelOceanCoastCore.h): a second or so to make, again in the background whenever the camera
+// has moved WindowMove from the window's centre. The texture keeps its shape from one window to
+// the next (the atlas's slices for the most tiles a window holds), so a new window's texels are
+// written into it in place (WriteInto: the index's boxes and the atlas's slices it fills) rather
+// than the texture made again. The cover blends from the last window's to the new one's over
+// WindowBlendSeconds and a field fades in when it first arrives (WindowRows: rows 21 to 23 of the
+// chart table's constants, live; the queries apply the same).
+//
 // A machine without a GPU (a dedicated server) makes none yet (stage O9j).
 
 #pragma once
@@ -23,6 +32,7 @@
 
 struct FVoxelLandBake;
 class FVoxelOceanShoreField;
+class UTexture2DArray;
 
 /** The fine cells whose depths the GPU samples (FVoxelOceanPages::SampleCoastDepths), and what came
  *  back. Shared by the builder (game thread) and the render thread's readbacks. */
@@ -30,6 +40,9 @@ struct FVoxelOceanCoastDepthJob
 {
     /** 3 ints a tile: face, bake cell i, j (the plan's interior tiles). */
     TArray<int32> Tiles;
+    /** Stage W7d: 0 the tiles' fine cells; 1 the land bake's padded cells (no tiles: the shore
+     *  field's heights from the terrain, VoxelOceanShoreField.cpp). */
+    int32 Mode = 0;
     int32 R = 1;
     int32 N = 0;
     double FootprintCm = 0.0;
@@ -57,8 +70,30 @@ public:
      *  compares these). */
     VoxelOceanCoastCore::FSettings Settings;
     VoxelOceanCoastCore::FSettings Requested;
-    /** Rows 19 to 21 of the chart table's constants (VoxelOceanCoast.ush's layout). */
+    /** Rows 19 to 21 of the chart table's constants (VoxelOceanCoast.ush's layout; row 21's
+     *  blend, fade and window from WindowRows). */
     FVector4f Rows[3];
+    /** Stage W7a: the window (none: the whole planet's field), its centre and the last window's
+     *  (planet frame, unit), the cover's radii (m), when the blend from the last window began and
+     *  when the field began to fade in (FPlatformTime's seconds; long past: done), how long each
+     *  takes. Set by the builder before the field is shared. */
+    bool bWindow = false;
+    FVector3d Centre = FVector3d::ZAxisVector;
+    FVector3d CentreLast = FVector3d::ZAxisVector;
+    double InnerM = 0.0;
+    double OuterM = 0.0;
+    double BlendStart = -1.0e30;
+    double FadeStart = -1.0e30;
+    double BlendSeconds = 1.5;
+    /** Per face the index's texels this field's tiles take (VoxelOceanCoastCore::IndexBoxes), and
+     *  the atlas's slices it fills. */
+    int32 IndexBox[6][4] = {};
+    int32 UsedAtlasSlices = 0;
+    /** A number of its own (the clipmap's static layer is written again for a new one). */
+    uint32 Serial = 0;
+    double SampleSeconds = 0.0;
+    double PackSeconds = 0.0;
+    int64 Cells = 0;
     /** Slices Side^2 texels (the solve's own buffer, moved in). */
     std::vector<uint32_t> Texels;
     /** Candidates left out to fit the budget (VoxelOceanCoastCore::FPlan::TrimmedTiles). */
@@ -72,6 +107,18 @@ public:
     double SolveSeconds = 0.0;
 
     bool IsValid() const;
+
+    /** Stage W7a: rows 21 to 23 of the chart table's constants at FPlatformTime's Now: (radius m,
+     *  blend, fade, window on), (centre, inner m), (the last centre, outer m). */
+    void WindowRows(double Now, FVector4f Out[3]) const;
+    /** Whether the blend from the last window and the fade in are done. */
+    bool IsSettled(double Now) const { return Now >= BlendStart + BlendSeconds && Now >= FadeStart + BlendSeconds; }
+
+    /** Game thread. Writes Made's texels into Texture, which holds an earlier field's of the same
+     *  shape (Last: its index's boxes are written again too): the atlas's slices Made fills and
+     *  the index's boxes, through a staging texture and a copy each on the render thread. False
+     *  if it can't (no resource). */
+    static bool WriteInto(UTexture2DArray* Texture, const TSharedPtr<const FVoxelOceanCoastField, ESPMode::ThreadSafe>& Made, const FVoxelOceanCoastField* Last);
 
     /** Any thread. The field at a point (planet frame, cm): A, B, their gradients (planet frame,
      *  per metre), the cover. */
@@ -93,8 +140,11 @@ public:
     ~FVoxelOceanCoastBuilder();
 
     void Reset();
+    /** Starts over (stage W7a: with the settings' window, round CentreDir, planet frame, unit;
+     *  Previous the field shown now, which a new window blends from). */
     void Start(const TSharedPtr<const FVoxelOceanShoreField, ESPMode::ThreadSafe>& InShore, const TSharedPtr<const FVoxelLandBake, ESPMode::ThreadSafe>& InBake,
-        const VoxelOceanCoastCore::FSettings& InSettings);
+        const VoxelOceanCoastCore::FSettings& InSettings, const FVector3d& CentreDir = FVector3d::ZAxisVector,
+        const TSharedPtr<const FVoxelOceanCoastField, ESPMode::ThreadSafe>& Previous = nullptr);
     /** Game thread, every frame while not done. */
     void Tick(const FSampler& Sampler);
 
@@ -110,6 +160,16 @@ private:
     TSharedPtr<const FVoxelLandBake, ESPMode::ThreadSafe> Bake;
     VoxelOceanCoastCore::FSettings Settings;
     double StartSeconds = 0.0;
+    double SampleStartSeconds = 0.0;
+    FVector3d Centre = FVector3d::ZAxisVector;
+    TSharedPtr<const FVoxelOceanCoastField, ESPMode::ThreadSafe> Previous;
+    /** Stage W7b: the coast's cells (the plan's candidates over the whole planet), kept for the
+     *  shore field and the settings they were found for: a window's plan then touches only its
+     *  own (it scanned the planet's bake each time, a quarter second at N 1024). Not reset. */
+    TSharedPtr<const VoxelOceanCoastCore::FCoastCells, ESPMode::ThreadSafe> KeptCells;
+    TWeakPtr<const FVoxelOceanShoreField, ESPMode::ThreadSafe> KeptShore;
+    VoxelOceanCoastCore::FSettings KeptSettings;
+    TSharedPtr<VoxelOceanCoastCore::FCoastCells, ESPMode::ThreadSafe> MadeCells;
     TSharedPtr<VoxelOceanCoastCore::FPlan, ESPMode::ThreadSafe> Plan;
     TFuture<void> Planned;
     TSharedPtr<FVoxelOceanCoastDepthJob, ESPMode::ThreadSafe> Job;

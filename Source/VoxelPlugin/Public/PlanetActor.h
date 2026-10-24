@@ -153,6 +153,16 @@ public:
     UFUNCTION(BlueprintCallable, Category = "Planet|Ocean")
     void SetOceanSettings(const FVoxelOceanSettings& InSettings);
 
+    /** Stage W6g: the ocean's realistic look (FVoxelOceanSettings::ApplyRealisticPreset: physical
+     *  wave heights, Monahan's whitecap coverage, the physical water light); only those settings
+     *  change. */
+    UFUNCTION(CallInEditor, BlueprintCallable, Category = "Planet|Ocean")
+    void OceanPresetRealistic();
+
+    /** Stage W6g: GodotOceanWaves' exaggerated look, the defaults (ApplyGodotPreset). */
+    UFUNCTION(CallInEditor, BlueprintCallable, Category = "Planet|Ocean")
+    void OceanPresetGodot();
+
     // --- Lifecycle ---
 
     virtual void OnConstruction(const FTransform& Transform) override;

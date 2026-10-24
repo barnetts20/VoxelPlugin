@@ -21,7 +21,7 @@
 //   settings (stage O9a, VoxelOceanSurf.ush), row 17 the mesh's split bias near shores (stage
 //   O9c: Detail, the band and the reach in cm, VoxelOcean.ush) and row 18 the surf's swell and
 //   blends (stage O9d), written by the surface with the frame (not part of the weather's table);
-//   rows 19 to 21 the coastal field's layout (stage O9h). Stage W6b: from row 24, the slots'
+//   rows 19 to 23 the coastal field's layout (stage O9h; 21 to 23 its window, stage W7a). Stage W6b: from row 24, the slots'
 //   resolved shares, a row per slot and mip (VoxelOceanSlotUnresolved; part of the table).
 // Width 5 N + F + 3, height max(6 N, 6 (F + 2)).
 //

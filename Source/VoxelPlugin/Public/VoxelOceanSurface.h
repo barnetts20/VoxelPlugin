@@ -248,7 +248,7 @@ private:
     /** The shore field's expansion, the surf's settings, the split bias and the coastal field's
      *  layout last written into the chart texture (rows 8 to 21 of its constants), and the table
      *  upload they were written after. */
-    FVector4f WrittenShoreFrame[14];
+    FVector4f WrittenShoreFrame[16];
     uint64 ShoreFrameUploads = 0;   // ChartUploads when it was written
     uint64 ChartUploads = 0;        // the weather's full uploads into the chart texture
     const UTexture2D* ShoreFrameTexture = nullptr;

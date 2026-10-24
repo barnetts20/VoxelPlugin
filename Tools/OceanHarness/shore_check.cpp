@@ -211,6 +211,66 @@ int main(int Argc, char** Argv)
         }
     }
 
+    // Stage W5m: the spill and the lagoons. A lagoon behind a berm wider than the bridge: sea when the
+    // berm is low (the sea spills over: its level the sea's within what the cells resolve), a basin
+    // behind a high one; a coastal lake at the sea's level (the bake's kept lake, its cells sampled
+    // above sea level) is sea with the lakes' levels.
+    {
+        int Found = -1, FF = 0, FI = 0, FJ = 0;
+        for (int F = 0; F < 6 && Found < 0; F++)
+            for (int J = 8; J < N - 8 && Found < 0; J++)
+                for (int I = 8; I < N - 16 && Found < 0; I++)
+                {
+                    bool bOk = Height[size_t(Index(F, I, J))] < -20.0f && (Attr[size_t(Index(F, I, J))] & 0x800) != 0;
+                    for (int k = 1; k <= 9 && bOk; k++)
+                        for (int r = 0; r <= 1 && bOk; r++)
+                            bOk = Height[size_t(Index(F, I + k, J + r))] > 1.0f;
+                    if (bOk) { Found = 1; FF = F; FI = I; FJ = J; }
+                }
+        if (Found > 0)
+        {
+            // A berm of five cells (past the bridge's three) east of the sea cell, the lagoon behind
+            // it three cells long; the rows either side stay land.
+            auto Lagoon = [&](float Berm, float Bed) {
+                std::vector<float> H = Height;
+                // (Walled round: the rows either side and the cell past it high, so only the berm joins it.)
+                for (int k = 1; k <= 9; k++) { H[size_t(Index(FF, FI + k, FJ - 1))] = 50.0f; H[size_t(Index(FF, FI + k, FJ + 2))] = 50.0f; }
+                for (int r = 0; r <= 1; r++) H[size_t(Index(FF, FI + 9, FJ + r))] = 50.0f;
+                for (int r = 0; r <= 1; r++)
+                {
+                    for (int k = 1; k <= 5; k++) H[size_t(Index(FF, FI + k, FJ + r))] = Berm;
+                    for (int k = 6; k <= 8; k++) H[size_t(Index(FF, FI + k, FJ + r))] = Bed;
+                }
+                return H;
+            };
+            auto SeaAt = [&](const std::vector<float>& H, const float* Water, int I) {
+                std::vector<uint16_t> A(size_t(Count), 0);
+                VoxelLandSea::Mark(N, Pad, H.data(), A.data(), 0x800, 0.02, 3, Water);
+                return (A[size_t(Index(FF, I, FJ))] & 0x800) != 0;
+            };
+            const std::vector<float> Low = Lagoon(2.0f, -4.0f), High = Lagoon(20.0f, -4.0f);
+            const bool bLow = SeaAt(Low, nullptr, FI + 7), bHigh = SeaAt(High, nullptr, FI + 7);
+            std::printf("  a lagoon behind five cells of berm: %s at 2 m, %s at 20 m\n", bLow ? "sea" : "a basin", bHigh ? "sea" : "a basin");
+            Check(bLow && !bHigh, "a lagoon behind a low berm is sea (the spill), behind a high one a basin", bLow && !bHigh ? 0 : 1, 0);
+            // The coastal lake: its cells sampled at 1 m, the bake's lake level 1.5 m, behind the low berm.
+            const std::vector<float> Lake = Lagoon(2.0f, 1.0f);
+            std::vector<float> Water(size_t(Count), -3.0e38f);
+            for (int r = 0; r <= 1; r++)
+                for (int k = 6; k <= 8; k++) Water[size_t(Index(FF, FI + k, FJ + r))] = 1.5f;
+            const bool bWithout = SeaAt(Lake, nullptr, FI + 7), bWith = SeaAt(Lake, Water.data(), FI + 7);
+            std::vector<float> WaterHigh = Water;
+            for (float& W : WaterHigh) if (W > -1.0e30f) W = 25.0f;
+            const bool bHighLake = SeaAt(Lake, WaterHigh.data(), FI + 7);
+            std::printf("  a coastal lake at 1.5 m (its cells at 1 m): %s without the lakes' levels, %s with them; a lake at 25 m: %s\n",
+                bWithout ? "sea" : "land", bWith ? "sea" : "land", bHighLake ? "sea" : "land");
+            Check(!bWithout && bWith && !bHighLake, "a lake at the sea's level next to it is sea (a lagoon), a higher lake not", (!bWithout && bWith && !bHighLake) ? 0 : 1, 0);
+        }
+        else
+        {
+            Check(false, "found a coast for the lagoon test", 0, 1);
+        }
+    }
+
     // -----------------------------------------------------------------------------------------
     std::printf("\n2. The field's build (the shared passes, on the CPU)\n");
     const auto T1 = std::chrono::steady_clock::now();

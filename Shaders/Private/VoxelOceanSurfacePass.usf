@@ -34,6 +34,9 @@
 // and this share of the distance (the depth's precision falling with it).
 #define VOXEL_OCEAN_SURFACE_EDGE_FADE 10.0f
 #define VOXEL_OCEAN_SURFACE_EDGE_FADE_PER_CM 0.002f
+// Stage W6j: the fade's width (cm) where the sea is opaque (SurfaceFar.x): the waterline only (the
+// share of the distance above grew to kilometres from altitude, and the bed showed through it).
+#define VOXEL_OCEAN_SURFACE_EDGE_FAR 300.0f
 
 #ifndef VOXEL_OCEAN_SURFACE_VELOCITY
 #define VOXEL_OCEAN_SURFACE_VELOCITY 0
@@ -160,6 +163,8 @@ float4 SurfaceGodotWater;
 // then), z the thickness it is solid from (0.6 until then); stage W6d: w the footprint (cm) by which
 // Godot's water light has handed over to ours (0: never).
 float4 SurfaceFoamLook;
+// Stage W6j: x the footprint (cm) by which the sea is opaque (0: never).
+float4 SurfaceFar;
 // The foam's texture set (stage W3g; VoxelOceanFoamTex.ush), its quantiles' table, and x: 1 / its
 // tile (1/m), y: its mips, z: on (else the procedural lace), w: the foam's softness (stage W3t: 1 its
 // smooth density, 0 its texture's cover).
@@ -291,6 +296,17 @@ void SurfacePS(float4 SvPosition : SV_POSITION,
     float4 FoamParts = float4(0.0f, 0.0f, 0.0f, 0.0f);
     float FoamSpacing = 0.0f;
     float4 FoamParts2 = float4(0.0f, 0.0f, 0.0f, 0.0f);
+    // Stage W8a: the pixel's sea state, looked up once for the far foam, the crest glow and the
+    // contact's surge (each looked it up again).
+    const int PixelN = max(int(W.FFT.y), 1);
+    const float3 PixelUpP = VoxelOceanRotateBack(W.Rotation, Up);
+    bool bPixelSea = false;
+    FVoxelOceanSeaState PixelSea;
+    PixelSea.Long = float3(0.0f, 0.0f, 0.0f);
+    PixelSea.Short2 = 0.0f;
+    PixelSea.Short3 = 0.0f;
+    PixelSea.Wind = 0.0f;
+    PixelSea.Swell = 0.0f;
     if (SurfaceClipOn != 0u)
     {
         // The clipmap's normal with the FFT's detail, its foam and whitecaps; near the camera the
@@ -317,17 +333,39 @@ void SurfacePS(float4 SvPosition : SV_POSITION,
         float WhitecapHere = C.Whitecap;
         if (C.Cover < 1.0f && W.FFT.x > 0.5f && SurfaceShading.z > 0.5f && !bFoamDebug)
         {
-            const float2 Far = VoxelOceanFFTFoamFar(VoxelOceanRotateBack(W.Rotation, Up), W, SurfaceCharts);
+            if (!bPixelSea) { PixelSea = VoxelOceanSeaStateAt(SurfaceCharts, PixelUpP, PixelN, W.Shape.y); bPixelSea = true; }
+            const float2 Far = VoxelOceanFFTFoamFarOf(PixelSea, W, SurfaceCharts);
             FoamHere += (1.0f - C.Cover) * Far.x;
             WhitecapHere += (1.0f - C.Cover) * Far.y;
         }
         Foam = FoamHere * FoamFar;
         Whitecap = WhitecapHere * FoamFar;
+        // Stage W6f part 2: no level holds the point at all (the clipmap has none this frame):
+        // the sea state's whole roughness, as the coarsest texels carry it.
+        if (C.Valid < 0.5f && C.SlopeVariance <= 0.0f && W.FFT.x > 0.5f)
+        {
+            if (!bPixelSea) { PixelSea = VoxelOceanSeaStateAt(SurfaceCharts, PixelUpP, PixelN, W.Shape.y); bPixelSea = true; }
+            SlopeVariance = VoxelOceanFFTSlopeVarianceFar(PixelSea, W, SurfaceCharts);
+        }
         Height = C.Height;
         FoamOwn = C.Own;
         FoamParts = C.Parts;
         FoamSpacing = C.Spacing;
         FoamParts2 = C.Parts2;
+    }
+    else if (W.FFT.x > 0.5f)
+    {
+        // Stage W6f part 2: THE CLIPMAP OFF (from high up, or turned off): the sea state's statistics,
+        // its whole roughness and its foam, as past the clipmap's reach (W6e).
+        if (!bPixelSea) { PixelSea = VoxelOceanSeaStateAt(SurfaceCharts, PixelUpP, PixelN, W.Shape.y); bPixelSea = true; }
+        SlopeVariance = VoxelOceanFFTSlopeVarianceFar(PixelSea, W, SurfaceCharts);
+        if (SurfaceShading.z > 0.5f)
+        {
+            const float2 Far = VoxelOceanFFTFoamFarOf(PixelSea, W, SurfaceCharts);
+            const float FoamFar = SurfaceFilter.z > 0.0f ? 1.0f - smoothstep(SurfaceFilter.y, SurfaceFilter.z, length(Rel)) : 1.0f;
+            Foam = Far.x * FoamFar;
+            Whitecap = Far.y * FoamFar;
+        }
     }
     const float3 V = normalize(-Rel);
     // A resolved normal facing away from the eye (a wave's back seen at grazing) is turned just
@@ -351,12 +389,14 @@ void SurfacePS(float4 SvPosition : SV_POSITION,
     const float3 SkyIrradiance = VOXEL_OCEAN_SHADING_PI * (0.2f * SkyHorizon + 0.8f * SkyZenith);
 
     // -- What the surface reflects ---------------------------------------------------------------
-    float3 R = reflect(-V, N);
-    // (A ray reflected into the sea by a steep slope would meet the next wave: the sky above.)
-    R = R - Up * (2.0f * min(dot(R, Up), 0.0f));
-    const float Fresnel = VoxelOceanMeanFresnel(dot(V, N), sqrt(S2));
+    // Stage W6c: the sky as the slopes the eye sees reflect it (each facet's own mirror direction,
+    // Fresnel factor and Smith's masking; VoxelOceanSkyReflectionOf), and their mean Fresnel factor
+    // for what passes into the water. Until W6c: the sky along N's reflection (folded up where it
+    // went into the sea) times the fitted mean Fresnel, 20 to 50% too bright at the limb (far_check).
+    const FVoxelOceanSkyReflection Sky = VoxelOceanSkyReflectionOf(V, N, Up, Tx, Ty, S2, S2, SkyZenith, SkyHorizon);
+    const float Fresnel = Sky.Fresnel;
     const float Glint = SunAbove * min(VoxelOceanGlint(L, V, N, Tx, Ty, S2, S2), 1000.0f);
-    const float3 Reflected = VoxelOceanStandInSky(R, Up, SkyZenith, SkyHorizon) * Fresnel + SurfaceSunIlluminance * Glint;
+    const float3 Reflected = Sky.Radiance + SurfaceSunIlluminance * Glint;
 
     // -- What comes up through it --------------------------------------------------------------
     const float Eta = 1.0f / VOXEL_OCEAN_WATER_IOR;
@@ -377,10 +417,16 @@ void SurfacePS(float4 SvPosition : SV_POSITION,
     const float PreExposure = max(View.PreExposure, 1.0e-10f);
     const int2 Pixel = clamp(int2(SvPosition.xy) - int2(SurfaceViewMin), int2(0, 0), int2(SurfaceViewSize) - 1);
     const float2 ViewSize = float2(SurfaceViewSize);
+    // Stage W6j: THE FAR SEA IS OPAQUE. From a quarter of SurfaceFar.x's footprint to all of it
+    // (smoothly in the log) the bed is no longer looked for: the water is deep, its own light the
+    // colour. From altitude the depth behind the water is the terrain's far mesh, which follows the
+    // bed too loosely to see through: the terrain bled through in blobs.
+    const float Opaque = SurfaceFar.x > 0.0f
+        ? smoothstep(log2(SurfaceFar.x) - 2.0f, log2(SurfaceFar.x), log2(max(Footprint, 1.0e-3f))) : 0.0f;
     float Path = -1.0f;
     float3 Bed = float3(0.0f, 0.0f, 0.0f);
     const float Depth0 = SurfaceBehindDepth.Load(int3(Pixel, 0));
-    if (Depth0 > 0.0f)
+    if (Depth0 > 0.0f && Opaque < 1.0f)
     {
         const float3 P0 = VoxelOceanSurfaceRelOf((float2(Pixel) + 0.5f) / ViewSize, Depth0);
         float Z = max(dot(Rel - P0, Up), 0.0f);
@@ -409,19 +455,34 @@ void SurfacePS(float4 SvPosition : SV_POSITION,
         // The bed as lit in air, its light into the water past the surface's reflection.
         Bed = SurfaceBehindColor.Load(int3(BedPixel, 0)).rgb * ((1.0f - VoxelOceanFresnel(SunUp)) / PreExposure);
     }
-    const float3 Body = float3(
+    float3 Body = float3(
         VoxelOceanWaterBody(SurfaceScattering.x, SurfaceExtinction.x, Path, MuView, MuSun, SunPhase, SunWater.x, SkyWater.x, Bed.x),
         VoxelOceanWaterBody(SurfaceScattering.y, SurfaceExtinction.y, Path, MuView, MuSun, SunPhase, SunWater.y, SkyWater.y, Bed.y),
         VoxelOceanWaterBody(SurfaceScattering.z, SurfaceExtinction.z, Path, MuView, MuSun, SunPhase, SunWater.z, SkyWater.z, Bed.z));
+    // (Stage W6j: toward the deep water's as the sea turns opaque.)
+    if (Opaque > 0.0f && Path >= 0.0f)
+    {
+        const float3 Deep = float3(
+            VoxelOceanWaterBody(SurfaceScattering.x, SurfaceExtinction.x, -1.0f, MuView, MuSun, SunPhase, SunWater.x, SkyWater.x, 0.0f),
+            VoxelOceanWaterBody(SurfaceScattering.y, SurfaceExtinction.y, -1.0f, MuView, MuSun, SunPhase, SunWater.y, SkyWater.y, 0.0f),
+            VoxelOceanWaterBody(SurfaceScattering.z, SurfaceExtinction.z, -1.0f, MuView, MuSun, SunPhase, SunWater.z, SkyWater.z, 0.0f));
+        Body = lerp(Body, Deep, Opaque);
+    }
     // The light through a thin crest (stage W3h; VoxelOceanCrestGlow): the sun behind a wave, through
     // its crest toward the eye. The crest's thickness by its height over the mean (in the sea's own
     // height deviation, from the point's sea state) and its slope.
+    // Stage W6d: Godot's light's share by the footprint (below).
+    const float GodotFade = SurfaceFoamLook.w > 0.0f
+        ? 1.0f - smoothstep(log2(SurfaceFoamLook.w) - 4.0f, log2(SurfaceFoamLook.w), log2(max(Footprint, 1.0e-3f))) : 1.0f;
+    const float GodotShare = SurfaceGodotWater.w * GodotFade;
+    // (Stage W6i: where Godot's light takes the water's whole share our crest glow cancels out of
+    // the colour exactly: not computed then, but for voxel.Ocean.DebugShade 4, which shows it.)
+    const bool bOursSeen = GodotShare < 1.0f || int(SurfaceFilter.w + 0.5f) == 4;
     float3 Glow = float3(0.0f, 0.0f, 0.0f);
-    if (SurfaceCrest.x > 0.0f && SunAbove > 0.0f && Height > 0.0f && W.FFT.x > 0.5f)
+    if (bOursSeen && SurfaceCrest.x > 0.0f && SunAbove > 0.0f && Height > 0.0f && W.FFT.x > 0.5f)
     {
-        const int NC = max(int(W.FFT.y), 1);
-        const float3 UpP = VoxelOceanRotateBack(W.Rotation, Up);
-        const float4 Sigma = VoxelOceanFFTBandSigma(VoxelOceanSeaStateAt(SurfaceCharts, UpP, NC, W.Shape.y), SurfaceCharts, NC);
+        if (!bPixelSea) { PixelSea = VoxelOceanSeaStateAt(SurfaceCharts, PixelUpP, PixelN, W.Shape.y); bPixelSea = true; }
+        const float4 Sigma = VoxelOceanFFTBandSigma(PixelSea, SurfaceCharts, PixelN);
         const float SigmaH = 100.0f * sqrt(max(dot(Sigma, Sigma), 1.0e-8f));
         const float Rise = saturate(Height / (VOXEL_OCEAN_SURFACE_CREST_HEIGHT * SigmaH));
         const float Slope = saturate(sqrt(max(1.0f - dot(N, Up) * dot(N, Up), 0.0f)) / VOXEL_OCEAN_SURFACE_CREST_SLOPE);
@@ -451,12 +512,9 @@ void SurfacePS(float4 SvPosition : SV_POSITION,
     // them); a half Lambert; the sky's light as ambient. Tinted by its water colour, past the
     // surface's reflection. (Godot's light colour carries pi: its terms are radiance per its
     // irradiance.)
-    // Stage W6d: Godot's light by the footprint, handing over to ours over the four octaves under
-    // SurfaceFoamLook.w (a near-field look: from afar about 5.5 times a deep sea's water-leaving
-    // light, far_check; Design/DistantOcean.md).
-    const float GodotFade = SurfaceFoamLook.w > 0.0f
-        ? 1.0f - smoothstep(log2(SurfaceFoamLook.w) - 4.0f, log2(SurfaceFoamLook.w), log2(max(Footprint, 1.0e-3f))) : 1.0f;
-    const float GodotShare = SurfaceGodotWater.w * GodotFade;
+    // Stage W6d: Godot's light by the footprint (GodotShare, above), handing over to ours over the
+    // four octaves under SurfaceFoamLook.w (a near-field look: from afar about 5.5 times a deep sea's
+    // water-leaving light, far_check; Design/DistantOcean.md).
     if (GodotShare > 0.0f)
     {
         const float NV = max(dot(N, V), 2.0e-5f);
@@ -510,8 +568,8 @@ void SurfacePS(float4 SvPosition : SV_POSITION,
             float Surge = 0.5f;
             if (W.FFT.x > 0.5f)
             {
-                const int NS = max(int(W.FFT.y), 1);
-                const float4 SigmaS = VoxelOceanFFTBandSigma(VoxelOceanSeaStateAt(SurfaceCharts, VoxelOceanRotateBack(W.Rotation, Up), NS, W.Shape.y), SurfaceCharts, NS);
+                if (!bPixelSea) { PixelSea = VoxelOceanSeaStateAt(SurfaceCharts, PixelUpP, PixelN, W.Shape.y); bPixelSea = true; }
+                const float4 SigmaS = VoxelOceanFFTBandSigma(PixelSea, SurfaceCharts, PixelN);
                 const float SigmaHS = 100.0f * sqrt(max(dot(SigmaS, SigmaS), 1.0e-8f));
                 Surge = saturate(0.5f + Height / (3.0f * SigmaHS));
             }
@@ -535,7 +593,12 @@ void SurfacePS(float4 SvPosition : SV_POSITION,
     Lace.Layer1 = 0.0f;
     Lace.Layer2 = 0.0f;
     Lace.Thick = 0.5f;
-    if (bFoam && (Foam > 0.0f || Whitecap > 0.0f))
+    // (Stage W6i: fully soft foam, FoamSoftness 1 (the default), replaces the structure's density,
+    // whitecap layer and thickness with the smooth density's below and never reads its other layers
+    // but in the foam's debug views 2 and 3: the foam set's or the lace's lookups skipped then.)
+    const int DebugFoamView = int(SurfaceShading.w + 0.5f);
+    const bool bFoamStructure = SurfaceFoamInfo.w < 1.0f || DebugFoamView == 2 || DebugFoamView == 3;
+    if (bFoam && bFoamStructure && (Foam > 0.0f || Whitecap > 0.0f))
     {
         if (SurfaceFoamInfo.z > 0.5f)
             Lace = VoxelOceanPixelFoamTexOf(SamplePoint, Footprint, saturate(Foam), Whitecap, W, SurfaceCharts, SurfaceFoamSet, SurfaceFoamSampler, SurfaceFoamTable,
@@ -572,7 +635,7 @@ void SurfacePS(float4 SvPosition : SV_POSITION,
         const float Gaps = lerp(VOXEL_OCEAN_SURFACE_FOAM_GAPS, 1.0f, Lace.Thick);
         const float3 SetLight = SurfaceFoamAlbedo * (SurfaceSunIlluminance * (SunAbove * Wrap) + SkyIrradiance * Gaps) * (1.0f / VOXEL_OCEAN_SHADING_PI);
         const float3 FlatLight = SurfaceFoamAlbedo * (SurfaceSunIlluminance * (SunAbove * saturate(SunUp)) + SkyIrradiance) * (1.0f / VOXEL_OCEAN_SHADING_PI);
-        const float3 Sheen = VoxelOceanStandInSky(R, Up, SkyZenith, SkyHorizon) * Fresnel;
+        const float3 Sheen = Sky.Radiance;
         const float3 FoamLight = lerp(SetLight, FlatLight * (1.0f - Fresnel) + Sheen, Soft);
         // The milky water under it (stage W3g): by the density, where the foam itself doesn't cover.
         Color = lerp(Color, FoamLight, (1.0f - Soft) * VOXEL_OCEAN_SURFACE_FOAM_HAZE * saturate(Foam) * (1.0f - Lace.Foam));
@@ -658,7 +721,9 @@ void SurfacePS(float4 SvPosition : SV_POSITION,
         const float3 Behind0 = VoxelOceanSurfaceRelOf((float2(Pixel) + 0.5f) / ViewSize, Depth0);
         const float Distance = length(Rel);
         const float Thick = length(Behind0) - Distance;
-        EdgeFade = saturate(Thick / max(VOXEL_OCEAN_SURFACE_EDGE_FADE, VOXEL_OCEAN_SURFACE_EDGE_FADE_PER_CM * Distance));
+        // (Stage W6j: narrowing to the waterline's own width as the sea turns opaque.)
+        const float Width = max(VOXEL_OCEAN_SURFACE_EDGE_FADE, VOXEL_OCEAN_SURFACE_EDGE_FADE_PER_CM * Distance);
+        EdgeFade = saturate(Thick / lerp(Width, min(Width, VOXEL_OCEAN_SURFACE_EDGE_FAR), Opaque));
     }
     // (White, or with voxel.Debug.LevelColor the rings' level.)
     OutColor = float4(lerp(SurfaceBehindColor.Load(int3(Pixel, 0)).rgb, Color * Tint * PreExposure, EdgeFade), 1.0f);

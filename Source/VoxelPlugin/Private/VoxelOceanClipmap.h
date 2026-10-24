@@ -92,6 +92,9 @@ namespace VoxelOceanClipmap
         FVector2D CameraPlane = FVector2D::ZeroVector;  // its plane coordinates (cm)
         double CameraAlong = 0.0;              // Camera . A (cm)
         double CameraHeight = 0.0;             // |Camera| - S (cm)
+        /** Stage W6f: the coarsest level stops short of the cover (the plane's 60 degrees bound
+         *  it: from orbit, its square shows on the globe). */
+        bool bPlaneLimited = false;
         FLevel Levels[MaxLevels];
 
         bool IsValid() const { return Plane.IsValid() && Size > 0 && Count > 0; }
@@ -238,6 +241,7 @@ namespace VoxelOceanClipmap
             if (0.5 * Out.Size * T >= Cover) break;
         }
         Out.Count = Count;
+        Out.bPlaneLimited = Count > 0 && 0.5 * Out.Size * Out.Levels[Count - 1].Spacing < Cover && Count < MaxCount;
         // New levels take the free slots.
         for (int32 i = 0; i < Out.Count; i++)
         {

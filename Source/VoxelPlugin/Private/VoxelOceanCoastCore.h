@@ -15,6 +15,16 @@
 // the swash finds a phase up the beach that continues its shoreline's, and the interpolation
 // near the shoreline sees no corner. Cells no ray reaches (cut off within the tiles) are untrusted.
 //
+// THE WINDOW (stage W7a). A planet's every coast at fine cells is tens of millions of cells (40
+// million and half a minute on a 1,000 km planet), so by default the field covers only the coasts
+// round the camera: the tiles within WindowRadius + WindowFade (the cover's ramp, applied by the
+// shaders: VoxelOceanCoastWindowCover) + 1.25 WindowMove (the camera's travel before the next
+// window) + the halo. The halo makes the window's values those of the whole planet's solve: a
+// point's first arrival comes from sources within the reach of it (deep water, or water past
+// Reach), so cutting the grid a halo past the cover changes no value the cover shows (coast_check
+// measures it). The window's cut is closed (no sources there), unlike the tiles' edge toward the
+// open sea. WindowRadius 0: the whole planet, as before.
+//
 // Plain C++ (std containers, no engine types): the plugin (VoxelOceanCoastField.cpp) and the
 // harness (Tools/OceanHarness/coast_check.cpp).
 
@@ -56,13 +66,38 @@ namespace VoxelOceanCoastCore
         /** The fine cells sampled and solved at most (the solve's time and memory: about 3 us and
          *  25 bytes a cell on a large planet). */
         double MaxCells = 40.0e6;
+        /** Stage W7a: the window round the camera (m: the full cover's radius; 0: the whole
+         *  planet), the cover's ramp past it, the camera's travel before the next window, the halo
+         *  past them (0: the larger of Reach and 4 km), the cells' size (m) and their most. */
+        double WindowRadiusM = 16000.0;
+        double WindowFadeM = 8000.0;
+        double WindowMoveM = 4000.0;
+        double WindowHaloM = 0.0;
+        double WindowCellM = 40.0;
+        double WindowMaxCells = 4.0e6;
+        /** The cover's blend from one window to the next, and its fade in (s). */
+        double WindowBlendSeconds = 1.5;
+
+        bool IsWindowed() const { return WindowRadiusM > 0.0; }
+        double HaloM() const { return WindowHaloM > 0.0 ? WindowHaloM : std::max(ReachM, 4000.0); }
+        /** The tiles' radius round the window's centre. */
+        double SolveRadiusM() const { return WindowRadiusM + WindowFadeM + 1.25 * WindowMoveM + HaloM(); }
 
         bool operator==(const FSettings& O) const
         {
             return SeedDepthM == O.SeedDepthM && ReachM == O.ReachM && LandReachM == O.LandReachM && LowLandM == O.LowLandM && BudgetBytes == O.BudgetBytes
-                && MinCellM == O.MinCellM && MaxCellM == O.MaxCellM && MaxR == O.MaxR && MaxCells == O.MaxCells;
+                && MinCellM == O.MinCellM && MaxCellM == O.MaxCellM && MaxR == O.MaxR && MaxCells == O.MaxCells
+                && WindowRadiusM == O.WindowRadiusM && WindowFadeM == O.WindowFadeM && WindowMoveM == O.WindowMoveM && WindowHaloM == O.WindowHaloM
+                && WindowCellM == O.WindowCellM && WindowMaxCells == O.WindowMaxCells && WindowBlendSeconds == O.WindowBlendSeconds;
         }
         bool operator!=(const FSettings& O) const { return !(*this == O); }
+    };
+
+    /** Stage W7a: the window's centre (planet frame, unit), when the settings ask for one. */
+    struct FWindow
+    {
+        bool bOn = false;
+        double Centre[3] = { 0.0, 0.0, 1.0 };
     };
 
     /** A tile: bake cell (I, J) of a face (I, J from -Pad: past a face's edge, an apron tile). */
@@ -96,13 +131,20 @@ namespace VoxelOceanCoastCore
         /** tan(pi/4 s) of the fine cells' centres from -Margin (TanTable[f + Margin]). */
         std::vector<double> TanTable;
         int TanMargin = 0;
+        /** Stage W7a: the window (its centre), the atlas's slices the texture holds for any window
+         *  (the same for every window of these settings: the texture is written in place), and per
+         *  index texel the bake cells the window cut off (a tile's but outside: a closed edge, no
+         *  sources). */
+        FWindow Window;
+        int CapacitySlices = 0;
+        std::vector<uint8_t> Cut;
 
         int FineN() const { return N * R; }
         int CellsPerTile() const { return R * R; }
         size_t InteriorCells() const { return size_t(InteriorTiles) * size_t(R) * size_t(R); }
         int Stride() const { return R + 2 * Apron; }
         /** The coast's texels: the index's 6 slices and the atlas's. */
-        int Slices() const { return 6 + AtlasSlices; }
+        int Slices() const { return 6 + std::max(AtlasSlices, CapacitySlices); }
     };
 
     // ---------------------------------------------------------------------------------------
@@ -189,47 +231,56 @@ namespace VoxelOceanCoastCore
         return (Face * S + J + Pad) * S + I + Pad;
     }
 
+    /** Stage W7a: whether the window cut bake cell (I, J) of a face off (within the faces). */
+    inline bool IsCut(const FPlan& P, int Face, int I, int J)
+    {
+        return !P.Cut.empty() && I >= 0 && J >= 0 && I < P.N && J < P.N && P.Cut[size_t(IndexTexel(P.N, Face, I, J))] != 0;
+    }
+
+    /** The centre direction of bake cell (I, J) of a face (double). */
+    inline void BakeCellDir(int N, int Face, int I, int J, double Out[3])
+    {
+        const double TU = std::tan(0.25 * Pi * (-1.0 + (2.0 * I + 1.0) / double(N)));
+        const double TV = std::tan(0.25 * Pi * (-1.0 + (2.0 * J + 1.0) / double(N)));
+        DirOfTan(Face, TU, TV, Out);
+    }
+
     // ---------------------------------------------------------------------------------------
     // The plan
     // ---------------------------------------------------------------------------------------
 
-    /** The bake cells near a coast and how fine their tiles are. Shore: the shore field's texels
-     *  (VoxelOceanShore.ush, 6 Side^2) and its reach; Height: the land bake's heights (m, the same
-     *  layout).
-     *  - (Stage W5k: tolerant: 2.5 cells, two cells round, a cell whose neighbourhood holds both
-     *    low ground and shallow water, a ring round every one chosen.)
-     *  - A bake cell gets a tile at the coast (within 1.5 cells of it); on the sea side within
-     *    Reach where some water nearby is shallower than 1.5 SeedDepth (the bake's heights are
-     *    cell means: past that no fine cell is near the seed depth); on the land side within
-     *    LandReach where some ground nearby lies below LowLand (a lowland's water).
-     *  - Reach is held a little inside the shore field's own (past it the field's distance is
-     *    capped, and every cell would seem within it).
-     *  - The cells: the finest (largest R) the budget holds, cells of MinCellM to MaxCellM. Where
-     *    even MaxCellM's don't fit, the tiles farthest from the coast are left out until they do
-     *    (TrimmedTiles; the shore's waves fade out there: the field's cover).
-     *  - Apron tiles for the bake's cells up to two past each face's edge, where the cell of the
-     *    face holding them has a tile. */
-    inline FPlan Plan(int N, double RadiusM, const uint32_t* Shore, double ShoreReachM, const float* Height, const FSettings& Settings)
+    /** Stage W7b: the bake cells that want a tile (the plan's candidates: the selection below), with
+     *  their distance from the coast (m; the ring's a cell farther), and the reach as held. The
+     *  same for every window of a shore field and these settings: the builder keeps them. */
+    struct FCoastCell
     {
-        FPlan P;
-        P.N = N;
-        P.RadiusM = RadiusM;
-        P.Settings = Settings;
-        if (N <= 0 || !Shore || !Height || !(RadiusM > 0.0)) return P;
-        const int S = VoxelOceanShoreCore::Side(N);
-        P.BakeCellM = 0.5 * Pi * RadiusM / double(N);
-        const double Cell = P.BakeCellM;
+        float Distance;
+        int Cell;          // (Face N + J) N + I
+    };
+
+    struct FCoastCells
+    {
+        bool bValid = false;
+        double ReachM = 0.0;
+        std::vector<FCoastCell> Cells;
+    };
+
+    inline FCoastCells CoastCells(int N, double RadiusM, const uint32_t* Shore, double ShoreReachM, const float* Height, const FSettings& Settings)
+    {
+        FCoastCells Out;
+        if (N <= 0 || !Shore || !Height || !(RadiusM > 0.0)) return Out;
+        const double Cell = 0.5 * Pi * RadiusM / double(N);
         const double ReachM = std::min(Settings.ReachM, ShoreReachM - 2.0 * Cell);
-        if (!(ReachM > 0.0)) return P;
-        P.Settings.ReachM = ReachM;
+        if (!(ReachM > 0.0)) return Out;
+        Out.ReachM = ReachM;
+        Out.bValid = true;
         auto Distance = [&](int Face, int I, int J)
             {
                 return double(VoxelShader::VoxelOceanShoreUnpack(Shore[size_t(IndexTexel(N, Face, I, J))], float(ShoreReachM)).Distance);
             };
         auto HeightAt = [&](int Face, int I, int J) { return double(Height[size_t(IndexTexel(N, Face, I, J))]); };
         // The interior candidates, nearest the coast first.
-        struct FCandidate { float Distance; int Cell; };
-        std::vector<FCandidate> Candidates;
+        std::vector<FCoastCell>& Candidates = Out.Cells;
         for (int Face = 0; Face < 6; Face++)
             for (int J = 0; J < N; J++)
                 for (int I = 0; I < N; I++)
@@ -259,12 +310,12 @@ namespace VoxelOceanCoastCore
                     if (bCoast || bSea || bLowland || bStraddle)
                         Candidates.push_back({ float(std::fabs(D)), (Face * N + J) * N + I });
                 }
-        if (Candidates.empty()) return P;
+        if (Candidates.empty()) return Out;
         // Stage W5k: a ring of one cell round every candidate (within the faces; the aprons past
         // their edges follow below), after them in the order (a cell farther than its neighbour).
         {
             std::vector<uint8_t> Chosen(size_t(6) * size_t(N) * size_t(N), 0);
-            for (const FCandidate& C : Candidates) Chosen[size_t(C.Cell)] = 1;
+            for (const FCoastCell& C : Candidates) Chosen[size_t(C.Cell)] = 1;
             const size_t Before = Candidates.size();
             for (size_t k = 0; k < Before; k++)
             {
@@ -285,42 +336,122 @@ namespace VoxelOceanCoastCore
                     }
             }
         }
+        return Out;
+    }
+
+    /** The bake cells near a coast and how fine their tiles are. Shore: the shore field's texels
+     *  (VoxelOceanShore.ush, 6 Side^2) and its reach; Height: the land bake's heights (m, the same
+     *  layout).
+     *  - (Stage W5k: tolerant: 2.5 cells, two cells round, a cell whose neighbourhood holds both
+     *    low ground and shallow water, a ring round every one chosen.)
+     *  - A bake cell gets a tile at the coast (within 1.5 cells of it); on the sea side within
+     *    Reach where some water nearby is shallower than 1.5 SeedDepth (the bake's heights are
+     *    cell means: past that no fine cell is near the seed depth); on the land side within
+     *    LandReach where some ground nearby lies below LowLand (a lowland's water).
+     *  - Reach is held a little inside the shore field's own (past it the field's distance is
+     *    capped, and every cell would seem within it).
+     *  - The cells: the finest (largest R) the budget holds, cells of MinCellM to MaxCellM. Where
+     *    even MaxCellM's don't fit, the tiles farthest from the coast are left out until they do
+     *    (TrimmedTiles; the shore's waves fade out there: the field's cover).
+     *  - Apron tiles for the bake's cells up to two past each face's edge, where the cell of the
+     *    face holding them has a tile.
+     *  - Stage W7a, a window (Settings.IsWindowed() and Window.bOn): only the candidates within
+     *    SolveRadiusM of its centre, the nearest first; cells of WindowCellM (R the same for every
+     *    window); at most WindowMaxCells of them (the farthest from the centre left out); the
+     *    atlas's slices for the most tiles any window holds (CapacitySlices); the candidates left
+     *    out marked Cut. */
+    inline FPlan Plan(int N, double RadiusM, const uint32_t* Shore, double ShoreReachM, const float* Height, const FSettings& Settings,
+        const FWindow& Window = FWindow(), const FCoastCells* Cached = nullptr)
+    {
+        FPlan P;
+        P.N = N;
+        P.RadiusM = RadiusM;
+        P.Settings = Settings;
+        const bool bWindow = Settings.IsWindowed() && Window.bOn;
+        P.Window = Window;
+        P.Window.bOn = bWindow;
+        if (N <= 0 || !Shore || !Height || !(RadiusM > 0.0)) return P;
+        const int S = VoxelOceanShoreCore::Side(N);
+        P.BakeCellM = 0.5 * Pi * RadiusM / double(N);
+        const double Cell = P.BakeCellM;
+        const double ReachM = std::min(Settings.ReachM, ShoreReachM - 2.0 * Cell);
+        if (!(ReachM > 0.0)) return P;
+        P.Settings.ReachM = ReachM;
+        // The interior candidates, nearest the coast first (stage W7b: as kept, or made now).
+        FCoastCells Made;
+        if (!Cached) Made = CoastCells(N, RadiusM, Shore, ShoreReachM, Height, Settings);
+        const FCoastCells& Cells = Cached ? *Cached : Made;
+        if (!Cells.bValid || Cells.Cells.empty()) return P;
+        using FCandidate = FCoastCell;
+        std::vector<FCandidate> Candidates = Cells.Cells;
+        // Stage W7a: the window's candidates, by their distance from its centre (the rest are cut).
+        std::vector<FCandidate> All;
+        if (bWindow)
+        {
+            All = Candidates;
+            Candidates.clear();
+            const double Limit = Settings.SolveRadiusM() + Cell;
+            for (const FCandidate& C : All)
+            {
+                const int Face = C.Cell / (N * N), J = (C.Cell / N) % N, I = C.Cell % N;
+                double D[3];
+                BakeCellDir(N, Face, I, J, D);
+                const double Chord = std::sqrt((D[0] - Window.Centre[0]) * (D[0] - Window.Centre[0]) + (D[1] - Window.Centre[1]) * (D[1] - Window.Centre[1])
+                    + (D[2] - Window.Centre[2]) * (D[2] - Window.Centre[2]));
+                const double Along = RadiusM * 2.0 * std::asin(std::min(0.5 * Chord, 1.0));
+                if (Along <= Limit) Candidates.push_back({ float(Along), C.Cell });
+            }
+        }
         std::stable_sort(Candidates.begin(), Candidates.end(), [](const FCandidate& A, const FCandidate& B) { return A.Distance < B.Distance; });
         std::vector<uint8_t> Selected(size_t(6) * size_t(N) * size_t(N), 0);
         // The tiles of the first Count candidates.
+        // (Stage W7b: sparse, the selected cells and the index's texels set undone one by one: a
+        // window's plan touches its own cells, not the planet's.)
+        std::vector<int> Picked;
+        std::vector<int> Indexed;
+        P.TileOf.assign(size_t(6) * size_t(S) * size_t(S), -1);
+        auto AddTile = [&](int Face, int I, int J)
+            {
+                const int X = IndexTexel(N, Face, I, J);
+                P.TileOf[size_t(X)] = int(P.Tiles.size());
+                Indexed.push_back(X);
+                FTile T;
+                T.Face = Face;
+                T.I = I;
+                T.J = J;
+                P.Tiles.push_back(T);
+            };
         auto Build = [&](size_t Count)
             {
-                std::fill(Selected.begin(), Selected.end(), uint8_t(0));
-                for (size_t k = 0; k < Count; k++) Selected[size_t(Candidates[k].Cell)] = 1;
+                for (int c : Picked) Selected[size_t(c)] = 0;
+                for (int X : Indexed) P.TileOf[size_t(X)] = -1;
+                Picked.clear();
+                Indexed.clear();
+                for (size_t k = 0; k < Count; k++)
+                {
+                    Selected[size_t(Candidates[k].Cell)] = 1;
+                    Picked.push_back(Candidates[k].Cell);
+                }
+                // (In the faces' order, as a scan would find them.)
+                std::sort(Picked.begin(), Picked.end());
                 P.Tiles.clear();
-                P.TileOf.assign(size_t(6) * size_t(S) * size_t(S), -1);
-                for (int Face = 0; Face < 6; Face++)
-                    for (int J = 0; J < N; J++)
-                        for (int I = 0; I < N; I++)
-                            if (Selected[(size_t(Face) * N + J) * N + I])
-                            {
-                                P.TileOf[size_t(IndexTexel(N, Face, I, J))] = int(P.Tiles.size());
-                                FTile T;
-                                T.Face = Face;
-                                T.I = I;
-                                T.J = J;
-                                P.Tiles.push_back(T);
-                            }
+                for (int c : Picked) AddTile(c / (N * N), c % N, (c / N) % N);
                 P.InteriorTiles = int(P.Tiles.size());
+                // The aprons: the two cells past each face's edge (their rows and columns only).
                 for (int Face = 0; Face < 6; Face++)
                     for (int J = -2; J < N + 2; J++)
-                        for (int I = -2; I < N + 2; I++)
+                    {
+                        const bool bRow = J < 0 || J >= N;
+                        const int Side[4] = { -2, -1, N, N + 1 };
+                        const int Count1 = bRow ? N + 4 : 4;
+                        for (int k = 0; k < Count1; k++)
                         {
-                            if (I >= 0 && I < N && J >= 0 && J < N) continue;
+                            const int I = bRow ? k - 2 : Side[k];
                             const VoxelShader::FVoxelOceanShoreCell C = VoxelShader::VoxelOceanShoreCellOf(Face, I, J, N);
                             if (!Selected[(size_t(C.Face) * N + C.J) * N + C.I]) continue;
-                            P.TileOf[size_t(IndexTexel(N, Face, I, J))] = int(P.Tiles.size());
-                            FTile T;
-                            T.Face = Face;
-                            T.I = I;
-                            T.J = J;
-                            P.Tiles.push_back(T);
+                            AddTile(Face, I, J);
                         }
+                    }
             };
         // The atlas for R (its bytes; per row, per column and slices out).
         auto Layout = [&](int R, int& PerRow, int& PerColumn, int& Slices)
@@ -341,30 +472,71 @@ namespace VoxelOceanCoastCore
             };
         const int RMin = std::max(1, int(std::ceil(Cell / Settings.MaxCellM)));
         const int RMax = std::max(RMin, std::min(Settings.MaxR, int(std::floor(Cell / Settings.MinCellM))));
-        Build(Candidates.size());
-        if (!Fits(RMin))
-        {
-            // The most tiles that fit at the coarsest cells, nearest the coast first.
-            size_t Lo = 0, Hi = Candidates.size();
-            while (Hi - Lo > 1)
+        // The candidates the window cut off (or that the budget left out), per index texel.
+        auto MarkCut = [&]()
             {
-                const size_t Mid = (Lo + Hi) / 2;
-                Build(Mid);
-                if (Fits(RMin)) Lo = Mid; else Hi = Mid;
+                P.Cut.assign(size_t(6) * size_t(S) * size_t(S), 0);
+                for (const FCandidate& C : All)
+                    if (!Selected[size_t(C.Cell)])
+                    {
+                        const int Face = C.Cell / (N * N), J = (C.Cell / N) % N, I = C.Cell % N;
+                        P.Cut[size_t(IndexTexel(N, Face, I, J))] = 1;
+                    }
+            };
+        if (bWindow)
+        {
+            // Stage W7a: cells of WindowCellM, the same for every window (the texture keeps its
+            // shape and the overlap its values); the most tiles the cells allow.
+            const int RW = std::clamp(int(std::lround(Cell / std::max(Settings.WindowCellM, 1.0))), RMin, RMax);
+            int PerRow = 0, PerColumn = 0, Unused = 0;
+            Layout(RW, PerRow, PerColumn, Unused);
+            const size_t PerSlice = size_t(std::max(PerRow, 0)) * size_t(std::max(PerColumn, 0));
+            if (PerSlice == 0 || Candidates.empty()) { P.Tiles.clear(); P.InteriorTiles = 0; return P; }
+            const size_t MaxInterior = std::max<size_t>(1, size_t(Settings.WindowMaxCells / (double(RW) * double(RW))));
+            // (The aprons past face edges: at most a quarter more, near a cube corner.)
+            const size_t Capacity = std::min(MaxInterior + MaxInterior / 4 + 64, size_t(MaxAtlasSlices) * PerSlice);
+            P.CapacitySlices = int((Capacity + PerSlice - 1) / PerSlice);
+            size_t Count = std::min(Candidates.size(), MaxInterior);
+            Build(Count);
+            while (P.Tiles.size() > Capacity && Count > 1)
+            {
+                Count = Count - std::max<size_t>(1, Count / 20);
+                Build(Count);
             }
-            P.TrimmedTiles = int(Candidates.size() - Lo);
-            Build(Lo);
-            if (Lo == 0 || !Fits(RMin)) { P.Tiles.clear(); P.InteriorTiles = 0; return P; }
-            // The field reaches to the farthest kept (the shaders fade the shore's waves by it).
-            // A kept cell's edge toward a trimmed one can lie up to a cell nearer the coast than
-            // the last kept centre: the reach a cell and a half inside it, so the cells along the
-            // cut are Reach sources (past the cap: untrusted) and the cover fades before the edge.
-            P.Settings.ReachM = std::min(P.Settings.ReachM, std::max(double(Candidates[Lo - 1].Distance) - 1.5 * Cell, 0.0));
+            P.TrimmedTiles = int(Candidates.size() - Count);
+            MarkCut();
+            P.R = RW;
+            Layout(P.R, P.TilesPerRow, P.TilesPerColumn, P.AtlasSlices);
+            // (The texture's: the slices any window may fill.)
+            P.AtlasBytes = double(P.CapacitySlices) * double(S) * double(S) * 4.0;
         }
-        int Chosen = RMin;
-        for (int R = RMin + 1; R <= RMax && Fits(R); R++) Chosen = R;
-        P.R = Chosen;
-        P.AtlasBytes = Layout(P.R, P.TilesPerRow, P.TilesPerColumn, P.AtlasSlices);
+        else
+        {
+            Build(Candidates.size());
+            if (!Fits(RMin))
+            {
+                // The most tiles that fit at the coarsest cells, nearest the coast first.
+                size_t Lo = 0, Hi = Candidates.size();
+                while (Hi - Lo > 1)
+                {
+                    const size_t Mid = (Lo + Hi) / 2;
+                    Build(Mid);
+                    if (Fits(RMin)) Lo = Mid; else Hi = Mid;
+                }
+                P.TrimmedTiles = int(Candidates.size() - Lo);
+                Build(Lo);
+                if (Lo == 0 || !Fits(RMin)) { P.Tiles.clear(); P.InteriorTiles = 0; return P; }
+                // The field reaches to the farthest kept (the shaders fade the shore's waves by it).
+                // A kept cell's edge toward a trimmed one can lie up to a cell nearer the coast than
+                // the last kept centre: the reach a cell and a half inside it, so the cells along the
+                // cut are Reach sources (past the cap: untrusted) and the cover fades before the edge.
+                P.Settings.ReachM = std::min(P.Settings.ReachM, std::max(double(Candidates[Lo - 1].Distance) - 1.5 * Cell, 0.0));
+            }
+            int Chosen = RMin;
+            for (int R = RMin + 1; R <= RMax && Fits(R); R++) Chosen = R;
+            P.R = Chosen;
+            P.AtlasBytes = Layout(P.R, P.TilesPerRow, P.TilesPerColumn, P.AtlasSlices);
+        }
         P.CellM = Cell / double(P.R);
         // The fine cells' tangents, three bake cells past each face edge.
         P.TanMargin = 3 * P.R + 2;
@@ -677,6 +849,8 @@ namespace VoxelOceanCoastCore
                         if (Nb[e] >= 0) continue;
                         const int FI = Id.FI + Step[e][0], FJ = Id.FJ + Step[e][1];
                         const VoxelShader::FVoxelOceanShoreCell BC = VoxelShader::VoxelOceanShoreCellOf(Id.Face, BakeOf(FI, P.R), BakeOf(FJ, P.R), P.N);
+                        // (Stage W7a: not across the window's cut, which is closed.)
+                        if (IsCut(P, BC.Face, BC.I, BC.J)) continue;
                         if (BakeDistance(BC.Face, BC.I, BC.J) > TileDistance) { Past = 0.0; bEdge = true; }
                     }
                 }
@@ -962,6 +1136,22 @@ namespace VoxelOceanCoastCore
             }
         }
         return Out;
+    }
+
+    /** Stage W7a: per face, the index texels the plan's tiles take (x0, y0, x1, y1 inclusive, the
+     *  index's own coordinates, pad included; x0 > x1: none): the texture's index is written again
+     *  there (and where the last window's were) when a window replaces another. */
+    inline void IndexBoxes(const FPlan& P, int Out[6][4])
+    {
+        for (int f = 0; f < 6; f++) { Out[f][0] = Out[f][1] = 1 << 30; Out[f][2] = Out[f][3] = -1; }
+        for (const FTile& T : P.Tiles)
+        {
+            int* B = Out[T.Face];
+            B[0] = std::min(B[0], T.I + Pad);
+            B[1] = std::min(B[1], T.J + Pad);
+            B[2] = std::max(B[2], T.I + Pad);
+            B[3] = std::max(B[3], T.J + Pad);
+        }
     }
 
     /** The layout as the shaders take it (rows 19 and 20 of the chart table's constants; row 21

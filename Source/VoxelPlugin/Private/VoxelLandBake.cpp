@@ -456,7 +456,9 @@ void FVoxelLandBake::BuildSeaConnected()
     SeaRegions = 0;
     BasinRegions = 0;
     if (N <= 0 || Height.Num() != NumCells() || Attr.Num() != NumCells()) return;
-    const VoxelLandSea::FStats Stats = VoxelLandSea::Mark(N, Pad, Height.GetData(), Attr.GetData(), SeaBit, SeaMinShare);
+    // (Stage W5m: with the kept lakes' levels, a lagoon at the sea's level is sea.)
+    const VoxelLandSea::FStats Stats = VoxelLandSea::Mark(N, Pad, Height.GetData(), Attr.GetData(), SeaBit, SeaMinShare, 3,
+        Water.Num() == NumCells() ? Water.GetData() : nullptr, SeaSpillLevel);
     SeaCells = Stats.SeaCells;
     SeaRegions = Stats.SeaRegions;
     BasinRegions = Stats.BasinRegions;

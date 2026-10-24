@@ -392,6 +392,160 @@ int main()
         Check(Slope < 1.5, "falling over a fine cell or more, no step", Slope, 1.5);
     }
 
+    // -----------------------------------------------------------------------------------------
+    std::printf("\n8. The window round the camera (stage W7a): its values the whole coast's, in a fraction of the time\n");
+    {
+        VoxelOceanCoastCore::FSettings W = Settings;
+        W.WindowRadiusM = 16000.0;
+        W.WindowFadeM = 8000.0;
+        W.WindowMoveM = 4000.0;
+        // (COAST_HALO=<m> tries another halo: on this planet's straight shelves even 2 km holds.)
+        W.WindowHaloM = std::getenv("COAST_HALO") ? std::atof(std::getenv("COAST_HALO")) : 0.0;
+        W.WindowCellM = P.CellM;
+        W.WindowMaxCells = 1.0e9;
+        const double Shown = W.WindowRadiusM + W.WindowFadeM + 1.25 * W.WindowMoveM;
+        std::printf("  cover to %.0f km, tiles within %.0f km (halo %.0f km), cells %.1f m\n", (W.WindowRadiusM + W.WindowFadeM) * 1e-3, W.SolveRadiusM() * 1e-3,
+            W.HaloM() * 1e-3, P.CellM);
+        double WorstPlan = 0.0;
+        int KeptSame = 0;
+        const VoxelOceanCoastCore::FCoastCells Kept = VoxelOceanCoastCore::CoastCells(N, RadiusM, Shore.data(), ReachM, Height.data(), W);
+        double WorstA = 0.0, WorstB = 0.0, WorstBelow = 0.0, WorstPhase = 0.0, WorstSampleA = 0.0, WorstSampleCover = 0.0, WorstTime = 0.0;
+        size_t Compared = 0, MostCells = 0;
+        int Windows = 0, BoxesOk = 0, SlicesOk = 0;
+        const double RootK6 = std::sqrt(std::pow(2.0 * 3.14159265358979 / 6.0, 2.0) / 9.81);
+        int FirstSlices = -1;
+        for (int k = 0; k < 8; k++)
+        {
+            // On the coast, and 6 km out (some of them by the island, some across face edges).
+            const double Theta = 0.37 + 0.785 * k;
+            const FDir C = Seaward(Theta, (k % 2) ? 6000.0 : 0.0);
+            VoxelOceanCoastCore::FWindow Win;
+            Win.bOn = true;
+            Win.Centre[0] = C.X; Win.Centre[1] = C.Y; Win.Centre[2] = C.Z;
+            // (Stage W7b: from the coast's cells as the builder keeps them; the same plan as made afresh.)
+            const auto TPlan = std::chrono::steady_clock::now();
+            const VoxelOceanCoastCore::FPlan PW = VoxelOceanCoastCore::Plan(N, RadiusM, Shore.data(), ReachM, Height.data(), W, Win, &Kept);
+            WorstPlan = std::max(WorstPlan, std::chrono::duration<double>(std::chrono::steady_clock::now() - TPlan).count());
+            {
+                const VoxelOceanCoastCore::FPlan Fresh = VoxelOceanCoastCore::Plan(N, RadiusM, Shore.data(), ReachM, Height.data(), W, Win);
+                bool bSame = Fresh.Tiles.size() == PW.Tiles.size() && Fresh.InteriorTiles == PW.InteriorTiles && Fresh.Cut == PW.Cut && Fresh.TileOf == PW.TileOf;
+                for (size_t t = 0; bSame && t < PW.Tiles.size(); t++)
+                    bSame = Fresh.Tiles[t].Face == PW.Tiles[t].Face && Fresh.Tiles[t].I == PW.Tiles[t].I && Fresh.Tiles[t].J == PW.Tiles[t].J;
+                if (bSame) KeptSame++;
+            }
+            if (!PW.bValid) { std::printf("  window %d: no plan\n", k); Fails++; continue; }
+            Windows++;
+            if (FirstSlices < 0) FirstSlices = PW.Slices();
+            if (PW.Slices() == FirstSlices && PW.R == P.R) SlicesOk++;
+            std::vector<float> DW(PW.InteriorCells());
+            for (size_t c = 0; c < DW.size(); c++)
+            {
+                double D[3];
+                VoxelOceanCoastCore::InteriorCellDir(PW, c, D);
+                DW[c] = float(-HeightAt({ D[0], D[1], D[2] }));
+            }
+            const VoxelOceanCoastCore::FSolved VW = VoxelOceanCoastCore::Solve(PW, DW.data(), Shore.data(), ReachM);
+            MostCells = std::max(MostCells, DW.size());
+            WorstTime = std::max(WorstTime, VW.Seconds);
+            // Every cell the cover can show (within the cover's reach of this centre or of a last
+            // one within a move of it), against the whole coast's solve.
+            for (size_t c = 0; c < DW.size(); c++)
+            {
+                const VoxelOceanCoastCore::FCellId Id = VoxelOceanCoastCore::CellIdOf(PW, int64_t(c));
+                double D[3];
+                VoxelOceanCoastCore::FineDir(PW, Id.Face, Id.FI, Id.FJ, D);
+                const double Along = RadiusM * std::acos(std::clamp(D[0] * C.X + D[1] * C.Y + D[2] * C.Z, -1.0, 1.0));
+                if (Along > Shown) continue;
+                const int64_t g = VoxelOceanCoastCore::InteriorCellAt(P, Id.Face, Id.FI, Id.FJ);
+                // (The water, and the beach up to 3 m where the swash runs: deep inland the rays
+                // cross land at the floor's slowness from wherever, and nothing shows them.)
+                if (g < 0 || !V.Trust[size_t(g)] || !(DW[c] > -3.0f)) continue;
+                const double DA = double(VW.A[c]) - double(V.A[size_t(g)]);
+                const double DB = double(VW.B[c]) - double(V.B[size_t(g)]);
+                WorstA = std::max(WorstA, std::abs(DA));
+                WorstB = std::max(WorstB, std::abs(DB));
+                WorstBelow = std::max(WorstBelow, -DA);
+                WorstPhase = std::max(WorstPhase, RootK6 * std::abs(DA));
+                Compared++;
+            }
+            // The index's boxes hold every tile.
+            int Boxes[6][4];
+            VoxelOceanCoastCore::IndexBoxes(PW, Boxes);
+            bool bBoxes = true;
+            for (const VoxelOceanCoastCore::FTile& T : PW.Tiles)
+            {
+                const int* B = Boxes[T.Face];
+                if (T.I + Pad < B[0] || T.I + Pad > B[2] || T.J + Pad < B[1] || T.J + Pad > B[3]) bBoxes = false;
+            }
+            if (bBoxes) BoxesOk++;
+            // The texels, sampled within the full cover, against the whole coast's.
+            const std::vector<uint32_t> CW = VoxelOceanCoastCore::Pack(PW, VW);
+            float WR0[4], WR1[4];
+            VoxelOceanCoastCore::LayoutRows(PW, WR0, WR1);
+            for (int j = 0; j < 400; j++)
+            {
+                const double Bearing = 0.0157 * j * 37.0, Dist = W.WindowRadiusM * std::sqrt((j % 97) / 97.0);
+                FDir T1 = Norm(Cross(C, { 0.3, 0.4, 0.86 }));
+                FDir T2 = Cross(C, T1);
+                const double A = Dist / RadiusM;
+                const FDir Pt = Norm(Add(Scale(C, std::cos(A)), Scale(Add(Scale(T1, std::cos(Bearing)), Scale(T2, std::sin(Bearing))), std::sin(A))));
+                const FVoxelOceanCoastSample G = SampleAt(Pt);
+                const FVoxelOceanCoastSample L = VoxelOceanCoastCore::Sample(Shore.data(), CW.data(), PW.Slices(), N, WR0, WR1, RadiusM, Pt.X, Pt.Y, Pt.Z);
+                if ((G.Cover <= 0.0f && L.Cover <= 0.0f) || HeightAt(Pt) > 3.0) continue;
+                WorstSampleCover = std::max(WorstSampleCover, double(std::abs(G.Cover - L.Cover)));
+                if (G.Cover > 0.5f) WorstSampleA = std::max(WorstSampleA, double(std::abs(G.A - L.A)));
+            }
+        }
+        std::printf("  %d windows, %zu cells compared; the largest window %zu cells (the whole coast %zu), solved in %.2f s (the whole coast %.2f s), planned in %.3f s\n",
+            Windows, Compared, MostCells, Depth.size(), WorstTime, V.Seconds, WorstPlan);
+        std::printf("  the water and the beach: A within %.3g m^1/2 (B %.3g m^3/2; below the whole coast's by %.3g), a 6 s wave's phase within %.3g rad\n", WorstA, WorstB, WorstBelow, WorstPhase);
+        Check(Windows == 8 && Compared > 10000, "every window planned, its shown cells compared", double(Compared), 10000.0);
+        Check(WorstPhase < 1.0e-3, "the shown cells' phase the whole coast's (a 6 s wave)", WorstPhase, 1.0e-3);
+        std::printf("  sampled within the full cover (the water and the beach): A within %.3g m^1/2, the cover within %.3g\n", WorstSampleA, WorstSampleCover);
+        Check(RootK6 * WorstSampleA < 1.0e-3 && WorstSampleCover < 1.0e-3, "the texels sample as the whole coast's within the full cover (a 6 s wave's phase)",
+            std::max(RootK6 * WorstSampleA, WorstSampleCover), 1.0e-3);
+        Check(BoxesOk == Windows, "the index's boxes hold every tile", double(BoxesOk), double(Windows));
+        Check(KeptSame == Windows, "a plan from the kept coast cells is the plan made afresh", double(KeptSame), double(Windows));
+        Check(SlicesOk == Windows, "every window the same texture shape and cells", double(SlicesOk), double(Windows));
+        Check(double(MostCells) < 0.3 * double(Depth.size()), "a window a fraction of the whole coast's cells", double(MostCells) / double(Depth.size()), 0.3);
+    }
+
+    std::printf("\n9. The window's cover (VoxelOceanCoastWindowCover): smooth, and a new window starts where the last one stood\n");
+    {
+        FVoxelOceanCoastLayout L = VoxelOceanCoastLayoutNone();
+        L.RadiusM = float(RadiusM);
+        L.WindowOn = 1.0f;
+        L.Inner = 16000.0f;
+        L.Outer = 24000.0f;
+        const FDir C0 = Seaward(0.37, 0.0);
+        const FDir T1 = Norm(Cross(C0, { 0.3, 0.4, 0.86 }));
+        auto At = [&](double Dist) { const double A = Dist / RadiusM; return Norm(Add(Scale(C0, std::cos(A)), Scale(T1, std::sin(A)))); };
+        const FDir C1 = At(4000.0);
+        auto F3 = [](FDir D) { return float3(float(D.X), float(D.Y), float(D.Z)); };
+        // The last window settled (its own centre both), the next one at blend 0 and 1.
+        FVoxelOceanCoastLayout Last = L;
+        Last.Centre = F3(C0); Last.CentreLast = F3(C0); Last.Blend = 1.0f; Last.Fade = 1.0f;
+        FVoxelOceanCoastLayout Next = L;
+        Next.Centre = F3(C1); Next.CentreLast = F3(C0); Next.Blend = 0.0f; Next.Fade = 1.0f;
+        double WorstSwap = 0.0, WorstStep = 0.0, Inside = 1.0, Outside = 0.0;
+        double Prev = -1.0;
+        for (int k = 0; k <= 4000; k++)
+        {
+            const double Dist = -30000.0 + 15.0 * k;
+            const FDir Pt = At(Dist);
+            const double A = VoxelOceanCoastWindowCover(Last, F3(Pt)), B = VoxelOceanCoastWindowCover(Next, F3(Pt));
+            WorstSwap = std::max(WorstSwap, std::abs(A - B));
+            if (Prev >= 0.0) WorstStep = std::max(WorstStep, std::abs(A - Prev));
+            Prev = A;
+            if (std::abs(Dist) < 15900.0) Inside = std::min(Inside, A);
+            if (std::abs(Dist) > 24100.0) Outside = std::max(Outside, A);
+        }
+        std::printf("  inside %.6f, outside %.6f, steepest %.4f per 15 m, the swap's step %.2g\n", Inside, Outside, WorstStep, WorstSwap);
+        Check(Inside > 0.9999 && Outside < 1.0e-4, "full within the radius, none past the fade", std::max(1.0 - Inside, Outside), 1.0e-4);
+        Check(WorstStep < 0.004, "smooth (8 km of fade: under 0.4% per 15 m)", WorstStep, 0.004);
+        Check(WorstSwap < 1.0e-5, "a new window starts with the last one's cover", WorstSwap, 1.0e-5);
+    }
+
     std::printf("\n%s: %d failure(s)\n", Fails ? "FAILED" : "PASSED", Fails);
     return Fails ? 1 : 0;
 }

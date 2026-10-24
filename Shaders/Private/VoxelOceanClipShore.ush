@@ -66,7 +66,8 @@ FVoxelOceanShore VoxelOceanClipShoreOf(FVoxelOceanClipStatic St, float3 UpP, flo
         Shore.Slope = St.S2.x;
         Shore.Coast.A = St.S2.y;
         Shore.Coast.B = St.S2.z;
-        Shore.Coast.Cover = St.S2.w;
+        // (Stage W7a: the layer holds the cover without the window and the fade in.)
+        Shore.Coast.Cover = St.S2.w * VoxelOceanCoastWindowCover(CoastLayout, UpP);
         Shore.Coast.GradA = T1 * St.S3.x + T2 * St.S3.y;
         Shore.Coast.GradB = T1 * St.S3.z + T2 * St.S3.w;
         Shore.CoastSeedM = CoastLayout.SeedDepthM;

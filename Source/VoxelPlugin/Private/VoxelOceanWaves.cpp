@@ -41,6 +41,12 @@ namespace VoxelOceanWavesDetail
     constexpr double BedSea = 6000.0;
     constexpr double BedMinStep = 100.0;
     constexpr double BedMaxFootprint = 100000.0;
+    /** Stage W6h: the terrain's own depth for the felt depth (VoxelOceanSurfFeltDepth): sampled where
+     *  the depth the waves feel lies under this (cm: within the felt depth's blend, 3 m, and on the
+     *  land side), at this footprint (cm: the wave clipmap's finer levels' texels, whose static
+     *  layer holds it for the drawn waves). */
+    constexpr double FeltBelow = 300.0;
+    constexpr double FeltFootprint = 100.0;
 }
 
 namespace VOW = VoxelOceanWavesDetail;
@@ -178,6 +184,7 @@ void FVoxelOceanWaveFrame::FillSites(TArrayView<FVoxelOceanWaveSite> Sites, doub
         Site.Depth = VoxelOceanWaves::Deep;
         Site.BedSlope = VoxelOceanWaves::BedUnknown;
         Site.BedRise = FVector::ZeroVector;
+        Site.BedDepth = VoxelOceanWaves::Deep;
         Site.Shore = FVoxelOceanShore();
         Site.Environment = Context.Environment;
         if (EnumHasAnyFlags(Required, EVoxelOceanWaveInputs::Shore) && Shore.IsValid())
@@ -207,6 +214,30 @@ void FVoxelOceanWaveFrame::FillSites(TArrayView<FVoxelOceanWaveSite> Sites, doub
         Density->Sample(FSampleInput(X.GetData(), Y.GetData(), Z.GetData(), Sites.Num(), Footprint), Values.GetData());
         for (int32 i = 0; i < Sites.Num(); i++)
             Sites[i].Depth = Values[i] - (SeaRadius > 0.0 ? Sites[i].Point.Size() - SeaRadius : 0.0);
+        // Stage W6h: the terrain's own depth where the felt depth can differ from it (the drawn
+        // waves', VoxelOceanSurfFeltDepth: within its blend of the coast, and on the land side,
+        // where the smoothing averaged the high ground behind the beach into the shallows).
+        {
+            TArray<int32> Near;
+            TArray<double> FX, FY, FZ;
+            for (int32 i = 0; i < Sites.Num(); i++)
+            {
+                if (Sites[i].Depth >= VoxelOceanWavesDetail::FeltBelow || Sites[i].Depth <= VoxelOceanWavesDetail::BedLand) continue;
+                Near.Add(i);
+                FX.Add(Sites[i].Point.X);
+                FY.Add(Sites[i].Point.Y);
+                FZ.Add(Sites[i].Point.Z);
+            }
+            if (Near.Num() > 0)
+            {
+                TArray<float> FValues;
+                FValues.SetNumZeroed(Near.Num());
+                Density->Sample(FSampleInput(FX.GetData(), FY.GetData(), FZ.GetData(), Near.Num(), FMath::Min(Footprint, VoxelOceanWavesDetail::FeltFootprint)),
+                    FValues.GetData());
+                for (int32 k = 0; k < Near.Num(); k++)
+                    Sites[Near[k]].BedDepth = FValues[k] - (SeaRadius > 0.0 ? Sites[Near[k]].Point.Size() - SeaRadius : 0.0);
+            }
+        }
         // An inland basin below sea level keeps the terrain's depth (stage O9b3): the model drains
         // the surface below the ground toward it (VoxelOceanSurfDrainOf), as the pages' waves do.
         // The bed's slope (stage O9b2): the depth's fall over the footprint either side along the

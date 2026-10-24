@@ -76,6 +76,10 @@ struct VOXELPLUGIN_API FVoxelLandBake
     /** A below-sea region is sea when it holds at least this share of all the below-sea cells
      *  (the largest one always is): oceans and the seas joined to them, not inland basins. */
     static constexpr double SeaMinShare = 0.02;
+    /** Stage W5m (VoxelLandSea::Mark): a below-sea region the sea reaches through ground no higher
+     *  than this (m), and a kept lake at most this high next to it, is sea (a lagoon behind a berm
+     *  the cells can't resolve). */
+    static constexpr float SeaSpillLevel = 3.0f;
     /** Interior cells with SeaBit, and the below-sea regions found (for the log). */
     int32 SeaCells = 0;
     int32 SeaRegions = 0;

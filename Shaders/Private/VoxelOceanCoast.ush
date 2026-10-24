@@ -47,8 +47,17 @@
 // gradients are tangent at the point (planet frame, per metre); Cover is 1 where the field's
 // values hold (the trust bits, interpolated), 0 outside the tiles.
 //
-// The layout reaches the shaders in rows 19 to 21 of the chart table's constants (written with
+// The layout reaches the shaders in rows 19 to 23 of the chart table's constants (written with
 // the frame, VoxelOceanSeaState.ush), and the CPU from FVoxelOceanCoastField.
+//
+// THE WINDOW (stage W7a; VoxelOceanCoastCore.h): the field covers the coasts round the camera.
+// Its cover (VoxelOceanCoastWindowCover) is 1 within Inner of the window's centre and falls to 0
+// at Outer (smoothly); a new window blends in from the last one's (Blend 0 to 1 over a second or
+// two: the cover the last window's centre gives to the new one's), and a field fades in when it
+// first arrives (Fade). Rows 21 to 23: (radius m, blend, fade, window on), (centre, inner m),
+// (the last centre, outer m), the centres unit vectors in the planet frame. The clipmap's static
+// layer stores the cover without the window and applies it as it reads (VoxelOceanClipShoreOf):
+// the blend and the fade move with time.
 
 #ifndef VOXEL_OCEAN_COAST_USH
 #define VOXEL_OCEAN_COAST_USH
@@ -86,6 +95,15 @@ struct FVoxelOceanCoastLayout
     float SeedDepthM;       // the outer edge's depth (m)
     float ReachM;           // the outer edge's farthest distance (m, the shore field's)
     float RadiusM;          // the sea sphere (m)
+    // Stage W7a: the window (WindowOn 0: the whole planet's field), its cover's radii (m), its
+    // centre and the last window's (planet frame, unit), the blend from that one and the fade in.
+    float WindowOn;
+    float Inner;
+    float Outer;
+    float3 Centre;
+    float3 CentreLast;
+    float Blend;
+    float Fade;
 };
 
 VOXEL_FUNC FVoxelOceanCoastLayout VoxelOceanCoastLayoutNone()
@@ -100,6 +118,13 @@ VOXEL_FUNC FVoxelOceanCoastLayout VoxelOceanCoastLayoutNone()
     L.SeedDepthM = 0.0f;
     L.ReachM = 0.0f;
     L.RadiusM = 1.0f;
+    L.WindowOn = 0.0f;
+    L.Inner = 0.0f;
+    L.Outer = 0.0f;
+    L.Centre = float3(0.0f, 0.0f, 1.0f);
+    L.CentreLast = float3(0.0f, 0.0f, 1.0f);
+    L.Blend = 1.0f;
+    L.Fade = 1.0f;
     return L;
 }
 
@@ -119,6 +144,36 @@ VOXEL_FUNC FVoxelOceanCoastLayout VoxelOceanCoastLayoutFrom(float4 Row0, float4 
     L.ReachM = Row1.w;
     L.RadiusM = RadiusM;
     return L;
+}
+
+// Stage W7a: the window and the fade from rows 21 to 23 (Row2: radius, blend, fade, on; Row3:
+// centre, inner; Row4: the last centre, outer).
+VOXEL_FUNC FVoxelOceanCoastLayout VoxelOceanCoastLayoutWindow(FVoxelOceanCoastLayout L, float4 Row2, float4 Row3, float4 Row4)
+{
+    FVoxelOceanCoastLayout O = L;
+    O.Blend = saturate(Row2.y);
+    O.Fade = saturate(Row2.z);
+    O.WindowOn = Row2.w > 0.5f ? 1.0f : 0.0f;
+    O.Centre = float3(Row3.x, Row3.y, Row3.z);
+    O.Inner = Row3.w;
+    O.CentreLast = float3(Row4.x, Row4.y, Row4.z);
+    O.Outer = max(Row4.w, Row3.w + 1.0f);
+    return O;
+}
+
+// Stage W7a: the cover the window and the fade give a direction (planet frame, unit).
+VOXEL_FUNC float VoxelOceanCoastWindowCover(FVoxelOceanCoastLayout L, float3 Dir)
+{
+    float Spatial = 1.0f;
+    if (L.WindowOn > 0.5f)
+    {
+        const float Here = L.RadiusM * length(Dir - L.Centre);
+        const float Last = L.RadiusM * length(Dir - L.CentreLast);
+        const float CoverHere = 1.0f - smoothstep(L.Inner, L.Outer, Here);
+        const float CoverLast = 1.0f - smoothstep(L.Inner, L.Outer, Last);
+        Spatial = CoverLast + (CoverHere - CoverLast) * L.Blend;
+    }
+    return L.Fade * Spatial;
 }
 
 VOXEL_FUNC int VoxelOceanCoastStride(int R)
@@ -406,8 +461,9 @@ VOXEL_FUNC FVoxelOceanCoastSample VoxelOceanCoastNear(VOXEL_OCEAN_SHORE_PARAM, F
     Sum.B *= Inv;
     Sum.GradA = Sum.GradA * Inv;
     Sum.GradB = Sum.GradB * Inv;
-    // A face without a tile in the blend fades the field out with its weight.
-    Sum.Cover = saturate(Sum.Cover * Inv) * (WeightValid / max(WeightAll, 1.0e-6f));
+    // A face without a tile in the blend fades the field out with its weight; stage W7a: the
+    // window's cover and the fade in.
+    Sum.Cover = saturate(Sum.Cover * Inv) * (WeightValid / max(WeightAll, 1.0e-6f)) * VoxelOceanCoastWindowCover(L, Dir);
     return Sum;
 }
 

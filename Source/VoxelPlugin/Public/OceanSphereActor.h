@@ -185,6 +185,15 @@ public:
     UFUNCTION(BlueprintCallable, Category = "Ocean")
     void SetOceanSettings(const FVoxelOceanSettings& InSettings, bool bInteractive = false);
 
+    /** Stage W6g: the realistic look (FVoxelOceanSettings::ApplyRealisticPreset) for a standalone
+     *  ocean (a planet's: use the planet's). */
+    UFUNCTION(CallInEditor, BlueprintCallable, Category = "Ocean")
+    void OceanPresetRealistic();
+
+    /** Stage W6g: GodotOceanWaves' look, the defaults (ApplyGodotPreset). */
+    UFUNCTION(CallInEditor, BlueprintCallable, Category = "Ocean")
+    void OceanPresetGodot();
+
 private:
     /** Page components attach to this one. It inherits the actor's position and rotation but
      *  uses absolute scale (1, 1, 1): the surface is built at world scale. */
@@ -248,11 +257,32 @@ private:
     /** voxel.Debug.OceanShore: the shore field around the camera. */
     void DrawShoreDebug() const;
 
+public:
+    /** Stage W8a: voxel.Ocean.PerfSweep: the GPU's frame time with each of the ocean's costly
+     *  features off in turn (the camera held still), logged as a table; the settings restored. */
+    void StartPerfSweep(int32 FramesPerStep);
+
+private:
+    struct FPerfSweep
+    {
+        bool bOn = false;
+        FVoxelOceanSettings Original;
+        int32 Step = 0;
+        int32 Frame = 0;
+        int32 Frames = 180;
+        TArray<float> Samples;
+        TArray<float> Results;
+    };
+    FPerfSweep PerfSweep;
+    void TickPerfSweep();
+
     /** The coastal travel-time field (stage O9h; FVoxelOceanCoastField): baked after the shore
      *  field from the terrain (CoastBuilder, the depths sampled on the GPU through the surface),
      *  its texels in ShoreTexture's slices 6 and up once made (the texture made again). None
      *  without a shore field, a renderer, or with bCoastField off. */
     TSharedPtr<FVoxelOceanCoastBuilder> CoastBuilder;
+    /** Stage W7a: the centre (planet frame, unit) of the window last asked of the builder. */
+    FVector3d CoastWindowCentre = FVector3d::ZAxisVector;
     TSharedPtr<const FVoxelOceanCoastField, ESPMode::ThreadSafe> CoastField;
     /** Starts the coastal field's bake when the shore field or its settings changed, and puts it
      *  into the shore texture when done. After the surface's inputs (it samples with them). */

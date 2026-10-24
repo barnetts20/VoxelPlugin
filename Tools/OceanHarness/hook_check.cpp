@@ -459,6 +459,21 @@ int main()
         std::printf("  highest of %d points (half in the storm) %.0f cm against the reach %.0f cm; Evaluate %.1f us per point (frames cached); two new 15 Hz frames %.1f ms in a calm, %.1f ms in the storm (the slots weighed only)\n",
             Count, Highest, Model.MaxHeight(), Us, CalmMs, StormMs);
         Expect(Highest < Model.MaxHeight(), "the waves stay within the model's reach");
+        // Stage W6i: the local reach (MaxHeightAt, the underwater pass's skip test): every point's
+        // waves within its own sea state's reach, and calm seas' reach well under the planet's.
+        double WorstRatio = 0.0, CalmSum = 0.0;
+        int CalmCount = 0, Over = 0;
+        for (int k = 0; k < Count; k++)
+        {
+            const double Local = Model.MaxHeightAt(Context, Sites[k].Point);
+            if (std::fabs(Results[k].Height) > Local) Over++;
+            WorstRatio = std::max(WorstRatio, std::fabs(Results[k].Height) / std::max(Local, 1.0));
+            if (Local < Model.MaxHeight()) { CalmSum += Local; CalmCount++; }
+        }
+        std::printf("  the local reach: the highest wave %.0f%% of its point's; %d of %d points' reach under the planet's (on average %.0f cm against %.0f cm)\n",
+            100.0 * WorstRatio, CalmCount, Count, CalmCount ? CalmSum / CalmCount : 0.0, Model.MaxHeight());
+        Expect(Over == 0, "every point's waves within its own sea state's reach (the underwater skip test, stage W6i)");
+        Expect(CalmCount > Count / 4, "the local reach under the planet's away from the storms");
     }
 
     std::printf("\n%s (%d failures)\n", Failures ? "FAILED" : "ALL OK", Failures);

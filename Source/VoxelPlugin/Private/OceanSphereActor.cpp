@@ -25,6 +25,7 @@
 #include "Materials/MaterialInstanceDynamic.h"
 #include "MaterialDomain.h"
 #include "Misc/App.h"
+#include "HAL/PlatformTime.h"
 #include "Misc/ScopeRWLock.h"
 #include "RenderingThread.h"
 #include "SceneViewExtension.h"
@@ -32,6 +33,8 @@
 #include "Engine/World.h"
 #include "GameFramework/GameStateBase.h"
 #include "HAL/IConsoleManager.h"
+#include "EngineUtils.h"
+#include "RHI.h"
 
 DECLARE_CYCLE_STAT(TEXT("Ocean: actor tick"), STAT_VoxelOceanActorTick, STATGROUP_VoxelTerrain);
 
@@ -285,6 +288,24 @@ void AOceanSphereActor::ApplyOptics()
     SurfaceMaterialInstance->SetScalarParameterValue(PhaseGName, OceanSettings.PhaseG);
 }
 
+void AOceanSphereActor::OceanPresetRealistic()
+{
+    if (bIsPlanetOwned) return;   // (the planet's settings rule it: its own buttons)
+    Modify();
+    FVoxelOceanSettings S = OceanSettings;
+    S.ApplyRealisticPreset();
+    SetOceanSettings(S);
+}
+
+void AOceanSphereActor::OceanPresetGodot()
+{
+    if (bIsPlanetOwned) return;
+    Modify();
+    FVoxelOceanSettings S = OceanSettings;
+    S.ApplyGodotPreset();
+    SetOceanSettings(S);
+}
+
 void AOceanSphereActor::SetOceanSettings(const FVoxelOceanSettings& InSettings, bool bInteractive)
 {
     OceanSettings = InSettings;
@@ -486,6 +507,7 @@ void AOceanSphereActor::UpdateSurfacePass()
     Params.GodotWaterLight = S.GodotWaterLight;
     Params.GodotWaterColor = FVector3f(S.GodotWaterColor.R, S.GodotWaterColor.G, S.GodotWaterColor.B);
     Params.GodotWaterLightFadeM = S.GodotWaterLightFade;
+    Params.FarOpaqueFootprintM = S.FarOpaqueFootprint;
     Params.WhitecapRelief = S.WhitecapRelief;
     Params.IntersectionFoam = S.IntersectionFoam;
     Params.IntersectionFoamWidthM = S.IntersectionFoamWidth;
@@ -735,7 +757,11 @@ void AOceanSphereActor::UpdateShoreField()
     }
     if (!bHave && !ShoreBuilder->IsFor(Bake.Get(), OceanRadius, ReachM))
         ShoreBuilder->Start(Bake, OceanRadius, ReachM);
-    ShoreBuilder->Tick();
+    // (Stage W7d: the terrain's heights at the bake's cells sampled through the surface first.)
+    ShoreBuilder->Tick([this](const TSharedPtr<FVoxelOceanCoastDepthJob, ESPMode::ThreadSafe>& Job, int64 First, int32 Count)
+        {
+            return Surface.IsValid() && Surface->SampleCoastDepths(Job, First, Count);
+        });
     if (!bHave && ShoreBuilder->IsDone() && ShoreBuilder->IsFor(Bake.Get(), OceanRadius, ReachM))
     {
         const TSharedPtr<const FVoxelOceanShoreField, ESPMode::ThreadSafe> Made = ShoreBuilder->GetResult();
@@ -793,22 +819,58 @@ void AOceanSphereActor::UpdateCoastField()
     Settings.SeedDepthM = FMath::Max(S.CoastSeedDepth, 1.0);
     Settings.ReachM = FMath::Max(S.CoastReach, 0.1) * 1000.0;
     Settings.BudgetBytes = FMath::Max(S.CoastMemoryMB, 1.0) * 1024.0 * 1024.0;
+    // Stage W7a: the window round the camera (0: the whole planet's coasts at once).
+    Settings.WindowRadiusM = FMath::Max(S.CoastWindowRadius, 0.0) * 1000.0;
+    Settings.WindowFadeM = FMath::Max(S.CoastWindowFade, 0.1) * 1000.0;
+    Settings.WindowMoveM = FMath::Max(S.CoastWindowMove, 0.1) * 1000.0;
+    Settings.WindowHaloM = FMath::Max(S.CoastWindowHalo, 0.0) * 1000.0;
+    Settings.WindowCellM = FMath::Max(S.CoastWindowCell, 1.0);
+    Settings.WindowMaxCells = FMath::Max(S.CoastWindowCells, 0.1) * 1.0e6;
+    Settings.WindowBlendSeconds = FMath::Max(S.CoastWindowBlend, 0.0);
+    const bool bWindow = Settings.IsWindowed();
+    const double Now = FPlatformTime::Seconds();
+    // The window's centre: the camera's direction (planet frame).
+    const FVector3d CameraDir = bHasCamera && !CameraPosition.IsNearlyZero() ? FVector3d(CameraPosition).GetSafeNormal() : FVector3d::ZAxisVector;
     const bool bHave = CoastField.IsValid() && CoastField->Requested == Settings;
-    if (!bHave && !CoastBuilder->IsFor(ShoreField.Get(), Settings))
-        CoastBuilder->Start(ShoreField, Bake, Settings);
+    if (!CoastBuilder->IsFor(ShoreField.Get(), Settings))
+    {
+        // (A window waits for a camera.)
+        if (!bWindow || bHasCamera)
+        {
+            CoastBuilder->Start(ShoreField, Bake, Settings, CameraDir, bHave ? CoastField : nullptr);
+            CoastWindowCentre = CameraDir;
+        }
+    }
+    else if (bWindow && bHasCamera && CoastBuilder->IsDone() && (!bHave || CoastField->IsSettled(Now))
+        && (CameraDir - CoastWindowCentre).Size() * OceanRadius * 0.01 > Settings.WindowMoveM)
+    {
+        // Stage W7a: moved on from the window's centre: the next window, the field shown until
+        // it's made.
+        CoastBuilder->Start(ShoreField, Bake, Settings, CameraDir, bHave ? CoastField : nullptr);
+        CoastWindowCentre = CameraDir;
+    }
     CoastBuilder->Tick([this](const TSharedPtr<FVoxelOceanCoastDepthJob, ESPMode::ThreadSafe>& Job, int64 First, int32 Count)
         {
             return Surface.IsValid() && Surface->SampleCoastDepths(Job, First, Count);
         });
-    if (!bHave && CoastBuilder->IsDone() && CoastBuilder->IsFor(ShoreField.Get(), Settings))
+    if (CoastBuilder->IsDone() && CoastBuilder->IsFor(ShoreField.Get(), Settings))
     {
         const TSharedPtr<const FVoxelOceanCoastField, ESPMode::ThreadSafe> Made = CoastBuilder->GetResult();
         if (Made.IsValid() && Made != CoastField && Made->Shore == ShoreField)
         {
+            // Stage W7a: a window after a window of the same shape is written into the texture in
+            // place (the pages', the probe's and the underwater view's handle stays; the clipmap's
+            // static layer is written again for the new field: FVoxelOceanDensityInputs::CoastSerial).
+            const bool bInPlace = Made->bWindow && CoastField.IsValid() && CoastField->bWindow && CoastField->Shore == ShoreField
+                && CoastField->Slices == Made->Slices && CoastField->N == Made->N && ShoreTexture && ShoreTexture->GetResource() == ShoreResource
+                && FVoxelOceanCoastField::WriteInto(ShoreTexture.Get(), Made, CoastField.Get());
+            if (!bInPlace)
+            {
+                ShoreTexture = ShoreField->MakeTexture(Made->Texels.data(), Made->Slices);
+                ShoreResource = ShoreTexture ? ShoreTexture->GetResource() : nullptr;
+                ShoreRHI = FVoxelOceanShoreRHI::Make(ShoreTexture.Get(), ShoreField->N, ShoreField->ReachM);
+            }
             CoastField = Made;
-            ShoreTexture = ShoreField->MakeTexture(Made->Texels.data(), Made->Slices);
-            ShoreResource = ShoreTexture ? ShoreTexture->GetResource() : nullptr;
-            ShoreRHI = FVoxelOceanShoreRHI::Make(ShoreTexture.Get(), ShoreField->N, ShoreField->ReachM);
         }
     }
 }
@@ -1031,6 +1093,8 @@ void AOceanSphereActor::InitializeInternal(TSharedPtr<FDensitySampleCompositor> 
     Settings.Clip.FinestCm = OceanSettings.ClipFinestSpacing;
     Settings.Clip.bRings = OceanSettings.bWaveRings;
     Settings.Clip.FarCells = OceanSettings.FarSphereCells;
+    Settings.Clip.RingsMaxHeightCm = FMath::Max(OceanSettings.RingsMaxHeight, 0.0) * 1.0e5;
+    Settings.Clip.ClipMaxHeightCm = FMath::Max(OceanSettings.ClipMaxHeight, 0.0) * 1.0e5;
     Settings.Clip.bOwnPass = OceanSettings.bOwnShading;
     Settings.Material = SurfaceMaterialInstance.Get();
     if (WaveChartsRadius == OceanRadius)
@@ -1088,9 +1152,136 @@ void AOceanSphereActor::Tick(float DeltaTime)
     UpdateUnderwater();
     // The ocean's own pass (stage W3), with the rings this frame.
     UpdateSurfacePass();
+    TickPerfSweep();
     DrawQueryDebug();
     DrawWeatherDebug();
     DrawShoreDebug();
+}
+
+// ---------------------------------------------------------------------------
+// Stage W8a: the performance sweep (voxel.Ocean.PerfSweep)
+// ---------------------------------------------------------------------------
+
+namespace VoxelOceanPerfSweep
+{
+    /** Frames each step waits after its settings apply (the passes' history, the clipmap's due
+     *  levels settling) before it measures. */
+    constexpr int32 WarmupFrames = 60;
+
+    struct FStep
+    {
+        const TCHAR* Name;
+        void (*Apply)(FVoxelOceanSettings&);
+    };
+
+    static void Everything(FVoxelOceanSettings& S)
+    {
+        S.bUnderwaterView = false;
+        S.WaveAnisotropy = 1;
+        S.bCubicFiltering = false;
+        S.WaveDetileCell = 0.0;
+        S.IntersectionFoam = 0.0f;
+        S.bSpray = false;
+        S.FoamDetailLevels = 0;
+        S.CrestGlow = 0.0f;
+    }
+
+    // Each feature off in turn against the baseline (the settings as they were), all of them
+    // together, then the baseline again (its drift: the camera or the weather moved).
+    static const FStep Steps[] = {
+        { TEXT("baseline"), [](FVoxelOceanSettings&) {} },
+        { TEXT("bUnderwaterView off"), [](FVoxelOceanSettings& S) { S.bUnderwaterView = false; } },
+        { TEXT("WaveAnisotropy 1"), [](FVoxelOceanSettings& S) { S.WaveAnisotropy = 1; } },
+        { TEXT("bCubicFiltering off"), [](FVoxelOceanSettings& S) { S.bCubicFiltering = false; } },
+        { TEXT("WaveDetileCell 0"), [](FVoxelOceanSettings& S) { S.WaveDetileCell = 0.0; } },
+        { TEXT("IntersectionFoam 0"), [](FVoxelOceanSettings& S) { S.IntersectionFoam = 0.0f; } },
+        { TEXT("bSpray off"), [](FVoxelOceanSettings& S) { S.bSpray = false; } },
+        { TEXT("FoamDetailLevels 0"), [](FVoxelOceanSettings& S) { S.FoamDetailLevels = 0; } },
+        { TEXT("CrestGlow 0"), [](FVoxelOceanSettings& S) { S.CrestGlow = 0.0f; } },
+        { TEXT("bFoam off"), [](FVoxelOceanSettings& S) { S.bFoam = false; } },
+        { TEXT("bSurf off"), [](FVoxelOceanSettings& S) { S.bSurf = false; } },
+        { TEXT("WaveUpdateRate 25"), [](FVoxelOceanSettings& S) { S.WaveUpdateRate = 25.0; } },
+        { TEXT("all of the above but foam and surf"), &Everything },
+        { TEXT("baseline again"), [](FVoxelOceanSettings&) {} },
+    };
+    constexpr int32 NumSteps = UE_ARRAY_COUNT(Steps);
+
+    void Run(const TArray<FString>& Args, UWorld* World)
+    {
+        if (!World) return;
+        const int32 Frames = Args.Num() > 0 ? FMath::Clamp(FCString::Atoi(*Args[0]), 30, 3000) : 180;
+        int32 Count = 0;
+        for (TActorIterator<AOceanSphereActor> It(World); It; ++It)
+        {
+            It->StartPerfSweep(Frames);
+            Count++;
+        }
+        if (Count == 0)
+            UE_LOG(LogVoxelPlugin, Warning, TEXT("[VoxelOcean] PerfSweep: no ocean in this world."));
+    }
+
+    FAutoConsoleCommandWithWorldAndArgs Command(
+        TEXT("voxel.Ocean.PerfSweep"),
+        TEXT("Stage W8a: [frames per step, 180] the GPU's frame time with each of the ocean's costly features off in turn (underwater view, anisotropy, cubic filtering, detiling, intersection foam, spray, fine foam, crest glow, foam, surf, the wave update rate), then all together; logged as a table and the settings restored. Hold the camera still (a minute or so at 60 fps)."),
+        FConsoleCommandWithWorldAndArgsDelegate::CreateStatic(&Run));
+}
+
+void AOceanSphereActor::StartPerfSweep(int32 FramesPerStep)
+{
+    if (PerfSweep.bOn || !bInitialized) return;
+    PerfSweep = FPerfSweep();
+    PerfSweep.bOn = true;
+    PerfSweep.Original = OceanSettings;
+    PerfSweep.Frames = FMath::Max(FramesPerStep, 30);
+    UE_LOG(LogVoxelPlugin, Log, TEXT("[VoxelOcean] PerfSweep: %d steps of %d frames (and %d to settle each); hold the camera still."),
+        VoxelOceanPerfSweep::NumSteps, PerfSweep.Frames, VoxelOceanPerfSweep::WarmupFrames);
+    FVoxelOceanSettings S = PerfSweep.Original;
+    VoxelOceanPerfSweep::Steps[0].Apply(S);
+    SetOceanSettings(S);
+}
+
+void AOceanSphereActor::TickPerfSweep()
+{
+    if (!PerfSweep.bOn) return;
+    namespace VPS = VoxelOceanPerfSweep;
+    PerfSweep.Frame++;
+    if (PerfSweep.Frame > VPS::WarmupFrames)
+    {
+        // The last frame the GPU finished (the stat unit's GPU figure).
+        const float Ms = (float)FPlatformTime::ToMilliseconds(RHIGetGPUFrameCycles(0));
+        if (Ms > 0.0f) PerfSweep.Samples.Add(Ms);
+    }
+    if (PerfSweep.Frame < VPS::WarmupFrames + PerfSweep.Frames) return;
+    // The step's median (a hitch doesn't move it).
+    float Median = 0.0f;
+    if (PerfSweep.Samples.Num() > 0)
+    {
+        PerfSweep.Samples.Sort();
+        Median = PerfSweep.Samples[PerfSweep.Samples.Num() / 2];
+    }
+    PerfSweep.Results.Add(Median);
+    PerfSweep.Samples.Reset();
+    PerfSweep.Frame = 0;
+    PerfSweep.Step++;
+    if (PerfSweep.Step < VPS::NumSteps)
+    {
+        FVoxelOceanSettings S = PerfSweep.Original;
+        VPS::Steps[PerfSweep.Step].Apply(S);
+        SetOceanSettings(S);
+        return;
+    }
+    // Done: the settings back, the table.
+    PerfSweep.bOn = false;
+    SetOceanSettings(PerfSweep.Original);
+    const float Base = PerfSweep.Results.Num() > 0 ? PerfSweep.Results[0] : 0.0f;
+    UE_LOG(LogVoxelPlugin, Log, TEXT("[VoxelOcean] PerfSweep at %.1f m above the sea (median GPU frame, ms; saving against the baseline):"),
+        (CameraPosition.Size() - OceanRadius) * 0.01);
+    for (int32 i = 0; i < PerfSweep.Results.Num(); i++)
+    {
+        const float Ms = PerfSweep.Results[i];
+        UE_LOG(LogVoxelPlugin, Log, TEXT("[VoxelOcean]   %-36s %7.2f ms   %+6.2f ms  (%+5.1f%%)"), VPS::Steps[i].Name, Ms, Base - Ms,
+            Base > 0.0f ? 100.0f * (Base - Ms) / Base : 0.0f);
+    }
 }
 
 AAdaptiveVoxelActor* AOceanSphereActor::FindTerrain() const
@@ -1171,6 +1362,7 @@ FVoxelOceanSurfaceInputs AOceanSphereActor::GatherInputs(const AAdaptiveVoxelAct
     Inputs.ShoreDetail.ReachM = S.ShoreDetailReach;
     // The foam (stage W3v): a whitecap threshold of 0 makes none.
     Inputs.Waves.FoamWhitecap = S.bFoam ? S.FoamWhitecap : 0.0;
+    Inputs.Waves.FoamWhitecapWind = S.FoamWhitecapWind;
     Inputs.Waves.FoamAmount = S.FoamAmount;
     Inputs.Waves.FoamRamp = S.FoamRamp;
     Inputs.Waves.FineFoamWhitecap = S.bFoam ? S.FineFoamWhitecap : 0.0;
@@ -1196,7 +1388,11 @@ FVoxelOceanSurfaceInputs AOceanSphereActor::GatherInputs(const AAdaptiveVoxelAct
             Inputs.Density.Shore = ShoreRHI;
             // The coastal field's layout (stage O9h) with the texture that holds its texels.
             if (CoastField.IsValid() && CoastField->Shore == ShoreField)
+            {
                 Inputs.Coast = CoastField;
+                // (Stage W7a: a window written in place: the clipmap's static layer again.)
+                Inputs.Density.CoastSerial = CoastField->Serial;
+            }
         }
     }
     if (Terrain && Terrain->ActualPrecision > 0.0)

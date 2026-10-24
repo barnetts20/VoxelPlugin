@@ -242,7 +242,8 @@ FScreenPassTexture FVoxelUnderwaterViewExtension::Render_RenderThread(
         if (H.W > 0.0)
             NearReach = FMath::Max(NearReach, FVector(H.X, H.Y, H.Z).Size() / H.W);
     }
-    if (CameraHeight - Waves.MaxHeight() - NearReach > FMath::Max(0.0f, Params.Meniscus.W) + VoxelUnderwaterDetail::ViewSlack)
+    // (Stage W6i: the waves' reach for the sea state at the camera, not the stormiest sea's.)
+    if (CameraHeight - Waves.MaxHeightAt(CameraPlanet) - NearReach > FMath::Max(0.0f, Params.Meniscus.W) + VoxelUnderwaterDetail::ViewSlack)
     {
         return Inputs.ReturnUntouchedSceneColorForPostProcessing(GraphBuilder);
     }

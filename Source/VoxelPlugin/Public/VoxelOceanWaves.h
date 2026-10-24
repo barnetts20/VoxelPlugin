@@ -161,6 +161,10 @@ struct FVoxelOceanWaveSite
      *  zero: unknown, the field's landward direction stands in). */
     double BedSlope = VoxelOceanWaves::BedUnknown;
     FVector BedRise = FVector::ZeroVector;
+    /** Stage W6h: the terrain's own depth there (cm; with the depth, where it lies within the felt
+     *  depth's blend of the coast: VoxelOceanSurfFeltDepth), Deep: unknown. The drawn waves feel it
+     *  at the coast (stage W5e), so the query, and the buoyancy on it, does too. */
+    double BedDepth = VoxelOceanWaves::Deep;
     FVoxelOceanEnvironment Environment;         // the frame's constants unless a source is set
 };
 
@@ -245,6 +249,9 @@ public:
      *  horizontally. They size the land cull, the underwater skip test and the query's search. */
     virtual double MaxHeight() const = 0;
     virtual double MaxHorizontal() const = 0;
+    /** Stage W6i: the most the waves displace vertically near a point (planet frame) for its own sea
+     *  state (no more than MaxHeight; the underwater skip test). */
+    virtual double MaxHeightAt(const FVoxelOceanWaveContext& Context, const FVector& PlanetPoint) const { return MaxHeight(); }
 
     /** The shaders' parameters, phases formed in double at Reference (planet frame). */
     virtual void GetShaderParams(const FVoxelOceanWaveContext& Context, const FVector& Reference,
@@ -346,6 +353,9 @@ struct FVoxelOceanFFTSettings
      *  the surface reads them every frame, so they aren't compared (a change doesn't rebuild the
      *  model or wipe the foam). */
     double FoamWhitecap = 0.85;
+    /** Stage W6g (live): the threshold's rise per m/s of the local wind over 10 m/s (the chart
+     *  table's row 17 w; VoxelOceanFFTWhitecapAt). */
+    double FoamWhitecapWind = 0.0;
     double FoamAmount = 8.0;
     /** Stage W3y (live): the span of J under the threshold over which the foam's steady state rises
      *  from none to all of it (0: Godot's, its growth over its decay). */
@@ -412,6 +422,8 @@ struct VOXELPLUGIN_API FVoxelOceanWaveFrame
     double Radius() const { return Context.Radius; }
     bool HasWaves() const { return Model.IsValid() && Model->MaxHeight() > 0.0; }
     double MaxHeight() const { return Model.IsValid() ? Model->MaxHeight() : 0.0; }
+    /** Stage W6i: near a point (planet frame), for its sea state. */
+    double MaxHeightAt(const FVector& PlanetPoint) const { return Model.IsValid() ? Model->MaxHeightAt(Context, PlanetPoint) : 0.0; }
     double MaxHorizontal() const { return Model.IsValid() ? Model->MaxHorizontal() : 0.0; }
 
     /** The shaders' parameters from Reference (planet frame); zero waves without a model. */

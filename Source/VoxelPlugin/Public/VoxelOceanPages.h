@@ -64,6 +64,10 @@ struct FVoxelOceanDensityInputs
      *  (its field distance below minus ShoreMarginCm) is land. Null: no field, no such cull. */
     TSharedPtr<const FVoxelOceanShoreRHI, ESPMode::ThreadSafe> Shore;
     double ShoreMarginCm = 0.0;
+    /** Stage W7a: the coastal field the shore texture holds (FVoxelOceanCoastField::Serial; 0:
+     *  none). A window written into the texture in place keeps Shore: this tells the clipmap's
+     *  static layer to write again. */
+    uint32 CoastSerial = 0;
     /** The depth the waves feel (stage O9b2): the vertices' and the probe's depth leave out
      *  terrain detail finer than this (cm; the tile's own footprint where that is coarser). The
      *  land cull keeps the tile's footprint. 0: the tile's footprint. */
@@ -135,7 +139,16 @@ struct FVoxelOceanClipSettings
     /** Stage W2: the mesh as rings on the clipmap's levels and a far sphere (VoxelOceanRings.usf)
      *  instead of the tile pages, whenever the clipmap runs; the far sphere's cells a face edge. */
     bool bRings = true;
-    int32 FarCells = 64;
+    int32 FarCells = 128;
+    /** Stage W6f: above this camera height (cm) the rings draw nothing and the far sphere the
+     *  whole sea (their waves under a pixel; the outermost ring's square, its cells stretched by
+     *  the plane, sagged below the sphere and showed from orbit). Back from 0.9 of it. 0: always. */
+    double RingsMaxHeightCm = 4.0e6;
+    /** Stage W6f part 2: above this camera height (cm), or once the clipmap's plane bounds its
+     *  coarsest level short of the horizon, the clipmap is off (no static layer, waves or foam
+     *  passes): the far sphere is shaded by the sea state's statistics alone. Back from 0.9 of the
+     *  height it went off at. 0: by the plane alone. */
+    double ClipMaxHeightCm = 3.0e7;
     /** Stage W3: the rings drawn by the ocean's own pass (no mesh component; GetRingDraw) instead
      *  of with the ocean material. */
     bool bOwnPass = true;
@@ -143,7 +156,7 @@ struct FVoxelOceanClipSettings
     bool operator==(const FVoxelOceanClipSettings& O) const
     {
         return bOn == O.bOn && Size == O.Size && Levels == O.Levels && FinestCm == O.FinestCm && bRings == O.bRings && FarCells == O.FarCells
-            && bOwnPass == O.bOwnPass;
+            && bOwnPass == O.bOwnPass && RingsMaxHeightCm == O.RingsMaxHeightCm && ClipMaxHeightCm == O.ClipMaxHeightCm;
     }
     bool operator!=(const FVoxelOceanClipSettings& O) const { return !(*this == O); }
 };
@@ -381,6 +394,11 @@ private:
     TStrongObjectPtr<UTexture2DArray> ClipWhitecap;
     TStrongObjectPtr<UTexture2D> ClipInfo;
     TUniquePtr<FVoxelOceanClipPlan> ClipPlan;
+    /** Stage W6f: the rings off (the camera above RingsMaxHeightCm; hysteresis). */
+    bool bRingsHigh = false;
+    /** Stage W6f part 2: the clipmap off, and the height it went off at. */
+    bool bClipHigh = false;
+    double ClipOffHeightCm = 0.0;
     /** The rings (stage W2; null: off). */
     TUniquePtr<FVoxelOceanRingSet> Rings;
     void DestroyRings();

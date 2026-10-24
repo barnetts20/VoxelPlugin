@@ -134,7 +134,23 @@ struct VOXELPLUGIN_API FVoxelOceanSettings
 
     /** The far sphere's cells along each cube face's edge (under and past the rings). */
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Mesh", meta = (EditCondition = "bWaveClipmap && bWaveRings", ClampMin = "4", ClampMax = "256"))
-    int32 FarSphereCells = 64;
+    int32 FarSphereCells = 128;
+
+    /** Stage W6f (Design/DistantOcean.md): above this camera height (km) the far sphere draws the
+     *  whole sea and the rings nothing (their waves are under a pixel from there). From orbit the
+     *  outermost ring's square showed: its cells, stretched by the clipmap's plane toward its
+     *  60-degree edge, sagged below the sphere by up to a kilometre. On again below 0.9 of it.
+     *  0: the rings at any height. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Mesh", meta = (EditCondition = "bWaveClipmap && bWaveRings", ClampMin = "0.0", UIMax = "500.0"))
+    double RingsMaxHeight = 40.0;
+
+    /** Stage W6f part 2: above this camera height (km) the wave clipmap is off (no static layer,
+     *  waves or foam passes) and the sea is shaded by the sea state's statistics alone; it is off
+     *  too wherever the clipmap's plane would stop its coarsest level short of the horizon (its
+     *  square showed on the globe from orbit). On again below 0.9 of the height it went off at.
+     *  0: by the plane alone. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Mesh", meta = (EditCondition = "bWaveClipmap", ClampMin = "0.0", UIMax = "2000.0"))
+    double ClipMaxHeight = 300.0;
 
     // --- Shading (stage W3) ---
 
@@ -255,6 +271,15 @@ struct VOXELPLUGIN_API FVoxelOceanSettings
      *  from altitude; ours is the water's single scattering. 0: Godot's at every distance. */
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Shading", meta = (EditCondition = "bOwnShading", ClampMin = "0.0", UIMax = "1000.0"))
     float GodotWaterLightFade = 32.0f;
+
+    /** Stage W6j (Design/DistantOcean.md): the pixel footprint (m) by which the sea is opaque, from a
+     *  quarter of it (smoothly in the footprint's log): nothing of the bed shows through, the
+     *  water's own light carries the colour, and the waterline's fade into what lies behind narrows
+     *  to its near width (VOXEL_OCEAN_SURFACE_EDGE_FAR). From altitude the depth behind the water is
+     *  the terrain's far mesh, which doesn't follow the bed closely enough to see through (the
+     *  terrain bled through in blobs). 0: never. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Shading", meta = (EditCondition = "bOwnShading", ClampMin = "0.0", UIMax = "1000.0"))
+    float FarOpaqueFootprint = 64.0f;
 
     /** How much higher a whitecap's billows stand than the lace's relief (stage W3h; 1: the same). */
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Shading", AdvancedDisplay, meta = (EditCondition = "bOwnShading", ClampMin = "1.0", UIMax = "8.0"))
@@ -583,16 +608,21 @@ struct VOXELPLUGIN_API FVoxelOceanSettings
     double ShoreFieldReach = 1000.0;
 
     /** Inland basins below sea level lose their ocean water beyond this many land bake cells from
-     *  the sea (the bake's coast is a cell or so from the terrain's own): from here to 1.5 times it
-     *  the sea's surface sinks below the ground (stage O9b3), past that the basin is land. */
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Shore", AdvancedDisplay, meta = (ClampMin = "0.0", UIMax = "8.0"))
-    double ShoreBasinMargin = 1.5;
+     *  the sea: from here to 1.5 times it the sea's surface sinks below the ground (stage O9b3),
+     *  past that the basin is land. Stage W7c: 4 (was 1.5). The bake samples a cell once, so its
+     *  coast can stand kilometres from the terrain's own (an islet's, sampled as land well past
+     *  its real shore): at 1.5 cells the shallows round it were drained and culled in the rings'
+     *  steps. Better a low inland pit near the sea flooded than a coast drained. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Shore", AdvancedDisplay, meta = (ClampMin = "0.0", UIMax = "16.0"))
+    double ShoreBasinMargin = 4.0;
 
     // -- Coast (stage O9h; Design/OceanWaves.md section 23) -------------------------------------
 
-    /** The coastal travel-time field: baked at load from the terrain along every sea coast, the
-     *  time the waves take to come in from deep water to each point. It gives the shore's waves
-     *  their direction and crest spacing (stage O9i). Seconds to bake, after the shore field. */
+    /** The coastal travel-time field: baked from the terrain along the sea's coasts, the time the
+     *  waves take to come in from deep water to each point. It gives the shore's waves their
+     *  direction and crest spacing (stage O9i). Stage W7a: by default only round the camera (the
+     *  window: a second or so to make, again as the camera moves on); the shore's waves fade in
+     *  as it arrives. */
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Coast", meta = (EditCondition = "bShoaling"))
     bool bCoastField = true;
 
@@ -603,6 +633,38 @@ struct VOXELPLUGIN_API FVoxelOceanSettings
      *  time grows with the cells (at most 40 million: about a minute's solve). */
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Coast", meta = (EditCondition = "bCoastField", ClampMin = "8.0", ClampMax = "1024.0", UIMax = "512.0"))
     double CoastMemoryMB = 128.0;
+
+    /** Stage W7a: the field covers the coasts within this of the camera (km; full cover), then
+     *  fades out over CoastWindowFade. 0: every coast of the planet at once (CoastMemoryMB picks
+     *  the cells; tens of seconds on a large planet). */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Coast", meta = (EditCondition = "bCoastField", ClampMin = "0.0", UIMax = "64.0"))
+    double CoastWindowRadius = 16.0;
+
+    /** The window's cover fades out over this past CoastWindowRadius (km). */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Coast", AdvancedDisplay, meta = (EditCondition = "bCoastField", ClampMin = "0.5", UIMax = "32.0"))
+    double CoastWindowFade = 8.0;
+
+    /** A new window is made once the camera is this far from the last one's centre (km). */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Coast", AdvancedDisplay, meta = (EditCondition = "bCoastField", ClampMin = "0.5", UIMax = "16.0"))
+    double CoastWindowMove = 4.0;
+
+    /** The tiles solved past the window's cover so its values are the whole planet's (km; 0: the
+     *  larger of CoastReach and 4 km). */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Coast", AdvancedDisplay, meta = (EditCondition = "bCoastField", ClampMin = "0.0", UIMax = "32.0"))
+    double CoastWindowHalo = 0.0;
+
+    /** The window's cells (m; rounded to whole parts of a land bake cell, 25 to 150 m). */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Coast", AdvancedDisplay, meta = (EditCondition = "bCoastField", ClampMin = "25.0", ClampMax = "150.0"))
+    double CoastWindowCell = 40.0;
+
+    /** The window's cells at most (millions; the time to make it grows with them: about a second a
+     *  few million). Past it the tiles farthest from the camera are left out. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Coast", AdvancedDisplay, meta = (EditCondition = "bCoastField", ClampMin = "0.5", UIMax = "20.0"))
+    double CoastWindowCells = 4.0;
+
+    /** The cover's blend from one window to the next, and the field's fade in (s). */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Coast", AdvancedDisplay, meta = (EditCondition = "bCoastField", ClampMin = "0.0", UIMax = "5.0"))
+    double CoastWindowBlend = 1.5;
 
     /** The field's outer edge (m of depth): the waves' rays start shore-normal there. The shore's
      *  waves ramp in from shallower water than this. */
@@ -674,6 +736,15 @@ struct VOXELPLUGIN_API FVoxelOceanSettings
      *  physical height (the equalizer at 1) the same foam takes 0.85. */
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Foam", meta = (EditCondition = "bFoam", ClampMin = "0.0", ClampMax = "1.0"))
     double FoamWhitecap = 0.5;
+
+    /** Stage W6g: the whitecap threshold's rise per m/s of the local wind over 10 m/s (and fall
+     *  under it). The rule on the summed surface's J foams the sea nearly as much in a breeze as in
+     *  a gale (its short waves are fully developed at any wind): 0.6% of the sea at 7 m/s to 1.8% at
+     *  18 at the threshold for 1% at 10, against Monahan's 0.3% to 7.3% (preset_check). 0.0115
+     *  follows Monahan from 7 to 18 m/s at physical heights (the realistic preset); 0: one threshold
+     *  at every wind (Godot's). */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Foam", meta = (EditCondition = "bFoam", ClampMin = "0.0", UIMax = "0.03"))
+    double FoamWhitecapWind = 0.0;
 
     /** How gradually the foam comes in (stage W3y): the span of J under the whitecap threshold
      *  over which a crest's foam goes from none (fully translucent) at the threshold to solid at
@@ -780,6 +851,7 @@ struct VOXELPLUGIN_API FVoxelOceanSettings
         SurfCutoff = FMath::Clamp(SurfCutoff, 0.0, 0.5);
         SurfFFTFloor = FMath::Clamp(SurfFFTFloor, 0.0, 1.0);
         FoamWhitecap = FMath::Clamp(FoamWhitecap, 0.0, 1.0);
+        FoamWhitecapWind = FMath::Max(FoamWhitecapWind, 0.0);
         FoamAmount = FMath::Max(FoamAmount, 0.0);
         FoamRamp = FMath::Max(FoamRamp, 0.0);
         FineFoamWhitecap = FMath::Clamp(FineFoamWhitecap, 0.0, 1.0);
@@ -795,6 +867,7 @@ struct VOXELPLUGIN_API FVoxelOceanSettings
         CrestGlow = FMath::Max(CrestGlow, 0.0f);
         GodotWaterLight = FMath::Clamp(GodotWaterLight, 0.0f, 1.0f);
         GodotWaterLightFade = FMath::Max(GodotWaterLightFade, 0.0f);
+        FarOpaqueFootprint = FMath::Max(FarOpaqueFootprint, 0.0f);
         WhitecapRelief = FMath::Max(WhitecapRelief, 1.0f);
         IntersectionFoam = FMath::Max(IntersectionFoam, 0.0f);
         IntersectionFoamWidth = FMath::Max(IntersectionFoamWidth, 0.1f);
@@ -815,13 +888,53 @@ struct VOXELPLUGIN_API FVoxelOceanSettings
         WaveAnisotropy = FMath::Clamp(WaveAnisotropy, 1, 16);
     }
 
+    /** Stage W6g (Design/DistantOcean.md): THE PRESETS, the settings that make the sea's look, the
+     *  rest left as they are. Realistic: the spectrum's own heights (the equalizer at 1), the whitecap
+     *  threshold for Monahan's coverage at those heights (about 1% of the sea at 10 m/s, 7% at 18,
+     *  following the local wind; preset_check), our water light (single scattering) and the short
+     *  waves' slopes for Cox and Munk's at 10 m/s (the bands hold 0.031 of their 0.054). Its far
+     *  ocean's albedo is a real sea's (about 0.06 at a high sun; far_check). Godot: GodotOceanWaves'
+     *  look, the defaults (2.83 x the heights, whitecap 0.5, its water light): an exaggerated sea,
+     *  about 4.6 times Cox and Munk's slopes and 14% foam at 10 m/s, a far albedo twice a real
+     *  sea's. */
+    void ApplyRealisticPreset()
+    {
+        float* G[FVoxelOceanWaveEqualizer::Knots] = { &WaveEqualizer.Gain25cm, &WaveEqualizer.Gain50cm, &WaveEqualizer.Gain1m, &WaveEqualizer.Gain2m,
+            &WaveEqualizer.Gain4m, &WaveEqualizer.Gain8m, &WaveEqualizer.Gain16m, &WaveEqualizer.Gain32m, &WaveEqualizer.Gain64m, &WaveEqualizer.Gain128m,
+            &WaveEqualizer.Gain256m, &WaveEqualizer.Gain512m, &WaveEqualizer.Gain1024m };
+        for (float* V : G) *V = 1.0f;
+        WaveChop = 1.0;
+        FoamWhitecap = 0.66;
+        FoamWhitecapWind = 0.0115;
+        FoamRamp = 0.0;
+        FoamAmount = 8.0;
+        GodotWaterLight = 0.0f;
+        ShortWaveSlopeVariance = 0.02f;
+    }
+
+    void ApplyGodotPreset()
+    {
+        float* G[FVoxelOceanWaveEqualizer::Knots] = { &WaveEqualizer.Gain25cm, &WaveEqualizer.Gain50cm, &WaveEqualizer.Gain1m, &WaveEqualizer.Gain2m,
+            &WaveEqualizer.Gain4m, &WaveEqualizer.Gain8m, &WaveEqualizer.Gain16m, &WaveEqualizer.Gain32m, &WaveEqualizer.Gain64m, &WaveEqualizer.Gain128m,
+            &WaveEqualizer.Gain256m, &WaveEqualizer.Gain512m, &WaveEqualizer.Gain1024m };
+        for (float* V : G) *V = 2.83f;
+        WaveChop = 1.0;
+        FoamWhitecap = 0.5;
+        FoamWhitecapWind = 0.0;
+        FoamRamp = 0.0;
+        FoamAmount = 8.0;
+        GodotWaterLight = 1.0f;
+        ShortWaveSlopeVariance = 0.001f;
+    }
+
     /** The fields whose change rebuilds the surface. */
     bool SameMesh(const FVoxelOceanSettings& Other) const
     {
         return FinestSpacing == Other.FinestSpacing && TileQuads == Other.TileQuads && SpareBufferSets == Other.SpareBufferSets
             && bWavesInCompute == Other.bWavesInCompute && bWaveClipmap == Other.bWaveClipmap && ClipSize == Other.ClipSize
             && ClipLevels == Other.ClipLevels && ClipFinestSpacing == Other.ClipFinestSpacing && bWaveRings == Other.bWaveRings
-            && FarSphereCells == Other.FarSphereCells && bOwnShading == Other.bOwnShading;
+            && FarSphereCells == Other.FarSphereCells && RingsMaxHeight == Other.RingsMaxHeight && ClipMaxHeight == Other.ClipMaxHeight
+            && bOwnShading == Other.bOwnShading;
     }
 
     /** The fields the surface material receives. */

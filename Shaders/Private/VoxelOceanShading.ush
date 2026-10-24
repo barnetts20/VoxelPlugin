@@ -112,6 +112,127 @@ VOXEL_FUNC float VoxelOceanGlint(float3 L, float3 V, float3 N, float3 Tx, float3
     return G / (1.0f + LL + LV);
 }
 
+/** The standard normal distribution's CDF (Abramowitz and Stegun 7.1.26: within 1.5e-7). */
+VOXEL_FUNC float VoxelOceanNormalCdf(float X)
+{
+    const float Z = abs(X) * 0.70710678f;
+    const float T = 1.0f / (1.0f + 0.3275911f * Z);
+    const float Poly = T * (0.254829592f + T * (-0.284496736f + T * (1.421413741f + T * (-1.453152027f + T * 1.061405429f))));
+    const float Erf = 1.0f - Poly * exp(-Z * Z);
+    return 0.5f + 0.5f * (X < 0.0f ? -Erf : Erf);
+}
+
+/** Its inverse (Acklam's rational approximation: within 1.2e-9 relative, before float), P in (0, 1). */
+VOXEL_FUNC float VoxelOceanNormalCdfInverse(float P)
+{
+    const float Low = 0.02425f;
+    if (P < Low || P > 1.0f - Low)
+    {
+        const float Q = sqrt(-2.0f * log(P < Low ? max(P, 1.0e-30f) : max(1.0f - P, 1.0e-30f)));
+        const float X = (((((-7.784894002430293e-03f * Q - 3.223964580411365e-01f) * Q - 2.400758277161838e+00f) * Q - 2.549732539343734e+00f) * Q
+            + 4.374664141464968e+00f) * Q + 2.938163982698783e+00f) / ((((7.784695709041462e-03f * Q + 3.224671290700398e-01f) * Q + 2.445134137142996e+00f) * Q
+            + 3.754408661907416e+00f) * Q + 1.0f);
+        return P < Low ? X : -X;
+    }
+    const float Q = P - 0.5f;
+    const float R = Q * Q;
+    return (((((-3.969683028665376e+01f * R + 2.209460984245205e+02f) * R - 2.759285104469687e+02f) * R + 1.383577518672690e+02f) * R
+        - 3.066479806614716e+01f) * R + 2.506628277459239e+00f) * Q / (((((-5.447609879822406e+01f * R + 1.615858368580409e+02f) * R
+        - 1.556989798598866e+02f) * R + 6.680131188771972e+01f) * R - 1.328068155288572e+01f) * R + 1.0f);
+}
+
+/** Stage W6c (Design/DistantOcean.md): THE SKY REFLECTED BY THE SLOPES THE EYE SEES. Until W6c the
+ *  sky's reflection was the stand-in sky along the mean normal's mirror direction times the mean
+ *  Fresnel: right for a calm sea, too bright and too sharp at grazing views of a rough one (far_check:
+ *  +20 to +50% at the limb): the facets' own mirror directions, lower in the sky, and their
+ *  reflections into the next wave (Smith's masking) were left out. Now a quadrature over the
+ *  Gaussian slopes about N (SX2, SY2 along Tx, Ty) in the frame of the eye's azimuth, each facet
+ *  weighed by its area toward the eye (V.n / n.N), reflecting the stand-in sky (Zenith, Horizon; up
+ *  Up) in its own mirror direction with its own Fresnel factor and Smith's masking on the way out (a
+ *  reflection below the horizon or into the next wave adds nothing). Along the eye's azimuth the
+ *  slopes are taken at the midpoints of equal shares of the Gaussian (its inverse CDF) up to where
+ *  the facets turn edge on (the Fresnel factor's mean) or reflect the horizon (the sky's: past it a
+ *  facet reflects nothing, so its integrand ends there, not mid-node); across it Gauss-Hermite's
+ *  three nodes. far_check holds it against a Monte Carlo of the same facets: the sky within 5%, the
+ *  Fresnel within 7%, nadir to the limb, calm to the Godot preset's roughness. Radiance: the
+ *  reflected sky; Fresnel: the facets' mean Fresnel factor (the water's light passes 1 minus it). At
+ *  small slopes it is the mirror's: Schlick's along N's reflection. */
+#define VOXEL_OCEAN_SKY_NODES 6
+
+struct FVoxelOceanSkyReflection
+{
+    float3 Radiance;
+    float Fresnel;
+};
+
+VOXEL_FUNC FVoxelOceanSkyReflection VoxelOceanSkyReflectionOf(float3 V, float3 N, float3 Up, float3 Tx, float3 Ty, float SX2, float SY2,
+    float3 Zenith, float3 Horizon)
+{
+    FVoxelOceanSkyReflection Out;
+    Out.Radiance = float3(0.0f, 0.0f, 0.0f);
+    Out.Fresnel = VOXEL_OCEAN_WATER_R0;
+    // The eye's azimuth about N (any, seen from above).
+    const float3 VT = V - N * dot(V, N);
+    const float VT2 = dot(VT, VT);
+    const float3 A = VT2 > 1.0e-10f ? VT * (1.0f / sqrt(VT2)) : Tx;
+    const float3 B = cross(N, A);
+    const float SA = max(sqrt(max(VoxelOceanSlopeVarianceAlong(A, Tx, Ty, SX2, SY2), 0.0f)), 1.0e-4f);
+    const float SB = sqrt(max(VoxelOceanSlopeVarianceAlong(B, Tx, Ty, SX2, SY2), 0.0f));
+    const float CosV = saturate(dot(V, N));
+    const float SinV = sqrt(VT2);
+    // In deviations along A: the facets turn edge on at cot V / SA, reflect the horizon at
+    // tan((90 deg - V) / 2) / SA (8 deviations: none).
+    const float Edge = SinV * 8.0f * SA > CosV ? CosV / max(SinV * SA, 1.0e-6f) : 8.0f;
+    const float HalfAngle = 0.5f * (1.5707963f - acos(CosV));
+    const float Horizontal = min(Edge, tan(HalfAngle) / SA);
+    const float PEdge = VoxelOceanNormalCdf(Edge);
+    const float PHorizon = VoxelOceanNormalCdf(Horizontal);
+    float3 Sum = float3(0.0f, 0.0f, 0.0f);
+    float FresnelSum = 0.0f;
+    float WeightSum = 0.0f;
+    for (int Pass = 0; Pass < 2; Pass++)
+    {
+        // Pass 0: every facet the eye sees (the Fresnel factor's mean, the weights); 1: those that
+        // reflect the sky.
+        const float PTop = Pass == 0 ? PEdge : PHorizon;
+        if (PTop <= 1.0e-6f) continue;
+        for (int I = 0; I < VOXEL_OCEAN_SKY_NODES; I++)
+        {
+            const float XA = VoxelOceanNormalCdfInverse((float(I) + 0.5f) * (1.0f / float(VOXEL_OCEAN_SKY_NODES)) * PTop);
+            const float WA = PTop * (1.0f / float(VOXEL_OCEAN_SKY_NODES));
+            for (int J = 0; J < 3; J++)
+            {
+                const float XB = J == 0 ? 0.0f : (J == 1 ? 1.7320508f : -1.7320508f);
+                const float WB = J == 0 ? 0.6666667f : 0.1666667f;
+                // The facet's normal for slopes (XA SA, XB SB) along A and B.
+                const float3 M = normalize(N - A * (XA * SA) - B * (XB * SB));
+                const float VM = dot(V, M);
+                if (VM <= 0.0f) continue;
+                const float W = WA * WB * VM / max(dot(M, N), 1.0e-3f);
+                const float F = VoxelOceanFresnel(VM);
+                if (Pass == 0)
+                {
+                    WeightSum += W;
+                    FresnelSum += W * F;
+                    continue;
+                }
+                const float3 R = M * (2.0f * VM) - V;
+                const float RUp = dot(R, Up);
+                if (RUp <= 0.0f) continue;
+                const float G1 = 1.0f / (1.0f + VoxelOceanLambda(dot(R, N), VoxelOceanSlopeVarianceAlong(R, Tx, Ty, SX2, SY2)));
+                const float H = sqrt(saturate(RUp));
+                Sum = Sum + (Horizon + (Zenith - Horizon) * H) * (W * F * G1);
+            }
+        }
+    }
+    if (WeightSum > 0.0f)
+    {
+        Out.Radiance = Sum * (1.0f / WeightSum);
+        Out.Fresnel = FresnelSum / WeightSum;
+    }
+    return Out;
+}
+
 /** Henyey-Greenstein's phase function (per steradian) at scattering angle cos CosTheta. */
 VOXEL_FUNC float VoxelOceanPhaseHG(float CosTheta, float G)
 {

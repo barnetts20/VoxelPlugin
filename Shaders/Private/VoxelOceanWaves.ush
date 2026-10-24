@@ -341,13 +341,15 @@ FVoxelOceanShoreFrame VoxelOceanShoreFrameOfTable(Texture2D OceanCharts, int N)
         OceanCharts.Load(int3(X, 11, 0)), OceanCharts.Load(int3(X, 12, 0)), OceanCharts.Load(int3(X, 13, 0)), OceanCharts.Load(int3(X, 14, 0)));
 }
 
-// The coastal travel-time field's layout (stage O9h), from the chart table (rows 19 to 21 of its
-// constants, written with the frame by the surface: VoxelOceanCoast.ush).
+// The coastal travel-time field's layout (stage O9h), from the chart table (rows 19 to 23 of its
+// constants, written with the frame by the surface: VoxelOceanCoast.ush; stage W7a: rows 21 to 23
+// the window and the fade in).
 FVoxelOceanCoastLayout VoxelOceanCoastLayoutOfTable(Texture2D OceanCharts, int N)
 {
     const int X = VoxelOceanConstantsX(N);
     const float4 Row2 = OceanCharts.Load(int3(X, 21, 0));
-    return VoxelOceanCoastLayoutFrom(OceanCharts.Load(int3(X, 19, 0)), OceanCharts.Load(int3(X, 20, 0)), Row2.x);
+    const FVoxelOceanCoastLayout L = VoxelOceanCoastLayoutFrom(OceanCharts.Load(int3(X, 19, 0)), OceanCharts.Load(int3(X, 20, 0)), Row2.x);
+    return VoxelOceanCoastLayoutWindow(L, Row2, OceanCharts.Load(int3(X, 22, 0)), OceanCharts.Load(int3(X, 23, 0)));
 }
 
 // The coastal field at a point P (from the reference point) whose radial is Up (world axes), its
@@ -609,9 +611,14 @@ FVoxelOceanFFTSample VoxelOceanFFTLookup(Texture2DArray OceanDisplacement, Sampl
     uint Mask, float Cubic, float Size)
 {
     FVoxelOceanFFTSample S = VoxelOceanFFTSampleZero();
-    const float4 D = OceanDisplacement.SampleLevel(OceanDisplacementSampler, float3(UV, Slice), LodDisplacement);
-    S.Displacement = D.xy * 100.0f;
-    S.Height = D.z * 100.0f;
+    // (Stage W6i: at the top mip and past it the displacement is the field's mean, zero: not read.
+    // The pixels' lookups (a spacing of 1e9: normals only) and the coarse clip levels' always are.)
+    if (LodDisplacement < log2(Size))
+    {
+        const float4 D = OceanDisplacement.SampleLevel(OceanDisplacementSampler, float3(UV, Slice), LodDisplacement);
+        S.Displacement = D.xy * 100.0f;
+        S.Height = D.z * 100.0f;
+    }
     if ((Mask & 2u) != 0u)
     {
         const float4 G = VoxelOceanSampleArrayCubic(OceanDerivatives, OceanDerivativesSampler, UV, Slice, LodNormal, Size, Cubic);
@@ -907,6 +914,17 @@ float VoxelOceanFFTBandUnresolved(FVoxelOceanFFTPoint Pt, FVoxelOceanWaveParams 
     return VoxelOceanFFTBandUnresolvedOf(Pt, W, Footprint, OceanCharts, B, false);
 }
 
+// Stage W6g: the whitecap threshold at a point's wind (m/s): the setting's (Base, the chart table's
+// row 16 z; 0: no foam) plus its rise per m/s over 10 m/s (row 17 w, FoamWhitecapWind): the rule
+// on the summed surface's J foams a breeze nearly as much as a gale, Monahan's coverage rises
+// twenty-five times from 7 to 18 m/s (preset_check).
+float VoxelOceanFFTWhitecapAt(float Base, float Wind, Texture2D OceanCharts, int N)
+{
+    if (Base <= 0.0f) return 0.0f;
+    const float K = OceanCharts.Load(int3(VoxelOceanConstantsX(N), 17, 0)).w;
+    return clamp(Base + K * (Wind - 10.0f), 0.01f, 1.0f);
+}
+
 // Stage W6e: THE FOAM PAST THE CLIPMAP (Design/DistantOcean.md, W6e). Past the outermost level's
 // reach (about +-24 km round its anchor at the defaults) the clipmap holds nothing, and until W6e
 // the foam stopped there: a bright square under the camera from altitude, the open sea past it
@@ -916,16 +934,36 @@ float VoxelOceanFFTBandUnresolved(FVoxelOceanFFTPoint Pt, FVoxelOceanWaveParams 
 // from the sea state at the point (planet frame UpP): x the drawn foam, y the whitecaps (the fresh
 // foam drawn, as the clipmap's), so the two meet at the reach. (No fine foam: the shortest band's
 // lookups stop past 13.7 m footprints, VoxelOceanFFTChartLookups, so the outer levels have none.)
-float2 VoxelOceanFFTFoamFar(float3 UpP, FVoxelOceanWaveParams W, Texture2D OceanCharts)
+// (Stage W8a: from a sea state already looked up: VoxelOceanFFTFoamFarOf.)
+float2 VoxelOceanFFTFoamFarOf(FVoxelOceanSeaState Sea, FVoxelOceanWaveParams W, Texture2D OceanCharts)
 {
     const int N = max(int(W.FFT.y), 1);
-    const FVoxelOceanSeaState Sea = VoxelOceanSeaStateAt(OceanCharts, UpP, N, W.Shape.y);
     const float4 V = VoxelOceanBandSlopeVariance(OceanCharts, Sea, N);
     const float4 Row16 = OceanCharts.Load(int3(VoxelOceanConstantsX(N), 16, 0));
     const float FreshGain = max(Row16.x, 0.0f);
     const float SigmaJ = VOXEL_OCEAN_FOAM_SPREAD_SCALE * max(W.Shape.x, 0.0f) * sqrt(max(V.x + V.y + V.z + V.w, 0.0f));
-    const float Fresh = VoxelOceanFoamFresh(VoxelOceanFoamSourceHeld(1.0f, SigmaJ, Row16.z, FreshGain), FreshGain);
+    const float Fresh = VoxelOceanFoamFresh(VoxelOceanFoamSourceHeld(1.0f, SigmaJ, VoxelOceanFFTWhitecapAt(Row16.z, Sea.Wind, OceanCharts, N), FreshGain), FreshGain);
     return float2(VoxelOceanFoamDrawn(min(Fresh, VOXEL_OCEAN_FOAM_MAX)), VoxelOceanFoamDrawn(Fresh));
+}
+
+// Stage W6f part 2: the sea's whole slope variance from the tables alone (every band's share at
+// the top mip: all of it unresolved, the W6b ledger's total), for the sea shaded without the
+// clipmap (from orbit, or with it off): the roughness the clipmap's coarsest texels carry.
+float VoxelOceanFFTSlopeVarianceFar(FVoxelOceanSeaState Sea, FVoxelOceanWaveParams W, Texture2D OceanCharts)
+{
+    const int N = max(int(W.FFT.y), 1);
+    const float4 V = VoxelOceanBandSlopeVariance(OceanCharts, Sea, N);
+    const float Top = float(VOXEL_OCEAN_RESOLVED_MIPS - 1);
+    return V.x * VoxelOceanBandUnresolved(OceanCharts, N, Sea.Long, 0, Top, false)
+        + V.y * VoxelOceanBandUnresolved(OceanCharts, N, Sea.Long, 1, Top, false)
+        + V.z * VoxelOceanBandUnresolved(OceanCharts, N, Sea.Long, 2, Top, false)
+        + V.w * VoxelOceanBandUnresolved(OceanCharts, N, Sea.Long, 3, Top, false);
+}
+
+float2 VoxelOceanFFTFoamFar(float3 UpP, FVoxelOceanWaveParams W, Texture2D OceanCharts)
+{
+    const int N = max(int(W.FFT.y), 1);
+    return VoxelOceanFFTFoamFarOf(VoxelOceanSeaStateAt(OceanCharts, UpP, N, W.Shape.y), W, OceanCharts);
 }
 
 // The bands' height deviations at a sea state (the table's constants, rows 6 and 7).
@@ -1280,7 +1318,8 @@ FVoxelOceanFFTPoint VoxelOceanFFTEvaluate(float3 P, float3 Up, float Spacing, fl
         // there, the bores' foam in its place: the foam's character changed across the zone's edge.)
         // (Stage W5h: the mean of the held foam over the footprint, VoxelOceanFoamSourceHeld: the held
         // mean whitened coarse texels about 4 times over at Godot's gain, more each level out.)
-        Out.FoamSource = Drain.Keep * VoxelOceanFoamSourceHeld(J, SigmaJ, Row16.z, FreshGain);
+        // (Stage W6g: the threshold by the point's wind, VoxelOceanFFTWhitecapAt.)
+        Out.FoamSource = Drain.Keep * VoxelOceanFoamSourceHeld(J, SigmaJ, VoxelOceanFFTWhitecapAt(Row16.z, Sea.Wind, OceanCharts, N), FreshGain);
         Out.SurfBreaking = Surf.Surf.Active > 0.5f ? Drain.Keep * saturate(Surf.Surf.Breaking) * saturate(Row16.y) : 0.0f;
         const float Fresh = VoxelOceanFoamFresh(Out.FoamSource, FreshGain);
         Out.Foam = VoxelOceanFoamDrawn(max(Fresh, Out.SurfFoam * VOXEL_OCEAN_FOAM_MAX) + Out.FineFoam);

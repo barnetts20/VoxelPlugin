@@ -79,6 +79,7 @@ namespace
     {
         double Sky = 0, Glint = 0, Body = 0, Godot = 0, Foam = 0;     // equivalent albedos (luma)
         double Fresnel = 0;
+        double OldSky = 0, OldFresnel = 0;    // until W6c
     };
 
     // The far pixel's terms (VoxelOceanSurfacePass.usf with N the mean normal), sun at zenith angle
@@ -92,12 +93,18 @@ namespace
         const double CosS = L.Z;
         FTerms T;
         // Reflected.
+        // (Stage W6c: the sky over the visible slopes, VoxelOceanSkyReflectionOf, as the shader; until
+        // W6c the sky along N's reflection times the fitted mean Fresnel: OldSky.)
         FV R = Reflect(Make(-V.X, -V.Y, -V.Z), N);
         if (R.Z < 0) R.Z = -R.Z;
-        const double F = VoxelOceanMeanFresnel(float(Dot(V, N)), float(std::sqrt(S2)));
+        const double FOld = VoxelOceanMeanFresnel(float(Dot(V, N)), float(std::sqrt(S2)));
+        T.OldSky = Pi * Luma(Sky(R)) * FOld / CosS;
+        T.OldFresnel = FOld;
+        const FVoxelOceanSkyReflection Q = VoxelOceanSkyReflectionOf(F3(V), F3(N), F3(Up), F3(Tx), F3(Ty), float(S2), float(S2),
+            float3(float(SkyZenith.R), float(SkyZenith.G), float(SkyZenith.B)), float3(float(SkyHorizon.R), float(SkyHorizon.G), float(SkyHorizon.B)));
+        const double F = Q.Fresnel;
         T.Fresnel = F;
-        const FRGB Sk = Sky(R);
-        T.Sky = Pi * Luma(Sk) * F / CosS;
+        T.Sky = Pi * Luma({ Q.Radiance.x, Q.Radiance.y, Q.Radiance.z }) / CosS;
         const double SunAbove = VoxelOceanSunAbove(float(CosS));
         const double G = SunAbove * std::min(double(VoxelOceanGlint(F3(L), F3(V), F3(N), F3(Tx), F3(Ty), float(S2), float(S2))), 1000.0);
         T.Glint = Pi * G / CosS;
@@ -194,6 +201,7 @@ namespace
 
 int main()
 {
+    double WorstQuad = 0.0, WorstQuadF = 0.0;
     struct FCase { const char* Name; double Wind; double Total; double Coverage; };
     // The bands' slope variance (ledger_check), the coverage: the physical sea's (Monahan: about 1%
     // at 10 m/s, 7% at 18), the Godot preset's (foam_check section 3: 12-16% at 10 m/s; at 18 an
@@ -235,10 +243,44 @@ int main()
             double U = 0, M = 0, MF = 0;
             SkyReference(S2, View * Deg, U, M, MF);
             const FTerms T = Shade(S2, 40.0 * Deg, View * Deg, Pi, C.Coverage);
-            const double Shader = T.Sky * std::cos(40.0 * Deg);   // (back to radiance pi L, the sun's term aside)
+            const double Shader = T.OldSky * std::cos(40.0 * Deg);   // (back to radiance pi L, the sun's term aside; until W6c)
             std::printf("     view %4.0f: shader %.4f, facets unmasked %.4f (%+.0f%%), masked %.4f (%+.0f%%); mean Fresnel fit %.4f, facets' %.4f\n",
-                View, Shader, U, 100.0 * (Shader / U - 1.0), M, 100.0 * (Shader / std::max(M, 1e-9) - 1.0), T.Fresnel, MF);
+                View, Shader, U, 100.0 * (Shader / U - 1.0), M, 100.0 * (Shader / std::max(M, 1e-9) - 1.0), T.OldFresnel, MF);
+            // Stage W6c: the quadrature over the visible slopes (VoxelOceanSkyReflectionOf), against the
+            // masked facets (the same model, by Monte Carlo).
+            const FV Vv = Make(-std::sin(View * Deg), 0, std::cos(View * Deg));
+            const FVoxelOceanSkyReflection Q = VoxelOceanSkyReflectionOf(F3(Vv), float3(0, 0, 1), float3(0, 0, 1), float3(1, 0, 0), float3(0, 1, 0),
+                float(S2), float(S2), float3(float(SkyZenith.R), float(SkyZenith.G), float(SkyZenith.B)), float3(float(SkyHorizon.R), float(SkyHorizon.G), float(SkyHorizon.B)));
+            const double QL = Pi * Luma({ Q.Radiance.x, Q.Radiance.y, Q.Radiance.z });
+            const double Err = QL / std::max(M, 1e-9) - 1.0, ErrF = Q.Fresnel / MF - 1.0;
+            std::printf("                W6c's quadrature %.4f (%+.1f%% of the masked facets), its Fresnel %.4f (%+.1f%%)\n", QL, 100.0 * Err, Q.Fresnel, 100.0 * ErrF);
+            WorstQuad = std::max(WorstQuad, std::abs(Err));
+            WorstQuadF = std::max(WorstQuadF, std::abs(ErrF));
         }
+    }
+
+    std::printf("\n");
+    Check(WorstQuad < 0.05, "W6c: the sky's reflection by quadrature within 5% of the masked facets' at every view and roughness", WorstQuad, 0.05);
+    Check(WorstQuadF < 0.07, "W6c: its mean Fresnel within 7% of the visible facets'", WorstQuadF, 0.07);
+
+    // W6c's white furnace: a sky of 1 everywhere reflects no more than the facets' Fresnel factor
+    // (the rest masked), never over 1, at every view and roughness, about a tilted normal too.
+    {
+        double WorstOver = 0.0;
+        for (double S2 : { 1.0e-5, 0.016, 0.12, 0.3 })
+            for (double View = 0.0; View < 90.0; View += 2.5)
+                for (double Tilt : { 0.0, 0.3 })
+                {
+                    const FV Nn = Norm(Make(std::sin(Tilt), 0.0, std::cos(Tilt)));
+                    const FV Vv = Make(-std::sin(View * Deg), 0, std::cos(View * Deg));
+                    if (Dot(Vv, Nn) <= 0.0) continue;
+                    const FV Tx = Norm(Make(std::cos(Tilt), 0.0, -std::sin(Tilt)));
+                    const FV Ty = Make(0, 1, 0);
+                    const FVoxelOceanSkyReflection Q = VoxelOceanSkyReflectionOf(F3(Vv), F3(Nn), float3(0, 0, 1), F3(Tx), F3(Ty), float(S2), float(S2),
+                        float3(1, 1, 1), float3(1, 1, 1));
+                    WorstOver = std::max({ WorstOver, double(Q.Radiance.y) - double(Q.Fresnel), double(Q.Fresnel) - 1.0 });
+                }
+        Check(WorstOver <= 1.0e-6, "W6c's white furnace: the reflected sky never over the Fresnel factor, nor it over 1", WorstOver, 1.0e-6);
     }
 
     // The integration's own consistency: a smooth surface's sky term against Fresnel times the sky.

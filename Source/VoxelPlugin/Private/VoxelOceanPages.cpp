@@ -180,6 +180,7 @@ BEGIN_SHADER_PARAMETER_STRUCT(FVoxelOceanCoastDepthParameters, )
     SHADER_PARAMETER(uint32, CoastGroupsX)
     SHADER_PARAMETER(float, CoastFootprint)
     SHADER_PARAMETER(float, CoastLatticeScale)
+    SHADER_PARAMETER(uint32, CoastMode)
     SHADER_PARAMETER_STRUCT_INCLUDE(FVoxelOceanDensityParameters, Density)
 END_SHADER_PARAMETER_STRUCT()
 
@@ -582,6 +583,9 @@ struct FVoxelOceanClipPlan
         int32 K = MIN_int32;
         FIntPoint Origin = FIntPoint(0, 0);
         uint64 Key = 0;
+        /** Stage W7a: the coastal field it was written with (a window written into the shore
+         *  texture in place: written again whole, the foam's history kept). */
+        uint32 CoastSerial = 0;
         // The waves: evaluated for this plane, level and window.
         bool bEvaluated = false;
         uint32 EvalPlane = 0;
@@ -1557,7 +1561,9 @@ bool FVoxelOceanPages::SampleCoastDepths(const TSharedPtr<FVoxelOceanCoastDepthJ
             const uint32 NumGroups = FMath::Max(FMath::DivideAndRoundUp((uint32)Count, 64u), 1u);
             const uint32 GroupsX = FMath::Min(NumGroups, 32768u);
             FVoxelOceanCoastDepthParameters* P = GraphBuilder.AllocParameters<FVoxelOceanCoastDepthParameters>();
+            // (Stage W7d: none for the shore field's bake cells; the upload stands one in.)
             P->CoastTiles = GraphBuilder.CreateSRV(VoxelGPUCommon::UploadStructuredBuffer<int32>(GraphBuilder, TEXT("Voxel.OceanCoastTiles"), MakeConstArrayView(Job->Tiles)));
+            P->CoastMode = (uint32)FMath::Max(Job->Mode, 0);
             P->CoastOut = GraphBuilder.CreateUAV(Out);
             P->CoastFirst = (uint32)First;
             P->CoastCount = (uint32)Count;
@@ -1731,6 +1737,36 @@ void FVoxelOceanPages::UpdateClipmap(const FVector& CameraPlanet, const FVoxelOc
     // The levels: on the shared plane, the first's spacing by the camera's height.
     const int32 Slots = ClipSettings.Levels;
     const FClipFrame Frame = MakeFrame(CameraPlanet, Radius, ClipSettings.Size, Slots, ClipSettings.FinestCm, Plan.bHasFrame ? &Plan.Frame : nullptr);
+    // Stage W6f part 2: THE CLIPMAP OFF FROM HIGH UP. Above ClipMaxHeightCm, or once the plane bounds
+    // the coarsest level short of the horizon (its square showed on the globe from orbit), or with no
+    // level at all: no static layer, no waves, no foam passes; the far sphere draws the sea, shaded
+    // by the sea state's statistics (VoxelOceanFFTSlopeVarianceFar, VoxelOceanFFTFoamFarOf): from
+    // there every wave is under a pixel. On again below 0.9 of the height it went off at.
+    {
+        const double Height = CameraPlanet.Size() - Radius;
+        const double MaxHeight = ClipSettings.ClipMaxHeightCm;
+        const bool bWantOff = !Frame.IsValid() || Frame.bPlaneLimited || (MaxHeight > 0.0 && Height > MaxHeight);
+        if (!bClipHigh && bWantOff)
+        {
+            bClipHigh = true;
+            ClipOffHeightCm = Height;
+            if (MaxHeight > 0.0) ClipOffHeightCm = FMath::Min(ClipOffHeightCm, MaxHeight);
+        }
+        else if (bClipHigh && !bWantOff && Height < 0.9 * ClipOffHeightCm)
+            bClipHigh = false;
+        if (bClipHigh)
+        {
+            ENQUEUE_RENDER_COMMAND(VoxelOceanClipOff)([Displace = DisplaceState](FRHICommandListImmediate&)
+                {
+                    Displace->bClip = false;
+                });
+            // Every level written afresh when it comes back.
+            for (FVoxelOceanClipPlan::FSlot& Slot : Plan.Slots) Slot = FVoxelOceanClipPlan::FSlot();
+            for (FVoxelOceanClipPlan::FFine& Fine : Plan.Fine) Fine = FVoxelOceanClipPlan::FFine();
+            Plan.bHasFrame = false;
+            return;
+        }
+    }
     if (!Frame.IsValid()) return;
     if (Plan.bHasFrame && Frame.Plane.Id != Plan.Frame.Plane.Id) Plan.Reanchors++;
     const int32 N = Frame.Size;
@@ -1789,12 +1825,20 @@ void FVoxelOceanPages::UpdateClipmap(const FVector& CameraPlanet, const FVoxelOc
                 StaticJobs.Add({ i, E, false });
                 bEdited[i] = true;
             }
+            // Stage W7a: a new coastal window in the same texture: the whole level again (its
+            // coastal values), the water already there (the foam's history kept), its waves due.
+            if (Slot.CoastSerial != DensityInputs.CoastSerial)
+            {
+                StaticJobs.Add({ i, FClipRect{ 0, 0, N, N }, false });
+                bEdited[i] = true;
+            }
         }
         Slot.bStatic = true;
         Slot.Plane = Frame.Plane.Id;
         Slot.K = L.K;
         Slot.Origin = L.Origin;
         Slot.Key = Key;
+        Slot.CoastSerial = DensityInputs.CoastSerial;
     }
     Plan.Edits.Reset();
     for (const FStaticJob& J : StaticJobs) Plan.StaticTexels += (int64)J.Rect.Width * J.Rect.Height;
@@ -1955,7 +1999,14 @@ void FVoxelOceanPages::UpdateClipmap(const FVector& CameraPlanet, const FVoxelOc
     // where the previous level's square lies, its centre on the next level's grid.
     if (Rings.IsValid())
     {
-        const int32 Count = FMath::Min(Frame.Count, Rings->Slots);
+        // Stage W6f: from high up none (the far sphere draws the whole sea, unsunk): their waves are
+        // under a pixel, and the outermost ring's stretched cells sagged below the sphere (a square
+        // that showed from orbit). Off above RingsMaxHeightCm, on again below 0.9 of it.
+        const double MaxHeight = ClipSettings.RingsMaxHeightCm;
+        if (MaxHeight <= 0.0) bRingsHigh = false;
+        else if (Frame.CameraHeight > MaxHeight) bRingsHigh = true;
+        else if (Frame.CameraHeight < 0.9 * MaxHeight) bRingsHigh = false;
+        const int32 Count = bRingsHigh ? 0 : FMath::Min(Frame.Count, Rings->Slots);
         FRingRow RingRows[MaxLevels];
         MakeRings(Frame, Count, RingRows);
         for (int32 i = 0; i < MaxLevels; i++)

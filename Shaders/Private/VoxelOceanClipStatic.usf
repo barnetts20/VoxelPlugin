@@ -102,7 +102,11 @@ void ClipStaticCS(uint3 Id : SV_DispatchThreadID)
 
     // The shore field and the coastal field there (as the waves would read them).
     const FVoxelOceanShoreFrame Frame = VoxelOceanShoreFrameOfTable(StaticCharts, max(int(W.FFT.y), 1));
-    const FVoxelOceanCoastLayout CoastLayout = VoxelOceanCoastLayoutOfTable(StaticCharts, max(int(W.FFT.y), 1));
+    // (Stage W7a: the coastal field's cover without the window's and the fade's, which move with
+    // time: VoxelOceanClipShoreOf applies them as it reads.)
+    FVoxelOceanCoastLayout CoastLayout = VoxelOceanCoastLayoutOfTable(StaticCharts, max(int(W.FFT.y), 1));
+    CoastLayout.WindowOn = 0.0f;
+    CoastLayout.Fade = 1.0f;
     const FVoxelOceanShore Shore = VoxelOceanShoreAt(P, Up, W, Frame, CoastLayout, Wave.Depth, StaticShore);
 
     const int2 S = int2((StaticOriginMod.x + I) % Size, (StaticOriginMod.y + J) % Size);

@@ -12,6 +12,7 @@ namespace VoxelShader
 #include "VoxelOceanFFTWaves.ush"
 #include "VoxelOceanShoal.ush"
 #include "VoxelOceanSurf.ush"
+#include "VoxelOceanFeltDepth.ush"
 #include "VoxelOceanFoam.ush"
 }
 
@@ -148,21 +149,10 @@ FVoxelOceanWavesFFT::FVoxelOceanWavesFFT(const FVoxelOceanFFTSettings& InSetting
     }
 
     // The reach, at the reach's wind; shoaled waves grow (stage O8).
-    MaxHeightCm = VOF::ReachSigmas * SigmaAt(FMath::Max(Settings.WindSpeed, 0.0)) * 100.0;
-    MaxHorizontalCm = FMath::Max(Settings.Chop, 0.0) * MaxHeightCm;
+    MaxHeightCm = HeightBoundCm(FMath::Max(Settings.WindSpeed, 0.0));
+    MaxHorizontalCm = FMath::Max(Settings.Chop, 0.0) * VOF::ReachSigmas * SigmaAt(FMath::Max(Settings.WindSpeed, 0.0)) * 100.0;
     if (Settings.ShoreBreaking > 0.0)
-    {
         MaxHorizontalCm *= VOXEL_OCEAN_SHOAL_REACH_HORIZONTAL;
-        MaxHeightCm *= VOXEL_OCEAN_SHOAL_REACH_HEIGHT;
-        // The surf (stage O9a) at its most: the long bands' significant height taken as 4 sigma
-        // of the whole sea (at least theirs), the short bands' 3 sigma on top.
-        VoxelShader::float4 Row0, Row1, Row2;
-        VOF::SurfRows(Settings, Row0, Row1, Row2);
-        const VoxelShader::FVoxelOceanSurfSettings Surf = VoxelShader::VoxelOceanSurfSettingsOf(Row0, Row1, Row2, (float)Settings.ShoreBreaking);
-        const double Sigma = SigmaAt(FMath::Max(Settings.WindSpeed, 0.0));
-        const double SurfCm = ((double)VoxelShader::VoxelOceanSurfMaxHeight((float)(4.0 * Sigma), Surf) + 3.0 * Sigma) * 100.0;
-        MaxHeightCm = FMath::Max(MaxHeightCm, SurfCm);
-    }
 
     Charts = VoxelOceanCharts::Build(Radius);
     // An exact float in the shaders (a 24-bit integer).
@@ -180,6 +170,45 @@ FVoxelOceanWavesFFT::FVoxelOceanWavesFFT(const FVoxelOceanFFTSettings& InSetting
         check(Cascade->IsValid());
         Prototypes.Add(Cascade);
     }
+}
+
+double FVoxelOceanWavesFFT::HeightBoundCm(double Wind) const
+{
+    double Bound = VOF::ReachSigmas * SigmaAt(Wind) * 100.0;
+    if (Settings.ShoreBreaking > 0.0)
+    {
+        Bound *= VOXEL_OCEAN_SHOAL_REACH_HEIGHT;
+        // The surf (stage O9a) at its most: the long bands' significant height taken as 4 sigma
+        // of the whole sea (at least theirs), the short bands' 3 sigma on top.
+        VoxelShader::float4 Row0, Row1, Row2;
+        VOF::SurfRows(Settings, Row0, Row1, Row2);
+        const VoxelShader::FVoxelOceanSurfSettings Surf = VoxelShader::VoxelOceanSurfSettingsOf(Row0, Row1, Row2, (float)Settings.ShoreBreaking);
+        const double Sigma = SigmaAt(Wind);
+        const double SurfCm = ((double)VoxelShader::VoxelOceanSurfMaxHeight((float)(4.0 * Sigma), Surf) + 3.0 * Sigma) * 100.0;
+        Bound = FMath::Max(Bound, SurfCm);
+    }
+    return Bound;
+}
+
+double FVoxelOceanWavesFFT::MaxHeightAt(const FVoxelOceanWaveContext& Context, const FVector& PlanetPoint) const
+{
+    // Stage W6i: the reach for the sea state at the point (its wind or swell, the larger, at either
+    // of the weather interval's keys), no more than the planet's. The underwater pass's skip test:
+    // the planet's reach is the stormiest sea's anywhere, so a camera metres over a calm sea ran the
+    // whole pass (its surface map's million FFT evaluations) every frame.
+    using namespace VoxelShader;
+    const FVoxelOceanWeatherTable* Weather = Context.Weather.Get();
+    if (!Weather || Weather->Table.N != Charts.N) return MaxHeightCm;
+    const FVoxelOceanTableReader Reader = Weather->Table.Reader();
+    const VoxelOceanCharts::FVec Dir = VoxelOceanCharts::Normalize({ PlanetPoint.X, PlanetPoint.Y, PlanetPoint.Z });
+    const float3 D((float)Dir.X, (float)Dir.Y, (float)Dir.Z);
+    double Wind = 0.0;
+    for (int32 Key = 0; Key < 2; Key++)
+    {
+        const FVoxelOceanSeaState Sea = VoxelOceanSeaStateAt(Reader, D, Charts.N, (float)Key);
+        Wind = FMath::Max(Wind, (double)FMath::Max(Sea.Wind, Sea.Swell));
+    }
+    return FMath::Min(MaxHeightCm, HeightBoundCm(Wind));
 }
 
 double FVoxelOceanWavesFFT::ShortScale(int32 Band, double Wind) const
@@ -366,12 +395,20 @@ void FVoxelOceanWavesFFT::Evaluate(const FVoxelOceanWaveContext& Context, TConst
         const double RiseL = Site.BedRise.Size();
         const bool bRise = RiseL > 0.5;
         const float3 Rise = bRise ? float3((float)(Site.BedRise.X / RiseL), (float)(Site.BedRise.Y / RiseL), (float)(Site.BedRise.Z / RiseL)) : float3(0.0f, 0.0f, 0.0f);
+        // Stage W6h: the depth the waves feel, as the drawn waves' (VoxelOceanSurfFeltDepth, stage W5e):
+        // the terrain's own where it lies lower near the coast (an inland basin's as land, as the
+        // clipmap's static layer has it). Until W6h the query's waves (and the buoyancy on them)
+        // stopped at the smoothed depth's line offshore, where the drawn ones run on to the beach.
+        const bool bBasinSite = Site.Shore.HasField() && Context.ShoreMarginM > 0.0 && Site.Shore.Distance * 0.01 < -Context.ShoreMarginM;
+        const bool bBed = !bBasinSite && Site.BedDepth < 0.5 * VoxelOceanWaves::Deep;
+        const double FeltCm = Site.Depth < 0.5 * VoxelOceanWaves::Deep
+            ? (double)VoxelOceanSurfFeltDepth((float)Site.Depth, bBed ? (float)Site.BedDepth : 1.0e30f, 100.0f * VOXEL_OCEAN_SURF_FELT_BLEND) : Site.Depth;
         // The drain toward inland basins (stage O9b3), as the hook: with shoaling and the field.
         if (ShoalSettings.Breaking > 0.0f && Context.ShoreCells > 0 && Site.Shore.HasField())
         {
             const float Bed = Site.BedSlope > VoxelOceanWaves::BedUnknown * 0.1 ? VoxelOceanBedSlopeOf(VoxelOceanBedCode((float)Site.BedSlope)) : (float)Site.Shore.Slope;
             Drain = VoxelOceanSurfDrainOf((float)(Site.Shore.Distance * 0.01),
-                Site.Depth < 0.5 * VoxelOceanWaves::Deep ? (float)(Site.Depth * 0.01) : 1.0e30f, Bed, (float)Context.ShoreMarginM);
+                FeltCm < 0.5 * VoxelOceanWaves::Deep ? (float)(FeltCm * 0.01) : 1.0e30f, Bed, (float)Context.ShoreMarginM);
             const double L = Site.Shore.Direction.Size();
             if (L > 1.0e-6)
                 DrainDir = float3((float)(Site.Shore.Direction.X / L), (float)(Site.Shore.Direction.Y / L), (float)(Site.Shore.Direction.Z / L));
@@ -386,7 +423,7 @@ void FVoxelOceanWavesFFT::Evaluate(const FVoxelOceanWaveContext& Context, TConst
             Field.Slope = (float)Site.Shore.Slope;
             Field.Direction = bField ? float3((float)Site.Shore.Direction.X, (float)Site.Shore.Direction.Y, (float)Site.Shore.Direction.Z) : float3(0.0f, 0.0f, 0.0f);
             Field.Weight = 1.0f;
-            const float DepthM = Site.Depth < 0.5 * VoxelOceanWaves::Deep ? (float)(Site.Depth * 0.01) : 1.0e30f;
+            const float DepthM = FeltCm < 0.5 * VoxelOceanWaves::Deep ? (float)(FeltCm * 0.01) : 1.0e30f;
             const float4 Sigma = VoxelOceanShoalBandSigma(SlotSigma0, SlotSigma1, Seas[i]);
             // The surf (VoxelOceanSurf.ush, as the hook's VoxelOceanFFTSurfAt), first: its handover
             // goes into the shoaling, before the long bands' cap.
@@ -412,7 +449,7 @@ void FVoxelOceanWavesFFT::Evaluate(const FVoxelOceanWaveContext& Context, TConst
                 // The bed's slope, coded as the mesh codes it (VoxelOceanBedCode, stage O9b2); the
                 // swash's foam isn't queried.
                 In.BedSlope = Site.BedSlope > VoxelOceanWaves::BedUnknown * 0.1 ? VoxelOceanBedSlopeOf(VoxelOceanBedCode((float)Site.BedSlope)) : VOXEL_OCEAN_BED_UNKNOWN;
-                In.BedDepthM = 1.0e30f;
+                In.BedDepthM = bBed ? (float)(Site.BedDepth * 0.01) : 1.0e30f;
                 In.ForNormals = 0.0f;
                 // The coastal field (stage O9i; the site's shore source's, planet frame).
                 In.CoastA = (float)Site.Shore.CoastA;
@@ -548,8 +585,12 @@ void FVoxelOceanWavesFFT::Evaluate(const FVoxelOceanWaveContext& Context, TConst
             Sum.Gradient = Sum.Gradient - DrainDir * Drain.Slope - (bRise ? Rise : DrainDir) * Drain.SlopeBed;
         }
         // Thin water (stage O9f), as the hook (the query's spacing: none, the least band).
-        if (ShoalSettings.Breaking > 0.0f && Context.ShoreCells > 0 && Site.Shore.HasField() && Site.Depth < 0.5 * VoxelOceanWaves::Deep)
-            Sum.Height -= 100.0f * VoxelOceanSurfThinDrop((Sum.Height + (float)Site.Depth) * 0.01f, 0.0f);
+        if (ShoalSettings.Breaking > 0.0f && Context.ShoreCells > 0 && Site.Shore.HasField() && FeltCm < 0.5 * VoxelOceanWaves::Deep)
+        {
+            // (Stage W6h: over the lower of the felt depth and the terrain's own, as the hook.)
+            const double Bottom = bBed ? FMath::Min(FeltCm, Site.BedDepth) : FeltCm;
+            Sum.Height -= 100.0f * VoxelOceanSurfThinDrop((Sum.Height + (float)Bottom) * 0.01f, 0.0f);
+        }
         const float3 Up((float)Site.Up.X, (float)Site.Up.Y, (float)Site.Up.Z);
         const FVoxelOceanFFTResult W = VoxelOceanFFTFinish(Sum, Up);
         R.Height = W.Height;

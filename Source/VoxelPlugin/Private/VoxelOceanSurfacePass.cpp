@@ -128,6 +128,7 @@ BEGIN_SHADER_PARAMETER_STRUCT(FVoxelOceanSurfaceParameters, )
     SHADER_PARAMETER(FVector3f, SurfaceFoamAlbedo)
     SHADER_PARAMETER(FVector4f, SurfaceGodotWater)
     SHADER_PARAMETER(FVector4f, SurfaceFoamLook)
+    SHADER_PARAMETER(FVector4f, SurfaceFar)
     SHADER_PARAMETER_TEXTURE(Texture2D, SurfaceFoamSet)
     SHADER_PARAMETER_SAMPLER(SamplerState, SurfaceFoamSampler)
     SHADER_PARAMETER_TEXTURE(Texture2D, SurfaceFoamTable)
@@ -540,6 +541,8 @@ void FVoxelOceanSurfacePass::Render_RenderThread(FPostOpaqueRenderParameters& Pa
     // W6d: w the footprint (cm) by which Godot's water light has handed over to ours (0: never).
     P->SurfaceFoamLook = FVector4f(FMath::Clamp(Params.FoamOpacity, 0.0f, 1.0f), FMath::Clamp(Params.FoamThinOpacity, 0.0f, 1.0f),
         FMath::Max(Params.FoamFalloff, 0.01f), FMath::Max(Params.GodotWaterLightFadeM, 0.0f) * 100.0f);
+    // Stage W6j: x the footprint (cm) by which the sea is opaque (0: never).
+    P->SurfaceFar = FVector4f(FMath::Max(Params.FarOpaqueFootprintM, 0.0f) * 100.0f, 0.0f, 0.0f, 0.0f);
     // The foam's set (stage W3g), once its textures exist.
     const FVoxelOceanFoamTexture* FoamSet = Params.FoamTexture.Get();
     const bool bFoamSet = FoamSet && FoamSet->bReady && FoamSet->Set.IsValid() && FoamSet->Table.IsValid();

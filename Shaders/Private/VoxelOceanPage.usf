@@ -319,12 +319,32 @@ uint CoastN;
 uint CoastGroupsX;
 float CoastFootprint;                   // cm
 float CoastLatticeScale;                // the sea sphere's radius in lattice units
+// Stage W7d: 1: the land bake's cells instead (the shore field's heights, VoxelOceanShoreField.cpp):
+// one thread per cell of the bake's padded layout (6 (N + 2 Pad)^2, CoastN the bake's N), the
+// terrain's own depth (cm) at the cell's centre (an apron cell's on its face continued, as the bake
+// holds it) at the cell's footprint, with no inland basin (the field isn't made yet).
+uint CoastMode;
 
 [numthreads(64, 1, 1)]
 void CoastDepthCS(uint3 GroupId : SV_GroupID, uint3 GroupThreadId : SV_GroupThreadID)
 {
     const uint I = (GroupId.y * CoastGroupsX + GroupId.x) * 64u + GroupThreadId.x;
     if (I >= CoastCount) return;
+    if (CoastMode == 1u)
+    {
+        const uint Side = CoastN + 2u * uint(VOXEL_OCEAN_SHORE_PAD);
+        const uint Padded = CoastFirst + I;
+        const uint BakeFace = Padded / (Side * Side);
+        const uint InFace = Padded - BakeFace * Side * Side;
+        const int BI = int(InFace % Side) - VOXEL_OCEAN_SHORE_PAD;
+        const int BJ = int(InFace / Side) - VOXEL_OCEAN_SHORE_PAD;
+        const float3 BakeDir = VoxelOceanShoreCellDir(int(BakeFace), BI, BJ, int(CoastN));
+        const int BX = int(round(BakeDir.x * CoastLatticeScale));
+        const int BY = int(round(BakeDir.y * CoastLatticeScale));
+        const int BZ = int(round(BakeDir.z * CoastLatticeScale));
+        CoastOut[I] = VoxelOceanDepthAt(BX, BY, BZ, max(CoastFootprint, DepthFootprint), false);
+        return;
+    }
     const uint Cell = CoastFirst + I;
     const uint PerTile = CoastR * CoastR;
     const uint Tile = Cell / PerTile;

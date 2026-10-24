@@ -94,7 +94,7 @@ namespace VoxelOceanSurfaceDetail
     /** The chart table's per-frame rows (from row 8): the shore frame (7), the surf (2), the
      *  split bias (1, stage O9c), the surf's third (1, stage O9d) and the coastal field's layout
      *  (3, stage O9h). */
-    constexpr int32 FrameRows = 14;
+    constexpr int32 FrameRows = 16;
     /** The split bias's per-node coast bounds kept at most (then dropped and made again). */
     constexpr int32 CoastBoundCacheMax = 200000;
     constexpr double Hysteresis = 1.1;
@@ -1106,16 +1106,25 @@ void FVoxelOceanSurface::WriteShoreFrame(const FVoxelOceanWaveShaderParams& Wave
     if (!Texture || !Texture->GetResource() || !FFTModel.IsValid()) return;
     // Rows 8 to 14 the shore field's expansion, 15 and 16 the surf's settings (stage O9a), 17 the
     // split bias the tiles on screen were selected with (stage O9c), 18 the surf's swell and
-    // blends (stage O9d), 19 to 21 the coastal field's layout (stage O9h; zeros: none).
+    // blends (stage O9d), 19 to 23 the coastal field's layout (stage O9h; zeros: none; stage
+    // W7a: 21 to 23 its window and fade in, live).
     static_assert(UE_ARRAY_COUNT(WrittenShoreFrame) == VOS::FrameRows, "one written row a frame row");
     FVector4f Rows[VOS::FrameRows];
     for (int32 i = 0; i < 7; i++) Rows[i] = Waves.ShoreFrame[i];
     Rows[7] = Waves.Surf[0];
     Rows[8] = Waves.Surf[1];
     Rows[9] = SelectionBias;
+    // (Stage W6g: w the whitecap threshold's rise per m/s of wind, VoxelOceanFFTWhitecapAt; live.)
+    Rows[9].W = (float)FMath::Clamp(Inputs.Waves.FoamWhitecapWind, 0.0, 0.1);
     Rows[10] = Waves.Surf[2];
     const bool bCoast = Inputs.Coast.IsValid() && Inputs.Coast->IsValid() && Inputs.ShoreTexture != nullptr;
-    for (int32 i = 0; i < 3; i++) Rows[11 + i] = bCoast ? Inputs.Coast->Rows[i] : FVector4f(0.0f, 0.0f, 0.0f, 0.0f);
+    for (int32 i = 0; i < 5; i++) Rows[11 + i] = FVector4f(0.0f, 0.0f, 0.0f, 0.0f);
+    if (bCoast)
+    {
+        Rows[11] = Inputs.Coast->Rows[0];
+        Rows[12] = Inputs.Coast->Rows[1];
+        Inputs.Coast->WindowRows(FPlatformTime::Seconds(), &Rows[13]);
+    }
     // The weather's upload rewrites the whole texture: write again after one (counted as made,
     // so a table uploaded again under the same serial counts too).
     bool bSame = ShoreFrameUploads == ChartUploads && ShoreFrameTexture == Texture;
