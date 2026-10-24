@@ -188,13 +188,13 @@ struct VOXELPLUGIN_API FVoxelOceanSettings
     float FoamDetailDistance = 500.0f;
 
     /** Stage W5f: all foam (whitecaps, trails, the surf's white water) has faded out by this
-     *  distance from the camera (m; 0: no fade). It fades from 70% of FoamDetailDistance (or of
-     *  this, if nearer), where the per-pixel detail starts handing over to the wave clipmap's
-     *  texels: past it those are metres wide and coarser each level out, a smooth smear the normals
-     *  and the displacement draw better alone (GodotOceanWaves fades its foam with distance too).
-     *  The clipmap skips its foam work past it. */
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Shading", meta = (EditCondition = "bOwnShading", ClampMin = "0.0", UIMax = "5000.0"))
-    float FoamFadeDistance = 600.0f;
+     *  distance from the camera (m; 0: no fade). It fades from half this distance, or from 70% of
+     *  FoamDetailDistance if that is further (where the per-pixel detail starts handing over to
+     *  the wave clipmap's texels, metres wide and coarser each level out). The default leaves the
+     *  clipmap's foam to the far view and fades it only from orbit; a few hundred metres gives
+     *  GodotOceanWaves' look (foam only near the camera). The clipmap skips its foam work past it. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Shading", meta = (EditCondition = "bOwnShading", ClampMin = "0.0", UIMax = "200000.0"))
+    float FoamFadeDistance = 100000.0f;
 
     /** Cubic filtering of the waves' textures where the pixels are finer than their texels (stage
      *  W3u, as GodotOceanWaves' bicubic lookups): smooth slopes, whitecaps and foam close up instead

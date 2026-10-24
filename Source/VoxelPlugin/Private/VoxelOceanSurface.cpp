@@ -51,7 +51,10 @@ static TAutoConsoleVariable<int32> CVarVoxelOceanDebugSurf(
     TEXT("17 the first long band's horizontal gain (a third grey: none, white: 3x), 18 its height gain (half grey: none), ")
     TEXT("19 the second long band's horizontal gain, 20 the long bands shoaled as swell (white) or wind sea (black), ")
     TEXT("21 the first long band's k d (white: 6, where its shoaling starts; black: unknown depth); ")
-    TEXT("18 taken apart: 22 the shoaling on (white), 23 the gain from the depth (half grey: none), 24 the surf's keep, 25 the breaking cap, 26 the coast's fade. With the ocean's own shading the view is drawn flat."),
+    TEXT("18 taken apart: 22 the shoaling on (white), 23 the gain from the depth (half grey: none), 24 the surf's keep, 25 the breaking cap, 26 the coast's fade; ")
+    TEXT("the charts and the foam's rule (stage W5f): 27 the heaviest chart (a shade each), 28 the charts' blend (white: an even blend), 29 the long and short headings' agreement (white: along each other), 30 the wind (25 m/s white), ")
+    TEXT("31 J's widening for the blends (half grey: none), 32 the compression the foam's rule sees (1 - J), 33 its unresolved deviation (white: 0.25), 34 the first long band's warp stretch (white: 0.5), 35 the second's; ")
+    TEXT("the foam's channels (stage W5g): 36 the surf's breaking zone, 37 the surf's whitecaps, 38 the surf's foam, 39 the open sea's fresh foam, 40 the fine cascade's foam. With the ocean's own shading the view is drawn flat."),
     ECVF_Default);
 
 static TAutoConsoleVariable<int32> CVarVoxelOceanFlipWinding(

@@ -1037,6 +1037,10 @@ FVoxelOceanFFTPoint VoxelOceanFFTEvaluate(float3 P, float3 Up, float Spacing, fl
     const FVoxelOceanChartBlend Blend = VoxelOceanChartBlendOf(Cand.Count, VoxelOceanChartDistancesOf(Cand, UpP), N);
     FVoxelOceanFFTAccum A = VoxelOceanFFTAccumZero();
     FVoxelOceanFFTAccum Detail = VoxelOceanFFTAccumZero();
+    // Stage W5f: the heaviest chart, its weight and its headings' agreement (the debug views 27 to 29).
+    float ChartMost = 0.0f;
+    int2 ChartMostTexel = int2(0, 0);
+    float ChartAgree = 1.0f;
     [unroll]
     for (int M = 0; M < VOXEL_OCEAN_CHART_MAX; M++)
     {
@@ -1047,6 +1051,12 @@ FVoxelOceanFFTPoint VoxelOceanFFTEvaluate(float3 P, float3 Up, float Spacing, fl
         const float4 T2 = OceanCharts.Load(int3(T.x + 2, T.y, 0));
         const FVoxelOceanChart C = VoxelOceanChartOf(T0.xyz, T1.xyz, T2.xyz, float3(T0.w, T1.w, T2.w));
         const FVoxelOceanChartHeadings H = VoxelOceanChartHeadingsAt(OceanCharts, T);
+        if (Blend.Weight[M] > ChartMost)
+        {
+            ChartMost = Blend.Weight[M];
+            ChartMostTexel = T;
+            ChartAgree = abs(dot(H.LongCurrent, H.ShortCurrent));
+        }
         const FVoxelOceanChartCoords Coords = VoxelOceanChartCoordsOf(C, W.RefHigh.xyz, W.RefLow.xyz, D);
         // A group that turned blends its two orientations (VoxelOceanTurnWeights).
         const float Distance = length(Coords.Base + Coords.Offset);
@@ -1097,9 +1107,9 @@ FVoxelOceanFFTPoint VoxelOceanFFTEvaluate(float3 P, float3 Up, float Spacing, fl
     // Stage W3w: the fine foam (GodotOceanWaves' short cascade's: the shortest band's own, in its
     // tile, VoxelOceanFFT.usf), its blend's mean; built at the short bands' reference wind, so
     // weighed by their amplitude here (squared: the compression past the threshold), out of the
-    // breaking zone.
+    // breaking zone until W5g (now everywhere, as the open sea's foam).
     Out.FineFoam = bFoam && Spread.FineWeight > 0.0f
-        ? Drain.Keep * (1.0f - Out.SurfZone) * saturate(Sea.Short3) * saturate(Sea.Short3) * Spread.FineFoam / Spread.FineWeight : 0.0f;
+        ? Drain.Keep * saturate(Sea.Short3) * saturate(Sea.Short3) * Spread.FineFoam / Spread.FineWeight : 0.0f;
     float DebugValue = -1.0f;
     // The debug view (stage O9f; voxel.Ocean.DebugSurf, the chart table's row 18 w): one of the
     // surf's and the shore's quantities as the foam (0 to 1), to find where one changes abruptly.
@@ -1164,6 +1174,13 @@ FVoxelOceanFFTPoint VoxelOceanFFTEvaluate(float3 P, float3 Up, float Spacing, fl
         else if (DebugMode == 24) V = Shoal.Parts.y;
         else if (DebugMode == 25) V = Shoal.Parts.z;
         else if (DebugMode == 26) V = Shoal.Parts.w;
+        // Stage W5f: the charts and the sea state, to find a seam in the foam fixed on the sea.
+        else if (DebugMode == 27) V = 0.15f + 0.85f * frac(sin(dot(float2(ChartMostTexel), float2(12.9898f, 78.233f))) * 43758.5453f);   // the heaviest chart (a shade each)
+        else if (DebugMode == 28) V = 2.0f * (1.0f - ChartMost * ChartMost);                                    // the charts' blend (black: one chart, white: an even blend of two)
+        else if (DebugMode == 29) V = ChartAgree;                                                               // the long and short bands' headings (white: along each other, black: across)
+        else if (DebugMode == 30) V = Sea.Wind * (1.0f / 25.0f);                                                // the wind (25 m/s white)
+        else if (DebugMode == 34) V = Shoal.Active > 0.0f ? 2.0f * Shoal.Stretch.x : 0.0f;                      // band 0's warp stretch r - 1 (white: 0.5), which scales its compression along the shore
+        else if (DebugMode == 35) V = Shoal.Active > 0.0f ? 2.0f * Shoal.Stretch.y : 0.0f;                      // band 1's
         DebugValue = saturate(V);
     }
     }
@@ -1212,11 +1229,25 @@ FVoxelOceanFFTPoint VoxelOceanFFTEvaluate(float3 P, float3 Up, float Spacing, fl
         // Stage W3z: the mean over the footprint, its unresolved compression's deviation the chop
         // (W.Shape.x) times the unresolved slopes' (VoxelOceanFoam.ush).
         const float SigmaJ = VOXEL_OCEAN_FOAM_SPREAD_SCALE * max(W.Shape.x, 0.0f) * sqrt(max(Unresolved, 0.0f));
-        Out.FoamSource = Drain.Keep * (1.0f - Out.SurfZone) * VoxelOceanFoamSourceSpread(J, SigmaJ, Row16.z);
+        // (Stage W5g: over the surf's breaking zone too: every water the open sea's rule, the zone
+        // choosing only the foam's linger, VoxelOceanFoamStepSurf. Until W5g its share was taken out
+        // there, the bores' foam in its place: the foam's character changed across the zone's edge.)
+        Out.FoamSource = Drain.Keep * VoxelOceanFoamSourceSpread(J, SigmaJ, Row16.z);
         Out.SurfBreaking = Surf.Surf.Active > 0.5f ? Drain.Keep * saturate(Surf.Surf.Breaking) * saturate(Row16.y) : 0.0f;
         const float Fresh = VoxelOceanFoamFresh(Out.FoamSource, FreshGain);
         Out.Foam = VoxelOceanFoamDrawn(max(Fresh, Out.SurfFoam * VOXEL_OCEAN_FOAM_MAX) + Out.FineFoam);
         Out.Whitecap = max(VoxelOceanFoamDrawn(Fresh), Out.SurfBreaking);
+        // Stage W5f: the foam rule's inputs (voxel.Ocean.DebugSurf 31 to 33); stage W5g: the foam's
+        // channels at the point (36 to 40).
+        const int DebugFoamRule = VoxelOceanDebugModeOf(OceanCharts, N);
+        if (DebugFoamRule == 36) DebugValue = saturate(Out.SurfZone);                  // the surf's breaking zone (its foam's linger)
+        else if (DebugFoamRule == 37) DebugValue = saturate(Out.SurfBreaking);         // the surf's whitecaps (the bores breaking now)
+        else if (DebugFoamRule == 38) DebugValue = saturate(Out.SurfFoam);             // the surf's foam
+        else if (DebugFoamRule == 39) DebugValue = VoxelOceanFoamDrawn(Fresh);         // the open sea's fresh foam, drawn
+        else if (DebugFoamRule == 40) DebugValue = saturate(Out.FineFoam);             // the fine cascade's foam
+        if (DebugFoamRule == 31) DebugValue = saturate(0.5f * Widen);                    // J's widening for the blends (half grey: none)
+        else if (DebugFoamRule == 32) DebugValue = saturate(1.0f - J);                 // the compression the rule sees (black: none, white: folded)
+        else if (DebugFoamRule == 33) DebugValue = saturate(4.0f * SigmaJ);            // its unresolved deviation (white: 0.25)
     }
     if (DebugValue >= 0.0f) Out.Foam = DebugValue;
     return Out;

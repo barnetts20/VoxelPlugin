@@ -79,7 +79,10 @@
 // wave, its cycle's mean. The swash's sheet is foamy where it runs thin. Stage W3n: the whitecaps
 // (Breaking) are the white water on the bores' faces and the steep crests, moving with them; the
 // trains' slope variance (SteepVar) no longer raises the open sea's foam (the trains' own crests
-// whiten instead; it counted the shoaling's steepness twice).
+// whiten instead; it counted the shoaling's steepness twice). Stage W5g: the steepness drive and
+// the steep crests' whitecaps are gone (the open sea's rule has the trains' squeeze since W5c: they
+// counted twice, at the train's whole height), the bores' saturation alone; and the open sea's foam
+// runs over the breaking zone too (VoxelOceanWaves.ush), the zone choosing only the foam's linger.
 //
 // GRADIENT: the phase's part along grad Phi (GradientPhase, in the caller's frame: the coastal
 // field's gradients'); the depth's part (the gain, the cap, the setup, the blend into the swash)
@@ -131,18 +134,18 @@
 #define VOXEL_OCEAN_SURF_SWASH_SHEET_FOAM 0.85f
 #define VOXEL_OCEAN_SURF_SWASH_FOAM_RISE 0.08f
 #define VOXEL_OCEAN_SURF_SWASH_FOAM_TRAIL 0.2f
-// Whitecaps on the trains' crests: from this wave slope (Hc k / 2), fully at the second; their
-// share of the bores' foam.
-#define VOXEL_OCEAN_SURF_WHITECAP0 0.1f
-#define VOXEL_OCEAN_SURF_WHITECAP1 0.25f
-#define VOXEL_OCEAN_SURF_WHITECAP_SHARE 0.6f
+// (Stage W5g: the trains' own whitecaps by their steepness are gone, VOXEL_OCEAN_SURF_WHITECAP0, 1
+// and _SHARE with them: since W5c the trains' squeeze enters the open sea's rule (VoxelOceanWaves.ush,
+// its J), which whitens their steep crests at the share of the sea they carry. The steepness term
+// counted them a second time, at the train's whole height whatever its share, and its weight (the
+// trains' presence) ends along the coastal field's depth line: a hard, coast-aligned line where the
+// whitecaps and the foam changed with no change in the waves.)
 // Stage W3n: the surf's whitecaps (the breaking now) are the white water on a bore's face and just
-// behind its crest (e^(-u / BORE_TRAIL) over the cycle), and on a steep train's crest either side
-// (e^(-|u| / CREST_WIDTH)); the foam's carpet between the bores is FOAM_FLOOR of the drive, the
+// behind its crest (e^(-u / BORE_TRAIL) over the cycle) (and until W5g on a steep train's crest
+// either side); the foam's carpet between the bores is FOAM_FLOOR of the drive, the
 // trail on top of it (until W3n the whitecaps were the bores' saturation, smooth over the whole
 // zone: whitecaps everywhere in it, all the time, and a carpet of a quarter).
 #define VOXEL_OCEAN_SURF_BORE_TRAIL 0.06f
-#define VOXEL_OCEAN_SURF_CREST_WIDTH 0.05f
 // (Stage W3p: 0, the carpet between the bores gone with the open sea's foam over the zone.)
 #define VOXEL_OCEAN_SURF_FOAM_FLOOR 0.0f
 // The bores' carpet (by the real depth, in breaking depths of the significant height): fully
@@ -700,13 +703,13 @@ VOXEL_FUNC FVoxelOceanSurfTrain VoxelOceanSurfTrainOf(int I, FVoxelOceanSurfInpu
         Out.WaveDDepth = 0.5f * DHcDD * PN.Shape + 0.5f * Hc * (FrontN > Front ? 0.0f : PN.DFront * DFrontDD);
         Out.Saturation = Ratio;
         Out.Steep = 0.5f * Hc * LocalK;
-        // The foam: the bore's saturation within the carpet, or the crest's whitecap by its
-        // steepness. Its face, the trail behind its crest (falling to nothing at the trough, where
-        // the face's begins), a carpet (VOXEL_OCEAN_SURF_FOAM_TRAIL). Where the footprint doesn't
-        // resolve the wave, its cycle's mean (no stripes).
-        const float Whitecap = smoothstep(VOXEL_OCEAN_SURF_WHITECAP0, VOXEL_OCEAN_SURF_WHITECAP1, Out.Steep) * VOXEL_OCEAN_SURF_WHITECAP_SHARE;
+        // The foam: the bore's saturation within the carpet (stage W5g: no longer also the crest's
+        // whitecap by its steepness: the open sea's rule whitens the trains' crests, their squeeze
+        // in its J since W5c). Its face, the trail behind its crest (falling to nothing at the
+        // trough, where the face's begins), a carpet (VOXEL_OCEAN_SURF_FOAM_TRAIL). Where the
+        // footprint doesn't resolve the wave, its cycle's mean (no stripes).
         const float Breaks = Sat * Carpet;
-        const float Drive = max(Breaks, Whitecap);
+        const float Drive = Breaks;
         const float U = VoxelOceanSurfFrac(Theta * (1.0f / VOXEL_OCEAN_SURF_TWO_PI));
         const float Back = 1.0f - Front;
         const float Tail = exp(-Back * (1.0f / VOXEL_OCEAN_SURF_FOAM_TRAIL));
@@ -715,14 +718,13 @@ VOXEL_FUNC FVoxelOceanSurfTrain VoxelOceanSurfTrainOf(int I, FVoxelOceanSurfInpu
         const float FaceMean = 0.5f * Front + (VOXEL_OCEAN_SURF_FOAM_TRAIL * (1.0f - Tail) - Back * Tail) * TrailScale;
         const float FaceSeen = FaceMean + (Face - FaceMean) * VoxelOceanSurfResolved(Wavelength, In.FootprintM);
         Out.Foam = Drive * saturate(VOXEL_OCEAN_SURF_FOAM_FLOOR + (1.0f - VOXEL_OCEAN_SURF_FOAM_FLOOR) * FaceSeen);
-        // Stage W3n: the whitecaps, where the water is breaking now. A bore's: its face and just
-        // behind its crest; a steep train's: its crest. Unresolved, their cycle's means.
+        // Stage W3n: the whitecaps, where the water is breaking now: a bore's face and just behind
+        // its crest. Unresolved, their cycle's means. (Stage W5g: a steep train's crest no longer;
+        // the open sea's rule has it.)
         const float Seen = VoxelOceanSurfResolved(Wavelength, In.FootprintM);
         const float BoreShape = U >= Back ? smoothstep(Back, 1.0f, U) : exp(-U * (1.0f / VOXEL_OCEAN_SURF_BORE_TRAIL));
         const float BoreMean = 0.5f * Front + VOXEL_OCEAN_SURF_BORE_TRAIL * (1.0f - exp(-Back * (1.0f / VOXEL_OCEAN_SURF_BORE_TRAIL)));
-        const float CrestShape = exp(-min(U, 1.0f - U) * (1.0f / VOXEL_OCEAN_SURF_CREST_WIDTH));
-        const float CrestMean = 2.0f * VOXEL_OCEAN_SURF_CREST_WIDTH * (1.0f - exp(-0.5f * (1.0f / VOXEL_OCEAN_SURF_CREST_WIDTH)));
-        Out.Bore = max(Breaks * (BoreMean + (BoreShape - BoreMean) * Seen), Whitecap * (CrestMean + (CrestShape - CrestMean) * Seen));
+        Out.Bore = Breaks * (BoreMean + (BoreShape - BoreMean) * Seen);
     }
     return Out;
 }

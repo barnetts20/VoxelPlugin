@@ -487,7 +487,15 @@ int main()
         std::printf("  the most: %.2f (bores 1 m deep, Hs 1.5), %.2f (9 m deep, Hs 0.8); a 5 s train's whitecaps 10 m deep: %.2f (Hs 4), %.2f (Hs 1)\n", Bore, Deep, Cap, Calm);
         Check(Bore > 0.5, "the bores make white water in the surf zone", Bore, 0.5);
         Check(Deep < 0.15, "a small sea past its surf zone: little", Deep, 0.15);
-        Check(Cap > 0.3, "a steep train's crests whiten (whitecaps, past the bores' carpet)", Cap, 0.3);
+        // (Stage W5g: a steep train's crests whiten by the open sea's rule, its squeeze in the rule's
+        // J (Pinch, since W5c), at the share of the sea it carries; its own steepness term counted it
+        // twice, at its whole height, and ended on a hard coast-aligned line with the trains' presence.)
+        Check(Cap < 1.0e-6, "a train past the bores' carpet makes no foam of its own (the open sea's rule has it)", Cap, 1.0e-6);
+        double Squeeze = 0.0;
+        for (int k = 0; k < 600; k++)
+            Squeeze = std::max(Squeeze, double(VoxelOceanSurfOf(Input(Beach, 10.0 / 0.02, 0.5f * k, 4.0f, 12.0f), S).Pinch));
+        std::printf("  the trains' squeeze 10 m deep (Hs 4): up to %.3f of J\n", Squeeze);
+        Check(Squeeze > 0.03, "its squeeze reaches the open sea's rule instead", Squeeze, 0.03);
         Check(Calm == 0.0, "a gentle one's don't", Calm, 0.0);
         const FVoxelOceanSurf In = VoxelOceanSurfOf(Input(Beach, 5.0 / 0.02, 10.0f), S);
         const FVoxelOceanSurf Out = VoxelOceanSurfOf(Input(Beach, 45.0 / 0.02, 10.0f), S);
@@ -529,13 +537,14 @@ int main()
             Check(FoamMin < 0.2, "between the bores the carpet is thin", FoamMin, 0.2);
         }
         {
-            // Stage W3p: the breaking zone (where the surf's foam replaces the open sea's): all of it
+            // Stage W3p: the breaking zone (stage W5g: whose foam lingers as the surf's; until W5g the
+            // surf's foam replaced the open sea's there): all of it
             // in the surf zone and on the beach, none well out past it.
             const float InZone = VoxelOceanSurfOf(Input(Beach, 1.0 / 0.02, 10.0f), S).Zone;
             const float OnBeach = VoxelOceanSurfOf(Input(Beach, -0.05 / 0.02, 10.0f), S).Zone;
             const float Out = VoxelOceanSurfOf(Input(Beach, 9.0 / 0.02, 10.0f, 0.8f, 8.0f), S).Zone;
             std::printf("  the breaking zone: %.2f 1 m deep, %.2f on the beach, %.2f 9 m deep (Hs 0.8)\n", InZone, OnBeach, Out);
-            Check(InZone > 0.7f, "the surf zone is the surf's (the open sea's foam faded there)", InZone, 0.7);
+            Check(InZone > 0.7f, "the surf zone is the surf's (its foam lingers as the surf's)", InZone, 0.7);
             Check(Out < 0.05f, "well past it, the open sea's", Out, 0.05);
             // The swash's foam comes and goes (no standing mat): stage W5f, the sheet white as it
             // rushes up (until then only its thin edge foamed), draining away after its peak.
@@ -602,7 +611,7 @@ int main()
             Check(std::fabs(Sum - SumNear) < 0.15 * SumNear, "and average what the resolved bores do (15%)", std::fabs(Sum - SumNear) / std::max(SumNear, 1e-9), 0.15);
         }
         {
-            // A steep train's whitecaps on its crests only (no bores' carpet: 10 m deep, Hs 4).
+            // A steep train past the bores' carpet (10 m deep, Hs 4): stage W5g, no whitecaps of its own.
             int White = 0, Count = 0;
             double Max = 0.0;
             for (int k = 0; k < 2400; k++)
@@ -614,7 +623,7 @@ int main()
                 Count++;
             }
             std::printf("  a steep train's crests: whitecaps at most %.2f, over 0.15 %.0f%% of the time\n", Max, 100.0 * White / Count);
-            Check(Max > 0.3, "a steep train's crest whitens", Max, 0.3);
+            Check(Max < 1.0e-6, "a steep train past the bores' carpet: no whitecaps of its own (stage W5g)", Max, 1.0e-6);
             Check(double(White) / Count < 0.25, "on its crests only", double(White) / Count, 0.25);
         }
     }

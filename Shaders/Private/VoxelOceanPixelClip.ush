@@ -193,6 +193,12 @@ struct FVoxelOceanPixelSurf
     float Spacing;          // the clipmap's footprint there (cm)
     float Valid;
     float Own;              // the share of the foam that is the pixel's own (0: the clipmap's)
+    // Stage W5f: the foam's layers, for the debug views (voxel.Ocean.DebugFoam 6 to 11): x the
+    // clipmap's buffer (its whitecap texture's y), y the fine history, z its share, w the pixel's
+    // fresh foam (as far as the buffer has grown); Parts2: x the surf's foam at the pixel, y the fine
+    // cascade's foam at the pixel, z the clipmap's drawn foam (its buffer and fine foam, drawn).
+    float4 Parts;
+    float4 Parts2;
 };
 
 // SamplePoint, Footprint, Depth, W as VoxelOceanPixelClipDetailOf; Across: the pixel's narrower
@@ -312,6 +318,8 @@ FVoxelOceanPixelSurf VoxelOceanPixelSurfOf(float3 SamplePoint, float Footprint, 
     O.Spacing = C.Spacing;
     O.Valid = C.Valid;
     O.Own = 0.0f;
+    O.Parts = float4(Caps.y, 0.0f, 0.0f, 0.0f);
+    O.Parts2 = float4(0.0f, 0.0f, C.Foam, 0.0f);
     float3 Normal = C.Normal;
     const float Keep = saturate(Depth * (1.0f / 100.0f));
     // (Stage W5d: the pixel's foam in shallow water and on the swash too, the composed sea's (W5c) with
@@ -380,6 +388,8 @@ FVoxelOceanPixelSurf VoxelOceanPixelSurfOf(float3 SamplePoint, float Footprint, 
             O.Foam = lerp(C.Foam, VoxelOceanFoamDrawn(max(max(History, Fresh * Grown), SurfFoam) + Fine), Own);
             O.Whitecap = lerp(Caps.x, max(VoxelOceanFoamDrawn(Fresh), Pt.SurfBreaking), Own);
             O.Own = Own;
+            O.Parts = float4(Caps.y, FineHist.x, FineHist.y, Fresh * Grown);
+            O.Parts2 = float4(SurfFoam, Fine, C.Foam, 0.0f);
         }
     }
     O.Normal = normalize(VoxelOceanRotate(W.Rotation, Normal));

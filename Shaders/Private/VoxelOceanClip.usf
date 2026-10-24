@@ -207,7 +207,11 @@ void ClipWaveCS(uint3 Id : SV_DispatchThreadID)
     // (Stage W3w: with the fine foam, the shortest band's own, added as Godot sums its cascades'.)
     const float Drawn = VoxelOceanFoamDrawn(Foam + FineFoam);
     const float Whitecap = bFoamHere ? saturate(Out.Whitecap) : 0.0f;
-    ClipDisplacementOut[C] = float4(VoxelOceanRotateBack(W.Rotation, Out.Displacement), Drawn);
+    // (Stage W5f: the surf's and the shore's debug views, voxel.Ocean.DebugSurf, carried as the
+    // waves' foam, drawn in place of the buffer's foam. Since W3v the buffer alone was drawn, and
+    // the views showed the foam instead.)
+    const float DrawnShown = VoxelOceanDebugModeOf(ClipCharts, max(int(W.FFT.y), 1)) > 0 && W.FFT.x > 0.5f ? saturate(Out.Foam) : Drawn;
+    ClipDisplacementOut[C] = float4(VoxelOceanRotateBack(W.Rotation, Out.Displacement), DrawnShown);
     ClipNormalOut[C] = float4(VoxelOceanRotateBack(W.Rotation, Out.Normal), max(Out.SlopeVariance, 0.0f));
     ClipWhitecapOut[C] = float4(Whitecap, Foam, SurfZone, OpenSource);
 }

@@ -76,8 +76,8 @@ struct FVoxelOceanShadingParams
      *  the waves' and the clipmap's lookups as cubic B-splines where their texels are magnified. */
     float FoamDetail = 1.0f;
     float FoamDetailDistanceM = 250.0f;
-    /** Stage W5f: all foam faded out by this distance (m; 0: no fade), from 70% of the nearer of it
-     *  and FoamDetailDistanceM. */
+    /** Stage W5f: all foam faded out by this distance (m; 0: no fade), from the further of half of
+     *  it and 70% of the nearer of it and FoamDetailDistanceM. */
     float FoamFadeDistanceM = 0.0f;
     bool bCubicFiltering = true;
     /** Stage W3y: the clipmap's lookups along a pixel's longer axis at grazing views (1: none). */

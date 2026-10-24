@@ -271,6 +271,9 @@ void SurfacePS(float4 SvPosition : SV_POSITION,
         SurfaceFFT, SurfaceRefHigh, SurfaceRefLow, SurfaceRotation, SurfaceTiles, SurfaceStates, SurfaceSlopeVar);
     // Stage W3u: how much of the foam is the pixel's own (VoxelOceanPixelSurfOf), for its look.
     float FoamOwn = 0.0f;
+    // Stage W5f: its layers (the debug views 6 to 11).
+    float4 FoamParts = float4(0.0f, 0.0f, 0.0f, 0.0f);
+    float4 FoamParts2 = float4(0.0f, 0.0f, 0.0f, 0.0f);
     if (SurfaceClipOn != 0u)
     {
         // The clipmap's normal with the FFT's detail, its foam and whitecaps; near the camera the
@@ -288,11 +291,15 @@ void SurfacePS(float4 SvPosition : SV_POSITION,
         // anything breaking, which the normals and the displacement draw better on their own. All of
         // it (whitecaps, trails, the surf's white water) fades out from SurfaceFilter.y to .z (cm from
         // the camera; .z 0: no fade), and the clipmap skips its foam past .z (ClipWaveCS).
-        const float FoamFar = SurfaceFilter.z > 0.0f ? 1.0f - smoothstep(SurfaceFilter.y, SurfaceFilter.z, length(Rel)) : 1.0f;
+        // (Not under the debug views: they're carried as the foam.)
+        const bool bFoamDebug = int(SurfaceShading.w + 0.5f) > 0 || VoxelOceanDebugModeOf(SurfaceCharts, max(int(W.FFT.y), 1)) > 0;
+        const float FoamFar = SurfaceFilter.z > 0.0f && !bFoamDebug ? 1.0f - smoothstep(SurfaceFilter.y, SurfaceFilter.z, length(Rel)) : 1.0f;
         Foam = C.Foam * FoamFar;
         Whitecap = C.Whitecap * FoamFar;
         Height = C.Height;
         FoamOwn = C.Own;
+        FoamParts = C.Parts;
+        FoamParts2 = C.Parts2;
     }
     const float3 V = normalize(-Rel);
     // A resolved normal facing away from the eye (a wave's back seen at grazing) is turned just
@@ -546,6 +553,22 @@ void SurfacePS(float4 SvPosition : SV_POSITION,
     else if (DebugFoam == 4) Color = saturate(Whitecap) * SkyIrradiance * (1.0f / VOXEL_OCEAN_SHADING_PI) + float3(1.0e-3f, 1.0e-3f, 1.0e-3f);
     else if (DebugFoam == 5) Color = float3(1.0f - FoamOwn, FoamOwn, 0.0f) * (0.25f + 0.75f * saturate(max(Foam, Whitecap))) * dot(SkyIrradiance, float3(0.3f, 0.6f, 0.1f)) * (1.0f / VOXEL_OCEAN_SHADING_PI);
     else if (DebugFoam == 3) Color = float3(Lace.Layer0, Lace.Layer1, Lace.Layer2) * dot(SkyIrradiance, float3(0.3f, 0.6f, 0.1f)) * (1.0f / VOXEL_OCEAN_SHADING_PI);
+    // Stage W5f: the foam's layers apart (before the distance fade), to find which one holds a seam:
+    // 6 the clipmap's buffer (raw: 1 is the cap), 7 the fine history (green) over its share (red),
+    // 8 the pixel's fresh foam, 9 the surf's foam at the pixel, 10 the fine cascade's foam at the
+    // pixel, 11 the clipmap's drawn foam (all of the clipmap's, as drawn past the pixels' reach).
+    else if (DebugFoam >= 6 && DebugFoam <= 11)
+    {
+        const float Grey = dot(SkyIrradiance, float3(0.3f, 0.6f, 0.1f)) * (1.0f / VOXEL_OCEAN_SHADING_PI);
+        float3 V = float3(0.0f, 0.0f, 0.0f);
+        if (DebugFoam == 6) V = saturate(FoamParts.x).xxx;
+        else if (DebugFoam == 7) V = float3(0.35f * saturate(FoamParts.z), saturate(FoamParts.y), 0.0f);
+        else if (DebugFoam == 8) V = saturate(FoamParts.w).xxx;
+        else if (DebugFoam == 9) V = saturate(FoamParts2.x).xxx;
+        else if (DebugFoam == 10) V = saturate(FoamParts2.y).xxx;
+        else V = saturate(FoamParts2.z).xxx;
+        Color = V * Grey + float3(1.0e-3f, 1.0e-3f, 1.0e-3f);
+    }
     // The surf's and the shore's debug views (voxel.Ocean.DebugSurf, carried as the foam): flat
     // grey, not through the foam's structure or its light.
     if (VoxelOceanDebugModeOf(SurfaceCharts, max(int(W.FFT.y), 1)) > 0)
