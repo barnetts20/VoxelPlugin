@@ -59,7 +59,8 @@ bool FVoxelOceanWeatherKeys::Update(double OceanTime, const TSharedPtr<const IVo
 
     // New charts or constants: the keys hold, the table doesn't.
     bool bRebuild = Configure(InSource, InTiming, Charts.N);
-    if (FMemory::Memcmp(InConstants.Texels, Constants.Texels, sizeof(Constants.Texels)) != 0)
+    if (FMemory::Memcmp(InConstants.Texels, Constants.Texels, sizeof(Constants.Texels)) != 0
+        || FMemory::Memcmp(InConstants.Resolved, Constants.Resolved, sizeof(Constants.Resolved)) != 0)
     {
         Constants = InConstants;
         bRebuild = true;

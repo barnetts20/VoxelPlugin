@@ -184,5 +184,11 @@ TSharedPtr<const FVoxelOceanWeatherTable, ESPMode::ThreadSafe> VoxelOceanWeather
         float* P = T.Texel(CX, Row);
         for (int32 k = 0; k < 4; k++) P[k] = Constants.Texels[Row * 4 + k];
     }
+    // Stage W6b: the resolved shares.
+    for (int32 Row = 0; Row < VOXEL_OCEAN_TABLE_RESOLVED_TEXELS; Row++)
+    {
+        float* P = T.Texel(CX, VOXEL_OCEAN_TABLE_RESOLVED_ROW + Row);
+        for (int32 k = 0; k < 4; k++) P[k] = Constants.Resolved[Row * 4 + k];
+    }
     return Out;
 }

@@ -485,6 +485,7 @@ void AOceanSphereActor::UpdateSurfacePass()
     Params.CrestGlow = S.CrestGlow;
     Params.GodotWaterLight = S.GodotWaterLight;
     Params.GodotWaterColor = FVector3f(S.GodotWaterColor.R, S.GodotWaterColor.G, S.GodotWaterColor.B);
+    Params.GodotWaterLightFadeM = S.GodotWaterLightFade;
     Params.WhitecapRelief = S.WhitecapRelief;
     Params.IntersectionFoam = S.IntersectionFoam;
     Params.IntersectionFoamWidthM = S.IntersectionFoamWidth;

@@ -872,6 +872,7 @@ struct FVoxelOceanFFTPoint
     FVoxelOceanFFTResult R;     // planet frame
     FVoxelOceanFFTAccum A;      // its J, for the query's Newton steps
     float4 SlopeVar;            // each band's slope variance at the point (its sea state, shoaled)
+    float3 LongState;           // stage W6b: its long bands' sea-state weights (VoxelOceanStateWeights: the unresolved shares' blend)
     float Foam;                 // with VOXEL_OCEAN_LOOKUP_FOAM and the normals: the fresh foam drawn, the open sea's and the surf's (0 to 1; stage W3v)
     float Whitecap;             // with VOXEL_OCEAN_LOOKUP_FOAM and the normals: the whitecaps (the breaking now, drawn; stage W3h, W3v)
     float SurfFoam;             // stage W3t: with VOXEL_OCEAN_LOOKUP_FOAM, the surf's own foam (its bores, trails and swash)
@@ -883,6 +884,49 @@ struct FVoxelOceanFFTPoint
     float FineFoam;             // stage W3w: with VOXEL_OCEAN_LOOKUP_FOAM, the fine foam (the shortest band's own; added before the drawing)
     float3 DetailGradient;      // stage W3u: with VOXEL_OCEAN_LOOKUP_DUAL, the high-passed gradient (planet frame, tangent)
 };
+
+// Stage W6b: the share of band B's slope variance its lookups for Footprint (cm) leave unresolved:
+// at the normal's mip as VoxelOceanFFTChartLookups takes it (LodN, the bias with it; the shortest
+// band on its own grid's mips, the long copy's one further), from the chart table's per-mip shares
+// (VoxelOceanBandUnresolved, from the band's modes and the GPU's box mips and trilinear lookup).
+// Footprint 0: the textures' own texels (mip 0). bClip: as the clipmap's texels hold them (their
+// grid's own bilinear lookup on top, VoxelOceanSlotUnresolvedClip).
+float VoxelOceanFFTBandUnresolvedOf(FVoxelOceanFFTPoint Pt, FVoxelOceanWaveParams W, float Footprint, Texture2D OceanCharts, int B, bool bClip)
+{
+    const float L = B == 0 ? W.Tiles.x : (B == 1 ? W.Tiles.y : (B == 2 ? W.Tiles.z : W.Tiles.w));
+    const float Texels = B == 3 ? VOXEL_OCEAN_FFT_FINE_TEXELS : VOXEL_OCEAN_FFT_TEXELS;
+    float Lod = log2(max(Footprint * 0.01f * Texels / max(L, 1.0e-3f), 1.0f)) + W.RefHigh.w;
+#if !VOXEL_OCEAN_FINE_CASCADE
+    if (B == 3) Lod = max(Lod, 1.0f);
+#endif
+    return VoxelOceanBandUnresolved(OceanCharts, max(int(W.FFT.y), 1), Pt.LongState, B, Lod, bClip);
+}
+
+float VoxelOceanFFTBandUnresolved(FVoxelOceanFFTPoint Pt, FVoxelOceanWaveParams W, float Footprint, Texture2D OceanCharts, int B)
+{
+    return VoxelOceanFFTBandUnresolvedOf(Pt, W, Footprint, OceanCharts, B, false);
+}
+
+// Stage W6e: THE FOAM PAST THE CLIPMAP (Design/DistantOcean.md, W6e). Past the outermost level's
+// reach (about +-24 km round its anchor at the defaults) the clipmap holds nothing, and until W6e
+// the foam stopped there: a bright square under the camera from altitude, the open sea past it
+// foamless. Its outer levels' texels (hundreds of metres) resolve no waves: their foam is the sea
+// state's statistics alone, the held mean (VoxelOceanFoamSourceHeld) at J's mean 1 with all of the
+// slopes unresolved, the fresh foam it settles at (the buffer's steady state), drawn. The same here
+// from the sea state at the point (planet frame UpP): x the drawn foam, y the whitecaps (the fresh
+// foam drawn, as the clipmap's), so the two meet at the reach. (No fine foam: the shortest band's
+// lookups stop past 13.7 m footprints, VoxelOceanFFTChartLookups, so the outer levels have none.)
+float2 VoxelOceanFFTFoamFar(float3 UpP, FVoxelOceanWaveParams W, Texture2D OceanCharts)
+{
+    const int N = max(int(W.FFT.y), 1);
+    const FVoxelOceanSeaState Sea = VoxelOceanSeaStateAt(OceanCharts, UpP, N, W.Shape.y);
+    const float4 V = VoxelOceanBandSlopeVariance(OceanCharts, Sea, N);
+    const float4 Row16 = OceanCharts.Load(int3(VoxelOceanConstantsX(N), 16, 0));
+    const float FreshGain = max(Row16.x, 0.0f);
+    const float SigmaJ = VOXEL_OCEAN_FOAM_SPREAD_SCALE * max(W.Shape.x, 0.0f) * sqrt(max(V.x + V.y + V.z + V.w, 0.0f));
+    const float Fresh = VoxelOceanFoamFresh(VoxelOceanFoamSourceHeld(1.0f, SigmaJ, Row16.z, FreshGain), FreshGain);
+    return float2(VoxelOceanFoamDrawn(min(Fresh, VOXEL_OCEAN_FOAM_MAX)), VoxelOceanFoamDrawn(Fresh));
+}
 
 // The bands' height deviations at a sea state (the table's constants, rows 6 and 7).
 float4 VoxelOceanFFTBandSigma(FVoxelOceanSeaState Sea, Texture2D OceanCharts, int N)
@@ -1096,6 +1140,7 @@ FVoxelOceanFFTPoint VoxelOceanFFTEvaluate(float3 P, float3 Up, float Spacing, fl
     FVoxelOceanFFTPoint Out;
     Out.R = VoxelOceanFFTFinish(A, UpP);
     Out.A = A;
+    Out.LongState = Sea.Long;
     Out.SurfFoam = bFoam ? Drain.Keep * saturate(Surf.Surf.Foam) : 0.0f;
     Out.Wind = Sea.Wind;
     Out.SurfZone = Surf.Surf.Active > 0.5f ? saturate(Surf.Surf.Zone) : 0.0f;
@@ -1215,7 +1260,8 @@ FVoxelOceanFFTPoint VoxelOceanFFTEvaluate(float3 P, float3 Up, float Spacing, fl
         for (int Bw = 0; Bw < 4; Bw++)
         {
             const float Var = InvKeep2 * (Bw == 0 ? Out.SlopeVar.x : (Bw == 1 ? Out.SlopeVar.y : (Bw == 2 ? Out.SlopeVar.z : Out.SlopeVar.w)));
-            const float Res = Var * (1.0f - VoxelOceanResolved(VoxelOceanBandMinWavelength(W, Bw) * 100.0f, Footprint));
+            // (Stage W6b: the exact unresolved share at the band's lookups, VoxelOceanFFTBandUnresolved.)
+            const float Res = Var * VoxelOceanFFTBandUnresolved(Out, W, Footprint, OceanCharts, Bw);
             SlopeVarAll += Var;
             Unresolved += Res;
             Blended += (Var - Res) * (Bw < 2 ? Spread.LongWeight2 : Spread.ShortWeight2);
@@ -1265,26 +1311,33 @@ FVoxelOceanFFTPoint VoxelOceanFFTEvaluate(float3 P, float3 Up, float Spacing, fl
 }
 
 // The slope variance the footprint leaves out: each band's (as the point's sea state weighs it),
-// as far as the footprint misses its shortest waves (where most of a band's slope is).
-float VoxelOceanFFTSlopeVariance(FVoxelOceanFFTPoint Pt, FVoxelOceanWaveParams W, float Footprint)
+// its unresolved share at the band's lookups (stage W6b; until then, as far as the footprint
+// missed the band's shortest waves: ledger_check, Design/DistantOcean.md).
+// bClip: as the clipmap's texels hold it (VoxelOceanFFTBandUnresolvedOf).
+float VoxelOceanFFTSlopeVarianceOf(FVoxelOceanFFTPoint Pt, FVoxelOceanWaveParams W, float Footprint, Texture2D OceanCharts, bool bClip)
 {
     float V = 0.0f;
     [unroll]
     for (int B = 0; B < 4; B++)
     {
         const float Var = B == 0 ? Pt.SlopeVar.x : (B == 1 ? Pt.SlopeVar.y : (B == 2 ? Pt.SlopeVar.z : Pt.SlopeVar.w));
-        V += Var * (1.0f - VoxelOceanResolved(VoxelOceanBandMinWavelength(W, B) * 100.0f, Footprint));
+        if (Var > 0.0f) V += Var * VoxelOceanFFTBandUnresolvedOf(Pt, W, Footprint, OceanCharts, B, bClip);
     }
     return V;
 }
 
-FVoxelOceanWaveOutput VoxelOceanFFTOutput(FVoxelOceanFFTPoint Pt, FVoxelOceanWaveInput In, FVoxelOceanWaveParams W, uint Mask)
+float VoxelOceanFFTSlopeVariance(FVoxelOceanFFTPoint Pt, FVoxelOceanWaveParams W, float Footprint, Texture2D OceanCharts)
+{
+    return VoxelOceanFFTSlopeVarianceOf(Pt, W, Footprint, OceanCharts, false);
+}
+
+FVoxelOceanWaveOutput VoxelOceanFFTOutput(FVoxelOceanFFTPoint Pt, FVoxelOceanWaveInput In, FVoxelOceanWaveParams W, uint Mask, Texture2D OceanCharts)
 {
     FVoxelOceanWaveOutput Out;
     Out.Height = Pt.R.Height;
     Out.Displacement = In.Up * Pt.R.Height + VoxelOceanRotate(W.Rotation, Pt.R.Displacement);
     Out.Normal = (Mask & 2u) != 0u ? VoxelOceanRotate(W.Rotation, Pt.R.Normal) : In.Up;
-    Out.SlopeVariance = (Mask & 2u) != 0u ? VoxelOceanFFTSlopeVariance(Pt, W, In.Footprint) : 0.0f;
+    Out.SlopeVariance = (Mask & 2u) != 0u ? VoxelOceanFFTSlopeVariance(Pt, W, In.Footprint, OceanCharts) : 0.0f;
     Out.Jacobian = (Mask & 2u) != 0u ? Pt.R.Jacobian : 1.0f;
     Out.Foam = (Mask & VOXEL_OCEAN_LOOKUP_FOAM) != 0u ? Pt.Foam : 0.0f;
     Out.Whitecap = (Mask & VOXEL_OCEAN_LOOKUP_FOAM) != 0u ? Pt.Whitecap : 0.0f;
@@ -1298,7 +1351,7 @@ FVoxelOceanWaveOutput VoxelOceanWavesFFT(FVoxelOceanWaveInput In, FVoxelOceanWav
 {
     if (W.FFT.x < 0.5f) return VoxelOceanWaves(In, W);
     const FVoxelOceanFFTPoint Pt = VoxelOceanFFTEvaluate(In.P, In.Up, In.Spacing, In.Footprint, In.Depth, In.Shore, W, VOXEL_OCEAN_TEXTURE_ARGS, Mask);
-    return VoxelOceanFFTOutput(Pt, In, W, Mask);
+    return VoxelOceanFFTOutput(Pt, In, W, Mask, OceanCharts);
 }
 
 // VoxelOceanHeightAt for any model; the FFT model's waves mipped for Footprint (cm; 0 unfaded,
@@ -1351,7 +1404,7 @@ float VoxelOceanHeightAtFFTShore(float3 Q, float2 Sphere, FVoxelOceanWaveParams 
             InvDet = 1.0f / max(Pt.R.Jacobian, 0.05f);
         }
     }
-    OutSurface = VoxelOceanFFTOutput(Pt, In, W, Mask);
+    OutSurface = VoxelOceanFFTOutput(Pt, In, W, Mask, OceanCharts);
     return Height - Pt.R.Height;
 }
 
@@ -1395,7 +1448,7 @@ float VoxelOceanHeightAtFFTMask(float3 Q, float2 Sphere, FVoxelOceanWaveParams W
             InvDet = 1.0f / max(Pt.R.Jacobian, 0.05f);
         }
     }
-    OutSurface = VoxelOceanFFTOutput(Pt, In, W, Mask);
+    OutSurface = VoxelOceanFFTOutput(Pt, In, W, Mask, OceanCharts);
     return Height - Pt.R.Height;
 }
 

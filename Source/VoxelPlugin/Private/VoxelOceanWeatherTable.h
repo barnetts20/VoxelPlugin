@@ -42,6 +42,9 @@ struct FVoxelOceanWeatherKey
 struct FVoxelOceanTableConstants
 {
     float Texels[VOXEL_OCEAN_TABLE_CONSTANTS * 4] = {};
+    /** Stage W6b: the slots' resolved shares per mip (VoxelOceanResolvedShare.h), rows
+     *  VOXEL_OCEAN_TABLE_RESOLVED_ROW on of the column (VoxelOceanSlotUnresolved). */
+    float Resolved[VOXEL_OCEAN_TABLE_RESOLVED_TEXELS * 4] = {};
 };
 
 /** The table of one interval (immutable once built). */

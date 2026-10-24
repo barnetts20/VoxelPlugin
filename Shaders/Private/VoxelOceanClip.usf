@@ -164,7 +164,11 @@ void ClipWaveCS(uint3 Id : SV_DispatchThreadID)
         const uint Mask = VOXEL_OCEAN_LOOKUP_ALL | (ClipFoamOn != 0u && bFoamHere ? VOXEL_OCEAN_LOOKUP_FOAM : 0u);
         const FVoxelOceanFFTPoint Pt = VoxelOceanFFTEvaluate(P, Up, VertexSpacing, Footprint, Depth, In.Shore, W,
             ClipDisplacement, ClipDisplacementSampler, ClipDerivatives, ClipDerivativesSampler, ClipCharts, ClipFoam, ClipFoamSampler, Mask);
-        Out = VoxelOceanFFTOutput(Pt, In, W, Mask);
+        Out = VoxelOceanFFTOutput(Pt, In, W, Mask, ClipCharts);
+        // Stage W6b: the texel's unresolved slope variance as the pixels will see it: the lookups at
+        // the level's spacing, on its grid, looked up bilinearly again (VoxelOceanSlotUnresolvedClip;
+        // ledger_check section 2).
+        Out.SlopeVariance = VoxelOceanFFTSlopeVarianceOf(Pt, W, Footprint, ClipCharts, true);
         SurfFoam = Pt.SurfFoam;
         Wind = Pt.Wind;
         SurfZone = Pt.SurfZone;

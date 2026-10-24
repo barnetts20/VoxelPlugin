@@ -157,7 +157,8 @@ float3 SurfaceFoamAlbedo;
 // Stage W4d: GodotOceanWaves' water light: its water colour (linear), w its share against ours.
 float4 SurfaceGodotWater;
 // Stage W3s: x the foam's opacity overall, y its thinnest parts' (VOXEL_OCEAN_SURFACE_FOAM_THIN until
-// then), z the thickness it is solid from (0.6 until then); w unused (stage W3t's history switch).
+// then), z the thickness it is solid from (0.6 until then); stage W6d: w the footprint (cm) by which
+// Godot's water light has handed over to ours (0: never).
 float4 SurfaceFoamLook;
 // The foam's texture set (stage W3g; VoxelOceanFoamTex.ush), its quantiles' table, and x: 1 / its
 // tile (1/m), y: its mips, z: on (else the procedural lace), w: the foam's softness (stage W3t: 1 its
@@ -310,8 +311,18 @@ void SurfacePS(float4 SvPosition : SV_POSITION,
         // (Not under the debug views: they're carried as the foam.)
         const bool bFoamDebug = int(SurfaceShading.w + 0.5f) > 0 || VoxelOceanDebugModeOf(SurfaceCharts, max(int(W.FFT.y), 1)) > 0;
         const float FoamFar = SurfaceFilter.z > 0.0f && !bFoamDebug ? 1.0f - smoothstep(SurfaceFilter.y, SurfaceFilter.z, length(Rel)) : 1.0f;
-        Foam = C.Foam * FoamFar;
-        Whitecap = C.Whitecap * FoamFar;
+        // Stage W6e: past the clipmap's reach (and over its edge's fade) the sea state's own foam
+        // (VoxelOceanFFTFoamFar), so the foam doesn't end in the outermost level's square.
+        float FoamHere = C.Foam;
+        float WhitecapHere = C.Whitecap;
+        if (C.Cover < 1.0f && W.FFT.x > 0.5f && SurfaceShading.z > 0.5f && !bFoamDebug)
+        {
+            const float2 Far = VoxelOceanFFTFoamFar(VoxelOceanRotateBack(W.Rotation, Up), W, SurfaceCharts);
+            FoamHere += (1.0f - C.Cover) * Far.x;
+            WhitecapHere += (1.0f - C.Cover) * Far.y;
+        }
+        Foam = FoamHere * FoamFar;
+        Whitecap = WhitecapHere * FoamFar;
         Height = C.Height;
         FoamOwn = C.Own;
         FoamParts = C.Parts;
@@ -440,7 +451,13 @@ void SurfacePS(float4 SvPosition : SV_POSITION,
     // them); a half Lambert; the sky's light as ambient. Tinted by its water colour, past the
     // surface's reflection. (Godot's light colour carries pi: its terms are radiance per its
     // irradiance.)
-    if (SurfaceGodotWater.w > 0.0f)
+    // Stage W6d: Godot's light by the footprint, handing over to ours over the four octaves under
+    // SurfaceFoamLook.w (a near-field look: from afar about 5.5 times a deep sea's water-leaving
+    // light, far_check; Design/DistantOcean.md).
+    const float GodotFade = SurfaceFoamLook.w > 0.0f
+        ? 1.0f - smoothstep(log2(SurfaceFoamLook.w) - 4.0f, log2(SurfaceFoamLook.w), log2(max(Footprint, 1.0e-3f))) : 1.0f;
+    const float GodotShare = SurfaceGodotWater.w * GodotFade;
+    if (GodotShare > 0.0f)
     {
         const float NV = max(dot(N, V), 2.0e-5f);
         const float NL = max(dot(N, L), 2.0e-5f);
@@ -455,7 +472,7 @@ void SurfacePS(float4 SvPosition : SV_POSITION,
         // Ours without the bed's light (the deep part: the scattering, the crest glow).
         const float3 Through = Path >= 0.0f ? Bed * exp(-SurfaceExtinction * Path * (1.0f + max(MuView, 0.05f) / max(MuSun, 0.05f))) : float3(0.0f, 0.0f, 0.0f);
         const float3 OursDeep = (Body - Through + Glow) * ((1.0f - Fresnel) / (VOXEL_OCEAN_WATER_IOR * VOXEL_OCEAN_WATER_IOR));
-        Color += SurfaceGodotWater.w * (GodotLight * (1.0f - Fresnel) - OursDeep);
+        Color += GodotShare * (GodotLight * (1.0f - Fresnel) - OursDeep);
     }
     const float3 ShadeWater = Color - Reflected;
 

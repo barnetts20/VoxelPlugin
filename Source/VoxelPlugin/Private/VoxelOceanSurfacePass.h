@@ -90,6 +90,8 @@ struct FVoxelOceanShadingParams
     /** Stage W4d: Godot's water light's share, and its water colour (linear). */
     float GodotWaterLight = 1.0f;
     FVector3f GodotWaterColor = FVector3f(0.0103f, 0.0194f, 0.0273f);
+    /** Stage W6d: the footprint (m) by which Godot's light has handed over to ours (0: never). */
+    float GodotWaterLightFadeM = 32.0f;
     float WhitecapRelief = 3.0f;
     /** Stage W3l: the intersection foam's strength (0: none) and reach (m). */
     float IntersectionFoam = 1.0f;

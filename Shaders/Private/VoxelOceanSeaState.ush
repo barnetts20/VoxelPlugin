@@ -20,7 +20,9 @@
 //   material's reference (VoxelOceanShore.ush, FVoxelOceanShoreFrame), rows 15 and 16 the surf's
 //   settings (stage O9a, VoxelOceanSurf.ush), row 17 the mesh's split bias near shores (stage
 //   O9c: Detail, the band and the reach in cm, VoxelOcean.ush) and row 18 the surf's swell and
-//   blends (stage O9d), written by the surface with the frame (not part of the weather's table).
+//   blends (stage O9d), written by the surface with the frame (not part of the weather's table);
+//   rows 19 to 21 the coastal field's layout (stage O9h). Stage W6b: from row 24, the slots'
+//   resolved shares, a row per slot and mip (VoxelOceanSlotUnresolved; part of the table).
 // Width 5 N + F + 3, height max(6 N, 6 (F + 2)).
 //
 // THE SEA STATE at a point (VoxelOceanSeaStateAt): the field's wind and swell there; the long
@@ -60,6 +62,12 @@
 #define VOXEL_OCEAN_FIELD_CELLS 64
 #define VOXEL_OCEAN_FIELD_SIDE 66
 #define VOXEL_OCEAN_TABLE_CONSTANTS 8
+// Stage W6b: the slots' resolved shares (VoxelOceanSlotUnresolved): a row per slot and mip from
+// this row of the constants' column (rows 8 to 21 are the surface's per-frame shore frame).
+#define VOXEL_OCEAN_RESOLVED_MIPS 10
+#define VOXEL_OCEAN_TABLE_RESOLVED_ROW 24
+#define VOXEL_OCEAN_TABLE_CLIP_ROW 104
+#define VOXEL_OCEAN_TABLE_RESOLVED_TEXELS 160
 #define VOXEL_OCEAN_SHORT_KNOTS 8
 // The sea states' winds (m/s; VoxelOceanSpectrum::FLayoutSettings::StateWind).
 #define VOXEL_OCEAN_STATE_WIND0 5.0f
@@ -187,6 +195,64 @@ VOXEL_FUNC float4 VoxelOceanBandSlopeVariance(VOXEL_OCEAN_TABLE_PARAM, FVoxelOce
     const float B2 = S.Short2 * C1.z;
     const float B3 = S.Short3 * C1.w;
     return float4(B0 * B0, B1 * B1, B2 * B2, B3 * B3);
+}
+
+// Stage W6b: the share of slot Slot's slope variance (its table's, the expectation over the random
+// spectrum) that its lookups at mip Lod leave unresolved (VoxelOceanResolvedShare.h): the GPU's
+// trilinear lookup on its 2 x 2 box mips keeps (1 - t)^2 K_m + t^2 K_m+1 + 2 t (1 - t) X_m of it
+// at m + t, of the slot's own draw rho (the textures' variance over the expectation). Each row:
+// (K_m, X_m, K_m+1, rho). Until W6b the share was the shortest waves' alone (VoxelOceanResolved on
+// the band's shortest wavelength): a band counted unresolved once its shortest waves were, 20 to
+// 46% too much roughness at 4 to 25 cm footprints (ledger_check).
+VOXEL_FUNC float VoxelOceanSlotUnresolved(VOXEL_OCEAN_TABLE_PARAM, int N, int Slot, float Lod)
+{
+    const float L = clamp(Lod, 0.0f, float(VOXEL_OCEAN_RESOLVED_MIPS - 1));
+    const int M = min(int(floor(L)), VOXEL_OCEAN_RESOLVED_MIPS - 1);
+    const float T = L - float(M);
+    const float4 R = VOXEL_OCEAN_TABLE_LOAD(VoxelOceanConstantsX(N), VOXEL_OCEAN_TABLE_RESOLVED_ROW + VOXEL_OCEAN_RESOLVED_MIPS * Slot + M);
+    const float Kept = (1.0f - T) * (1.0f - T) * R.x + T * T * R.z + 2.0f * T * (1.0f - T) * R.y;
+    return max(R.w - Kept, 0.0f);
+}
+
+// The same for the clipmap's texels (VoxelOceanClip.usf; their normal's w): the lookups at Lod taken
+// on the level's grid (its spacing the lod's texel) and looked up bilinearly there again by the
+// pixels (VoxelOceanPixelClip.ush), which keeps less (ledger_check: 3 to 8% of the sea's slope
+// variance less). Each row (C_m, C_m+1/2, C_m+1, rho), quadratic between.
+VOXEL_FUNC float VoxelOceanSlotUnresolvedClip(VOXEL_OCEAN_TABLE_PARAM, int N, int Slot, float Lod)
+{
+    const float L = clamp(Lod, 0.0f, float(VOXEL_OCEAN_RESOLVED_MIPS - 1));
+    const int M = min(int(floor(L)), VOXEL_OCEAN_RESOLVED_MIPS - 1);
+    const float T = L - float(M);
+    const float4 R = VOXEL_OCEAN_TABLE_LOAD(VoxelOceanConstantsX(N), VOXEL_OCEAN_TABLE_CLIP_ROW + VOXEL_OCEAN_RESOLVED_MIPS * Slot + M);
+    const float Kept = R.x * (1.0f - T) * (1.0f - 2.0f * T) + 4.0f * R.y * T * (1.0f - T) + R.z * T * (2.0f * T - 1.0f);
+    return max(R.w - Kept, 0.0f);
+}
+
+// A band's unresolved share at mip Lod (of its variance, VoxelOceanBandSlopeVariance): the short
+// bands' slot's; the long bands' their sea states' slots' by their amplitudes (Long: the states'
+// weights, VoxelOceanStateWeights; the slope deviations from rows 0 and 1).
+// bClip: the clipmap's texels' (VoxelOceanSlotUnresolvedClip).
+VOXEL_FUNC float VoxelOceanSlotUnresolvedOf(VOXEL_OCEAN_TABLE_PARAM, int N, int Slot, float Lod, bool bClip)
+{
+    return bClip ? VoxelOceanSlotUnresolvedClip(VOXEL_OCEAN_TABLE_ARG, N, Slot, Lod) : VoxelOceanSlotUnresolved(VOXEL_OCEAN_TABLE_ARG, N, Slot, Lod);
+}
+
+VOXEL_FUNC float VoxelOceanBandUnresolved(VOXEL_OCEAN_TABLE_PARAM, int N, float3 Long, int B, float Lod, bool bClip)
+{
+    if (B >= 2) return VoxelOceanSlotUnresolvedOf(VOXEL_OCEAN_TABLE_ARG, N, 4 + B, Lod, bClip);
+    const int X = VoxelOceanConstantsX(N);
+    const float4 C0 = VOXEL_OCEAN_TABLE_LOAD(X, 0);
+    const float4 C1 = VOXEL_OCEAN_TABLE_LOAD(X, 1);
+    const float W0 = Long.x * (B == 0 ? C0.x : C0.y);
+    const float W1 = Long.y * (B == 0 ? C0.z : C0.w);
+    const float W2 = Long.z * (B == 0 ? C1.x : C1.y);
+    const float Sum = W0 + W1 + W2;
+    if (Sum <= 1.0e-12f) return 1.0f;
+    float U = 0.0f;
+    if (W0 > 0.0f) U += W0 * VoxelOceanSlotUnresolvedOf(VOXEL_OCEAN_TABLE_ARG, N, B, Lod, bClip);
+    if (W1 > 0.0f) U += W1 * VoxelOceanSlotUnresolvedOf(VOXEL_OCEAN_TABLE_ARG, N, 2 + B, Lod, bClip);
+    if (W2 > 0.0f) U += W2 * VoxelOceanSlotUnresolvedOf(VOXEL_OCEAN_TABLE_ARG, N, 4 + B, Lod, bClip);
+    return U / Sum;
 }
 
 // The slots' height standard deviations (m): slots 0-3 and 4-7 (rows 6 and 7 of the constants).

@@ -248,6 +248,14 @@ struct VOXELPLUGIN_API FVoxelOceanSettings
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Shading", meta = (EditCondition = "bOwnShading"))
     FLinearColor GodotWaterColor = FLinearColor(0.0103f, 0.0194f, 0.0273f);
 
+    /** Stage W6d (Design/DistantOcean.md): the pixel footprint (m) by which Godot's water light
+     *  (GodotWaterLight) has handed over to ours, from a sixteenth of it (four octaves, smoothly in
+     *  the footprint's log). Godot's light is a near-field look: from afar it gives the sea about 5.5
+     *  times a deep ocean's water-leaving light at any distance (far_check), the planet too bright
+     *  from altitude; ours is the water's single scattering. 0: Godot's at every distance. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Shading", meta = (EditCondition = "bOwnShading", ClampMin = "0.0", UIMax = "1000.0"))
+    float GodotWaterLightFade = 32.0f;
+
     /** How much higher a whitecap's billows stand than the lace's relief (stage W3h; 1: the same). */
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Shading", AdvancedDisplay, meta = (EditCondition = "bOwnShading", ClampMin = "1.0", UIMax = "8.0"))
     float WhitecapRelief = 3.0f;
@@ -786,6 +794,7 @@ struct VOXELPLUGIN_API FVoxelOceanSettings
         FoamTile = FMath::Max(FoamTile, 1.0f);
         CrestGlow = FMath::Max(CrestGlow, 0.0f);
         GodotWaterLight = FMath::Clamp(GodotWaterLight, 0.0f, 1.0f);
+        GodotWaterLightFade = FMath::Max(GodotWaterLightFade, 0.0f);
         WhitecapRelief = FMath::Max(WhitecapRelief, 1.0f);
         IntersectionFoam = FMath::Max(IntersectionFoam, 0.0f);
         IntersectionFoamWidth = FMath::Max(IntersectionFoamWidth, 0.1f);

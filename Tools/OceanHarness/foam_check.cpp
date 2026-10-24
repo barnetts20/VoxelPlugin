@@ -22,6 +22,7 @@
 #include "ocean_fft_emulation.h"
 #include "VoxelOceanShoreCore.h"
 #include "VoxelOceanCoastCore.h"
+#include "VoxelOceanResolvedShare.h"
 
 namespace VoxelShader
 {
@@ -261,9 +262,11 @@ int main()
             const uint32_t Tick = TickOf(141.0);
             FGPUSlot G[4];
             double Var[4], MinL[4];
+            FResolvedShare Share[4];
             for (int b = 0; b < 4; b++)
             {
                 G[b] = EmulateGPU(Sl[Use[b]], Tick);
+                Share[b] = ResolvedShareOf(Sl[Use[b]]);
                 const FBandStats St = StatsOf(Sl[Use[b]]);
                 Var[b] = (St.SlopeVarianceX + St.SlopeVarianceY) * (b < 2 ? Wt[K] * Wt[K] : 1.0);
                 MinL[b] = b < 3 ? 0.25 * Sl[Use[b + 1]].Params.TileLength : Sl[Use[3]].Params.TileLength * 4.0 / SizeOfBand(3);
@@ -282,8 +285,15 @@ int main()
             for (double F : { 0.4, 0.8, 1.6, 3.2 })
             {
                 const int M = std::max(8, int(std::lround(F / 0.05)));
+                // (Stage W6b: the exact unresolved share at the band's lookups for the texel, as the
+                // shading's table, VoxelOceanSlotUnresolved; until then its shortest waves' alone.)
                 double Unresolved = 0.0;
-                for (int b = 0; b < 4; b++) Unresolved += Var[b] * (1.0 - std::clamp(MinL[b] / (2.0 * F) - 1.0, 0.0, 1.0));
+                for (int b = 0; b < 4; b++)
+                {
+                    const double Lod = std::log2(std::max(F * SizeOfBand(b) / Sl[Use[b]].Params.TileLength, 1.0));
+                    Unresolved += Var[b] * (1.0 - 0.5 * (ResolvedShareAt(Share[b], Lod, 0) + ResolvedShareAt(Share[b], Lod, 1)));
+                    (void)MinL;
+                }
                 const double SigmaStats = VOXEL_OCEAN_FOAM_SPREAD_SCALE * 0.9 * std::sqrt(Unresolved);
                 std::mt19937 Rng(91);
                 std::uniform_real_distribution<double> Pos(0.0, 2.0e4);
@@ -331,7 +341,7 @@ int main()
     {
         const double H = 2.83, C = 0.5;
         const double Gain = VoxelOceanFoamGrowRate(8.0f) / VoxelOceanFoamDecayRate(8.0f);
-        double WorstOld = 0.0, WorstNew = 0.0, WorstNewCoarse = 0.0;
+        double WorstOld = 0.0, WorstNew = 0.0, WorstNewCoarse = 0.0, WorstFar = 0.0;
         for (double U : { 10.0, 18.0 })
         {
             FLayoutSettings A = S;
@@ -344,9 +354,11 @@ int main()
             const uint32_t Tick = TickOf(141.0);
             FGPUSlot G[4];
             double Var[4], MinL[4];
+            FResolvedShare Share[4];
             for (int b = 0; b < 4; b++)
             {
                 G[b] = EmulateGPU(Sl[Use[b]], Tick);
+                Share[b] = ResolvedShareOf(Sl[Use[b]]);
                 const FBandStats St = StatsOf(Sl[Use[b]]);
                 Var[b] = (St.SlopeVarianceX + St.SlopeVarianceY) * (b < 2 ? Wt[K] * Wt[K] : 1.0) * H * H;
                 MinL[b] = b < 3 ? 0.25 * Sl[Use[b + 1]].Params.TileLength : Sl[Use[3]].Params.TileLength * 4.0 / SizeOfBand(3);
@@ -362,11 +374,19 @@ int main()
                 }
             };
             std::printf("  %2.0f m/s:", U);
+            double LastTruth = 0.0;
             for (double F : { 0.4, 1.6, 6.4 })
             {
                 const int M = std::min(128, std::max(8, int(std::lround(F / 0.05))));
+                // (Stage W6b: the exact unresolved share at the band's lookups for the texel, as the
+                // shading's table, VoxelOceanSlotUnresolved; until then its shortest waves' alone.)
                 double Unresolved = 0.0;
-                for (int b = 0; b < 4; b++) Unresolved += Var[b] * (1.0 - std::clamp(MinL[b] / (2.0 * F) - 1.0, 0.0, 1.0));
+                for (int b = 0; b < 4; b++)
+                {
+                    const double Lod = std::log2(std::max(F * SizeOfBand(b) / Sl[Use[b]].Params.TileLength, 1.0));
+                    Unresolved += Var[b] * (1.0 - 0.5 * (ResolvedShareAt(Share[b], Lod, 0) + ResolvedShareAt(Share[b], Lod, 1)));
+                    (void)MinL;
+                }
                 const float Sigma = float(VOXEL_OCEAN_FOAM_SPREAD_SCALE * std::sqrt(Unresolved));
                 std::mt19937 Rng(17);
                 std::uniform_real_distribution<double> Pos(0.0, 2.0e4);
@@ -393,14 +413,26 @@ int main()
                     New += std::min(Gain * double(VoxelOceanFoamSourceHeld(JTexel, Sigma, float(C), float(Gain))), 1.0);
                 }
                 Truth /= Cells; Old /= Cells; New /= Cells;
+                LastTruth = Truth;
                 std::printf("  %.1f m: truth %.3f, held mean %.3f, mean held %.3f (sigma x gain %.1f) |", F, Truth, Old, New, Sigma * Gain);
                 WorstOld = std::max(WorstOld, std::abs(Old - Truth) / std::max(Truth, 1e-9));
                 WorstNew = std::max(WorstNew, std::abs(New - Truth) / std::max(Truth, 1e-9));
                 if (F > 1.0) WorstNewCoarse = std::max(WorstNewCoarse, std::abs(New - Truth) / std::max(Truth, 1e-9));
             }
+            // Stage W6e: past the clipmap (VoxelOceanFFTFoamFar): the held mean at J's mean 1 with all of
+            // the slopes unresolved, against the fine surface's mean at the coarsest texels here.
+            {
+                double VarAll = 0.0;
+                for (int b = 0; b < 4; b++) VarAll += Var[b];
+                const float SigmaAll = float(VOXEL_OCEAN_FOAM_SPREAD_SCALE * std::sqrt(VarAll));
+                const double Far = std::min(Gain * double(VoxelOceanFoamSourceHeld(1.0f, SigmaAll, float(C), float(Gain))), 1.0);
+                std::printf("  past the clipmap (W6e): %.3f against the 6.4 m texels' truth %.3f |", Far, LastTruth);
+                WorstFar = std::max(WorstFar, std::abs(Far - LastTruth) / std::max(LastTruth, 1e-9));
+            }
             std::printf("\n");
         }
         std::printf("  worst: the held mean %.0f%% off, the mean held %.0f%% (%.0f%% at 1.6 m and coarser)\n", 100.0 * WorstOld, 100.0 * WorstNew, 100.0 * WorstNewCoarse);
+        Check(WorstFar < 0.15, "past the clipmap (W6e): the sea state's held mean within 15% of the fine surface's mean foam", WorstFar, 0.15);
         Check(WorstNewCoarse < 0.3, "a coarse texel's foam holds the fine surface's mean of the held foam (30%)", WorstNewCoarse, 0.3);
         Check(WorstNew < WorstOld, "nearer than the held mean (W3z to W5g)", WorstNew, WorstOld);
     }

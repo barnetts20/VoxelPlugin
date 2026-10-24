@@ -1,4 +1,5 @@
 #include "VoxelOceanWavesFFT.h"
+#include "VoxelOceanResolvedShare.h"
 #include "VoxelOceanShoreCore.h"
 #include "Misc/ScopeLock.h"
 
@@ -131,6 +132,20 @@ FVoxelOceanWavesFFT::FVoxelOceanWavesFFT(const FVoxelOceanFFTSettings& InSetting
     // The slots' height deviations (m): the breaking's (stage O8).
     for (int32 Slot = 0; Slot < SlotCount; Slot++)
         C[24 + Slot] = (float)SlotSigma[Slot];
+
+    // Stage W6b: each slot's share of its slope variance its lookups keep per mip (the GPU's box mips
+    // and trilinear lookups, from its modes; VoxelOceanResolvedShare.h), for the unresolved
+    // roughness at any footprint (VoxelOceanSlotUnresolved).
+    // The clipmap's texels' second set (their grid's own bilinear lookup on top), from row
+    // VOXEL_OCEAN_TABLE_CLIP_ROW (VoxelOceanSlotUnresolvedClip).
+    static_assert(VOXEL_OCEAN_TABLE_RESOLVED_TEXELS == 2 * SlotCount * ResolvedMips && VOXEL_OCEAN_RESOLVED_MIPS == ResolvedMips
+        && VOXEL_OCEAN_TABLE_CLIP_ROW == VOXEL_OCEAN_TABLE_RESOLVED_ROW + SlotCount * ResolvedMips, "the resolved shares' rows must match the shaders'");
+    for (int32 Slot = 0; Slot < SlotCount; Slot++)
+    {
+        const FResolvedShare Share = ResolvedShareOf(Slots[Slot]);
+        PackResolvedRows(Share, Constants.Resolved + 4 * ResolvedMips * Slot);
+        PackClipRows(Share, Constants.Resolved + 4 * ResolvedMips * (SlotCount + Slot));
+    }
 
     // The reach, at the reach's wind; shoaled waves grow (stage O8).
     MaxHeightCm = VOF::ReachSigmas * SigmaAt(FMath::Max(Settings.WindSpeed, 0.0)) * 100.0;

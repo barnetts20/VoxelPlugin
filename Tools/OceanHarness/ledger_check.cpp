@@ -17,6 +17,8 @@
 
 #include "VoxelShaderCompat.h"
 #include "ocean_fft_emulation.h"
+#include "VoxelOceanResolvedShare.h"
+#include "VoxelOceanCharts.h"
 
 #include <algorithm>
 #include <cmath>
@@ -119,6 +121,8 @@ namespace
         double Texels = 0.0;
         double MinWavelength = 0.0;
         double VarX = 0.0, VarY = 0.0;  // the spectrum's (StatsOf)
+        double DrawX = 0.0, DrawY = 0.0; // the textures' own (one draw of the random spectrum)
+        FResolvedShare Table;           // stage W6b: the share each mip keeps (VoxelOceanResolvedShare.h)
         double Var() const { return VarX + VarY; }
     };
 
@@ -130,6 +134,23 @@ namespace
     {
         double V = 0.0;
         for (const FBand& B : Bands) V += B.Var() * (1.0 - Resolved(B.MinWavelength, Footprint));
+        return V;
+    }
+
+    // Stage W6b: the exact model's unresolved variance (the table at the lookup's lod), both axes;
+    // bClip: as the clipmap's texels hold it (their grid's bilinear lookup on top).
+    double ExactUnresolved(const std::vector<FBand>& Bands, double Footprint, bool bClip = false)
+    {
+        double V = 0.0;
+        for (const FBand& B : Bands)
+        {
+            const double L = LodOf(B, Footprint);
+            // (The draw's variance over time, as the shading's rows hold it: rho per axis.)
+            const double RX = B.Table.Drawn[0] / std::max(B.Table.Expected[0], 1e-30), RY = B.Table.Drawn[1] / std::max(B.Table.Expected[1], 1e-30);
+            const double SX = bClip ? ClipShareAt(B.Table, L, 0) : ResolvedShareAt(B.Table, L, 0);
+            const double SY = bClip ? ClipShareAt(B.Table, L, 1) : ResolvedShareAt(B.Table, L, 1);
+            V += B.VarX * RX * (1.0 - SX) + B.VarY * RY * (1.0 - SY);
+        }
         return V;
     }
 
@@ -172,8 +193,11 @@ namespace
     // The pixel's surface (VoxelOceanPixelClipDetailOf without the shore): the level pick for its
     // footprint, the two levels blended, the per-pixel detail where the clipmap is coarser. Out: the
     // slope and the roughness.
-    FSlope PixelAt(const std::vector<FBand>& Bands, const FClip& Clip, double Px, double Py, double Footprint, double& Rough)
+    FSlope PixelAt(const std::vector<FBand>& Bands, const FClip& Clip, double Px, double Py, double Footprint, double& Rough, bool bExact)
     {
+        auto Unresolved = [&](double F) { return bExact ? ExactUnresolved(Bands, F) : ModelUnresolved(Bands, F); };
+        // (W6b: the texels' normal's w as the clipmap holds it.)
+        auto TexelUnresolved = [&](double F) { return bExact ? ExactUnresolved(Bands, F, true) : ModelUnresolved(Bands, F); };
         const double Want = std::max(std::log2(Footprint / Clip.L0), 0.0);
         const int First = std::min(int(std::floor(Want)), Clip.Count - 1);
         const double Frac = Want - std::floor(Want);
@@ -181,13 +205,13 @@ namespace
         const FSlope A = ClipLevelAt(Bands, Clip, First, Px, Py);
         FSlope O = A;
         const double SA = Clip.L0 * std::ldexp(1.0, First);
-        Rough = Weight * ModelUnresolved(Bands, SA);
+        Rough = Weight * TexelUnresolved(SA);
         if (Weight < 1.0)
         {
             const FSlope B = ClipLevelAt(Bands, Clip, First + 1, Px, Py);
             O.X = Weight * A.X + (1 - Weight) * B.X;
             O.Y = Weight * A.Y + (1 - Weight) * B.Y;
-            Rough += (1 - Weight) * ModelUnresolved(Bands, 2.0 * SA);
+            Rough += (1 - Weight) * TexelUnresolved(2.0 * SA);
         }
         // The pick's spacing (VoxelOceanPixelClipFilteredOf): L0 2^(level + 1 - weight).
         const double Spacing = Clip.L0 * std::exp2(double(First) + 1.0 - Weight);
@@ -197,7 +221,7 @@ namespace
             const FSlope D = SumAt(Bands, Px, Py, Footprint), H = SumAt(Bands, Px, Py, Spacing);
             O.X += D.X - H.X;
             O.Y += D.Y - H.Y;
-            Rough = std::max(Rough - (ModelUnresolved(Bands, Spacing) - ModelUnresolved(Bands, Footprint)), 0.0);
+            Rough = std::max(Rough - (Unresolved(Spacing) - Unresolved(Footprint)), 0.0);
         }
         return O;
     }
@@ -212,6 +236,20 @@ namespace
         double Var() const { return VarX() + VarY(); }
         double MeanRough() const { return Rough / Count; }
     };
+
+    // A band's lookups' variance at Lod over the whole tile, stratified (one point at random in each
+    // of its texels: the variance without the random points' own noise).
+    FMoments Stratified(const FBand& B, double Lod)
+    {
+        std::mt19937 R(5);
+        std::uniform_real_distribution<double> Unit(0.0, 1.0);
+        const int N = B.Chain.N0;
+        FMoments Mo;
+        for (int j = 0; j < N; j++)
+            for (int i = 0; i < N; i++)
+                Mo.Add(Sample(B.Chain, Lod, (i + Unit(R)) / N, (j + Unit(R)) / N), 0.0);
+        return Mo;
+    }
 
     std::vector<FBand> MakeBands(double Wind, uint32_t Tick)
     {
@@ -233,6 +271,10 @@ namespace
             const FBandStats St = StatsOf(Slot);
             B.VarX = St.SlopeVarianceX;
             B.VarY = St.SlopeVarianceY;
+            B.Table = ResolvedShareOf(Slot);
+            for (size_t i = 0; i < B.Chain.X[0].size(); i++) { B.DrawX += double(B.Chain.X[0][i]) * B.Chain.X[0][i]; B.DrawY += double(B.Chain.Y[0][i]) * B.Chain.Y[0][i]; }
+            B.DrawX /= double(B.Chain.X[0].size());
+            B.DrawY /= double(B.Chain.Y[0].size());
         }
         // VoxelOceanBandMinWavelength: a band's shortest waves at the next band's lower edge (a
         // quarter of its tile), the last band's at four of its grid's samples.
@@ -309,6 +351,93 @@ int main()
         }
         std::printf("  worst: %+.1f%% at %.3g m\n", 100.0 * WorstLookup, WorstLookupAt);
 
+        // 1b. Stage W6b: the exact table (VoxelOceanResolvedShare.h) against the lookups.
+        std::printf("\n1b. The exact table (W6b) against the lookups: each band's share kept at the footprint's lod (x, y), the lookups' own over the textures' draw\n");
+        double WorstShare = 0.0, WorstExact = 0.0, WorstExactAt = 0.0, WorstDraw = 0.0;
+        for (size_t f = 0; f < Feet.size(); f++)
+        {
+            const double F = Feet[f];
+            double R = 0.0, UExact = 0.0, UDraw = 0.0, TotalDraw = 0.0;
+            char Line[256] = "";
+            for (int b = 0; b < 4; b++)
+            {
+                const FBand& B = Bands[b];
+                const FMoments Mo = Stratified(B, LodOf(B, F));
+                const double L = LodOf(B, F);
+                const double SX = ResolvedShareAt(B.Table, L, 0), SY = ResolvedShareAt(B.Table, L, 1);
+                const double MX = Mo.VarX() / B.DrawX, MY = Mo.VarY() / B.DrawY;
+                WorstShare = std::max({ WorstShare, std::abs(SX - MX) * B.DrawX / (B.DrawX + B.DrawY), std::abs(SY - MY) * B.DrawY / (B.DrawX + B.DrawY) });
+                std::snprintf(Line + std::strlen(Line), sizeof(Line) - std::strlen(Line), " %5.3f/%5.3f %5.3f/%5.3f |", SX, MX, SY, MY);
+                R += Mo.Var();
+                UExact += B.VarX * (1.0 - SX) + B.VarY * (1.0 - SY);
+                UDraw += B.DrawX * (1.0 - SX) + B.DrawY * (1.0 - SY);
+                TotalDraw += B.DrawX + B.DrawY;
+            }
+            const double Ledger = (R + UExact) / Total - 1.0, LedgerDraw = (R + UDraw) / TotalDraw - 1.0;
+            if (std::abs(Ledger) > std::abs(WorstExact)) { WorstExact = Ledger; WorstExactAt = F; }
+            WorstDraw = std::max(WorstDraw, std::abs(LedgerDraw));
+            if (f % 2 == 0) std::printf("  %8.3g m |%s ledger %+5.1f%% (the draw's own totals %+5.1f%%)\n", F, Line, 100.0 * Ledger, 100.0 * LedgerDraw);
+        }
+        std::printf("  (table/lookups, x then y, per band 0-3)\n");
+        std::printf("  worst: the exact model's ledger %+.1f%% at %.3g m (with the expectation's totals, as the shading's table holds them); with the draw's own %.2f%%\n",
+            100.0 * WorstExact, WorstExactAt, 100.0 * WorstDraw);
+        // (The rest: the table weighs the modes by the spectrum's expectation, the lookups by the
+        // draw's amplitudes.)
+        Check(WorstShare < 0.02, "the table's share within 0.02 of the lookups' at every footprint (each band's share of its variance, per axis)", WorstShare, 0.02);
+        Check(WorstDraw < 0.01, "the exact ledger within 1% at every footprint (the draw's totals)", WorstDraw, 0.01);
+
+        // 1c. The shaders' own reading of it: the table's rows as VoxelOceanWavesFFT.cpp packs them
+        // (PackResolvedRows) in a chart table, read by VoxelOceanBandUnresolved (VoxelOceanSeaState.ush,
+        // compiled here), each band's table variance (the expectation) times its share, against the
+        // textures' own totals.
+        {
+            VoxelOceanCharts::FTable Table = VoxelOceanCharts::Build(6.371e8);
+            const int CX = VoxelShader::VoxelOceanConstantsX(Table.N);
+            FLayoutSettings S;
+            S.PlanetSeed = 1234567u;
+            S.ShortWind = Wind;
+            const std::vector<FSlot> Slots = MakeSlots(S);
+            float Slope[8];
+            for (int k = 0; k < 8; k++)
+            {
+                const FBandStats St = StatsOf(Slots[k]);
+                Slope[k] = float(std::sqrt(St.SlopeVarianceX + St.SlopeVarianceY));
+                float Rows[4 * ResolvedMips];
+                PackResolvedRows(ResolvedShareOf(Slots[k]), Rows);
+                for (int m = 0; m < ResolvedMips; m++)
+                {
+                    float* P = Table.Texel(CX, VOXEL_OCEAN_TABLE_RESOLVED_ROW + ResolvedMips * k + m);
+                    for (int c = 0; c < 4; c++) P[c] = Rows[4 * m + c];
+                }
+            }
+            float* R0 = Table.Texel(CX, 0);
+            float* R1 = Table.Texel(CX, 1);
+            for (int c = 0; c < 4; c++) { R0[c] = Slope[c]; R1[c] = Slope[4 + c]; }
+            const VoxelShader::FVoxelOceanTableReader Reader = Table.Reader();
+            const int State = Wind <= 7.5 ? 0 : (Wind <= 14.0 ? 1 : 2);
+            const VoxelShader::float3 Long(State == 0 ? 1.0f : 0.0f, State == 1 ? 1.0f : 0.0f, State == 2 ? 1.0f : 0.0f);
+            double Worst = 0.0, WorstAt = 0.0;
+            for (size_t f = 0; f < Feet.size(); f++)
+            {
+                const double F = Feet[f];
+                double R = 0.0, U = 0.0, TotalDraw = 0.0;
+                for (int b = 0; b < 4; b++)
+                {
+                    const FBand& B = Bands[b];
+                    const FMoments Mo = Stratified(B, LodOf(B, F));
+                    R += Mo.Var();
+                    U += B.Var() * double(VoxelShader::VoxelOceanBandUnresolved(Reader, Table.N, Long, b, float(LodOf(B, F)), false));
+                    TotalDraw += B.DrawX + B.DrawY;
+                }
+                const double Ledger = (R + U) / TotalDraw - 1.0;
+                if (std::abs(Ledger) > std::abs(Worst)) { Worst = Ledger; WorstAt = F; }
+            }
+            std::printf("\n1c. The shaders' reading (VoxelOceanBandUnresolved on the packed rows): the ledger's worst %+.2f%% at %.3g m\n", 100.0 * Worst, WorstAt);
+            // (The table holds the draw's variance over time; the textures at one time differ by their
+            // modes' beats, a percent or so for the long bands' few dominant modes.)
+            Check(std::abs(Worst) < 0.02, "the shaders' exact ledger within 2% at every footprint (against the textures' totals at one time)", std::abs(Worst), 0.02);
+        }
+
         // 4. The axes.
         std::printf("\n4. The axes: the unresolved variance along (x) and across (y) the wind (the shading takes half the sum for each)\n");
         for (size_t f = 0; f < Feet.size(); f += 4)
@@ -322,27 +451,36 @@ int main()
         std::printf("\n2. The clipmap's chain at the pixel (first level %.0f cm, %d levels; the outermost's spacing %.1f m)\n", 100.0 * Clip.L0, Clip.Count,
             Clip.L0 * std::ldexp(1.0, Clip.Count - 1));
         std::printf("  %10s | %8s %8s %8s | %7s | %s\n", "footprint", "resolved", "rough", "sum", "ledger", "(resolved as the bands' own lookups at the footprint would hold it)");
-        const int MP = 2500;
-        double WorstClip = 0.0, WorstClipAt = 0.0, WorstNear = 0.0;
+        const int MP = 12000;
+        double WorstClip = 0.0, WorstClipAt = 0.0, WorstNear = 0.0, WorstClipExact = 0.0;
+        double TotalDrawn = 0.0;
+        for (const FBand& B : Bands) TotalDrawn += B.DrawX + B.DrawY;
         for (size_t f = 0; f < Feet.size(); f++)
         {
             const double F = Feet[f];
-            FMoments Mo;
+            FMoments Mo, Ex;
             for (int n = 0; n < MP; n++)
             {
                 const double Px = 1.0e5 * Unit(Rng), Py = 1.0e5 * Unit(Rng);
-                double Rough = 0.0;
-                const FSlope S = PixelAt(Bands, Clip, Px, Py, F, Rough);
+                double Rough = 0.0, RoughExact = 0.0;
+                const FSlope S = PixelAt(Bands, Clip, Px, Py, F, Rough, false);
                 Mo.Add(S, Rough);
+                PixelAt(Bands, Clip, Px, Py, F, RoughExact, true);
+                Ex.Add(S, RoughExact);
             }
+            const double LedgerExact = (Ex.Var() + Ex.MeanRough()) / TotalDrawn - 1.0;
+            WorstClipExact = std::max(WorstClipExact, std::abs(LedgerExact));
             double Own = 0.0;
             for (int b = 0; b < 4; b++) Own += ResolvedShare[b][f] * Bands[b].Var();
             const double Ledger = (Mo.Var() + Mo.MeanRough()) / Total - 1.0;
             if (std::abs(Ledger) > std::abs(WorstClip)) { WorstClip = Ledger; WorstClipAt = F; }
             if (F <= Clip.L0 * std::ldexp(1.0, Clip.Count - 1)) WorstNear = std::max(WorstNear, std::abs(Ledger));
-            std::printf("  %8.3g m | %8.5f %8.5f %8.5f | %+6.1f%% | %8.5f\n", F, Mo.Var(), Mo.MeanRough(), Mo.Var() + Mo.MeanRough(), 100.0 * Ledger, Own);
+            std::printf("  %8.3g m | %8.5f %8.5f %8.5f | %+6.1f%% | %8.5f | W6b: rough %8.5f, ledger %+5.1f%%\n", F, Mo.Var(), Mo.MeanRough(), Mo.Var() + Mo.MeanRough(), 100.0 * Ledger, Own,
+                Ex.MeanRough(), 100.0 * LedgerExact);
         }
-        std::printf("  worst: %+.1f%% at %.3g m\n", 100.0 * WorstClip, WorstClipAt);
+        std::printf("  worst: %+.1f%% at %.3g m; with W6b's exact model %.1f%% (against the textures' totals)\n", 100.0 * WorstClip, WorstClipAt, 100.0 * WorstClipExact);
+        // (The pixels' 12000 points at random: 1.3% of noise in the resolved variance.)
+        Check(WorstClipExact < 0.04, "the clipmap's chain at the pixel with W6b's model: the ledger within 4% at every footprint", WorstClipExact, 0.04);
 
         // 3. Past the outermost level's spacing: one lookup of its texels per pixel, however many
         // texels the pixel covers. Its resolved variance is the level's, as noise over the pixels.

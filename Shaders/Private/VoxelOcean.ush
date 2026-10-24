@@ -439,7 +439,7 @@ float3 VoxelOceanPixelFFTBed(FMaterialPixelParameters Parameters, float3 SampleP
     const uint Mask = VOXEL_OCEAN_LOOKUP_ALL | VOXEL_OCEAN_LOOKUP_FOAM;
     const FVoxelOceanFFTPoint Pt = VoxelOceanFFTEvaluate(In.P, In.Up, In.Spacing, In.Footprint, In.Depth, In.Shore, Waves,
         Displacement, DisplacementSampler, Derivatives, DerivativesSampler, Charts, FoamMap, FoamMapSampler, Mask);
-    const FVoxelOceanWaveOutput Out = VoxelOceanFFTOutput(Pt, In, Waves, Mask);
+    const FVoxelOceanWaveOutput Out = VoxelOceanFFTOutput(Pt, In, Waves, Mask, Charts);
     SlopeVariance = Out.SlopeVariance;
     Foam = Out.Foam;
     return Out.Normal;
