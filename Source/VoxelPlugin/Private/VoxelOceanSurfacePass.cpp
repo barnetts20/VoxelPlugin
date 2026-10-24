@@ -22,7 +22,7 @@ DECLARE_GPU_STAT(VoxelOceanSurface);
 
 static TAutoConsoleVariable<int32> CVarVoxelOceanDebugFoam(
     TEXT("voxel.Ocean.DebugFoam"), 0,
-    TEXT("The ocean's own pass (stage W3f): 1 the foam's density (grey), 2 its structure (the lace drawn for the density), 3 the structure's layers (with a foam set, stage W3g: red the lace, green the streaks, blue the whitecaps; with the procedural lace: red the streaks, green the lace, blue the bubbles), 4 the whitecaps' density (stage W3h: the breaking now), 5 where the foam is the pixel's own (stage W3u: green, FoamDetail) or the wave clipmap's (red); its layers apart (stage W5f): 6 the clipmap's buffer, 7 the fine history (green) over its share (red), 8 the pixel's fresh foam, 9 the surf's foam at the pixel, 10 the fine cascade's foam at the pixel, 11 the clipmap's drawn foam. 0 off."),
+    TEXT("The ocean's own pass (stage W3f): 1 the foam's density (grey), 2 its structure (the lace drawn for the density), 3 the structure's layers (with a foam set, stage W3g: red the lace, green the streaks, blue the whitecaps; with the procedural lace: red the streaks, green the lace, blue the bubbles), 4 the whitecaps' density (stage W3h: the breaking now), 5 where the foam is the pixel's own (stage W3u: green, FoamDetail) or the wave clipmap's (red); its layers apart (stage W5f): 6 the clipmap's buffer, 7 the fine history (green) over its share (red), 8 the pixel's fresh foam, 9 the surf's foam at the pixel, 10 the fine cascade's foam at the pixel, 11 the clipmap's drawn foam; 12 the clipmap level the pixel reads (stage W5h: a hue per octave). 0 off."),
     ECVF_RenderThreadSafe);
 
 namespace VoxelOceanSurfacePassDetail

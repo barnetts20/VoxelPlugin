@@ -8,6 +8,14 @@
 // the next face's edge cell). A region is sea when it holds at least MinShare of all the
 // below-sea cells; the largest always is. An apron cell takes the bit of the interior cell holding
 // its centre, so a face's own reads (the shore field's seeds) see its neighbours' flags.
+//
+// Stage W5l, THE BRIDGE: a below-sea region within BridgeCells steps of the sea (4-connected steps
+// through any cells, land included) is sea too. The bake's heights are one sample a cell, so a bay
+// or a fjord whose mouth is narrower than a cell (or whose cells there sample the walls) came out cut
+// off from the sea: an "inland basin", which the ocean drains (its surface sunk by its depth over
+// the basins' margin: a wall of water across the bay) and culls past it. A true inland basin lies
+// farther from the sea than that; one closer is taken as sea (better a basin flooded at the sea's
+// level than a bay drained).
 
 #pragma once
 
@@ -68,7 +76,7 @@ namespace VoxelLandSea
 
     /** Sets Bit in Attr on the sea-connected cells and clears it elsewhere. Height and Attr: 6 faces
      *  of (N + 2 Pad)^2 cells (the bake's layout). */
-    inline FStats Mark(int N, int Pad, const float* Height, uint16_t* Attr, uint16_t Bit, double MinShare)
+    inline FStats Mark(int N, int Pad, const float* Height, uint16_t* Attr, uint16_t Bit, double MinShare, int BridgeCells = 3)
     {
         FStats Stats;
         if (N <= 0 || !Height || !Attr) return Stats;
@@ -142,6 +150,48 @@ namespace VoxelLandSea
             if (double(Size[size_t(r)]) >= MinShare * double(Below)) IsSea[size_t(r)] = 1;
         }
         if (Largest >= 0) IsSea[size_t(Largest)] = 1;
+        // Stage W5l: the bridge (above), until no region joins (a joined one bridges on).
+        if (BridgeCells > 0)
+        {
+            std::vector<int> Steps(size_t(Cells), -1);
+            for (int Pass = 0; Pass < 8; Pass++)
+            {
+                std::fill(Steps.begin(), Steps.end(), -1);
+                Queue.clear();
+                for (int Cell = 0; Cell < Cells; Cell++)
+                    if (Label[size_t(Cell)] >= 0 && IsSea[size_t(Label[size_t(Cell)])])
+                    {
+                        Steps[size_t(Cell)] = 0;
+                        Queue.push_back(Cell);
+                    }
+                bool bJoined = false;
+                for (size_t Head = 0; Head < Queue.size(); Head++)
+                {
+                    const int Cell = Queue[Head];
+                    if (Steps[size_t(Cell)] >= BridgeCells) continue;
+                    const int F = Cell / (N * N), J = (Cell / N) % N, I = Cell % N;
+                    const int Next[4] = {
+                        I + 1 < N ? Cell + 1 : Across[size_t(F * 4 + 0) * N + J],
+                        I > 0 ? Cell - 1 : Across[size_t(F * 4 + 1) * N + J],
+                        J + 1 < N ? Cell + N : Across[size_t(F * 4 + 2) * N + I],
+                        J > 0 ? Cell - N : Across[size_t(F * 4 + 3) * N + I] };
+                    for (int E = 0; E < 4; E++)
+                    {
+                        const int Other = Next[E];
+                        if (Steps[size_t(Other)] >= 0) continue;
+                        Steps[size_t(Other)] = Steps[size_t(Cell)] + 1;
+                        Queue.push_back(Other);
+                        const int L = Label[size_t(Other)];
+                        if (L >= 0 && !IsSea[size_t(L)])
+                        {
+                            IsSea[size_t(L)] = 1;
+                            bJoined = true;
+                        }
+                    }
+                }
+                if (!bJoined) break;
+            }
+        }
         for (unsigned char Sea : IsSea)
         {
             if (Sea) Stats.SeaRegions++;

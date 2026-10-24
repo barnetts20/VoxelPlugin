@@ -330,7 +330,9 @@ int main()
             }
             AtZero = std::max(AtZero, std::abs(double(VoxelOceanSurfOf(Input(Beach, 0.0005, T), S).Height) - VoxelOceanSurfOf(Input(Beach, -0.0005, T), S).Height));
         }
-        Check(Step < 0.06, "no step over 10 cm along the beach (1.5 m up to 2.5 m deep, 300 s)", Step, 0.06);
+        // (Stage W5i: 0.065, was 0.06: the bores run on to the mean shoreline, their fronts steepest
+        // in its last few centimetres of depth.)
+        Check(Step < 0.065, "no step over 10 cm along the beach (1.5 m up to 2.5 m deep, 300 s)", Step, 0.065);
         Check(AtZero < 0.002, "across the still level", AtZero, 0.002);
         double Wrap = 0.0;
         for (int i = 0; i < 200; i++)
@@ -363,10 +365,11 @@ int main()
         Check(Hi - Lo > 0.2, "the shoreline's level swings (run-up and run-down)", Hi - Lo, 0.2);
         Check(Sum / Count > 0.02, "its mean stands above the still level (setup)", Sum / Count, 0.02);
         Check(Hi < 0.5 * 10.0 * 0.05 * 2.0 + 0.3 * 1.5 * 1.3 + 0.01, "within the reach's hold and the setup's cap", Hi, 0.5 * 10.0 * 0.05 * 2.0 + 0.3 * 1.5 * 1.3);
-        // Far up the beach (past three reaches): the still level.
+        // Far up the beach (past three reaches from the mean shoreline, stage W5i: the setup's
+        // shoreline, up to 0.3 Hs above the still level's, 9 m up this beach): the still level.
         double Far = 0.0;
         for (int k = 0; k < 600; k++)
-            Far = std::max(Far, std::abs(double(VoxelOceanSurfOf(Input(Steep, -35.0, 1.0f * k), S).Height)));
+            Far = std::max(Far, std::abs(double(VoxelOceanSurfOf(Input(Steep, -40.0, 1.0f * k), S).Height)));
         Check(Far == 0.0, "past three reaches up the beach: the still level", Far, 0.0);
         // The bores reach the swash: the shoreline's level rises with the crests (correlated with
         // the sea's surface a little offshore, a lag later).
@@ -649,6 +652,29 @@ int main()
             std::printf("  %s: highest %.2f m for Hs 2 m (bound %.2f m)\n", Strong ? "strength and swash 2" : "defaults", Highest, Bound);
             Check(Highest < Bound, "within the surf's bound (VoxelOceanSurfMaxHeight, the model's reach)", Highest, Bound);
         }
+    }
+
+    std::printf("\n== the mean shoreline (stage W5i): ground under the setup's water is sea, not beach\n");
+    {
+        // A point 3 cm above the still level on a 1:50 beach, under the setup: the bores run over it
+        // (its surface moves along the beach) rather than the swash's flat sheet standing on it.
+        const FBeach Flat(0.02);
+        const FVoxelOceanSurfSettings SS = Settings(1.0f, 0.85f, 0.33f, 1.0f, 1000.0f, 0.2f, 0.5f, 1.0f);
+        double Structure = 0.0;
+        for (int k = 0; k < 200; k++)
+        {
+            double M1 = 0.0, M2 = 0.0;
+            for (int j = -10; j <= 10; j++)
+            {
+                const double H = VoxelOceanSurfOf(Input(Flat, -0.03 / 0.02 + 0.1 * j, 100.0f + 0.1f * k, 4.0f, 10.0f), SS).Height;
+                M1 += H; M2 += H * H;
+            }
+            M1 /= 21.0;
+            Structure += std::sqrt(std::max(M2 / 21.0 - M1 * M1, 0.0));
+        }
+        Structure /= 200.0;
+        std::printf("  3 cm above the still level (Hs 4, swash 0.33): the surface's deviation across 2 m %.4f m\n", Structure);
+        Check(Structure > 0.002, "the bores run on over it (not the sheet's flat level)", Structure, 0.002);
     }
 
     std::printf("\n== the felt depth at the coast (stage W5e; VoxelOceanSurfFeltDepth)\n");

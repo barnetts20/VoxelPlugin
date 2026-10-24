@@ -100,6 +100,41 @@ VOXEL_FUNC float VoxelOceanFoamSourceSpread(float J, float Sigma, float Whitecap
     return max(D * Cdf + Sigma * Pdf, 0.0f);
 }
 
+// Stage W5h: THE TEXEL'S MEAN OF THE HELD FOAM. The foam at a point is held at 1 (its steady state
+// min(Gain Source, 1): Gain the rule's Grow / Decay, FreshGain, 26 at Godot's amount 8 with no
+// ramp), so a texel's mean foam is the mean of the held foam over the surface it covers, not the
+// held mean: min(Gain E[s], 1) whitens a whole coarse texel wherever a few of its points break, and
+// more so the coarser the texel (each clipmap level out: a step in the foam at each level's edge, a
+// smear far off). The source a texel steps with is that mean over Gain: with Y = Whitecap - J' and
+// J' Gaussian about J (deviation Sigma), T = 1 / Gain,
+//   E[min(Gain Y+, 1)] = Gain E[Y; 0 < Y < T] + P(Y > T),
+//   E[Y; 0 < Y < T] = D (Phi(b) - Phi(a)) + Sigma (phi(a) - phi(b)), a = -D / Sigma, b = (T - D) / Sigma.
+// Where the texel resolves its compression (Sigma Gain small) the free mean: a resolved crest far past
+// the threshold fills its texel at once, as Godot's (the held one would fill it over the decay time).
+// The two blend over Sigma Gain from 0.5 to 2.
+VOXEL_FUNC float VoxelOceanFoamCdf(float Z)
+{
+    return 0.5f + 0.5f * tanh(0.7978845608f * (Z + 0.044715f * Z * Z * Z));
+}
+
+VOXEL_FUNC float VoxelOceanFoamSourceHeld(float J, float Sigma, float Whitecap, float Gain)
+{
+    const float Free = VoxelOceanFoamSourceSpread(J, Sigma, Whitecap);
+    if (Whitecap <= 0.0f || Gain <= 0.0f || Sigma <= 1.0e-4f) return Free;
+    const float D = Whitecap - J;
+    const float T = 1.0f / Gain;
+    const float A = clamp(-D / Sigma, -8.0f, 8.0f);
+    const float B = clamp((T - D) / Sigma, -8.0f, 8.0f);
+    const float CdfA = VoxelOceanFoamCdf(A);
+    const float CdfB = VoxelOceanFoamCdf(B);
+    const float PdfA = 0.3989422804f * exp(-0.5f * A * A);
+    const float PdfB = 0.3989422804f * exp(-0.5f * B * B);
+    const float Linear = max(D * (CdfB - CdfA) + Sigma * (PdfA - PdfB), 0.0f);
+    const float Held = (Gain * Linear + (1.0f - CdfB)) * T;
+    const float W = saturate((Sigma * Gain - 0.5f) * (1.0f / 1.5f));
+    return Free + (min(Held, Free) - Free) * W;
+}
+
 // One step: Keep = e^(-Decay dt), GrowDt = (Grow / Decay) (1 - Keep) (the exact step's growth per
 // unit of source; Grow dt to first order, Godot's); Source the open sea's compression past the
 // threshold plus the surf's foam (0 to 1). Within 0 and VOXEL_OCEAN_FOAM_MAX.

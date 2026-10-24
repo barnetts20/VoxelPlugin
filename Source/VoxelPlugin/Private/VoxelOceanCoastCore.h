@@ -196,6 +196,8 @@ namespace VoxelOceanCoastCore
     /** The bake cells near a coast and how fine their tiles are. Shore: the shore field's texels
      *  (VoxelOceanShore.ush, 6 Side^2) and its reach; Height: the land bake's heights (m, the same
      *  layout).
+     *  - (Stage W5k: tolerant: 2.5 cells, two cells round, a cell whose neighbourhood holds both
+     *    low ground and shallow water, a ring round every one chosen.)
      *  - A bake cell gets a tile at the coast (within 1.5 cells of it); on the sea side within
      *    Reach where some water nearby is shallower than 1.5 SeedDepth (the bake's heights are
      *    cell means: past that no fine cell is near the seed depth); on the land side within
@@ -233,22 +235,56 @@ namespace VoxelOceanCoastCore
                 for (int I = 0; I < N; I++)
                 {
                     const double D = Distance(Face, I, J);
+                    // (Stage W5k: tolerant, better a tile too many than one missing: the bake's
+                    // heights are cell means, and a coast finer than a cell, or bent across one,
+                    // left a coastal cell without a tile (the shore's trains stopped at its edge).
+                    // Two cells round instead of one, the coast's band 2.5 cells instead of 1.5,
+                    // any cell whose neighbourhood holds both ground near the sea's level and
+                    // shallow water, and below a ring round every chosen cell.)
                     double Lowest = 1.0e30, Highest = -1.0e30;
-                    for (int dj = -1; dj <= 1; dj++)
-                        for (int di = -1; di <= 1; di++)
+                    for (int dj = -2; dj <= 2; dj++)
+                        for (int di = -2; di <= 2; di++)
                         {
                             // The apron's cells hold the neighbouring face's heights.
                             const double H = HeightAt(Face, I + di, J + dj);
                             Lowest = std::min(Lowest, H);
                             Highest = std::max(Highest, H);
                         }
-                    const bool bCoast = std::fabs(D) < 1.5 * Cell;
+                    const bool bCoast = std::fabs(D) < 2.5 * Cell;
                     const bool bSea = D > 0.0 && D < ReachM + 1.5 * Cell && Highest > -1.5 * Settings.SeedDepthM;
                     const bool bLowland = D <= 0.0 && D > -Settings.LandReachM && Lowest < Settings.LowLandM;
-                    if (bCoast || bSea || bLowland)
+                    // (Not deep inland: land is crossed at the floor's slowness, and tiles far up it
+                    // let rays come round to the shore across it, from the wrong side.)
+                    const bool bStraddle = D > -2.5 * Cell && D < ReachM + 1.5 * Cell && Lowest < Settings.LowLandM && Highest > -1.5 * Settings.SeedDepthM;
+                    if (bCoast || bSea || bLowland || bStraddle)
                         Candidates.push_back({ float(std::fabs(D)), (Face * N + J) * N + I });
                 }
         if (Candidates.empty()) return P;
+        // Stage W5k: a ring of one cell round every candidate (within the faces; the aprons past
+        // their edges follow below), after them in the order (a cell farther than its neighbour).
+        {
+            std::vector<uint8_t> Chosen(size_t(6) * size_t(N) * size_t(N), 0);
+            for (const FCandidate& C : Candidates) Chosen[size_t(C.Cell)] = 1;
+            const size_t Before = Candidates.size();
+            for (size_t k = 0; k < Before; k++)
+            {
+                const int Cell0 = Candidates[k].Cell;
+                const int Face = Cell0 / (N * N), J = (Cell0 / N) % N, I = Cell0 % N;
+                for (int dj = -1; dj <= 1; dj++)
+                    for (int di = -1; di <= 1; di++)
+                    {
+                        const int I1 = I + di, J1 = J + dj;
+                        if (I1 < 0 || J1 < 0 || I1 >= N || J1 >= N) continue;
+                        const int Cell1 = (Face * N + J1) * N + I1;
+                        if (Chosen[size_t(Cell1)]) continue;
+                        // (The sea's side and the coast's band only: not up the land, as above.)
+                        const double D1 = Distance(Face, I1, J1);
+                        if (D1 < -2.5 * Cell) continue;
+                        Chosen[size_t(Cell1)] = 1;
+                        Candidates.push_back({ float(std::fabs(D1)) + float(Cell), Cell1 });
+                    }
+            }
+        }
         std::stable_sort(Candidates.begin(), Candidates.end(), [](const FCandidate& A, const FCandidate& B) { return A.Distance < B.Distance; });
         std::vector<uint8_t> Selected(size_t(6) * size_t(N) * size_t(N), 0);
         // The tiles of the first Count candidates.
@@ -830,6 +866,10 @@ namespace VoxelOceanCoastCore
                         B = ResampleAt(P, V, D);
                     }
                 }
+            // Stage W5k: the cells next to a gap (toward a bake cell without a tile), the block's
+            // set cells as they were before the gaps grow.
+            std::vector<uint8_t> WasSet(Block.size(), 0);
+            for (size_t b = 0; b < Block.size(); b++) WasSet[b] = Block[b].bSet ? 1 : 0;
             // Gaps (toward cells without a tile): grown from their set neighbours.
             for (int Pass = 0; Pass < 2 * Stride; Pass++)
             {
@@ -869,6 +909,29 @@ namespace VoxelOceanCoastCore
                     }
                 Block.swap(Next);
                 if (!bAny) break;
+            }
+            // Stage W5k: THE COVER ENDS AT NOTHING AT A TILE'S EDGE. A point in a bake cell without a
+            // tile has no field (cover 0), but the cover a tile's samples interpolate (Catmull-Rom over
+            // its cells and its grown apron, untrusted) still stood near a half at its edge: the
+            // shore's trains (their waves and foam) stopped there in a straight line, a cliff in the
+            // mesh. The tile's own cells within EdgeCells of such a gap are untrusted too, so the
+            // cover falls to 0 inside the tile, before its edge.
+            {
+                constexpr int EdgeCells = 2;
+                std::vector<uint8_t> NearGap(Block.size(), 0);
+                for (int y = 0; y < Stride; y++)
+                    for (int x = 0; x < Stride; x++)
+                    {
+                        if (WasSet[size_t(y) * Stride + x]) continue;
+                        for (int dy = -EdgeCells; dy <= EdgeCells; dy++)
+                            for (int dx = -EdgeCells; dx <= EdgeCells; dx++)
+                            {
+                                const int X1 = x + dx, Y1 = y + dy;
+                                if (X1 >= 0 && Y1 >= 0 && X1 < Stride && Y1 < Stride) NearGap[size_t(Y1) * Stride + X1] = 1;
+                            }
+                    }
+                for (size_t b = 0; b < Block.size(); b++)
+                    if (NearGap[b]) Block[b].Trust = 0.0f;
             }
             // The tile's ranges, then its codes.
             float MinA = std::numeric_limits<float>::infinity(), MaxA = -MinA, MinB = MinA, MaxB = -MinA;

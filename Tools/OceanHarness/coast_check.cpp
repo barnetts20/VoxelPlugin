@@ -196,7 +196,10 @@ int main()
         std::printf("  %d points 2.5 m deep to a fifth of the deep wavelength: worst %.2f%% (%.0f s, %.1f m deep, bearing %.2f)\n", Points, Worst * 100.0, WorstT, WorstD, WorstTheta);
         // 7%: the series' 4% at a fifth of the deep wavelength (VoxelOceanCoast.ush), and up to
         // 6% from the grid within 2.5 to 4 m of depth on the 1:30 beach (57 m cells).
-        Check(Points > 500 && Worst < 0.07, "the crests are spaced at the local wavelength (7%)", Worst, 0.07);
+        // (Stage W5k: 8%, was 7%: the tolerant selection's more tiles take this small planet's
+        // atlas from 64 fine cells a tile to 63, 58.4 m cells against 57.5, and the worst point (a
+        // 14 s swell 2.9 m deep) goes from 6.1% to 7.5%; the old selection at 63 gives the same.)
+        Check(Points > 500 && Worst < 0.08, "the crests are spaced at the local wavelength (8%)", Worst, 0.08);
         Check(WorstAngle < 4.0, "the rays run shoreward, normal to a round coast (degrees)", WorstAngle, 4.0);
         Check(WorstFD < 0.03, "the phase's change along the ray is its gradient's (3%)", WorstFD, 0.03);
     }
@@ -346,6 +349,47 @@ int main()
             }
         }
         Check(DeepPoints > 50 && DeepCover < 0.05, "20 m past the seed depth the cover is gone", DeepCover, 0.05);
+    }
+
+    std::printf("\n7. The cover at a tile's edge toward a cell without one (stage W5k): it falls to nothing\n"
+                "   inside the tile (the shore's trains stopped at the cell's edge, a step of about a half)\n");
+    {
+        double WorstStep = 0.0, AtEdge = 0.0;
+        int Edges = 0;
+        for (int t = 0; t < P.InteriorTiles && Edges < 400; t++)
+        {
+            const VoxelOceanCoastCore::FTile& T = P.Tiles[size_t(t)];
+            if (T.I < 3 || T.J < 3 || T.I >= N - 3 || T.J >= N - 3) continue;
+            static const int Dir4[4][2] = { { 1, 0 }, { 0, 1 }, { -1, 0 }, { 0, -1 } };
+            for (int e = 0; e < 4; e++)
+            {
+                const int I1 = T.I + Dir4[e][0], J1 = T.J + Dir4[e][1];
+                if (P.TileOf[size_t(VoxelOceanCoastCore::IndexTexel(N, T.Face, I1, J1))] >= 0) continue;
+                // From the tile's centre to the neighbour's, along fine cells.
+                double Prev = -1.0;
+                const double R = double(P.R);
+                for (int k = 0; k <= 400; k++)
+                {
+                    const double F = double(k) / 400.0;
+                    const double FU = (T.I + 0.5 + Dir4[e][0] * F) * R - 0.5, FV = (T.J + 0.5 + Dir4[e][1] * F) * R - 0.5;
+                    const double S = -1.0 + (2.0 * FU + 1.0) / (double(N) * R), Tt = -1.0 + (2.0 * FV + 1.0) / (double(N) * R);
+                    // The face's point at (s, t) (equal-angle): the cube coordinates by tan.
+                    double D[3];
+                    VoxelOceanCoastCore::DirOfTan(T.Face, std::tan(0.25 * 3.14159265358979 * S), std::tan(0.25 * 3.14159265358979 * Tt), D);
+                    const double C = SampleAt({ D[0], D[1], D[2] }).Cover;
+                    if (Prev >= 0.0) WorstStep = std::max(WorstStep, std::abs(C - Prev));
+                    if (k == 200) AtEdge = std::max(AtEdge, C);
+                    Prev = C;
+                }
+                Edges++;
+            }
+        }
+        // (Its slope per fine cell: the trust a bit per cell, Catmull-Rom between, so the cover
+        // falls over a fine cell or two; before W5k it fell by about a half at the edge itself.)
+        const double Slope = WorstStep * 400.0 / double(P.R);
+        std::printf("  %d edges: the cover at the edge at most %.3f, its steepest fall %.2f a fine cell (%.0f m)\n", Edges, AtEdge, Slope, P.CellM);
+        Check(Edges > 10 && AtEdge < 0.02, "nothing at a tile's edge toward a cell without one", AtEdge, 0.02);
+        Check(Slope < 1.5, "falling over a fine cell or more, no step", Slope, 1.5);
     }
 
     std::printf("\n%s: %d failure(s)\n", Fails ? "FAILED" : "PASSED", Fails);

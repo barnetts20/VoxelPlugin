@@ -1232,7 +1232,9 @@ FVoxelOceanFFTPoint VoxelOceanFFTEvaluate(float3 P, float3 Up, float Spacing, fl
         // (Stage W5g: over the surf's breaking zone too: every water the open sea's rule, the zone
         // choosing only the foam's linger, VoxelOceanFoamStepSurf. Until W5g its share was taken out
         // there, the bores' foam in its place: the foam's character changed across the zone's edge.)
-        Out.FoamSource = Drain.Keep * VoxelOceanFoamSourceSpread(J, SigmaJ, Row16.z);
+        // (Stage W5h: the mean of the held foam over the footprint, VoxelOceanFoamSourceHeld: the held
+        // mean whitened coarse texels about 4 times over at Godot's gain, more each level out.)
+        Out.FoamSource = Drain.Keep * VoxelOceanFoamSourceHeld(J, SigmaJ, Row16.z, FreshGain);
         Out.SurfBreaking = Surf.Surf.Active > 0.5f ? Drain.Keep * saturate(Surf.Surf.Breaking) * saturate(Row16.y) : 0.0f;
         const float Fresh = VoxelOceanFoamFresh(Out.FoamSource, FreshGain);
         Out.Foam = VoxelOceanFoamDrawn(max(Fresh, Out.SurfFoam * VOXEL_OCEAN_FOAM_MAX) + Out.FineFoam);

@@ -325,6 +325,86 @@ int main()
         std::printf("  (the hard rule on a texel's own J errs up to %.0f%%)\n", 100.0 * WorstHard);
     }
 
+    std::printf("\n3d. A coarse texel's held foam (stage W5h; VoxelOceanFoamSourceHeld): the mean of the fine surface's\n"
+                "    steady foam min(Gain s, 1) over the texel, at the Godot preset (height x2.83, whitecap 0.5, chop 1, gain of\n"
+                "    amount 8 without a ramp), against min(Gain E[s], 1) (W3z to W5g: the held mean)\n");
+    {
+        const double H = 2.83, C = 0.5;
+        const double Gain = VoxelOceanFoamGrowRate(8.0f) / VoxelOceanFoamDecayRate(8.0f);
+        double WorstOld = 0.0, WorstNew = 0.0, WorstNewCoarse = 0.0;
+        for (double U : { 10.0, 18.0 })
+        {
+            FLayoutSettings A = S;
+            A.ShortWind = U;
+            const std::vector<FSlot> Sl = MakeSlots(A);
+            double Wt[3];
+            StateWeights(U, Wt);
+            const int K = U <= 10.0 ? 1 : 2;
+            const int Use[4] = { 2 * K, 2 * K + 1, 6, 7 };
+            const uint32_t Tick = TickOf(141.0);
+            FGPUSlot G[4];
+            double Var[4], MinL[4];
+            for (int b = 0; b < 4; b++)
+            {
+                G[b] = EmulateGPU(Sl[Use[b]], Tick);
+                const FBandStats St = StatsOf(Sl[Use[b]]);
+                Var[b] = (St.SlopeVarianceX + St.SlopeVarianceY) * (b < 2 ? Wt[K] * Wt[K] : 1.0) * H * H;
+                MinL[b] = b < 3 ? 0.25 * Sl[Use[b + 1]].Params.TileLength : Sl[Use[3]].Params.TileLength * 4.0 / SizeOfBand(3);
+            }
+            auto JAt = [&](double X, double Y, double& Jxx, double& Jyy, double& Jxy)
+            {
+                Jxx = Jyy = Jxy = 0.0;
+                for (int b = 0; b < 4; b++)
+                {
+                    const double L = Sl[Use[b]].Params.TileLength, Wb = (b < 2 ? Wt[K] : 1.0) * H;
+                    const F4 D = Bilinear(G[b].Derivatives, X / L * G[b].N, Y / L * G[b].N), Xd = Bilinear(G[b].Displacement, X / L * G[b].N, Y / L * G[b].N);
+                    Jxx += Wb * D.z; Jyy += Wb * D.w; Jxy += Wb * Xd.w;
+                }
+            };
+            std::printf("  %2.0f m/s:", U);
+            for (double F : { 0.4, 1.6, 6.4 })
+            {
+                const int M = std::min(128, std::max(8, int(std::lround(F / 0.05))));
+                double Unresolved = 0.0;
+                for (int b = 0; b < 4; b++) Unresolved += Var[b] * (1.0 - std::clamp(MinL[b] / (2.0 * F) - 1.0, 0.0, 1.0));
+                const float Sigma = float(VOXEL_OCEAN_FOAM_SPREAD_SCALE * std::sqrt(Unresolved));
+                std::mt19937 Rng(17);
+                std::uniform_real_distribution<double> Pos(0.0, 2.0e4);
+                double Truth = 0.0, Old = 0.0, New = 0.0;
+                const int Cells = F > 3.0 ? 60 : 200;
+                for (int c = 0; c < Cells; c++)
+                {
+                    const double X0 = Pos(Rng), Y0 = Pos(Rng);
+                    double Sxx = 0, Syy = 0, Sxy = 0, T = 0;
+                    for (int j = 0; j < M; j++)
+                        for (int i = 0; i < M; i++)
+                        {
+                            double Jxx, Jyy, Jxy;
+                            JAt(X0 + (i + 0.5) * F / M, Y0 + (j + 0.5) * F / M, Jxx, Jyy, Jxy);
+                            const double J = (1 + Jxx) * (1 + Jyy) - Jxy * Jxy;
+                            T += std::min(Gain * std::max(C - J, 0.0), 1.0);
+                            Sxx += Jxx; Syy += Jyy; Sxy += Jxy;
+                        }
+                    const double Inv = 1.0 / (double(M) * M);
+                    Sxx *= Inv; Syy *= Inv; Sxy *= Inv;
+                    const float JTexel = float((1 + Sxx) * (1 + Syy) - Sxy * Sxy);
+                    Truth += T * Inv;
+                    Old += std::min(Gain * double(VoxelOceanFoamSourceSpread(JTexel, Sigma, float(C))), 1.0);
+                    New += std::min(Gain * double(VoxelOceanFoamSourceHeld(JTexel, Sigma, float(C), float(Gain))), 1.0);
+                }
+                Truth /= Cells; Old /= Cells; New /= Cells;
+                std::printf("  %.1f m: truth %.3f, held mean %.3f, mean held %.3f (sigma x gain %.1f) |", F, Truth, Old, New, Sigma * Gain);
+                WorstOld = std::max(WorstOld, std::abs(Old - Truth) / std::max(Truth, 1e-9));
+                WorstNew = std::max(WorstNew, std::abs(New - Truth) / std::max(Truth, 1e-9));
+                if (F > 1.0) WorstNewCoarse = std::max(WorstNewCoarse, std::abs(New - Truth) / std::max(Truth, 1e-9));
+            }
+            std::printf("\n");
+        }
+        std::printf("  worst: the held mean %.0f%% off, the mean held %.0f%% (%.0f%% at 1.6 m and coarser)\n", 100.0 * WorstOld, 100.0 * WorstNew, 100.0 * WorstNewCoarse);
+        Check(WorstNewCoarse < 0.3, "a coarse texel's foam holds the fine surface's mean of the held foam (30%)", WorstNewCoarse, 0.3);
+        Check(WorstNew < WorstOld, "nearer than the held mean (W3z to W5g)", WorstNew, WorstOld);
+    }
+
     std::printf("\n4b. The fine foam (stage W3w; VoxelOceanFFT.usf): Godot's rule in the shortest band's own tile, its J at the\n"
                 "    waves' chop, at the defaults (whitecap 0.9, amount 5), 10 s at 50 Hz (the cascades' rate)\n");
     {

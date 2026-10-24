@@ -171,6 +171,46 @@ int main(int Argc, char** Argv)
         Check(Again == Attr, "marking again changes nothing", Again == Attr ? 0 : 1, 0);
     }
 
+    // Stage W5l: a bay cut off from the sea by one cell of land (a mouth narrower than a cell) is
+    // sea by the bridge, not an inland basin (the ocean drained it into a wall of water).
+    {
+        std::vector<float> Bay = Height;
+        int Found = -1, FF = 0, FI = 0, FJ = 0;
+        for (int F = 0; F < 6 && Found < 0; F++)
+            for (int J = 8; J < N - 8 && Found < 0; J++)
+                for (int I = 8; I < N - 8 && Found < 0; I++)
+                {
+                    // A sea cell with four land cells east of it, two rows of them.
+                    bool bOk = Height[size_t(Index(F, I, J))] < -20.0f && (Attr[size_t(Index(F, I, J))] & 0x800) != 0;
+                    for (int k = 1; k <= 4 && bOk; k++)
+                        bOk = Height[size_t(Index(F, I + k, J))] > 1.0f && Height[size_t(Index(F, I + k, J + 1))] > 1.0f;
+                    if (bOk) { Found = 1; FF = F; FI = I; FJ = J; }
+                }
+        if (Found > 0)
+        {
+            // The barrier one cell, the bay behind it two by two.
+            Bay[size_t(Index(FF, FI + 1, FJ))] = 300.0f;
+            Bay[size_t(Index(FF, FI + 1, FJ + 1))] = 300.0f;
+            for (int k = 2; k <= 3; k++)
+            {
+                Bay[size_t(Index(FF, FI + k, FJ))] = -50.0f;
+                Bay[size_t(Index(FF, FI + k, FJ + 1))] = -50.0f;
+            }
+            std::vector<uint16_t> A0(size_t(Count), 0), A3(size_t(Count), 0);
+            VoxelLandSea::Mark(N, Pad, Bay.data(), A0.data(), 0x800, 0.02, 0);
+            VoxelLandSea::Mark(N, Pad, Bay.data(), A3.data(), 0x800, 0.02);
+            const bool bCutOff = (A0[size_t(Index(FF, FI + 2, FJ))] & 0x800) == 0;
+            const bool bJoined = (A3[size_t(Index(FF, FI + 2, FJ))] & 0x800) != 0;
+            std::printf("  a bay behind one cell of land: %s without the bridge, %s with it (its sea cell %s)\n", bCutOff ? "a basin" : "sea", bJoined ? "sea" : "a basin",
+                (A3[size_t(Index(FF, FI, FJ))] & 0x800) != 0 ? "sea" : "not sea");
+            Check(bCutOff && bJoined, "a bay cut off by a mouth narrower than a cell is sea (the bridge)", bJoined ? 0 : 1, 0);
+        }
+        else
+        {
+            Check(false, "found a coast for the bay test", 0, 1);
+        }
+    }
+
     // -----------------------------------------------------------------------------------------
     std::printf("\n2. The field's build (the shared passes, on the CPU)\n");
     const auto T1 = std::chrono::steady_clock::now();

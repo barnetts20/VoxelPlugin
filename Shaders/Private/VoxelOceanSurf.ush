@@ -565,6 +565,17 @@ VOXEL_FUNC float2 VoxelOceanSurfGainOf(FVoxelOceanDispersion Disp, float K)
     return float2(Raw, Raw * DLogGain * DXDY * K);
 }
 
+// Stage W5i: train I's setup (Stockdon's mean, as VoxelOceanSurfTrainOf's swash works it out): Hs
+// the sets' height, SwashSlope the bed's held slope, Weight the swash's (S.Swash).
+VOXEL_FUNC float VoxelOceanSurfSetupOf(int I, float Hs, float SwashSlope, float Weight)
+{
+    const float Omega = VOXEL_OCEAN_SURF_TWO_PI * VoxelOceanSurfCycles(I) / VOXEL_OCEAN_SURF_WRAP;
+    const float L0 = VOXEL_OCEAN_SURF_TWO_PI * VOXEL_OCEAN_SHOAL_GRAVITY / (Omega * Omega);
+    const float Root = sqrt(max(Hs * L0, 0.0f));
+    const float SetupStockdon = 0.35f * min(SwashSlope, 0.1f) * Root;
+    return Weight * (SetupStockdon < 0.3f * Hs ? SetupStockdon : 0.3f * Hs);
+}
+
 // Train I at a point (In's coastal field), its sets (Hs, HsRate, Jitter, GroupShift), the swash's
 // slope, the point's distance up the beach from the shoreline (m; below 0 at sea), the bores'
 // carpet.
@@ -780,7 +791,11 @@ VOXEL_FUNC FVoxelOceanSurf VoxelOceanSurfOf(FVoxelOceanSurfInput In, FVoxelOcean
     // skips there, VoxelOceanShoreAt, changes nothing.)
     const float DeepFade = In.CoastSeedM > 0.0f
         ? 1.0f - smoothstep(In.CoastSeedM, VOXEL_OCEAN_SURF_SEED_FADE * In.CoastSeedM, In.DepthM) : 1.0f;
-    const float Presence = Ramp * saturate(In.CoastCover) * ReachFade * DeepFade;
+    // (Stage W5k: by the cover's smoothstep, so the trains' amplitude, sqrt of their share, comes
+    // in from nothing with a finite slope; by the cover itself it rose as its square root, steeply
+    // from 0.)
+    const float CoverIn = saturate(In.CoastCover);
+    const float Presence = Ramp * CoverIn * CoverIn * (3.0f - 2.0f * CoverIn) * ReachFade * DeepFade;
     const float Share = (1.0f - S.Floor) * Presence;
     const float Amp = sqrt(Share);
     Out.Active = 1.0f;
@@ -799,16 +814,40 @@ VOXEL_FUNC FVoxelOceanSurf VoxelOceanSurfOf(FVoxelOceanSurfInput In, FVoxelOcean
     const float HeightRate = Hs * (2.0f * VOXEL_OCEAN_SURF_DRIFT * S.Sets * Drift.y * (1.0f / 120.0f) * PeakFactor
         + DriftFactor * 2.0f * VOXEL_OCEAN_SURF_PEAKS * S.Sets * Peaks.y * (1.0f / 40.0f));
 
+    // What the mesh (the height) or the footprint (the normals) carries of the swash's sheet (stage
+    // O9i: a distant mesh leaves it at the still level, and the terrain draws the waterline), and
+    // its fade with the field's cover (where the field ends along a coast: a budget's cut, an islet
+    // without tiles, so it doesn't stop at a line where the cover reaches 0).
+    const bool bNormals = In.ForNormals > 0.5f;
+    float SheetSeen = 1.0f;
+    if (S.SwashReach > 0.0f)
+        SheetSeen = bNormals ? VoxelOceanSurfResolved(2.0f * VOXEL_OCEAN_SURF_SHEET1 * S.SwashReach, In.FootprintM)
+            : VoxelOceanSurfMeshResolved(2.0f * VOXEL_OCEAN_SURF_SHEET1 * S.SwashReach, In.SpacingM);
+    const float CoverX = saturate(In.CoastCover * (1.0f / VOXEL_OCEAN_SURF_COVER_SWASH));
+    const float SwashCover = CoverX * CoverX * (3.0f - 2.0f * CoverX);
+    // Stage W5i: THE MEAN SHORELINE. The surf's sea and its beach meet where the water's mean level
+    // (the still level raised by the setup) meets the bed, not at the still level's contour: the
+    // bores run on in the water the setup raises, shoal and cap by its depth (Dm, the still depth plus
+    // the setup), and the swash's sheet begins where they end. Until W5i a flat lying a few tens of
+    // centimetres above the still level, under the setup's water, was the beach: the swash's flat
+    // sheet and its white water, a band of solid foam along such shores, its edge on the still
+    // level's contour (under the terrain on steeper shores: only on the low ones).
+    const float SetupMean = (WA * VoxelOceanSurfSetupOf(Lower, Height, BedHeld, S.Swash)
+        + WB * VoxelOceanSurfSetupOf(Lower + 1, Height, BedHeld, S.Swash)) * SheetSeen * SwashCover;
+    const float Dm = D + SetupMean;
+    FVoxelOceanSurfInput InMean = In;
+    InMean.DepthM = Dm;
+
     // The trains.
-    const float UpBeach = D < 0.0f ? -D / BedHeld : 0.0f;
+    const float UpBeach = Dm < 0.0f ? -Dm / BedHeld : 0.0f;
     // To the shoreline (signed; out at sea within the blend's reach, the sheet's on land).
     const float ToShoreMax = S.SwashReach > 0.0f ? VOXEL_OCEAN_SURF_SHEET1 * S.SwashReach : 1.0e4f;
-    const float ToShore = clamp(-D / BedHeld, -ToShoreMax, ToShoreMax);
+    const float ToShore = clamp(-Dm / BedHeld, -ToShoreMax, ToShoreMax);
     const float BreakDepth = max(Hs / S.Breaking, 0.1f);
-    const float CarpetX = saturate((D - VOXEL_OCEAN_SURF_CARPET0 * BreakDepth) / ((VOXEL_OCEAN_SURF_CARPET1 - VOXEL_OCEAN_SURF_CARPET0) * BreakDepth));
+    const float CarpetX = saturate((Dm - VOXEL_OCEAN_SURF_CARPET0 * BreakDepth) / ((VOXEL_OCEAN_SURF_CARPET1 - VOXEL_OCEAN_SURF_CARPET0) * BreakDepth));
     const float Carpet = 1.0f - CarpetX * CarpetX * (3.0f - 2.0f * CarpetX);
-    const FVoxelOceanSurfTrain A = VoxelOceanSurfTrainOf(Lower, In, S, Height, HeightRate, Jitter, GroupShift, BedHeld, ToShore, Carpet);
-    const FVoxelOceanSurfTrain B = VoxelOceanSurfTrainOf(Lower + 1, In, S, Height, HeightRate, Jitter, GroupShift, BedHeld, ToShore, Carpet);
+    const FVoxelOceanSurfTrain A = VoxelOceanSurfTrainOf(Lower, InMean, S, Height, HeightRate, Jitter, GroupShift, BedHeld, ToShore, Carpet);
+    const FVoxelOceanSurfTrain B = VoxelOceanSurfTrainOf(Lower + 1, InMean, S, Height, HeightRate, Jitter, GroupShift, BedHeld, ToShore, Carpet);
     // What the mesh (the height) and the footprint (the normals) show of each train.
     const float MeshA = VoxelOceanSurfMeshResolved(A.Wavelength, In.SpacingM);
     const float MeshB = VoxelOceanSurfMeshResolved(B.Wavelength, In.SpacingM);
@@ -820,28 +859,19 @@ VOXEL_FUNC FVoxelOceanSurf VoxelOceanSurfOf(FVoxelOceanSurfInput In, FVoxelOcean
     // footprint, it leaves those too). So every clipmap level, every vertex and every pixel composes
     // the same sea at a point. (Until W3f the long bands took back what the mesh couldn't show,
     // judged by each level's own spacing: levels disagreed, and the sea stepped where they met.)
-    const bool bNormals = In.ForNormals > 0.5f;
     Out.LongKeep = sqrt(max(1.0f - Share * (WA + WB), 0.0f));
     // The swash's sheet on land reaches only so far up the beach (stage O9b3): its distance up the
-    // beach held within 1.5 to 3 times the reach; and only as far as the mesh (the height) or the
-    // footprint (the normals) carries a sheet that wide (stage O9i: a distant mesh leaves it at
-    // the still level, and the terrain draws the waterline).
+    // beach held within 1.5 to 3 times the reach (stage W5i: from the mean shoreline).
     float Sheet = 1.0f;
     float SheetD = 0.0f;    // d Sheet / d depth
-    float SheetSeen = 1.0f;
     if (S.SwashReach > 0.0f)
     {
         const float S0 = VOXEL_OCEAN_SURF_SHEET0 * S.SwashReach;
         const float S1 = VOXEL_OCEAN_SURF_SHEET1 * S.SwashReach;
         const float SX = saturate((UpBeach - S0) / (S1 - S0));
         Sheet = 1.0f - SX * SX * (3.0f - 2.0f * SX);
-        SheetD = D < 0.0f && UpBeach > S0 && UpBeach < S1 ? 6.0f * SX * (1.0f - SX) / ((S1 - S0) * BedHeld) : 0.0f;
-        SheetSeen = bNormals ? VoxelOceanSurfResolved(2.0f * S1, In.FootprintM) : VoxelOceanSurfMeshResolved(2.0f * S1, In.SpacingM);
+        SheetD = Dm < 0.0f && UpBeach > S0 && UpBeach < S1 ? 6.0f * SX * (1.0f - SX) / ((S1 - S0) * BedHeld) : 0.0f;
     }
-    // The swash fades in with the field's cover (where the field ends along a coast: a budget's
-    // cut, an islet without tiles), so it doesn't stop at a line where the cover reaches 0.
-    const float CoverX = saturate(In.CoastCover * (1.0f / VOXEL_OCEAN_SURF_COVER_SWASH));
-    const float SwashCover = CoverX * CoverX * (3.0f - 2.0f * CoverX);
     // Energy: the waves add by amplitude (cos, sin), the levels by energy.
     const float LevelShore = (WA * A.Level + WB * B.Level) * SheetSeen * SwashCover;
     const float LevelHere = LevelShore * Inland;
@@ -871,7 +901,7 @@ VOXEL_FUNC FVoxelOceanSurf VoxelOceanSurfOf(FVoxelOceanSurfInput In, FVoxelOcean
 
     float2 HeightP = float2(0.0f, 0.0f);    // by the depth, by the field's distance
     float3 PhaseP = float3(0.0f, 0.0f, 0.0f);
-    if (D <= 0.0f)
+    if (Dm <= 0.0f)
     {
         // Above the still level: the shoreline's level, flat (up the beach as far as it reaches).
         Out.Height = Level;
@@ -886,10 +916,10 @@ VOXEL_FUNC FVoxelOceanSurf VoxelOceanSurfOf(FVoxelOceanSurfInput In, FVoxelOcean
         // height).
         const float Sea = Amp * (AmpA * MeshA * A.Wave + AmpB * MeshB * B.Wave);
         const float SeaRate = Amp * (AmpA * MeshA * A.WaveRate + AmpB * MeshB * B.WaveRate);
-        const float SetupX = saturate(D / BreakDepth);
+        const float SetupX = saturate(Dm / BreakDepth);
         const float SetupShape = 1.0f - SetupX * SetupX * (3.0f - 2.0f * SetupX);
         const float SetupHere = Setup * SetupShape;
-        const float SetupD = D < BreakDepth ? -Setup * 6.0f * SetupX * (1.0f - SetupX) / BreakDepth : 0.0f;
+        const float SetupD = Dm < BreakDepth ? -Setup * 6.0f * SetupX * (1.0f - SetupX) / BreakDepth : 0.0f;
         // For the normals: the trains as the footprint shows them, their partials.
         const float UnitA = Amp * AmpA * SeenA;
         const float UnitB = Amp * AmpB * SeenB;
@@ -901,9 +931,9 @@ VOXEL_FUNC FVoxelOceanSurf VoxelOceanSurfOf(FVoxelOceanSurfInput In, FVoxelOcean
         // range and 2 m. Constant in time (the mean swash), so the blend has no rate of its own.
         const float SwashDepth = max(Setup + Swing, 0.1f);
         const float Dsw = clamp(0.5f * BedHeld * Period * sqrt(VOXEL_OCEAN_SHOAL_GRAVITY * SwashDepth), 0.02f, min(1.5f * SwashDepth, VOXEL_OCEAN_SURF_MIN_REACH));
-        const float X = saturate(D / Dsw);
+        const float X = saturate(Dm / Dsw);
         const float Blend = X * X * (3.0f - 2.0f * X);
-        const float BlendD = D < Dsw ? 6.0f * X * (1.0f - X) / Dsw : 0.0f;
+        const float BlendD = Dm < Dsw ? 6.0f * X * (1.0f - X) / Dsw : 0.0f;
         Out.Height = Level + (Sea + SetupHere - Level) * Blend;
         Out.Rate = LevelRate + (SeaRate + SetupRate * SetupShape - LevelRate) * Blend;
         // The bores' foam (where the trains are) on the sea's side, the swash's within its blend.

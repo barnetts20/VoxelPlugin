@@ -956,7 +956,8 @@ void FVoxelOceanSurface::UpdateMaterial()
         Waves.Surf[1].Y = (float)FMath::Max(Inputs.Waves.SurfFoam, 0.0);
         Waves.Surf[1].Z = (float)FMath::Clamp(Inputs.Waves.FoamWhitecap, 0.0, 1.0);
         // The debug view (stage O9f; row 18 w).
-        Waves.Surf[2].W = (float)FMath::Clamp(CVarVoxelOceanDebugSurf.GetValueOnGameThread(), 0, 26);
+        // (Stage W5k: up to 40; it was held at 26, so the views W5f to W5h added never showed.)
+        Waves.Surf[2].W = (float)FMath::Clamp(CVarVoxelOceanDebugSurf.GetValueOnGameThread(), 0, 40);
         // The shore field's expansion around the selection camera (VoxelOceanShore.ush).
         WriteShoreFrame(Waves);
         // The shore field's texture once it exists (until then States.x is 0: no field).

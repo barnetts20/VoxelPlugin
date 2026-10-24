@@ -341,7 +341,16 @@ VOXEL_FUNC FVoxelOceanShoal VoxelOceanShoalOf(float DepthM, FVoxelOceanShoreSamp
     // Jacobian is I + Stretch e e^T exactly (e of length 1).
     const float DirLength2 = bField ? dot(Shore.Direction, Shore.Direction) : 0.0f;
     const float DirLength = sqrt(DirLength2);
-    const float Agree = min(DirLength2, 1.0f);
+    // (Stage W5k: much more steeply: the length of the interpolated unit directions is the cosine
+    // of half their spread, and a move of kilometres turning by even 20 degrees over a field's
+    // texel shears the FFT's pattern into a tear. To the 16th power of its square: 0.89 at a 10
+    // degree spread, 0.61 at 20, 0.14 at 40; until W5k its square, 0.97 at 20. ShoreWarp stays off
+    // by default.)
+    const float AgreeLinear = min(DirLength2, 1.0f);
+    const float Agree2 = AgreeLinear * AgreeLinear;
+    const float Agree4 = Agree2 * Agree2;
+    const float Agree8 = Agree4 * Agree4;
+    const float Agree = Agree8 * Agree8;
     Out.Amp = float4(Amp[0], Amp[1], Amp[2], Amp[3]);
     Out.Chop = float4(Chop[0], Chop[1], Chop[2], Chop[3]);
     Out.Stretch = float4(Stretch[0] * Agree, Stretch[1] * Agree, Stretch[2] * Agree, Stretch[3] * Agree);
