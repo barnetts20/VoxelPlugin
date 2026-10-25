@@ -1,5 +1,6 @@
 #include "PlanetActor.h"
 #include "PlanetGravityZone.h"
+#include "Components/DirectionalLightComponent.h"
 #include "VoxelLandBake.h"
 #include "VoxelPlugin.h"
 #include "EngineUtils.h"
@@ -79,7 +80,8 @@ void APlanetActor::FlagPendingWork()
     }
     else if ((!bTerrestrial && SeaLevel != LastSeaLevel)
         || bEnableOcean != bLastEnableOcean
-        || bEnableGravity != bLastEnableGravity)
+        || bEnableGravity != bLastEnableGravity
+        || bEnableAtmosphere != bLastEnableAtmosphere)
     {
         bPendingOceanUpdate = true;
     }
@@ -114,6 +116,21 @@ void APlanetActor::PostEditChangeProperty(FPropertyChangedEvent& PropertyChanged
     {
         if (OceanActor)
             OceanActor->SetOceanMaterial(OceanMaterial);
+        return;
+    }
+
+    // Stage A1: the atmosphere's generation (its seed, model and set) applies in place: the
+    // atmosphere regenerates, the planet isn't rebuilt.
+    if (MemberName == GET_MEMBER_NAME_CHECKED(APlanetActor, AtmosphereSeed)
+        || MemberName == GET_MEMBER_NAME_CHECKED(APlanetActor, AtmosphereType)
+        || MemberName == GET_MEMBER_NAME_CHECKED(APlanetActor, AtmosphereSet))
+    {
+        if (!bInteractive)
+        {
+            double PlanetRadius = 0.0, NoiseAmplitude = 0.0, OceanRadius = 0.0;
+            ComputeShape(PlanetRadius, NoiseAmplitude, OceanRadius);
+            ConfigureAtmosphere(PlanetRadius, OceanRadius, MemberName == GET_MEMBER_NAME_CHECKED(APlanetActor, AtmosphereSet));
+        }
         return;
     }
 
@@ -216,6 +233,8 @@ void APlanetActor::Tick(float DeltaTime)
         const bool bSeaLevelChanged = Generator != EVoxelSurfaceGenerator::Terrestrial && SeaLevel != LastSeaLevel;
         if (bSeaLevelChanged || bEnableOcean != bLastEnableOcean)
             ConfigureOcean(PlanetRadius, NoiseAmplitude, OceanRadius);
+        // (Stage A1: the atmosphere at the new surface, or on or off; and the ocean's sun again.)
+        ConfigureAtmosphere(PlanetRadius, OceanRadius);
         // The elevation debug view measures from the new sea level.
         if (bSeaLevelChanged && TerrainActor)
             TerrainActor->SetDebugSeaRadius(OceanRadius);
@@ -343,6 +362,8 @@ void APlanetActor::Initialize()
 
     ConfigureOcean(PlanetRadius, NoiseAmplitude, OceanRadius);
     ConfigureGravity(PlanetRadius, OceanRadius);
+    // Stage A1: after the ocean, which takes the atmosphere's light as its sun.
+    ConfigureAtmosphere(PlanetRadius, OceanRadius);
 
     RecordAppliedState();
     bInitialized = true;
@@ -394,6 +415,66 @@ void APlanetActor::ConfigureGravity(double PlanetRadius, double OceanRadius)
     GravityZone->SetActorEnableCollision(true);
 }
 
+int32 APlanetActor::GetAtmosphereSeed() const
+{
+    return AtmosphereSeed >= 0 ? AtmosphereSeed : TerrestrialSettings.Seed;
+}
+
+bool APlanetActor::HasAtmosphereSet() const
+{
+    const FAtmosphereGenerationSet& S = AtmosphereSet;
+    return S.AirOnly != nullptr || S.Terrestrial.Look != nullptr || S.GasGiant.Look != nullptr
+        || S.Terrestrial.Archetypes.Num() > 0 || S.GasGiant.Archetypes.Num() > 0;
+}
+
+void APlanetActor::ConfigureAtmosphere(double PlanetRadius, double OceanRadius, bool bRegenerate)
+{
+    if (!AtmosphereActor) return;
+    if (!bEnableAtmosphere)
+    {
+        // The only off-switch for its march (hiding it leaves it drawing): parked, the sim given
+        // up, its light hidden.
+        AtmosphereActor->SetAtmosphereActive(false);
+        AtmosphereActor->SetActorHiddenInGame(true);
+        AtmosphereActor->SetActorTickEnabled(false);
+#if WITH_EDITOR
+        AtmosphereActor->SetIsTemporarilyHiddenInEditor(true);
+#endif
+        if (OceanActor) OceanActor->SetSunLightOverride(nullptr);
+        return;
+    }
+    // The generation: the seed, the model and the planet's set (if it names any; else the
+    // atmosphere's own). Its first tick generates; later, only a change does (each restarts the
+    // sim from the rolled start).
+    const int32 Seed = GetAtmosphereSeed();
+    const bool bConfigured = LastAtmosphereSeed != INDEX_NONE;
+    const bool bChanged = !bConfigured || Seed != LastAtmosphereSeed || AtmosphereType != LastAtmosphereType || bRegenerate;
+    AtmosphereActor->Seed = Seed;
+    if (HasAtmosphereSet())
+        AtmosphereActor->Set = AtmosphereSet;
+    if (AtmosphereActor->PlanetType != AtmosphereType)
+        AtmosphereActor->SetPlanetType(AtmosphereType);
+    // The visible surface's radius: the atmosphere's floor (its default, max of the ocean's and
+    // the planet's radii).
+    AtmosphereActor->InitializeFromPlanet(PlanetRoot, FVector(FMath::Max(OceanRadius, PlanetRadius)));
+    AtmosphereActor->SetAtmosphereActive(true);
+    AtmosphereActor->SetActorHiddenInGame(false);
+    AtmosphereActor->SetActorTickEnabled(true);
+#if WITH_EDITOR
+    AtmosphereActor->SetIsTemporarilyHiddenInEditor(false);
+#endif
+    if (bConfigured && bChanged)
+        AtmosphereActor->Generate();
+    LastAtmosphereSeed = Seed;
+    LastAtmosphereType = AtmosphereType;
+    if (bHasStarWorldPosition)
+        AtmosphereActor->OrientToStar(StarWorldPosition);
+    // The ocean's sun: the atmosphere's light (the star's direction, the light at the top of the
+    // air; the march dims it on the water as on the terrain, stage A2 takes that over).
+    if (OceanActor)
+        OceanActor->SetSunLightOverride(AtmosphereActor->FindComponentByClass<UDirectionalLightComponent>());
+}
+
 void APlanetActor::RecordAppliedState()
 {
     LastInitScale = GetActorScale3D();
@@ -404,6 +485,7 @@ void APlanetActor::RecordAppliedState()
     LastTerrestrialHash = TerrestrialSettings.GetSettingsHash();
     bLastEnableOcean = bEnableOcean;
     bLastEnableGravity = bEnableGravity;
+    bLastEnableAtmosphere = bEnableAtmosphere;
 }
 
 // ---------------------------------------------------------------------------
@@ -439,6 +521,7 @@ void APlanetActor::SpawnChildActors()
     if (TerrainActor && TerrainActor->GetOwner() != this) TerrainActor = nullptr;
     if (OceanActor && OceanActor->GetOwner() != this) OceanActor = nullptr;
     if (GravityZone && GravityZone->GetOwner() != this) GravityZone = nullptr;
+    if (AtmosphereActor && AtmosphereActor->GetOwner() != this) AtmosphereActor = nullptr;
 
     if (!TerrainActor)
     {
@@ -482,6 +565,52 @@ void APlanetActor::SpawnChildActors()
         }
     }
 
+    // Stage A1: no second atmosphere. A level saved before the atmosphere was detached (or by
+    // an older build) can still hold one this planet spawned then, attached under it or owned by
+    // it: a seeded one is adopted (when this planet has none), any other is the old plumbing's
+    // and goes, so one march draws the planet.
+    {
+        TArray<AActor*> Candidates;
+        GetAttachedActors(Candidates, true, true);
+        for (TActorIterator<APlanetAtmosphereActor> It(World); It; ++It)
+            if (It->GetOwner() == this) Candidates.AddUnique(*It);
+        for (AActor* Actor : Candidates)
+        {
+            APlanetAtmosphereActor* Atmosphere = Cast<APlanetAtmosphereActor>(Actor);
+            if (!Atmosphere || Atmosphere == AtmosphereActor) continue;
+            ASeededAtmosphereActor* Seeded = Cast<ASeededAtmosphereActor>(Atmosphere);
+            if (!AtmosphereActor && Seeded && Seeded->GetOwner() == this)
+            {
+                AtmosphereActor = Seeded;
+                LastAtmosphereSeed = INDEX_NONE;
+                continue;
+            }
+            UE_LOG(LogVoxelPlugin, Log, TEXT("[Planet] %s: removed %s, an atmosphere left from the old planet plumbing (the planet's seeded atmosphere replaces it)."),
+                *GetName(), *Atmosphere->GetName());
+            Atmosphere->Destroy();
+        }
+    }
+
+    // Stage A1: the atmosphere (seeded), attached as the others with absolute scale (its scale is
+    // the surface's radius, set by ConfigureAtmosphere through InitializeFromPlanet).
+    if (!AtmosphereActor)
+    {
+        AtmosphereActor = World->SpawnActor<ASeededAtmosphereActor>(
+            ASeededAtmosphereActor::StaticClass(),
+            FTransform(GetActorRotation(), GetActorLocation()),
+            SpawnParams);
+        if (AtmosphereActor)
+        {
+            if (USceneComponent* ChildRoot = AtmosphereActor->GetRootComponent())
+            {
+                ChildRoot->SetAbsolute(false, false, true);
+                ChildRoot->AttachToComponent(PlanetRoot,
+                    FAttachmentTransformRules::KeepWorldTransform);
+            }
+            LastAtmosphereSeed = INDEX_NONE;
+        }
+    }
+
     // Load default materials if none set - paths reference plugin Content folder
     if (!TerrainMaterial)
     {
@@ -509,6 +638,10 @@ void APlanetActor::DestroyChildActors()
     if (GravityZone && GravityZone->GetOwner() == this)
         GravityZone->Destroy();
     GravityZone = nullptr;
+    if (AtmosphereActor && AtmosphereActor->GetOwner() == this)
+        AtmosphereActor->Destroy();
+    AtmosphereActor = nullptr;
+    LastAtmosphereSeed = INDEX_NONE;
 }
 
 double APlanetActor::ComputeOceanRadius(double PlanetRadius, double NoiseAmplitude) const
@@ -591,12 +724,23 @@ void APlanetActor::SetDormant(bool bDormant)
         GravityZone->SetActorTickEnabled(bOn);
         GravityZone->SetActorEnableCollision(bOn);
     }
+    if (AtmosphereActor)
+    {
+        // Parked: its march, its sim bid and its light off (waking rebakes its shadow levels).
+        const bool bOn = bActive && bEnableAtmosphere;
+        AtmosphereActor->SetAtmosphereActive(bOn);
+        AtmosphereActor->SetActorHiddenInGame(!bOn);
+        AtmosphereActor->SetActorTickEnabled(bOn);
+    }
 }
 
 void APlanetActor::SetStarWorldPosition(const FVector& StarWorldPos)
 {
     StarWorldPosition = StarWorldPos;
     bHasStarWorldPosition = true;
+    // Stage A1: the atmosphere's light and march toward the star.
+    if (AtmosphereActor && bEnableAtmosphere && bInitialized)
+        AtmosphereActor->OrientToStar(StarWorldPos);
 }
 
 void APlanetActor::OnReturnToPool()

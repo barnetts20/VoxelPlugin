@@ -408,10 +408,23 @@ void AOceanSphereActor::CreateSurfacePass()
     bSurfacePassOn = false;
 }
 
+void AOceanSphereActor::SetSunLightOverride(UDirectionalLightComponent* InLight)
+{
+    SunLightOverride = InLight;
+    // The search again from the next tick when the override goes.
+    SunLightSearchTime = -1.0e9;
+    bWarnedNoSun = false;
+}
+
 UDirectionalLightComponent* AOceanSphereActor::FindSunLight()
 {
     UWorld* World = GetWorld();
     if (!World) return nullptr;
+    // Stage A1: the planet's atmosphere's light (it carries the star's direction and the
+    // atmosphere's light at the top of the air).
+    if (UDirectionalLightComponent* Override = SunLightOverride.Get())
+        if (Override->GetWorld() == World && Override->IsRegistered() && Override->IsVisible())
+            return Override;
     const double Now = FPlatformTime::Seconds();
     UDirectionalLightComponent* Current = SunLight.Get();
     if (Current && Current->GetWorld() == World && Now - SunLightSearchTime < 1.0) return Current;

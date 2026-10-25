@@ -179,6 +179,10 @@ public:
     UFUNCTION(BlueprintCallable, Category = "Ocean|Material")
     void SetOceanMaterial(UMaterialInterface* InMaterial);
 
+    /** Stage A1: the sun the ocean shades with, set by the planet to its atmosphere's light
+     *  (null: the world's brightest directional light, as before). */
+    void SetSunLightOverride(UDirectionalLightComponent* InLight);
+
     /** New settings, applying only what changed: a mesh change rebuilds the surface (unless
      *  bInteractive: a slider still moving, applied on release), the LOD factor and the optics
      *  apply in place, the rest is read every tick. */
@@ -337,6 +341,8 @@ private:
     bool bFoamTextureForFoam = false;
     /** The stand-in sun: the world's directional light (looked for again every second). */
     TWeakObjectPtr<UDirectionalLightComponent> SunLight;
+    /** Stage A1: the planet's atmosphere's light, preferred to the search while set and valid. */
+    TWeakObjectPtr<UDirectionalLightComponent> SunLightOverride;
     double SunLightSearchTime = -1.0e9;
     bool bWarnedNoSun = false;
 

@@ -20,6 +20,7 @@
 #include "VoxelLandSettings.h"
 #include "VoxelOceanSettings.h"
 #include "PooledActor.h"
+#include "SeededAtmosphereActor.h"
 #include "PlanetActor.generated.h"
 
 class APlanetGravityZone;
@@ -27,9 +28,10 @@ class FVoxelLandBaker;
 struct FVoxelLandBake;
 struct FVoxelLandNoiseSet;
 
-/** Top-level planet actor that spawns and coordinates terrain, ocean, and
- *  gravity child actors. The atmosphere is not attached while mesh generation is
- *  reworked; the star position the star system pushes is kept for its return.
+/** Top-level planet actor that spawns and coordinates terrain, ocean, atmosphere and
+ *  gravity child actors. Stage A1: the atmosphere (CloudAtmosphere's seeded actor) is a child
+ *  again, generated from the planet's seed, aimed at the star the star system pushes, and the
+ *  ocean's sun.
  *
  *  Builds a shared FDensitySampleCompositor (noise heightmap + sparse edit store)
  *  that is passed to both the terrain and ocean actors so they sample identical
@@ -108,6 +110,27 @@ public:
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Planet|Terrain")
     UMaterialInterface* TerrainMaterial = nullptr;
 
+    // --- Atmosphere (stage A1) ---
+
+    /** The CloudAtmosphere atmosphere as a child (ASeededAtmosphereActor), generated from
+     *  AtmosphereSeed. Off: parked and hidden (its march, sim bid and light off). */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Planet|Atmosphere")
+    bool bEnableAtmosphere = true;
+
+    /** The atmosphere's model: the terrestrial slab (clouds and weather), or air alone. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Planet|Atmosphere", meta = (EditCondition = "bEnableAtmosphere"))
+    EPlanetAtmosphereType AtmosphereType = EPlanetAtmosphereType::Terrestrial;
+
+    /** The atmosphere's seed; -1: the terrain's (TerrestrialSettings.Seed), the route every
+     *  component will share. A change regenerates the atmosphere (its sim restarts). */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Planet|Atmosphere", meta = (EditCondition = "bEnableAtmosphere"))
+    int32 AtmosphereSeed = -1;
+
+    /** The archetypes and looks the seed draws from (the seeded actor's Set). Empty: the
+     *  atmosphere's own (its class defaults). A change regenerates. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Planet|Atmosphere", meta = (EditCondition = "bEnableAtmosphere"))
+    FAtmosphereGenerationSet AtmosphereSet;
+
     // --- Gravity ---
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Planet|Gravity")
@@ -123,6 +146,13 @@ public:
 
     UFUNCTION(BlueprintCallable, Category = "Planet")
     APlanetGravityZone* GetGravityZone() const { return GravityZone; }
+
+    UFUNCTION(BlueprintCallable, Category = "Planet")
+    ASeededAtmosphereActor* GetAtmosphereActor() const { return AtmosphereActor; }
+
+    /** The seed the atmosphere generates from (AtmosphereSeed, or the terrain's for -1). */
+    UFUNCTION(BlueprintPure, Category = "Planet|Atmosphere")
+    int32 GetAtmosphereSeed() const;
 
     /** 1 when the planet's surface is ready to build: always for the noise surface; for the
      *  terrestrial generator once the bake for the current settings is made or loaded. */
@@ -179,8 +209,8 @@ public:
     virtual void OnAcquired(double WorldRadius) override;
     virtual void OnReturnToPool() override;
 
-    // IStarLit -- the star system pushes its star's world position each frame. Stored
-    // for the atmosphere and lighting integration; nothing consumes it yet.
+    // IStarLit -- the star system pushes its star's world position each frame. Stage A1: the
+    // atmosphere aims its light and its march at it (OrientToStar).
     virtual void SetStarWorldPosition(const FVector& StarWorldPos) override;
 
     /** Last star position pushed through IStarLit (world space), and whether one arrived. */
@@ -214,6 +244,11 @@ private:
     UPROPERTY(TextExportTransient)
     APlanetGravityZone* GravityZone = nullptr;
 
+    /** Stage A1: the atmosphere child actor (ASeededAtmosphereActor). Scale = the visible
+     *  surface's radius (the larger of the ocean's and the planet's). */
+    UPROPERTY(TextExportTransient)
+    ASeededAtmosphereActor* AtmosphereActor = nullptr;
+
     /** Shared compositor (surface density + edit store) passed to both terrain and
      *  ocean actors so they sample identical density. Built during Initialize. */
     TSharedPtr<FDensitySampleCompositor> SharedCompositor;
@@ -229,6 +264,11 @@ private:
     uint32 LastTerrestrialHash = 0;
     bool bLastEnableOcean = true;
     bool bLastEnableGravity = true;
+    bool bLastEnableAtmosphere = true;
+    /** The seed and model the atmosphere last generated from (INDEX_NONE: not yet configured,
+     *  its own first tick generates). */
+    int32 LastAtmosphereSeed = INDEX_NONE;
+    EPlanetAtmosphereType LastAtmosphereType = EPlanetAtmosphereType::Terrestrial;
 
     bool bInitialized = false;
 
@@ -282,6 +322,13 @@ private:
      *  or hidden and without collision when bEnableGravity is off. */
     void ConfigureGravity(double PlanetRadius, double OceanRadius);
 
+    /** Stage A1: the atmosphere at the visible surface, from the seed, model and set, aimed at
+     *  the star, and the ocean's sun; or parked and hidden when bEnableAtmosphere is off.
+     *  bRegenerate: the seed's draws again even if the seed and model are unchanged (a set edit). */
+    void ConfigureAtmosphere(double PlanetRadius, double OceanRadius, bool bRegenerate = false);
+
+    /** Whether the planet's set names anything (else the atmosphere keeps its own). */
+    bool HasAtmosphereSet() const;
     /** Records the values FlagPendingWork compares against. */
     void RecordAppliedState();
 
