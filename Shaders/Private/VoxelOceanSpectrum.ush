@@ -487,6 +487,17 @@ VOXEL_FUNC float2 VoxelOceanTwiddle(uint J, uint HalfN)
 // 2022). The weights are its barycentric coordinates divided by sqrt(sum w^2), which keeps the
 // variance of a Gaussian field (the waves are one), so blends don't look calmer. A pure function
 // of the chart-plane position and the seed: the CPU query blends the same copies.
+// Stage W8c: THE CONTRAST. Each barycentric weight less VOXEL_OCEAN_DETILE_CONTRAST (at 0, then
+// renormalised), as hex tiling's contrast does (Mikkelsen 2022): near a vertex one copy, along an
+// edge two, all three only in the middle 6% of each triangle. A copy whose weight is 0 is skipped
+// (VoxelOceanFFTEvaluate's loops), so a point averages 1.9 lookups a band instead of 3 (the
+// sweep: detiling was 2 to 3 ms of the frame). The variance is kept (the same normalisation); the
+// blends are narrower, the copies' seams still smooth (the weights continuous). The long bands
+// only (VoxelOceanDetileOfBand), whose lattices are hundreds of metres to kilometres: 18 of a
+// point's 24 lookups (three states each). The short bands' lattices are tens of metres, where the
+// weights' own slope (left out of the normals, as always) would grow past what the underside's
+// normals allow (underwater_map_check).
+#define VOXEL_OCEAN_DETILE_CONTRAST 0.25f
 struct FVoxelOceanDetile
 {
     float2 Offset0;     // m, added to the position before each copy's lookup
@@ -501,7 +512,7 @@ VOXEL_FUNC float2 VoxelOceanDetileOffset(uint Seed, int I, int J)
     return float2(float(H & 0xffffu) * (1024.0f / 65536.0f), float(H >> 16u) * (1024.0f / 65536.0f));
 }
 
-VOXEL_FUNC FVoxelOceanDetile VoxelOceanDetileOf(float2 Position, float Cell, uint Seed)
+VOXEL_FUNC FVoxelOceanDetile VoxelOceanDetileOfContrast(float2 Position, float Cell, uint Seed, float Contrast)
 {
     // No lattice: one copy, unshifted.
     if (Cell <= 0.0f)
@@ -543,9 +554,18 @@ VOXEL_FUNC FVoxelOceanDetile VoxelOceanDetileOf(float2 Position, float Cell, uin
         W1 = FY - FX;
         W2 = FX;
     }
-    const float Norm = 1.0f / sqrt(W0 * W0 + W1 * W1 + W2 * W2);
+    // (Stage W8c: the contrast, under a third: one weight at least stays above it.)
+    W0 = max(W0 - Contrast, 0.0f);
+    W1 = max(W1 - Contrast, 0.0f);
+    W2 = max(W2 - Contrast, 0.0f);
+    const float Norm = 1.0f / sqrt(max(W0 * W0 + W1 * W1 + W2 * W2, 1.0e-12f));
     D.Weight = float3(W0 * Norm, W1 * Norm, W2 * Norm);
     return D;
+}
+
+VOXEL_FUNC FVoxelOceanDetile VoxelOceanDetileOf(float2 Position, float Cell, uint Seed)
+{
+    return VoxelOceanDetileOfContrast(Position, Cell, Seed, 0.0f);
 }
 
 // Band B's lattice (stage O9b3): the cell scaled by the band's tile against the first band's, so
@@ -555,7 +575,8 @@ VOXEL_FUNC FVoxelOceanDetile VoxelOceanDetileOf(float2 Position, float Cell, uin
 VOXEL_FUNC FVoxelOceanDetile VoxelOceanDetileOfBand(float2 Position, float Cell, uint Seed, int Band, float4 Tiles)
 {
     const float Tile = Band == 0 ? Tiles.x : (Band == 1 ? Tiles.y : (Band == 2 ? Tiles.z : Tiles.w));
-    return VoxelOceanDetileOf(Position, Cell * Tile / max(Tiles.x, 1.0e-3f), Seed + uint(Band) * 0x9e3779b9u);
+    return VoxelOceanDetileOfContrast(Position, Cell * Tile / max(Tiles.x, 1.0e-3f), Seed + uint(Band) * 0x9e3779b9u,
+        Band < 2 ? VOXEL_OCEAN_DETILE_CONTRAST : 0.0f);
 }
 
 #endif // VOXEL_OCEAN_SPECTRUM_USH

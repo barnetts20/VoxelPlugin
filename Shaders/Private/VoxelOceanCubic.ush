@@ -48,6 +48,34 @@ VOXEL_FUNC FVoxelOceanCubicTaps VoxelOceanCubicTapsOf(float U, float Size)
     return T;
 }
 
+// Stage W8h: the taps toward the cubic by Share (0 to 1; above 0) in four lookups, not five: each
+// axis's weights the share's blend of the B-spline's and the bilinear's (texels I and I + 1 at
+// 1 - F and F), all positive and summing to 1, so two taps per axis still hold them. The 2D filter
+// is then the blend per axis, not the blend of the 2D filters as it was: they differ by
+// Share (1 - Share) (Lx - Cx)(Ly - Cy), the product of both axes' smoothing, at most a quarter of it
+// at half share (cubic_check §6). Share 1: VoxelOceanCubicTapsOf exactly.
+VOXEL_FUNC FVoxelOceanCubicTaps VoxelOceanCubicTapsBlendOf(float U, float Size, float Share)
+{
+    const float X = U * Size - 0.5f;
+    const float I = floor(X);
+    const float F = X - I;
+    const float F2 = F * F;
+    const float F3 = F2 * F;
+    const float S = clamp(Share, 1.0e-4f, 1.0f);
+    const float L = 1.0f - S;
+    const float W0 = S * (1.0f / 6.0f) * (1.0f - 3.0f * F + 3.0f * F2 - F3);
+    const float W1 = S * (1.0f / 6.0f) * (4.0f - 6.0f * F2 + 3.0f * F3) + L * (1.0f - F);
+    const float W2 = S * (1.0f / 6.0f) * (1.0f + 3.0f * F + 3.0f * F2 - 3.0f * F3) + L * F;
+    const float W3 = S * (1.0f / 6.0f) * F3;
+    FVoxelOceanCubicTaps T;
+    T.G0 = W0 + W1;
+    T.G1 = W2 + W3;
+    // (G0 and G1 at least S / 6: the B-spline's pairs are.)
+    T.P0 = (I - 0.5f + W1 / T.G0) / Size;
+    T.P1 = (I + 1.5f + W3 / T.G1) / Size;
+    return T;
+}
+
 // How far toward the cubic a lookup goes (0 bilinear, 1 cubic): from a texel per footprint (none)
 // to two (all), so the filter changes over an octave of distance, not at a line on the water.
 // Magnify: the texel's size over the footprint's.

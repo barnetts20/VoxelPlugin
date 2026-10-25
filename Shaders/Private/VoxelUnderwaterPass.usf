@@ -43,6 +43,11 @@ float4 UnderwaterMapE2[VOXEL_UNDERWATER_MAP_LEVELS];
 // as the ray sees it from below (rgb, linear scene units before exposure; a: 0 off).
 Texture2DArray<float> UnderwaterFoamMap;
 RWTexture2DArray<float> UnderwaterFoamMapOut;
+// Stage W8b: 1: the camera's probe instead of the map: an 8 x 8 grid round the camera's foot (level
+// 0's anchor and texel set for it), each point's surface height above the sphere into
+// UnderwaterCameraOut (read back for the next frames' test whether the view can reach the water).
+RWStructuredBuffer<float> UnderwaterCameraOut;
+uint UnderwaterCameraMode;
 float4 UnderwaterFoamColor;
 #define VOXEL_UNDERWATER_MAP_FOAM_LOAD(Level, X, Y) UnderwaterFoamMap.Load(int4(X, Y, Level, 0))
 #define VOXEL_UNDERWATER_FOAM_COLOR float4(UnderwaterFoamColor.rgb * View.PreExposure, UnderwaterFoamColor.a)
@@ -203,6 +208,12 @@ void UnderwaterMapCS(uint3 DispatchThreadId : SV_DispatchThreadID)
         UnderwaterDerivatives, UnderwaterDerivativesSampler, UnderwaterCharts, UnderwaterShore, UnderwaterFoam, UnderwaterFoamSampler, Frame,
         VoxelUnderwaterProbeDepth(X), Mask, Texel, Surface);
     const float Height = VoxelOceanSphereHeight(X, UnderwaterSphere.x, UnderwaterSphere.y, normalize(-Waves.Center));
+    if (UnderwaterCameraMode != 0u)
+    {
+        if (DispatchThreadId.x < 8u && DispatchThreadId.y < 8u && DispatchThreadId.z == 0u)
+            UnderwaterCameraOut[DispatchThreadId.y * 8u + DispatchThreadId.x] = Height - Above;
+        return;
+    }
     UnderwaterMapOut[DispatchThreadId] = Height - Above;
     UnderwaterFoamMapOut[DispatchThreadId] = UnderwaterFoamOn != 0u ? max(Surface.Foam, Surface.Whitecap) : 0.0f;
 }

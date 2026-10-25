@@ -26,6 +26,20 @@
 // The disc's largest radius (pixels): farther objects' rings are under a pixel or two anyway.
 #define VOXEL_OCEAN_CONTACT_MAX_PIXELS 48.0f
 
+// Stage W8l: the height over the sea sphere of the point Rel (from the view's camera, cm), less the
+// camera's: UpK.xyz the camera's radial, w its distance from the planet's centre (cm). Exactly
+// |C + Rel| - |C|, as (2 K u + |Rel|^2) / (|C + Rel| + K) (u = Rel . Up): no large terms cancel, so
+// it holds to a part in 10^7 of itself at any distance (the tiles' and the water's alike,
+// VoxelOceanContactTiles.usf).
+float VoxelOceanContactHeightOf(float3 Rel, float4 UpK)
+{
+    const float U = dot(Rel, UpK.xyz);
+    const float R2 = dot(Rel, Rel);
+    const float K = UpK.w;
+    const float Far = sqrt(max((K + U) * (K + U) + max(R2 - U * U, 0.0f), 0.0f));
+    return (2.0f * K * U + R2) / max(Far + K, 1.0f);
+}
+
 // The nearest contact's distance along the surface (cm; 1e9: none within the disc) round the water
 // point Rel (from the view's camera, world axes; Up its radial) at Pixel (the view rect's), the
 // water's size per pixel there (cm) and the reach (cm). Behind: the depth before the sea was drawn

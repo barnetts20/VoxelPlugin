@@ -13,7 +13,11 @@
 // 4b. the fine foam (stage W3w): the rule in the shortest band's own tile, its share at the defaults;
 // 4. the surf's foam (VoxelOceanSurf.ush; the source fed into the same buffer): the bores' faces
 //    and short wake, no step at the trough, the mean where unresolved, the swash's thin edge, off
-//    when off.
+//    when off;
+// 5. stage W8j: the strain kept in the clipmap (three tangent components) plus a pixel's own
+//    short bands give the whole sum's J;
+// 6. stage W8k: the fine foam's long bands held from the levels' texels (bilinear) against every
+//    band looked up at the fine texels: J's error at each fine level's spacing.
 //
 //   g++ -O2 -std=c++20 -ffp-contract=off -I<plugin>/Source/VoxelPlugin/Public -I<plugin>/Source/VoxelPlugin/Private
 //       -I<plugin>/Shaders/Private -I. foam_check.cpp -o foam_check
@@ -549,6 +553,166 @@ int main()
         Check(OffMax == 0.0, "no surf foam with the setting at 0", OffMax, 0.0);
     }
 
+
+    std::printf("5. The strain kept in the clipmap (stage W8j: VoxelOceanFFTStrainOf, VoxelOceanFFTAddStrain)\n");
+    {
+        // The whole sum's J against the clipmap's strain (the long bands' sum, as its three tangent
+        // components) added to the pixel's own lookups (the short bands'): the same J, so the same
+        // foam rule's input; the charts' axes tangent at the point, or tilted as a chart's anchor
+        // a few kilometres off tilts them.
+        using namespace VoxelShader;
+        std::mt19937 Rng(77);
+        std::uniform_real_distribution<float> Uni(-1.0f, 1.0f);
+        auto Unit = [&]() { float3 V(Uni(Rng), Uni(Rng), Uni(Rng)); return normalize(V); };
+        auto ChartAt = [&](float3 Up, float Tilt)
+            {
+                // E1, E2 tangent at Up turned about a random tangent axis by Tilt (radians).
+                float3 A = Unit();
+                float3 E1 = normalize(A - Up * dot(Up, A));
+                float3 E2 = cross(Up, E1);
+                const float3 Axis = normalize(E1 * Uni(Rng) + E2 * Uni(Rng));
+                auto Turn = [&](float3 V)
+                    {
+                        // Rodrigues about Axis.
+                        const float C = std::cos(Tilt), S = std::sin(Tilt);
+                        return V * C + cross(Axis, V) * S + Axis * (dot(Axis, V) * (1.0f - C));
+                    };
+                FVoxelOceanChart Ch;
+                Ch.AnchorHigh = float3(0.0f, 0.0f, 0.0f);
+                Ch.AnchorLow = float3(0.0f, 0.0f, 0.0f);
+                Ch.E1 = Turn(E1);
+                Ch.E2 = Turn(E2);
+                return Ch;
+            };
+        auto Sample = [&]()
+            {
+                FVoxelOceanFFTSample S = VoxelOceanFFTSampleZero();
+                S.Jxx = 0.6f * Uni(Rng);
+                S.Jyy = 0.6f * Uni(Rng);
+                S.Jxy = 0.4f * Uni(Rng);
+                S.Slope = float2(0.3f * Uni(Rng), 0.3f * Uni(Rng));
+                return S;
+            };
+        double WorstRound = 0.0, WorstFlat = 0.0, WorstTilt = 0.0;
+        for (int K = 0; K < 20000; K++)
+        {
+            const float3 Up = Unit();
+            float3 Axis = Unit();
+            if (std::abs(dot(Up, Axis)) > 0.9f) continue;
+            // The round trip: three components in, the same three out.
+            {
+                const float Txx = Uni(Rng), Tyy = Uni(Rng), Txy = Uni(Rng);
+                const float3 T = VoxelOceanFFTStrainOf(VoxelOceanFFTAddStrain(VoxelOceanFFTAccumZero(), Up, Axis, Txx, Tyy, Txy), Up, Axis);
+                WorstRound = std::max(WorstRound, (double)std::max(std::abs(T.x - Txx), std::max(std::abs(T.y - Tyy), std::abs(T.z - Txy))));
+            }
+            for (int Pass = 0; Pass < 2; Pass++)
+            {
+                // Two charts' long bands, one chart's short bands; tilted: an anchor 5 km off on a
+                // 600 km planet (the charts' tangent planes against the point's).
+                const float Tilt = Pass == 0 ? 0.0f : 5.0f / 600.0f;
+                FVoxelOceanFFTAccum Whole = VoxelOceanFFTAccumZero();
+                FVoxelOceanFFTAccum Long = VoxelOceanFFTAccumZero();
+                FVoxelOceanFFTAccum Short = VoxelOceanFFTAccumZero();
+                for (int C = 0; C < 3; C++)
+                {
+                    const FVoxelOceanChart Ch = ChartAt(Up, Tilt);
+                    const float Ang = 3.14159265f * Uni(Rng);
+                    const float2 Wind(std::cos(Ang), std::sin(Ang));
+                    const float Weight = 0.5f + 0.5f * Uni(Rng);
+                    const FVoxelOceanFFTSample S = Sample();
+                    Whole = VoxelOceanFFTAccumAdd(Whole, Ch, Wind, Weight, S);
+                    if (C < 2) Long = VoxelOceanFFTAccumAdd(Long, Ch, Wind, Weight, S);
+                    else Short = VoxelOceanFFTAccumAdd(Short, Ch, Wind, Weight, S);
+                }
+                const float3 T = VoxelOceanFFTStrainOf(Long, Up, Axis);
+                const FVoxelOceanFFTAccum Split = VoxelOceanFFTAddStrain(Short, Up, Axis, T.x, T.y, T.z);
+                const double JW = VoxelOceanFFTFinish(Whole, Up).Jacobian;
+                const double JS = VoxelOceanFFTFinish(Split, Up).Jacobian;
+                (Pass == 0 ? WorstFlat : WorstTilt) = std::max(Pass == 0 ? WorstFlat : WorstTilt, std::abs(JW - JS));
+            }
+        }
+        Check(WorstRound < 1.0e-5, "the strain's three components back as they went in", WorstRound, 1.0e-5);
+        Check(WorstFlat < 1.0e-5, "the strain plus the short bands: the whole sum's J (charts tangent at the point)", WorstFlat, 1.0e-5);
+        Check(WorstTilt < 2.0e-3, "the same with the charts' planes tilted as an anchor 5 km off tilts them (600 km planet)", WorstTilt, 2.0e-3);
+    }
+
+    std::printf("\n6. The fine foam's held long bands (stage W8k: ClipFineFoamCS takes them from the levels' strains)\n");
+    {
+        // The summed surface's J at fine points, every band looked up there, against the long bands
+        // the level's texels resolve interpolated bilinearly from them (its spacing S apart) and the
+        // rest looked up: at the fine levels' S (20, 40, 80, 160 cm), the 10 m/s layout, a storm's
+        // too (25 m/s: the long bands' states). Held as the shader holds them
+        // (VOXEL_OCEAN_CLIP_FINE_HOLD): band 0 at every level, band 1 at the first two.
+        const double Hold = 0.051;
+        const uint32_t Tick = TickOf(211.0);
+        FGPUSlot G[8];
+        for (int s = 0; s < 8; s++) G[s] = s == 7 ? LongCopy(EmulateGPU(Slots[s], Tick)) : EmulateGPU(Slots[s], Tick);
+        for (double Wind : { 10.0, 25.0 })
+        {
+            double Wt[3];
+            StateWeights(Wind, Wt);
+            // Band B's J terms at (X, Y) (m), its sea states blended.
+            auto BandAt = [&](int B, double X, double Y, double Out[3])
+                {
+                    Out[0] = Out[1] = Out[2] = 0.0;
+                    auto Add = [&](int s, double W)
+                        {
+                            const double L = Slots[s].Params.TileLength;
+                            const F4 D = Bilinear(G[s].Derivatives, X / L * G[s].N, Y / L * G[s].N), Xd = Bilinear(G[s].Displacement, X / L * G[s].N, Y / L * G[s].N);
+                            Out[0] += W * D.z; Out[1] += W * D.w; Out[2] += W * Xd.w;
+                        };
+                    if (B < 2) { for (int K = 0; K < 3; K++) if (Wt[K] > 0.0) Add(2 * K + B, Wt[K]); }
+                    else Add(4 + B, 1.0);
+                };
+            auto JOf = [](const double T[3]) { return (1.0 + T[0]) * (1.0 + T[1]) - T[2] * T[2]; };
+            const double Lambda0 = Slots[1].Params.TileLength / 4.0, Lambda1 = Slots[6].Params.TileLength / 4.0;
+            std::printf("  %.0f m/s (band 0's shortest waves %.1f m, band 1's %.1f m):\n", Wind, Lambda0, Lambda1);
+            std::mt19937 Rng(911);
+            std::uniform_real_distribution<double> Pos(0.0, 5.0e4);
+            for (double S : { 0.2, 0.4, 0.8, 1.6 })
+            {
+                const bool bHold0 = S <= Hold * Lambda0, bHold1 = S <= Hold * Lambda1;
+                double Worst = 0.0, Sum2 = 0.0, WorstUnheld1 = 0.0;
+                const int M = 20000;
+                for (int n = 0; n < M; n++)
+                {
+                    const double X = Pos(Rng), Y = Pos(Rng);
+                    double Whole[3] = { 0.0, 0.0, 0.0 }, Split[3] = { 0.0, 0.0, 0.0 }, Alt[3] = { 0.0, 0.0, 0.0 };
+                    for (int B = 0; B < 4; B++)
+                    {
+                        double T[3];
+                        BandAt(B, X, Y, T);
+                        for (int c = 0; c < 3; c++) Whole[c] += T[c];
+                        const bool bHeld = (B == 0 && bHold0) || (B == 1 && bHold1);
+                        // The interpolated one: the level's texels S apart, bilinear.
+                        double I[3] = { T[0], T[1], T[2] };
+                        if (B < 2)
+                        {
+                            const double GX = std::floor(X / S), GY = std::floor(Y / S), FX = X / S - GX, FY = Y / S - GY;
+                            double C00[3], C10[3], C01[3], C11[3];
+                            BandAt(B, GX * S, GY * S, C00); BandAt(B, (GX + 1) * S, GY * S, C10);
+                            BandAt(B, GX * S, (GY + 1) * S, C01); BandAt(B, (GX + 1) * S, (GY + 1) * S, C11);
+                            for (int c = 0; c < 3; c++)
+                                I[c] = (1 - FY) * ((1 - FX) * C00[c] + FX * C10[c]) + FY * ((1 - FX) * C01[c] + FX * C11[c]);
+                        }
+                        for (int c = 0; c < 3; c++) Split[c] += bHeld ? I[c] : T[c];
+                        // (Band 1 held regardless, to show why it isn't past the first two levels.)
+                        for (int c = 0; c < 3; c++) Alt[c] += (B == 0 && bHold0) || B == 1 ? I[c] : T[c];
+                    }
+                    const double D = std::abs(JOf(Whole) - JOf(Split));
+                    Worst = std::max(Worst, D);
+                    Sum2 += D * D;
+                    WorstUnheld1 = std::max(WorstUnheld1, std::abs(JOf(Whole) - JOf(Alt)));
+                }
+                char Buf[160];
+                std::snprintf(Buf, sizeof(Buf), "S %.0f cm, held %s%s: J off by at most (rms %.5f)", 100.0 * S, bHold0 ? "band 0" : "none", bHold1 ? " and 1" : "",
+                    std::sqrt(Sum2 / M));
+                Check(Worst < 0.01, Buf, Worst, 0.01);
+                if (!bHold1)
+                    std::printf("    (band 1 held here too: off by %.4f)\n", WorstUnheld1);
+            }
+        }
+    }
 
     std::printf("\n%s: %d failure(s)\n", Fails ? "FAILED" : "PASSED", Fails);
     return Fails ? 1 : 0;

@@ -1,4 +1,5 @@
 #include "VoxelUnderwaterViewExtension.h"
+#include "VoxelOceanGPUTime.h"
 #include "VoxelUnderwaterMap.h"
 #include "VoxelOceanShoreField.h"
 #include "VoxelOceanDepthProbe.h"
@@ -25,6 +26,16 @@ namespace VoxelUnderwaterDetail
     constexpr int32 ThreadGroupSize = 8;
     /** Slack (cm) on the test of whether a view can see the water, for the float heights. */
     constexpr double ViewSlack = 1.0;
+    /** Stage W8b: the camera's probe: its grid's spacing (cm; 8 x 8 points round the camera's
+     *  foot), the readings in flight at most, how old a reading may be (s) and how far the camera
+     *  may have moved from it (cm) to be used, the waves' rise per second (cm) and the base margin
+     *  (cm) the test allows. */
+    constexpr double CameraProbeSpacing = 25.0;
+    constexpr int32 CameraProbeInFlight = 4;
+    constexpr double CameraProbeMaxAge = 0.5;
+    constexpr double CameraProbeMaxMove = 2000.0;
+    constexpr double CameraProbeRise = 300.0;
+    constexpr double CameraProbeMargin = 30.0;
 }
 
 // ---------------------------------------------------------------------------
@@ -123,6 +134,9 @@ BEGIN_SHADER_PARAMETER_STRUCT(FVoxelUnderwaterMapParameters, )
     SHADER_PARAMETER_ARRAY(FVector4f, UnderwaterProbeE2, [VoxelOceanDepthProbe::Levels])
     SHADER_PARAMETER(uint32, UnderwaterProbeOn)
     SHADER_PARAMETER_ARRAY(FVector4f, UnderwaterShoreFrame, [7])
+    // Stage W8b: the camera's probe (mode 1: its 64 heights here, not the map).
+    SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<float>, UnderwaterCameraOut)
+    SHADER_PARAMETER(uint32, UnderwaterCameraMode)
 END_SHADER_PARAMETER_STRUCT()
 
 class FVoxelUnderwaterMapCS : public FGlobalShader
@@ -255,6 +269,27 @@ FScreenPassTexture FVoxelUnderwaterViewExtension::Render_RenderThread(
             return Inputs.ReturnUntouchedSceneColorForPostProcessing(GraphBuilder);
     }
 
+    // Stage W8b: the camera probe's readings come back (in order).
+    while (CameraReadbacks.Num() > 0 && CameraReadbacks[0].Buffer.IsValid() && CameraReadbacks[0].Buffer->IsReady())
+    {
+        FCameraReadback& R = CameraReadbacks[0];
+        const float* Heights = static_cast<const float*>(R.Buffer->Lock(64u * sizeof(float)));
+        if (Heights)
+        {
+            float Highest = Heights[0];
+            for (int32 i = 1; i < 64; i++) Highest = FMath::Max(Highest, Heights[i]);
+            R.Buffer->Unlock();
+            if (FMath::IsFinite(Highest))
+            {
+                bHasCameraSurface = true;
+                CameraSurfaceMax = (double)Highest;
+                CameraSurfaceAt = R.CameraPlanet;
+                CameraSurfaceSeconds = R.Seconds;
+            }
+        }
+        CameraReadbacks.RemoveAt(0);
+    }
+
     const FScreenPassTexture SceneColor = FScreenPassTexture::CopyFromSlice(GraphBuilder, SceneColorSlice);
     const FIntRect Rect = SceneColor.ViewRect;
     const FIntPoint OutputSize = Rect.Size();
@@ -265,6 +300,7 @@ FScreenPassTexture FVoxelUnderwaterViewExtension::Render_RenderThread(
     }
 
     RDG_EVENT_SCOPE_STAT(GraphBuilder, VoxelUnderwater, "VoxelUnderwater");
+    VoxelOceanGPUTime::FScope OceanGPUTime(GraphBuilder, VoxelOceanGPUTime::Underwater);
 
     // Into a new texture of the scene colour's size, written inside the view rect only: the
     // passes after this one read within it.
@@ -325,53 +361,105 @@ FScreenPassTexture FVoxelUnderwaterViewExtension::Render_RenderThread(
         TEXT("VoxelUnderwater.FoamMap"));
     FRHITexture* Foam = FoamRHI.GetReference();
     const bool bFoam = bFFT && Foam && Params.FoamColor.W > 0.0f;
+    // The map pass's parameters (the probe's too, stage W8b: the same waves, shore and depth probe).
+    FRDGBufferRef CameraOut = GraphBuilder.CreateBuffer(FRDGBufferDesc::CreateStructuredDesc(sizeof(float), 64u), TEXT("VoxelUnderwater.CameraProbe"));
+    auto MakeMapParams = [&](FRDGTextureUAVRef MapUAV, FRDGTextureUAVRef FoamUAV, bool bFoamOn) -> FVoxelUnderwaterMapParameters*
+        {
+            FVoxelUnderwaterMapParameters* P = GraphBuilder.AllocParameters<FVoxelUnderwaterMapParameters>();
+            P->Waves = WaveP;
+            P->UnderwaterMapOut = MapUAV;
+            P->UnderwaterFoamMapOut = FoamUAV;
+            P->UnderwaterFoam = bFoamOn ? Foam : GBlackArrayTexture->TextureRHI.GetReference();
+            P->UnderwaterFoamSampler = TStaticSamplerState<SF_Trilinear, AM_Wrap, AM_Wrap, AM_Clamp>::GetRHI();
+            P->UnderwaterFoamOn = bFoamOn ? 1u : 0u;
+            P->UnderwaterCameraOut = GraphBuilder.CreateUAV(CameraOut);
+            P->UnderwaterCameraMode = 0u;
+            // The shore field's texture, or a stand-in (the waves then see no field: States.x is 0
+            // without one, VoxelOceanWaveShaderParams).
+            FRHITexture* ShoreTexture = Params.Shore.IsValid() ? Params.Shore->Texture.GetReference() : nullptr;
+            P->UnderwaterShore = ShoreTexture ? ShoreTexture : GBlackArrayTexture->TextureRHI.GetReference();
+            if (!ShoreTexture)
+            {
+                P->Waves.UnderwaterStates.X = 0.0f;
+            }
+            for (int32 i = 0; i < 7; i++)
+                P->UnderwaterShoreFrame[i] = ShoreTexture ? WaveParams.ShoreFrame[i] : FVector4f(0.0f, 0.0f, 0.0f, 0.0f);
+            // The depth probe, its levels from this view's camera.
+            const FVoxelOceanProbeState* Probe = Params.Probe.IsValid() && Params.Probe->bValid && Params.Probe->Depth.IsValid() ? Params.Probe.Get() : nullptr;
+            if (Probe)
+            {
+                P->UnderwaterProbe = GraphBuilder.CreateSRV(GraphBuilder.RegisterExternalBuffer(Probe->Depth));
+                const FQuat Rotation = Waves.PlanetToWorld.GetRotation();
+                for (int32 Level = 0; Level < VoxelOceanDepthProbe::Levels; Level++)
+                {
+                    const FVector Anchor = Rotation.RotateVector(Probe->Levels.Anchor[Level] - CameraPlanet);
+                    const FVector E1 = Rotation.RotateVector(Probe->Levels.E1[Level]);
+                    const FVector E2 = Rotation.RotateVector(Probe->Levels.E2[Level]);
+                    P->UnderwaterProbeAnchor[Level] = FVector4f((float)Anchor.X, (float)Anchor.Y, (float)Anchor.Z, (float)Probe->Levels.Spacing[Level]);
+                    P->UnderwaterProbeE1[Level] = FVector4f((float)E1.X, (float)E1.Y, (float)E1.Z, 0.0f);
+                    P->UnderwaterProbeE2[Level] = FVector4f((float)E2.X, (float)E2.Y, (float)E2.Z, 0.0f);
+                }
+                P->UnderwaterProbeOn = 1u;
+            }
+            else
+            {
+                P->UnderwaterProbe = GraphBuilder.CreateSRV(VoxelGPUCommon::UploadStructuredBuffer<float>(GraphBuilder, TEXT("VoxelUnderwater.NoProbe"), TConstArrayView<float>()));
+                for (int32 Level = 0; Level < VoxelOceanDepthProbe::Levels; Level++)
+                {
+                    P->UnderwaterProbeAnchor[Level] = FVector4f(0.0f, 0.0f, 0.0f, 1.0f);
+                    P->UnderwaterProbeE1[Level] = FVector4f(1.0f, 0.0f, 0.0f, 0.0f);
+                    P->UnderwaterProbeE2[Level] = FVector4f(0.0f, 1.0f, 0.0f, 0.0f);
+                }
+                P->UnderwaterProbeOn = 0u;
+            }
+            return P;
+        };
+
+    // -- Stage W8b: the camera's probe, and the test against the last reading --------------------
+    // The surface round the camera's foot (64 of the map pass's points, 25 cm apart), read back for
+    // the next frames; this frame's view is skipped while the camera stands clear above the last
+    // reading (its highest point), by more than the near plane's reach and the meniscus, with
+    // margins for the reading's age (the waves' rise) and the camera's travel since (a slope of 1).
     if (bFFT)
     {
-        FVoxelUnderwaterMapParameters* P = GraphBuilder.AllocParameters<FVoxelUnderwaterMapParameters>();
-        P->Waves = WaveP;
-        P->UnderwaterMapOut = GraphBuilder.CreateUAV(Map);
-        P->UnderwaterFoamMapOut = GraphBuilder.CreateUAV(FoamMap);
-        P->UnderwaterFoam = bFoam ? Foam : GBlackArrayTexture->TextureRHI.GetReference();
-        P->UnderwaterFoamSampler = TStaticSamplerState<SF_Trilinear, AM_Wrap, AM_Wrap, AM_Clamp>::GetRHI();
-        P->UnderwaterFoamOn = bFoam ? 1u : 0u;
-        // The shore field's texture, or a stand-in (the waves then see no field: States.x is 0
-        // without one, VoxelOceanWaveShaderParams).
-        FRHITexture* ShoreTexture = Params.Shore.IsValid() ? Params.Shore->Texture.GetReference() : nullptr;
-        P->UnderwaterShore = ShoreTexture ? ShoreTexture : GBlackArrayTexture->TextureRHI.GetReference();
-        if (!ShoreTexture)
+        const FVector Up = CameraPlanet.GetSafeNormal();
+        const FVector Foot = Waves.PlanetToWorld.GetRotation().RotateVector(Up * Waves.Radius() - CameraPlanet);
+        const double T = VoxelUnderwaterDetail::CameraProbeSpacing;
+        const double Shift = (0.5 * VoxelUnderwaterMap::Size - 4.0) * T;
+        const FVector E1(Levels.E1[0].X, Levels.E1[0].Y, Levels.E1[0].Z);
+        const FVector E2(Levels.E2[0].X, Levels.E2[0].Y, Levels.E2[0].Z);
+        const FVector Anchor = Foot + (E1 + E2) * Shift;
+        FRDGTextureRef ProbeMap = GraphBuilder.CreateTexture(FRDGTextureDesc::Create2DArray(FIntPoint(1, 1), PF_R32_FLOAT, FClearValueBinding::Black,
+            TexCreate_ShaderResource | TexCreate_UAV, 1), TEXT("VoxelUnderwater.CameraProbeMap"));
+        FRDGTextureRef ProbeFoam = GraphBuilder.CreateTexture(FRDGTextureDesc::Create2DArray(FIntPoint(1, 1), PF_R16F, FClearValueBinding::Black,
+            TexCreate_ShaderResource | TexCreate_UAV, 1), TEXT("VoxelUnderwater.CameraProbeFoam"));
+        FVoxelUnderwaterMapParameters* P = MakeMapParams(GraphBuilder.CreateUAV(ProbeMap), GraphBuilder.CreateUAV(ProbeFoam), false);
+        P->Waves.UnderwaterMapAnchor[0] = FVector4f((float)Anchor.X, (float)Anchor.Y, (float)Anchor.Z, (float)T);
+        P->UnderwaterCameraMode = 1u;
+        TShaderMapRef<FVoxelUnderwaterMapCS> ProbeShader(GetGlobalShaderMap(View.GetFeatureLevel()));
+        FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("Underwater camera probe"), ProbeShader, P,
+            FIntVector(FMath::DivideAndRoundUp(8, VoxelUnderwaterDetail::ThreadGroupSize), FMath::DivideAndRoundUp(8, VoxelUnderwaterDetail::ThreadGroupSize), 1));
+        if (CameraReadbacks.Num() < VoxelUnderwaterDetail::CameraProbeInFlight)
         {
-            P->Waves.UnderwaterStates.X = 0.0f;
+            FCameraReadback& R = CameraReadbacks.AddDefaulted_GetRef();
+            R.Buffer = MakeUnique<FRHIGPUBufferReadback>(TEXT("VoxelUnderwater.CameraProbeReadback"));
+            R.CameraPlanet = CameraPlanet;
+            R.Seconds = FPlatformTime::Seconds();
+            AddEnqueueCopyPass(GraphBuilder, R.Buffer.Get(), CameraOut, 64u * sizeof(float));
         }
-        for (int32 i = 0; i < 7; i++)
-            P->UnderwaterShoreFrame[i] = ShoreTexture ? WaveParams.ShoreFrame[i] : FVector4f(0.0f, 0.0f, 0.0f, 0.0f);
-        // The depth probe, its levels from this view's camera.
-        const FVoxelOceanProbeState* Probe = Params.Probe.IsValid() && Params.Probe->bValid && Params.Probe->Depth.IsValid() ? Params.Probe.Get() : nullptr;
-        if (Probe)
+        const double Age = FPlatformTime::Seconds() - CameraSurfaceSeconds;
+        const double Moved = (CameraPlanet - CameraSurfaceAt).Size();
+        if (bHasCameraSurface && Age >= 0.0 && Age < VoxelUnderwaterDetail::CameraProbeMaxAge && Moved < VoxelUnderwaterDetail::CameraProbeMaxMove)
         {
-            P->UnderwaterProbe = GraphBuilder.CreateSRV(GraphBuilder.RegisterExternalBuffer(Probe->Depth));
-            const FQuat Rotation = Waves.PlanetToWorld.GetRotation();
-            for (int32 Level = 0; Level < VoxelOceanDepthProbe::Levels; Level++)
-            {
-                const FVector Anchor = Rotation.RotateVector(Probe->Levels.Anchor[Level] - CameraPlanet);
-                const FVector E1 = Rotation.RotateVector(Probe->Levels.E1[Level]);
-                const FVector E2 = Rotation.RotateVector(Probe->Levels.E2[Level]);
-                P->UnderwaterProbeAnchor[Level] = FVector4f((float)Anchor.X, (float)Anchor.Y, (float)Anchor.Z, (float)Probe->Levels.Spacing[Level]);
-                P->UnderwaterProbeE1[Level] = FVector4f((float)E1.X, (float)E1.Y, (float)E1.Z, 0.0f);
-                P->UnderwaterProbeE2[Level] = FVector4f((float)E2.X, (float)E2.Y, (float)E2.Z, 0.0f);
-            }
-            P->UnderwaterProbeOn = 1u;
+            const double Margin = VoxelUnderwaterDetail::CameraProbeMargin + Moved + VoxelUnderwaterDetail::CameraProbeRise * Age;
+            if (CameraHeight - CameraSurfaceMax - NearReach > FMath::Max(0.0f, Params.Meniscus.W) + Margin)
+                return Inputs.ReturnUntouchedSceneColorForPostProcessing(GraphBuilder);
         }
-        else
-        {
-            P->UnderwaterProbe = GraphBuilder.CreateSRV(VoxelGPUCommon::UploadStructuredBuffer<float>(GraphBuilder, TEXT("VoxelUnderwater.NoProbe"), TConstArrayView<float>()));
-            for (int32 Level = 0; Level < VoxelOceanDepthProbe::Levels; Level++)
-            {
-                P->UnderwaterProbeAnchor[Level] = FVector4f(0.0f, 0.0f, 0.0f, 1.0f);
-                P->UnderwaterProbeE1[Level] = FVector4f(1.0f, 0.0f, 0.0f, 0.0f);
-                P->UnderwaterProbeE2[Level] = FVector4f(0.0f, 1.0f, 0.0f, 0.0f);
-            }
-            P->UnderwaterProbeOn = 0u;
-        }
+    }
+
+    if (bFFT)
+    {
+        FVoxelUnderwaterMapParameters* P = MakeMapParams(GraphBuilder.CreateUAV(Map), GraphBuilder.CreateUAV(FoamMap), bFoam);
         TShaderMapRef<FVoxelUnderwaterMapCS> Shader(GetGlobalShaderMap(View.GetFeatureLevel()));
         FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("Underwater surface map %dx%dx%d", MapSize, MapSize, MapLevels),
             Shader, P, FIntVector(FMath::DivideAndRoundUp(MapSize, VoxelUnderwaterDetail::ThreadGroupSize),

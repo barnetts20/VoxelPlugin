@@ -1,0 +1,37 @@
+// VoxelOceanGPUTimeRef.usf - Stage W8g: the performance sweep's reference workload
+// (VoxelOceanGPUTime.cpp dispatches it next to the ocean's surface pass while the sweep runs).
+//
+// Fixed work every frame: arithmetic, a transcendental and group-shared reads, nothing that depends
+// on the scene. Its time changes only with the GPU's speed (clocks, power state, other work
+// sharing the GPU), so the sweep scales the ocean's times by it: a segment where the GPU ran 10%
+// slow no longer reads as a 10% dearer ocean.
+//
+// Parameter names must match FVoxelOceanGPUTimeRefCS's parameters (VoxelOceanGPUTime.cpp).
+
+#include "/Engine/Public/Platform.ush"
+
+RWStructuredBuffer<float> RefOut;
+uint RefIterations;
+
+groupshared float RefShared[64];
+
+[numthreads(64, 1, 1)]
+void GPUTimeRefCS(uint3 GroupThreadId : SV_GroupThreadID, uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+    float A = (float)DispatchThreadId.x * 1.0e-6f;
+    float B = 1.0f;
+    RefShared[GroupThreadId.x] = A;
+    GroupMemoryBarrierWithGroupSync();
+    for (uint i = 0u; i < RefIterations; i++)
+    {
+        const float S = RefShared[(GroupThreadId.x + i) & 63u];
+        A = A * 0.999f + S * 0.001f + 0.5f;
+        B = B * 1.0001f - A * 1.0e-7f;
+        A = frac(sin(A) * 43758.5453f);
+    }
+    // Never true; keeps the loop live.
+    if (A + B == -12345.0f)
+    {
+        RefOut[0] = A;
+    }
+}

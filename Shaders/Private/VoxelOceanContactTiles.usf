@@ -1,0 +1,75 @@
+// VoxelOceanContactTiles.usf - Stage W8l: where the intersection foam's search can find anything
+// (VoxelOceanContactSearch.ush; VoxelOceanSurfacePass.cpp runs these before the surface's draw).
+//
+// The search looks at 16 points of the depth behind the water round every water pixel, a disc of
+// up to VOXEL_OCEAN_CONTACT_MAX_PIXELS (48), for a scene point from CONTACT_BAND under the water up.
+// On the open sea everything behind the water is the bed, metres down, or the sky, and the 16 taps
+// find nothing. So first, per tile of 16 x 16 pixels, the highest scene point behind (its height
+// over the sea sphere less the camera's: VoxelOceanContactHeightOf, TilesUp), then that
+// tile's greatest over the tiles within three of it (any disc's reach from any of its pixels).
+// A water pixel whose own height is more than the band over that greatest doesn't search: none of
+// its taps could have counted (a tap counts only where it stands at most the band under the water
+// along the water's radial, and along it a point is never higher than its height over the sphere
+// says, the sphere bending down from the radial).
+//
+// Parameter names must match FVoxelOceanContactTilesParameters (VoxelOceanSurfacePass.cpp).
+
+#include "/Engine/Public/Platform.ush"
+#include "/Plugin/VoxelPlugin/Private/VoxelOceanContactSearch.ush"
+
+#define VOXEL_OCEAN_CONTACT_TILE 16
+#define VOXEL_OCEAN_CONTACT_TILE_REACH 3
+
+Texture2D<float> TilesBehindDepth;
+uint2 TilesViewSize;
+float4x4 TilesClipToRel;
+float4 TilesUp;
+uint2 TilesCount;
+RWTexture2D<float> TilesOut;
+Texture2D<float> TilesIn;
+
+groupshared float TilesShared[VOXEL_OCEAN_CONTACT_TILE * VOXEL_OCEAN_CONTACT_TILE];
+
+[numthreads(16, 16, 1)]
+void ContactTilesCS(uint3 GroupId : SV_GroupID, uint3 GroupThreadId : SV_GroupThreadID, uint GroupIndex : SV_GroupIndex)
+{
+    const uint2 Pixel = GroupId.xy * uint(VOXEL_OCEAN_CONTACT_TILE) + GroupThreadId.xy;
+    float G = -1.0e30f;
+    if (Pixel.x < TilesViewSize.x && Pixel.y < TilesViewSize.y)
+    {
+        const float Depth = TilesBehindDepth.Load(int3(int2(Pixel), 0));
+        if (Depth > 0.0f)
+        {
+            // As VoxelOceanContactSearch places its taps.
+            const float4 H = mul(float4((float(Pixel.x) + 0.5f) / float(TilesViewSize.x) * 2.0f - 1.0f,
+                1.0f - (float(Pixel.y) + 0.5f) / float(TilesViewSize.y) * 2.0f, Depth, 1.0f), TilesClipToRel);
+            G = VoxelOceanContactHeightOf(H.xyz / H.w, TilesUp);
+        }
+    }
+    TilesShared[GroupIndex] = G;
+    GroupMemoryBarrierWithGroupSync();
+    [unroll]
+    for (uint Half = 128u; Half > 0u; Half >>= 1u)
+    {
+        if (GroupIndex < Half) TilesShared[GroupIndex] = max(TilesShared[GroupIndex], TilesShared[GroupIndex + Half]);
+        GroupMemoryBarrierWithGroupSync();
+    }
+    if (GroupIndex == 0u) TilesOut[int2(GroupId.xy)] = TilesShared[0];
+}
+
+[numthreads(8, 8, 1)]
+void ContactDilateCS(uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+    if (DispatchThreadId.x >= TilesCount.x || DispatchThreadId.y >= TilesCount.y) return;
+    const int2 T = int2(DispatchThreadId.xy);
+    const int2 Last = int2(TilesCount) - 1;
+    float M = -1.0e30f;
+    [loop]
+    for (int Y = -VOXEL_OCEAN_CONTACT_TILE_REACH; Y <= VOXEL_OCEAN_CONTACT_TILE_REACH; Y++)
+    {
+        [loop]
+        for (int X = -VOXEL_OCEAN_CONTACT_TILE_REACH; X <= VOXEL_OCEAN_CONTACT_TILE_REACH; X++)
+            M = max(M, TilesIn.Load(int3(clamp(T + int2(X, Y), int2(0, 0), Last), 0)));
+    }
+    TilesOut[T] = M;
+}

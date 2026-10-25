@@ -34,6 +34,7 @@
 #include "GameFramework/GameStateBase.h"
 #include "HAL/IConsoleManager.h"
 #include "EngineUtils.h"
+#include "VoxelOceanGPUTime.h"
 #include "RHI.h"
 
 DECLARE_CYCLE_STAT(TEXT("Ocean: actor tick"), STAT_VoxelOceanActorTick, STATGROUP_VoxelTerrain);
@@ -118,6 +119,7 @@ void AOceanSphereActor::BeginPlay()
 
 void AOceanSphereActor::EndPlay(const EEndPlayReason::Type EndPlayReason)
 {
+    StopPerfSweep();
     ReleaseUnderwater();
     ReleaseSurfacePass();
     if (ShoreBuilder.IsValid())
@@ -153,6 +155,7 @@ void AOceanSphereActor::Destroyed()
 
 void AOceanSphereActor::BeginDestroy()
 {
+    StopPerfSweep();
     // An editor world unloads without EndPlay or Destroyed.
     ReleaseUnderwater();
     ReleaseSurfacePass();
@@ -527,6 +530,7 @@ void AOceanSphereActor::UpdateSurfacePass()
     Params.FoamDetailDistanceM = S.FoamDetailDistance;
     Params.FoamFadeDistanceM = S.FoamFadeDistance;
     Params.bCubicFiltering = S.bCubicFiltering;
+    Params.bFoamDetailFromClip = S.bFoamDetailFromClip;
     Params.Anisotropy = S.WaveAnisotropy;
     if (Params.SprayAmount > 0.0f && bHasCamera)
     {
@@ -1164,15 +1168,30 @@ void AOceanSphereActor::Tick(float DeltaTime)
 
 namespace VoxelOceanPerfSweep
 {
-    /** Frames each step waits after its settings apply (the passes' history, the clipmap's due
-     *  levels settling) before it measures. */
-    constexpr int32 WarmupFrames = 60;
+    /** Frames each segment waits after its settings apply (the passes' history, the clipmap's
+     *  due levels settling) before it measures; stage W8d: the rounds of baseline and variant
+     *  each step alternates (the frame drifts by a millisecond over a sweep: a saving is the
+     *  median of the rounds' differences, each against the baseline just before it). */
+    constexpr int32 WarmupFrames = 30;
+    constexpr int32 DefaultRounds = 3;
+    constexpr int32 DefaultFrames = 120;
+    /** Stage W8e: the first baseline's settling (the held weather made again). */
+    constexpr int32 FirstSettleFrames = 120;
 
     struct FStep
     {
         const TCHAR* Name;
         void (*Apply)(FVoxelOceanSettings&);
+        /** Stage W8l: or a console variable set to 0 for the variant (1 for the baseline). */
+        const TCHAR* CVar = nullptr;
     };
+
+    static void SetCVar(const TCHAR* Name, int32 Value)
+    {
+        if (!Name) return;
+        if (IConsoleVariable* Var = IConsoleManager::Get().FindConsoleVariable(Name))
+            Var->Set(Value, ECVF_SetByConsole);
+    }
 
     static void Everything(FVoxelOceanSettings& S)
     {
@@ -1186,34 +1205,45 @@ namespace VoxelOceanPerfSweep
         S.CrestGlow = 0.0f;
     }
 
-    // Each feature off in turn against the baseline (the settings as they were), all of them
-    // together, then the baseline again (its drift: the camera or the weather moved).
+    // Each feature off in turn against the baseline (the settings as they were), then all of them
+    // together; first nothing at all against the baseline (the noise floor).
     static const FStep Steps[] = {
-        { TEXT("baseline"), [](FVoxelOceanSettings&) {} },
+        { TEXT("nothing (the noise floor)"), [](FVoxelOceanSettings&) {} },
         { TEXT("bUnderwaterView off"), [](FVoxelOceanSettings& S) { S.bUnderwaterView = false; } },
         { TEXT("WaveAnisotropy 1"), [](FVoxelOceanSettings& S) { S.WaveAnisotropy = 1; } },
         { TEXT("bCubicFiltering off"), [](FVoxelOceanSettings& S) { S.bCubicFiltering = false; } },
         { TEXT("WaveDetileCell 0"), [](FVoxelOceanSettings& S) { S.WaveDetileCell = 0.0; } },
         { TEXT("IntersectionFoam 0"), [](FVoxelOceanSettings& S) { S.IntersectionFoam = 0.0f; } },
+        // (Stage W8l: its search everywhere, as before W8l.)
+        { TEXT("voxel.Ocean.ContactTiles 0"), [](FVoxelOceanSettings&) {}, TEXT("voxel.Ocean.ContactTiles") },
         { TEXT("bSpray off"), [](FVoxelOceanSettings& S) { S.bSpray = false; } },
         { TEXT("FoamDetailLevels 0"), [](FVoxelOceanSettings& S) { S.FoamDetailLevels = 0; } },
+        // (Stage W8k: the fine foam with every band looked up again, as before W8k.)
+        { TEXT("bFineFoamFromClip off"), [](FVoxelOceanSettings& S) { S.bFineFoamFromClip = false; } },
         { TEXT("CrestGlow 0"), [](FVoxelOceanSettings& S) { S.CrestGlow = 0.0f; } },
         { TEXT("bFoam off"), [](FVoxelOceanSettings& S) { S.bFoam = false; } },
+        // (Stage W8c: the foam's parts: the pixel's own foam, with its dual lookups; the surf's foam.)
+        { TEXT("FoamDetail 0"), [](FVoxelOceanSettings& S) { S.FoamDetail = 0.0f; } },
+        // (Stage W8j: the pixel's foam with every band looked up again, as before W8j.)
+        { TEXT("bFoamDetailFromClip off"), [](FVoxelOceanSettings& S) { S.bFoamDetailFromClip = false; } },
+        { TEXT("SurfFoam 0"), [](FVoxelOceanSettings& S) { S.SurfFoam = 0.0; } },
         { TEXT("bSurf off"), [](FVoxelOceanSettings& S) { S.bSurf = false; } },
         { TEXT("WaveUpdateRate 25"), [](FVoxelOceanSettings& S) { S.WaveUpdateRate = 25.0; } },
         { TEXT("all of the above but foam and surf"), &Everything },
-        { TEXT("baseline again"), [](FVoxelOceanSettings&) {} },
     };
     constexpr int32 NumSteps = UE_ARRAY_COUNT(Steps);
 
     void Run(const TArray<FString>& Args, UWorld* World)
     {
         if (!World) return;
-        const int32 Frames = Args.Num() > 0 ? FMath::Clamp(FCString::Atoi(*Args[0]), 30, 3000) : 180;
+        // Stage W8g: 120 frames a segment by default (a second of the waves isn't the same work as
+        // the next); the rounds as the second argument.
+        const int32 Frames = Args.Num() > 0 ? FMath::Clamp(FCString::Atoi(*Args[0]), 20, 3000) : DefaultFrames;
+        const int32 Rounds = Args.Num() > 1 ? FMath::Clamp(FCString::Atoi(*Args[1]), 1, 9) : DefaultRounds;
         int32 Count = 0;
         for (TActorIterator<AOceanSphereActor> It(World); It; ++It)
         {
-            It->StartPerfSweep(Frames);
+            It->StartPerfSweep(Frames, Rounds);
             Count++;
         }
         if (Count == 0)
@@ -1222,65 +1252,265 @@ namespace VoxelOceanPerfSweep
 
     FAutoConsoleCommandWithWorldAndArgs Command(
         TEXT("voxel.Ocean.PerfSweep"),
-        TEXT("Stage W8a: [frames per step, 180] the GPU's frame time with each of the ocean's costly features off in turn (underwater view, anisotropy, cubic filtering, detiling, intersection foam, spray, fine foam, crest glow, foam, surf, the wave update rate), then all together; logged as a table and the settings restored. Hold the camera still (a minute or so at 60 fps)."),
+        TEXT("Stage W8a: [frames per segment, 120] [rounds, 3] the ocean's own GPU time (stage W8f: its pass groups' timestamps; the whole frame alongside) with each of the ocean's costly features off in turn (underwater view, anisotropy, cubic filtering, detiling, intersection foam, spray, fine foam, crest glow, foam, the pixel's foam, the surf's foam, surf, the wave update rate), then all together; each against the baseline just before it, the rounds interleaved (stage W8d), scaled by a reference workload's time (stage W8g: the GPU's speed), the frame uncapped; logged as a table and the settings restored. Hold the camera still (three to four minutes)."),
         FConsoleCommandWithWorldAndArgsDelegate::CreateStatic(&Run));
 }
 
-void AOceanSphereActor::StartPerfSweep(int32 FramesPerStep)
+void AOceanSphereActor::StartPerfSweep(int32 FramesPerStep, int32 Rounds)
 {
     if (PerfSweep.bOn || !bInitialized) return;
     PerfSweep = FPerfSweep();
     PerfSweep.bOn = true;
     PerfSweep.Original = OceanSettings;
-    PerfSweep.Frames = FMath::Max(FramesPerStep, 30);
-    UE_LOG(LogVoxelPlugin, Log, TEXT("[VoxelOcean] PerfSweep: %d steps of %d frames (and %d to settle each); hold the camera still."),
-        VoxelOceanPerfSweep::NumSteps, PerfSweep.Frames, VoxelOceanPerfSweep::WarmupFrames);
-    FVoxelOceanSettings S = PerfSweep.Original;
-    VoxelOceanPerfSweep::Steps[0].Apply(S);
-    SetOceanSettings(S);
+    PerfSweep.Frames = FMath::Max(FramesPerStep, 20);
+    PerfSweep.Rounds = FMath::Clamp(Rounds, 1, 9);
+    // Stage W8g: the frame uncapped while it runs (a GPU with time to spare between frames lowers
+    // its clocks, and by more or less from one second to the next); put back at the end.
+    {
+        IConsoleManager& CM = IConsoleManager::Get();
+        PerfSweep.SavedVars.Reset();
+        for (const TCHAR* Name : { TEXT("t.MaxFPS"), TEXT("r.VSync"), TEXT("r.VSyncEditor") })
+        {
+            if (IConsoleVariable* Var = CM.FindConsoleVariable(Name))
+            {
+                PerfSweep.SavedVars.Add(Name, Var->GetString());
+                Var->Set(TEXT("0"), ECVF_SetByConsole);
+            }
+        }
+    }
+    // Stage W8e: the weather's clock held where it is (the procedural weather's): no weather key
+    // and no heading turn starts mid-sweep (a turn evaluates the waves twice for 30 s, and swung
+    // the baselines by 2 to 4 ms). The first baseline settles longer (the weather made again).
+    PerfSweep.Held = PerfSweep.Original;
+    bool bHeld = false;
+    if (const FVoxelOceanProceduralWeather* Procedural = static_cast<const FVoxelOceanProceduralWeather*>(WeatherSourceSettings.bProceduralWeather ? WeatherSource.Get() : nullptr))
+    {
+        PerfSweep.Held.WeatherTimeOffset = Procedural->WeatherTime(GetOceanTime());
+        PerfSweep.Held.WeatherTimeScale = 0.0;
+        bHeld = true;
+    }
+    PerfSweep.Frame = -VoxelOceanPerfSweep::FirstSettleFrames;
+    // Stage W8f: the ocean's passes timed while the sweep runs.
+    VoxelOceanGPUTime::SetEnabled(true);
+    UE_LOG(LogVoxelPlugin, Log, TEXT("[VoxelOcean] PerfSweep: %d steps, each %d rounds of the baseline and the variant (%d frames measured after %d to settle)%s, the frame uncapped, the GPU's speed tracked by a reference workload; hold the camera still and keep the editor in front."),
+        VoxelOceanPerfSweep::NumSteps, PerfSweep.Rounds, PerfSweep.Frames, VoxelOceanPerfSweep::WarmupFrames,
+        bHeld ? TEXT(", the weather's clock held") : TEXT(""));
+    // The first segment: the baseline.
+    SetOceanSettings(PerfSweep.Held);
+}
+
+void AOceanSphereActor::RestorePerfSweepVars()
+{
+    IConsoleManager& CM = IConsoleManager::Get();
+    for (const TPair<FString, FString>& It : PerfSweep.SavedVars)
+        if (IConsoleVariable* Var = CM.FindConsoleVariable(*It.Key))
+            Var->Set(*It.Value, ECVF_SetByConsole);
+    PerfSweep.SavedVars.Reset();
+}
+
+void AOceanSphereActor::StopPerfSweep()
+{
+    // Stage W8f: a sweep cut short (the world ending): the timing off, the settings as they were.
+    if (!PerfSweep.bOn) return;
+    PerfSweep.bOn = false;
+    if (PerfSweep.Phase == 1 && PerfSweep.Step < VoxelOceanPerfSweep::NumSteps)
+        VoxelOceanPerfSweep::SetCVar(VoxelOceanPerfSweep::Steps[PerfSweep.Step].CVar, 1);
+    VoxelOceanGPUTime::SetEnabled(false);
+    RestorePerfSweepVars();
+    OceanSettings = PerfSweep.Original;
 }
 
 void AOceanSphereActor::TickPerfSweep()
 {
     if (!PerfSweep.bOn) return;
     namespace VPS = VoxelOceanPerfSweep;
+    namespace VGT = VoxelOceanGPUTime;
+    static_assert((int32)VGT::NumGroups <= FPerfSweep::MaxGroups, "The sweep keeps every group.");
+    using FMeasure = FPerfSweep::FMeasure;
     PerfSweep.Frame++;
+    // Stage W8f: the ocean's GPU frames resolved since the last tick (a few frames behind: those
+    // of the last segment's settings fall in this one's warm-up and are let go).
+    TArray<VGT::FFrameTimes> Resolved;
+    VGT::Drain(Resolved);
     if (PerfSweep.Frame > VPS::WarmupFrames)
     {
-        // The last frame the GPU finished (the stat unit's GPU figure).
+        for (const VGT::FFrameTimes& T : Resolved)
+        {
+            PerfSweep.RawSamples.Add(T.Total);
+            PerfSweep.RefSamples.Add(T.Ms[VGT::Reference]);
+            for (int32 g = 0; g < VGT::NumGroups; g++) PerfSweep.GroupSamples[g].Add(T.Ms[g]);
+        }
+        // The last frame the GPU finished (the stat unit's GPU figure), for context.
         const float Ms = (float)FPlatformTime::ToMilliseconds(RHIGetGPUFrameCycles(0));
-        if (Ms > 0.0f) PerfSweep.Samples.Add(Ms);
+        if (Ms > 0.0f) PerfSweep.FrameSamples.Add(Ms);
     }
     if (PerfSweep.Frame < VPS::WarmupFrames + PerfSweep.Frames) return;
-    // The step's median (a hitch doesn't move it).
-    float Median = 0.0f;
-    if (PerfSweep.Samples.Num() > 0)
+    // The segment's figures (a hitch doesn't move them), each part on its own.
+    auto MedianOf = [](TArray<float>& Values) -> float
+        {
+            if (Values.Num() == 0) return 0.0f;
+            Values.Sort();
+            return Values[Values.Num() / 2];
+        };
+    // Stage W8i: a segment's frames by their mean with the highest and lowest tenth left out, not
+    // their median: work that runs on some frames only (the clipmap at the wave update rate, the
+    // fine foam's levels in turn) has a median of 0 or of its whole cost, whichever half of the
+    // frames is larger; the trimmed mean is its average cost and still ignores a hitch.
+    auto TrimmedMeanOf = [](TArray<float>& Values) -> float
+        {
+            if (Values.Num() == 0) return 0.0f;
+            Values.Sort();
+            const int32 Cut = Values.Num() / 10;
+            double Sum = 0.0;
+            for (int32 i = Cut; i < Values.Num() - Cut; i++) Sum += Values[i];
+            return (float)(Sum / FMath::Max(Values.Num() - 2 * Cut, 1));
+        };
+    // Stage W8g: the segment scaled by the reference: as it would read at the GPU speed of the
+    // sweep's first segment (the reference's own time there).
+    FMeasure Median;
+    Median.Raw = TrimmedMeanOf(PerfSweep.RawSamples);
+    Median.Ref = MedianOf(PerfSweep.RefSamples);
+    Median.Frame = TrimmedMeanOf(PerfSweep.FrameSamples);
+    if (PerfSweep.RefNominal <= 0.0f && Median.Ref > 0.0f) PerfSweep.RefNominal = Median.Ref;
+    const float Scale = PerfSweep.RefNominal > 0.0f && Median.Ref > 0.0f ? PerfSweep.RefNominal / Median.Ref : 1.0f;
+    Median.Ocean = Median.Raw * Scale;
+    for (int32 g = 0; g < VGT::NumGroups; g++)
     {
-        PerfSweep.Samples.Sort();
-        Median = PerfSweep.Samples[PerfSweep.Samples.Num() / 2];
+        Median.Groups[g] = TrimmedMeanOf(PerfSweep.GroupSamples[g]) * (g < VGT::NumOceanGroups ? Scale : 1.0f);
+        PerfSweep.GroupSamples[g].Reset();
     }
-    PerfSweep.Results.Add(Median);
-    PerfSweep.Samples.Reset();
+    PerfSweep.RawSamples.Reset();
+    PerfSweep.RefSamples.Reset();
+    PerfSweep.FrameSamples.Reset();
     PerfSweep.Frame = 0;
-    PerfSweep.Step++;
-    if (PerfSweep.Step < VPS::NumSteps)
+    if (PerfSweep.Phase == 0)
     {
-        FVoxelOceanSettings S = PerfSweep.Original;
+        // The baseline measured: now the variant.
+        PerfSweep.SegmentBase = Median;
+        PerfSweep.Bases.Add(Median);
+        PerfSweep.Phase = 1;
+        FVoxelOceanSettings S = PerfSweep.Held;
         VPS::Steps[PerfSweep.Step].Apply(S);
+        VPS::SetCVar(VPS::Steps[PerfSweep.Step].CVar, 0);
         SetOceanSettings(S);
         return;
     }
-    // Done: the settings back, the table.
+    // The variant measured: its saving against the baseline just before it.
+    VPS::SetCVar(VPS::Steps[PerfSweep.Step].CVar, 1);
+    {
+        FMeasure Saving;
+        Saving.Ocean = PerfSweep.SegmentBase.Ocean - Median.Ocean;
+        Saving.Raw = PerfSweep.SegmentBase.Raw - Median.Raw;
+        Saving.Ref = PerfSweep.SegmentBase.Ref - Median.Ref;
+        Saving.Frame = PerfSweep.SegmentBase.Frame - Median.Frame;
+        for (int32 g = 0; g < VGT::NumGroups; g++) Saving.Groups[g] = PerfSweep.SegmentBase.Groups[g] - Median.Groups[g];
+        PerfSweep.Savings.Add(Saving);
+    }
+    PerfSweep.Phase = 0;
+    PerfSweep.Round++;
+    if (PerfSweep.Round >= PerfSweep.Rounds)
+    {
+        FPerfSweep::FResult R;
+        TArray<float> Parts;
+        for (const FMeasure& M : PerfSweep.Savings) Parts.Add(M.Ocean);
+        R.Saving.Ocean = MedianOf(Parts);
+        R.Least = Parts.Num() > 0 ? Parts[0] : 0.0f;
+        R.Most = Parts.Num() > 0 ? Parts.Last() : 0.0f;
+        Parts.Reset();
+        for (const FMeasure& M : PerfSweep.Savings) Parts.Add(M.Frame);
+        R.Saving.Frame = MedianOf(Parts);
+        Parts.Reset();
+        for (const FMeasure& M : PerfSweep.Savings) Parts.Add(M.Raw);
+        R.Saving.Raw = MedianOf(Parts);
+        for (int32 g = 0; g < VGT::NumGroups; g++)
+        {
+            Parts.Reset();
+            for (const FMeasure& M : PerfSweep.Savings) Parts.Add(M.Groups[g]);
+            R.Saving.Groups[g] = MedianOf(Parts);
+        }
+        PerfSweep.Results.Add(R);
+        PerfSweep.Savings.Reset();
+        PerfSweep.Round = 0;
+        PerfSweep.Step++;
+    }
+    if (PerfSweep.Step < VPS::NumSteps)
+    {
+        // The next round's baseline.
+        SetOceanSettings(PerfSweep.Held);
+        return;
+    }
+    // Done: the settings back, the timing off, the table.
     PerfSweep.bOn = false;
+    VGT::SetEnabled(false);
+    RestorePerfSweepVars();
     SetOceanSettings(PerfSweep.Original);
-    const float Base = PerfSweep.Results.Num() > 0 ? PerfSweep.Results[0] : 0.0f;
-    UE_LOG(LogVoxelPlugin, Log, TEXT("[VoxelOcean] PerfSweep at %.1f m above the sea (median GPU frame, ms; saving against the baseline):"),
-        (CameraPosition.Size() - OceanRadius) * 0.01);
+    FMeasure Base;
+    TArray<float> Parts;
+    for (const FMeasure& M : PerfSweep.Bases) Parts.Add(M.Ocean);
+    Base.Ocean = MedianOf(Parts);
+    const float OceanLeast = Parts.Num() > 0 ? Parts[0] : 0.0f;
+    const float OceanMost = Parts.Num() > 0 ? Parts.Last() : 0.0f;
+    Parts.Reset();
+    for (const FMeasure& M : PerfSweep.Bases) Parts.Add(M.Frame);
+    Base.Frame = MedianOf(Parts);
+    const float FrameLeast = Parts.Num() > 0 ? Parts[0] : 0.0f;
+    const float FrameMost = Parts.Num() > 0 ? Parts.Last() : 0.0f;
+    Parts.Reset();
+    for (const FMeasure& M : PerfSweep.Bases) Parts.Add(M.Raw);
+    Base.Raw = MedianOf(Parts);
+    const float RawLeast = Parts.Num() > 0 ? Parts[0] : 0.0f;
+    const float RawMost = Parts.Num() > 0 ? Parts.Last() : 0.0f;
+    // The reference over every segment, the variants' too: how far the GPU's speed wandered.
+    Parts.Reset();
+    for (const FMeasure& M : PerfSweep.Bases) Parts.Add(M.Ref);
+    Base.Ref = MedianOf(Parts);
+    const float RefLeast = Parts.Num() > 0 ? Parts[0] : 0.0f;
+    const float RefMost = Parts.Num() > 0 ? Parts.Last() : 0.0f;
+    FString Groups;
+    for (int32 g = 0; g < VGT::NumGroups; g++)
+    {
+        Parts.Reset();
+        for (const FMeasure& M : PerfSweep.Bases) Parts.Add(M.Groups[g]);
+        Base.Groups[g] = MedianOf(Parts);
+        Groups += FString::Printf(TEXT("%s%s %.2f"), g > 0 ? TEXT(", ") : TEXT(""), VGT::GroupName(g), Base.Groups[g]);
+    }
+    const bool bTimed = Base.Ocean > 0.0f;
+    UE_LOG(LogVoxelPlugin, Log, TEXT("[VoxelOcean] PerfSweep at %.1f m above the sea, %d segments of the baseline: the ocean's own GPU time %.2f ms (%.2f to %.2f; as timed %.2f, %.2f to %.2f), the GPU's whole frame %.2f ms (%.2f to %.2f)."),
+        (CameraPosition.Size() - OceanRadius) * 0.01, PerfSweep.Bases.Num(), Base.Ocean, OceanLeast, OceanMost, Base.Raw, RawLeast, RawMost, Base.Frame, FrameLeast, FrameMost);
+    if (Base.Ref > 0.0f)
+    {
+        UE_LOG(LogVoxelPlugin, Log, TEXT("[VoxelOcean]   the reference workload %.3f ms (%.3f to %.3f): the GPU's speed wandered %.0f%% over the baselines; every time below is scaled to the first segment's speed."),
+            Base.Ref, RefLeast, RefMost, 100.0f * (RefMost - RefLeast) / Base.Ref);
+    }
+    if (bTimed)
+    {
+        UE_LOG(LogVoxelPlugin, Log, TEXT("[VoxelOcean]   the baseline by group (ms): %s"), *Groups);
+        if (Base.Frame > 0.0f && Base.Ocean > 1.5f * Base.Frame)
+        {
+            UE_LOG(LogVoxelPlugin, Warning, TEXT("[VoxelOcean]   the ocean's time reads more than the whole frame: this RHI's timestamps aren't in microseconds; the ratios between steps still hold."));
+        }
+    }
+    else
+    {
+        UE_LOG(LogVoxelPlugin, Warning, TEXT("[VoxelOcean]   no GPU timestamps came back (this RHI has no timestamp queries?): the savings below are the whole frame's."));
+    }
+    UE_LOG(LogVoxelPlugin, Log, TEXT("[VoxelOcean]   each step's saving, the median of %d rounds against the baseline just before (least, most), %% of the ocean's time; the ocean's as timed (unscaled); the whole frame's; the groups that moved:"), PerfSweep.Rounds);
     for (int32 i = 0; i < PerfSweep.Results.Num(); i++)
     {
-        const float Ms = PerfSweep.Results[i];
-        UE_LOG(LogVoxelPlugin, Log, TEXT("[VoxelOcean]   %-36s %7.2f ms   %+6.2f ms  (%+5.1f%%)"), VPS::Steps[i].Name, Ms, Base - Ms,
-            Base > 0.0f ? 100.0f * (Base - Ms) / Base : 0.0f);
+        const FPerfSweep::FResult& R = PerfSweep.Results[i];
+        FString Moved;
+        for (int32 g = 0; g < VGT::NumGroups; g++)
+            if (FMath::Abs(R.Saving.Groups[g]) >= 0.05f)
+                Moved += FString::Printf(TEXT(" %s %+.2f"), VGT::GroupName(g), R.Saving.Groups[g]);
+        if (bTimed)
+        {
+            UE_LOG(LogVoxelPlugin, Log, TEXT("[VoxelOcean]   %-36s %+6.2f ms  (%+5.2f .. %+5.2f)  %+5.1f%%   as timed %+6.2f  frame %+6.2f  |%s"), VPS::Steps[i].Name,
+                R.Saving.Ocean, R.Least, R.Most, 100.0f * R.Saving.Ocean / Base.Ocean, R.Saving.Raw, R.Saving.Frame, *Moved);
+        }
+        else
+        {
+            UE_LOG(LogVoxelPlugin, Log, TEXT("[VoxelOcean]   %-36s frame %+6.2f ms"), VPS::Steps[i].Name, R.Saving.Frame);
+        }
     }
 }
 
@@ -1369,6 +1599,7 @@ FVoxelOceanSurfaceInputs AOceanSphereActor::GatherInputs(const AAdaptiveVoxelAct
     Inputs.Waves.FineFoamAmount = S.FineFoamAmount;
     Inputs.Waves.UpdateRate = S.WaveUpdateRate;
     Inputs.Waves.FoamDetailLevels = S.FoamDetailLevels;
+    Inputs.Waves.bFineFoamFromClip = S.bFineFoamFromClip;
     Inputs.Waves.SurfFoamLinger = S.SurfFoamLinger;
     Inputs.Waves.FoamBreakup = S.FoamBreakup;
     // (Stage W5f: the clipmap cuts its foam only where the own pass fades it out.)

@@ -185,4 +185,34 @@ VOXEL_FUNC FVoxelOceanFFTResult VoxelOceanFFTFinish(FVoxelOceanFFTAccum A, float
     return R;
 }
 
+// Stage W8j: THE STRAIN KEPT IN THE CLIPMAP. The sum's J (the horizontal displacement's gradient,
+// planet frame) is a tangent tensor: its three components in the tangent basis at Up from Axis
+// (U: Axis less its radial part, normalised; V = Up x U) are what the clipmap keeps per texel
+// (VoxelOceanClip.usf), and what a pixel near the camera adds back (VoxelOceanFFTAddStrain) to the
+// bands it looks up finer than the clipmap's texels, for the whole surface's J its foam rule takes:
+// the long bands not looked up again per pixel. Txx = U.J.U, Tyy = V.J.V, Txy = U.J.V.
+VOXEL_FUNC float3 VoxelOceanFFTStrainOf(FVoxelOceanFFTAccum A, float3 Up, float3 Axis)
+{
+    const float3 U = normalize(Axis - Up * dot(Up, Axis));
+    const float3 V = cross(Up, U);
+    const float3 JU = VoxelOceanFFTApplyJ(A, U);
+    const float3 JV = VoxelOceanFFTApplyJ(A, V);
+    return float3(dot(U, JU), dot(V, JV), dot(U, JV));
+}
+
+// J += Txx U U^T + Txy (U V^T + V U^T) + Tyy V V^T, in the basis VoxelOceanFFTStrainOf takes.
+VOXEL_FUNC FVoxelOceanFFTAccum VoxelOceanFFTAddStrain(FVoxelOceanFFTAccum A, float3 Up, float3 Axis, float Txx, float Tyy, float Txy)
+{
+    const float3 U = normalize(Axis - Up * dot(Up, Axis));
+    const float3 V = cross(Up, U);
+    FVoxelOceanFFTAccum R = A;
+    R.J11 = A.J11 + Txx * U.x * U.x + 2.0f * Txy * U.x * V.x + Tyy * V.x * V.x;
+    R.J22 = A.J22 + Txx * U.y * U.y + 2.0f * Txy * U.y * V.y + Tyy * V.y * V.y;
+    R.J33 = A.J33 + Txx * U.z * U.z + 2.0f * Txy * U.z * V.z + Tyy * V.z * V.z;
+    R.J12 = A.J12 + Txx * U.x * U.y + Txy * (U.x * V.y + V.x * U.y) + Tyy * V.x * V.y;
+    R.J13 = A.J13 + Txx * U.x * U.z + Txy * (U.x * V.z + V.x * U.z) + Tyy * V.x * V.z;
+    R.J23 = A.J23 + Txx * U.y * U.z + Txy * (U.y * V.z + V.y * U.z) + Tyy * V.y * V.z;
+    return R;
+}
+
 #endif // VOXEL_OCEAN_FFT_WAVES_USH

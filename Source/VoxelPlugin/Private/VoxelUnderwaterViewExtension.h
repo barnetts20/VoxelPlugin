@@ -20,6 +20,7 @@
 #include "CoreMinimal.h"
 #include "SceneViewExtension.h"
 #include "RHIResources.h"
+#include "RHIGPUReadback.h"
 #include "VoxelOceanWaves.h"
 #include <atomic>
 
@@ -105,4 +106,20 @@ private:
     FTextureRHIRef ChartsRHI;
     FTextureRHIRef FoamRHI;
     bool bHasFrame = false;
+
+    /** Stage W8b: the camera's probe (the surface's height round the camera's foot, an 8 x 8
+     *  grid of the map pass's points) read back a few frames later; the pass is skipped while the
+     *  camera stands clear above the last reading, with margins for its age and the camera's
+     *  travel since. Render thread only. */
+    struct FCameraReadback
+    {
+        TUniquePtr<FRHIGPUBufferReadback> Buffer;
+        FVector CameraPlanet = FVector::ZeroVector;
+        double Seconds = 0.0;
+    };
+    TArray<FCameraReadback> CameraReadbacks;
+    bool bHasCameraSurface = false;
+    double CameraSurfaceMax = 0.0;          // cm above the sphere, the grid's highest
+    FVector CameraSurfaceAt = FVector::ZeroVector;
+    double CameraSurfaceSeconds = 0.0;
 };

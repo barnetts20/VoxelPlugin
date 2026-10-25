@@ -41,6 +41,21 @@
 #define VOXEL_OCEAN_CLIP_SHARED_ROWS 4
 #define VOXEL_OCEAN_CLIP_LEVEL_ROWS 2
 #define VOXEL_OCEAN_CLIP_INFO_ROWS 36           // VoxelOceanClipmap::InfoRows
+
+// Stage W8l: a shader defining VOXEL_OCEAN_CLIP_INFO_CONSTANTS 1 before this include reads the info
+// from shader constants (VoxelOceanClipInfoConstants: the rows the info texture holds, the same
+// frame's) instead of the texture (the ocean's own pass: a pixel picks its levels, filters them
+// and its anisotropic taps pick theirs, a hundred and more dependent texture loads of the info).
+// The functions keep their texture argument (the material's and the other passes' callers), unread.
+#ifndef VOXEL_OCEAN_CLIP_INFO_CONSTANTS
+#define VOXEL_OCEAN_CLIP_INFO_CONSTANTS 0
+#endif
+#if VOXEL_OCEAN_CLIP_INFO_CONSTANTS
+float4 VoxelOceanClipInfoConstants[VOXEL_OCEAN_CLIP_INFO_ROWS];
+#define VOXEL_OCEAN_CLIP_INFO_ROW(Info, R) VoxelOceanClipInfoConstants[R]
+#else
+#define VOXEL_OCEAN_CLIP_INFO_ROW(Info, R) Info.Load(int3(R, 0, 0))
+#endif
 // A level's reach: no samples within EDGE texels of a window's edge (bilinear and the vertex's
 // spacing), nor within SLACK of how far the camera can be from an evaluated window's centre
 // (VoxelOceanClipmap::OriginSlack + EvaluatedSlack); the fade to the next level over FADE of the
@@ -102,13 +117,14 @@ FVoxelOceanClipLevel VoxelOceanClipLevelOf(float4 R0, float4 R1)
 // From the info texture (the material's).
 FVoxelOceanClipFrame VoxelOceanClipFrameOfTexture(Texture2D Info)
 {
-    return VoxelOceanClipFrameOf(Info.Load(int3(0, 0, 0)), Info.Load(int3(1, 0, 0)), Info.Load(int3(2, 0, 0)), Info.Load(int3(3, 0, 0)));
+    return VoxelOceanClipFrameOf(VOXEL_OCEAN_CLIP_INFO_ROW(Info, 0), VOXEL_OCEAN_CLIP_INFO_ROW(Info, 1), VOXEL_OCEAN_CLIP_INFO_ROW(Info, 2),
+        VOXEL_OCEAN_CLIP_INFO_ROW(Info, 3));
 }
 
 FVoxelOceanClipLevel VoxelOceanClipLevelOfTexture(Texture2D Info, int I)
 {
     const int R = VOXEL_OCEAN_CLIP_SHARED_ROWS + VOXEL_OCEAN_CLIP_LEVEL_ROWS * I;
-    return VoxelOceanClipLevelOf(Info.Load(int3(R, 0, 0)), Info.Load(int3(R + 1, 0, 0)));
+    return VoxelOceanClipLevelOf(VOXEL_OCEAN_CLIP_INFO_ROW(Info, R), VOXEL_OCEAN_CLIP_INFO_ROW(Info, R + 1));
 }
 
 // The plane offset (cm) of the point X (planet frame, from the camera) from the camera's own:

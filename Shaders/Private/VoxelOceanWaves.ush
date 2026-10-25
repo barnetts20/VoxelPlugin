@@ -146,6 +146,13 @@ struct FVoxelOceanWaveParams
     // grazing view a pixel spans far more water along the view than across it: the mips follow the
     // longer axis, so across it their texels are magnified, and would show as blocks.
     float CubicFootprint;
+    // Stage W8j: the strain of the bands the lookups leave out (VoxelOceanFFTAddStrain: Txx, Tyy,
+    // Txy in the basis from StrainAxis; w 1: on), added to the sum before its J is taken: the wave
+    // clipmap's, under a pixel's high-passed lookups, so its foam rule sees the whole surface.
+    float4 BaseStrain;
+    float3 StrainAxis;
+    // Stage W8k: the bands not looked up at all (bit B: band B), their part in BaseStrain.
+    float HeldBands;
 };
 
 FVoxelOceanWaveParams VoxelOceanMakeWaveParams(float4 Params, float4 Wave0, float4 Wave1, float4 Wave2, float3 Center, float4 Shape)
@@ -166,6 +173,9 @@ FVoxelOceanWaveParams VoxelOceanMakeWaveParams(float4 Params, float4 Wave0, floa
     W.HighPass = 0.0f;
     W.SurfSpacing = 0.0f;
     W.CubicFootprint = 0.0f;
+    W.BaseStrain = float4(0.0f, 0.0f, 0.0f, 0.0f);
+    W.StrainAxis = float3(1.0f, 0.0f, 0.0f);
+    W.HeldBands = 0.0f;
     W.SlopeVar = float4(0.0f, 0.0f, 0.0f, 0.0f);
     return W;
 }
@@ -238,6 +248,12 @@ FVoxelOceanWaveParams VoxelOceanMakeWaveParamsFFT(float4 Params, float4 Wave0, f
 //   (FVoxelOceanFFTPoint.DetailGradient: what the high pass alone gives), in one evaluation.
 #define VOXEL_OCEAN_LOOKUP_CUBIC 8u
 #define VOXEL_OCEAN_LOOKUP_DUAL 16u
+// Stage W8k: STRAIN: the two long bands' strains apart (FVoxelOceanFFTPoint.Strain0 and Strain1, in
+// the tangent basis from W.StrainAxis: VoxelOceanFFTStrainOf), as the wave clipmap keeps them for its
+// fine foam (VoxelOceanClip.usf, ClipFineFoamCS: the bands its texels resolve not looked up again).
+#define VOXEL_OCEAN_LOOKUP_STRAIN 32u
+// The long bands' shortest waves, in their next band's tiles (VoxelOceanSpectrum.h: BoundaryModes).
+#define VOXEL_OCEAN_FFT_BOUNDARY_MODES 4.0f
 // The cascades' texels across a tile at mip 0 (VoxelOceanFFT.usf's VOXEL_OCEAN_FFT_SIZE): the long
 // arrays', and the fine cascade's (stage W3z; VoxelOceanSpectrum.ush).
 #define VOXEL_OCEAN_FFT_TEXELS float(VOXEL_OCEAN_FFT_LONG_SIZE)
@@ -591,16 +607,16 @@ float2 VoxelOceanFFTBandUV(FVoxelOceanChartCoords Coords, float2 Shift, float2 W
 
 // Stage W3u: a slice of a texture array at UV and Lod, toward its cubic B-spline by Cubic (0 to 1;
 // VoxelOceanCubic.ush), on Size texels at mip 0 (the cubic's taps on the mip's own texels).
+// (Stage W8h: part way, the blend in the taps (VoxelOceanCubicTapsBlendOf): four lookups, not the
+// bilinear's and the cubic's five.)
 float4 VoxelOceanSampleArrayCubic(Texture2DArray T, SamplerState S, float2 UV, float Slice, float Lod, float Size, float Cubic)
 {
-    const float4 Linear = Cubic < 1.0f ? T.SampleLevel(S, float3(UV, Slice), Lod) : float4(0.0f, 0.0f, 0.0f, 0.0f);
-    if (Cubic <= 0.0f) return Linear;
+    if (Cubic <= 0.0f) return T.SampleLevel(S, float3(UV, Slice), Lod);
     const float MipSize = Size * exp2(-floor(max(Lod, 0.0f)));
-    const FVoxelOceanCubicTaps X = VoxelOceanCubicTapsOf(UV.x, MipSize);
-    const FVoxelOceanCubicTaps Y = VoxelOceanCubicTapsOf(UV.y, MipSize);
-    const float4 C = Y.G0 * (X.G0 * T.SampleLevel(S, float3(X.P0, Y.P0, Slice), Lod) + X.G1 * T.SampleLevel(S, float3(X.P1, Y.P0, Slice), Lod))
+    const FVoxelOceanCubicTaps X = VoxelOceanCubicTapsBlendOf(UV.x, MipSize, Cubic);
+    const FVoxelOceanCubicTaps Y = VoxelOceanCubicTapsBlendOf(UV.y, MipSize, Cubic);
+    return Y.G0 * (X.G0 * T.SampleLevel(S, float3(X.P0, Y.P0, Slice), Lod) + X.G1 * T.SampleLevel(S, float3(X.P1, Y.P0, Slice), Lod))
         + Y.G1 * (X.G0 * T.SampleLevel(S, float3(X.P0, Y.P1, Slice), Lod) + X.G1 * T.SampleLevel(S, float3(X.P1, Y.P1, Slice), Lod));
-    return Cubic >= 1.0f ? C : lerp(Linear, C, Cubic);
 }
 
 // One slot at one point of a tile ([0, 1) coordinates), as a lookup (cm, the chop applied); the
@@ -690,6 +706,8 @@ struct FVoxelOceanFFTBands
     // Stage W3w, with VOXEL_OCEAN_LOOKUP_FOAM: the fine foam (the shortest band's own, in its tile:
     // VoxelOceanFFT.usf) at the point, its copies' mean.
     float FineFoam;
+    // Stage W8k: band 0's sum alone (Long less it: band 1's).
+    FVoxelOceanFFTSample Band0;
 };
 
 FVoxelOceanFFTBands VoxelOceanFFTChartLookups(VOXEL_OCEAN_TEXTURE_PARAMS, FVoxelOceanChartCoords LongCoords, FVoxelOceanChartCoords ShortCoords,
@@ -702,6 +720,8 @@ FVoxelOceanFFTBands VoxelOceanFFTChartLookups(VOXEL_OCEAN_TEXTURE_PARAMS, FVoxel
     Out.LongDetail = VoxelOceanFFTSampleZero();
     Out.ShortDetail = VoxelOceanFFTSampleZero();
     Out.FineFoam = 0.0f;
+    Out.Band0 = VoxelOceanFFTSampleZero();
+    const uint Held = uint(max(W.HeldBands, 0.0f) + 0.5f);
     const float Bias = W.RefHigh.w;
     const bool bNormal = (Mask & 2u) != 0u;
     const bool bFineFoam = (Mask & VOXEL_OCEAN_LOOKUP_FOAM) != 0u;
@@ -712,6 +732,8 @@ FVoxelOceanFFTBands VoxelOceanFFTChartLookups(VOXEL_OCEAN_TEXTURE_PARAMS, FVoxel
     [loop]
     for (int B = 0; B < 4; B++)
     {
+        // (Stage W8k: a band held in BaseStrain not looked up.)
+        if (((Held >> uint(B)) & 1u) != 0u) continue;
         const float Amp = bShoal ? VoxelOceanShoalComponent(Shoal.Amp, B) : 1.0f;
         if (Amp <= 0.0f) continue;
         const float Stretch = bShoal ? VoxelOceanShoalComponent(Shoal.Stretch, B) : 0.0f;
@@ -766,7 +788,7 @@ FVoxelOceanFFTBands VoxelOceanFFTChartLookups(VOXEL_OCEAN_TEXTURE_PARAMS, FVoxel
                 [loop]
                 for (int Copy = 0; Copy < 3; Copy++)
                 {
-                    if ((Copy == 1 && Detile.Weight.y <= 0.0f) || (Copy == 2 && Detile.Weight.z <= 0.0f)) continue;
+                    if ((Copy == 0 && Detile.Weight.x <= 0.0f) || (Copy == 1 && Detile.Weight.y <= 0.0f) || (Copy == 2 && Detile.Weight.z <= 0.0f)) continue;
                     const float2 Shift = Copy == 0 ? Detile.Offset0 : (Copy == 1 ? Detile.Offset1 : Detile.Offset2);
                     const float WCopy = Copy == 0 ? Detile.Weight.x : (Copy == 1 ? Detile.Weight.y : Detile.Weight.z);
                     const float2 UV = VoxelOceanFFTBandUV(LongCoords, Shift, Warp, Half, InvL);
@@ -791,7 +813,7 @@ FVoxelOceanFFTBands VoxelOceanFFTChartLookups(VOXEL_OCEAN_TEXTURE_PARAMS, FVoxel
             [loop]
             for (int Copy = 0; Copy < 3; Copy++)
             {
-                if ((Copy == 1 && Detile.Weight.y <= 0.0f) || (Copy == 2 && Detile.Weight.z <= 0.0f)) continue;
+                if ((Copy == 0 && Detile.Weight.x <= 0.0f) || (Copy == 1 && Detile.Weight.y <= 0.0f) || (Copy == 2 && Detile.Weight.z <= 0.0f)) continue;
                 const float2 Shift = Copy == 0 ? Detile.Offset0 : (Copy == 1 ? Detile.Offset1 : Detile.Offset2);
                 const float WCopy = Copy == 0 ? Detile.Weight.x : (Copy == 1 ? Detile.Weight.y : Detile.Weight.z);
                 const float2 UV = VoxelOceanFFTBandUV(ShortCoords, Shift, Warp, Half, InvL);
@@ -817,6 +839,7 @@ FVoxelOceanFFTBands VoxelOceanFFTChartLookups(VOXEL_OCEAN_TEXTURE_PARAMS, FVoxel
             if (bDetail)
                 Detail = VoxelOceanShoalSample(Detail, Amp, VoxelOceanShoalComponent(Shoal.Chop, B), Stretch, E);
         }
+        if (B == 0) Out.Band0 = Band;
         if (B < 2)
         {
             Out.Long = VoxelOceanFFTSampleMad(Out.Long, 1.0f, Band);
@@ -848,7 +871,8 @@ struct FVoxelOceanFFTSpread
 // group weighed apart (a group weighed 0 isn't looked up); the weights' squares to Spread.
 FVoxelOceanFFTAccum VoxelOceanFFTAddOrientation(FVoxelOceanFFTAccum A, VOXEL_OCEAN_TEXTURE_PARAMS, FVoxelOceanChart C, FVoxelOceanChartCoords Coords,
     float2 LongWind, float2 ShortWind, float LongWeight, float ShortWeight, FVoxelOceanSeaState Sea, FVoxelOceanWaveParams W, float Spacing, float Footprint, uint Mask,
-    FVoxelOceanShoal Shoal, VOXEL_OCEAN_FOAM_TEXTURE_PARAMS, inout FVoxelOceanFFTSpread Spread, inout FVoxelOceanFFTAccum Detail)
+    FVoxelOceanShoal Shoal, VOXEL_OCEAN_FOAM_TEXTURE_PARAMS, inout FVoxelOceanFFTSpread Spread, inout FVoxelOceanFFTAccum Detail,
+    inout FVoxelOceanFFTAccum Held0, inout FVoxelOceanFFTAccum Held1)
 {
     const float2 Plane = Coords.Base + Coords.Offset;
     FVoxelOceanSeaState Used = Sea;
@@ -870,6 +894,12 @@ FVoxelOceanFFTAccum VoxelOceanFFTAddOrientation(FVoxelOceanFFTAccum A, VOXEL_OCE
         Detail = VoxelOceanFFTAccumAdd(Detail, C, LongWind, LongWeight, Bands.LongDetail);
         Detail = VoxelOceanFFTAccumAdd(Detail, C, ShortWind, ShortWeight, Bands.ShortDetail);
     }
+    // (Stage W8k: the long bands apart, for the clipmap's fine foam.)
+    if ((Mask & VOXEL_OCEAN_LOOKUP_STRAIN) != 0u)
+    {
+        Held0 = VoxelOceanFFTAccumAdd(Held0, C, LongWind, LongWeight, Bands.Band0);
+        Held1 = VoxelOceanFFTAccumAdd(Held1, C, LongWind, LongWeight, VoxelOceanFFTSampleMad(Bands.Long, -1.0f, Bands.Band0));
+    }
     A = VoxelOceanFFTAccumAdd(A, C, LongWind, LongWeight, Bands.Long);
     return VoxelOceanFFTAccumAdd(A, C, ShortWind, ShortWeight, Bands.Short);
 }
@@ -890,6 +920,8 @@ struct FVoxelOceanFFTPoint
     float SurfBreaking;         // stage W3v: the surf's bores breaking now (0 to 1; their whitecaps)
     float FineFoam;             // stage W3w: with VOXEL_OCEAN_LOOKUP_FOAM, the fine foam (the shortest band's own; added before the drawing)
     float3 DetailGradient;      // stage W3u: with VOXEL_OCEAN_LOOKUP_DUAL, the high-passed gradient (planet frame, tangent)
+    float3 Strain0;             // stage W8k: with VOXEL_OCEAN_LOOKUP_STRAIN, band 0's strain (VoxelOceanFFTStrainOf at W.StrainAxis)
+    float3 Strain1;             // and band 1's
 };
 
 // Stage W6b: the share of band B's slope variance its lookups for Footprint (cm) leave unresolved:
@@ -1119,6 +1151,8 @@ FVoxelOceanFFTPoint VoxelOceanFFTEvaluate(float3 P, float3 Up, float Spacing, fl
     const FVoxelOceanChartBlend Blend = VoxelOceanChartBlendOf(Cand.Count, VoxelOceanChartDistancesOf(Cand, UpP), N);
     FVoxelOceanFFTAccum A = VoxelOceanFFTAccumZero();
     FVoxelOceanFFTAccum Detail = VoxelOceanFFTAccumZero();
+    FVoxelOceanFFTAccum Held0 = VoxelOceanFFTAccumZero();
+    FVoxelOceanFFTAccum Held1 = VoxelOceanFFTAccumZero();
     // Stage W5f: the heaviest chart, its weight and its headings' agreement (the debug views 27 to 29).
     float ChartMost = 0.0f;
     int2 ChartMostTexel = int2(0, 0);
@@ -1146,10 +1180,12 @@ FVoxelOceanFFTPoint VoxelOceanFFTEvaluate(float3 P, float3 Up, float Spacing, fl
         const float2 WShort = VoxelOceanTurnWeights(Fade, Distance, H.ShortPrevious, H.ShortCurrent, VOXEL_OCEAN_SHORT_CORRELATION_LENGTH);
         if (WLong.x > 0.0f || WShort.x > 0.0f)
             A = VoxelOceanFFTAddOrientation(A, VOXEL_OCEAN_TEXTURE_ARGS, C, Coords, H.LongCurrent, H.ShortCurrent,
-                Blend.Weight[M] * WLong.x, Blend.Weight[M] * WShort.x, Sea, W, Spacing, Footprint, Mask, Shoal, VOXEL_OCEAN_FOAM_TEXTURE_ARGS, Spread, Detail);
+                Blend.Weight[M] * WLong.x, Blend.Weight[M] * WShort.x, Sea, W, Spacing, Footprint, Mask, Shoal, VOXEL_OCEAN_FOAM_TEXTURE_ARGS, Spread, Detail,
+                Held0, Held1);
         if (WLong.y > 0.0f || WShort.y > 0.0f)
             A = VoxelOceanFFTAddOrientation(A, VOXEL_OCEAN_TEXTURE_ARGS, C, Coords, H.LongPrevious, H.ShortPrevious,
-                Blend.Weight[M] * WLong.y, Blend.Weight[M] * WShort.y, Sea, W, Spacing, Footprint, Mask, Shoal, VOXEL_OCEAN_FOAM_TEXTURE_ARGS, Spread, Detail);
+                Blend.Weight[M] * WLong.y, Blend.Weight[M] * WShort.y, Sea, W, Spacing, Footprint, Mask, Shoal, VOXEL_OCEAN_FOAM_TEXTURE_ARGS, Spread, Detail,
+                Held0, Held1);
     }
     // The surf's height, gradient (along the landward direction and up the bed) and rate (cm).
     if (Surf.Surf.Active > 0.5f)
@@ -1175,6 +1211,9 @@ FVoxelOceanFFTPoint VoxelOceanFFTEvaluate(float3 P, float3 Up, float Spacing, fl
         const float Bottom = Shore.BedDepth < 0.5f * VOXEL_OCEAN_DEEP ? min(Depth, Shore.BedDepth) : Depth;
         A.Height -= 100.0f * VoxelOceanSurfThinDrop((A.Height + Bottom) * 0.01f, (W.SurfSpacing > 0.0f ? W.SurfSpacing : Spacing) * 0.01f);
     }
+    // Stage W8j: the strain of the bands not looked up (the clipmap's, under a pixel's high pass).
+    if (W.BaseStrain.w > 0.5f)
+        A = VoxelOceanFFTAddStrain(A, UpP, W.StrainAxis, W.BaseStrain.x, W.BaseStrain.y, W.BaseStrain.z);
     FVoxelOceanFFTPoint Out;
     Out.R = VoxelOceanFFTFinish(A, UpP);
     Out.A = A;
@@ -1184,6 +1223,9 @@ FVoxelOceanFFTPoint VoxelOceanFFTEvaluate(float3 P, float3 Up, float Spacing, fl
     Out.SurfZone = Surf.Surf.Active > 0.5f ? saturate(Surf.Surf.Zone) : 0.0f;
     Out.OpenKeep = 1.0f;
     Out.DetailGradient = (Mask & VOXEL_OCEAN_LOOKUP_DUAL) != 0u ? Detail.Gradient - UpP * dot(UpP, Detail.Gradient) : float3(0.0f, 0.0f, 0.0f);
+    const bool bStrains = (Mask & VOXEL_OCEAN_LOOKUP_STRAIN) != 0u;
+    Out.Strain0 = bStrains ? VoxelOceanFFTStrainOf(Held0, UpP, W.StrainAxis) : float3(0.0f, 0.0f, 0.0f);
+    Out.Strain1 = bStrains ? VoxelOceanFFTStrainOf(Held1, UpP, W.StrainAxis) : float3(0.0f, 0.0f, 0.0f);
     Out.SurfBreaking = 0.0f;
     Out.FoamSource = 0.0f;
     Out.Foam = 0.0f;

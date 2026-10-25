@@ -260,21 +260,57 @@ private:
 public:
     /** Stage W8a: voxel.Ocean.PerfSweep: the GPU's frame time with each of the ocean's costly
      *  features off in turn (the camera held still), logged as a table; the settings restored. */
-    void StartPerfSweep(int32 FramesPerStep);
+    void StartPerfSweep(int32 FramesPerStep, int32 Rounds = 3);
 
 private:
     struct FPerfSweep
     {
         bool bOn = false;
         FVoxelOceanSettings Original;
+        /** Stage W8e: the settings measured from: the original with the weather's clock held
+         *  (no weather key, no heading turn mid-sweep: a turn doubles the waves' work for 30 s). */
+        FVoxelOceanSettings Held;
         int32 Step = 0;
+        /** Stage W8d: interleaved: each step's rounds of the baseline then the variant. */
+        int32 Round = 0;
+        int32 Phase = 0;
         int32 Frame = 0;
-        int32 Frames = 180;
-        TArray<float> Samples;
-        TArray<float> Results;
+        int32 Frames = 120;
+        int32 Rounds = 3;
+        /** Stage W8g: the reference's time the sweep scales every segment to (its first). */
+        float RefNominal = 0.0f;
+        TArray<float> RawSamples;
+        TArray<float> RefSamples;
+        /** Stage W8g: the console variables uncapped while it runs, as they were. */
+        TMap<FString, FString> SavedVars;
+        /** Stage W8f: what a segment measures: the ocean's own GPU time (VoxelOceanGPUTime, its
+         *  pass groups' timestamps) and, for context, the GPU's whole frame. */
+        static constexpr int32 MaxGroups = 12;
+        struct FMeasure
+        {
+            float Ocean = 0.0f;         // stage W8g: scaled by the reference (the GPU's speed)
+            float Raw = 0.0f;           // the ocean's as timed
+            float Ref = 0.0f;           // the reference's
+            float Frame = 0.0f;
+            float Groups[MaxGroups] = {};
+        };
+        TArray<float> FrameSamples;
+        TArray<float> GroupSamples[MaxGroups];
+        FMeasure SegmentBase;
+        TArray<FMeasure> Savings;       // this step's, a round each
+        TArray<FMeasure> Bases;         // every round's baseline
+        struct FResult
+        {
+            FMeasure Saving;            // the median of the rounds' savings, each part on its own
+            float Least = 0.0f;         // the ocean's least and most of them
+            float Most = 0.0f;
+        };
+        TArray<FResult> Results;
     };
     FPerfSweep PerfSweep;
     void TickPerfSweep();
+    void StopPerfSweep();
+    void RestorePerfSweepVars();
 
     /** The coastal travel-time field (stage O9h; FVoxelOceanCoastField): baked after the shore
      *  field from the terrain (CoastBuilder, the depths sampled on the GPU through the surface),

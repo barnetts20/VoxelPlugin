@@ -1,4 +1,5 @@
 #include "VoxelOceanCascades.h"
+#include "VoxelOceanGPUTime.h"
 #include "VoxelGPUCommon.h"
 #include "VoxelPlugin.h"
 #include "DataDrivenShaderPlatformInfo.h"
@@ -408,6 +409,7 @@ void FVoxelOceanCascades::Update(uint32 Tick, double Time, const FVector4f& Fine
             FRDGBuilder GraphBuilder(RHICmdList);
             {
                 RDG_EVENT_SCOPE_STAT(GraphBuilder, VoxelOceanCascades, "VoxelOceanCascades");
+                VoxelOceanGPUTime::FScope OceanGPUTime(GraphBuilder, VoxelOceanGPUTime::Cascades);
                 // A new slot table: both grids' start spectra again, and the fine foam from nothing (it
                 // settles on the waves' compression within seconds).
                 const bool bNewSpectrum = RenderState->Generation != Gen || !RenderState->Spectrum.IsValid() || !RenderState->Multiples.IsValid()

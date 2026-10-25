@@ -31,6 +31,14 @@ RWTexture2DArray<float4> ClipNormalOut;
 // the open sea's compression past the whitecap threshold here (the own pass sharpens the foam per
 // pixel from them near the camera, VoxelOceanPixelSurfOf).
 RWTexture2DArray<float4> ClipWhitecapOut;
+// Stage W8j: the summed surface's strain at the texel (VoxelOceanFFTStrainOf: Txx, Tyy, Txy in the
+// tangent basis from the frame's E1; w 0), for the pixels' own foam near the camera: they look up
+// only the bands finer than the texel again and add this for the rest (VoxelOceanPixelSurfOf).
+RWTexture2DArray<float4> ClipStrainOut;
+// Stage W8k: the two long bands' strains apart (xyz; w 0), for the fine foam below: the bands its
+// coarse texels resolve not looked up again at the fine texels (ClipFineFoamCS).
+RWTexture2DArray<float4> ClipStrain0Out;
+RWTexture2DArray<float4> ClipStrain1Out;
 // THE FOAM (stage W3v; VoxelOceanFoam.ush: GodotOceanWaves' rule, run on the clipmap as Crest runs
 // its foam): per texel of each level, kept from frame to frame in the levels' own (rest-point)
 // frame, so it rides the water: Foam e^(-Decay dt) plus Grow dt times the source, within 0 and
@@ -157,11 +165,15 @@ void ClipWaveCS(uint3 Id : SV_DispatchThreadID)
     float SurfZone = 0.0f;
     float OpenSource = 0.0f;
     float FineFoam = 0.0f;
+    float3 Strain = float3(0.0f, 0.0f, 0.0f);
+    float3 Strain0 = float3(0.0f, 0.0f, 0.0f);
+    float3 Strain1 = float3(0.0f, 0.0f, 0.0f);
     // (Stage W5f: past the far cut no foam.)
     const bool bFoamHere = ClipFoamSurf.z <= 0.0f || length(Offset) <= ClipFoamSurf.z + 2.0f * Spacing;
     if (W.FFT.x > 0.5f)
     {
-        const uint Mask = VOXEL_OCEAN_LOOKUP_ALL | (ClipFoamOn != 0u && bFoamHere ? VOXEL_OCEAN_LOOKUP_FOAM : 0u);
+        const uint Mask = VOXEL_OCEAN_LOOKUP_ALL | VOXEL_OCEAN_LOOKUP_STRAIN | (ClipFoamOn != 0u && bFoamHere ? VOXEL_OCEAN_LOOKUP_FOAM : 0u);
+        W.StrainAxis = F.E1;
         const FVoxelOceanFFTPoint Pt = VoxelOceanFFTEvaluate(P, Up, VertexSpacing, Footprint, Depth, In.Shore, W,
             ClipDisplacement, ClipDisplacementSampler, ClipDerivatives, ClipDerivativesSampler, ClipCharts, ClipFoam, ClipFoamSampler, Mask);
         Out = VoxelOceanFFTOutput(Pt, In, W, Mask, ClipCharts);
@@ -174,6 +186,9 @@ void ClipWaveCS(uint3 Id : SV_DispatchThreadID)
         SurfZone = Pt.SurfZone;
         OpenSource = Pt.FoamSource;
         FineFoam = Pt.FineFoam;
+        Strain = VoxelOceanFFTStrainOf(Pt.A, UpP, F.E1);
+        Strain0 = Pt.Strain0;
+        Strain1 = Pt.Strain1;
     }
     else
     {
@@ -218,6 +233,9 @@ void ClipWaveCS(uint3 Id : SV_DispatchThreadID)
     ClipDisplacementOut[C] = float4(VoxelOceanRotateBack(W.Rotation, Out.Displacement), DrawnShown);
     ClipNormalOut[C] = float4(VoxelOceanRotateBack(W.Rotation, Out.Normal), max(Out.SlopeVariance, 0.0f));
     ClipWhitecapOut[C] = float4(Whitecap, Foam, SurfZone, OpenSource);
+    ClipStrainOut[C] = float4(Strain.x, Strain.y, Strain.z, 0.0f);
+    ClipStrain0Out[C] = float4(Strain0.x, Strain0.y, Strain0.z, 0.0f);
+    ClipStrain1Out[C] = float4(Strain1.x, Strain1.y, Strain1.z, 0.0f);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -251,6 +269,35 @@ float4 FineSurf;                // stage W5c: x the surf's foam's keep over the 
 RWTexture2DArray<float> FineHistory;
 Texture2DArray<float> FineCoarseHistory;    // the buffer above (this frame's)
 Texture2DArray<float4> FineCoarseWhitecap;  // the whitecap levels (this frame's: z the surf's zone, w the open sea's mean source)
+// Stage W8k: the long bands' strains (ClipStrain0Out, ClipStrain1Out: this frame's); FineHeldOn 1:
+// a band the level's texels resolve (its shortest waves at least VOXEL_OCEAN_CLIP_FINE_HOLD^-1 of
+// them per wavelength) taken from them, bilinear at the fine texel, not looked up again.
+Texture2DArray<float4> FineStrain0;
+Texture2DArray<float4> FineStrain1;
+uint FineHeldOn;
+
+// The texels per wavelength of a band's shortest waves its texels must hold to stand for it at a
+// fine texel (bilinear between them): a sinusoid of wavelength L interpolated from samples S apart
+// is off by (pi S / L)^2 / 2 at most, 2% at S = 0.051 L, with the shore's stretch (its waves
+// shortened by up to a quarter) inside that. Band 0 (its shortest 60 m) is held at every fine level
+// (S to 160 cm), band 1 (15 m) at the first two (20 and 40 cm).
+#define VOXEL_OCEAN_CLIP_FINE_HOLD 0.051f
+
+// A strain texture at a level's storage texel coordinate (texels; their centres at i + 0.5),
+// bilinear across the toroidal storage (as VoxelOceanClipStaticBilinear).
+float4 VoxelOceanClipFineStrainAt(Texture2DArray<float4> T, float2 Texel, int Slot, int Size)
+{
+    const float2 X = Texel - 0.5f;
+    const float2 B = floor(X);
+    const float2 F = X - B;
+    const int2 I0 = int2((int(B.x) % Size + Size) % Size, (int(B.y) % Size + Size) % Size);
+    const int2 I1 = int2((I0.x + 1) % Size, (I0.y + 1) % Size);
+    const float4 A = T.Load(int4(I0.x, I0.y, Slot, 0));
+    const float4 Bx = T.Load(int4(I1.x, I0.y, Slot, 0));
+    const float4 By = T.Load(int4(I0.x, I1.y, Slot, 0));
+    const float4 C = T.Load(int4(I1.x, I1.y, Slot, 0));
+    return lerp(lerp(A, Bx, F.x), lerp(By, C, F.x), F.y);
+}
 
 bool VoxelOceanClipFineInRect(int4 R, int2 C)
 {
@@ -308,6 +355,22 @@ void ClipFineFoamCS(uint3 Id : SV_DispatchThreadID)
         // spacing out of reach (VoxelOceanFFTLookup skips the displacement's fetches), the surf's
         // spacing kept as it was.)
         if (W.SurfSpacing <= 0.0f) W.SurfSpacing = 2.0f * Spacing;
+        // Stage W8k: the long bands the level's texels resolve, from their strains (FineHeldOn).
+        if (FineHeldOn != 0u)
+        {
+            const float Coarse = FineWindow.z;
+            const uint Held = (Coarse <= VOXEL_OCEAN_CLIP_FINE_HOLD * 100.0f * W.Tiles.y / VOXEL_OCEAN_FFT_BOUNDARY_MODES ? 1u : 0u)
+                | (Coarse <= VOXEL_OCEAN_CLIP_FINE_HOLD * 100.0f * W.Tiles.z / VOXEL_OCEAN_FFT_BOUNDARY_MODES ? 2u : 0u);
+            if (Held != 0u)
+            {
+                float4 T = float4(0.0f, 0.0f, 0.0f, 0.0f);
+                if ((Held & 1u) != 0u) T += VoxelOceanClipFineStrainAt(FineStrain0, CoarseTexel, Slot, Size);
+                if ((Held & 2u) != 0u) T += VoxelOceanClipFineStrainAt(FineStrain1, CoarseTexel, Slot, Size);
+                W.BaseStrain = float4(T.x, T.y, T.z, 1.0f);
+                W.StrainAxis = F.E1;
+                W.HeldBands = float(Held);
+            }
+        }
         const FVoxelOceanFFTPoint Pt = VoxelOceanFFTEvaluate(P, Up, 1.0e9f, Spacing, St.S0.x, Shore, W,
             ClipDisplacement, ClipDisplacementSampler, ClipDerivatives, ClipDerivativesSampler, ClipCharts, ClipFoam, ClipFoamSampler,
             2u | (ClipFoamOn != 0u ? VOXEL_OCEAN_LOOKUP_FOAM : 0u));

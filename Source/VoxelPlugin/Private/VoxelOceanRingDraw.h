@@ -10,6 +10,7 @@
 #include "RenderGraphDefinitions.h"
 #include "RHIResources.h"
 #include "VoxelOceanPages.h"
+#include "VoxelOceanClipmap.h"
 
 /** One frame of the rings, in the caller's graph (render thread). */
 struct FVoxelOceanRingDrawFrame
@@ -46,7 +47,12 @@ struct FVoxelOceanRingDrawFrame
     FRHITexture* ClipNormal = nullptr;
     /** Stage W3h: the whitecaps' density (null before the first clipmap frame). */
     FRHITexture* ClipWhitecap = nullptr;
+    /** Stage W8j: the summed surface's strain (null: none; the pixels' own foam looks every band up). */
+    FRHITexture* ClipStrain = nullptr;
     FRHITexture* ClipInfo = nullptr;
+    /** Stage W8l: the info's rows themselves (what ClipInfo holds this frame), for the own pass's
+     *  constants (VoxelOceanClipInfoConstants). */
+    FVector4f ClipRows[VoxelOceanClipmap::InfoRows];
     /** Stage W4c: the foam's fine history (null: none), its levels and its factor. */
     FRHITexture* ClipFineHistory = nullptr;
     FVector2f ClipFineInfo = FVector2f(0.0f, 0.0f);

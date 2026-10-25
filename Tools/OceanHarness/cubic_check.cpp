@@ -8,7 +8,9 @@
 //   bilinear sampler's);
 // - smoothness: across texel boundaries the value and its first and second differences change
 //   continuously (C2), where the bilinear's first difference jumps;
-// - the share toward the cubic: none at a texel per footprint or coarser, all from two.
+// - the share toward the cubic: none at a texel per footprint or coarser, all from two;
+// - stage W8h: part way toward the cubic in four taps (VoxelOceanCubicTapsBlendOf) against its own
+//   16-texel sum, its ends, and the 2D filters' blend it replaced.
 //
 //   g++ -O2 -std=c++20 -I<plugin>/Source/VoxelPlugin/Public -I<plugin>/Shaders/Private cubic_check.cpp -o cubic_check
 
@@ -185,6 +187,75 @@ int main()
         Expect(std::abs(VoxelOceanCubicShareOf(1.41421356f) - 0.5f) < 1.0e-5f, "half an octave magnified: half", VoxelOceanCubicShareOf(1.41421356f));
         Expect(VoxelOceanCubicShareOf(2.0f) == 1.0f, "two pixels a texel: cubic", VoxelOceanCubicShareOf(2.0f));
         Expect(VoxelOceanCubicShareOf(50.0f) == 1.0f, "fifty: cubic", VoxelOceanCubicShareOf(50.0f));
+    }
+
+    std::printf("6. Part way toward the cubic in four taps (stage W8h)\n");
+    {
+        FTex T;
+        T.N = 256;
+        T.V.resize(256 * 256);
+        for (double& X : T.V) X = Uni(Rng) * 2.0 - 1.0;
+        // The blend per axis as the GPU combines it, and its 16-texel sum.
+        auto Blend = [&T](double U, double W, float Share)
+            {
+                const FVoxelOceanCubicTaps X = VoxelOceanCubicTapsBlendOf((float)U, 256.0f, Share);
+                const FVoxelOceanCubicTaps Y = VoxelOceanCubicTapsBlendOf((float)W, 256.0f, Share);
+                return Y.G0 * (X.G0 * T.Bilinear(X.P0, Y.P0) + X.G1 * T.Bilinear(X.P1, Y.P0))
+                    + Y.G1 * (X.G0 * T.Bilinear(X.P0, Y.P1) + X.G1 * T.Bilinear(X.P1, Y.P1));
+            };
+        auto BlendDirect = [&T](double U, double W, double Share)
+            {
+                auto Weights = [Share](double F, double* Out)
+                    {
+                        Out[0] = Share * (1 - F) * (1 - F) * (1 - F) / 6.0;
+                        Out[1] = Share * (4 - 6 * F * F + 3 * F * F * F) / 6.0 + (1 - Share) * (1 - F);
+                        Out[2] = Share * (1 + 3 * F + 3 * F * F - 3 * F * F * F) / 6.0 + (1 - Share) * F;
+                        Out[3] = Share * F * F * F / 6.0;
+                    };
+                const double X = U * T.N - 0.5, Y = W * T.N - 0.5;
+                const double I = std::floor(X), J = std::floor(Y);
+                double WX[4], WY[4];
+                Weights(X - I, WX);
+                Weights(Y - J, WY);
+                double S = 0.0;
+                for (int b = 0; b < 4; b++)
+                    for (int a = 0; a < 4; a++) S += WX[a] * WY[b] * T.At((int)I - 1 + a, (int)J - 1 + b);
+                return S;
+            };
+        double WorstDirect = 0.0, WorstOld = 0.0, WorstSpread = 0.0, WorstEnds = 0.0, WorstZero = 0.0;
+        for (int K = 0; K < 100000; K++)
+        {
+            const double U = Uni(Rng) * 3.0 - 1.0, W = Uni(Rng) * 3.0 - 1.0;
+            const float Share = (float)(0.02 + 0.96 * Uni(Rng));
+            const double New = Blend(U, W, Share);
+            WorstDirect = std::max(WorstDirect, std::abs(New - BlendDirect(U, W, Share)));
+            // Against the blend of the 2D filters (until W8h: the bilinear's and the cubic's lookups).
+            const double Lin = T.Bilinear(U, W), Cub = T.Cubic(U, W);
+            WorstOld = std::max(WorstOld, std::abs(New - ((1.0 - Share) * Lin + Share * Cub)));
+            WorstSpread = std::max(WorstSpread, std::abs(Cub - Lin));
+            // At the ends: all of it the cubic's; next to none, the bilinear's.
+            WorstEnds = std::max(WorstEnds, std::abs(Blend(U, W, 1.0f) - Cub));
+            WorstZero = std::max(WorstZero, std::abs(Blend(U, W, 1.0e-4f) - Lin));
+        }
+        Expect(WorstDirect < 2.0e-4, "four taps = the per-axis blend's sixteen texels (worst error)", WorstDirect);
+        Expect(WorstEnds < 1.0e-6, "share 1: the cubic's lookups exactly", WorstEnds);
+        Expect(WorstZero < 1.0e-3, "share 0.0001: the bilinear's", WorstZero);
+        std::printf("    (the cubic and the bilinear differ by up to %.3f on texels within +-1)\n", WorstSpread);
+        Expect(WorstOld < 0.3 * WorstSpread, "against the 2D filters' blend: within 30% of the filters' own difference", WorstOld);
+        // The weights stay a filter: positive pairs summing to 1, taps between their texels.
+        double WorstSum = 0.0, MinG = 1.0;
+        for (int K = 0; K <= 20000; K++)
+        {
+            const float U = (float)(K / 20000.0 * 4.0 / 256.0);
+            for (float Share : { 0.01f, 0.3f, 0.7f })
+            {
+                const FVoxelOceanCubicTaps P = VoxelOceanCubicTapsBlendOf(U, 256.0f, Share);
+                WorstSum = std::max(WorstSum, (double)std::abs(P.G0 + P.G1 - 1.0f));
+                MinG = std::min(MinG, (double)std::min(P.G0, P.G1));
+            }
+        }
+        Expect(WorstSum < 1.0e-6, "the pairs' weights sum to 1 at every share", WorstSum);
+        Expect(MinG > 0.0, "each pair's weight positive", MinG);
     }
 
     std::printf(Failures ? "FAILED: %d\n" : "ALL OK\n", Failures);

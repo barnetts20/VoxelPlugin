@@ -369,6 +369,8 @@ struct FVoxelOceanFFTSettings
     double UpdateRate = 50.0;
     /** Stage W4c (live): the levels keeping the foam's fine history (FVoxelOceanPages::UpdateClipmap). */
     int32 FoamDetailLevels = 4;
+    /** Stage W8k (live): the fine history's long bands from the levels' strains (UpdateClipmap). */
+    bool bFineFoamFromClip = true;
     /** Stage W5a (live): the surf's foam's linger (s) and the foam's breakup (VoxelOceanFoam.ush). */
     double SurfFoamLinger = 2.5;
     double FoamBreakup = 6.0;

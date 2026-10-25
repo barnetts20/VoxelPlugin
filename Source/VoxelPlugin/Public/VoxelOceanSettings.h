@@ -218,6 +218,14 @@ struct VOXELPLUGIN_API FVoxelOceanSettings
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Shading", AdvancedDisplay, meta = (EditCondition = "bOwnShading"))
     bool bCubicFiltering = true;
 
+    /** Stage W8j: the pixels' own foam near the camera (FoamDetail) takes the whole surface's
+     *  compression from the wave clipmap's texels for the waves they already hold, and looks up
+     *  again only the waves finer than them, as the slopes' detail does. Off: every band looked up
+     *  again at each pixel (the long ones in every sea state and detiling copy), about 2 ms dearer
+     *  near the water for the same foam. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Shading", AdvancedDisplay, meta = (EditCondition = "bOwnShading"))
+    bool bFoamDetailFromClip = true;
+
     /** Anisotropic filtering of the wave clipmap at grazing views (stage W3y): up to this many
      *  lookups along the water a pixel covers lengthwise, so the waves' and the foam's detail
      *  across the view survives at a distance instead of blurring. 1: none. */
@@ -779,6 +787,13 @@ struct VOXELPLUGIN_API FVoxelOceanSettings
      *  is 4 MB at the default clipmap size; all are stepped each wave update. */
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Foam", meta = (EditCondition = "bFoam", ClampMin = "0", ClampMax = "4"))
     int32 FoamDetailLevels = 4;
+
+    /** Stage W8k: the fine history's compression takes the long swells from the wave clipmap's
+     *  texels where they resolve them (the longest band at every fine level, the next at the first
+     *  two), looking up again only the shorter waves at the fine texels. Off: every band looked up
+     *  at each fine texel, about a third dearer, for the same foam. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Foam", AdvancedDisplay, meta = (EditCondition = "bFoam"))
+    bool bFineFoamFromClip = true;
 
     /** The surf's foam (0: none): the bores' white water, their short wake and the swash's foamy
      *  edge, fed into the same foam as the open sea's (stage W3v), so it builds and lingers there

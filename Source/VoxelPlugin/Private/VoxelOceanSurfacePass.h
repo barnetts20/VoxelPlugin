@@ -75,6 +75,8 @@ struct FVoxelOceanShadingParams
      *  whitecaps at each pixel; 0: the wave clipmap's), how far from the camera it reaches (m), and
      *  the waves' and the clipmap's lookups as cubic B-splines where their texels are magnified. */
     float FoamDetail = 1.0f;
+    /** Stage W8j: the pixel's own foam from the clipmap's strain and the finer bands. */
+    bool bFoamDetailFromClip = true;
     float FoamDetailDistanceM = 250.0f;
     /** Stage W5f: all foam faded out by this distance (m; 0: no fade), from the further of half of
      *  it and 70% of the nearer of it and FoamDetailDistanceM. */

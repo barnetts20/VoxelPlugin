@@ -25,6 +25,8 @@
 #include "/Engine/Private/Common.ush"
 // Stage W3z: the shortest band from its own 512^2 cascade near the camera (VoxelOceanWaves.ush).
 #define VOXEL_OCEAN_FINE_CASCADE 1
+// (Stage W8l: the clipmap's info from constants, VoxelOceanClipInfoConstants: VoxelOceanClip.ush.)
+#define VOXEL_OCEAN_CLIP_INFO_CONSTANTS 1
 #include "/Plugin/VoxelPlugin/Private/VoxelOceanPixelClip.ush"
 #include "/Plugin/VoxelPlugin/Private/VoxelOceanFoamTex.ush"
 #include "/Plugin/VoxelPlugin/Private/VoxelOceanShading.ush"
@@ -87,6 +89,12 @@ uint2 SurfaceViewMin;
 uint2 SurfaceViewSize;
 Texture2D SurfaceBehindColor;
 Texture2D<float> SurfaceBehindDepth;
+// Stage W8l: the intersection foam's tiles (VoxelOceanContactTiles.usf: the highest scene point behind
+// within reach of each 16-pixel tile, VoxelOceanContactHeightOf with SurfaceContactUp); On 0: none,
+// every pixel searches.
+Texture2D<float> SurfaceContactTiles;
+float4 SurfaceContactUp;
+uint SurfaceContactTilesOn;
 
 // The waves as the material takes them (FVoxelOceanDisplaceFrame, from the selection camera).
 float4 SurfaceParams;
@@ -115,6 +123,9 @@ uint SurfaceClipOn;
 // Stage W3h: the whitecaps' density per level (x); stage W3u: y the foam's history, z the surf's
 // breaking zone, w its own foam.
 Texture2DArray SurfaceClipWhitecap;
+// Stage W8j: the clipmap's strain (VoxelOceanClip.usf; SurfaceClipFineInfo.w 1: the pixel's own foam
+// from it and the bands finer than the clipmap's texels).
+Texture2DArray SurfaceClipStrain;
 // Stage W3u: the foam per pixel near the camera (VoxelOceanPixelSurfOf): the cascades' foam
 // envelopes; x its strength (0 none), y its reach (cm), z 1 with the texture, w 1 for the cubic
 // filtering.
@@ -128,7 +139,7 @@ Texture2DArray SurfaceFineDerivatives;
 Texture2DArray SurfaceFineFoam;
 // Stage W4c: the foam's fine history (VoxelOceanClip.usf, ClipFineFoamCS): its levels; x their
 // count (0: none), y their resolution's factor over the clipmap's; stage W5c: z 1 with the static
-// layer (SurfaceClipStatic).
+// layer (SurfaceClipStatic); stage W8j: w 1 with the clipmap's strain (SurfaceClipStrain).
 Texture2DArray SurfaceClipFineHistory;
 float4 SurfaceClipFineInfo;
 // Stage W5c: the clipmap's static layer (VoxelOceanClipStatic.usf: the shore at its texels, 4 slices
@@ -315,7 +326,7 @@ void SurfacePS(float4 SvPosition : SV_POSITION,
         const FVoxelOceanPixelSurf C = VoxelOceanPixelSurfOf(SamplePoint, Footprint, FootprintAcross, FootprintMajor, SurfaceFilter.x, DepthLand.x, length(Rel), W, SurfaceDisplacement,
             SurfaceDisplacementSampler, SurfaceDerivatives, SurfaceDerivativesSampler, SurfaceCharts, SurfaceFineDisplacement, SurfaceFineDerivatives,
             SurfaceCascadeFoam, SurfaceCascadeFoamSampler, SurfaceFineFoam, SurfaceClipDisplacement, SurfaceClipNormal, SurfaceClipWhitecap, SurfaceClipSampler, SurfaceClipInfo, SurfacePixelFoam,
-            SurfaceClipFineHistory, SurfaceClipFineInfo, SurfaceClipStatic);
+            SurfaceClipFineHistory, SurfaceClipFineInfo, SurfaceClipStatic, SurfaceClipStrain);
         N = C.Normal;
         SlopeVariance = C.SlopeVariance;
         // Stage W5f: THE FOAM'S DISTANCE FADE (as GodotOceanWaves fades its foam with distance:
@@ -560,7 +571,14 @@ void SurfacePS(float4 SvPosition : SV_POSITION,
             Across = length(DB - Up * dot(DB, Up));
         }
         // ... and anything standing out of the water round the pixel (stage W3p: the ring).
-        const float AcrossRing = VoxelOceanContactSearch(SurfaceBehindDepth, Pixel, int2(SurfaceViewSize), SurfaceClipToRel, Rel, Up, PixelAcross, Reach);
+        // (Stage W8l: not where nothing behind the water within the disc's reach stands high enough
+        // to count: the tiles' highest point more than the band, and a margin, under the water.)
+        float AcrossRing = 1.0e9f;
+        bool bSearch = true;
+        if (SurfaceContactTilesOn != 0u)
+            bSearch = SurfaceContactTiles.Load(int3(Pixel / 16, 0)) >= VoxelOceanContactHeightOf(Rel, SurfaceContactUp) - VOXEL_OCEAN_CONTACT_BAND - 10.0f;
+        if (bSearch)
+            AcrossRing = VoxelOceanContactSearch(SurfaceBehindDepth, Pixel, int2(SurfaceViewSize), SurfaceClipToRel, Rel, Up, PixelAcross, Reach);
         if ((Across < Reach && Below < Reach) || AcrossRing < Reach)
         {
             // The surge: the pixel's height over the mean in the sea's height deviation (the point's
