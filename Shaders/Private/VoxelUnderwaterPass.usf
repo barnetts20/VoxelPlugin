@@ -191,6 +191,12 @@ float3 UnderwaterSunIlluminance;
 float3 UnderwaterSunDirection;
 uint UnderwaterAtmoOn;
 float3 UnderwaterDepthLight;
+// Stage A7: the water's light as scattered sun and sky (VoxelUnderwater.ush's FVoxelUnderwaterLight):
+// on (needs a sun), its gain, the water's phase g, the diffuse light's attenuation (per metre).
+uint UnderwaterScatterOn;
+float UnderwaterScatterGain;
+float UnderwaterPhaseG;
+float3 UnderwaterKd;
 
 RWTexture2D<float4> UnderwaterOutput;
 
@@ -224,6 +230,42 @@ float3 VoxelUnderwaterDaylightOf()
     }
     const float Reference = max(dot(UnderwaterSunIlluminance, float3(0.2126f, 0.7152f, 0.0722f)), 1.0e-20f);
     return max(E / Reference, 0.0f);
+}
+
+/** Stage A7: the light coming down into the water over the camera (VoxelUnderwater.ush): the sun's
+ *  beam refracted, past the surface's reflection, its irradiance normal to the beam in the water;
+ *  the sky's light, and the diffuse share, from the atmosphere's table (a tenth of the sun's without
+ *  it). Pre-exposed. */
+FVoxelUnderwaterLight VoxelUnderwaterLightOf(float PreExposure)
+{
+    FVoxelUnderwaterLight Lit = VoxelUnderwaterNoLight();
+    if (UnderwaterScatterOn == 0u) return Lit;
+    const float3 Up = normalize(-UnderwaterCenter);
+    const float3 L = UnderwaterSunDirection;
+    const float MuS = dot(L, Up);
+    const float Above = saturate((MuS + 0.0045f) / 0.009f);
+    const float4 Sun = (UnderwaterAtmoOn & 1u) != 0u ? UnderwaterAtmoSun[0] : float4(1.0f, 1.0f, 1.0f, Above);
+    const float Mu = max(MuS, 0.0f);
+    const float Pass = 1.0f - (0.02f + 0.98f * pow(1.0f - Mu, 5.0f));
+    // Refracted (Snell, water 1.333); straight down with the sun set.
+    const float3 Down = MuS > 0.0f ? refract(-L, Up, 1.0f / 1.333f) : -Up;
+    const float MuW = max(-dot(Down, Up), 0.05f);
+    const float Gain = max(UnderwaterScatterGain, 0.0f) * PreExposure;
+    Lit.SunBeam = UnderwaterSunIlluminance * Sun.rgb * (Sun.a * Pass * Mu / MuW) * Gain;
+    Lit.SunDir = Down;
+    float3 Sky = UnderwaterSunIlluminance * 0.1f * Mu;
+    if ((UnderwaterAtmoOn & 2u) != 0u)
+    {
+        const float Z = 0.5f + 0.5f * sign(MuS) * sqrt(abs(MuS));
+        Sky = UnderwaterSunIlluminance * UnderwaterAtmoSkyIrradiance.SampleLevel(UnderwaterAtmoSkySampler,
+            float2(VoxelUnderwaterAtmoSkyCoord(Z, UnderwaterAtmoSkySize.w), 0.5f), 0.0f).rgb;
+    }
+    Lit.SkyDown = Sky * 0.934f * Gain;
+    Lit.Kd = UnderwaterKd;
+    Lit.Up = Up;
+    Lit.PhaseG = clamp(UnderwaterPhaseG, -0.95f, 0.95f);
+    Lit.On = 1.0f;
+    return Lit;
 }
 
 FVoxelOceanWaveParams VoxelUnderwaterWaveParams()
@@ -294,6 +336,6 @@ void UnderwaterCS(uint3 DispatchThreadId : SV_DispatchThreadID)
     const float3 Color = VoxelUnderwaterColor(Scene.rgb, Dir, NearDistance, SceneDistance, UnderwaterSphere, Waves,
         UnderwaterDisplacement, UnderwaterDisplacementSampler, UnderwaterDerivatives, UnderwaterDerivativesSampler, UnderwaterCharts,
         UnderwaterAbsorption, UnderwaterScattering, UnderwaterLight * GUnderwaterDaylight * UnderwaterDepthLight * PreExposure,
-        float4(UnderwaterMeniscus.rgb * GUnderwaterDaylight * PreExposure, UnderwaterMeniscus.w));
+        float4(UnderwaterMeniscus.rgb * GUnderwaterDaylight * PreExposure, UnderwaterMeniscus.w), VoxelUnderwaterLightOf(PreExposure));
     UnderwaterOutput[Pixel] = float4(Color, Scene.a);
 }

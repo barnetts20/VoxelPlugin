@@ -374,6 +374,10 @@ void AOceanSphereActor::UpdateUnderwater()
     // Stage A4: the daylight over the camera from the planet's atmosphere (while its light is the
     // sun), and the light dimmed with the camera's depth.
     Params.DepthDarkening = S.UnderwaterDepthDarkening;
+    // Stage A7: the water's light as scattered sun and sky.
+    Params.bScattering = S.bUnderwaterScattering;
+    Params.ScatterGain = S.UnderwaterScatterGain;
+    Params.PhaseG = S.PhaseG;
     if (UDirectionalLightComponent* Sun = FindSunLight())
     {
         const FLinearColor E = Sun->GetColoredLightBrightness();

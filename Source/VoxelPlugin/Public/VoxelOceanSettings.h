@@ -400,6 +400,18 @@ struct VOXELPLUGIN_API FVoxelOceanSettings
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Optics", meta = (ClampMin = "0.0", UIMax = "2.0"))
     float UnderwaterDepthDarkening = 1.0f;
 
+    /** Stage A7: the water's light under water as the sun's and the sky's light scattered in it (the
+     *  sun's beam refracted and dimmed down its slant path, through the water's phase function; the
+     *  diffuse light dimmed with depth; the bed lit by what reaches its depth), while there's a sun.
+     *  Off: the fog of UnderwaterLight (with A4's daylight and depth). */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Optics")
+    bool bUnderwaterScattering = true;
+
+    /** Stage A7: scales the scattered light. 2 stands in for the light scattered more than once,
+     *  which the single scattering leaves out (the blue's albedo is about a half: as much again). */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Optics", meta = (EditCondition = "bUnderwaterScattering", ClampMin = "0.0", UIMax = "8.0"))
+    float UnderwaterScatterGain = 2.0f;
+
     /** The thin band (cm) where the near plane meets the surface. */
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Optics", meta = (ClampMin = "0.0", UIMax = "10.0"))
     double MeniscusWidth = 1.5;

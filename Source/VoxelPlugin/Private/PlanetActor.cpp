@@ -454,9 +454,14 @@ void APlanetActor::ConfigureAtmosphere(double PlanetRadius, double OceanRadius, 
         AtmosphereActor->Set = AtmosphereSet;
     if (AtmosphereActor->PlanetType != AtmosphereType)
         AtmosphereActor->SetPlanetType(AtmosphereType);
-    // The visible surface's radius: the atmosphere's floor (its default, max of the ocean's and
-    // the planet's radii).
-    AtmosphereActor->InitializeFromPlanet(PlanetRoot, FVector(FMath::Max(OceanRadius, PlanetRadius)));
+    // The atmosphere's floor. Stage A7: THE SEA'S LEVEL where there is one (and on the terrestrial
+    // generator, whose heights are about sea level, the actor's radius): the floor is where the air
+    // starts, where the sun sets (its planet shadow) and where the sky tables are made. Above the
+    // water (the terrestrial lattice's centre can sit over the sea on some seeds) the sun set behind
+    // an invisible floor over the horizon, and the air under it was missing. Without either, the
+    // larger of the two, as before.
+    const bool bSeaFloor = bEnableOcean || Generator == EVoxelSurfaceGenerator::Terrestrial;
+    AtmosphereActor->InitializeFromPlanet(PlanetRoot, FVector(bSeaFloor ? OceanRadius : FMath::Max(OceanRadius, PlanetRadius)));
     AtmosphereActor->SetAtmosphereActive(true);
     AtmosphereActor->SetActorHiddenInGame(false);
     AtmosphereActor->SetActorTickEnabled(true);

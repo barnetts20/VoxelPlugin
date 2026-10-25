@@ -568,6 +568,7 @@ void SurfacePS(float4 SvPosition : SV_POSITION,
         const float3 P0 = VoxelOceanSurfaceRelOf((float2(Pixel) + 0.5f) / ViewSize, Depth0);
         float Z = max(dot(Rel - P0, Up), 0.0f);
         int2 BedPixel = Pixel;
+        float3 BedPoint = P0;
         const float Offset = min(Z, 5000.0f) * SurfaceShading.y;
         if (Offset > 0.0f)
         {
@@ -584,6 +585,7 @@ void SurfacePS(float4 SvPosition : SV_POSITION,
                     {
                         Z = Z1;
                         BedPixel = Pixel1;
+                        BedPoint = VoxelOceanSurfaceRelOf((float2(Pixel1) + 0.5f) / ViewSize, Depth1);
                     }
                 }
             }
@@ -593,6 +595,19 @@ void SurfacePS(float4 SvPosition : SV_POSITION,
         // (Stage A2: dimmed as the atmosphere's march would have dimmed it: the march leaves the
         // sea's pixels to the ocean.)
         Bed = SurfaceBehindColor.Load(int3(BedPixel, 0)).rgb * AtmoSun.Behind * ((1.0f - VoxelOceanFresnel(SunUp)) / PreExposure);
+        // Stage A7: A WAVE ISN'T A WINDOW ONTO DRY LAND. What lies behind a pixel is the bed under it
+        // only where it is under the water itself: a point above the sea (the beach past a ridge,
+        // the shore behind a crest seen side-on) is hidden by the wave's body, and the refracted ray
+        // runs down into the water instead, to a bed as deep as the waves feel there. Blended over
+        // the sea's level +-20 cm (its height over the sea sphere: the camera's, SurfaceOrigin.w,
+        // plus its own from the camera's radius).
+        const float BedHeight = VoxelOceanContactHeightOf(BedPoint, SurfaceContactUp) + SurfaceOrigin.w;
+        const float Submerged = 1.0f - smoothstep(-20.0f, 20.0f, BedHeight);
+        // (At least 5 m: the bed under a shallow wave isn't in the screen to show, so the water
+        // stands in for it.)
+        const float HiddenPath = clamp(DepthLand.x, 500.0f, 1.0e5f) / MuView;
+        Path = lerp(HiddenPath, Path, Submerged);
+        Bed *= Submerged;
     }
     float3 Body = float3(
         VoxelOceanWaterBody(SurfaceScattering.x, SurfaceExtinction.x, Path, MuView, MuSun, SunPhase, SunWater.x, SkyWater.x, Bed.x),

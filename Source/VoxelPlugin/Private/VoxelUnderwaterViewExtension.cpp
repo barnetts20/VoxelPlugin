@@ -98,6 +98,11 @@ BEGIN_SHADER_PARAMETER_STRUCT(FVoxelUnderwaterParameters, )
     SHADER_PARAMETER(FVector3f, UnderwaterSunDirection)
     SHADER_PARAMETER(uint32, UnderwaterAtmoOn)
     SHADER_PARAMETER(FVector3f, UnderwaterDepthLight)
+    // Stage A7: the scattered light.
+    SHADER_PARAMETER(uint32, UnderwaterScatterOn)
+    SHADER_PARAMETER(float, UnderwaterScatterGain)
+    SHADER_PARAMETER(float, UnderwaterPhaseG)
+    SHADER_PARAMETER(FVector3f, UnderwaterKd)
 
     SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2D<float4>, UnderwaterOutput)
 END_SHADER_PARAMETER_STRUCT()
@@ -531,6 +536,10 @@ FScreenPassTexture FVoxelUnderwaterViewExtension::Render_RenderThread(
         P->UnderwaterSunDirection = Params.SunDirection;
         P->UnderwaterAtmoOn = AtmoOn;
         P->UnderwaterDepthLight = DepthLight;
+        P->UnderwaterScatterOn = (Params.bScattering && !Params.SunIlluminance.IsNearlyZero() && !Params.SunDirection.IsNearlyZero()) ? 1u : 0u;
+        P->UnderwaterScatterGain = Params.ScatterGain;
+        P->UnderwaterPhaseG = Params.PhaseG;
+        P->UnderwaterKd = (Params.Absorption + Params.Scattering * 0.25f) * FMath::Max(Params.DepthDarkening, 0.0f);
 
         P->View = View.ViewUniformBuffer;
         P->UnderwaterSceneColor = SceneColor.Texture;

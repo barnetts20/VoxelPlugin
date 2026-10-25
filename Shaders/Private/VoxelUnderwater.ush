@@ -166,12 +166,90 @@ float VoxelUnderwaterExit(float3 Start, float3 Dir, float2 Sphere, FVoxelOceanWa
     return Exit;
 }
 
+// Stage A7: THE WATER'S LIGHT AS SCATTERED SUNLIGHT AND SKYLIGHT, not a fog colour. The sun's beam
+// refracts at the surface and dims along its slant path down (exp(-sigma_t d / mu_w)); the sky's
+// light, and the sun's once scattered, come down diffusely and dim by Kd per metre of depth. Along
+// the view ray the depth changes linearly (the local vertical, planar over the water's few hundred
+// metres of visibility), so the single scattering integrates in closed form per channel: the sun's
+// through the water's phase function (Henyey-Greenstein, g), the diffuse light's isotropically over
+// the lower half (1 / 2 pi). Looking down darkens, looking up toward the sun glows, the deep goes
+// dark; the bed's own light dims by the depth it lies at.
+struct FVoxelUnderwaterLight
+{
+    float3 SunBeam;   // the sun's beam just under the surface, irradiance normal to it (pre-exposed)
+    float3 SunDir;    // the beam's direction of travel in the water (unit, downward)
+    float3 SkyDown;   // the diffuse light coming down just under the surface, on the horizontal
+    float3 Kd;        // the diffuse light's attenuation with depth (per metre)
+    float3 Up;        // the local vertical at the camera
+    float PhaseG;
+    float On;         // 0: the fog model (Light), as before
+};
+
+FVoxelUnderwaterLight VoxelUnderwaterNoLight()
+{
+    FVoxelUnderwaterLight L;
+    L.SunBeam = float3(0.0f, 0.0f, 0.0f);
+    L.SunDir = float3(0.0f, 0.0f, -1.0f);
+    L.SkyDown = float3(0.0f, 0.0f, 0.0f);
+    L.Kd = float3(0.0f, 0.0f, 0.0f);
+    L.Up = float3(0.0f, 0.0f, 1.0f);
+    L.PhaseG = 0.0f;
+    L.On = 0.0f;
+    return L;
+}
+
+/** The integral of exp(-A t) over [0, P] (per metre), per channel; its exponent held off overflow
+ *  where A is negative (looking up toward brighter water). The series for small A P is formed from
+ *  a clamped X: unclamped, a ray into open water (P the sky's 1e28 m) overflows it to -inf, and the
+ *  lerp's 0 x inf made the whole pixel NaN (black), where the water should fade to its own light. */
+float3 VoxelUnderwaterIntegralOf(float3 A, float P)
+{
+    const float3 X = A * P;
+    const float3 SafeA = lerp(A, float3(1.0f, 1.0f, 1.0f), step(abs(A), float3(1.0e-6f, 1.0e-6f, 1.0e-6f)));
+    const float3 Full = (1.0f - exp(-clamp(X, -60.0f, 60.0f))) / SafeA;
+    const float3 Series = float3(P, P, P) * (1.0f - 0.5f * clamp(X, -1.0f, 1.0f));
+    return lerp(Full, Series, step(abs(X), float3(1.0e-4f, 1.0e-4f, 1.0e-4f)));
+}
+
+// The longest path the scattering integrates (m): past it the water is opaque (the clearest
+// water's extinction, about 0.02 per metre, leaves exp(-200)), so a ray that meets nothing, the
+// sky's distance, converges on the water's own light: the fog it fades into.
+#define VOXEL_UNDERWATER_MAX_PATH_M 1.0e4f
+
+/** Henyey-Greenstein's phase function (per steradian). */
+float VoxelUnderwaterPhaseOf(float CosTheta, float G)
+{
+    const float G2 = G * G;
+    const float D = max(1.0f + G2 - 2.0f * G * CosTheta, 1.0e-4f);
+    return (1.0f - G2) / (4.0f * 3.14159265f * D * sqrt(D));
+}
+
+/** The light the water scatters toward the eye along Dir from a point StartDepth (cm) under the
+ *  surface, over Path (cm), per channel (per metre coefficients). */
+float3 VoxelUnderwaterInscatterOf(float3 Dir, float StartDepth, float Path, float3 Scattering, float3 Extinction, FVoxelUnderwaterLight L)
+{
+    const float D0 = max(StartDepth, 0.0f) * 0.01f;
+    const float P = clamp(Path * 0.01f, 0.0f, VOXEL_UNDERWATER_MAX_PATH_M);
+    // Depth gained per metre along the ray; the beam's slant through the depth.
+    const float S = -dot(Dir, L.Up);
+    const float MuW = max(-dot(L.SunDir, L.Up), 0.05f);
+    const float3 Sun0 = L.SunBeam * exp(-min(Extinction * (D0 / MuW), 60.0f));
+    const float3 Sky0 = L.SkyDown * exp(-min(L.Kd * D0, 60.0f));
+    // The scattering angle: from the beam's direction of travel to the light's toward the eye (-Dir):
+    // looking up into the beam is forward scattering, looking down at the bed back scattering.
+    const float Phase = VoxelUnderwaterPhaseOf(dot(-Dir, L.SunDir), L.PhaseG);
+    const float3 SunTerm = Sun0 * Phase * VoxelUnderwaterIntegralOf(Extinction * (1.0f + S / MuW), P);
+    const float3 SkyTerm = Sky0 * (1.0f / (2.0f * 3.14159265f)) * VoxelUnderwaterIntegralOf(Extinction + L.Kd * S, P);
+    return max(Scattering * (SunTerm + SkyTerm), 0.0f);
+}
+
 // The scene colour seen through the water along one pixel's ray from the reference point.
 // Dir: the ray (unit, world axes); NearDistance: to the near plane along it; SceneDistance: to
 // the scene point (VOXEL_UNDERWATER_FAR for the sky). Light and Meniscus.rgb are in the scene
 // colour's units (pre-exposed).
 float3 VoxelUnderwaterColor(float3 SceneColor, float3 Dir, float NearDistance, float SceneDistance, float2 Sphere,
-    FVoxelOceanWaveParams W, VOXEL_OCEAN_TEXTURE_PARAMS, float3 Absorption, float3 Scattering, float3 Light, float4 Meniscus)
+    FVoxelOceanWaveParams W, VOXEL_OCEAN_TEXTURE_PARAMS, float3 Absorption, float3 Scattering, float3 Light, float4 Meniscus,
+    FVoxelUnderwaterLight Lit)
 {
     // The pixel's point on the near plane.
     const float3 Near = Dir * NearDistance;
@@ -204,7 +282,10 @@ float3 VoxelUnderwaterColor(float3 SceneColor, float3 Dir, float NearDistance, f
             const float X = 1.0f - CosT;
             Fresnel = 0.02f + 0.98f * X * X * X * X * X;
         }
-        Behind = lerp(SceneColor, WaterColor, Fresnel);
+        // (Stage A7: outside the window, the water below as seen along the reflected ray.)
+        const float3 Mirrored = Lit.On > 0.5f
+            ? VoxelUnderwaterInscatterOf(reflect(Dir, N), 0.0f, 1.0e5f, Scattering, Extinction, Lit) : WaterColor;
+        Behind = lerp(SceneColor, Mirrored, Fresnel);
 #if VOXEL_UNDERWATER_HAS_FOAM
         // The foam where it leaves (the map's, at the exit's foot on the sphere).
         const float4 FoamColor = VOXEL_UNDERWATER_FOAM_COLOR;
@@ -217,7 +298,19 @@ float3 VoxelUnderwaterColor(float3 SceneColor, float3 Dir, float NearDistance, f
         }
 #endif
     }
-    const float3 Transmittance = exp(-Extinction * (Path * 0.01f));
+    const float3 Transmittance = exp(-Extinction * min(Path * 0.01f, VOXEL_UNDERWATER_MAX_PATH_M));
+    if (Lit.On > 0.5f)
+    {
+        // Stage A7: the scattered light along the path, from the near plane's depth; a bed (the
+        // scene in the water) lit only by what comes down to the depth it lies at.
+        const float StartDepth = max(-NearHeight, 0.0f);
+        if (!bExits)
+            Behind *= exp(-min(Lit.Kd * (max(StartDepth - dot(Dir, Lit.Up) * min(Path, VOXEL_UNDERWATER_MAX_PATH_M * 100.0f), 0.0f) * 0.01f), 60.0f));
+        // Past the longest path nothing behind shows (and an unbounded sky colour can't make 0 x inf).
+        Behind = Path * 0.01f < VOXEL_UNDERWATER_MAX_PATH_M ? Behind : float3(0.0f, 0.0f, 0.0f);
+        const float3 Lit3 = Behind * Transmittance + VoxelUnderwaterInscatterOf(Dir, StartDepth, Path, Scattering, Extinction, Lit);
+        return lerp(Lit3, Meniscus.rgb, MeniscusMix);
+    }
     const float3 Color = Behind * Transmittance + WaterColor * (1.0f - Transmittance);
     return lerp(Color, Meniscus.rgb, MeniscusMix);
 }

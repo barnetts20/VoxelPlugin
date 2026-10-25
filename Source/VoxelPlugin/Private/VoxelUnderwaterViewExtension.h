@@ -55,6 +55,11 @@ struct FVoxelUnderwaterParams
     /** Stage A4: the water's light dimmed with the camera's depth, exp(-K depth) with K the
      *  absorption plus a quarter of the scattering, times this (0: none). */
     float DepthDarkening = 1.0f;
+    /** Stage A7: the water's light as scattered sunlight and skylight (VoxelUnderwater.ush) rather
+     *  than the fog of Light, while there's a sun; its gain, and the water's phase g. */
+    bool bScattering = true;
+    float ScatterGain = 2.0f;
+    float PhaseG = 0.8f;
 
     /** The FFT model's textures (FVoxelOceanCascadeTextures' resources; null for any other
      *  model). Read only by SetFrame_GameThread's render command, which keeps references to their
