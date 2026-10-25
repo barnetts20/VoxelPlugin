@@ -29,6 +29,7 @@ struct FScreenPassTexture;
 class FTextureResource;
 struct FVoxelOceanShoreRHI;
 struct FVoxelOceanProbeState;
+class FAtmosphereViewExtension;
 
 /** The pass's inputs, flattened for the render thread. The ocean actor sets every member. */
 struct FVoxelUnderwaterParams
@@ -43,6 +44,17 @@ struct FVoxelUnderwaterParams
     FVector3f Light = FVector3f::ZeroVector;
     /** rgb: the waterline's tint (scene units before exposure); w: its width (cm). */
     FVector4f Meniscus = FVector4f::Zero();
+
+    /** Stage A4: the planet's atmosphere (null: none). With it, Light, the foam's colour and the
+     *  meniscus's are scaled by the daylight at the sea over the camera (the sun through the clouds'
+     *  shadow and the air, and the sky's irradiance: its surface-sun pass and sky tables) against
+     *  the light above the air, SunIlluminance toward SunDirection. */
+    TWeakPtr<FAtmosphereViewExtension, ESPMode::ThreadSafe> Atmosphere;
+    FVector3f SunDirection = FVector3f::ZeroVector;
+    FVector3f SunIlluminance = FVector3f::ZeroVector;
+    /** Stage A4: the water's light dimmed with the camera's depth, exp(-K depth) with K the
+     *  absorption plus a quarter of the scattering, times this (0: none). */
+    float DepthDarkening = 1.0f;
 
     /** The FFT model's textures (FVoxelOceanCascadeTextures' resources; null for any other
      *  model). Read only by SetFrame_GameThread's render command, which keeps references to their

@@ -388,10 +388,17 @@ struct VOXELPLUGIN_API FVoxelOceanSettings
     float PhaseG = 0.8f;
 
     /** The light the water scatters toward the camera under water, in the scene's light units
-     *  (linear, before exposure, so it holds as the exposure adapts), until the atmosphere
-     *  provides the sun's. */
+     *  (linear, before exposure, so it holds as the exposure adapts). Stage A4: with the planet's
+     *  atmosphere, this at the daylight of a clear noon, scaled by the daylight over the camera. */
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Optics")
     FLinearColor UnderwaterLight = FLinearColor(0.4f, 0.8f, 1.0f);
+
+    /** Stage A4: how much the water's light dims with the camera's depth: exp(-K depth), K the
+     *  absorption plus a quarter of the scattering per metre, times this (0: none, as before A4). With
+     *  the planet's atmosphere the light also follows the daylight over the camera (the sun through
+     *  the clouds' shadow and the air, the sky's light), about 0.9 of UnderwaterLight at a clear noon. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Optics", meta = (ClampMin = "0.0", UIMax = "2.0"))
+    float UnderwaterDepthDarkening = 1.0f;
 
     /** The thin band (cm) where the near plane meets the surface. */
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Optics", meta = (ClampMin = "0.0", UIMax = "10.0"))
@@ -482,6 +489,33 @@ struct VOXELPLUGIN_API FVoxelOceanSettings
      *  machine. Off: the Environment constants everywhere. */
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Weather")
     bool bProceduralWeather = true;
+
+    /** Stage A5: the weather from the planet's atmosphere (its flow sim's lowest layer: the wind,
+     *  the storm, and a swell from the wind at a weather system's scale) when the planet has one;
+     *  the procedural weather (or the Environment constants) until its first read-back lands, and
+     *  without one. NOT THE SAME ON EVERY MACHINE: the sim runs on each one's GPU. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Weather")
+    bool bWeatherFromAtmosphere = true;
+
+    /** Stage A5: the atmosphere's wind scaled so its mean over the planet is this (m/s): the sim
+     *  is dimensionless. About 7 over Earth's oceans. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Weather", meta = (EditCondition = "bWeatherFromAtmosphere", ClampMin = "0.0", UIMax = "20.0"))
+    double AtmosphereMeanWind = 7.0;
+
+    /** Stage A5: the swell from the atmosphere's wind at a weather system's scale, as a share of
+     *  its speed. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Weather", meta = (EditCondition = "bWeatherFromAtmosphere", ClampMin = "0.0", UIMax = "1.5"))
+    double AtmosphereSwellShare = 0.6;
+
+    /** Stage A6: rain on the water, from the planet's atmosphere's weather (its cloud cover where the
+     *  air rises, and its storms): the drops' rings near the camera and their roughness beyond. This
+     *  scales it (0: none). Needs the atmosphere's sun at the water (voxel.Ocean.AtmosphereSun). */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Weather", meta = (ClampMin = "0.0", UIMax = "2.0"))
+    float RainAmount = 1.0f;
+
+    /** Stage A6: how far from the camera the rain's rings are drawn (m); past it, their roughness. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Weather", meta = (ClampMin = "1.0", UIMax = "200.0"))
+    float RainRippleDistance = 40.0f;
 
     /** The weather's seed. */
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Weather", meta = (EditCondition = "bProceduralWeather"))

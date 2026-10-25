@@ -28,6 +28,8 @@
 #include "/Plugin/VoxelPlugin/Private/VoxelOceanFoamTex.ush"
 #include "/Plugin/VoxelPlugin/Private/VoxelOceanShading.ush"
 #include "/Plugin/VoxelPlugin/Private/VoxelOceanSpray.ush"
+#include "/Plugin/VoxelPlugin/Private/VoxelOceanAtmoSun.ush"
+#include "/Plugin/VoxelPlugin/Private/VoxelOceanAtmoSky.ush"
 
 #define VOXEL_OCEAN_SPRAY_SPAWN_CELL 8
 // At most this many puffs a spawn cell a frame.
@@ -262,6 +264,15 @@ float3 SurfaceSunDirection;
 float3 SurfaceSunIlluminance;
 float3 SurfaceSkyZenith;
 float3 SurfaceSkyHorizon;
+// Stage A2: the sun at the water from the atmosphere (the surface pass's grid; VoxelOceanAtmoSun.ush).
+Texture2DArray SurfaceAtmoSun;
+SamplerState SurfaceAtmoSunSampler;
+uint SurfaceAtmoSunOn;
+// Stage A3: the sky's irradiance from the atmosphere (the surface pass's; VoxelOceanAtmoSky.ush).
+Texture2D SurfaceAtmoSkyIrradiance;
+SamplerState SurfaceAtmoSkySampler;
+float4 SurfaceAtmoSkySize;
+uint SurfaceAtmoSkyOn;
 
 void SprayVS(uint VertexId : SV_VertexID,
     out float4 OutPosition : SV_POSITION,
@@ -398,10 +409,15 @@ void SprayPS(float4 SvPosition : SV_POSITION,
     const float SunUp = dot(L, Up);
     const float SunAbove = VoxelOceanSunAbove(SunUp);
     const float Day = VoxelOceanStandInDay(SunUp);
-    const float3 SkyIrradiance = VOXEL_OCEAN_SHADING_PI * (0.2f * SurfaceSkyHorizon + 0.8f * SurfaceSkyZenith) * Day;
+    const float3 SkyIrradiance = SurfaceAtmoSkyOn != 0u
+        ? SurfaceSunIlluminance * VoxelOceanAtmoSkyIrradianceAt(SurfaceAtmoSkyIrradiance, SurfaceAtmoSkySampler, SurfaceAtmoSkySize, SunUp)
+        : VOXEL_OCEAN_SHADING_PI * (0.2f * SurfaceSkyHorizon + 0.8f * SurfaceSkyZenith) * Day;
     const float3 V = -Rel / max(Distance, 1.0f);
     const float Phase = VoxelOceanPhaseHG(dot(L, -V), 0.6f);
-    const float3 Light = SurfaceSunIlluminance * (SunAbove * (0.7f * 0.8f / VOXEL_OCEAN_SHADING_PI + 0.3f * Phase)) + SkyIrradiance * (0.8f / VOXEL_OCEAN_SHADING_PI);
+    // (Stage A2: the sun as it reaches the water there, the atmosphere's.)
+    const FVoxelOceanAtmoSun AtmoSun = VoxelOceanAtmoSunOf(SurfaceAtmoSun, SurfaceAtmoSunSampler,
+        (float2(Pixel) + 0.5f) / float2(SurfaceViewSize), SurfaceAtmoSunOn);
+    const float3 Light = SurfaceSunIlluminance * AtmoSun.Sun * (SunAbove * (0.7f * 0.8f / VOXEL_OCEAN_SHADING_PI + 0.3f * Phase)) + SkyIrradiance * (0.8f / VOXEL_OCEAN_SHADING_PI);
     const float PreExposure = max(View.PreExposure, 1.0e-10f);
     OutColor = float4(Light * (Alpha * PreExposure), Alpha);
 }

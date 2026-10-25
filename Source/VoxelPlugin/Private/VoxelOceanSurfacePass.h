@@ -37,6 +37,7 @@ class IRendererModule;
 class FPostOpaqueRenderParameters;
 class FRDGBuilder;
 class FVoxelOceanSurfaceParameters;
+class FAtmosphereViewExtension;
 
 /** What the own pass draws and shades with (game thread snapshot). */
 struct FVoxelOceanShadingParams
@@ -56,6 +57,14 @@ struct FVoxelOceanShadingParams
     FVector3f SunIlluminance = FVector3f::ZeroVector;
     FVector3f SkyZenith = FVector3f::ZeroVector;
     FVector3f SkyHorizon = FVector3f::ZeroVector;
+    /** Stage A2: the planet's atmosphere (CloudAtmosphere's march; null: none): the sun at the water
+     *  from it (its surface-sun pass: the clouds' shadow and the air below SunIlluminance, the light
+     *  above the air), and the sea's pixels marked for its march to leave alone. */
+    TWeakPtr<FAtmosphereViewExtension, ESPMode::ThreadSafe> Atmosphere;
+    /** Stage A6: the rain on the water, from the atmosphere's weather: its amount (0: none) and
+     *  how far from the camera its rings are drawn (m). */
+    float RainAmount = 1.0f;
+    float RainRippleDistanceM = 40.0f;
 
     /** The short waves' slope variance (both axes) the wave bands don't hold; the refraction's
      *  strength (0: none); the foam on and its albedo. */

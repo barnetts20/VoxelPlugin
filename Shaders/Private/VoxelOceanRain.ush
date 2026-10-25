@@ -1,0 +1,112 @@
+// VoxelOceanRain.ush - Stage A6: rain on the water (Design/AtmosphereOceanSide.md section 6). The
+// rain at a pixel comes from the atmosphere's weather at the sea (its surface-weather pass on the
+// A2 grid: cloud cover, storm, rising air; VoxelOceanAtmoSun.ush's third slice). Near the camera it
+// draws rings, the drops' ripples; past where a pixel can hold them, the rings' slopes as roughness.
+//
+// THE RINGS: two layers of cells (32 and 21 cm), a drop per cell per period (1.2 and 0.8 s: both divide the clock's hour wrap, VOXEL_OCEAN_SURF_WRAP) with a
+// chance of the rain's amount, landing at a seeded point in its cell at a seeded phase. Its ring
+// spreads to a cell's width over the period, fading as (1 - age)^2, its profile a cosine under a
+// Gaussian a few centimetres wide. In the waves' chart coordinates (VoxelOceanCharts.ush, as the
+// foam's texture: precise on any planet, blended across charts), wrapped every 256 cells.
+
+#pragma once
+
+/** Rain (0..1) from the atmosphere's weather at the sea: cloud cover past 0.6 where the air rises,
+ *  and the storm. */
+float VoxelOceanRainOf(float4 Weather)
+{
+    const float Cover = saturate((Weather.x - 0.6f) / 0.3f);
+    const float Rising = saturate(0.5f + 2.0f * Weather.z);
+    return saturate(Cover * Rising + 0.6f * Weather.y);
+}
+
+uint VoxelOceanRainHash(uint2 C, uint Salt)
+{
+    uint H = C.x * 0x8da6b343u ^ C.y * 0xd8163841u ^ Salt * 0xcb1ab31fu;
+    H ^= H >> 13u;
+    H *= 0x5bd1e995u;
+    H ^= H >> 15u;
+    return H;
+}
+
+float VoxelOceanRainUnit(uint H)
+{
+    return float(H & 0xffffffu) * (1.0f / 16777216.0f);
+}
+
+// The rings' peak slope at full rain, and their profile's sharpness (per cell).
+#define VOXEL_OCEAN_RAIN_SLOPE 0.25f
+#define VOXEL_OCEAN_RAIN_SHARPNESS 12.0f
+// The rings' slope variance (both axes) at full rain, where a pixel is too wide to draw them: the
+// rings' own (0.002, measured over the pattern) and as much again for the splashes' capillaries.
+#define VOXEL_OCEAN_RAIN_VARIANCE 0.004f
+
+/** One layer of rings: the height's gradient (dimensionless, along the chart's two axes) at chart
+ *  coordinates Base + Offset (m). */
+float2 VoxelOceanRainLayerOf(float2 Base, float2 Offset, float Cell, float Period, float Time, float Rain, uint Salt)
+{
+    const float Tile = Cell * 256.0f;
+    const float2 P = (fmod(Base, float2(Tile, Tile)) + Offset) / Cell;
+    const float2 Ci = floor(P);
+    float2 Gradient = float2(0.0f, 0.0f);
+    for (int J = -1; J <= 1; J++)
+    {
+        for (int I = -1; I <= 1; I++)
+        {
+            const float2 C = Ci + float2(float(I), float(J));
+            const uint2 Cu = uint2(int2(C) & 255);
+            const float Phase = VoxelOceanRainUnit(VoxelOceanRainHash(Cu, Salt));
+            const float Cycle = Time / Period + Phase;
+            const float Age = frac(Cycle);
+            const uint Drop = VoxelOceanRainHash(Cu + uint2(uint(int(floor(Cycle)) & 0xffff) * 0x9e37u, 0x2c1bu), Salt + 7u);
+            if (VoxelOceanRainUnit(Drop) >= Rain) continue;
+            const float2 Centre = C + 0.15f + 0.7f * float2(VoxelOceanRainUnit(Drop * 747796405u), VoxelOceanRainUnit(Drop * 2891336453u));
+            const float2 D = P - Centre;
+            const float Dist = length(D);
+            const float X = (Dist - Age) * VOXEL_OCEAN_RAIN_SHARPNESS;
+            if (abs(X) > 3.0f || Dist < 1.0e-4f) continue;
+            const float Fade = (1.0f - Age) * (1.0f - Age) * smoothstep(0.0f, 0.08f, Age);
+            // h = cos(pi X) exp(-X^2 / 2): its slope along X, about 3 at most.
+            const float Env = exp(-0.5f * X * X);
+            const float DhDx = (-3.14159265f * sin(3.14159265f * X) - X * cos(3.14159265f * X)) * Env;
+            Gradient += (Fade * VOXEL_OCEAN_RAIN_SLOPE / 3.0f * DhDx) * (D / Dist);
+        }
+    }
+    return Gradient;
+}
+
+/** The rain's rings at a surface point: the height's gradient in world axes (tangent), blended over
+ *  the waves' charts as the foam's texture is. Rain 0..1, Time the ocean's clock (s). */
+float3 VoxelOceanRainGradientOf(float3 SamplePoint, float Rain, float Time, FVoxelOceanWaveParams W, Texture2D OceanCharts)
+{
+    float3 Out = float3(0.0f, 0.0f, 0.0f);
+    if (Rain <= 0.0f || W.FFT.x < 0.5f) return Out;
+    const float3 D = VoxelOceanRotateBack(W.Rotation, SamplePoint);
+    const float3 UpP = VoxelOceanRotateBack(W.Rotation, normalize(SamplePoint - W.Center));
+    const int N = max(int(W.FFT.y), 1);
+    const FVoxelOceanChartCandidates Cand = VoxelOceanChartCandidatesOf(UpP, N);
+    const FVoxelOceanChartBlend Blend = VoxelOceanChartBlendOf(Cand.Count, VoxelOceanChartDistancesOf(Cand, UpP), N);
+    float Sum = 0.0f;
+    for (int M = 0; M < VOXEL_OCEAN_CHART_MAX; M++)
+    {
+        if (M < Blend.Count) Sum += Blend.Weight[M];
+    }
+    if (Sum <= 0.0f) return Out;
+    [unroll]
+    for (int K = 0; K < VOXEL_OCEAN_CHART_MAX; K++)
+    {
+        if (K >= Blend.Count) continue;
+        const int2 T = Cand.Texel[Blend.Index[K]];
+        const float4 T0 = OceanCharts.Load(int3(T.x, T.y, 0));
+        const float4 T1 = OceanCharts.Load(int3(T.x + 1, T.y, 0));
+        const float4 T2 = OceanCharts.Load(int3(T.x + 2, T.y, 0));
+        const FVoxelOceanChart C = VoxelOceanChartOf(T0.xyz, T1.xyz, T2.xyz, float3(T0.w, T1.w, T2.w));
+        const FVoxelOceanChartCoords Plane = VoxelOceanChartCoordsOf(C, W.RefHigh.xyz, W.RefLow.xyz, D);
+        const uint Seed = VoxelOceanRainHash(uint2(uint(T.x), uint(T.y)), 0x51ed27u);
+        const float2 G = VoxelOceanRainLayerOf(Plane.Base, Plane.Offset, 0.32f, 1.2f, Time, Rain, Seed)
+            + VoxelOceanRainLayerOf(Plane.Base, Plane.Offset, 0.21f, 0.8f, Time, Rain, Seed ^ 0x6c8e9cf5u);
+        const float Wk = Blend.Weight[K] / Sum;
+        Out += Wk * (G.x * VoxelOceanRotate(W.Rotation, C.E1) + G.y * VoxelOceanRotate(W.Rotation, C.E2));
+    }
+    return Out;
+}

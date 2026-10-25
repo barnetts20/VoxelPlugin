@@ -31,6 +31,9 @@
 #include "/Plugin/VoxelPlugin/Private/VoxelOceanFoamTex.ush"
 #include "/Plugin/VoxelPlugin/Private/VoxelOceanShading.ush"
 #include "/Plugin/VoxelPlugin/Private/VoxelOceanContactSearch.ush"
+#include "/Plugin/VoxelPlugin/Private/VoxelOceanAtmoSun.ush"
+#include "/Plugin/VoxelPlugin/Private/VoxelOceanAtmoSky.ush"
+#include "/Plugin/VoxelPlugin/Private/VoxelOceanRain.ush"
 
 // Stage W5d: the water's edge fades into what is behind it over this thickness along the view (cm),
 // and this share of the distance (the depth's precision falling with it).
@@ -163,6 +166,50 @@ float3 SurfaceSunDirection;
 float3 SurfaceSunIlluminance;
 float3 SurfaceSkyZenith;
 float3 SurfaceSkyHorizon;
+// Stage A2: the sun at the water from the atmosphere (VoxelOceanAtmoSun.ush: the grid over the view's
+// rect, two slices); On 0: none, the sun undimmed (the atmosphere's march dims the sea's pixels then).
+Texture2DArray SurfaceAtmoSun;
+SamplerState SurfaceAtmoSunSampler;
+uint SurfaceAtmoSunOn;
+// Stage A3: the sky from the atmosphere (VoxelOceanAtmoSky.ush: its radiance by direction and its
+// irradiance, per unit of SurfaceSunIlluminance; Size: the tables' sizes); On 0: the stand-in's.
+Texture3D SurfaceAtmoSky;
+Texture2D SurfaceAtmoSkyIrradiance;
+SamplerState SurfaceAtmoSkySampler;
+float4 SurfaceAtmoSkySize;
+uint SurfaceAtmoSkyOn;
+// Stage A3b: the reflection marched by the atmosphere (ReflectRaysCS's grid: float4(the light along
+// the flat sea's mirror direction, its transmittance), the air and the cloud); On 0: none.
+Texture2D SurfaceAtmoReflect;
+uint SurfaceAtmoReflectOn;
+// Stage A3b part 2: the grid blurred more (ReflectBlurCS: about 3 texels against 1), for rough water;
+// x, y the grid's size, z the angle (radians) a grid texel spans.
+Texture2D SurfaceAtmoReflectBroad;
+float4 SurfaceAtmoReflectInfo;
+
+/** A cubic B-spline read of a small texture from four bilinear taps: smooth across the texels, so a
+ *  coarse grid magnified many times shows no bilinear diamonds. */
+float4 VoxelOceanSampleBSpline(Texture2D Tex, SamplerState TexSampler, float2 UV, float2 Size)
+{
+    const float2 X = UV * Size - 0.5f;
+    const float2 I = floor(X);
+    const float2 F = X - I;
+    const float2 F2 = F * F;
+    const float2 F3 = F2 * F;
+    const float2 W0 = (1.0f / 6.0f) * (1.0f - 3.0f * F + 3.0f * F2 - F3);
+    const float2 W1 = (1.0f / 6.0f) * (4.0f - 6.0f * F2 + 3.0f * F3);
+    const float2 W2 = (1.0f / 6.0f) * (1.0f + 3.0f * F + 3.0f * F2 - 3.0f * F3);
+    const float2 W3 = (1.0f / 6.0f) * F3;
+    const float2 G0 = W0 + W1;
+    const float2 G1 = W2 + W3;
+    const float2 H0 = (I - 0.5f + W1 / max(G0, 1.0e-6f)) / Size;
+    const float2 H1 = (I + 1.5f + W3 / max(G1, 1.0e-6f)) / Size;
+    return G0.y * (G0.x * Tex.SampleLevel(TexSampler, float2(H0.x, H0.y), 0.0f) + G1.x * Tex.SampleLevel(TexSampler, float2(H1.x, H0.y), 0.0f))
+        + G1.y * (G0.x * Tex.SampleLevel(TexSampler, float2(H0.x, H1.y), 0.0f) + G1.x * Tex.SampleLevel(TexSampler, float2(H1.x, H1.y), 0.0f));
+}
+// Stage A6: the rain (VoxelOceanRain.ush): x its amount (0 none; from the atmosphere's weather, the
+// AtmoSun grid's third slice), y the rings' reach (cm from the camera).
+float4 SurfaceRain;
 // x: the short waves' slope variance (both axes; added to the clipmap's unresolved), y: the
 // refraction's strength (0 none), z: foam on, w: the foam's debug view (voxel.Ocean.DebugFoam). The
 // foam's albedo.
@@ -378,6 +425,24 @@ void SurfacePS(float4 SvPosition : SV_POSITION,
             Whitecap = Far.y * FoamFar;
         }
     }
+    // -- Stage A6: rain on the water (VoxelOceanRain.ush) --------------------------------------
+    // The drops' rings where a pixel can hold them, near the camera; past that, their slopes as
+    // roughness.
+    float RainVariance = 0.0f;
+    if (SurfaceAtmoSunOn != 0u && SurfaceRain.x > 0.0f)
+    {
+        const float2 RainUV = (SvPosition.xy - float2(SurfaceViewMin)) / float2(SurfaceViewSize);
+        const float Rain = saturate(VoxelOceanRainOf(SurfaceAtmoSun.SampleLevel(SurfaceAtmoSunSampler, float3(RainUV, 2.0f), 0.0f)) * SurfaceRain.x);
+        if (Rain > 0.0f)
+        {
+            const float RainDistance = length(Rel);
+            const float Held = (1.0f - smoothstep(0.01f, 0.04f, Footprint * 0.01f))
+                * (1.0f - smoothstep(0.7f * SurfaceRain.y, SurfaceRain.y, RainDistance));
+            if (Held > 0.0f)
+                N = normalize(N - VoxelOceanRainGradientOf(SamplePoint, Rain, W.SlopeVar.w, W, SurfaceCharts) * Held);
+            RainVariance = (1.0f - Held) * Rain * VOXEL_OCEAN_RAIN_VARIANCE;
+        }
+    }
     const float3 V = normalize(-Rel);
     // A resolved normal facing away from the eye (a wave's back seen at grazing) is turned just
     // toward it: what the pixel sees of that wave is its crest.
@@ -386,28 +451,89 @@ void SurfacePS(float4 SvPosition : SV_POSITION,
     const float3 Tx = normalize(cross(Axis, N));
     const float3 Ty = cross(N, Tx);
     // The unresolved slopes' variance per axis (isotropic): the clipmap's and the short waves'.
-    const float S2 = max(0.5f * (SlopeVariance + SurfaceShading.x), 1.0e-5f);
+    const float S2 = max(0.5f * (SlopeVariance + SurfaceShading.x + RainVariance), 1.0e-5f);
 
     // -- The light ----------------------------------------------------------------------------
+    // Stage A2: THE SUN AT THE WATER, the atmosphere's (VoxelOceanAtmoSun.ush): the light above the
+    // air (SurfaceSunIlluminance, the atmosphere's directional light) through the clouds' shadow and
+    // the air to this point, and the march's own multiply for what shows from behind the water.
+    const FVoxelOceanAtmoSun AtmoSun = VoxelOceanAtmoSunOf(SurfaceAtmoSun, SurfaceAtmoSunSampler,
+        (SvPosition.xy - float2(SurfaceViewMin)) / float2(SurfaceViewSize), SurfaceAtmoSunOn);
+    const float3 SunIlluminance = SurfaceSunIlluminance * AtmoSun.Sun;
     const float3 L = SurfaceSunDirection;
     const float SunUp = dot(L, Up);
     const float SunAbove = VoxelOceanSunAbove(SunUp);
     const float Day = VoxelOceanStandInDay(SunUp);
-    const float3 SkyZenith = SurfaceSkyZenith * Day;
-    const float3 SkyHorizon = SurfaceSkyHorizon * Day;
+    float3 SkyZenith = SurfaceSkyZenith * Day;
+    float3 SkyHorizon = SurfaceSkyHorizon * Day;
     // The stand-in sky's irradiance on the horizontal: pi (0.2 horizon + 0.8 zenith) for its
     // gradient in sqrt(cos).
-    const float3 SkyIrradiance = VOXEL_OCEAN_SHADING_PI * (0.2f * SkyHorizon + 0.8f * SkyZenith);
+    float3 SkyIrradiance = VOXEL_OCEAN_SHADING_PI * (0.2f * SkyHorizon + 0.8f * SkyZenith);
+    // Stage A3: THE ATMOSPHERE'S SKY (VoxelOceanAtmoSky.ush): its zenith, its horizon under the
+    // mirror direction's azimuth (the gradient the slopes' integral below takes), and the sky in the
+    // mirror direction itself, which corrects the integral's gradient to the real sky there; its
+    // irradiance. Per unit of the light above the air; clear air (no cloud in it yet).
+    const float3 Mirror = reflect(-V, N);
+    const float3 MirrorUp = normalize(Mirror - Up * min(dot(Mirror, Up), 0.0f) + Up * 1.0e-3f);
+    float3 SkyMirror = float3(0.0f, 0.0f, 0.0f);
+    if (SurfaceAtmoSkyOn != 0u)
+    {
+        const float3 Across = MirrorUp - Up * dot(MirrorUp, Up);
+        const float3 HorizonDir = normalize((dot(Across, Across) > 1.0e-8f ? normalize(Across) : Tx) + Up * 0.02f);
+        SkyZenith = SurfaceSunIlluminance * VoxelOceanAtmoSkyAt(SurfaceAtmoSky, SurfaceAtmoSkySampler, SurfaceAtmoSkySize, Up, Up, L);
+        SkyHorizon = SurfaceSunIlluminance * VoxelOceanAtmoSkyAt(SurfaceAtmoSky, SurfaceAtmoSkySampler, SurfaceAtmoSkySize, HorizonDir, Up, L);
+        SkyMirror = SurfaceSunIlluminance * VoxelOceanAtmoSkyAt(SurfaceAtmoSky, SurfaceAtmoSkySampler, SurfaceAtmoSkySize, MirrorUp, Up, L);
+        SkyIrradiance = SurfaceSunIlluminance * VoxelOceanAtmoSkyIrradianceAt(SurfaceAtmoSkyIrradiance, SurfaceAtmoSkySampler, SurfaceAtmoSkySize, SunUp);
+        // Stage A3b: THE CLOUD IN THE REFLECTION. The atmosphere's march along the flat sea's mirror
+        // direction (ReflectRaysCS's grid): its light, and through its gaps (its transmittance) the
+        // clear sky's change from that direction to this pixel's own mirror direction. The gradient
+        // the slopes' integral takes, and the sky's light, go to the cloud's as the gaps close.
+        if (SurfaceAtmoReflectOn != 0u)
+        {
+            // Stage A3b part 2: READ WHERE THIS PIXEL'S OWN MIRROR DIRECTION IS MARCHED, so the cloud's
+            // reflection moves with the waves as a mirror's does: the grid's texel whose flat-sea mirror
+            // is this pixel's mirror is the one whose view ray is that mirror reflected back down
+            // (planar reflection's lookup), clamped to the view. Rough water reads the blurred grid
+            // by its slopes' spread, both through the B-spline.
+            const float3 Back = reflect(MirrorUp, Up);
+            const float4 BackH = mul(float4(Back * 1.0e5f, 1.0f), SurfaceRelToClip);
+            const float2 PixelUV = (SvPosition.xy - float2(SurfaceViewMin)) / float2(SurfaceViewSize);
+            const float2 ReflectUV = BackH.w > 0.0f
+                ? saturate(float2(BackH.x / BackH.w, -BackH.y / BackH.w) * 0.5f + 0.5f) : PixelUV;
+            const float Spread = 2.0f * sqrt(S2) / max(SurfaceAtmoReflectInfo.z, 1.0e-6f);
+            const float4 March = lerp(
+                VoxelOceanSampleBSpline(SurfaceAtmoReflect, SurfaceAtmoSunSampler, ReflectUV, SurfaceAtmoReflectInfo.xy),
+                VoxelOceanSampleBSpline(SurfaceAtmoReflectBroad, SurfaceAtmoSunSampler, ReflectUV, SurfaceAtmoReflectInfo.xy),
+                saturate((Spread - 1.0f) * 0.5f));
+            const float Gap = saturate(March.a);
+            // The texel's own flat mirror (this pixel's mirror unless the lookup was clamped).
+            const float3 Flat = reflect(normalize(VoxelOceanSurfaceRelOf(ReflectUV, 0.5f)), Up);
+            const float3 FlatUp = normalize(Flat - Up * min(dot(Flat, Up), 0.0f) + Up * 1.0e-3f);
+            const float3 SkyFlat = SurfaceSunIlluminance * VoxelOceanAtmoSkyAt(SurfaceAtmoSky, SurfaceAtmoSkySampler, SurfaceAtmoSkySize, FlatUp, Up, L);
+            SkyMirror = max(March.rgb + Gap * (SkyMirror - SkyFlat), 0.0f);
+            SkyZenith = SkyZenith * Gap + March.rgb * (1.0f - Gap);
+            SkyHorizon = SkyHorizon * Gap + March.rgb * (1.0f - Gap);
+            SkyIrradiance = SkyIrradiance * Gap + VOXEL_OCEAN_SHADING_PI * March.rgb * (1.0f - Gap);
+        }
+    }
 
     // -- What the surface reflects ---------------------------------------------------------------
     // Stage W6c: the sky as the slopes the eye sees reflect it (each facet's own mirror direction,
     // Fresnel factor and Smith's masking; VoxelOceanSkyReflectionOf), and their mean Fresnel factor
     // for what passes into the water. Until W6c: the sky along N's reflection (folded up where it
     // went into the sea) times the fitted mean Fresnel, 20 to 50% too bright at the limb (far_check).
-    const FVoxelOceanSkyReflection Sky = VoxelOceanSkyReflectionOf(V, N, Up, Tx, Ty, S2, S2, SkyZenith, SkyHorizon);
+    FVoxelOceanSkyReflection Sky = VoxelOceanSkyReflectionOf(V, N, Up, Tx, Ty, S2, S2, SkyZenith, SkyHorizon);
+    if (SurfaceAtmoSkyOn != 0u)
+    {
+        // (Stage A3: the gradient's sky in the mirror direction against the atmosphere's there: exact
+        // for a calm sea, the slopes' spread kept for a rough one.)
+        const float3 Gradient = lerp(SkyHorizon, SkyZenith, sqrt(saturate(dot(MirrorUp, Up))));
+        const float3 Floor = max(Gradient, max(max(SkyZenith.x, SkyZenith.y), SkyZenith.z) * 1.0e-4f + 1.0e-20f);
+        Sky.Radiance *= clamp(SkyMirror / Floor, 0.0f, 8.0f);
+    }
     const float Fresnel = Sky.Fresnel;
     const float Glint = SunAbove * min(VoxelOceanGlint(L, V, N, Tx, Ty, S2, S2), 1000.0f);
-    const float3 Reflected = Sky.Radiance + SurfaceSunIlluminance * Glint;
+    const float3 Reflected = Sky.Radiance + SunIlluminance * Glint;
 
     // -- What comes up through it --------------------------------------------------------------
     const float Eta = 1.0f / VOXEL_OCEAN_WATER_IOR;
@@ -418,7 +544,7 @@ void SurfacePS(float4 SvPosition : SV_POSITION,
     const float3 Ts = refract(-L, Up, Eta);
     const float MuSun = max(-dot(Ts, Up), 0.05f);
     const float SunIn = SunAbove * (1.0f - VoxelOceanFresnel(SunUp)) * max(SunUp, 0.0f) / MuSun;
-    const float3 SunWater = SurfaceSunIlluminance * SunIn;
+    const float3 SunWater = SunIlluminance * SunIn;
     const float SunPhase = VoxelOceanPhaseHG(dot(Ts, -T), SurfacePhaseG);
     const float3 SkyWater = SkyIrradiance * (1.0f - VOXEL_OCEAN_DIFFUSE_FRESNEL);
 
@@ -464,7 +590,9 @@ void SurfacePS(float4 SvPosition : SV_POSITION,
         }
         Path = Z / MuView;
         // The bed as lit in air, its light into the water past the surface's reflection.
-        Bed = SurfaceBehindColor.Load(int3(BedPixel, 0)).rgb * ((1.0f - VoxelOceanFresnel(SunUp)) / PreExposure);
+        // (Stage A2: dimmed as the atmosphere's march would have dimmed it: the march leaves the
+        // sea's pixels to the ocean.)
+        Bed = SurfaceBehindColor.Load(int3(BedPixel, 0)).rgb * AtmoSun.Behind * ((1.0f - VoxelOceanFresnel(SunUp)) / PreExposure);
     }
     float3 Body = float3(
         VoxelOceanWaterBody(SurfaceScattering.x, SurfaceExtinction.x, Path, MuView, MuSun, SunPhase, SunWater.x, SkyWater.x, Bed.x),
@@ -501,7 +629,7 @@ void SurfacePS(float4 SvPosition : SV_POSITION,
         if (Thickness > 0.0f)
         {
             const float Phase = VoxelOceanPhaseHG(dot(-L, V), VOXEL_OCEAN_SURFACE_CREST_G);
-            const float3 E = SurfaceSunIlluminance * SunAbove;
+            const float3 E = SunIlluminance * SunAbove;
             Glow = SurfaceCrest.x * float3(
                 VoxelOceanCrestGlow(SurfaceScattering.x, SurfaceExtinction.x, Thickness, Phase, E.x),
                 VoxelOceanCrestGlow(SurfaceScattering.y, SurfaceExtinction.y, Thickness, Phase, E.y),
@@ -511,8 +639,8 @@ void SurfacePS(float4 SvPosition : SV_POSITION,
     // Out through the surface: past its reflection, and radiance divides by n^2.
     float3 Color = Reflected + (Body + Glow) * ((1.0f - Fresnel) / (VOXEL_OCEAN_WATER_IOR * VOXEL_OCEAN_WATER_IOR));
     // (Stage W6a: the terms apart, for voxel.Ocean.DebugShade.)
-    const float3 ShadeSky = Reflected - SurfaceSunIlluminance * Glint;
-    const float3 ShadeGlint = SurfaceSunIlluminance * Glint;
+    const float3 ShadeSky = Reflected - SunIlluminance * Glint;
+    const float3 ShadeGlint = SunIlluminance * Glint;
     const float3 ShadeOurs = Color - Reflected;
     // Stage W4d: GodotOceanWaves' water light (its water.gdshader's light(), after Atlas' GDC 2019
     // water), toward it by SurfaceGodotWater.w in place of our scattering and crest glow (the bed seen
@@ -537,7 +665,7 @@ void SurfacePS(float4 SvPosition : SV_POSITION,
         const float SssHeight = max(0.0f, Height * 0.01f + 2.5f) * (Back * Back) * (Back * Back) * (Away * Away * Away);
         const float SssNear = 0.5f * NV * NV;
         const float3 Sss = (SssHeight + SssNear) * float3(0.9f, 1.15f, 0.85f) / (1.0f + LightMask);
-        const float3 GodotLight = SurfaceGodotWater.rgb * (SurfaceSunIlluminance * SunAbove * (Sss + 0.5f * NL) + SkyIrradiance * (1.0f / VOXEL_OCEAN_SHADING_PI));
+        const float3 GodotLight = SurfaceGodotWater.rgb * (SunIlluminance * SunAbove * (Sss + 0.5f * NL) + SkyIrradiance * (1.0f / VOXEL_OCEAN_SHADING_PI));
         // Ours without the bed's light (the deep part: the scattering, the crest glow).
         const float3 Through = Path >= 0.0f ? Bed * exp(-SurfaceExtinction * Path * (1.0f + max(MuView, 0.05f) / max(MuSun, 0.05f))) : float3(0.0f, 0.0f, 0.0f);
         const float3 OursDeep = (Body - Through + Glow) * ((1.0f - Fresnel) / (VOXEL_OCEAN_WATER_IOR * VOXEL_OCEAN_WATER_IOR));
@@ -651,8 +779,8 @@ void SurfacePS(float4 SvPosition : SV_POSITION,
         const float3 NF = normalize(N - FoamRise * (VOXEL_OCEAN_SURFACE_FOAM_RELIEF * (1.0f - Soft)));
         const float Wrap = saturate((dot(NF, L) + VOXEL_OCEAN_SURFACE_FOAM_WRAP) / (1.0f + VOXEL_OCEAN_SURFACE_FOAM_WRAP));
         const float Gaps = lerp(VOXEL_OCEAN_SURFACE_FOAM_GAPS, 1.0f, Lace.Thick);
-        const float3 SetLight = SurfaceFoamAlbedo * (SurfaceSunIlluminance * (SunAbove * Wrap) + SkyIrradiance * Gaps) * (1.0f / VOXEL_OCEAN_SHADING_PI);
-        const float3 FlatLight = SurfaceFoamAlbedo * (SurfaceSunIlluminance * (SunAbove * saturate(SunUp)) + SkyIrradiance) * (1.0f / VOXEL_OCEAN_SHADING_PI);
+        const float3 SetLight = SurfaceFoamAlbedo * (SunIlluminance * (SunAbove * Wrap) + SkyIrradiance * Gaps) * (1.0f / VOXEL_OCEAN_SHADING_PI);
+        const float3 FlatLight = SurfaceFoamAlbedo * (SunIlluminance * (SunAbove * saturate(SunUp)) + SkyIrradiance) * (1.0f / VOXEL_OCEAN_SHADING_PI);
         const float3 Sheen = Sky.Radiance;
         const float3 FoamLight = lerp(SetLight, FlatLight * (1.0f - Fresnel) + Sheen, Soft);
         // The milky water under it (stage W3g): by the density, where the foam itself doesn't cover.
@@ -711,7 +839,7 @@ void SurfacePS(float4 SvPosition : SV_POSITION,
     if (DebugShade > 0)
     {
         const float3 LumaW = float3(0.2126f, 0.7152f, 0.0722f);
-        const float3 Lit = SurfaceSunIlluminance * (SunAbove * max(SunUp, 0.0f)) + SkyIrradiance;
+        const float3 Lit = SunIlluminance * (SunAbove * max(SunUp, 0.0f)) + SkyIrradiance;
         const float ToAlbedo = VOXEL_OCEAN_SHADING_PI / max(dot(Lit, LumaW), 1.0e-6f);
         const float CosT = saturate(dot(N, Up));
         const float Tilt2 = (1.0f - CosT * CosT) / max(CosT * CosT, 1.0e-4f);
@@ -744,9 +872,149 @@ void SurfacePS(float4 SvPosition : SV_POSITION,
         EdgeFade = saturate(Thick / lerp(Width, min(Width, VOXEL_OCEAN_SURFACE_EDGE_FAR), Opaque));
     }
     // (White, or with voxel.Debug.LevelColor the rings' level.)
-    OutColor = float4(lerp(SurfaceBehindColor.Load(int3(Pixel, 0)).rgb, Color * Tint * PreExposure, EdgeFade), 1.0f);
+    // (Stage A2: what shows from behind through the edge's fade dimmed as the bed, where it is a
+    // surface: the march dims no sky.)
+    const float3 BehindHere = SurfaceBehindColor.Load(int3(Pixel, 0)).rgb * (Depth0 > 0.0f ? AtmoSun.Behind : float3(1.0f, 1.0f, 1.0f));
+    OutColor = float4(lerp(BehindHere, Color * Tint * PreExposure, EdgeFade), 1.0f);
 #if VOXEL_OCEAN_SURFACE_VELOCITY
     // No motion of its own: the camera's, from the depth.
     OutVelocity = float4(0.0f, 0.0f, 0.0f, 0.0f);
 #endif
+}
+
+// ---------------------------------------------------------------------------------------------
+// Stage A2: the sun at the water from the atmosphere (VoxelOceanAtmoSun.ush)
+// ---------------------------------------------------------------------------------------------
+
+// The grid's size (texels over the view's rect), the sea sphere's centre from the view's camera
+// (world axes, cm) and its radius (w), the camera's height over it (cm, formed in double).
+uint2 SunGridSize;
+float4 SunSea;
+float SunSeaHeight;
+// The points (3 floats each, camera-relative world, cm) for the atmosphere's pass.
+RWBuffer<float> SunPointsOut;
+// The atmosphere's result (2 a point) and the grid it fills (3 slices; stage A6: the third its
+// weather at the points, SunWeatherIn, zeros with SunWeatherOn 0).
+Buffer<float4> SunGridIn;
+Buffer<float4> SunWeatherIn;
+uint SunWeatherOn;
+RWTexture2DArray<float4> SunGridOut;
+
+/** Where the ray from the camera along Dir meets the sea sphere (camera-relative): the near hit
+ *  from above, the far one from under it, and where it misses, the sphere's point under the ray's
+ *  closest approach (its horizon point): continuous across the view. */
+float3 VoxelOceanSunSeaPointOf(float3 Dir)
+{
+    const float3 C = SunSea.xyz;
+    const float R = SunSea.w;
+    const float B = dot(Dir, C);
+    // |C|^2 - R^2 without the cancellation: the height times |C| + R.
+    const float H = SunSeaHeight;
+    const float Cq = H * (2.0f * R + H);
+    const float Disc = B * B - Cq;
+    if (H <= 0.0f)
+    {
+        // Under the sea sphere: the far root, always there.
+        return Dir * (B + sqrt(max(Disc, 0.0f)));
+    }
+    if (Disc >= 0.0f && B > 0.0f)
+    {
+        // The near root, stably: Cq / (B + sqrt(Disc)).
+        return Dir * (Cq / (B + sqrt(Disc)));
+    }
+    const float3 Closest = Dir * max(B, 0.0f) - C;
+    const float Len = length(Closest);
+    return C + (Len > 1.0e-3f ? Closest / Len : -normalize(C)) * R;
+}
+
+[numthreads(8, 8, 1)]
+void SunPointsCS(uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+    if (DispatchThreadId.x >= SunGridSize.x || DispatchThreadId.y >= SunGridSize.y) return;
+    const float2 UV = (float2(DispatchThreadId.xy) + 0.5f) / float2(SunGridSize);
+    // A finite point along the texel centre's ray (reverse z: 0.5 is in front of the camera).
+    const float3 Dir = normalize(VoxelOceanSurfaceRelOf(UV, 0.5f));
+    const float3 P = VoxelOceanSunSeaPointOf(Dir);
+    const uint I = (DispatchThreadId.y * SunGridSize.x + DispatchThreadId.x) * 3u;
+    SunPointsOut[I] = P.x;
+    SunPointsOut[I + 1u] = P.y;
+    SunPointsOut[I + 2u] = P.z;
+}
+
+[numthreads(8, 8, 1)]
+void SunGridCS(uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+    if (DispatchThreadId.x >= SunGridSize.x || DispatchThreadId.y >= SunGridSize.y) return;
+    const uint I = (DispatchThreadId.y * SunGridSize.x + DispatchThreadId.x) * 2u;
+    SunGridOut[uint3(DispatchThreadId.xy, 0u)] = SunGridIn[I];
+    SunGridOut[uint3(DispatchThreadId.xy, 1u)] = SunGridIn[I + 1u];
+    SunGridOut[uint3(DispatchThreadId.xy, 2u)] = SunWeatherOn != 0u ? SunWeatherIn[I / 2u] : float4(0.0f, 0.0f, 0.0f, 0.0f);
+}
+
+// The self-lit mask (the atmosphere's march leaves its surface multiply off these pixels): 1 where
+// the ocean drew (its depth over what lay behind), over the view's rect.
+RWTexture2D<float> SurfaceSelfLitOut;
+
+[numthreads(8, 8, 1)]
+void SelfLitCS(uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+    if (DispatchThreadId.x >= SurfaceCopySize.x || DispatchThreadId.y >= SurfaceCopySize.y) return;
+    const float Now = SurfaceSceneDepth.Load(int3(int2(DispatchThreadId.xy + SurfaceCopyMin), 0));
+    const float Before = SurfaceBehindDepth.Load(int3(int2(DispatchThreadId.xy), 0));
+    SurfaceSelfLitOut[DispatchThreadId.xy] = Now != Before ? 1.0f : 0.0f;
+}
+
+// Stage A3b: the reflection's rays for the atmosphere's march: per texel of the grid (SunGridSize
+// here), the sea sphere's point under its centre's ray (VoxelOceanSunSeaPointOf), lifted a metre, and
+// the flat sea's mirror direction there (folded just above the horizon): six floats.
+RWBuffer<float> ReflectRaysOut;
+// The march's result (one float4 a ray) and the grid it fills.
+Buffer<float4> ReflectGridIn;
+RWTexture2D<float4> ReflectGridOut;
+
+[numthreads(8, 8, 1)]
+void ReflectRaysCS(uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+    if (DispatchThreadId.x >= SunGridSize.x || DispatchThreadId.y >= SunGridSize.y) return;
+    const float2 UV = (float2(DispatchThreadId.xy) + 0.5f) / float2(SunGridSize);
+    const float3 Dir = normalize(VoxelOceanSurfaceRelOf(UV, 0.5f));
+    const float3 P = VoxelOceanSunSeaPointOf(Dir);
+    const float3 Up = normalize(P - SunSea.xyz);
+    const float3 Mirror = reflect(Dir, Up);
+    const float3 MirrorUp = normalize(Mirror - Up * min(dot(Mirror, Up), 0.0f) + Up * 0.01f);
+    const float3 Origin = P + Up * 100.0f;
+    const uint I = (DispatchThreadId.y * SunGridSize.x + DispatchThreadId.x) * 6u;
+    ReflectRaysOut[I] = Origin.x;
+    ReflectRaysOut[I + 1u] = Origin.y;
+    ReflectRaysOut[I + 2u] = Origin.z;
+    ReflectRaysOut[I + 3u] = MirrorUp.x;
+    ReflectRaysOut[I + 4u] = MirrorUp.y;
+    ReflectRaysOut[I + 5u] = MirrorUp.z;
+}
+
+[numthreads(8, 8, 1)]
+void ReflectGridCS(uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+    if (DispatchThreadId.x >= SunGridSize.x || DispatchThreadId.y >= SunGridSize.y) return;
+    ReflectGridOut[DispatchThreadId.xy] = ReflectGridIn[DispatchThreadId.y * SunGridSize.x + DispatchThreadId.x];
+}
+
+// Stage A3b part 2: a binomial blur of the reflection's grid (1 4 6 4 1, taps Step texels apart,
+// along one axis), for the B-spline read and the rough water's broad copy.
+Texture2D<float4> ReflectBlurIn;
+RWTexture2D<float4> ReflectBlurOut;
+int2 ReflectBlurStep;
+
+[numthreads(8, 8, 1)]
+void ReflectBlurCS(uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+    if (DispatchThreadId.x >= SunGridSize.x || DispatchThreadId.y >= SunGridSize.y) return;
+    const int2 Last = int2(SunGridSize) - 1;
+    const int2 P = int2(DispatchThreadId.xy);
+    const float Weights[5] = { 1.0f / 16.0f, 4.0f / 16.0f, 6.0f / 16.0f, 4.0f / 16.0f, 1.0f / 16.0f };
+    float4 Sum = float4(0.0f, 0.0f, 0.0f, 0.0f);
+    [unroll]
+    for (int K = 0; K < 5; K++)
+        Sum += Weights[K] * ReflectBlurIn.Load(int3(clamp(P + ReflectBlurStep * (K - 2), int2(0, 0), Last), 0));
+    ReflectBlurOut[DispatchThreadId.xy] = Sum;
 }

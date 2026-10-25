@@ -49,8 +49,11 @@ RWTexture2DArray<float> UnderwaterFoamMapOut;
 RWStructuredBuffer<float> UnderwaterCameraOut;
 uint UnderwaterCameraMode;
 float4 UnderwaterFoamColor;
+// Stage A4: the daylight at the surface over the camera (UnderwaterCS sets it first; 1 without the
+// atmosphere), which the water's light, the foam's and the meniscus's take.
+static float3 GUnderwaterDaylight = float3(1.0f, 1.0f, 1.0f);
 #define VOXEL_UNDERWATER_MAP_FOAM_LOAD(Level, X, Y) UnderwaterFoamMap.Load(int4(X, Y, Level, 0))
-#define VOXEL_UNDERWATER_FOAM_COLOR float4(UnderwaterFoamColor.rgb * View.PreExposure, UnderwaterFoamColor.a)
+#define VOXEL_UNDERWATER_FOAM_COLOR float4(UnderwaterFoamColor.rgb * GUnderwaterDaylight * View.PreExposure, UnderwaterFoamColor.a)
 #define VOXEL_UNDERWATER_MAP_ANCHOR(Level) UnderwaterMapAnchor[Level].xyz
 #define VOXEL_UNDERWATER_MAP_TEXEL(Level) UnderwaterMapAnchor[Level].w
 #define VOXEL_UNDERWATER_MAP_E1(Level) UnderwaterMapE1[Level].xyz
@@ -175,8 +178,53 @@ float3 UnderwaterAbsorption;
 float3 UnderwaterScattering;
 float3 UnderwaterLight;
 float4 UnderwaterMeniscus;
+// Stage A4: the light from the atmosphere. The sun at the sea over the camera (the atmosphere's
+// surface-sun pass: float4(Sun, SunUp), float4(Air, DirectFraction)) and its sky's irradiance table
+// (VoxelOceanAtmoSky.ush's mapping; Size.w its width), per unit of the light above the air
+// (UnderwaterSunIlluminance, toward UnderwaterSunDirection); On: bit 0 the sun, bit 1 the sky (0:
+// UnderwaterLight as set). The light's attenuation down to the camera's depth (per channel).
+Buffer<float4> UnderwaterAtmoSun;
+Texture2D UnderwaterAtmoSkyIrradiance;
+SamplerState UnderwaterAtmoSkySampler;
+float4 UnderwaterAtmoSkySize;
+float3 UnderwaterSunIlluminance;
+float3 UnderwaterSunDirection;
+uint UnderwaterAtmoOn;
+float3 UnderwaterDepthLight;
 
 RWTexture2D<float4> UnderwaterOutput;
+
+float VoxelUnderwaterAtmoSkyCoord(float U, float N)
+{
+    return (saturate(U) * (N - 1.0f) + 0.5f) / N;
+}
+
+/** Stage A4: the daylight reaching the sea over the camera, against the light above the air at
+ *  normal incidence (its luminance): the sun through the clouds' shadow and the air, past the
+ *  surface's reflection, and the sky's irradiance. About 0.9 under a clear high sun, so
+ *  UnderwaterLight keeps its look at noon; 1 without the atmosphere. */
+float3 VoxelUnderwaterDaylightOf()
+{
+    if (UnderwaterAtmoOn == 0u) return float3(1.0f, 1.0f, 1.0f);
+    const float3 Up = normalize(-UnderwaterCenter);
+    const float3 L = UnderwaterSunDirection;
+    const float MuS = dot(L, Up);
+    const float Above = saturate((MuS + 0.0045f) / 0.009f);
+    const float4 Sun = (UnderwaterAtmoOn & 1u) != 0u ? UnderwaterAtmoSun[0] : float4(1.0f, 1.0f, 1.0f, Above);
+    const float Mu = max(MuS, 0.0f);
+    // Schlick's reflection at the sun's incidence (the water's 0.02 at normal incidence).
+    const float Pass = 1.0f - (0.02f + 0.98f * pow(1.0f - Mu, 5.0f));
+    float3 E = UnderwaterSunIlluminance * Sun.rgb * (Sun.a * Mu * Pass);
+    if ((UnderwaterAtmoOn & 2u) != 0u)
+    {
+        const float Z = 0.5f + 0.5f * sign(MuS) * sqrt(abs(MuS));
+        // The sky's diffuse light past the surface's mean reflection (6.6%).
+        E += UnderwaterSunIlluminance * UnderwaterAtmoSkyIrradiance.SampleLevel(UnderwaterAtmoSkySampler,
+            float2(VoxelUnderwaterAtmoSkyCoord(Z, UnderwaterAtmoSkySize.w), 0.5f), 0.0f).rgb * 0.934f;
+    }
+    const float Reference = max(dot(UnderwaterSunIlluminance, float3(0.2126f, 0.7152f, 0.0722f)), 1.0e-20f);
+    return max(E / Reference, 0.0f);
+}
 
 FVoxelOceanWaveParams VoxelUnderwaterWaveParams()
 {
@@ -238,12 +286,14 @@ void UnderwaterCS(uint3 DispatchThreadId : SV_DispatchThreadID)
     const float NearDistance = NearLength / max(NearH.w, 1.0e-20f);
     const float SceneDistance = SceneH.w > 0.0f ? length(SceneH.xyz) / SceneH.w : VOXEL_UNDERWATER_FAR;
 
-    // The water's light and the meniscus in the scene colour's (pre-exposed) units.
+    // The water's light and the meniscus in the scene colour's (pre-exposed) units; stage A4: by the
+    // daylight over the camera, and the water's light by its depth.
+    GUnderwaterDaylight = VoxelUnderwaterDaylightOf();
     const float PreExposure = View.PreExposure;
     const FVoxelOceanWaveParams Waves = VoxelUnderwaterWaveParams();
     const float3 Color = VoxelUnderwaterColor(Scene.rgb, Dir, NearDistance, SceneDistance, UnderwaterSphere, Waves,
         UnderwaterDisplacement, UnderwaterDisplacementSampler, UnderwaterDerivatives, UnderwaterDerivativesSampler, UnderwaterCharts,
-        UnderwaterAbsorption, UnderwaterScattering, UnderwaterLight * PreExposure,
-        float4(UnderwaterMeniscus.rgb * PreExposure, UnderwaterMeniscus.w));
+        UnderwaterAbsorption, UnderwaterScattering, UnderwaterLight * GUnderwaterDaylight * UnderwaterDepthLight * PreExposure,
+        float4(UnderwaterMeniscus.rgb * GUnderwaterDaylight * PreExposure, UnderwaterMeniscus.w));
     UnderwaterOutput[Pixel] = float4(Color, Scene.a);
 }

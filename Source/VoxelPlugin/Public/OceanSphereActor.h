@@ -33,6 +33,9 @@ class FVoxelUnderwaterViewExtension;
 class FVoxelOceanSurfacePass;
 struct FVoxelOceanFoamTexture;
 class UDirectionalLightComponent;
+class APlanetAtmosphereActor;
+class FAtmosphereWeatherFeed;
+class FVoxelOceanProceduralWeather;
 struct FVoxelDensityGPUData;
 struct FVoxelOceanSurfaceInputs;
 class FVoxelOceanShoreField;
@@ -182,6 +185,11 @@ public:
     /** Stage A1: the sun the ocean shades with, set by the planet to its atmosphere's light
      *  (null: the world's brightest directional light, as before). */
     void SetSunLightOverride(UDirectionalLightComponent* InLight);
+
+    /** Stage A2: the planet's atmosphere (null: none). Its light is the ocean's sun (as
+     *  SetSunLightOverride), and its march gives the sun at the water (the clouds' shadow and the
+     *  air; voxel.Ocean.AtmosphereSun), leaving the sea's pixels to the ocean. */
+    void SetAtmosphere(APlanetAtmosphereActor* InAtmosphere);
 
     /** New settings, applying only what changed: a mesh change rebuilds the surface (unless
      *  bInteractive: a slider still moving, applied on release), the LOD factor and the optics
@@ -343,6 +351,8 @@ private:
     TWeakObjectPtr<UDirectionalLightComponent> SunLight;
     /** Stage A1: the planet's atmosphere's light, preferred to the search while set and valid. */
     TWeakObjectPtr<UDirectionalLightComponent> SunLightOverride;
+    /** Stage A2: the planet's atmosphere (its march's view extension asked for every tick). */
+    TWeakObjectPtr<APlanetAtmosphereActor> Atmosphere;
     double SunLightSearchTime = -1.0e9;
     bool bWarnedNoSun = false;
 
@@ -409,6 +419,13 @@ private:
      *  camera. */
     void DrawWeatherDebug() const;
     TSharedPtr<const IVoxelOceanEnvironmentSource, ESPMode::ThreadSafe> WeatherSource;
+    /** The procedural weather, when that's the source or the atmosphere's fallback. */
+    TSharedPtr<const FVoxelOceanProceduralWeather, ESPMode::ThreadSafe> ProceduralWeather;
+    /** Stage A5: the planet's atmosphere's weather feed (held: its read-backs run while held), the
+     *  one WeatherSource was made over, and whether a map had landed then. */
+    TSharedPtr<FAtmosphereWeatherFeed, ESPMode::ThreadSafe> AtmosphereWeatherFeed;
+    TSharedPtr<FAtmosphereWeatherFeed, ESPMode::ThreadSafe> WeatherSourceFeed;
+    bool bWeatherSourceHadMap = false;
     /** The settings and radius WeatherSource was made for. */
     FVoxelOceanSettings WeatherSourceSettings;
     double WeatherSourceRadius = -1.0;

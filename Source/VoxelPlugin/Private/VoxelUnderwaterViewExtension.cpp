@@ -4,6 +4,7 @@
 #include "VoxelOceanShoreField.h"
 #include "VoxelOceanDepthProbe.h"
 #include "VoxelGPUCommon.h"
+#include "AtmosphereViewExtension.h"
 
 #include "DataDrivenShaderPlatformInfo.h"
 #include "GlobalShader.h"
@@ -88,6 +89,15 @@ BEGIN_SHADER_PARAMETER_STRUCT(FVoxelUnderwaterParameters, )
     SHADER_PARAMETER(FVector3f, UnderwaterScattering)
     SHADER_PARAMETER(FVector3f, UnderwaterLight)
     SHADER_PARAMETER(FVector4f, UnderwaterMeniscus)
+    // Stage A4: the light from the atmosphere, and down to the camera's depth.
+    SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<float4>, UnderwaterAtmoSun)
+    SHADER_PARAMETER_RDG_TEXTURE(Texture2D, UnderwaterAtmoSkyIrradiance)
+    SHADER_PARAMETER_SAMPLER(SamplerState, UnderwaterAtmoSkySampler)
+    SHADER_PARAMETER(FVector4f, UnderwaterAtmoSkySize)
+    SHADER_PARAMETER(FVector3f, UnderwaterSunIlluminance)
+    SHADER_PARAMETER(FVector3f, UnderwaterSunDirection)
+    SHADER_PARAMETER(uint32, UnderwaterAtmoOn)
+    SHADER_PARAMETER(FVector3f, UnderwaterDepthLight)
 
     SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2D<float4>, UnderwaterOutput)
 END_SHADER_PARAMETER_STRUCT()
@@ -471,10 +481,56 @@ FScreenPassTexture FVoxelUnderwaterViewExtension::Render_RenderThread(
         AddClearUAVPass(GraphBuilder, GraphBuilder.CreateUAV(FoamMap), FLinearColor::Black);
     }
 
+    // -- Stage A4: the light from the atmosphere -------------------------------------------------
+    // The sun at the sea over the camera (the atmosphere's surface-sun pass at that one point), and
+    // the sky's irradiance (its sky tables, made this frame by the ocean's pass already).
+    uint32 AtmoOn = 0u;
+    // (Its stand-in, kept where the pass doesn't run: the sun unshadowed, nothing to take behind.)
+    static const FVector4f NoAtmoSun[2] = { FVector4f(1.0f, 1.0f, 1.0f, 1.0f), FVector4f(1.0f, 1.0f, 1.0f, 0.0f) };
+    FRDGBufferRef AtmoSun = CreateVertexBuffer(GraphBuilder, TEXT("VoxelUnderwater.AtmoSun"),
+        FRDGBufferDesc::CreateBufferDesc(sizeof(FVector4f), 2), NoAtmoSun, sizeof(NoAtmoSun));
+    FRDGTextureRef AtmoSky = nullptr;
+    FRDGTextureRef AtmoSkyIrradiance = nullptr;
+    if (const TSharedPtr<FAtmosphereViewExtension, ESPMode::ThreadSafe> Atmosphere = Params.Atmosphere.Pin();
+        Atmosphere.IsValid() && !Params.SunIlluminance.IsNearlyZero() && !Params.SunDirection.IsNearlyZero())
+    {
+        // The sea sphere's point over the camera, from the camera (world axes, cm; formed in double).
+        const FVector FromCenter = ViewOrigin - Waves.PlanetToWorld.GetLocation();
+        const double Distance = FromCenter.Size();
+        const FVector Over = Distance > 1.0 ? FromCenter / Distance * -CameraHeight : FVector::ZeroVector;
+        const float Point[3] = { (float)Over.X, (float)Over.Y, (float)Over.Z };
+        FRDGBufferRef Points = CreateVertexBuffer(GraphBuilder, TEXT("VoxelUnderwater.AtmoPoint"),
+            FRDGBufferDesc::CreateBufferDesc(sizeof(float), 3), Point, sizeof(Point));
+        if (Atmosphere->AddSurfaceSunPass_RenderThread(GraphBuilder, View, GraphBuilder.CreateSRV(Points, PF_R32_FLOAT), 1u,
+            FMatrix44f::Identity, GraphBuilder.CreateUAV(AtmoSun, PF_A32B32G32R32F)))
+            AtmoOn |= 1u;
+        if (Atmosphere->GetSkyTables_RenderThread(GraphBuilder, View, AtmoSky, AtmoSkyIrradiance) && AtmoSkyIrradiance)
+            AtmoOn |= 2u;
+    }
+    if ((AtmoOn & 2u) == 0u)
+    {
+        AtmoSkyIrradiance = GraphBuilder.CreateTexture(FRDGTextureDesc::Create2D(FIntPoint(1, 1), PF_FloatRGBA, FClearValueBinding::Black,
+            TexCreate_ShaderResource | TexCreate_UAV), TEXT("VoxelUnderwater.NoAtmoSky"));
+        AddClearUAVPass(GraphBuilder, GraphBuilder.CreateUAV(AtmoSkyIrradiance), FVector4f(0.0f, 0.0f, 0.0f, 0.0f));
+    }
+    // The water's light down to the camera's depth (per metre to per cm).
+    const double Depth = FMath::Max(-CameraHeight, 0.0);
+    const FVector3f K = (Params.Absorption + Params.Scattering * 0.25f) * (0.01f * FMath::Max(Params.DepthDarkening, 0.0f));
+    const FVector3f DepthLight((float)FMath::Exp(-K.X * Depth), (float)FMath::Exp(-K.Y * Depth), (float)FMath::Exp(-K.Z * Depth));
+
     // -- The view through the water -----------------------------------------------------------
 
     {
         FVoxelUnderwaterParameters* P = GraphBuilder.AllocParameters<FVoxelUnderwaterParameters>();
+        P->UnderwaterAtmoSun = GraphBuilder.CreateSRV(AtmoSun, PF_A32B32G32R32F);
+        P->UnderwaterAtmoSkyIrradiance = AtmoSkyIrradiance;
+        P->UnderwaterAtmoSkySampler = TStaticSamplerState<SF_Bilinear, AM_Clamp, AM_Clamp, AM_Clamp>::GetRHI();
+        P->UnderwaterAtmoSkySize = FVector4f((float)AtmosphereSkyTables::ViewZenith, (float)AtmosphereSkyTables::Azimuth,
+            (float)AtmosphereSkyTables::SunZenith, (float)AtmosphereSkyTables::Irradiance);
+        P->UnderwaterSunIlluminance = Params.SunIlluminance;
+        P->UnderwaterSunDirection = Params.SunDirection;
+        P->UnderwaterAtmoOn = AtmoOn;
+        P->UnderwaterDepthLight = DepthLight;
 
         P->View = View.ViewUniformBuffer;
         P->UnderwaterSceneColor = SceneColor.Texture;

@@ -1,0 +1,41 @@
+// VoxelOceanAtmoSun.ush - Stage A2: the sun at the water from the atmosphere (CloudAtmosphere;
+// Design/AtmosphereOceanSide.md). The ocean lights its own sun, so it takes from the atmosphere what
+// of the sun reaches the water, and dims what it shows from behind itself as the atmosphere's march
+// dims the scene; the march leaves the sea's pixels alone (the self-lit mask).
+//
+// THE GRID (VoxelOceanSurfacePass.cpp, SunPointsCS and SunGridCS in VoxelOceanSurfacePass.usf): the
+// view's rect at 1 / voxel.Ocean.AtmosphereSunScale, each texel the point where its centre's ray
+// meets the sea sphere (its horizon point where it misses), the atmosphere's surface-sun pass at
+// those points (FAtmosphereViewExtension::AddSurfaceSunPass_RenderThread, the march's own
+// Atmo_SurfaceSun), two slices:
+// - 0: the sun through the deck's shadow and the air, per channel (rgb); the planet's shadow (a: 1
+//   lit);
+// - 1: the air's transmittance alone (rgb); the march's direct share (a: DirectFraction).
+// The sea sphere is smooth across the view, horizon included, so the grid filters bilinearly without
+// a depth guide; the waves' height is nothing to the shadow map's texels or the air.
+
+#pragma once
+
+/** The sun at a water pixel: its illuminance's factor, and the factor on what the pixel shows from
+ *  behind the water (the bed, the shore through the edge's fade): the march's own surface multiply,
+ *  1 - DirectFraction * SunUp * (1 - Sun). Both 1 without the atmosphere. */
+struct FVoxelOceanAtmoSun
+{
+    float3 Sun;
+    float3 Behind;
+};
+
+FVoxelOceanAtmoSun VoxelOceanAtmoSunOf(Texture2DArray Grid, SamplerState GridSampler, float2 UV, uint On)
+{
+    FVoxelOceanAtmoSun R;
+    R.Sun = float3(1.0f, 1.0f, 1.0f);
+    R.Behind = float3(1.0f, 1.0f, 1.0f);
+    if (On != 0u)
+    {
+        const float4 A = Grid.SampleLevel(GridSampler, float3(UV, 0.0f), 0.0f);
+        const float4 B = Grid.SampleLevel(GridSampler, float3(UV, 1.0f), 0.0f);
+        R.Sun = A.rgb * A.a;
+        R.Behind = 1.0f - B.a * A.a * (1.0f - A.rgb);
+    }
+    return R;
+}

@@ -1,5 +1,7 @@
 #include "OceanSphereActor.h"
 #include "PlanetActor.h"
+#include "PlanetAtmosphereActor.h"
+#include "VoxelOceanAtmosphereWeather.h"
 #include "VoxelPlugin.h"
 #include "VoxelOceanSurface.h"
 #include "VoxelDensityGPU.h"
@@ -369,6 +371,17 @@ void AOceanSphereActor::UpdateUnderwater()
     Params.Scattering = FVector3f(S.Scattering.R, S.Scattering.G, S.Scattering.B);
     Params.Light = FVector3f(S.UnderwaterLight.R, S.UnderwaterLight.G, S.UnderwaterLight.B);
     Params.Meniscus = FVector4f(S.MeniscusColor.R, S.MeniscusColor.G, S.MeniscusColor.B, (float)FMath::Max(S.MeniscusWidth, 0.0));
+    // Stage A4: the daylight over the camera from the planet's atmosphere (while its light is the
+    // sun), and the light dimmed with the camera's depth.
+    Params.DepthDarkening = S.UnderwaterDepthDarkening;
+    if (UDirectionalLightComponent* Sun = FindSunLight())
+    {
+        const FLinearColor E = Sun->GetColoredLightBrightness();
+        Params.SunDirection = FVector3f(-Sun->GetDirection().GetSafeNormal());
+        Params.SunIlluminance = FVector3f(E.R, E.G, E.B);
+        if (APlanetAtmosphereActor* Air = Atmosphere.Get(); Air && Sun == SunLightOverride.Get())
+            Params.Atmosphere = Air->GetViewExtension();
+    }
     // The FFT model's textures (kept alive here; released after the extension).
     if (const FVoxelOceanCascadeTextures* Textures = Surface.IsValid() ? Surface->GetCascadeTextures() : nullptr)
     {
@@ -414,6 +427,14 @@ void AOceanSphereActor::SetSunLightOverride(UDirectionalLightComponent* InLight)
     // The search again from the next tick when the override goes.
     SunLightSearchTime = -1.0e9;
     bWarnedNoSun = false;
+}
+
+void AOceanSphereActor::SetAtmosphere(APlanetAtmosphereActor* InAtmosphere)
+{
+    Atmosphere = InAtmosphere;
+    // Stage A5: holding its weather's feed starts its read-backs.
+    AtmosphereWeatherFeed = InAtmosphere ? TSharedPtr<FAtmosphereWeatherFeed, ESPMode::ThreadSafe>(InAtmosphere->GetWeatherFeed()) : nullptr;
+    SetSunLightOverride(InAtmosphere ? InAtmosphere->GetSunLight() : nullptr);
 }
 
 UDirectionalLightComponent* AOceanSphereActor::FindSunLight()
@@ -484,6 +505,10 @@ void AOceanSphereActor::UpdateSurfacePass()
         Params.SunIlluminance = FVector3f(E.R, E.G, E.B);
         Params.SkyZenith = FVector3f(S.StandInSkyZenith.R, S.StandInSkyZenith.G, S.StandInSkyZenith.B) * Luminance;
         Params.SkyHorizon = FVector3f(S.StandInSkyHorizon.R, S.StandInSkyHorizon.G, S.StandInSkyHorizon.B) * Luminance;
+        // Stage A2: the sun at the water from the planet's atmosphere, while its light is the sun
+        // (its march's extension is made on its first frame, and again after it's turned off and on).
+        if (APlanetAtmosphereActor* Air = Atmosphere.Get(); Air && Sun == SunLightOverride.Get())
+            Params.Atmosphere = Air->GetViewExtension();
     }
     else if (!bWarnedNoSun)
     {
@@ -541,6 +566,9 @@ void AOceanSphereActor::UpdateSurfacePass()
     Params.FoamSoftness = S.FoamSoftness;
     Params.FoamDetail = S.FoamDetail;
     Params.FoamDetailDistanceM = S.FoamDetailDistance;
+    // Stage A6: the rain from the atmosphere's weather.
+    Params.RainAmount = S.RainAmount;
+    Params.RainRippleDistanceM = S.RainRippleDistance;
     Params.FoamFadeDistanceM = S.FoamFadeDistance;
     Params.bCubicFiltering = S.bCubicFiltering;
     Params.bFoamDetailFromClip = S.bFoamDetailFromClip;
@@ -650,7 +678,12 @@ void AOceanSphereActor::UpdateWeatherSource()
                 && S.StormWind == Was.StormWind && S.StormRadius == Was.StormRadius && S.StormHours == Was.StormHours
                 && S.SwellStrength == Was.SwellStrength && S.SwellRange == Was.SwellRange
                 && S.WeatherTimeScale == Was.WeatherTimeScale && S.WeatherTimeOffset == Was.WeatherTimeOffset)
-            : (S.WindSpeed == Was.WindSpeed && S.WindHeading == Was.WindHeading && S.StormIntensity == Was.StormIntensity));
+            : (S.WindSpeed == Was.WindSpeed && S.WindHeading == Was.WindHeading && S.StormIntensity == Was.StormIntensity))
+        // Stage A5: the atmosphere's weather: its settings, its feed, and once its first map lands
+        // (the keys the fallback made are let go then, once).
+        && S.bWeatherFromAtmosphere == Was.bWeatherFromAtmosphere && S.AtmosphereMeanWind == Was.AtmosphereMeanWind
+        && S.AtmosphereSwellShare == Was.AtmosphereSwellShare && AtmosphereWeatherFeed == WeatherSourceFeed
+        && (!WeatherSourceFeed.IsValid() || bWeatherSourceHadMap || !WeatherSourceFeed->Latest().IsValid());
     if (bSame) return;
     if (S.bProceduralWeather)
     {
@@ -669,11 +702,25 @@ void AOceanSphereActor::UpdateWeatherSource()
         W.SwellRangeKm = S.SwellRange;
         W.TimeScale = S.WeatherTimeScale;
         W.TimeOffset = S.WeatherTimeOffset;
-        WeatherSource = MakeShared<FVoxelOceanProceduralWeather, ESPMode::ThreadSafe>(W, FMath::Max(OceanRadius, 1.0));
+        ProceduralWeather = MakeShared<FVoxelOceanProceduralWeather, ESPMode::ThreadSafe>(W, FMath::Max(OceanRadius, 1.0));
+        WeatherSource = ProceduralWeather;
     }
     else
     {
+        ProceduralWeather.Reset();
         WeatherSource = MakeShared<FVoxelOceanConstantWeather, ESPMode::ThreadSafe>(GetEnvironment());
+    }
+    // Stage A5: the atmosphere's weather over it, which answers from its first map on.
+    WeatherSourceFeed = S.bWeatherFromAtmosphere ? AtmosphereWeatherFeed : nullptr;
+    bWeatherSourceHadMap = WeatherSourceFeed.IsValid() && WeatherSourceFeed->Latest().IsValid();
+    if (WeatherSourceFeed.IsValid())
+    {
+        WeatherSource = MakeShared<FVoxelOceanAtmosphereWeather, ESPMode::ThreadSafe>(WeatherSourceFeed, WeatherSource, S.AtmosphereMeanWind,
+            S.AtmosphereSwellShare);
+        if (bWeatherSourceHadMap)
+        {
+            UE_LOG(LogVoxelPlugin, Log, TEXT("[VoxelOcean] %s: the weather is the atmosphere's now (its first read-back has landed)."), *GetName());
+        }
     }
     WeatherSourceSettings = S;
     WeatherSourceRadius = OceanRadius;
@@ -725,7 +772,7 @@ void AOceanSphereActor::DrawWeatherDebug() const
         }
     }
     // The source is procedural when the settings it was made for say so.
-    if (const FVoxelOceanProceduralWeather* Procedural = static_cast<const FVoxelOceanProceduralWeather*>(WeatherSourceSettings.bProceduralWeather ? WeatherSource.Get() : nullptr))
+    if (const FVoxelOceanProceduralWeather* Procedural = ProceduralWeather.Get())
     {
         TArray<FVoxelOceanStorm> Storms;
         Procedural->StormsAt(Procedural->WeatherTime(Time), Storms);
@@ -1229,6 +1276,14 @@ namespace VoxelOceanPerfSweep
         { TEXT("IntersectionFoam 0"), [](FVoxelOceanSettings& S) { S.IntersectionFoam = 0.0f; } },
         // (Stage W8l: its search everywhere, as before W8l.)
         { TEXT("voxel.Ocean.ContactTiles 0"), [](FVoxelOceanSettings&) {}, TEXT("voxel.Ocean.ContactTiles") },
+        // (Stage A2: the sun at the water from the atmosphere: its points, its pass and the mask.)
+        { TEXT("voxel.Ocean.AtmosphereSun 0"), [](FVoxelOceanSettings&) {}, TEXT("voxel.Ocean.AtmosphereSun") },
+        // (Stage A3: the sky from the atmosphere: its tables' lookups.)
+        { TEXT("voxel.Ocean.AtmosphereSky 0"), [](FVoxelOceanSettings&) {}, TEXT("voxel.Ocean.AtmosphereSky") },
+        // (Stage A3b: the cloud in the reflection: the atmosphere's march along the mirror directions.)
+        { TEXT("voxel.Ocean.AtmosphereReflection 0"), [](FVoxelOceanSettings&) {}, TEXT("voxel.Ocean.AtmosphereReflection") },
+        // (Stage A6: the rain's weather pass and its rings.)
+        { TEXT("RainAmount 0"), [](FVoxelOceanSettings& S) { S.RainAmount = 0.0f; } },
         { TEXT("bSpray off"), [](FVoxelOceanSettings& S) { S.bSpray = false; } },
         { TEXT("FoamDetailLevels 0"), [](FVoxelOceanSettings& S) { S.FoamDetailLevels = 0; } },
         // (Stage W8k: the fine foam with every band looked up again, as before W8k.)
@@ -1296,7 +1351,7 @@ void AOceanSphereActor::StartPerfSweep(int32 FramesPerStep, int32 Rounds)
     // the baselines by 2 to 4 ms). The first baseline settles longer (the weather made again).
     PerfSweep.Held = PerfSweep.Original;
     bool bHeld = false;
-    if (const FVoxelOceanProceduralWeather* Procedural = static_cast<const FVoxelOceanProceduralWeather*>(WeatherSourceSettings.bProceduralWeather ? WeatherSource.Get() : nullptr))
+    if (const FVoxelOceanProceduralWeather* Procedural = ProceduralWeather.Get())
     {
         PerfSweep.Held.WeatherTimeOffset = Procedural->WeatherTime(GetOceanTime());
         PerfSweep.Held.WeatherTimeScale = 0.0;

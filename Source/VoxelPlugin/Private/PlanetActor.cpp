@@ -440,7 +440,7 @@ void APlanetActor::ConfigureAtmosphere(double PlanetRadius, double OceanRadius, 
 #if WITH_EDITOR
         AtmosphereActor->SetIsTemporarilyHiddenInEditor(true);
 #endif
-        if (OceanActor) OceanActor->SetSunLightOverride(nullptr);
+        if (OceanActor) OceanActor->SetAtmosphere(nullptr);
         return;
     }
     // The generation: the seed, the model and the planet's set (if it names any; else the
@@ -470,9 +470,10 @@ void APlanetActor::ConfigureAtmosphere(double PlanetRadius, double OceanRadius, 
     if (bHasStarWorldPosition)
         AtmosphereActor->OrientToStar(StarWorldPosition);
     // The ocean's sun: the atmosphere's light (the star's direction, the light at the top of the
-    // air; the march dims it on the water as on the terrain, stage A2 takes that over).
+    // air), and stage A2: the sun at the water from its march (the clouds' shadow and the air),
+    // the sea's pixels left to the ocean.
     if (OceanActor)
-        OceanActor->SetSunLightOverride(AtmosphereActor->FindComponentByClass<UDirectionalLightComponent>());
+        OceanActor->SetAtmosphere(AtmosphereActor);
 }
 
 void APlanetActor::RecordAppliedState()

@@ -2,6 +2,7 @@
 #include "VoxelOceanGPUTime.h"
 #include "VoxelOceanRingDraw.h"
 #include "VoxelOceanFoamTexture.h"
+#include "AtmosphereViewExtension.h"
 
 #include "CommonRenderResources.h"
 #include "CoreGlobals.h"
@@ -37,6 +38,45 @@ static TAutoConsoleVariable<int32> CVarVoxelOceanContactTiles(
     TEXT("voxel.Ocean.ContactTiles"),
     1,
     TEXT("Stage W8l: 1 (default): the intersection foam's search skipped where nothing behind the water within its reach stands high enough to count (16-pixel tiles of the depth behind); 0: every water pixel searches."),
+    ECVF_RenderThreadSafe);
+
+// Stage A2: the sun at the water from the atmosphere (VoxelOceanAtmoSun.ush).
+static TAutoConsoleVariable<int32> CVarVoxelOceanAtmosphereSun(
+    TEXT("voxel.Ocean.AtmosphereSun"),
+    1,
+    TEXT("Stage A2: 1 (default): with the planet's atmosphere, the ocean takes the sun at the water from it (the clouds' shadow and the air, the atmosphere's own surface-sun pass), dims what shows from behind the water as the atmosphere dims the scene, and the atmosphere's march leaves the sea's pixels alone; 0: as stage A1, the march dims the whole sea, sky reflection included, by its surface multiply."),
+    ECVF_RenderThreadSafe);
+
+// Stage A3: the sky from the atmosphere (VoxelOceanAtmoSky.ush).
+static TAutoConsoleVariable<int32> CVarVoxelOceanAtmosphereSky(
+    TEXT("voxel.Ocean.AtmosphereSky"),
+    1,
+    TEXT("Stage A3: 1 (default): with the planet's atmosphere, the sky the sea reflects and the sky light on its water, foam and spray are the atmosphere's (its sky tables: the air's own scattering, clear air); 0: the stand-in gradient (StandInSkyZenith, StandInSkyHorizon)."),
+    ECVF_RenderThreadSafe);
+
+// Stage A3b: the cloud in the reflection (the atmosphere's march along the mirror directions).
+static TAutoConsoleVariable<int32> CVarVoxelOceanAtmosphereReflection(
+    TEXT("voxel.Ocean.AtmosphereReflection"),
+    1,
+    TEXT("Stage A3b: 1 (default): with the atmosphere's sky on, the atmosphere marches the flat sea's mirror directions on a coarse grid (voxel.Ocean.AtmosphereReflectionScale), so the sea reflects its cloud and the air as the view sees them; 0: the clear sky's tables alone."),
+    ECVF_RenderThreadSafe);
+
+static TAutoConsoleVariable<int32> CVarVoxelOceanAtmosphereReflectionScale(
+    TEXT("voxel.Ocean.AtmosphereReflectionScale"),
+    8,
+    TEXT("Stage A3b: the reflection's rays on a grid of 1 in this many pixels each way (2 to 32; default 8), filtered bilinearly: the waves' normals scatter it finer."),
+    ECVF_RenderThreadSafe);
+
+static TAutoConsoleVariable<int32> CVarVoxelOceanAtmosphereReflectionSteps(
+    TEXT("voxel.Ocean.AtmosphereReflectionSteps"),
+    24,
+    TEXT("Stage A3b: the cloud's steps along each reflection ray (the air takes half): the view's are far more."),
+    ECVF_RenderThreadSafe);
+
+static TAutoConsoleVariable<int32> CVarVoxelOceanAtmosphereSunScale(
+    TEXT("voxel.Ocean.AtmosphereSunScale"),
+    2,
+    TEXT("Stage A2: the sun at the water is evaluated on a grid of 1 in this many pixels each way over the view (1 to 16; default 2), filtered bilinearly: the sea under the view is smooth, so nothing but the clouds' shadow edges sharpens with a finer grid."),
     ECVF_RenderThreadSafe);
 
 namespace VoxelOceanSurfacePassDetail
@@ -111,6 +151,83 @@ public:
 };
 IMPLEMENT_GLOBAL_SHADER(FVoxelOceanContactDilateCS, "/Plugin/VoxelPlugin/Private/VoxelOceanContactTiles.usf", "ContactDilateCS", SF_Compute);
 
+// Stage A2: the sun at the water from the atmosphere (VoxelOceanAtmoSun.ush): the sea sphere's points
+// under a grid over the view, the atmosphere's result at them into the grid's texture, and after the
+// sea is drawn, the pixels it drew (the self-lit mask the atmosphere's march leaves alone).
+BEGIN_SHADER_PARAMETER_STRUCT(FVoxelOceanSunPointsParameters, )
+    SHADER_PARAMETER(FMatrix44f, SurfaceClipToRel)
+    SHADER_PARAMETER(FUintVector2, SunGridSize)
+    SHADER_PARAMETER(FVector4f, SunSea)
+    SHADER_PARAMETER(float, SunSeaHeight)
+    SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<float>, SunPointsOut)
+END_SHADER_PARAMETER_STRUCT()
+
+BEGIN_SHADER_PARAMETER_STRUCT(FVoxelOceanSunGridParameters, )
+    SHADER_PARAMETER(FUintVector2, SunGridSize)
+    SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<float4>, SunGridIn)
+    // Stage A6: the weather at the points (the third slice).
+    SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<float4>, SunWeatherIn)
+    SHADER_PARAMETER(uint32, SunWeatherOn)
+    SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2DArray<float4>, SunGridOut)
+END_SHADER_PARAMETER_STRUCT()
+
+BEGIN_SHADER_PARAMETER_STRUCT(FVoxelOceanSelfLitParameters, )
+    SHADER_PARAMETER_RDG_TEXTURE(Texture2D<float>, SurfaceSceneDepth)
+    SHADER_PARAMETER_RDG_TEXTURE(Texture2D<float>, SurfaceBehindDepth)
+    SHADER_PARAMETER(FUintVector2, SurfaceCopyMin)
+    SHADER_PARAMETER(FUintVector2, SurfaceCopySize)
+    SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2D<float>, SurfaceSelfLitOut)
+END_SHADER_PARAMETER_STRUCT()
+
+BEGIN_SHADER_PARAMETER_STRUCT(FVoxelOceanReflectRaysParameters, )
+    SHADER_PARAMETER(FMatrix44f, SurfaceClipToRel)
+    SHADER_PARAMETER(FUintVector2, SunGridSize)
+    SHADER_PARAMETER(FVector4f, SunSea)
+    SHADER_PARAMETER(float, SunSeaHeight)
+    SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<float>, ReflectRaysOut)
+END_SHADER_PARAMETER_STRUCT()
+
+BEGIN_SHADER_PARAMETER_STRUCT(FVoxelOceanReflectGridParameters, )
+    SHADER_PARAMETER(FUintVector2, SunGridSize)
+    SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<float4>, ReflectGridIn)
+    SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2D<float4>, ReflectGridOut)
+END_SHADER_PARAMETER_STRUCT()
+
+BEGIN_SHADER_PARAMETER_STRUCT(FVoxelOceanReflectBlurParameters, )
+    SHADER_PARAMETER(FUintVector2, SunGridSize)
+    SHADER_PARAMETER_RDG_TEXTURE(Texture2D<float4>, ReflectBlurIn)
+    SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2D<float4>, ReflectBlurOut)
+    SHADER_PARAMETER(FIntPoint, ReflectBlurStep)
+END_SHADER_PARAMETER_STRUCT()
+
+#define VOXEL_OCEAN_SURFACE_GLOBAL_CS(Name, Params) \
+    class Name : public FGlobalShader \
+    { \
+    public: \
+        DECLARE_GLOBAL_SHADER(Name); \
+        using FParameters = Params; \
+        SHADER_USE_PARAMETER_STRUCT(Name, FGlobalShader); \
+        static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters) \
+        { \
+            return IsFeatureLevelSupported(Parameters.Platform, ERHIFeatureLevel::SM5); \
+        } \
+    };
+
+VOXEL_OCEAN_SURFACE_GLOBAL_CS(FVoxelOceanSunPointsCS, FVoxelOceanSunPointsParameters)
+VOXEL_OCEAN_SURFACE_GLOBAL_CS(FVoxelOceanSunGridCS, FVoxelOceanSunGridParameters)
+VOXEL_OCEAN_SURFACE_GLOBAL_CS(FVoxelOceanSelfLitCS, FVoxelOceanSelfLitParameters)
+VOXEL_OCEAN_SURFACE_GLOBAL_CS(FVoxelOceanReflectRaysCS, FVoxelOceanReflectRaysParameters)
+VOXEL_OCEAN_SURFACE_GLOBAL_CS(FVoxelOceanReflectGridCS, FVoxelOceanReflectGridParameters)
+VOXEL_OCEAN_SURFACE_GLOBAL_CS(FVoxelOceanReflectBlurCS, FVoxelOceanReflectBlurParameters)
+#undef VOXEL_OCEAN_SURFACE_GLOBAL_CS
+
+IMPLEMENT_GLOBAL_SHADER(FVoxelOceanSunPointsCS, "/Plugin/VoxelPlugin/Private/VoxelOceanSurfacePass.usf", "SunPointsCS", SF_Compute);
+IMPLEMENT_GLOBAL_SHADER(FVoxelOceanSunGridCS, "/Plugin/VoxelPlugin/Private/VoxelOceanSurfacePass.usf", "SunGridCS", SF_Compute);
+IMPLEMENT_GLOBAL_SHADER(FVoxelOceanSelfLitCS, "/Plugin/VoxelPlugin/Private/VoxelOceanSurfacePass.usf", "SelfLitCS", SF_Compute);
+IMPLEMENT_GLOBAL_SHADER(FVoxelOceanReflectRaysCS, "/Plugin/VoxelPlugin/Private/VoxelOceanSurfacePass.usf", "ReflectRaysCS", SF_Compute);
+IMPLEMENT_GLOBAL_SHADER(FVoxelOceanReflectGridCS, "/Plugin/VoxelPlugin/Private/VoxelOceanSurfacePass.usf", "ReflectGridCS", SF_Compute);
+IMPLEMENT_GLOBAL_SHADER(FVoxelOceanReflectBlurCS, "/Plugin/VoxelPlugin/Private/VoxelOceanSurfacePass.usf", "ReflectBlurCS", SF_Compute);
+
 // The surface: the rings' vertices, the view, what lies behind, the waves as the material takes
 // them, the water and the light.
 BEGIN_SHADER_PARAMETER_STRUCT(FVoxelOceanSurfaceParameters, )
@@ -177,6 +294,23 @@ BEGIN_SHADER_PARAMETER_STRUCT(FVoxelOceanSurfaceParameters, )
     SHADER_PARAMETER(FVector3f, SurfaceSunIlluminance)
     SHADER_PARAMETER(FVector3f, SurfaceSkyZenith)
     SHADER_PARAMETER(FVector3f, SurfaceSkyHorizon)
+    // Stage A2: the sun at the water (VoxelOceanAtmoSun.ush).
+    SHADER_PARAMETER_RDG_TEXTURE(Texture2DArray, SurfaceAtmoSun)
+    SHADER_PARAMETER_SAMPLER(SamplerState, SurfaceAtmoSunSampler)
+    SHADER_PARAMETER(uint32, SurfaceAtmoSunOn)
+    // Stage A3: the sky from the atmosphere (VoxelOceanAtmoSky.ush).
+    SHADER_PARAMETER_RDG_TEXTURE(Texture3D, SurfaceAtmoSky)
+    SHADER_PARAMETER_RDG_TEXTURE(Texture2D, SurfaceAtmoSkyIrradiance)
+    SHADER_PARAMETER_SAMPLER(SamplerState, SurfaceAtmoSkySampler)
+    SHADER_PARAMETER(FVector4f, SurfaceAtmoSkySize)
+    SHADER_PARAMETER(uint32, SurfaceAtmoSkyOn)
+    // Stage A3b: the reflection the atmosphere marched.
+    SHADER_PARAMETER_RDG_TEXTURE(Texture2D, SurfaceAtmoReflect)
+    SHADER_PARAMETER(uint32, SurfaceAtmoReflectOn)
+    SHADER_PARAMETER_RDG_TEXTURE(Texture2D, SurfaceAtmoReflectBroad)
+    SHADER_PARAMETER(FVector4f, SurfaceAtmoReflectInfo)
+    // Stage A6: the rain (VoxelOceanRain.ush).
+    SHADER_PARAMETER(FVector4f, SurfaceRain)
     SHADER_PARAMETER(FVector4f, SurfaceShading)
     SHADER_PARAMETER(FVector3f, SurfaceFoamAlbedo)
     SHADER_PARAMETER(FVector4f, SurfaceGodotWater)
@@ -302,6 +436,13 @@ BEGIN_SHADER_PARAMETER_STRUCT(FVoxelOceanSprayDrawParameters, )
     SHADER_PARAMETER(FVector3f, SurfaceSunIlluminance)
     SHADER_PARAMETER(FVector3f, SurfaceSkyZenith)
     SHADER_PARAMETER(FVector3f, SurfaceSkyHorizon)
+    SHADER_PARAMETER_RDG_TEXTURE(Texture2DArray, SurfaceAtmoSun)
+    SHADER_PARAMETER_SAMPLER(SamplerState, SurfaceAtmoSunSampler)
+    SHADER_PARAMETER(uint32, SurfaceAtmoSunOn)
+    SHADER_PARAMETER_RDG_TEXTURE(Texture2D, SurfaceAtmoSkyIrradiance)
+    SHADER_PARAMETER_SAMPLER(SamplerState, SurfaceAtmoSkySampler)
+    SHADER_PARAMETER(FVector4f, SurfaceAtmoSkySize)
+    SHADER_PARAMETER(uint32, SurfaceAtmoSkyOn)
     RENDER_TARGET_BINDING_SLOTS()
 END_SHADER_PARAMETER_STRUCT()
 
@@ -497,6 +638,176 @@ void FVoxelOceanSurfacePass::Render_RenderThread(FPostOpaqueRenderParameters& Pa
     const FVector Origin = Rings.PlanetToWorld.TransformPosition(Rings.Origin) - ViewOrigin;
     const FQuat PlanetRotation = Rings.PlanetToWorld.GetRotation();
 
+    // (w: the view's camera above the sea sphere, cm: from near or under the surface the sunk far
+    // sphere is left out.)
+    const double ViewHeight = (ViewOrigin - Rings.PlanetToWorld.GetLocation()).Size() - Rings.SeaRadius;
+
+    // -- Stage A2: the sun at the water, the atmosphere's (VoxelOceanAtmoSun.ush) ---------------
+    // Its surface-sun pass at the sea sphere's points under a grid over the view (the march's own
+    // Atmo_SurfaceSun), into the grid's two slices. Without it (no atmosphere, or its surface shadow
+    // off) the sun undimmed, and the march dims the sea's pixels as it did (stage A1).
+    const TSharedPtr<FAtmosphereViewExtension, ESPMode::ThreadSafe> Atmosphere = Params.Atmosphere.Pin();
+    FRDGTextureRef AtmoSun = nullptr;
+    if (Atmosphere.IsValid() && CVarVoxelOceanAtmosphereSun.GetValueOnRenderThread() != 0 && Atmosphere->IsSurfaceShadowOn_RenderThread())
+    {
+        TShaderMapRef<FVoxelOceanSunPointsCS> PointsShader(ShaderMap);
+        TShaderMapRef<FVoxelOceanSunGridCS> GridShader(ShaderMap);
+        const int32 Scale = FMath::Clamp(CVarVoxelOceanAtmosphereSunScale.GetValueOnRenderThread(), 1, 16);
+        const FIntPoint Grid(FMath::DivideAndRoundUp(Size.X, Scale), FMath::DivideAndRoundUp(Size.Y, Scale));
+        const uint32 Count = (uint32)(Grid.X * Grid.Y);
+        if (PointsShader.IsValid() && GridShader.IsValid() && Count > 0u)
+        {
+            FRDGBufferRef Points = GraphBuilder.CreateBuffer(FRDGBufferDesc::CreateBufferDesc(sizeof(float), 3 * Count), TEXT("Voxel.OceanSunPoints"));
+            {
+                FVoxelOceanSunPointsParameters* SP = GraphBuilder.AllocParameters<FVoxelOceanSunPointsParameters>();
+                const FVector SeaCenter = Rings.PlanetToWorld.GetLocation() - ViewOrigin;
+                SP->SurfaceClipToRel = FMatrix44f(ClipToRel);
+                SP->SunGridSize = FUintVector2((uint32)Grid.X, (uint32)Grid.Y);
+                SP->SunSea = FVector4f((float)SeaCenter.X, (float)SeaCenter.Y, (float)SeaCenter.Z, (float)Rings.SeaRadius);
+                SP->SunSeaHeight = (float)ViewHeight;
+                SP->SunPointsOut = GraphBuilder.CreateUAV(Points, PF_R32_FLOAT);
+                FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("VoxelOceanSunPoints %dx%d", Grid.X, Grid.Y), PointsShader, SP,
+                    FComputeShaderUtils::GetGroupCount(Grid, ThreadGroupSize));
+            }
+            // (Half floats: factors in [0, 1].)
+            FRDGBufferRef SunAtPoints = GraphBuilder.CreateBuffer(FRDGBufferDesc::CreateBufferDesc(4 * sizeof(uint16), 2 * Count), TEXT("Voxel.OceanSunAtPoints"));
+            if (Atmosphere->AddSurfaceSunPass_RenderThread(GraphBuilder, View, GraphBuilder.CreateSRV(Points, PF_R32_FLOAT), Count, FMatrix44f::Identity,
+                GraphBuilder.CreateUAV(SunAtPoints, PF_FloatRGBA)))
+            {
+                // Stage A6: the weather at the same points, for the rain (with the rain on).
+                FRDGBufferRef WeatherAtPoints = nullptr;
+                bool bWeather = false;
+                if (Params.RainAmount > 0.0f)
+                {
+                    WeatherAtPoints = GraphBuilder.CreateBuffer(FRDGBufferDesc::CreateBufferDesc(4 * sizeof(uint16), Count), TEXT("Voxel.OceanWeatherAtPoints"));
+                    bWeather = Atmosphere->AddSurfaceWeatherPass_RenderThread(GraphBuilder, View, GraphBuilder.CreateSRV(Points, PF_R32_FLOAT), Count,
+                        FMatrix44f::Identity, GraphBuilder.CreateUAV(WeatherAtPoints, PF_FloatRGBA));
+                }
+                if (!bWeather)
+                {
+                    // Bound but not read (SunWeatherOn 0).
+                    static const uint16 NoWeather[4] = { 0, 0, 0, 0 };
+                    WeatherAtPoints = CreateVertexBuffer(GraphBuilder, TEXT("Voxel.OceanNoWeather"), FRDGBufferDesc::CreateBufferDesc(4 * sizeof(uint16), 1),
+                        NoWeather, sizeof(NoWeather));
+                }
+                AtmoSun = GraphBuilder.CreateTexture(FRDGTextureDesc::Create2DArray(Grid, PF_FloatRGBA, FClearValueBinding::Black,
+                    TexCreate_ShaderResource | TexCreate_UAV, 3), TEXT("Voxel.OceanAtmoSun"));
+                FVoxelOceanSunGridParameters* GP = GraphBuilder.AllocParameters<FVoxelOceanSunGridParameters>();
+                GP->SunGridSize = FUintVector2((uint32)Grid.X, (uint32)Grid.Y);
+                GP->SunGridIn = GraphBuilder.CreateSRV(SunAtPoints, PF_FloatRGBA);
+                GP->SunWeatherIn = GraphBuilder.CreateSRV(WeatherAtPoints, PF_FloatRGBA);
+                GP->SunWeatherOn = bWeather ? 1u : 0u;
+                GP->SunGridOut = GraphBuilder.CreateUAV(AtmoSun);
+                FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("VoxelOceanSunGrid %dx%d", Grid.X, Grid.Y), GridShader, GP,
+                    FComputeShaderUtils::GetGroupCount(Grid, ThreadGroupSize));
+            }
+        }
+    }
+    const bool bAtmoSun = AtmoSun != nullptr;
+
+    // -- Stage A3: the sky from the atmosphere (VoxelOceanAtmoSky.ush) -------------------------------
+    FRDGTextureRef AtmoSky = nullptr;
+    FRDGTextureRef AtmoSkyIrradiance = nullptr;
+    const bool bAtmoSky = Atmosphere.IsValid() && CVarVoxelOceanAtmosphereSky.GetValueOnRenderThread() != 0
+        && Atmosphere->GetSkyTables_RenderThread(GraphBuilder, View, AtmoSky, AtmoSkyIrradiance) && AtmoSky && AtmoSkyIrradiance;
+    if (!bAtmoSky)
+    {
+        // Bound but not read (SurfaceAtmoSkyOn 0).
+        AtmoSky = GraphBuilder.CreateTexture(FRDGTextureDesc::Create3D(FIntVector(1, 1, 1), PF_FloatRGBA, FClearValueBinding::Black,
+            TexCreate_ShaderResource | TexCreate_UAV), TEXT("Voxel.OceanNoAtmoSky"));
+        AtmoSkyIrradiance = GraphBuilder.CreateTexture(FRDGTextureDesc::Create2D(FIntPoint(1, 1), PF_FloatRGBA, FClearValueBinding::Black,
+            TexCreate_ShaderResource | TexCreate_UAV), TEXT("Voxel.OceanNoAtmoSkyIrradiance"));
+        AddClearUAVPass(GraphBuilder, GraphBuilder.CreateUAV(AtmoSky), FVector4f(0.0f, 0.0f, 0.0f, 0.0f));
+        AddClearUAVPass(GraphBuilder, GraphBuilder.CreateUAV(AtmoSkyIrradiance), FVector4f(0.0f, 0.0f, 0.0f, 0.0f));
+    }
+
+    // -- Stage A3b: the cloud in the reflection (the atmosphere's march along the mirror directions) --
+    FRDGTextureRef AtmoReflect = nullptr;
+    FRDGTextureRef AtmoReflectBroad = nullptr;
+    FVector4f AtmoReflectInfo(1.0f, 1.0f, 1.0f, 0.0f);
+    if (bAtmoSky && CVarVoxelOceanAtmosphereReflection.GetValueOnRenderThread() != 0)
+    {
+        TShaderMapRef<FVoxelOceanReflectRaysCS> RaysShader(ShaderMap);
+        TShaderMapRef<FVoxelOceanReflectGridCS> GridShader(ShaderMap);
+        const int32 Scale = FMath::Clamp(CVarVoxelOceanAtmosphereReflectionScale.GetValueOnRenderThread(), 2, 32);
+        const int32 Steps = FMath::Clamp(CVarVoxelOceanAtmosphereReflectionSteps.GetValueOnRenderThread(), 4, 128);
+        const FIntPoint Grid(FMath::DivideAndRoundUp(Size.X, Scale), FMath::DivideAndRoundUp(Size.Y, Scale));
+        const uint32 Count = (uint32)(Grid.X * Grid.Y);
+        if (RaysShader.IsValid() && GridShader.IsValid() && Count > 0u)
+        {
+            FRDGBufferRef Rays = GraphBuilder.CreateBuffer(FRDGBufferDesc::CreateBufferDesc(sizeof(float), 6 * Count), TEXT("Voxel.OceanReflectRays"));
+            {
+                FVoxelOceanReflectRaysParameters* RP = GraphBuilder.AllocParameters<FVoxelOceanReflectRaysParameters>();
+                const FVector SeaCenter = Rings.PlanetToWorld.GetLocation() - ViewOrigin;
+                RP->SurfaceClipToRel = FMatrix44f(ClipToRel);
+                RP->SunGridSize = FUintVector2((uint32)Grid.X, (uint32)Grid.Y);
+                RP->SunSea = FVector4f((float)SeaCenter.X, (float)SeaCenter.Y, (float)SeaCenter.Z, (float)Rings.SeaRadius);
+                RP->SunSeaHeight = (float)ViewHeight;
+                RP->ReflectRaysOut = GraphBuilder.CreateUAV(Rays, PF_R32_FLOAT);
+                FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("VoxelOceanReflectRays %dx%d", Grid.X, Grid.Y), RaysShader, RP,
+                    FComputeShaderUtils::GetGroupCount(Grid, ThreadGroupSize));
+            }
+            FRDGBufferRef Marched = GraphBuilder.CreateBuffer(FRDGBufferDesc::CreateBufferDesc(4 * sizeof(uint16), Count), TEXT("Voxel.OceanReflectMarched"));
+            if (Atmosphere->AddReflectionPass_RenderThread(GraphBuilder, View, GraphBuilder.CreateSRV(Rays, PF_R32_FLOAT), Count, (uint32)Grid.X,
+                FMath::Max(Steps / 2, 2), Steps, GraphBuilder.CreateUAV(Marched, PF_FloatRGBA)))
+            {
+                AtmoReflect = GraphBuilder.CreateTexture(FRDGTextureDesc::Create2D(Grid, PF_FloatRGBA, FClearValueBinding::Black,
+                    TexCreate_ShaderResource | TexCreate_UAV), TEXT("Voxel.OceanAtmoReflect"));
+                FVoxelOceanReflectGridParameters* GP = GraphBuilder.AllocParameters<FVoxelOceanReflectGridParameters>();
+                GP->SunGridSize = FUintVector2((uint32)Grid.X, (uint32)Grid.Y);
+                GP->ReflectGridIn = GraphBuilder.CreateSRV(Marched, PF_FloatRGBA);
+                GP->ReflectGridOut = GraphBuilder.CreateUAV(AtmoReflect);
+                FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("VoxelOceanReflectGrid %dx%d", Grid.X, Grid.Y), GridShader, GP,
+                    FComputeShaderUtils::GetGroupCount(Grid, ThreadGroupSize));
+                // Part 2: the grid blurred (a binomial each way, the march's per-cell noise smoothed),
+                // and blurred again three texels apart for rough water.
+                TShaderMapRef<FVoxelOceanReflectBlurCS> BlurShader(ShaderMap);
+                if (BlurShader.IsValid())
+                {
+                    const auto Blur = [&](FRDGTextureRef In, FIntPoint Step, const TCHAR* Name)
+                    {
+                        FRDGTextureRef Out = GraphBuilder.CreateTexture(FRDGTextureDesc::Create2D(Grid, PF_FloatRGBA, FClearValueBinding::Black,
+                            TexCreate_ShaderResource | TexCreate_UAV), Name);
+                        FVoxelOceanReflectBlurParameters* BP = GraphBuilder.AllocParameters<FVoxelOceanReflectBlurParameters>();
+                        BP->SunGridSize = FUintVector2((uint32)Grid.X, (uint32)Grid.Y);
+                        BP->ReflectBlurIn = In;
+                        BP->ReflectBlurOut = GraphBuilder.CreateUAV(Out);
+                        BP->ReflectBlurStep = Step;
+                        FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("VoxelOceanReflectBlur %d,%d", Step.X, Step.Y), BlurShader, BP,
+                            FComputeShaderUtils::GetGroupCount(Grid, ThreadGroupSize));
+                        return Out;
+                    };
+                    AtmoReflect = Blur(Blur(AtmoReflect, FIntPoint(1, 0), TEXT("Voxel.OceanAtmoReflectH")), FIntPoint(0, 1), TEXT("Voxel.OceanAtmoReflectSmooth"));
+                    AtmoReflectBroad = Blur(Blur(AtmoReflect, FIntPoint(3, 0), TEXT("Voxel.OceanAtmoReflectBroadH")), FIntPoint(0, 3), TEXT("Voxel.OceanAtmoReflectBroad"));
+                }
+                else
+                {
+                    AtmoReflectBroad = AtmoReflect;
+                }
+                // The angle a grid texel spans (the view's pixel angle times the grid's spacing).
+                const double M11 = View.ViewMatrices.GetProjectionMatrix().M[1][1];
+                const float PixelAngle = M11 > 0.0 ? (float)(2.0 / (M11 * (double)Size.Y)) : 1.0e-3f;
+                AtmoReflectInfo = FVector4f((float)Grid.X, (float)Grid.Y, PixelAngle * (float)Scale, 0.0f);
+            }
+        }
+    }
+    const bool bAtmoReflect = AtmoReflect != nullptr;
+    if (!bAtmoReflect)
+    {
+        // Bound but not read (SurfaceAtmoReflectOn 0).
+        AtmoReflect = GraphBuilder.CreateTexture(FRDGTextureDesc::Create2D(FIntPoint(1, 1), PF_FloatRGBA, FClearValueBinding::Black,
+            TexCreate_ShaderResource | TexCreate_UAV), TEXT("Voxel.OceanNoAtmoReflect"));
+        AddClearUAVPass(GraphBuilder, GraphBuilder.CreateUAV(AtmoReflect), FVector4f(0.0f, 0.0f, 0.0f, 1.0f));
+        AtmoReflectBroad = AtmoReflect;
+    }
+    if (!bAtmoSun)
+    {
+        // Bound but not read (SurfaceAtmoSunOn 0).
+        AtmoSun = GraphBuilder.CreateTexture(FRDGTextureDesc::Create2DArray(FIntPoint(1, 1), PF_FloatRGBA, FClearValueBinding::Black,
+            TexCreate_ShaderResource | TexCreate_UAV, 3), TEXT("Voxel.OceanNoAtmoSun"));
+        AddClearUAVPass(GraphBuilder, GraphBuilder.CreateUAV(AtmoSun), FVector4f(1.0f, 1.0f, 1.0f, 1.0f));
+    }
+
     // -- The surface -----------------------------------------------------------------------------
     FVoxelOceanSurfaceParameters* P = GraphBuilder.AllocParameters<FVoxelOceanSurfaceParameters>();
     P->View = View.ViewUniformBuffer;
@@ -505,9 +816,6 @@ void FVoxelOceanSurfacePass::Render_RenderThread(FPostOpaqueRenderParameters& Pa
     P->SurfaceColors = Rings.Colors;
     P->SurfaceIndices = Rings.Indices;
     P->SurfaceTexWords = Rings.TexWords;
-    // (w: the view's camera above the sea sphere, cm: from near or under the surface the sunk far
-    // sphere is left out.)
-    const double ViewHeight = (ViewOrigin - Rings.PlanetToWorld.GetLocation()).Size() - Rings.SeaRadius;
     P->SurfaceOrigin = FVector4f((float)Origin.X, (float)Origin.Y, (float)Origin.Z, (float)FMath::Clamp(ViewHeight, -1.0e9, 1.0e9));
     P->SurfacePlanetRotation = FVector4f((float)PlanetRotation.X, (float)PlanetRotation.Y, (float)PlanetRotation.Z, (float)PlanetRotation.W);
     P->SurfaceRelToClip = FMatrix44f(RelToClip);
@@ -638,6 +946,20 @@ void FVoxelOceanSurfacePass::Render_RenderThread(FPostOpaqueRenderParameters& Pa
     P->SurfaceSunIlluminance = Params.SunDirection.IsNearlyZero() ? FVector3f::ZeroVector : Params.SunIlluminance;
     P->SurfaceSkyZenith = Params.SkyZenith;
     P->SurfaceSkyHorizon = Params.SkyHorizon;
+    P->SurfaceAtmoSun = AtmoSun;
+    P->SurfaceAtmoSunSampler = TStaticSamplerState<SF_Bilinear, AM_Clamp, AM_Clamp, AM_Clamp>::GetRHI();
+    P->SurfaceAtmoSunOn = bAtmoSun ? 1u : 0u;
+    P->SurfaceAtmoSky = AtmoSky;
+    P->SurfaceAtmoSkyIrradiance = AtmoSkyIrradiance;
+    P->SurfaceAtmoSkySampler = TStaticSamplerState<SF_Bilinear, AM_Clamp, AM_Clamp, AM_Clamp>::GetRHI();
+    P->SurfaceAtmoSkySize = FVector4f((float)AtmosphereSkyTables::ViewZenith, (float)AtmosphereSkyTables::Azimuth,
+        (float)AtmosphereSkyTables::SunZenith, (float)AtmosphereSkyTables::Irradiance);
+    P->SurfaceAtmoSkyOn = bAtmoSky ? 1u : 0u;
+    P->SurfaceAtmoReflect = AtmoReflect;
+    P->SurfaceAtmoReflectOn = bAtmoReflect ? 1u : 0u;
+    P->SurfaceAtmoReflectBroad = AtmoReflectBroad;
+    P->SurfaceAtmoReflectInfo = AtmoReflectInfo;
+    P->SurfaceRain = FVector4f(FMath::Max(Params.RainAmount, 0.0f), FMath::Max(Params.RainRippleDistanceM, 1.0f) * 100.0f, 0.0f, 0.0f);
     P->SurfaceShading = FVector4f(FMath::Max(Params.ShortWaveSlopeVariance, 0.0f), FMath::Max(Params.Refraction, 0.0f), Params.bFoam ? 1.0f : 0.0f,
         (float)FMath::Clamp(CVarVoxelOceanDebugFoam.GetValueOnRenderThread(), 0, 12));
     P->SurfaceFoamAlbedo = Params.FoamAlbedo;
@@ -685,6 +1007,27 @@ void FVoxelOceanSurfacePass::Render_RenderThread(FPostOpaqueRenderParameters& Pa
             SetShaderParameters(RHICmdList, PixelShader, PixelShader.GetPixelShader(), *P);
             RHICmdList.DrawPrimitive(0, Triangles, 1);
         });
+
+    // Stage A2: the pixels the sea drew (its depth over what lay behind), which the atmosphere's march
+    // leaves its surface multiply off: the sea dimmed its own sun and what it shows from behind.
+    if (bAtmoSun)
+    {
+        TShaderMapRef<FVoxelOceanSelfLitCS> SelfLitShader(ShaderMap);
+        if (SelfLitShader.IsValid())
+        {
+            FRDGTextureRef Mask = GraphBuilder.CreateTexture(FRDGTextureDesc::Create2D(Size, PF_R16F, FClearValueBinding::Black,
+                TexCreate_ShaderResource | TexCreate_UAV), TEXT("Voxel.OceanSelfLit"));
+            FVoxelOceanSelfLitParameters* M = GraphBuilder.AllocParameters<FVoxelOceanSelfLitParameters>();
+            M->SurfaceSceneDepth = SceneDepth;
+            M->SurfaceBehindDepth = BehindDepth;
+            M->SurfaceCopyMin = FUintVector2((uint32)Rect.Min.X, (uint32)Rect.Min.Y);
+            M->SurfaceCopySize = FUintVector2((uint32)Size.X, (uint32)Size.Y);
+            M->SurfaceSelfLitOut = GraphBuilder.CreateUAV(Mask);
+            FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("VoxelOceanSelfLit %dx%d", Size.X, Size.Y), SelfLitShader, M,
+                FComputeShaderUtils::GetGroupCount(Size, ThreadGroupSize));
+            Atmosphere->SetSelfLitMask_RenderThread(GraphBuilder, View, Mask);
+        }
+    }
 
     // (Stage W8f: the spray timed on its own.)
     SurfaceTime.End();
@@ -866,6 +1209,13 @@ void FVoxelOceanSurfacePass::RenderSpray_RenderThread(FRDGBuilder& GraphBuilder,
     D->SurfaceSunIlluminance = Surface.SurfaceSunIlluminance;
     D->SurfaceSkyZenith = Surface.SurfaceSkyZenith;
     D->SurfaceSkyHorizon = Surface.SurfaceSkyHorizon;
+    D->SurfaceAtmoSun = Surface.SurfaceAtmoSun;
+    D->SurfaceAtmoSunSampler = Surface.SurfaceAtmoSunSampler;
+    D->SurfaceAtmoSunOn = Surface.SurfaceAtmoSunOn;
+    D->SurfaceAtmoSkyIrradiance = Surface.SurfaceAtmoSkyIrradiance;
+    D->SurfaceAtmoSkySampler = Surface.SurfaceAtmoSkySampler;
+    D->SurfaceAtmoSkySize = Surface.SurfaceAtmoSkySize;
+    D->SurfaceAtmoSkyOn = Surface.SurfaceAtmoSkyOn;
     D->RenderTargets[0] = FRenderTargetBinding(SceneColor, ERenderTargetLoadAction::ELoad);
     const FIntRect Rect = SV.Rect;
     GraphBuilder.AddPass(RDG_EVENT_NAME("VoxelOceanSpray %u", Pool), D, ERDGPassFlags::Raster,

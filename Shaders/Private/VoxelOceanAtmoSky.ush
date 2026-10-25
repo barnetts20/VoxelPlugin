@@ -1,0 +1,48 @@
+// VoxelOceanAtmoSky.ush - Stage A3: the sky from the atmosphere (CloudAtmosphere's sky tables,
+// FAtmosphereViewExtension::GetSkyTables_RenderThread; Design/AtmosphereOceanSide.md): the air's
+// radiance at the surface by direction, and its irradiance on the horizontal, per unit of the light
+// above the air (SurfaceSunIlluminance, the atmosphere's directional light). Planet-local, so one
+// table serves every point of the sea, from the shore to orbit. Clear air only: no cloud.
+//
+// THE MAPPING IS THE ATMOSPHERE'S (AtmosphereMarchPass.usf, MainSkyLutCS), at texel centres:
+//   x  sqrt(mu), mu the direction's cosine from the local zenith (the upper hemisphere)
+//   y  its azimuth from the sun's, over pi
+//   z  0.5 + 0.5 sign(mus) sqrt(|mus|), mus the sun's cosine from the zenith
+// The irradiance table by z alone. Size: x, y, z the table's, w the irradiance's.
+
+#pragma once
+
+float VoxelOceanAtmoSkyCoord(float U, float N)
+{
+    return (saturate(U) * (N - 1.0f) + 0.5f) / N;
+}
+
+float VoxelOceanAtmoSkySunCoord(float MuS)
+{
+    return 0.5f + 0.5f * sign(MuS) * sqrt(abs(MuS));
+}
+
+/** The sky's radiance toward Dir (folded to the horizon below it), per unit of the light above the
+ *  air, at a point whose zenith is Up, the sun toward L. */
+float3 VoxelOceanAtmoSkyAt(Texture3D Lut, SamplerState LutSampler, float4 Size, float3 Dir, float3 Up, float3 L)
+{
+    const float Mu = saturate(dot(Dir, Up));
+    const float MuS = dot(L, Up);
+    const float3 DirT = Dir - Up * dot(Dir, Up);
+    const float3 LT = L - Up * MuS;
+    const float D2 = dot(DirT, DirT);
+    const float L2 = dot(LT, LT);
+    // (Straight up, or the sun at the zenith: the azimuth is anything.)
+    const float CosPhi = D2 > 1.0e-8f && L2 > 1.0e-8f ? dot(DirT, LT) * rsqrt(D2 * L2) : 1.0f;
+    const float Phi = acos(clamp(CosPhi, -1.0f, 1.0f)) * (1.0f / 3.14159265f);
+    const float3 UVW = float3(VoxelOceanAtmoSkyCoord(sqrt(Mu), Size.x), VoxelOceanAtmoSkyCoord(Phi, Size.y),
+        VoxelOceanAtmoSkyCoord(VoxelOceanAtmoSkySunCoord(MuS), Size.z));
+    return Lut.SampleLevel(LutSampler, UVW, 0.0f).rgb;
+}
+
+/** The sky's irradiance on the horizontal, per unit of the light above the air, for the sun at cos
+ *  MuS from the zenith. */
+float3 VoxelOceanAtmoSkyIrradianceAt(Texture2D Irradiance, SamplerState LutSampler, float4 Size, float MuS)
+{
+    return Irradiance.SampleLevel(LutSampler, float2(VoxelOceanAtmoSkyCoord(VoxelOceanAtmoSkySunCoord(MuS), Size.w), 0.5f), 0.0f).rgb;
+}
