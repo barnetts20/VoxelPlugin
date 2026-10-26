@@ -47,6 +47,14 @@
 #define VOXEL_UNDERWATER_HAS_MAP 0
 #endif
 
+// Stage A8: the caustics, with the map (VoxelUnderwaterMap.ush; the includer's
+// VOXEL_UNDERWATER_CAUSTIC_SAMPLE).
+#if VOXEL_UNDERWATER_HAS_MAP && defined(VOXEL_UNDERWATER_CAUSTIC_SAMPLE)
+#define VOXEL_UNDERWATER_HAS_CAUSTICS 1
+#else
+#define VOXEL_UNDERWATER_HAS_CAUSTICS 0
+#endif
+
 #if VOXEL_UNDERWATER_HAS_MAP && defined(VOXEL_UNDERWATER_MAP_FOAM_LOAD) && defined(VOXEL_UNDERWATER_FOAM_COLOR)
 #define VOXEL_UNDERWATER_HAS_FOAM 1
 #else
@@ -183,6 +191,11 @@ struct FVoxelUnderwaterLight
     float3 Up;        // the local vertical at the camera
     float PhaseG;
     float On;         // 0: the fog model (Light), as before
+    // Stage A8: the caustics on the bed and the shafts in the water (strengths, 0 none: 1 as the
+    // waves focus the beam), and the pixel's jitter (0..1) for the shafts' march.
+    float CausticStrength;
+    float ShaftStrength;
+    float Jitter;
 };
 
 FVoxelUnderwaterLight VoxelUnderwaterNoLight()
@@ -195,6 +208,9 @@ FVoxelUnderwaterLight VoxelUnderwaterNoLight()
     L.Up = float3(0.0f, 0.0f, 1.0f);
     L.PhaseG = 0.0f;
     L.On = 0.0f;
+    L.CausticStrength = 0.0f;
+    L.ShaftStrength = 0.0f;
+    L.Jitter = 0.5f;
     return L;
 }
 
@@ -225,8 +241,9 @@ float VoxelUnderwaterPhaseOf(float CosTheta, float G)
 }
 
 /** The light the water scatters toward the eye along Dir from a point StartDepth (cm) under the
- *  surface, over Path (cm), per channel (per metre coefficients). */
-float3 VoxelUnderwaterInscatterOf(float3 Dir, float StartDepth, float Path, float3 Scattering, float3 Extinction, FVoxelUnderwaterLight L)
+ *  surface, over Path (cm), per channel (per metre coefficients). SunMod scales the sun's share
+ *  (stage A8: the shafts, the caustics' mean along the ray; 1 none). */
+float3 VoxelUnderwaterInscatterOf(float3 Dir, float StartDepth, float Path, float3 Scattering, float3 Extinction, FVoxelUnderwaterLight L, float SunMod)
 {
     const float D0 = max(StartDepth, 0.0f) * 0.01f;
     const float P = clamp(Path * 0.01f, 0.0f, VOXEL_UNDERWATER_MAX_PATH_M);
@@ -238,10 +255,58 @@ float3 VoxelUnderwaterInscatterOf(float3 Dir, float StartDepth, float Path, floa
     // The scattering angle: from the beam's direction of travel to the light's toward the eye (-Dir):
     // looking up into the beam is forward scattering, looking down at the bed back scattering.
     const float Phase = VoxelUnderwaterPhaseOf(dot(-Dir, L.SunDir), L.PhaseG);
-    const float3 SunTerm = Sun0 * Phase * VoxelUnderwaterIntegralOf(Extinction * (1.0f + S / MuW), P);
+    const float3 SunTerm = (Sun0 * (Phase * SunMod)) * VoxelUnderwaterIntegralOf(Extinction * (1.0f + S / MuW), P);
     const float3 SkyTerm = Sky0 * (1.0f / (2.0f * 3.14159265f)) * VoxelUnderwaterIntegralOf(Extinction + L.Kd * S, P);
     return max(Scattering * (SunTerm + SkyTerm), 0.0f);
 }
+
+#if VOXEL_UNDERWATER_HAS_CAUSTICS
+/** Stage A8: the sun's beam at a point in the water (from the camera), DepthCm under the mean surface,
+ *  against the beam unfocused: the surface point the beam came through (back up along the refracted
+ *  sun, on the sphere) and the path down from it (VoxelUnderwaterMapCaustic). */
+float VoxelUnderwaterCausticAt(float3 Point, float DepthCm, FVoxelUnderwaterLight L, float2 Sphere, FVoxelOceanWaveParams W)
+{
+    if (DepthCm <= 0.0f) return 1.0f;
+    const float MuW = max(-dot(L.SunDir, L.Up), 0.05f);
+    const float Slant = DepthCm / MuW;
+    const float3 Q = Point - L.SunDir * Slant;
+    const float Height = VoxelOceanSphereHeight(Q, Sphere.x, Sphere.y, normalize(-W.Center));
+    const float3 Foot = Q - normalize(Q - W.Center) * Height;
+    return VoxelUnderwaterMapCaustic(Foot, Slant * 0.01f);
+}
+
+// The shafts' samples along a ray.
+#define VOXEL_UNDERWATER_SHAFT_STEPS 12
+
+/** Stage A8: THE SHAFTS. The sun's in-scatter along the ray takes the beam's light at each point, so
+ *  the caustics' pattern through the water's depth shows as the shafts (points along one sun ray
+ *  share their surface point, so the light runs in streaks along the beam). The analytic integral
+ *  keeps the amount; this is its weighted mean of the caustics: samples spread by the integrand's own
+ *  decay (its extinction, the green and blue's, along the ray and down the beam), stratified and
+ *  jittered per pixel. 1 with no focusing. */
+float VoxelUnderwaterShaftOf(float3 Near, float3 Dir, float StartDepth, float Path, float3 Extinction, FVoxelUnderwaterLight L,
+    float2 Sphere, FVoxelOceanWaveParams W)
+{
+    const float S = -dot(Dir, L.Up);
+    const float MuW = max(-dot(L.SunDir, L.Up), 0.05f);
+    const float A = 0.5f * (Extinction.y + Extinction.z) * (1.0f + S / MuW);
+    const float AbsA = max(abs(A), 1.0e-3f);
+    const float P = clamp(Path * 0.01f, 0.0f, VOXEL_UNDERWATER_MAX_PATH_M);
+    const float Span = 1.0f - exp(-min(AbsA * P, 60.0f));
+    float Sum = 0.0f;
+    [loop]
+    for (int I = 0; I < VOXEL_UNDERWATER_SHAFT_STEPS; I++)
+    {
+        const float U = (float(I) + L.Jitter) / float(VOXEL_UNDERWATER_SHAFT_STEPS);
+        // Where the integrand's weight is U of the way: from the start where it decays, from the far
+        // end where it grows (looking up toward the brighter water).
+        const float Into = -log(max(1.0f - U * Span, 1.0e-6f)) / AbsA;
+        const float T = A >= 0.0f ? Into : max(P - Into, 0.0f);
+        Sum += VoxelUnderwaterCausticAt(Near + Dir * (T * 100.0f), StartDepth + S * T * 100.0f, L, Sphere, W);
+    }
+    return max(lerp(1.0f, Sum / float(VOXEL_UNDERWATER_SHAFT_STEPS), L.ShaftStrength), 0.0f);
+}
+#endif
 
 // The scene colour seen through the water along one pixel's ray from the reference point.
 // Dir: the ray (unit, world axes); NearDistance: to the near plane along it; SceneDistance: to
@@ -284,8 +349,14 @@ float3 VoxelUnderwaterColor(float3 SceneColor, float3 Dir, float NearDistance, f
         }
         // (Stage A7: outside the window, the water below as seen along the reflected ray.)
         const float3 Mirrored = Lit.On > 0.5f
-            ? VoxelUnderwaterInscatterOf(reflect(Dir, N), 0.0f, 1.0e5f, Scattering, Extinction, Lit) : WaterColor;
-        Behind = lerp(SceneColor, Mirrored, Fresnel);
+            ? VoxelUnderwaterInscatterOf(reflect(Dir, N), 0.0f, 1.0e5f, Scattering, Extinction, Lit, 1.0f) : WaterColor;
+        // Stage A7c: RADIANCE GOING INTO WATER GAINS n^2 (L / n^2 is what a ray keeps: the window
+        // squeezes the sky's whole hemisphere into its 97 degree cone), so the sky seen through the
+        // window is 1.78 times its radiance in air, past the Fresnel loss: the counterpart of the
+        // surface's pass dividing the water's light by n^2 on its way out. The scattering model's
+        // only; the fog model keeps its look.
+        const float WindowGain = Lit.On > 0.5f ? 1.7769f : 1.0f;
+        Behind = lerp(SceneColor * WindowGain, Mirrored, Fresnel);
 #if VOXEL_UNDERWATER_HAS_FOAM
         // The foam where it leaves (the map's, at the exit's foot on the sphere).
         const float4 FoamColor = VOXEL_UNDERWATER_FOAM_COLOR;
@@ -304,11 +375,34 @@ float3 VoxelUnderwaterColor(float3 SceneColor, float3 Dir, float NearDistance, f
         // Stage A7: the scattered light along the path, from the near plane's depth; a bed (the
         // scene in the water) lit only by what comes down to the depth it lies at.
         const float StartDepth = max(-NearHeight, 0.0f);
+        float SunMod = 1.0f;
         if (!bExits)
-            Behind *= exp(-min(Lit.Kd * (max(StartDepth - dot(Dir, Lit.Up) * min(Path, VOXEL_UNDERWATER_MAX_PATH_M * 100.0f), 0.0f) * 0.01f), 60.0f));
+        {
+            const float BedDepth = max(StartDepth - dot(Dir, Lit.Up) * min(Path, VOXEL_UNDERWATER_MAX_PATH_M * 100.0f), 0.0f);
+            float3 BedLight = exp(-min(Lit.Kd * (BedDepth * 0.01f), 60.0f));
+#if VOXEL_UNDERWATER_HAS_CAUSTICS
+            // Stage A8: THE CAUSTICS ON THE BED. Only the sun's unscattered beam focuses: its share of
+            // the light coming down (at the surface), dimmed by the beam's own extinction down its
+            // slant, moves by the caustics' light; the rest (the sky's, the scattered sun's) as before.
+            if (Lit.CausticStrength > 0.0f && W.FFT.x >= 0.5f && Path * 0.01f < VOXEL_UNDERWATER_MAX_PATH_M)
+            {
+                const float MuW = max(-dot(Lit.SunDir, Lit.Up), 0.05f);
+                const float3 SunDown = Lit.SunBeam * MuW;
+                const float3 Share = SunDown / max(SunDown + Lit.SkyDown, 1.0e-20f);
+                const float3 Beam = exp(-min(Extinction * (BedDepth * 0.01f / MuW), 60.0f));
+                const float Caustic = VoxelUnderwaterCausticAt(Near + Dir * Path, BedDepth, Lit, Sphere, W);
+                BedLight = max(BedLight + Share * Beam * (Lit.CausticStrength * (Caustic - 1.0f)), 0.0f);
+            }
+#endif
+            Behind *= BedLight;
+        }
+#if VOXEL_UNDERWATER_HAS_CAUSTICS
+        if (Lit.ShaftStrength > 0.0f && W.FFT.x >= 0.5f)
+            SunMod = VoxelUnderwaterShaftOf(Near, Dir, StartDepth, Path, Extinction, Lit, Sphere, W);
+#endif
         // Past the longest path nothing behind shows (and an unbounded sky colour can't make 0 x inf).
         Behind = Path * 0.01f < VOXEL_UNDERWATER_MAX_PATH_M ? Behind : float3(0.0f, 0.0f, 0.0f);
-        const float3 Lit3 = Behind * Transmittance + VoxelUnderwaterInscatterOf(Dir, StartDepth, Path, Scattering, Extinction, Lit);
+        const float3 Lit3 = Behind * Transmittance + VoxelUnderwaterInscatterOf(Dir, StartDepth, Path, Scattering, Extinction, Lit, SunMod);
         return lerp(Lit3, Meniscus.rgb, MeniscusMix);
     }
     const float3 Color = Behind * Transmittance + WaterColor * (1.0f - Transmittance);

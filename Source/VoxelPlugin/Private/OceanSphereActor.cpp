@@ -378,6 +378,9 @@ void AOceanSphereActor::UpdateUnderwater()
     Params.bScattering = S.bUnderwaterScattering;
     Params.ScatterGain = S.UnderwaterScatterGain;
     Params.PhaseG = S.PhaseG;
+    Params.bCaustics = S.bUnderwaterCaustics;
+    Params.CausticStrength = S.UnderwaterCausticStrength;
+    Params.ShaftStrength = S.UnderwaterShaftStrength;
     if (UDirectionalLightComponent* Sun = FindSunLight())
     {
         const FLinearColor E = Sun->GetColoredLightBrightness();

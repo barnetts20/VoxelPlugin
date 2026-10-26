@@ -154,6 +154,67 @@ VOXEL_FUNC float VoxelUnderwaterMapFoam(float3 Foot)
 }
 #endif
 
+#ifdef VOXEL_UNDERWATER_CAUSTIC_SAMPLE
+// Stage A8: THE CAUSTICS. The sun's beam refracts through the tilted surface: a ray's offset at path
+// L (m) along the beam below it is 0.25 L grad h (the refraction's deflection, 1 - 1/1.333, of a
+// small slope). UnderwaterCausticSplatCS sends each grid point's light along that offset at
+// VOXEL_UNDERWATER_CAUSTIC_SLICES paths (0.5 m, growing by 1.6: to 13 m), splatting it bilinearly
+// where it lands (atomics), from a margin past the grid's edge too so the edge keeps its light;
+// UnderwaterCausticBlurXCS and YCS blur each slice by a tent growing with its path (the sun's size,
+// and where the beam spreads the sources thin) and store the light against the beam's own (1: none focused; the bright network where the beam's
+// sheets fold, the dark cells between). Light is only moved, never made: the mean stays 1. The
+// first VOXEL_UNDERWATER_CAUSTIC_LEVELS levels have it (2 cm, 8 cm, 32 cm: to 40 m from the camera),
+// a texture array of Levels x Slices layers. Paths are along the beam: a point's depth over the
+// refracted sun's cosine; above the first slice the light goes to 1 at the surface, past the last
+// to 1 by twice its path (the beam's own blur, and the waves' scales overlapping).
+// The includer defines VOXEL_UNDERWATER_CAUSTIC_SAMPLE(Layer, UV) (float, bilinear) first.
+#define VOXEL_UNDERWATER_CAUSTIC_SLICES 8
+#define VOXEL_UNDERWATER_CAUSTIC_LEVELS 3
+#define VOXEL_UNDERWATER_CAUSTIC_FIRST 0.5f
+#define VOXEL_UNDERWATER_CAUSTIC_RATIO 1.6f
+
+/** Slice K's path (m). */
+VOXEL_FUNC float VoxelUnderwaterCausticSlicePath(int K)
+{
+    return VOXEL_UNDERWATER_CAUSTIC_FIRST * pow(VOXEL_UNDERWATER_CAUSTIC_RATIO, float(K));
+}
+
+/** A level's light at grid coordinates P and path L (m): its slices, interpolated in the log of the
+ *  path. */
+VOXEL_FUNC float VoxelUnderwaterCausticLevel(int Level, float2 P, float L)
+{
+    const float2 UV = (P + 0.5f) / float(VOXEL_UNDERWATER_MAP_SIZE);
+    const float Last = VoxelUnderwaterCausticSlicePath(VOXEL_UNDERWATER_CAUSTIC_SLICES - 1);
+    const float X = log2(max(L, 1.0e-3f) / VOXEL_UNDERWATER_CAUSTIC_FIRST) / log2(VOXEL_UNDERWATER_CAUSTIC_RATIO);
+    const float Xc = clamp(X, 0.0f, float(VOXEL_UNDERWATER_CAUSTIC_SLICES - 1));
+    const int K = min(int(floor(Xc)), VOXEL_UNDERWATER_CAUSTIC_SLICES - 2);
+    const float Base = float(Level * VOXEL_UNDERWATER_CAUSTIC_SLICES + K);
+    float C = lerp(VOXEL_UNDERWATER_CAUSTIC_SAMPLE(Base, UV), VOXEL_UNDERWATER_CAUSTIC_SAMPLE(Base + 1.0f, UV), Xc - float(K));
+    // Toward none at the surface, and past the last slice.
+    C = lerp(1.0f, C, saturate(L / VOXEL_UNDERWATER_CAUSTIC_FIRST));
+    return lerp(C, 1.0f, saturate((L - Last) / Last));
+}
+
+/** The beam's light at path L (m) below the surface over Foot (a sphere point), against the beam's
+ *  own (1: no focusing): the levels blended as the heights; 1 past the last caustic level. */
+VOXEL_FUNC float VoxelUnderwaterMapCaustic(float3 Foot, float L)
+{
+    float C = 0.0f;
+    float Rest = 1.0f;
+    VOXEL_LOOP
+    for (int Level = 0; Level < VOXEL_UNDERWATER_CAUSTIC_LEVELS; Level++)
+    {
+        const float2 P = VOXEL_UNDERWATER_MAP_COORDS(Level, Foot);
+        const float Cover = VoxelUnderwaterMapCover(P);
+        if (Cover <= 0.0f) continue;
+        C += Rest * Cover * VoxelUnderwaterCausticLevel(Level, P, L);
+        Rest *= 1.0f - Cover;
+        if (Rest <= 0.0f) break;
+    }
+    return C + Rest;
+}
+#endif
+
 // The finest level fully covering Foot, or else the coarsest covering it at all
 // (VOXEL_UNDERWATER_MAP_LEVELS if none): in a level's blend ring the heights are mostly the next
 // level's, so their differences are taken at its texel.

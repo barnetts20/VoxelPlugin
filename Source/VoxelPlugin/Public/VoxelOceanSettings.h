@@ -412,6 +412,20 @@ struct VOXELPLUGIN_API FVoxelOceanSettings
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Optics", meta = (EditCondition = "bUnderwaterScattering", ClampMin = "0.0", UIMax = "8.0"))
     float UnderwaterScatterGain = 2.0f;
 
+    /** Stage A8: the waves focus the sun's beam under the water: caustics on the bed, shafts in the
+     *  water (the FFT model, with the scattering). Seen from under the water for now. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Optics", meta = (EditCondition = "bUnderwaterScattering"))
+    bool bUnderwaterCaustics = true;
+
+    /** Stage A8: the caustics on the bed (1: as the waves focus the beam; 0 none). */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Optics", meta = (EditCondition = "bUnderwaterCaustics", ClampMin = "0.0", UIMax = "3.0"))
+    float UnderwaterCausticStrength = 1.0f;
+
+    /** Stage A8: the shafts in the water (1: as the waves focus the beam; 0 none, which skips their
+     *  march). */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Optics", meta = (EditCondition = "bUnderwaterCaustics", ClampMin = "0.0", UIMax = "3.0"))
+    float UnderwaterShaftStrength = 1.0f;
+
     /** The thin band (cm) where the near plane meets the surface. */
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Optics", meta = (ClampMin = "0.0", UIMax = "10.0"))
     double MeniscusWidth = 1.5;

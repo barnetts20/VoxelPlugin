@@ -1532,22 +1532,25 @@ void FVoxelOceanPages::ProbeDepth(const VoxelOceanDepthProbe::FLevels& Levels, d
                 return;
             }
             FRDGBuilder GraphBuilder(RHICmdList);
-            RDG_EVENT_SCOPE_STAT(GraphBuilder, VoxelOceanProbe, "VoxelOceanProbe");
-            VoxelOceanGPUTime::FScope OceanGPUTime(GraphBuilder, VoxelOceanGPUTime::Other);
-            const uint32 Count = (uint32)VoxelOceanDepthProbe::Points;
-            // The depths, then the bed's slopes (stage O9b2).
-            FRDGBufferRef Out = GraphBuilder.CreateBuffer(FRDGBufferDesc::CreateStructuredDesc(sizeof(float), 2 * Count), TEXT("Voxel.OceanProbe"));
-            FVoxelOceanProbeParameters* P = GraphBuilder.AllocParameters<FVoxelOceanProbeParameters>();
-            P->ProbePoints = GraphBuilder.CreateSRV(VoxelGPUCommon::UploadStructuredBuffer<int32>(GraphBuilder, TEXT("Voxel.OceanProbePoints"), MakeConstArrayView(Lattice)));
-            P->ProbeOut = GraphBuilder.CreateUAV(Out);
-            P->ProbeCount = Count;
-            P->ProbeLevelPoints = (uint32)(VoxelOceanDepthProbe::Size * VoxelOceanDepthProbe::Size);
-            P->ProbeFootprint = Footprint;
-            VOP::FillDensity(GraphBuilder, *Cache, Density, Edits, HalfFinest, Shore, Margin, DepthFootprintCm, InRadius, LandCache, P->Density);
-            FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("VoxelOceanProbe %u points", Count), TShaderMapRef<FVoxelOceanProbeCS>(ShaderMap), P,
-                FIntVector((int32)FMath::DivideAndRoundUp(Count, 64u), 1, 1));
-            GraphBuilder.QueueBufferExtraction(Out, &State->Depth);
-            OceanGPUTime.End();
+            // (The event scope closes before Execute: RDG's breadcrumbs assert on one left open.)
+            {
+                RDG_EVENT_SCOPE_STAT(GraphBuilder, VoxelOceanProbe, "VoxelOceanProbe");
+                VoxelOceanGPUTime::FScope OceanGPUTime(GraphBuilder, VoxelOceanGPUTime::Other);
+                const uint32 Count = (uint32)VoxelOceanDepthProbe::Points;
+                // The depths, then the bed's slopes (stage O9b2).
+                FRDGBufferRef Out = GraphBuilder.CreateBuffer(FRDGBufferDesc::CreateStructuredDesc(sizeof(float), 2 * Count), TEXT("Voxel.OceanProbe"));
+                FVoxelOceanProbeParameters* P = GraphBuilder.AllocParameters<FVoxelOceanProbeParameters>();
+                P->ProbePoints = GraphBuilder.CreateSRV(VoxelGPUCommon::UploadStructuredBuffer<int32>(GraphBuilder, TEXT("Voxel.OceanProbePoints"), MakeConstArrayView(Lattice)));
+                P->ProbeOut = GraphBuilder.CreateUAV(Out);
+                P->ProbeCount = Count;
+                P->ProbeLevelPoints = (uint32)(VoxelOceanDepthProbe::Size * VoxelOceanDepthProbe::Size);
+                P->ProbeFootprint = Footprint;
+                VOP::FillDensity(GraphBuilder, *Cache, Density, Edits, HalfFinest, Shore, Margin, DepthFootprintCm, InRadius, LandCache, P->Density);
+                FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("VoxelOceanProbe %u points", Count), TShaderMapRef<FVoxelOceanProbeCS>(ShaderMap), P,
+                    FIntVector((int32)FMath::DivideAndRoundUp(Count, 64u), 1, 1));
+                GraphBuilder.QueueBufferExtraction(Out, &State->Depth);
+                OceanGPUTime.End();
+            }
             GraphBuilder.Execute();
             State->Levels = Levels;
             State->bValid = State->Depth.IsValid();
@@ -1580,34 +1583,37 @@ bool FVoxelOceanPages::SampleCoastDepths(const TSharedPtr<FVoxelOceanCoastDepthJ
                 return;
             }
             FRDGBuilder GraphBuilder(RHICmdList);
-            RDG_EVENT_SCOPE_STAT(GraphBuilder, VoxelOceanProbe, "VoxelOceanCoastDepths");
-            VoxelOceanGPUTime::FScope OceanGPUTime(GraphBuilder, VoxelOceanGPUTime::Other);
-            FRDGBufferRef Out = GraphBuilder.CreateBuffer(FRDGBufferDesc::CreateStructuredDesc(sizeof(float), (uint32)Count), TEXT("Voxel.OceanCoastDepths"));
-            const uint32 NumGroups = FMath::Max(FMath::DivideAndRoundUp((uint32)Count, 64u), 1u);
-            const uint32 GroupsX = FMath::Min(NumGroups, 32768u);
-            FVoxelOceanCoastDepthParameters* P = GraphBuilder.AllocParameters<FVoxelOceanCoastDepthParameters>();
-            // (Stage W7d: none for the shore field's bake cells; the upload stands one in.)
-            P->CoastTiles = GraphBuilder.CreateSRV(VoxelGPUCommon::UploadStructuredBuffer<int32>(GraphBuilder, TEXT("Voxel.OceanCoastTiles"), MakeConstArrayView(Job->Tiles)));
-            P->CoastMode = (uint32)FMath::Max(Job->Mode, 0);
-            P->CoastOut = GraphBuilder.CreateUAV(Out);
-            P->CoastFirst = (uint32)First;
-            P->CoastCount = (uint32)Count;
-            P->CoastR = (uint32)Job->R;
-            P->CoastN = (uint32)Job->N;
-            P->CoastGroupsX = GroupsX;
-            P->CoastFootprint = (float)Job->FootprintCm;
-            P->CoastLatticeScale = (float)(InRadius / HalfFinest);
-            // The density only (stage O9m): the coastal field is the queries' and the server's too,
-            // which sample the terrain on the CPU.
-            VOP::FillDensity(GraphBuilder, *Cache, Density, Edits, HalfFinest, Shore, Margin, DepthFootprintCm, InRadius, nullptr, P->Density);
-            FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("VoxelOceanCoastDepths %d cells", Count), TShaderMapRef<FVoxelOceanCoastDepthCS>(ShaderMap), P,
-                FIntVector((int32)GroupsX, (int32)FMath::DivideAndRoundUp(NumGroups, GroupsX), 1));
             // The readback, released on the render thread whichever thread lets it go last (a poll
             // torn down at exit: as the shore builder's).
             TSharedPtr<VOP::FCoastReadback, ESPMode::ThreadSafe> Readback = MakeShared<VOP::FCoastReadback, ESPMode::ThreadSafe>();
             Readback->Buffer = MakeUnique<FRHIGPUBufferReadback>(TEXT("Voxel.OceanCoastDepthsReadback"));
-            AddEnqueueCopyPass(GraphBuilder, Readback->Buffer.Get(), Out, (uint32)Count * (uint32)sizeof(float));
-            OceanGPUTime.End();
+            // (The event scope closes before Execute: RDG's breadcrumbs assert on one left open.)
+            {
+                RDG_EVENT_SCOPE_STAT(GraphBuilder, VoxelOceanProbe, "VoxelOceanCoastDepths");
+                VoxelOceanGPUTime::FScope OceanGPUTime(GraphBuilder, VoxelOceanGPUTime::Other);
+                FRDGBufferRef Out = GraphBuilder.CreateBuffer(FRDGBufferDesc::CreateStructuredDesc(sizeof(float), (uint32)Count), TEXT("Voxel.OceanCoastDepths"));
+                const uint32 NumGroups = FMath::Max(FMath::DivideAndRoundUp((uint32)Count, 64u), 1u);
+                const uint32 GroupsX = FMath::Min(NumGroups, 32768u);
+                FVoxelOceanCoastDepthParameters* P = GraphBuilder.AllocParameters<FVoxelOceanCoastDepthParameters>();
+                // (Stage W7d: none for the shore field's bake cells; the upload stands one in.)
+                P->CoastTiles = GraphBuilder.CreateSRV(VoxelGPUCommon::UploadStructuredBuffer<int32>(GraphBuilder, TEXT("Voxel.OceanCoastTiles"), MakeConstArrayView(Job->Tiles)));
+                P->CoastMode = (uint32)FMath::Max(Job->Mode, 0);
+                P->CoastOut = GraphBuilder.CreateUAV(Out);
+                P->CoastFirst = (uint32)First;
+                P->CoastCount = (uint32)Count;
+                P->CoastR = (uint32)Job->R;
+                P->CoastN = (uint32)Job->N;
+                P->CoastGroupsX = GroupsX;
+                P->CoastFootprint = (float)Job->FootprintCm;
+                P->CoastLatticeScale = (float)(InRadius / HalfFinest);
+                // The density only (stage O9m): the coastal field is the queries' and the server's too,
+                // which sample the terrain on the CPU.
+                VOP::FillDensity(GraphBuilder, *Cache, Density, Edits, HalfFinest, Shore, Margin, DepthFootprintCm, InRadius, nullptr, P->Density);
+                FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("VoxelOceanCoastDepths %d cells", Count), TShaderMapRef<FVoxelOceanCoastDepthCS>(ShaderMap), P,
+                    FIntVector((int32)GroupsX, (int32)FMath::DivideAndRoundUp(NumGroups, GroupsX), 1));
+                AddEnqueueCopyPass(GraphBuilder, Readback->Buffer.Get(), Out, (uint32)Count * (uint32)sizeof(float));
+                OceanGPUTime.End();
+            }
             GraphBuilder.Execute();
             VoxelGPUCommon::PollRenderThread([Job, Readback, First, Count]() -> bool
                 {

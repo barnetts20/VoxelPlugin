@@ -59,6 +59,24 @@ static float3 GUnderwaterDaylight = float3(1.0f, 1.0f, 1.0f);
 #define VOXEL_UNDERWATER_MAP_E1(Level) UnderwaterMapE1[Level].xyz
 #define VOXEL_UNDERWATER_MAP_E2(Level) UnderwaterMapE2[Level].xyz
 
+// Stage A8: the caustics (VoxelUnderwaterMap.ush): the splat's accumulation (Levels x Slices layers,
+// VOXEL_UNDERWATER_CAUSTIC_FIXED per unit of a grid point's light), the resolved light and its
+// sampler (and the resolve's halfway texture); UnderwaterCausticOn 0: none. UnderwaterCaustic: x the
+// bed's caustics' strength, y the shafts' (0: no march), z the resolve's blur per metre of path (m).
+RWTexture2DArray<uint> UnderwaterCausticAccumOut;
+Texture2DArray<uint> UnderwaterCausticAccum;
+RWTexture2DArray<float> UnderwaterCausticTempOut;
+Texture2DArray<float> UnderwaterCausticTemp;
+RWTexture2DArray<float> UnderwaterCausticMapOut;
+Texture2DArray<float> UnderwaterCausticMap;
+SamplerState UnderwaterCausticSampler;
+uint UnderwaterCausticOn;
+float4 UnderwaterCaustic;
+#define VOXEL_UNDERWATER_CAUSTIC_FIXED 1024.0f
+// The splat's margin past the grid's edge (texels): past the deepest slice's reach at 2 cm.
+#define VOXEL_UNDERWATER_CAUSTIC_MARGIN 32
+#define VOXEL_UNDERWATER_CAUSTIC_SAMPLE(Layer, UV) UnderwaterCausticMap.SampleLevel(UnderwaterCausticSampler, float3(UV, Layer), 0.0f)
+
 // The shore (stage O8): the depth probe (levels: the anchor from the camera, world axes, and the
 // spacing in w; the plane's axes), UnderwaterProbeOn 0 without one. Ahead of the wave hook: its
 // inversion reads the depth at each step's point through it (VOXEL_OCEAN_HEIGHT_DEPTH).
@@ -197,12 +215,43 @@ uint UnderwaterScatterOn;
 float UnderwaterScatterGain;
 float UnderwaterPhaseG;
 float3 UnderwaterKd;
+// Stage A7c: the atmosphere's march up from the sea over the camera (UnderwaterAtmoOn bit 2): seven
+// cosine-weighted directions (the zenith, six at 49 degrees), float4(the light, its transmittance).
+Buffer<float4> UnderwaterAtmoSkyRays;
 
 RWTexture2D<float4> UnderwaterOutput;
 
 float VoxelUnderwaterAtmoSkyCoord(float U, float N)
 {
     return (saturate(U) * (N - 1.0f) + 0.5f) / N;
+}
+
+/** Stage A7c: THE SKY'S LIGHT ON THE SEA OVER THE CAMERA, cloud included (horizontal irradiance, per the
+ *  light above the air times UnderwaterSunIlluminance; not past the surface yet). The clear table's,
+ *  going to the clouds' own light as the sky closes: the mean of the atmosphere's march up along
+ *  seven cosine-weighted directions, times pi, by their mean transmittance. The same blend the
+ *  surface's pass makes for the sky the water above it is lit by (A3b), so the light that goes
+ *  into the water from above is the light that comes down to the camera under it. */
+float3 VoxelUnderwaterSkyIrradianceOf(float MuS)
+{
+    const float Z = 0.5f + 0.5f * sign(MuS) * sqrt(abs(MuS));
+    float3 Sky = UnderwaterSunIlluminance * UnderwaterAtmoSkyIrradiance.SampleLevel(UnderwaterAtmoSkySampler,
+        float2(VoxelUnderwaterAtmoSkyCoord(Z, UnderwaterAtmoSkySize.w), 0.5f), 0.0f).rgb;
+    if ((UnderwaterAtmoOn & 4u) != 0u)
+    {
+        float3 March = float3(0.0f, 0.0f, 0.0f);
+        float Gap = 0.0f;
+        [unroll]
+        for (int I = 0; I < 7; I++)
+        {
+            const float4 R = UnderwaterAtmoSkyRays[I];
+            March += R.rgb;
+            Gap += R.a;
+        }
+        Gap = saturate(Gap / 7.0f);
+        Sky = Sky * Gap + 3.14159265f * (March / 7.0f) * (1.0f - Gap);
+    }
+    return Sky;
 }
 
 /** Stage A4: the daylight reaching the sea over the camera, against the light above the air at
@@ -221,13 +270,9 @@ float3 VoxelUnderwaterDaylightOf()
     // Schlick's reflection at the sun's incidence (the water's 0.02 at normal incidence).
     const float Pass = 1.0f - (0.02f + 0.98f * pow(1.0f - Mu, 5.0f));
     float3 E = UnderwaterSunIlluminance * Sun.rgb * (Sun.a * Mu * Pass);
+    // The sky's diffuse light past the surface's mean reflection (6.6%).
     if ((UnderwaterAtmoOn & 2u) != 0u)
-    {
-        const float Z = 0.5f + 0.5f * sign(MuS) * sqrt(abs(MuS));
-        // The sky's diffuse light past the surface's mean reflection (6.6%).
-        E += UnderwaterSunIlluminance * UnderwaterAtmoSkyIrradiance.SampleLevel(UnderwaterAtmoSkySampler,
-            float2(VoxelUnderwaterAtmoSkyCoord(Z, UnderwaterAtmoSkySize.w), 0.5f), 0.0f).rgb * 0.934f;
-    }
+        E += VoxelUnderwaterSkyIrradianceOf(MuS) * 0.934f;
     const float Reference = max(dot(UnderwaterSunIlluminance, float3(0.2126f, 0.7152f, 0.0722f)), 1.0e-20f);
     return max(E / Reference, 0.0f);
 }
@@ -255,15 +300,14 @@ FVoxelUnderwaterLight VoxelUnderwaterLightOf(float PreExposure)
     Lit.SunDir = Down;
     float3 Sky = UnderwaterSunIlluminance * 0.1f * Mu;
     if ((UnderwaterAtmoOn & 2u) != 0u)
-    {
-        const float Z = 0.5f + 0.5f * sign(MuS) * sqrt(abs(MuS));
-        Sky = UnderwaterSunIlluminance * UnderwaterAtmoSkyIrradiance.SampleLevel(UnderwaterAtmoSkySampler,
-            float2(VoxelUnderwaterAtmoSkyCoord(Z, UnderwaterAtmoSkySize.w), 0.5f), 0.0f).rgb;
-    }
+        Sky = VoxelUnderwaterSkyIrradianceOf(MuS);
     Lit.SkyDown = Sky * 0.934f * Gain;
     Lit.Kd = UnderwaterKd;
     Lit.Up = Up;
     Lit.PhaseG = clamp(UnderwaterPhaseG, -0.95f, 0.95f);
+    // Stage A8: the caustics (the jitter is the pixel's: UnderwaterCS).
+    Lit.CausticStrength = UnderwaterCausticOn != 0u ? max(UnderwaterCaustic.x, 0.0f) : 0.0f;
+    Lit.ShaftStrength = UnderwaterCausticOn != 0u ? max(UnderwaterCaustic.y, 0.0f) : 0.0f;
     Lit.On = 1.0f;
     return Lit;
 }
@@ -308,6 +352,96 @@ void UnderwaterMapCS(uint3 DispatchThreadId : SV_DispatchThreadID)
     UnderwaterFoamMapOut[DispatchThreadId] = UnderwaterFoamOn != 0u ? max(Surface.Foam, Surface.Whitecap) : 0.0f;
 }
 
+// Stage A8: THE CAUSTICS' SPLAT (VoxelUnderwaterMap.ush). One grid point per thread (x, y from a
+// margin past the grid, z the level): the surface's slope there (the heights' central differences;
+// past the edge the edge's, so the light keeps coming in), and its light sent along the beam's
+// deflection at each slice's path, splatted bilinearly into the accumulation.
+[numthreads(VOXEL_UNDERWATER_THREADS, VOXEL_UNDERWATER_THREADS, 1)]
+void UnderwaterCausticSplatCS(uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+    const int N = VOXEL_UNDERWATER_MAP_SIZE;
+    const int M = VOXEL_UNDERWATER_CAUSTIC_MARGIN;
+    if (any(DispatchThreadId.xy >= uint2(uint(N + 2 * M), uint(N + 2 * M))) || DispatchThreadId.z >= uint(VOXEL_UNDERWATER_CAUSTIC_LEVELS)) return;
+    const int Level = int(DispatchThreadId.z);
+    const int X = int(DispatchThreadId.x) - M;
+    const int Y = int(DispatchThreadId.y) - M;
+    const int Xc = clamp(X, 1, N - 2);
+    const int Yc = clamp(Y, 1, N - 2);
+    const float Texel = UnderwaterMapAnchor[Level].w;
+    const float2 Slope = float2(
+        UnderwaterMap.Load(int4(Xc + 1, Yc, Level, 0)) - UnderwaterMap.Load(int4(Xc - 1, Yc, Level, 0)),
+        UnderwaterMap.Load(int4(Xc, Yc + 1, Level, 0)) - UnderwaterMap.Load(int4(Xc, Yc - 1, Level, 0))) / (2.0f * Texel);
+    [loop]
+    for (int K = 0; K < VOXEL_UNDERWATER_CAUSTIC_SLICES; K++)
+    {
+        // The deflection 0.25 L grad h, in texels.
+        const float2 R = float2(float(X), float(Y)) + Slope * (25.0f * VoxelUnderwaterCausticSlicePath(K) / Texel);
+        const float2 B = floor(R);
+        const float2 F = R - B;
+        const int2 I = int2(B);
+        const uint Layer = uint(Level * VOXEL_UNDERWATER_CAUSTIC_SLICES + K);
+        [unroll]
+        for (int C = 0; C < 4; C++)
+        {
+            const int2 O = int2(C & 1, C >> 1);
+            const int2 Q = I + O;
+            if (any(Q < int2(0, 0)) || any(Q > int2(N - 1, N - 1))) continue;
+            const float Wx = O.x != 0 ? F.x : 1.0f - F.x;
+            const float Wy = O.y != 0 ? F.y : 1.0f - F.y;
+            const uint Add = uint(Wx * Wy * VOXEL_UNDERWATER_CAUSTIC_FIXED + 0.5f);
+            if (Add != 0u) InterlockedAdd(UnderwaterCausticAccumOut[uint3(uint2(Q), Layer)], Add);
+        }
+    }
+}
+
+// Stage A8: THE CAUSTICS' RESOLVE, in two passes (x then y): a tent as wide as the blur at the slice's
+// path, UnderwaterCaustic.z per metre of it (the sun's size, 0.4 degrees in water, and where the
+// beam spreads the splat's sources thin: 1.9 cm a metre), 1 to 6 texels, so the splat's grain and
+// stripes smooth out deeper down. One texel per thread, z the layer (level x slices + slice).
+int VoxelUnderwaterCausticRadiusOf(int Layer)
+{
+    const int Level = Layer / VOXEL_UNDERWATER_CAUSTIC_SLICES;
+    const int K = Layer - Level * VOXEL_UNDERWATER_CAUSTIC_SLICES;
+    return clamp(int(UnderwaterCaustic.z * VoxelUnderwaterCausticSlicePath(K) * 100.0f / UnderwaterMapAnchor[Level].w + 0.5f), 1, 6);
+}
+
+[numthreads(VOXEL_UNDERWATER_THREADS, VOXEL_UNDERWATER_THREADS, 1)]
+void UnderwaterCausticBlurXCS(uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+    const int N = VOXEL_UNDERWATER_MAP_SIZE;
+    if (any(DispatchThreadId.xy >= uint2(uint(N), uint(N))) || DispatchThreadId.z >= uint(VOXEL_UNDERWATER_CAUSTIC_LEVELS * VOXEL_UNDERWATER_CAUSTIC_SLICES)) return;
+    const int Layer = int(DispatchThreadId.z);
+    const int Radius = VoxelUnderwaterCausticRadiusOf(Layer);
+    const int2 P = int2(DispatchThreadId.xy);
+    float Sum = 0.0f;
+    [loop]
+    for (int I = -Radius; I <= Radius; I++)
+    {
+        const int X = clamp(P.x + I, 0, N - 1);
+        Sum += float(Radius + 1 - abs(I)) * float(UnderwaterCausticAccum.Load(int4(X, P.y, Layer, 0)));
+    }
+    const float Weight = float((Radius + 1) * (Radius + 1));
+    UnderwaterCausticTempOut[DispatchThreadId] = Sum / (Weight * VOXEL_UNDERWATER_CAUSTIC_FIXED);
+}
+
+[numthreads(VOXEL_UNDERWATER_THREADS, VOXEL_UNDERWATER_THREADS, 1)]
+void UnderwaterCausticBlurYCS(uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+    const int N = VOXEL_UNDERWATER_MAP_SIZE;
+    if (any(DispatchThreadId.xy >= uint2(uint(N), uint(N))) || DispatchThreadId.z >= uint(VOXEL_UNDERWATER_CAUSTIC_LEVELS * VOXEL_UNDERWATER_CAUSTIC_SLICES)) return;
+    const int Layer = int(DispatchThreadId.z);
+    const int Radius = VoxelUnderwaterCausticRadiusOf(Layer);
+    const int2 P = int2(DispatchThreadId.xy);
+    float Sum = 0.0f;
+    [loop]
+    for (int I = -Radius; I <= Radius; I++)
+    {
+        const int Y = clamp(P.y + I, 0, N - 1);
+        Sum += float(Radius + 1 - abs(I)) * UnderwaterCausticTemp.Load(int4(P.x, Y, Layer, 0));
+    }
+    UnderwaterCausticMapOut[DispatchThreadId] = Sum / float((Radius + 1) * (Radius + 1));
+}
+
 [numthreads(VOXEL_UNDERWATER_THREADS, VOXEL_UNDERWATER_THREADS, 1)]
 void UnderwaterCS(uint3 DispatchThreadId : SV_DispatchThreadID)
 {
@@ -333,9 +467,14 @@ void UnderwaterCS(uint3 DispatchThreadId : SV_DispatchThreadID)
     GUnderwaterDaylight = VoxelUnderwaterDaylightOf();
     const float PreExposure = View.PreExposure;
     const FVoxelOceanWaveParams Waves = VoxelUnderwaterWaveParams();
+    // Stage A8: the shafts' jitter, the pixel's and the frame's (interleaved gradient noise; the
+    // temporal upscaler after this pass averages it out).
+    FVoxelUnderwaterLight Lit = VoxelUnderwaterLightOf(PreExposure);
+    const float2 Noise = float2(Pixel) + 5.588238f * float(View.StateFrameIndexMod8);
+    Lit.Jitter = frac(52.9829189f * frac(dot(Noise, float2(0.06711056f, 0.00583715f))));
     const float3 Color = VoxelUnderwaterColor(Scene.rgb, Dir, NearDistance, SceneDistance, UnderwaterSphere, Waves,
         UnderwaterDisplacement, UnderwaterDisplacementSampler, UnderwaterDerivatives, UnderwaterDerivativesSampler, UnderwaterCharts,
         UnderwaterAbsorption, UnderwaterScattering, UnderwaterLight * GUnderwaterDaylight * UnderwaterDepthLight * PreExposure,
-        float4(UnderwaterMeniscus.rgb * GUnderwaterDaylight * PreExposure, UnderwaterMeniscus.w), VoxelUnderwaterLightOf(PreExposure));
+        float4(UnderwaterMeniscus.rgb * GUnderwaterDaylight * PreExposure, UnderwaterMeniscus.w), Lit);
     UnderwaterOutput[Pixel] = float4(Color, Scene.a);
 }

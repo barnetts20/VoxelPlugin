@@ -60,6 +60,11 @@ struct FVoxelUnderwaterParams
     bool bScattering = true;
     float ScatterGain = 2.0f;
     float PhaseG = 0.8f;
+    /** Stage A8: the caustics on the bed and the shafts in the water (the FFT model, with the
+     *  scattering), their strengths (1: as the waves focus the beam). */
+    bool bCaustics = true;
+    float CausticStrength = 1.0f;
+    float ShaftStrength = 1.0f;
 
     /** The FFT model's textures (FVoxelOceanCascadeTextures' resources; null for any other
      *  model). Read only by SetFrame_GameThread's render command, which keeps references to their

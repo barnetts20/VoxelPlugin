@@ -37,7 +37,16 @@ namespace VoxelUnderwaterDetail
     constexpr double CameraProbeMaxMove = 2000.0;
     constexpr double CameraProbeRise = 300.0;
     constexpr double CameraProbeMargin = 30.0;
+    /** Stage A8: the caustics' levels, slices and splat margin (texels): VoxelUnderwaterMap.ush's and
+     *  VoxelUnderwaterPass.usf's VOXEL_UNDERWATER_CAUSTIC_LEVELS, _SLICES and _MARGIN. The resolve's
+     *  blur per metre of path (m): the sun's size in water (0.007) and where the beam spreads the
+     *  splat's sources thin (the test sea's stripes went at 0.019). */
+    constexpr int32 CausticLevels = 3;
+    constexpr int32 CausticSlices = 8;
+    constexpr int32 CausticMargin = 32;
+    constexpr float CausticBlur = 0.019f;
 }
+static_assert(VoxelUnderwaterDetail::CausticLevels <= VoxelUnderwaterMap::Levels, "the caustics' levels are the surface map's first");
 
 // ---------------------------------------------------------------------------
 // Shader
@@ -103,6 +112,13 @@ BEGIN_SHADER_PARAMETER_STRUCT(FVoxelUnderwaterParameters, )
     SHADER_PARAMETER(float, UnderwaterScatterGain)
     SHADER_PARAMETER(float, UnderwaterPhaseG)
     SHADER_PARAMETER(FVector3f, UnderwaterKd)
+    // Stage A7c: the atmosphere's march up from the sea over the camera (UnderwaterAtmoOn bit 2).
+    SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<float4>, UnderwaterAtmoSkyRays)
+    // Stage A8: the caustics (UnderwaterCausticOn 0: none; strengths and the sun's blur).
+    SHADER_PARAMETER_RDG_TEXTURE(Texture2DArray<float>, UnderwaterCausticMap)
+    SHADER_PARAMETER_SAMPLER(SamplerState, UnderwaterCausticSampler)
+    SHADER_PARAMETER(uint32, UnderwaterCausticOn)
+    SHADER_PARAMETER(FVector4f, UnderwaterCaustic)
 
     SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2D<float4>, UnderwaterOutput)
 END_SHADER_PARAMETER_STRUCT()
@@ -173,6 +189,82 @@ public:
 };
 
 IMPLEMENT_GLOBAL_SHADER(FVoxelUnderwaterMapCS, "/Plugin/VoxelPlugin/Private/VoxelUnderwaterPass.usf", "UnderwaterMapCS", SF_Compute);
+
+// Stage A8: the caustics' splat (the map's slopes into the accumulation) and resolve (into the map).
+BEGIN_SHADER_PARAMETER_STRUCT(FVoxelUnderwaterCausticSplatParameters, )
+    SHADER_PARAMETER_ARRAY(FVector4f, UnderwaterMapAnchor, [VoxelUnderwaterMap::Levels])
+    SHADER_PARAMETER_RDG_TEXTURE(Texture2DArray<float>, UnderwaterMap)
+    SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2DArray<uint>, UnderwaterCausticAccumOut)
+END_SHADER_PARAMETER_STRUCT()
+
+class FVoxelUnderwaterCausticSplatCS : public FGlobalShader
+{
+public:
+    DECLARE_GLOBAL_SHADER(FVoxelUnderwaterCausticSplatCS);
+    using FParameters = FVoxelUnderwaterCausticSplatParameters;
+    SHADER_USE_PARAMETER_STRUCT(FVoxelUnderwaterCausticSplatCS, FGlobalShader);
+
+    static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
+    {
+        return IsFeatureLevelSupported(Parameters.Platform, ERHIFeatureLevel::SM5);
+    }
+
+    static void ModifyCompilationEnvironment(const FGlobalShaderPermutationParameters& Parameters, FShaderCompilerEnvironment& OutEnvironment)
+    {
+        FVoxelUnderwaterCS::ModifyCompilationEnvironment(Parameters, OutEnvironment);
+    }
+};
+
+IMPLEMENT_GLOBAL_SHADER(FVoxelUnderwaterCausticSplatCS, "/Plugin/VoxelPlugin/Private/VoxelUnderwaterPass.usf", "UnderwaterCausticSplatCS", SF_Compute);
+
+BEGIN_SHADER_PARAMETER_STRUCT(FVoxelUnderwaterCausticBlurParameters, )
+    SHADER_PARAMETER_ARRAY(FVector4f, UnderwaterMapAnchor, [VoxelUnderwaterMap::Levels])
+    SHADER_PARAMETER(FVector4f, UnderwaterCaustic)
+    SHADER_PARAMETER_RDG_TEXTURE(Texture2DArray<uint>, UnderwaterCausticAccum)
+    SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2DArray<float>, UnderwaterCausticTempOut)
+    SHADER_PARAMETER_RDG_TEXTURE(Texture2DArray<float>, UnderwaterCausticTemp)
+    SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2DArray<float>, UnderwaterCausticMapOut)
+END_SHADER_PARAMETER_STRUCT()
+
+class FVoxelUnderwaterCausticBlurXCS : public FGlobalShader
+{
+public:
+    DECLARE_GLOBAL_SHADER(FVoxelUnderwaterCausticBlurXCS);
+    using FParameters = FVoxelUnderwaterCausticBlurParameters;
+    SHADER_USE_PARAMETER_STRUCT(FVoxelUnderwaterCausticBlurXCS, FGlobalShader);
+
+    static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
+    {
+        return IsFeatureLevelSupported(Parameters.Platform, ERHIFeatureLevel::SM5);
+    }
+
+    static void ModifyCompilationEnvironment(const FGlobalShaderPermutationParameters& Parameters, FShaderCompilerEnvironment& OutEnvironment)
+    {
+        FVoxelUnderwaterCS::ModifyCompilationEnvironment(Parameters, OutEnvironment);
+    }
+};
+
+IMPLEMENT_GLOBAL_SHADER(FVoxelUnderwaterCausticBlurXCS, "/Plugin/VoxelPlugin/Private/VoxelUnderwaterPass.usf", "UnderwaterCausticBlurXCS", SF_Compute);
+
+class FVoxelUnderwaterCausticBlurYCS : public FGlobalShader
+{
+public:
+    DECLARE_GLOBAL_SHADER(FVoxelUnderwaterCausticBlurYCS);
+    using FParameters = FVoxelUnderwaterCausticBlurParameters;
+    SHADER_USE_PARAMETER_STRUCT(FVoxelUnderwaterCausticBlurYCS, FGlobalShader);
+
+    static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
+    {
+        return IsFeatureLevelSupported(Parameters.Platform, ERHIFeatureLevel::SM5);
+    }
+
+    static void ModifyCompilationEnvironment(const FGlobalShaderPermutationParameters& Parameters, FShaderCompilerEnvironment& OutEnvironment)
+    {
+        FVoxelUnderwaterCS::ModifyCompilationEnvironment(Parameters, OutEnvironment);
+    }
+};
+
+IMPLEMENT_GLOBAL_SHADER(FVoxelUnderwaterCausticBlurYCS, "/Plugin/VoxelPlugin/Private/VoxelUnderwaterPass.usf", "UnderwaterCausticBlurYCS", SF_Compute);
 
 // ---------------------------------------------------------------------------
 // Extension
@@ -486,6 +578,67 @@ FScreenPassTexture FVoxelUnderwaterViewExtension::Render_RenderThread(
         AddClearUAVPass(GraphBuilder, GraphBuilder.CreateUAV(FoamMap), FLinearColor::Black);
     }
 
+    // -- Stage A8: the caustics, from the map's slopes (the FFT model, the scattered light) ------------
+    const bool bCaustics = bFFT && Params.bScattering && Params.bCaustics
+        && (Params.CausticStrength > 0.0f || Params.ShaftStrength > 0.0f);
+    const FVector4f CausticInfo(FMath::Max(Params.CausticStrength, 0.0f), FMath::Max(Params.ShaftStrength, 0.0f),
+        VoxelUnderwaterDetail::CausticBlur, 0.0f);
+    FRDGTextureRef CausticMap = nullptr;
+    {
+        using namespace VoxelUnderwaterDetail;
+        const int32 Size = bCaustics ? VoxelUnderwaterMap::Size : 1;
+        const int32 Layers = bCaustics ? CausticLevels * CausticSlices : 1;
+        CausticMap = GraphBuilder.CreateTexture(FRDGTextureDesc::Create2DArray(FIntPoint(Size, Size), PF_R16F, FClearValueBinding::Black,
+            TexCreate_ShaderResource | TexCreate_UAV, Layers), TEXT("VoxelUnderwater.CausticMap"));
+        if (bCaustics)
+        {
+            FRDGTextureRef Accum = GraphBuilder.CreateTexture(FRDGTextureDesc::Create2DArray(FIntPoint(Size, Size), PF_R32_UINT, FClearValueBinding::Black,
+                TexCreate_ShaderResource | TexCreate_UAV, Layers), TEXT("VoxelUnderwater.CausticAccum"));
+            AddClearUAVPass(GraphBuilder, GraphBuilder.CreateUAV(Accum), FUintVector4(0u, 0u, 0u, 0u));
+            const FGlobalShaderMap* ShaderMap = GetGlobalShaderMap(View.GetFeatureLevel());
+            {
+                FVoxelUnderwaterCausticSplatParameters* P = GraphBuilder.AllocParameters<FVoxelUnderwaterCausticSplatParameters>();
+                for (int32 Level = 0; Level < VoxelUnderwaterMap::Levels; Level++)
+                    P->UnderwaterMapAnchor[Level] = WaveP.UnderwaterMapAnchor[Level];
+                P->UnderwaterMap = Map;
+                P->UnderwaterCausticAccumOut = GraphBuilder.CreateUAV(Accum);
+                const int32 Span = Size + 2 * CausticMargin;
+                TShaderMapRef<FVoxelUnderwaterCausticSplatCS> Shader(ShaderMap);
+                FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("Underwater caustics splat %dx%dx%d", Span, Span, CausticLevels), Shader, P,
+                    FIntVector(FMath::DivideAndRoundUp(Span, ThreadGroupSize), FMath::DivideAndRoundUp(Span, ThreadGroupSize), CausticLevels));
+            }
+            // The resolve: x into a halfway texture, then y into the map. Each pass binds only its own
+            // input and output; the other two stay unset (its shader doesn't use them).
+            FRDGTextureRef Temp = GraphBuilder.CreateTexture(FRDGTextureDesc::Create2DArray(FIntPoint(Size, Size), PF_R16F, FClearValueBinding::Black,
+                TexCreate_ShaderResource | TexCreate_UAV, Layers), TEXT("VoxelUnderwater.CausticHalfway"));
+            const FIntVector Groups(FMath::DivideAndRoundUp(Size, ThreadGroupSize), FMath::DivideAndRoundUp(Size, ThreadGroupSize), Layers);
+            {
+                FVoxelUnderwaterCausticBlurParameters* P = GraphBuilder.AllocParameters<FVoxelUnderwaterCausticBlurParameters>();
+                for (int32 Level = 0; Level < VoxelUnderwaterMap::Levels; Level++)
+                    P->UnderwaterMapAnchor[Level] = WaveP.UnderwaterMapAnchor[Level];
+                P->UnderwaterCaustic = CausticInfo;
+                P->UnderwaterCausticAccum = Accum;
+                P->UnderwaterCausticTempOut = GraphBuilder.CreateUAV(Temp);
+                TShaderMapRef<FVoxelUnderwaterCausticBlurXCS> Shader(ShaderMap);
+                FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("Underwater caustics blur x %dx%dx%d", Size, Size, Layers), Shader, P, Groups);
+            }
+            {
+                FVoxelUnderwaterCausticBlurParameters* P = GraphBuilder.AllocParameters<FVoxelUnderwaterCausticBlurParameters>();
+                for (int32 Level = 0; Level < VoxelUnderwaterMap::Levels; Level++)
+                    P->UnderwaterMapAnchor[Level] = WaveP.UnderwaterMapAnchor[Level];
+                P->UnderwaterCaustic = CausticInfo;
+                P->UnderwaterCausticTemp = Temp;
+                P->UnderwaterCausticMapOut = GraphBuilder.CreateUAV(CausticMap);
+                TShaderMapRef<FVoxelUnderwaterCausticBlurYCS> Shader(ShaderMap);
+                FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("Underwater caustics blur y %dx%dx%d", Size, Size, Layers), Shader, P, Groups);
+            }
+        }
+        else
+        {
+            AddClearUAVPass(GraphBuilder, GraphBuilder.CreateUAV(CausticMap), FVector4f(1.0f, 1.0f, 1.0f, 1.0f));
+        }
+    }
+
     // -- Stage A4: the light from the atmosphere -------------------------------------------------
     // The sun at the sea over the camera (the atmosphere's surface-sun pass at that one point), and
     // the sky's irradiance (its sky tables, made this frame by the ocean's pass already).
@@ -496,6 +649,17 @@ FScreenPassTexture FVoxelUnderwaterViewExtension::Render_RenderThread(
         FRDGBufferDesc::CreateBufferDesc(sizeof(FVector4f), 2), NoAtmoSun, sizeof(NoAtmoSun));
     FRDGTextureRef AtmoSky = nullptr;
     FRDGTextureRef AtmoSkyIrradiance = nullptr;
+    // Stage A7c: the cloud in the light coming down. The atmosphere's own march (its reflection
+    // pass) up from the sea over the camera along a cosine-weighted set of directions: the zenith and
+    // six at 49 degrees (the centroid of the projected disc's outer six sevenths), so their mean
+    // light times pi is the irradiance; float4(the light, its transmittance). Its stand-in: clear.
+    constexpr int32 SkyRayCount = 7;
+    static const FVector4f ClearSkyRays[SkyRayCount] = {
+        FVector4f(0.0f, 0.0f, 0.0f, 1.0f), FVector4f(0.0f, 0.0f, 0.0f, 1.0f), FVector4f(0.0f, 0.0f, 0.0f, 1.0f),
+        FVector4f(0.0f, 0.0f, 0.0f, 1.0f), FVector4f(0.0f, 0.0f, 0.0f, 1.0f), FVector4f(0.0f, 0.0f, 0.0f, 1.0f),
+        FVector4f(0.0f, 0.0f, 0.0f, 1.0f) };
+    FRDGBufferRef AtmoSkyRays = CreateVertexBuffer(GraphBuilder, TEXT("VoxelUnderwater.AtmoSkyRays"),
+        FRDGBufferDesc::CreateBufferDesc(sizeof(FVector4f), SkyRayCount), ClearSkyRays, sizeof(ClearSkyRays));
     if (const TSharedPtr<FAtmosphereViewExtension, ESPMode::ThreadSafe> Atmosphere = Params.Atmosphere.Pin();
         Atmosphere.IsValid() && !Params.SunIlluminance.IsNearlyZero() && !Params.SunDirection.IsNearlyZero())
     {
@@ -511,6 +675,31 @@ FScreenPassTexture FVoxelUnderwaterViewExtension::Render_RenderThread(
             AtmoOn |= 1u;
         if (Atmosphere->GetSkyTables_RenderThread(GraphBuilder, View, AtmoSky, AtmoSkyIrradiance) && AtmoSkyIrradiance)
             AtmoOn |= 2u;
+        if ((AtmoOn & 2u) != 0u && Params.bScattering)
+        {
+            // From a metre over the sea above the camera (camera-relative, as the sun's point).
+            const FVector Up = Distance > 1.0 ? FromCenter / Distance : FVector::UpVector;
+            FVector T1, T2;
+            Up.FindBestAxisVectors(T1, T2);
+            const FVector Origin = Over + Up * 100.0;
+            float Rays[SkyRayCount * 6];
+            for (int32 I = 0; I < SkyRayCount; I++)
+            {
+                const double Angle = (double)(I - 1) * (UE_DOUBLE_PI / 3.0);
+                const FVector Dir = I == 0 ? Up : (Up * 0.6547 + (T1 * FMath::Cos(Angle) + T2 * FMath::Sin(Angle)) * 0.7559).GetSafeNormal();
+                Rays[I * 6 + 0] = (float)Origin.X;
+                Rays[I * 6 + 1] = (float)Origin.Y;
+                Rays[I * 6 + 2] = (float)Origin.Z;
+                Rays[I * 6 + 3] = (float)Dir.X;
+                Rays[I * 6 + 4] = (float)Dir.Y;
+                Rays[I * 6 + 5] = (float)Dir.Z;
+            }
+            FRDGBufferRef RayBuffer = CreateVertexBuffer(GraphBuilder, TEXT("VoxelUnderwater.AtmoSkyRayDirs"),
+                FRDGBufferDesc::CreateBufferDesc(sizeof(float), SkyRayCount * 6), Rays, sizeof(Rays));
+            if (Atmosphere->AddReflectionPass_RenderThread(GraphBuilder, View, GraphBuilder.CreateSRV(RayBuffer, PF_R32_FLOAT),
+                (uint32)SkyRayCount, (uint32)SkyRayCount, 16, 32, GraphBuilder.CreateUAV(AtmoSkyRays, PF_A32B32G32R32F)))
+                AtmoOn |= 4u;
+        }
     }
     if ((AtmoOn & 2u) == 0u)
     {
@@ -540,6 +729,11 @@ FScreenPassTexture FVoxelUnderwaterViewExtension::Render_RenderThread(
         P->UnderwaterScatterGain = Params.ScatterGain;
         P->UnderwaterPhaseG = Params.PhaseG;
         P->UnderwaterKd = (Params.Absorption + Params.Scattering * 0.25f) * FMath::Max(Params.DepthDarkening, 0.0f);
+        P->UnderwaterAtmoSkyRays = GraphBuilder.CreateSRV(AtmoSkyRays, PF_A32B32G32R32F);
+        P->UnderwaterCausticMap = CausticMap;
+        P->UnderwaterCausticSampler = TStaticSamplerState<SF_Bilinear, AM_Clamp, AM_Clamp, AM_Clamp>::GetRHI();
+        P->UnderwaterCausticOn = bCaustics ? 1u : 0u;
+        P->UnderwaterCaustic = CausticInfo;
 
         P->View = View.ViewUniformBuffer;
         P->UnderwaterSceneColor = SceneColor.Texture;

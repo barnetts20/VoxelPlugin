@@ -969,377 +969,380 @@ void VoxelLandSolve::FJob::Tick(FRHICommandListImmediate& RHICmdList, const FPla
     I.PhaseFrames++;
 
     FRDGBuilder GraphBuilder(RHICmdList);
-    RDG_EVENT_SCOPE_STAT(GraphBuilder, VoxelLandSolve, "VoxelLand solve");
-    FImpl::FFrame F;
-    I.Register(GraphBuilder, Fields, F);
-    const FSettings& S = I.S;
     bool bFailed = false;
     bool bFinished = false;
-
-    // Phases may follow each other within a frame; the loop stops at one that waits.
-    for (int32 Guard = 0; Guard < 8 && !bFailed && !bFinished; Guard++)
+    // (The event scope closes before Execute: RDG's breadcrumbs assert on one left open.)
     {
-        const EPhase Before = I.Phase;
-        switch (I.Phase)
+        RDG_EVENT_SCOPE_STAT(GraphBuilder, VoxelLandSolve, "VoxelLand solve");
+        FImpl::FFrame F;
+        I.Register(GraphBuilder, Fields, F);
+        const FSettings& S = I.S;
+
+        // Phases may follow each other within a frame; the loop stops at one that waits.
+        for (int32 Guard = 0; Guard < 8 && !bFailed && !bFinished; Guard++)
         {
-        case EPhase::Start:
-        {
-            I.Single<FVoxelSolveResetCS>(GraphBuilder, F, TEXT("reset"), 1);
-            if (S.bErode)
+            const EPhase Before = I.Phase;
+            switch (I.Phase)
             {
-                I.CountDomainSlots(GraphBuilder, F, 0, Result);
-            }
-            else
+            case EPhase::Start:
             {
-                I.Pass<FVoxelSolveNormaliseCS>(GraphBuilder, F, I.NumCells, TEXT("plate heights"));
-                I.CountDomainSlots(GraphBuilder, F, 1, Result);
-            }
-            break;
-        }
-        case EPhase::CountWait:
-        {
-            if (I.Pending.Num() == 0 || !I.Pending[0].IsReady()) break;
-            TArray<uint32> Words;
-            if (!VLS::Read(I.Pending[0], Words) || Words.Num() < 1)
-            {
-                bFailed = true;
-                break;
-            }
-            I.Pending.Reset();
-            I.NumSlots = Words[0];
-            I.RegisterSlots(GraphBuilder, F);
-            if (I.CountDomain == 0)
-            {
-                Result.SolvedCells = (int32)I.NumSlots;
-                I.SolvedSlots = I.NumSlots;
-                if (I.NumSlots == 0)
+                I.Single<FVoxelSolveResetCS>(GraphBuilder, F, TEXT("reset"), 1);
+                if (S.bErode)
                 {
-                    // No mountains: the static heights.
-                    I.Pass<FVoxelSolveNormaliseCS>(GraphBuilder, F, I.NumCells, TEXT("normalise"));
+                    I.CountDomainSlots(GraphBuilder, F, 0, Result);
+                }
+                else
+                {
+                    I.Pass<FVoxelSolveNormaliseCS>(GraphBuilder, F, I.NumCells, TEXT("plate heights"));
                     I.CountDomainSlots(GraphBuilder, F, 1, Result);
-                    break;
                 }
-                I.Pass<FVoxelSolveInitCS>(GraphBuilder, F, I.NumCells, TEXT("init"));
-                I.bSolved = true;
-                I.SetPhase(EPhase::InitFill, Result);
+                break;
             }
-            else
+            case EPhase::CountWait:
             {
-                Result.LandCells = (int32)I.NumSlots;
-                if (I.UseTreeStart() && I.NumSlots > 0 && S.bRouteAhead && !I.bRouteByLoops)
-                {
-                    // S1: the whole routing now, checked when the fields come back.
-                    I.RecordRoutingAhead(GraphBuilder, F, Result);
-                    Progress.store(0.95f, std::memory_order_relaxed);
-                    break;
-                }
-                // After a solve, the lake levels start from its last receivers' tree fill.
-                I.Pass<FVoxelSolveRouteInitCS>(GraphBuilder, F, I.NumCells, TEXT("route init"), I.UseTreeStart() ? 2u : 0u);
-                if (I.UseTreeStart() && I.NumSlots > 0)
-                    I.RouteTreeFill(GraphBuilder, F, 0);
-                I.SetPhase(EPhase::Fill0, Result);
-            }
-            break;
-        }
-        case EPhase::InitFill:
-        {
-            if (!I.Loop<FVoxelSolveFillTiledCS, true>(GraphBuilder, F, TEXT("initial fill"), 1, bFailed)) break;
-            if (bFailed) break;
-            I.Pass<FVoxelSolveUndrainedCS>(GraphBuilder, F, I.NumSlots, TEXT("undrained"));
-            I.Pass<FVoxelSolveReceiversCS>(GraphBuilder, F, I.NumSlots, TEXT("receivers"), 1);
-            I.SetPhase(EPhase::Steps, Result);
-            break;
-        }
-        case EPhase::Steps:
-        {
-            bool bDone = false;
-            while (I.Pending.Num() > 0 && I.Pending[0].IsReady())
-            {
+                if (I.Pending.Num() == 0 || !I.Pending[0].IsReady()) break;
                 TArray<uint32> Words;
-                if (!VLS::Read(I.Pending[0], Words) || Words.Num() < 2)
+                if (!VLS::Read(I.Pending[0], Words) || Words.Num() < 1)
                 {
                     bFailed = true;
                     break;
                 }
-                I.Pending.RemoveAt(0);
-                Progress.store(0.05f + 0.75f * FMath::Clamp((float)Words[1] / (float)FMath::Max(S.MaxSteps, 1), 0.0f, 1.0f), std::memory_order_relaxed);
-                bDone |= Words[0] != 0u;
-            }
-            if (bFailed) break;
-            if (bDone)
-            {
                 I.Pending.Reset();
-                // The outlets, and the histograms of the relief above them.
-                I.Pass<FVoxelSolveOutletInitCS>(GraphBuilder, F, I.NumSlots, TEXT("outlets"));
-                for (int32 r = 0; r < VLS::JumpRounds; r++)
+                I.NumSlots = Words[0];
+                I.RegisterSlots(GraphBuilder, F);
+                if (I.CountDomain == 0)
                 {
-                    I.Pass<FVoxelSolveOutletJumpCS>(GraphBuilder, F, I.NumSlots, TEXT("outlet jump"));
-                    I.JumpParity ^= 1;
-                }
-                AddClearUAVPass(GraphBuilder, GraphBuilder.CreateUAV(F.Histogram), 0u);
-                I.Pass<FVoxelSolveHistogramCS>(GraphBuilder, F, I.NumSlots, TEXT("histograms"));
-                I.Pending.Add(VLS::Enqueue(GraphBuilder, F.Histogram, 2 * VLS::HistogramBins * 4, TEXT("Voxel.LandSolveHistogramReadback")));
-                I.Pending.Add(VLS::Enqueue(GraphBuilder, F.State, 8, TEXT("Voxel.LandSolveStateReadback")));
-                I.Pending.Add(VLS::Enqueue(GraphBuilder, F.Log, (uint32)FMath::Max(S.MaxSteps, 1) * 4, TEXT("Voxel.LandSolveLogReadback")));
-                I.Pending.Add(VLS::Enqueue(GraphBuilder, F.Flags, 8, TEXT("Voxel.LandSolveFlagsReadback")));
-                I.SetPhase(EPhase::OutletsWait, Result);
-                break;
-            }
-            if (I.Pending.Num() >= VLS::MaxPending) break;
-            const int32 Left = S.MaxSteps + 2 - I.StepsDispatched;
-            if (Left <= 0)
-            {
-                // Every step is sent (the last sets done): read the state again.
-                I.Pending.Add(VLS::Enqueue(GraphBuilder, F.State, 8, TEXT("Voxel.LandSolveStateReadback")));
-                break;
-            }
-            // The slope cap (T3g) adds about a third to a step's passes.
-            const int64 StepCost = S.ChannelCells > 0.0f ? (int64)I.NumSlots * 4 / 3 : (int64)I.NumSlots;
-            const int32 Steps = FMath::Min((int32)FMath::Clamp<int64>(S.StepCellsPerFrame / FMath::Max<int64>(StepCost, 1), 1, VLS::MaxStepsPerFrame), Left);
-            for (int32 s = 0; s < Steps; s++)
-                I.Step(GraphBuilder, F);
-            I.StepsDispatched += Steps;
-            I.Pending.Add(VLS::Enqueue(GraphBuilder, F.State, 8, TEXT("Voxel.LandSolveStateReadback")));
-            break;
-        }
-        case EPhase::OutletsWait:
-        {
-            if (I.Pending.Num() < 4 || !I.Pending[0].IsReady() || !I.Pending[1].IsReady() || !I.Pending[2].IsReady() || !I.Pending[3].IsReady()) break;
-            TArray<uint32> Bins, StateWords, FlagWords;
-            TArray<float> Residuals;
-            if (!VLS::Read(I.Pending[0], Bins) || !VLS::Read(I.Pending[1], StateWords) || !VLS::Read(I.Pending[2], Residuals) || !VLS::Read(I.Pending[3], FlagWords))
-            {
-                bFailed = true;
-                break;
-            }
-            I.Pending.Reset();
-            Result.Steps = (int32)FMath::Min<uint32>(StateWords[1], (uint32)S.MaxSteps);
-            Result.Residual = Result.Steps > 0 ? Residuals[Result.Steps - 1] : 0.0f;
-            I.Errors |= FlagWords[1];
-            const float SolvedP90 = VLS::Quantile(Bins.GetData(), 0.9);
-            const float TargetP90 = VLS::Quantile(Bins.GetData() + VLS::HistogramBins, 0.9);
-            const float TargetTop = VLS::Quantile(Bins.GetData() + VLS::HistogramBins, 0.999);
-            if (TargetP90 >= 1.0f && SolvedP90 >= 1.0f)
-            {
-                I.Factor = FMath::Clamp(TargetP90 / SolvedP90, 0.01f, 100.0f);
-                I.Knee = TargetP90;
-                I.Top = FMath::Max(S.ReliefTopScale * TargetTop, 1.2f * TargetP90);
-                // Above the knee a logarithm, K + s ln(1 + (R - K) / s) (VoxelSolveCompressRelief),
-                // with s fitted so the solved 99.9th percentile lands on the top: s ln(1 + D / s)
-                // rises from 0 to D with s, so any top is reached (a large s: nearly linear).
-                const float SolvedTop = VLS::Quantile(Bins.GetData(), 0.999);
-                const float D = I.Factor * SolvedTop - I.Knee;
-                const float Want = I.Top - I.Knee;
-                I.ReliefScale = 1.0e9f;
-                if (D > Want && Want > 0.0f)
-                {
-                    double Lo = 1.0e-3 * Want, Hi = 1.0e3 * FMath::Max((double)D, 1.0);
-                    for (int32 Iteration = 0; Iteration < 80; Iteration++)
+                    Result.SolvedCells = (int32)I.NumSlots;
+                    I.SolvedSlots = I.NumSlots;
+                    if (I.NumSlots == 0)
                     {
-                        const double Mid = FMath::Sqrt(Lo * Hi);
-                        (Mid * FMath::Loge(1.0 + D / Mid) > Want ? Hi : Lo) = Mid;
+                        // No mountains: the static heights.
+                        I.Pass<FVoxelSolveNormaliseCS>(GraphBuilder, F, I.NumCells, TEXT("normalise"));
+                        I.CountDomainSlots(GraphBuilder, F, 1, Result);
+                        break;
                     }
-                    I.ReliefScale = (float)FMath::Sqrt(Lo * Hi);
+                    I.Pass<FVoxelSolveInitCS>(GraphBuilder, F, I.NumCells, TEXT("init"));
+                    I.bSolved = true;
+                    I.SetPhase(EPhase::InitFill, Result);
                 }
-            }
-            Result.Factor = I.Factor;
-            Result.ReliefKnee = I.Knee;
-            Result.ReliefTop = I.Top;
-            Result.ReliefScale = I.ReliefScale;
-            // The links already uphill (lakes behind sills) before the normalisation; after it,
-            // no new step uphill along the last step's receivers (VoxelSolveSettlePass): a tree
-            // fill that stops at those links, then each solved cell up to its level.
-            I.Pass<FVoxelSolveSettleMarkCS>(GraphBuilder, F, I.NumSlots, TEXT("settle mark"));
-            I.Pass<FVoxelSolveNormaliseCS>(GraphBuilder, F, I.NumCells, TEXT("normalise"));
-            I.Pass<FVoxelSolveSettleInitCS>(GraphBuilder, F, I.NumSlots, TEXT("settle fill"));
-            for (int32 r = 0; r < VLS::JumpRounds; r++)
-            {
-                I.Pass<FVoxelSolveTreeFillJumpCS>(GraphBuilder, F, I.NumSlots, TEXT("settle fill jump"), 0, 0);
-                I.JumpParity ^= 1;
-            }
-            I.Pass<FVoxelSolveTreeFillFinishCS>(GraphBuilder, F, I.NumSlots, TEXT("settle fill finish"), 0, 0);
-            I.Pass<FVoxelSolveSettleCS>(GraphBuilder, F, I.NumSlots, TEXT("settle"));
-            Progress.store(0.85f, std::memory_order_relaxed);
-            I.CountDomainSlots(GraphBuilder, F, 1, Result);
-            break;
-        }
-        case EPhase::Fill0:
-        {
-            if (I.NumSlots > 0 && !I.Loop<FVoxelSolveFillTiledCS, true>(GraphBuilder, F, TEXT("lake levels"), 0, bFailed)) break;
-            if (bFailed) break;
-            I.Pass<FVoxelSolveRouteInitCS>(GraphBuilder, F, I.NumCells, TEXT("route init"), I.UseTreeStart() ? 3u : 1u);
-            if (I.UseTreeStart() && I.NumSlots > 0)
-                I.RouteTreeFill(GraphBuilder, F, 1);
-            I.SetPhase(EPhase::Fill1, Result);
-            Progress.store(0.88f, std::memory_order_relaxed);
-            break;
-        }
-        case EPhase::Fill1:
-        {
-            if (I.NumSlots > 0 && !I.Loop<FVoxelSolveFillTiledCS, true>(GraphBuilder, F, TEXT("routing fill"), 1, bFailed)) break;
-            if (bFailed) break;
-            I.Pass<FVoxelSolveReceiversCS>(GraphBuilder, F, I.NumSlots, TEXT("receivers"), 0);
-            // S1: the drainage, exact in fixed passes (it was iterated to convergence: about a
-            // pass per cell of the longest path).
-            if (I.NumSlots > 0)
-                I.AccumulateByJumps(GraphBuilder, F, 0);
-            // The drainage field's spread over the hillslopes (VoxelSolveSpreadPass), from the
-            // D8 areas; the solve and the lakes keep D8.
-            if (S.SpreadCells > 0.0f && I.NumSlots > 0)
-            {
-                I.Pass<FVoxelSolveSpreadInitCS>(GraphBuilder, F, I.NumSlots, TEXT("drainage spread init"));
-                I.SetPhase(EPhase::Spread, Result);
-                Progress.store(0.92f, std::memory_order_relaxed);
+                else
+                {
+                    Result.LandCells = (int32)I.NumSlots;
+                    if (I.UseTreeStart() && I.NumSlots > 0 && S.bRouteAhead && !I.bRouteByLoops)
+                    {
+                        // S1: the whole routing now, checked when the fields come back.
+                        I.RecordRoutingAhead(GraphBuilder, F, Result);
+                        Progress.store(0.95f, std::memory_order_relaxed);
+                        break;
+                    }
+                    // After a solve, the lake levels start from its last receivers' tree fill.
+                    I.Pass<FVoxelSolveRouteInitCS>(GraphBuilder, F, I.NumCells, TEXT("route init"), I.UseTreeStart() ? 2u : 0u);
+                    if (I.UseTreeStart() && I.NumSlots > 0)
+                        I.RouteTreeFill(GraphBuilder, F, 0);
+                    I.SetPhase(EPhase::Fill0, Result);
+                }
                 break;
             }
-            I.Pass<FVoxelSolveLabelInitCS>(GraphBuilder, F, I.NumSlots, TEXT("lake labels"));
-            I.SetPhase(EPhase::Labels, Result);
-            Progress.store(0.94f, std::memory_order_relaxed);
-            break;
-        }
-        case EPhase::Spread:
-        {
-            if (!I.Loop<FVoxelSolveSpreadCS>(GraphBuilder, F, TEXT("drainage spread"), 0, bFailed)) break;
-            if (bFailed) break;
-            // S1: the hillslopes converged (a few dozen passes); the channels sum them down the
-            // tree in fixed passes.
-            I.AccumulateByJumps(GraphBuilder, F, 1);
-            I.Pass<FVoxelSolveLabelInitCS>(GraphBuilder, F, I.NumSlots, TEXT("lake labels"));
-            I.SetPhase(EPhase::Labels, Result);
-            Progress.store(0.94f, std::memory_order_relaxed);
-            break;
-        }
-        case EPhase::Labels:
-        {
-            if (I.NumSlots > 0 && !I.Loop<FVoxelSolveLabelCS>(GraphBuilder, F, TEXT("lake labels"), 0, bFailed)) break;
-            if (bFailed) break;
-            // Lakes, then the fields; read back once.
-            I.RecordOutput(GraphBuilder, F, Result);
-            Progress.store(0.97f, std::memory_order_relaxed);
-            break;
-        }
-        case EPhase::OutputWait:
-        {
-            bool bReady = I.Pending.Num() == 9 && (!I.Rivers.IsValid() || I.Rivers.IsReady());
-            for (const VLS::FReadback& R : I.Pending)
-                bReady &= R.IsReady();
-            for (const VLS::FReadback& R : I.Checks)
-                bReady &= R.IsReady();
-            if (I.Checks.Num() > 0)
-                bReady &= I.PreRouting.IsReady();
-            if (!bReady) break;
-            if (I.Checks.Num() > 0)
+            case EPhase::InitFill:
             {
-                // S1: the routing recorded ahead: every loop had settled, or it routes again by
-                // loops (from INF: the routing replaced the solve's receivers).
-                FString Unsettled;
-                static const TCHAR* CheckNames[] = { TEXT("lake levels"), TEXT("routing fill"), TEXT("drainage spread"), TEXT("lake labels") };
-                const bool bSpread = I.Checks.Num() == 4;
-                TArray<uint32> PreWords;
-                if (!VLS::Read(I.PreRouting, PreWords) || PreWords.Num() < 2)
-                {
-                    bFailed = true;
-                    break;
-                }
-                for (int32 k = 0; k < I.Checks.Num(); k++)
+                if (!I.Loop<FVoxelSolveFillTiledCS, true>(GraphBuilder, F, TEXT("initial fill"), 1, bFailed)) break;
+                if (bFailed) break;
+                I.Pass<FVoxelSolveUndrainedCS>(GraphBuilder, F, I.NumSlots, TEXT("undrained"));
+                I.Pass<FVoxelSolveReceiversCS>(GraphBuilder, F, I.NumSlots, TEXT("receivers"), 1);
+                I.SetPhase(EPhase::Steps, Result);
+                break;
+            }
+            case EPhase::Steps:
+            {
+                bool bDone = false;
+                while (I.Pending.Num() > 0 && I.Pending[0].IsReady())
                 {
                     TArray<uint32> Words;
-                    if (!VLS::Read(I.Checks[k], Words) || Words.Num() < 2)
+                    if (!VLS::Read(I.Pending[0], Words) || Words.Num() < 2)
                     {
                         bFailed = true;
                         break;
                     }
-                    if (Words[0] != 0u)
-                        Unsettled += FString(Unsettled.IsEmpty() ? TEXT("") : TEXT(", ")) + CheckNames[(!bSpread && k == 2) ? 3 : k];
+                    I.Pending.RemoveAt(0);
+                    Progress.store(0.05f + 0.75f * FMath::Clamp((float)Words[1] / (float)FMath::Max(S.MaxSteps, 1), 0.0f, 1.0f), std::memory_order_relaxed);
+                    bDone |= Words[0] != 0u;
                 }
-                I.Checks.Reset();
                 if (bFailed) break;
-                if (!Unsettled.IsEmpty())
+                if (bDone)
                 {
-                    UE_LOG(LogVoxelPlugin, Log, TEXT("[VoxelLand] The routing recorded ahead hadn't settled (%s); routing again by loops."), *Unsettled);
                     I.Pending.Reset();
-                    I.Rivers.Reset();
-                    I.KeptHeight.SafeRelease();
-                    I.KeptWater.SafeRelease();
-                    I.KeptFlow.SafeRelease();
-                    I.KeptRec.SafeRelease();
-                    I.bRouteByLoops = true;
-                    // Back to the state the routing started from: the heights (the lakes not
-                    // kept were filled into them), the solve's receivers, the errors so far
-                    // (the unsettled attempt's are dropped, with the flags).
-                    AddCopyBufferPass(GraphBuilder, F.H, GraphBuilder.RegisterExternalBuffer(I.KeptH));
-                    AddCopyBufferPass(GraphBuilder, F.Rec, GraphBuilder.RegisterExternalBuffer(I.KeptSolveRec));
-                    I.Errors = I.ErrorsBeforeRouting | PreWords[1];
-                    I.Single<FVoxelSolveResetCS>(GraphBuilder, F, TEXT("reset"), 1);
-                    // The rivers used the slot buffer as scratch: count the land again.
-                    I.CountDomainSlots(GraphBuilder, F, 1, Result);
+                    // The outlets, and the histograms of the relief above them.
+                    I.Pass<FVoxelSolveOutletInitCS>(GraphBuilder, F, I.NumSlots, TEXT("outlets"));
+                    for (int32 r = 0; r < VLS::JumpRounds; r++)
+                    {
+                        I.Pass<FVoxelSolveOutletJumpCS>(GraphBuilder, F, I.NumSlots, TEXT("outlet jump"));
+                        I.JumpParity ^= 1;
+                    }
+                    AddClearUAVPass(GraphBuilder, GraphBuilder.CreateUAV(F.Histogram), 0u);
+                    I.Pass<FVoxelSolveHistogramCS>(GraphBuilder, F, I.NumSlots, TEXT("histograms"));
+                    I.Pending.Add(VLS::Enqueue(GraphBuilder, F.Histogram, 2 * VLS::HistogramBins * 4, TEXT("Voxel.LandSolveHistogramReadback")));
+                    I.Pending.Add(VLS::Enqueue(GraphBuilder, F.State, 8, TEXT("Voxel.LandSolveStateReadback")));
+                    I.Pending.Add(VLS::Enqueue(GraphBuilder, F.Log, (uint32)FMath::Max(S.MaxSteps, 1) * 4, TEXT("Voxel.LandSolveLogReadback")));
+                    I.Pending.Add(VLS::Enqueue(GraphBuilder, F.Flags, 8, TEXT("Voxel.LandSolveFlagsReadback")));
+                    I.SetPhase(EPhase::OutletsWait, Result);
                     break;
                 }
-            }
-            TArray<float> Heights, Waters;
-            TArray<uint32> Flows, Attrs, LakeCount, LakeWords, FlagWords, Forms, Recs;
-            if (!VLS::Read(I.Pending[0], Heights) || !VLS::Read(I.Pending[1], Flows) || !VLS::Read(I.Pending[2], Waters) || !VLS::Read(I.Pending[3], Attrs)
-                || !VLS::Read(I.Pending[4], LakeCount) || !VLS::Read(I.Pending[5], LakeWords) || !VLS::Read(I.Pending[6], FlagWords)
-                || !VLS::Read(I.Pending[7], Forms) || !VLS::Read(I.Pending[8], Recs))
-            {
-                bFailed = true;
+                if (I.Pending.Num() >= VLS::MaxPending) break;
+                const int32 Left = S.MaxSteps + 2 - I.StepsDispatched;
+                if (Left <= 0)
+                {
+                    // Every step is sent (the last sets done): read the state again.
+                    I.Pending.Add(VLS::Enqueue(GraphBuilder, F.State, 8, TEXT("Voxel.LandSolveStateReadback")));
+                    break;
+                }
+                // The slope cap (T3g) adds about a third to a step's passes.
+                const int64 StepCost = S.ChannelCells > 0.0f ? (int64)I.NumSlots * 4 / 3 : (int64)I.NumSlots;
+                const int32 Steps = FMath::Min((int32)FMath::Clamp<int64>(S.StepCellsPerFrame / FMath::Max<int64>(StepCost, 1), 1, VLS::MaxStepsPerFrame), Left);
+                for (int32 s = 0; s < Steps; s++)
+                    I.Step(GraphBuilder, F);
+                I.StepsDispatched += Steps;
+                I.Pending.Add(VLS::Enqueue(GraphBuilder, F.State, 8, TEXT("Voxel.LandSolveStateReadback")));
                 break;
             }
-            I.Pending.Reset();
-            I.Errors |= FlagWords[1];
-            // Only copies here: the baker narrows and checks them on a worker.
-            Result.Height = MoveTemp(Heights);
-            Result.Water = MoveTemp(Waters);
-            Result.Attr = MoveTemp(Attrs);
-            Result.FlowHalves = MoveTemp(Flows);
-            Result.Form = MoveTemp(Forms);
-            Result.Receiver = MoveTemp(Recs);
-            Result.LakesFound = (int32)LakeCount[0];
-            const int32 Kept = FMath::Min<int32>(Result.LakesFound, (int32)VLS::MaxLakes);
-            const double CellAreaKm2 = 1.0e-2;   // the list's area unit (1e4 m^2) in km^2
-            Result.Lakes.SetNum(Kept);
-            for (int32 k = 0; k < Kept; k++)
+            case EPhase::OutletsWait:
             {
-                FVoxelLandLake& Lake = Result.Lakes[k];
-                Lake.Cell = LakeWords[k * 4];
-                FMemory::Memcpy(&Lake.Level, &LakeWords[k * 4 + 1], sizeof(float));
-                Lake.Outlet = LakeWords[k * 4 + 2];
-                Lake.AreaKm2 = (float)((double)LakeWords[k * 4 + 3] * CellAreaKm2);
-            }
-            // In the order of their ids, whatever order the GPU appended them in.
-            Result.Lakes.Sort([](const FVoxelLandLake& A, const FVoxelLandLake& B) { return A.Cell < B.Cell; });
-            if (Result.LakesFound > Kept)
-            {
-                UE_LOG(LogVoxelPlugin, Warning, TEXT("[VoxelLand] %d lakes found, %d kept in the list (the rest are still water in the bake)."), Result.LakesFound, Kept);
-            }
-            Result.Errors = I.Errors;
-            if (I.Rivers.IsValid() && !I.FinishRivers(GraphBuilder, F, Result))
-            {
-                I.SetPhase(EPhase::RiverWait, Result);
+                if (I.Pending.Num() < 4 || !I.Pending[0].IsReady() || !I.Pending[1].IsReady() || !I.Pending[2].IsReady() || !I.Pending[3].IsReady()) break;
+                TArray<uint32> Bins, StateWords, FlagWords;
+                TArray<float> Residuals;
+                if (!VLS::Read(I.Pending[0], Bins) || !VLS::Read(I.Pending[1], StateWords) || !VLS::Read(I.Pending[2], Residuals) || !VLS::Read(I.Pending[3], FlagWords))
+                {
+                    bFailed = true;
+                    break;
+                }
+                I.Pending.Reset();
+                Result.Steps = (int32)FMath::Min<uint32>(StateWords[1], (uint32)S.MaxSteps);
+                Result.Residual = Result.Steps > 0 ? Residuals[Result.Steps - 1] : 0.0f;
+                I.Errors |= FlagWords[1];
+                const float SolvedP90 = VLS::Quantile(Bins.GetData(), 0.9);
+                const float TargetP90 = VLS::Quantile(Bins.GetData() + VLS::HistogramBins, 0.9);
+                const float TargetTop = VLS::Quantile(Bins.GetData() + VLS::HistogramBins, 0.999);
+                if (TargetP90 >= 1.0f && SolvedP90 >= 1.0f)
+                {
+                    I.Factor = FMath::Clamp(TargetP90 / SolvedP90, 0.01f, 100.0f);
+                    I.Knee = TargetP90;
+                    I.Top = FMath::Max(S.ReliefTopScale * TargetTop, 1.2f * TargetP90);
+                    // Above the knee a logarithm, K + s ln(1 + (R - K) / s) (VoxelSolveCompressRelief),
+                    // with s fitted so the solved 99.9th percentile lands on the top: s ln(1 + D / s)
+                    // rises from 0 to D with s, so any top is reached (a large s: nearly linear).
+                    const float SolvedTop = VLS::Quantile(Bins.GetData(), 0.999);
+                    const float D = I.Factor * SolvedTop - I.Knee;
+                    const float Want = I.Top - I.Knee;
+                    I.ReliefScale = 1.0e9f;
+                    if (D > Want && Want > 0.0f)
+                    {
+                        double Lo = 1.0e-3 * Want, Hi = 1.0e3 * FMath::Max((double)D, 1.0);
+                        for (int32 Iteration = 0; Iteration < 80; Iteration++)
+                        {
+                            const double Mid = FMath::Sqrt(Lo * Hi);
+                            (Mid * FMath::Loge(1.0 + D / Mid) > Want ? Hi : Lo) = Mid;
+                        }
+                        I.ReliefScale = (float)FMath::Sqrt(Lo * Hi);
+                    }
+                }
+                Result.Factor = I.Factor;
+                Result.ReliefKnee = I.Knee;
+                Result.ReliefTop = I.Top;
+                Result.ReliefScale = I.ReliefScale;
+                // The links already uphill (lakes behind sills) before the normalisation; after it,
+                // no new step uphill along the last step's receivers (VoxelSolveSettlePass): a tree
+                // fill that stops at those links, then each solved cell up to its level.
+                I.Pass<FVoxelSolveSettleMarkCS>(GraphBuilder, F, I.NumSlots, TEXT("settle mark"));
+                I.Pass<FVoxelSolveNormaliseCS>(GraphBuilder, F, I.NumCells, TEXT("normalise"));
+                I.Pass<FVoxelSolveSettleInitCS>(GraphBuilder, F, I.NumSlots, TEXT("settle fill"));
+                for (int32 r = 0; r < VLS::JumpRounds; r++)
+                {
+                    I.Pass<FVoxelSolveTreeFillJumpCS>(GraphBuilder, F, I.NumSlots, TEXT("settle fill jump"), 0, 0);
+                    I.JumpParity ^= 1;
+                }
+                I.Pass<FVoxelSolveTreeFillFinishCS>(GraphBuilder, F, I.NumSlots, TEXT("settle fill finish"), 0, 0);
+                I.Pass<FVoxelSolveSettleCS>(GraphBuilder, F, I.NumSlots, TEXT("settle"));
+                Progress.store(0.85f, std::memory_order_relaxed);
+                I.CountDomainSlots(GraphBuilder, F, 1, Result);
                 break;
             }
-            I.Finish(Result);
-            I.SetPhase(EPhase::Done, Result);
-            I.Release();
-            Progress.store(1.0f, std::memory_order_relaxed);
-            bFinished = true;
-            break;
+            case EPhase::Fill0:
+            {
+                if (I.NumSlots > 0 && !I.Loop<FVoxelSolveFillTiledCS, true>(GraphBuilder, F, TEXT("lake levels"), 0, bFailed)) break;
+                if (bFailed) break;
+                I.Pass<FVoxelSolveRouteInitCS>(GraphBuilder, F, I.NumCells, TEXT("route init"), I.UseTreeStart() ? 3u : 1u);
+                if (I.UseTreeStart() && I.NumSlots > 0)
+                    I.RouteTreeFill(GraphBuilder, F, 1);
+                I.SetPhase(EPhase::Fill1, Result);
+                Progress.store(0.88f, std::memory_order_relaxed);
+                break;
+            }
+            case EPhase::Fill1:
+            {
+                if (I.NumSlots > 0 && !I.Loop<FVoxelSolveFillTiledCS, true>(GraphBuilder, F, TEXT("routing fill"), 1, bFailed)) break;
+                if (bFailed) break;
+                I.Pass<FVoxelSolveReceiversCS>(GraphBuilder, F, I.NumSlots, TEXT("receivers"), 0);
+                // S1: the drainage, exact in fixed passes (it was iterated to convergence: about a
+                // pass per cell of the longest path).
+                if (I.NumSlots > 0)
+                    I.AccumulateByJumps(GraphBuilder, F, 0);
+                // The drainage field's spread over the hillslopes (VoxelSolveSpreadPass), from the
+                // D8 areas; the solve and the lakes keep D8.
+                if (S.SpreadCells > 0.0f && I.NumSlots > 0)
+                {
+                    I.Pass<FVoxelSolveSpreadInitCS>(GraphBuilder, F, I.NumSlots, TEXT("drainage spread init"));
+                    I.SetPhase(EPhase::Spread, Result);
+                    Progress.store(0.92f, std::memory_order_relaxed);
+                    break;
+                }
+                I.Pass<FVoxelSolveLabelInitCS>(GraphBuilder, F, I.NumSlots, TEXT("lake labels"));
+                I.SetPhase(EPhase::Labels, Result);
+                Progress.store(0.94f, std::memory_order_relaxed);
+                break;
+            }
+            case EPhase::Spread:
+            {
+                if (!I.Loop<FVoxelSolveSpreadCS>(GraphBuilder, F, TEXT("drainage spread"), 0, bFailed)) break;
+                if (bFailed) break;
+                // S1: the hillslopes converged (a few dozen passes); the channels sum them down the
+                // tree in fixed passes.
+                I.AccumulateByJumps(GraphBuilder, F, 1);
+                I.Pass<FVoxelSolveLabelInitCS>(GraphBuilder, F, I.NumSlots, TEXT("lake labels"));
+                I.SetPhase(EPhase::Labels, Result);
+                Progress.store(0.94f, std::memory_order_relaxed);
+                break;
+            }
+            case EPhase::Labels:
+            {
+                if (I.NumSlots > 0 && !I.Loop<FVoxelSolveLabelCS>(GraphBuilder, F, TEXT("lake labels"), 0, bFailed)) break;
+                if (bFailed) break;
+                // Lakes, then the fields; read back once.
+                I.RecordOutput(GraphBuilder, F, Result);
+                Progress.store(0.97f, std::memory_order_relaxed);
+                break;
+            }
+            case EPhase::OutputWait:
+            {
+                bool bReady = I.Pending.Num() == 9 && (!I.Rivers.IsValid() || I.Rivers.IsReady());
+                for (const VLS::FReadback& R : I.Pending)
+                    bReady &= R.IsReady();
+                for (const VLS::FReadback& R : I.Checks)
+                    bReady &= R.IsReady();
+                if (I.Checks.Num() > 0)
+                    bReady &= I.PreRouting.IsReady();
+                if (!bReady) break;
+                if (I.Checks.Num() > 0)
+                {
+                    // S1: the routing recorded ahead: every loop had settled, or it routes again by
+                    // loops (from INF: the routing replaced the solve's receivers).
+                    FString Unsettled;
+                    static const TCHAR* CheckNames[] = { TEXT("lake levels"), TEXT("routing fill"), TEXT("drainage spread"), TEXT("lake labels") };
+                    const bool bSpread = I.Checks.Num() == 4;
+                    TArray<uint32> PreWords;
+                    if (!VLS::Read(I.PreRouting, PreWords) || PreWords.Num() < 2)
+                    {
+                        bFailed = true;
+                        break;
+                    }
+                    for (int32 k = 0; k < I.Checks.Num(); k++)
+                    {
+                        TArray<uint32> Words;
+                        if (!VLS::Read(I.Checks[k], Words) || Words.Num() < 2)
+                        {
+                            bFailed = true;
+                            break;
+                        }
+                        if (Words[0] != 0u)
+                            Unsettled += FString(Unsettled.IsEmpty() ? TEXT("") : TEXT(", ")) + CheckNames[(!bSpread && k == 2) ? 3 : k];
+                    }
+                    I.Checks.Reset();
+                    if (bFailed) break;
+                    if (!Unsettled.IsEmpty())
+                    {
+                        UE_LOG(LogVoxelPlugin, Log, TEXT("[VoxelLand] The routing recorded ahead hadn't settled (%s); routing again by loops."), *Unsettled);
+                        I.Pending.Reset();
+                        I.Rivers.Reset();
+                        I.KeptHeight.SafeRelease();
+                        I.KeptWater.SafeRelease();
+                        I.KeptFlow.SafeRelease();
+                        I.KeptRec.SafeRelease();
+                        I.bRouteByLoops = true;
+                        // Back to the state the routing started from: the heights (the lakes not
+                        // kept were filled into them), the solve's receivers, the errors so far
+                        // (the unsettled attempt's are dropped, with the flags).
+                        AddCopyBufferPass(GraphBuilder, F.H, GraphBuilder.RegisterExternalBuffer(I.KeptH));
+                        AddCopyBufferPass(GraphBuilder, F.Rec, GraphBuilder.RegisterExternalBuffer(I.KeptSolveRec));
+                        I.Errors = I.ErrorsBeforeRouting | PreWords[1];
+                        I.Single<FVoxelSolveResetCS>(GraphBuilder, F, TEXT("reset"), 1);
+                        // The rivers used the slot buffer as scratch: count the land again.
+                        I.CountDomainSlots(GraphBuilder, F, 1, Result);
+                        break;
+                    }
+                }
+                TArray<float> Heights, Waters;
+                TArray<uint32> Flows, Attrs, LakeCount, LakeWords, FlagWords, Forms, Recs;
+                if (!VLS::Read(I.Pending[0], Heights) || !VLS::Read(I.Pending[1], Flows) || !VLS::Read(I.Pending[2], Waters) || !VLS::Read(I.Pending[3], Attrs)
+                    || !VLS::Read(I.Pending[4], LakeCount) || !VLS::Read(I.Pending[5], LakeWords) || !VLS::Read(I.Pending[6], FlagWords)
+                    || !VLS::Read(I.Pending[7], Forms) || !VLS::Read(I.Pending[8], Recs))
+                {
+                    bFailed = true;
+                    break;
+                }
+                I.Pending.Reset();
+                I.Errors |= FlagWords[1];
+                // Only copies here: the baker narrows and checks them on a worker.
+                Result.Height = MoveTemp(Heights);
+                Result.Water = MoveTemp(Waters);
+                Result.Attr = MoveTemp(Attrs);
+                Result.FlowHalves = MoveTemp(Flows);
+                Result.Form = MoveTemp(Forms);
+                Result.Receiver = MoveTemp(Recs);
+                Result.LakesFound = (int32)LakeCount[0];
+                const int32 Kept = FMath::Min<int32>(Result.LakesFound, (int32)VLS::MaxLakes);
+                const double CellAreaKm2 = 1.0e-2;   // the list's area unit (1e4 m^2) in km^2
+                Result.Lakes.SetNum(Kept);
+                for (int32 k = 0; k < Kept; k++)
+                {
+                    FVoxelLandLake& Lake = Result.Lakes[k];
+                    Lake.Cell = LakeWords[k * 4];
+                    FMemory::Memcpy(&Lake.Level, &LakeWords[k * 4 + 1], sizeof(float));
+                    Lake.Outlet = LakeWords[k * 4 + 2];
+                    Lake.AreaKm2 = (float)((double)LakeWords[k * 4 + 3] * CellAreaKm2);
+                }
+                // In the order of their ids, whatever order the GPU appended them in.
+                Result.Lakes.Sort([](const FVoxelLandLake& A, const FVoxelLandLake& B) { return A.Cell < B.Cell; });
+                if (Result.LakesFound > Kept)
+                {
+                    UE_LOG(LogVoxelPlugin, Warning, TEXT("[VoxelLand] %d lakes found, %d kept in the list (the rest are still water in the bake)."), Result.LakesFound, Kept);
+                }
+                Result.Errors = I.Errors;
+                if (I.Rivers.IsValid() && !I.FinishRivers(GraphBuilder, F, Result))
+                {
+                    I.SetPhase(EPhase::RiverWait, Result);
+                    break;
+                }
+                I.Finish(Result);
+                I.SetPhase(EPhase::Done, Result);
+                I.Release();
+                Progress.store(1.0f, std::memory_order_relaxed);
+                bFinished = true;
+                break;
+            }
+            case EPhase::RiverWait:
+            {
+                if (!I.Rivers.IsReady()) break;
+                if (!I.FinishRivers(GraphBuilder, F, Result)) break;
+                I.Finish(Result);
+                I.SetPhase(EPhase::Done, Result);
+                I.Release();
+                Progress.store(1.0f, std::memory_order_relaxed);
+                bFinished = true;
+                break;
+            }
+            case EPhase::Done:
+                break;
+            }
+            if (I.Phase == Before) break;
         }
-        case EPhase::RiverWait:
-        {
-            if (!I.Rivers.IsReady()) break;
-            if (!I.FinishRivers(GraphBuilder, F, Result)) break;
-            I.Finish(Result);
-            I.SetPhase(EPhase::Done, Result);
-            I.Release();
-            Progress.store(1.0f, std::memory_order_relaxed);
-            bFinished = true;
-            break;
-        }
-        case EPhase::Done:
-            break;
-        }
-        if (I.Phase == Before) break;
     }
     GraphBuilder.Execute();
     if (bFailed)
