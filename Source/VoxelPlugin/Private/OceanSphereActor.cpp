@@ -316,6 +316,8 @@ void AOceanSphereActor::SetOceanSettings(const FVoxelOceanSettings& InSettings, 
     OceanSettings = InSettings;
     if (!bInteractive)
         OceanSettings.Sanitize();
+    // Stage A10: the derived colours follow a colour pick live (Sanitize derives them too).
+    OceanSettings.DeriveColors();
     if (!bInitialized) return;   // the next initialization takes them
 
     // Live, even while a slider moves: the optics on the surface material. The underwater

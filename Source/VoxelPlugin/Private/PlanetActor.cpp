@@ -2,6 +2,9 @@
 #include "PlanetGravityZone.h"
 #include "Components/DirectionalLightComponent.h"
 #include "VoxelLandBake.h"
+#include "VoxelCubeSphere.h"
+#include "AtmosphereWeather.h"
+#include "Async/ParallelFor.h"
 #include "VoxelPlugin.h"
 #include "EngineUtils.h"
 #include "HAL/FileManager.h"
@@ -123,7 +126,8 @@ void APlanetActor::PostEditChangeProperty(FPropertyChangedEvent& PropertyChanged
     // atmosphere regenerates, the planet isn't rebuilt.
     if (MemberName == GET_MEMBER_NAME_CHECKED(APlanetActor, AtmosphereSeed)
         || MemberName == GET_MEMBER_NAME_CHECKED(APlanetActor, AtmosphereType)
-        || MemberName == GET_MEMBER_NAME_CHECKED(APlanetActor, AtmosphereSet))
+        || MemberName == GET_MEMBER_NAME_CHECKED(APlanetActor, AtmosphereSet)
+        || MemberName == GET_MEMBER_NAME_CHECKED(APlanetActor, AtmosphereTerrainHeight))
     {
         if (!bInteractive)
         {
@@ -427,6 +431,148 @@ bool APlanetActor::HasAtmosphereSet() const
         || S.Terrestrial.Archetypes.Num() > 0 || S.GasGiant.Archetypes.Num() > 0;
 }
 
+namespace VoxelPlanetClimate
+{
+    /** The land bake's cell holding a planet-local direction (index into its fields). */
+    int32 BakeCellOf(const FVoxelLandBake& Bake, const FVector& Dir)
+    {
+        int32 Face = 0;
+        double S = 0.0, T = 0.0;
+        VoxelCubeSphere::Locate(Dir, Face, S, T);
+        const int32 N = Bake.N;
+        const int32 Side = Bake.Side();
+        const int32 CI = FMath::Clamp((int32)FMath::FloorToInt((S + 1.0) * 0.5 * N), 0, N - 1);
+        const int32 CJ = FMath::Clamp((int32)FMath::FloorToInt((T + 1.0) * 0.5 * N), 0, N - 1);
+        return Face * Side * Side + (CJ + FVoxelLandBake::Pad) * Side + CI + FVoxelLandBake::Pad;
+    }
+}
+
+void APlanetActor::ConfigureAtmosphereSurface()
+{
+    if (!AtmosphereActor) return;
+    const FVoxelLandBake* Bake = Generator == EVoxelSurfaceGenerator::Terrestrial && LandBake.IsValid() && AtmosphereTerrainHeight > 0.0f
+        ? LandBake.Get() : nullptr;
+    const uint32 Key = Bake ? (HashCombine(Bake->Key, GetTypeHash(AtmosphereTerrainHeight)) | 1u) : 0u;
+    if (Key == LastSurfaceMapKey && (Key == 0u) == (AtmosphereActor->GetSurfaceMap() == nullptr)) return;
+    LastSurfaceMapKey = Key;
+    if (!Bake)
+    {
+        AtmosphereActor->SetSurfaceMap(0, 0, TConstArrayView<FVector2f>());
+        return;
+    }
+    // THE WEATHER SIM'S LAYOUT (CloudAtmosphere, APlanetAtmosphereActor::SetSurfaceMap): longitude x
+    // sin(latitude) in the planet's frame (Z the spin axis, longitude 0 on +X), row 0 the south.
+    // 512 x 256 (the sim's grid at resolution 128; coarser grids average it), each texel the
+    // mean of 4 x 4 points over its span: the elevation above sea level over the terrain height
+    // (the sea's floor counts as the sea's level), and the land's share (not sea-connected).
+    const double StartSeconds = FPlatformTime::Seconds();
+    constexpr int32 Width = 512;
+    constexpr int32 Height = 256;
+    constexpr int32 Sub = 4;
+    TArray<FVector2f> Cells;
+    Cells.SetNumZeroed(Width * Height);
+    const bool bAttr = Bake->Attr.Num() == Bake->NumCells();
+    const float InvHeight = 1.0f / AtmosphereTerrainHeight;
+    ParallelFor(Height, [&](int32 J)
+        {
+            for (int32 I = 0; I < Width; I++)
+            {
+                float Elevation = 0.0f;
+                float Land = 0.0f;
+                for (int32 SJ = 0; SJ < Sub; SJ++)
+                {
+                    const double Mu = -1.0 + 2.0 * ((double)J + ((double)SJ + 0.5) / Sub) / Height;
+                    const double Cos = FMath::Sqrt(FMath::Max(1.0 - Mu * Mu, 0.0));
+                    for (int32 SI = 0; SI < Sub; SI++)
+                    {
+                        const double Lon = 2.0 * UE_DOUBLE_PI * ((double)I + ((double)SI + 0.5) / Sub) / Width;
+                        const FVector Dir(Cos * FMath::Cos(Lon), Cos * FMath::Sin(Lon), Mu);
+                        const int32 Index = VoxelPlanetClimate::BakeCellOf(*Bake, Dir);
+                        const float H = Bake->Height[Index];
+                        const bool bSea = bAttr ? (Bake->Attr[Index] & FVoxelLandBake::SeaBit) != 0 : H <= 0.0f;
+                        Elevation += FMath::Clamp(H * InvHeight, 0.0f, 1.0f);
+                        Land += bSea ? 0.0f : 1.0f;
+                    }
+                }
+                Cells[J * Width + I] = FVector2f(Elevation / (Sub * Sub), Land / (Sub * Sub));
+            }
+        });
+    AtmosphereActor->SetSurfaceMap(Width, Height, Cells);
+    UE_LOG(LogVoxelPlugin, Log, TEXT("[Planet] %s: the atmosphere's surface map (%dx%d from the land bake, terrain height %.0f m) in %.0f ms."),
+        *GetName(), Width, Height, AtmosphereTerrainHeight, (FPlatformTime::Seconds() - StartSeconds) * 1000.0);
+}
+
+TSharedPtr<const FAtmosphereClimateMap, ESPMode::ThreadSafe> APlanetActor::GetClimateMap() const
+{
+    return AtmosphereActor ? AtmosphereActor->GetClimateFeed()->Latest() : nullptr;
+}
+
+FVoxelPlanetClimate APlanetActor::GetClimateAt(const FVector& WorldLocation) const
+{
+    FVoxelPlanetClimate Out;
+    // The planet-local direction (the frame the bake and the atmosphere's sim share).
+    const FTransform Frame = PlanetRoot ? PlanetRoot->GetComponentTransform() : GetActorTransform();
+    const FVector Dir = Frame.InverseTransformVectorNoScale(WorldLocation - Frame.GetLocation()).GetSafeNormal();
+    if (Dir.IsNearlyZero()) return Out;
+    if (Generator == EVoxelSurfaceGenerator::Terrestrial && LandBake.IsValid() && LandBake->Height.Num() == LandBake->NumCells())
+        Out.Elevation = FMath::Max(LandBake->Height[VoxelPlanetClimate::BakeCellOf(*LandBake, Dir)], 0.0f);
+    const double Sin2 = FMath::Square(FMath::Clamp(Dir.Z, -1.0, 1.0));
+    float Temperature = (float)(ClimateEquatorTemperature + (ClimatePoleTemperature - ClimateEquatorTemperature) * Sin2)
+        - ClimateLapseRate * Out.Elevation * 0.001f;
+    if (const TSharedPtr<const FAtmosphereClimateMap, ESPMode::ThreadSafe> Map = GetClimateMap(); Map.IsValid())
+    {
+        const FVector4f C = Map->Sample(Dir);
+        Out.Precipitation = FMath::Max(C.X, 0.0f);
+        Out.Humidity = FMath::Clamp(C.Y, 0.0f, 1.0f);
+        Out.CloudCover = FMath::Clamp(C.Z, 0.0f, 1.0f);
+        Temperature += ClimateWarmthScale * C.W;
+        Out.bFromSim = true;
+    }
+    Out.Temperature = Temperature;
+    return Out;
+}
+
+void APlanetActor::LogClimate()
+{
+    const TSharedPtr<const FAtmosphereClimateMap, ESPMode::ThreadSafe> Map = GetClimateMap();
+    if (!Map.IsValid())
+    {
+        UE_LOG(LogVoxelPlugin, Log, TEXT("[Planet] %s: no climate yet (the atmosphere's sim gives one every ClimateReadbackSeconds while this planet drives it)."), *GetName());
+        return;
+    }
+    // A grid even in area (longitude x sin(latitude)), land and sea apart by the bake's sea.
+    struct FStats { double N = 0, T = 0, P = 0, H = 0, C = 0; float TMin = 1e9f, TMax = -1e9f, PMin = 1e9f, PMax = -1e9f; };
+    FStats Land, Sea;
+    const FTransform Frame = PlanetRoot ? PlanetRoot->GetComponentTransform() : GetActorTransform();
+    const bool bBake = Generator == EVoxelSurfaceGenerator::Terrestrial && LandBake.IsValid() && LandBake->Attr.Num() == LandBake->NumCells();
+    constexpr int32 W = 128, H = 64;
+    for (int32 J = 0; J < H; J++)
+    {
+        const double Mu = -1.0 + 2.0 * (J + 0.5) / H;
+        const double Cos = FMath::Sqrt(FMath::Max(1.0 - Mu * Mu, 0.0));
+        for (int32 I = 0; I < W; I++)
+        {
+            const double Lon = 2.0 * UE_DOUBLE_PI * (I + 0.5) / W;
+            const FVector Dir(Cos * FMath::Cos(Lon), Cos * FMath::Sin(Lon), Mu);
+            const FVoxelPlanetClimate C = GetClimateAt(Frame.GetLocation() + Frame.TransformVectorNoScale(Dir) * 100.0);
+            const bool bSea = bBake ? (LandBake->Attr[VoxelPlanetClimate::BakeCellOf(*LandBake, Dir)] & FVoxelLandBake::SeaBit) != 0 : true;
+            FStats& S = bSea ? Sea : Land;
+            S.N += 1.0; S.T += C.Temperature; S.P += C.Precipitation; S.H += C.Humidity; S.C += C.CloudCover;
+            S.TMin = FMath::Min(S.TMin, C.Temperature); S.TMax = FMath::Max(S.TMax, C.Temperature);
+            S.PMin = FMath::Min(S.PMin, C.Precipitation); S.PMax = FMath::Max(S.PMax, C.Precipitation);
+        }
+    }
+    const auto Report = [this](const TCHAR* Name, const FStats& S)
+        {
+            if (S.N <= 0.0) return;
+            UE_LOG(LogVoxelPlugin, Log, TEXT("[Planet] %s climate, %s (%.0f%%): temperature %.1f C (%.1f to %.1f), precipitation %.3f (%.3f to %.3f), humidity %.2f, cloud %.2f."),
+                *GetName(), Name, 100.0 * S.N / (128.0 * 64.0), S.T / S.N, S.TMin, S.TMax, S.P / S.N, S.PMin, S.PMax, S.H / S.N, S.C / S.N);
+        };
+    Report(TEXT("land"), Land);
+    Report(TEXT("sea"), Sea);
+    UE_LOG(LogVoxelPlugin, Log, TEXT("[Planet] %s climate: map %u (%dx%d)."), *GetName(), (uint32)Map->Serial, Map->Width, Map->Height);
+}
+
 void APlanetActor::ConfigureAtmosphere(double PlanetRadius, double OceanRadius, bool bRegenerate)
 {
     if (!AtmosphereActor) return;
@@ -472,6 +618,9 @@ void APlanetActor::ConfigureAtmosphere(double PlanetRadius, double OceanRadius, 
         AtmosphereActor->Generate();
     LastAtmosphereSeed = Seed;
     LastAtmosphereType = AtmosphereType;
+    // Stage A9: the ground under the weather (the map lives on the atmosphere, which puts it on
+    // each config it generates).
+    ConfigureAtmosphereSurface();
     if (bHasStarWorldPosition)
         AtmosphereActor->OrientToStar(StarWorldPosition);
     // The ocean's sun: the atmosphere's light (the star's direction, the light at the top of the

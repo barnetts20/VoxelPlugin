@@ -175,7 +175,8 @@ struct VOXELPLUGIN_API FVoxelOceanSettings
     float Refraction = 1.0f;
 
     /** The foam's albedo, lit by the sun and the sky. Stage W4d: GodotOceanWaves' foam colour, sRGB
-     *  (0.73, 0.67, 0.62) in linear (was a neutral 0.85). */
+     *  (0.73, 0.67, 0.62) in linear (was a neutral 0.85). Stage A10: THE FOAM'S ONE COLOUR: with
+     *  bDeriveWaterColors the foam seen from under water (UnderwaterFoamColor) follows it. */
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Shading", meta = (EditCondition = "bOwnShading"))
     FLinearColor FoamAlbedo = FLinearColor(0.492f, 0.407f, 0.342f);
 
@@ -269,7 +270,7 @@ struct VOXELPLUGIN_API FVoxelOceanSettings
 
     /** The water's colour in Godot's light (GodotWaterLight; linear): GodotOceanWaves' water_color,
      *  sRGB (0.1, 0.15, 0.18). */
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Shading", meta = (EditCondition = "bOwnShading"))
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Shading", meta = (EditCondition = "bOwnShading && !bDeriveWaterColors"))
     FLinearColor GodotWaterColor = FLinearColor(0.0103f, 0.0194f, 0.0273f);
 
     /** Stage W6d (Design/DistantOcean.md): the pixel footprint (m) by which Godot's water light
@@ -372,14 +373,36 @@ struct VOXELPLUGIN_API FVoxelOceanSettings
 
     // --- Optics ---
 
-    /** Absorption of the water per metre, per channel (red goes first). Feeds the underwater
-     *  pass and the surface material (VoxelOceanAbsorption). */
+    /** Stage A10: ONE COLOUR FOR THE WATER (WaterColor, with WaterTurbidity for its clarity) AND ONE
+     *  FOR THE FOAM (FoamAlbedo); every other colour follows them (DeriveColors): Absorption and
+     *  Scattering, GodotWaterColor, UnderwaterLight, MeniscusColor and UnderwaterFoamColor, shown
+     *  greyed. Off: each set by hand, as before. */
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Optics")
+    bool bDeriveWaterColors = true;
+
+    /** Stage A10: the water's colour: the share of the light its scattering returns, per channel
+     *  (its single-scattering albedo, scattering over extinction: what deep water looks like lit
+     *  from above). The default is the water's look before A10 (the absorption and scattering
+     *  below), a deep teal blue; greener, browner or bluer water is a pick away. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Optics", meta = (EditCondition = "bDeriveWaterColors"))
+    FLinearColor WaterColor = FLinearColor(0.05405f, 0.3f, 0.53846f);
+
+    /** Stage A10: how much the water scatters, per metre (green): its clarity. The scattering is
+     *  this times (0.67, 1, 1.17), a little more in the blue as a particle haze's, and the
+     *  absorption what WaterColor leaves: lower is clearer water seen further, higher murkier. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Optics", meta = (EditCondition = "bDeriveWaterColors", ClampMin = "0.001", UIMax = "0.3"))
+    float WaterTurbidity = 0.03f;
+
+    /** Absorption of the water per metre, per channel (red goes first). Feeds the underwater
+     *  pass and the surface material (VoxelOceanAbsorption). Stage A10: from WaterColor and
+     *  WaterTurbidity with bDeriveWaterColors. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Optics", meta = (EditCondition = "!bDeriveWaterColors"))
     FLinearColor Absorption = FLinearColor(0.35f, 0.07f, 0.03f);
 
     /** Scattering of the water per metre, per channel. Feeds the underwater pass and the
-     *  surface material (VoxelOceanScattering). */
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Optics")
+     *  surface material (VoxelOceanScattering). Stage A10: from WaterTurbidity with
+     *  bDeriveWaterColors. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Optics", meta = (EditCondition = "!bDeriveWaterColors"))
     FLinearColor Scattering = FLinearColor(0.02f, 0.03f, 0.035f);
 
     /** Forward scattering anisotropy: the ocean's own pass (stage W3), or a Single Layer Water
@@ -390,7 +413,7 @@ struct VOXELPLUGIN_API FVoxelOceanSettings
     /** The light the water scatters toward the camera under water, in the scene's light units
      *  (linear, before exposure, so it holds as the exposure adapts). Stage A4: with the planet's
      *  atmosphere, this at the daylight of a clear noon, scaled by the daylight over the camera. */
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Optics")
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Optics", meta = (EditCondition = "!bDeriveWaterColors"))
     FLinearColor UnderwaterLight = FLinearColor(0.4f, 0.8f, 1.0f);
 
     /** Stage A4: how much the water's light dims with the camera's depth: exp(-K depth), K the
@@ -431,13 +454,13 @@ struct VOXELPLUGIN_API FVoxelOceanSettings
     double MeniscusWidth = 1.5;
 
     /** The waterline's tint, in the scene's light units (as UnderwaterLight). */
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Optics")
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Optics", meta = (EditCondition = "!bDeriveWaterColors"))
     FLinearColor MeniscusColor = FLinearColor(0.02f, 0.06f, 0.08f);
 
     /** The foam on the surface seen from under water (whitecaps, the surf's bores and swash: the
      *  Foam category's), in the scene's light units (as UnderwaterLight): lit from above, brighter
      *  than the water around it. */
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Optics")
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Optics", meta = (EditCondition = "!bDeriveWaterColors"))
     FLinearColor UnderwaterFoamColor = FLinearColor(0.6f, 0.7f, 0.75f);
 
     // --- Environment (the constant weather: everywhere when bProceduralWeather is off) ---
@@ -961,6 +984,48 @@ struct VOXELPLUGIN_API FVoxelOceanSettings
         FoamDetailDistance = FMath::Max(FoamDetailDistance, 10.0f);
         FoamFadeDistance = FMath::Max(FoamFadeDistance, 0.0f);
         WaveAnisotropy = FMath::Clamp(WaveAnisotropy, 1, 16);
+        WaterTurbidity = FMath::Max(WaterTurbidity, 0.001f);
+        DeriveColors();
+    }
+
+    /** Stage A10: the colours that follow WaterColor, WaterTurbidity and FoamAlbedo, with
+     *  bDeriveWaterColors (else nothing). Each relation reproduces the hand-set colour before A10 at
+     *  the defaults, near enough: Absorption and Scattering exactly, GodotWaterColor within 3% (the
+     *  blue), MeniscusColor within 0.01, UnderwaterLight within 0.1 (its green: 0.9 for 0.8) and
+     *  UnderwaterFoamColor within 0.08 (its blue: 0.67 for 0.75). */
+    void DeriveColors()
+    {
+        if (!bDeriveWaterColors) return;
+        const auto Luminance = [](const FLinearColor& C) { return 0.2126f * C.R + 0.7152f * C.G + 0.0722f * C.B; };
+        const FLinearColor Albedo(FMath::Clamp(WaterColor.R, 0.002f, 0.98f), FMath::Clamp(WaterColor.G, 0.002f, 0.98f),
+            FMath::Clamp(WaterColor.B, 0.002f, 0.98f), 1.0f);
+        // The scattering, a particle haze's (a little more in the blue), and the absorption the albedo
+        // leaves: albedo = scattering / (scattering + absorption).
+        const float T = FMath::Max(WaterTurbidity, 0.001f);
+        Scattering = FLinearColor(T * (2.0f / 3.0f), T, T * (7.0f / 6.0f), 1.0f);
+        Absorption = FLinearColor(Scattering.R * (1.0f / Albedo.R - 1.0f), Scattering.G * (1.0f / Albedo.G - 1.0f),
+            Scattering.B * (1.0f / Albedo.B - 1.0f), 1.0f);
+        // Godot's water colour: the albedo half desaturated (0.54) at 0.068 of its luminance:
+        // GodotOceanWaves' water_color from the default albedo.
+        const float Y = Luminance(Albedo);
+        GodotWaterColor = FLinearColor(Y + 0.54f * (Albedo.R - Y), Y + 0.54f * (Albedo.G - Y), Y + 0.54f * (Albedo.B - Y), 1.0f) * 0.068f;
+        GodotWaterColor.A = 1.0f;
+        // The light under water (the fog's: its colour this times the albedo): the daylight through
+        // 2.5 m of the water's absorption, its brightest channel 1.
+        const FLinearColor Down(FMath::Exp(-2.5f * Absorption.R), FMath::Exp(-2.5f * Absorption.G), FMath::Exp(-2.5f * Absorption.B), 1.0f);
+        const float Peak = FMath::Max3(Down.R, Down.G, Down.B);
+        UnderwaterLight = FLinearColor(Down.R / Peak, Down.G / Peak, Down.B / Peak, 1.0f);
+        // The waterline's tint: the fog's colour half desaturated, at a fifth.
+        const FLinearColor Fog(UnderwaterLight.R * Albedo.R, UnderwaterLight.G * Albedo.G, UnderwaterLight.B * Albedo.B, 1.0f);
+        const float YF = Luminance(Fog);
+        MeniscusColor = FLinearColor(YF + 0.5f * (Fog.R - YF), YF + 0.5f * (Fog.G - YF), YF + 0.5f * (Fog.B - YF), 1.0f) * 0.2f;
+        MeniscusColor.A = 1.0f;
+        // The foam from below: its albedo, half tinted by the light under water at the albedo's
+        // luminance, 1.75 times (lit from above through itself, brighter than the water around it).
+        const float YA = Luminance(FoamAlbedo);
+        UnderwaterFoamColor = FLinearColor(0.5f * FoamAlbedo.R + 0.5f * YA * UnderwaterLight.R, 0.5f * FoamAlbedo.G + 0.5f * YA * UnderwaterLight.G,
+            0.5f * FoamAlbedo.B + 0.5f * YA * UnderwaterLight.B, 1.0f) * 1.75f;
+        UnderwaterFoamColor.A = 1.0f;
     }
 
     /** Stage W6g (Design/DistantOcean.md): THE PRESETS, the settings that make the sea's look, the

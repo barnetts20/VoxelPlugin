@@ -28,6 +28,40 @@ class FVoxelLandBaker;
 struct FVoxelLandBake;
 struct FVoxelLandNoiseSet;
 
+/** Stage A11: the climate at a point (APlanetActor::GetClimateAt), from the atmosphere's sim
+ *  (its long-run means) and the planet's own latitude and ground. */
+USTRUCT(BlueprintType)
+struct VOXELPLUGIN_API FVoxelPlanetClimate
+{
+    GENERATED_BODY()
+
+    /** Mean temperature (degrees C): the latitude's profile, the sim's warmth, the ground's
+     *  height through the lapse rate. */
+    UPROPERTY(BlueprintReadOnly, Category = "Planet|Climate")
+    float Temperature = 0.0f;
+
+    /** Precipitation (the sim's long-run net condensation: about 0 dry, 0.05 to 0.3 wet). */
+    UPROPERTY(BlueprintReadOnly, Category = "Planet|Climate")
+    float Precipitation = 0.0f;
+
+    /** The low air's relative humidity (0 to 1). */
+    UPROPERTY(BlueprintReadOnly, Category = "Planet|Climate")
+    float Humidity = 0.0f;
+
+    /** Cloud cover (0 to 1). */
+    UPROPERTY(BlueprintReadOnly, Category = "Planet|Climate")
+    float CloudCover = 0.0f;
+
+    /** The ground's height above sea level (m; 0 at sea and on the noise surface). */
+    UPROPERTY(BlueprintReadOnly, Category = "Planet|Climate")
+    float Elevation = 0.0f;
+
+    /** False until the atmosphere's sim has given a climate (the temperature is then the
+     *  latitude's and the ground's alone). */
+    UPROPERTY(BlueprintReadOnly, Category = "Planet|Climate")
+    bool bFromSim = false;
+};
+
 /** Top-level planet actor that spawns and coordinates terrain, ocean, atmosphere and
  *  gravity child actors. Stage A1: the atmosphere (CloudAtmosphere's seeded actor) is a child
  *  again, generated from the planet's seed, aimed at the star the star system pushes, and the
@@ -131,6 +165,32 @@ public:
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Planet|Atmosphere", meta = (EditCondition = "bEnableAtmosphere"))
     FAtmosphereGenerationSet AtmosphereSet;
 
+    /** Stage A9: the terrain height (m above sea level) the weather sim reads as its highest
+     *  (the surface map's elevation 1; higher ground counts as this). The sim's mountains hold
+     *  back and steer the wind and lift it into cloud and rain (the sim config's Planet|Surface
+     *  sets how much). The terrestrial generator's bake; 0: no terrain in the sim (all sea). */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Planet|Atmosphere", meta = (EditCondition = "bEnableAtmosphere", ClampMin = "0.0", UIMax = "12000.0"))
+    float AtmosphereTerrainHeight = 6000.0f;
+
+    // --- Climate (stage A11: GetClimateAt) ---
+
+    /** The mean temperature at the equator and at the poles at sea level (degrees C), between
+     *  them as sin^2 of the latitude (Earth's annual means: about 27 and -25). */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Planet|Climate")
+    float ClimateEquatorTemperature = 27.0f;
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Planet|Climate")
+    float ClimatePoleTemperature = -25.0f;
+
+    /** How fast the temperature falls with the ground's height (degrees C per km). */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Planet|Climate", meta = (ClampMin = "0.0", UIMax = "12.0"))
+    float ClimateLapseRate = 6.5f;
+
+    /** Degrees C per unit of the sim's warmth (its columns' thickness against their latitude's
+     *  mean, about -0.1 to 0.1): the weather's standing warm ridges and cold troughs. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Planet|Climate", meta = (ClampMin = "0.0", UIMax = "200.0"))
+    float ClimateWarmthScale = 60.0f;
+
     // --- Gravity ---
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Planet|Gravity")
@@ -192,6 +252,21 @@ public:
     /** Stage W6g: GodotOceanWaves' exaggerated look, the defaults (ApplyGodotPreset). */
     UFUNCTION(CallInEditor, BlueprintCallable, Category = "Planet|Ocean")
     void OceanPresetGodot();
+
+    /** Stage A11: the climate at a world location (its direction from the planet's centre): the
+     *  atmosphere's sim's long-run means there (GetClimateMap), the latitude's temperature, the
+     *  ground's height (the land bake's). Game thread. */
+    UFUNCTION(BlueprintCallable, Category = "Planet|Climate")
+    FVoxelPlanetClimate GetClimateAt(const FVector& WorldLocation) const;
+
+    /** Stage A11: the atmosphere's latest climate map (null until its sim has given one; the
+     *  last one stays while another planet drives the sim). */
+    TSharedPtr<const struct FAtmosphereClimateMap, ESPMode::ThreadSafe> GetClimateMap() const;
+
+    /** Stage A11: logs the climate over the planet (land and sea apart): the temperature, the
+     *  precipitation, the humidity and the cloud, their means and ranges, from a grid of points. */
+    UFUNCTION(CallInEditor, Category = "Planet|Climate")
+    void LogClimate();
 
     // --- Lifecycle ---
 
@@ -269,6 +344,8 @@ private:
      *  its own first tick generates). */
     int32 LastAtmosphereSeed = INDEX_NONE;
     EPlanetAtmosphereType LastAtmosphereType = EPlanetAtmosphereType::Terrestrial;
+    /** Stage A9: the bake and terrain height the atmosphere's surface map was made from (0: none). */
+    uint32 LastSurfaceMapKey = 0;
 
     bool bInitialized = false;
 
@@ -326,6 +403,9 @@ private:
      *  the star, and the ocean's sun; or parked and hidden when bEnableAtmosphere is off.
      *  bRegenerate: the seed's draws again even if the seed and model are unchanged (a set edit). */
     void ConfigureAtmosphere(double PlanetRadius, double OceanRadius, bool bRegenerate = false);
+    /** Stage A9: the atmosphere's surface map from the land bake (elevation and land on the
+     *  weather sim's grid layout), when the bake or the terrain height changed. */
+    void ConfigureAtmosphereSurface();
 
     /** Whether the planet's set names anything (else the atmosphere keeps its own). */
     bool HasAtmosphereSet() const;
