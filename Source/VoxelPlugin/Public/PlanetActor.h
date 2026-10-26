@@ -26,6 +26,7 @@
 class APlanetGravityZone;
 class FVoxelLandBaker;
 struct FVoxelLandBake;
+class UVoxelOceanProfile;
 struct FVoxelLandNoiseSet;
 
 /** Stage A11: the climate at a point (APlanetActor::GetClimateAt), from the atmosphere's sim
@@ -139,6 +140,35 @@ public:
     UPROPERTY(EditAnywhere, BlueprintReadWrite, BlueprintSetter = SetOceanSettings, Category = "Planet|Ocean")
     FVoxelOceanSettings OceanSettings;
 
+    // --- Ocean seeding (stage A12: VoxelOceanProfile.h) ---
+
+    /** What the ocean's seed draws onto OceanSettings (the base, kept as authored): the water's
+     *  and the foam's colours, the waves, the wind... None: the ocean is OceanSettings as they are. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Planet|Ocean|Seeding")
+    TObjectPtr<UVoxelOceanProfile> OceanProfile = nullptr;
+
+    /** The ocean's seed; -1: the terrain's (TerrestrialSettings.Seed), as the atmosphere's. A
+     *  change applies in place. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Planet|Ocean|Seeding")
+    int32 OceanSeed = -1;
+
+    /** Paths the seed leaves as OceanSettings has them (the profile's paths: WaterColor,
+     *  WaveEqualizer.Gain2m...). */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Planet|Ocean|Seeding")
+    TArray<FString> OceanLocks;
+
+    /** A draw's path (or a palette's name: Water, Foam) to hold at OceanSweepPosition in its range
+     *  while every other keeps the seed's draw: for finding a range's ends. Not saved. */
+    UPROPERTY(EditAnywhere, Transient, Category = "Planet|Ocean|Seeding")
+    FString OceanSweepPath;
+
+    UPROPERTY(EditAnywhere, Transient, Category = "Planet|Ocean|Seeding", meta = (ClampMin = "0.0", ClampMax = "1.0"))
+    float OceanSweepPosition = 0.5f;
+
+    /** Every setting the last generation wrote (and every path it could not). */
+    UPROPERTY(VisibleInstanceOnly, Transient, BlueprintReadOnly, Category = "Planet|Ocean|Seeding", meta = (TitleProperty = "Path"))
+    TArray<FAtmosphereDrawRecord> OceanReport;
+
     // --- Terrain ---
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Planet|Terrain")
@@ -209,6 +239,14 @@ public:
 
     UFUNCTION(BlueprintCallable, Category = "Planet")
     ASeededAtmosphereActor* GetAtmosphereActor() const { return AtmosphereActor; }
+
+    /** Stage A12: the seed the ocean draws from (OceanSeed, or the terrain's for -1). */
+    UFUNCTION(BlueprintPure, Category = "Planet|Ocean|Seeding")
+    int32 GetOceanSeed() const;
+
+    /** Stage A12: the settings the ocean gets: OceanSettings with OceanProfile's draws for the
+     *  ocean's seed (OceanReport refilled). */
+    FVoxelOceanSettings GenerateOceanSettings();
 
     /** The seed the atmosphere generates from (AtmosphereSeed, or the terrain's for -1). */
     UFUNCTION(BlueprintPure, Category = "Planet|Atmosphere")

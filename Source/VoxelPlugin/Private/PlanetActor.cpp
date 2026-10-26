@@ -4,6 +4,7 @@
 #include "VoxelLandBake.h"
 #include "VoxelCubeSphere.h"
 #include "AtmosphereWeather.h"
+#include "VoxelOceanProfile.h"
 #include "Async/ParallelFor.h"
 #include "VoxelPlugin.h"
 #include "EngineUtils.h"
@@ -140,13 +141,25 @@ void APlanetActor::PostEditChangeProperty(FPropertyChangedEvent& PropertyChanged
 
     // The ocean's settings apply in place, as far as they can (a change inside the struct
     // reports the struct as the member property); slider drags apply on release.
+    // Stage A12: the ocean's seeding applies in place (the sweep's slider live).
+    if (MemberName == GET_MEMBER_NAME_CHECKED(APlanetActor, OceanProfile)
+        || MemberName == GET_MEMBER_NAME_CHECKED(APlanetActor, OceanSeed)
+        || MemberName == GET_MEMBER_NAME_CHECKED(APlanetActor, OceanLocks)
+        || MemberName == GET_MEMBER_NAME_CHECKED(APlanetActor, OceanSweepPath)
+        || MemberName == GET_MEMBER_NAME_CHECKED(APlanetActor, OceanSweepPosition))
+    {
+        if (OceanActor)
+            OceanActor->SetOceanSettings(GenerateOceanSettings(), bInteractive);
+        return;
+    }
+
     if (MemberName == GET_MEMBER_NAME_CHECKED(APlanetActor, OceanSettings))
     {
         // The planet shows what the ocean builds (TileQuads snapped, limits) once released.
         if (!bInteractive)
             OceanSettings.Sanitize();
         if (OceanActor)
-            OceanActor->SetOceanSettings(OceanSettings, bInteractive);
+            OceanActor->SetOceanSettings(GenerateOceanSettings(), bInteractive);
         return;
     }
 
@@ -175,7 +188,7 @@ void APlanetActor::ForwardChildSettings()
     {
         if (OceanMaterial && OceanActor->OceanMaterial != OceanMaterial)
             OceanActor->SetOceanMaterial(OceanMaterial);
-        OceanActor->SetOceanSettings(OceanSettings);
+        OceanActor->SetOceanSettings(GenerateOceanSettings());
     }
 }
 
@@ -184,7 +197,7 @@ void APlanetActor::SetOceanSettings(const FVoxelOceanSettings& InSettings)
     OceanSettings = InSettings;
     OceanSettings.Sanitize();
     if (OceanActor && bInitialized)
-        OceanActor->SetOceanSettings(OceanSettings);
+        OceanActor->SetOceanSettings(GenerateOceanSettings());
 }
 
 void APlanetActor::OceanPresetRealistic()
@@ -391,7 +404,7 @@ void APlanetActor::ConfigureOcean(double PlanetRadius, double NoiseAmplitude, do
     OceanActor->NoiseAmplitudeRatio = ChildNoiseAmplitudeRatio(PlanetRadius, NoiseAmplitude);
     OceanActor->SurfaceSettings = SurfaceSettings;
     // Before the initialization, which builds the surface with them.
-    OceanActor->OceanSettings = OceanSettings;
+    OceanActor->OceanSettings = GenerateOceanSettings();
     OceanActor->InitializeFromPlanet(SharedCompositor, PlanetRoot, FVector(OceanRadius));
     OceanActor->SetActorHiddenInGame(false);
     OceanActor->SetActorTickEnabled(true);
@@ -417,6 +430,16 @@ void APlanetActor::ConfigureGravity(double PlanetRadius, double OceanRadius)
     GravityZone->SetActorHiddenInGame(false);
     GravityZone->SetActorTickEnabled(true);
     GravityZone->SetActorEnableCollision(true);
+}
+
+int32 APlanetActor::GetOceanSeed() const
+{
+    return OceanSeed >= 0 ? OceanSeed : TerrestrialSettings.Seed;
+}
+
+FVoxelOceanSettings APlanetActor::GenerateOceanSettings()
+{
+    return VoxelOceanSeeding::Generate(GetOceanSeed(), OceanSettings, OceanProfile, OceanLocks, OceanSweepPath, OceanSweepPosition, OceanReport);
 }
 
 int32 APlanetActor::GetAtmosphereSeed() const
