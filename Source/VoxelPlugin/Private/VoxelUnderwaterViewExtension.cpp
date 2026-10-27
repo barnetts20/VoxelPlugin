@@ -37,16 +37,19 @@ namespace VoxelUnderwaterDetail
     constexpr double CameraProbeMaxMove = 2000.0;
     constexpr double CameraProbeRise = 300.0;
     constexpr double CameraProbeMargin = 30.0;
-    /** Stage A8: the caustics' levels, slices and splat margin (texels): VoxelUnderwaterMap.ush's and
-     *  VoxelUnderwaterPass.usf's VOXEL_UNDERWATER_CAUSTIC_LEVELS, _SLICES and _MARGIN. The resolve's
+    /** Stage A8: the caustics' levels (their own grids since T5d3: VoxelUnderwaterMap::CausticLevels),
+     *  slices and splat margin (texels): VoxelUnderwaterMap.ush's and VoxelUnderwaterPass.usf's
+     *  VOXEL_UNDERWATER_CAUSTIC_LEVELS, _SLICES and _MARGIN. The resolve's
      *  blur per metre of path (m): the sun's size in water (0.007) and where the beam spreads the
      *  splat's sources thin (the test sea's stripes went at 0.019). */
-    constexpr int32 CausticLevels = 3;
+    constexpr int32 CausticLevels = VoxelUnderwaterMap::CausticLevels;
+    /** T5d3: the deepest bed (cm) the caustics' grids are moved up-sun for (deeper, the caustics
+     *  have faded: their last slice's path is 13 m, gone by twice that). */
+    constexpr double CausticCentreMaxDepth = 3000.0;
     constexpr int32 CausticSlices = 8;
     constexpr int32 CausticMargin = 32;
     constexpr float CausticBlur = 0.019f;
 }
-static_assert(VoxelUnderwaterDetail::CausticLevels <= VoxelUnderwaterMap::Levels, "the caustics' levels are the surface map's first");
 
 // ---------------------------------------------------------------------------
 // Shader
@@ -119,6 +122,10 @@ BEGIN_SHADER_PARAMETER_STRUCT(FVoxelUnderwaterParameters, )
     SHADER_PARAMETER_SAMPLER(SamplerState, UnderwaterCausticSampler)
     SHADER_PARAMETER(uint32, UnderwaterCausticOn)
     SHADER_PARAMETER(FVector4f, UnderwaterCaustic)
+    // T5d3: the caustics' own grids (VoxelUnderwaterMap::MakeCausticLevels).
+    SHADER_PARAMETER_ARRAY(FVector4f, UnderwaterCausticAnchor, [VoxelUnderwaterMap::CausticLevels])
+    SHADER_PARAMETER_ARRAY(FVector4f, UnderwaterCausticE1, [VoxelUnderwaterMap::CausticLevels])
+    SHADER_PARAMETER_ARRAY(FVector4f, UnderwaterCausticE2, [VoxelUnderwaterMap::CausticLevels])
 
     SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2D<float4>, UnderwaterOutput)
 END_SHADER_PARAMETER_STRUCT()
@@ -142,6 +149,7 @@ public:
         // The surface map's sizes (VoxelUnderwaterMap.ush) from the CPU's.
         OutEnvironment.SetDefine(TEXT("VOXEL_UNDERWATER_MAP_SIZE"), VoxelUnderwaterMap::Size);
         OutEnvironment.SetDefine(TEXT("VOXEL_UNDERWATER_MAP_LEVELS"), VoxelUnderwaterMap::Levels);
+        OutEnvironment.SetDefine(TEXT("VOXEL_UNDERWATER_CAUSTIC_LEVELS"), VoxelUnderwaterMap::CausticLevels);
         // The stable sphere height and the shell roots were checked in IEEE float order.
         OutEnvironment.CompilerFlags.Add(CFLAG_NoFastMath);
     }
@@ -193,6 +201,12 @@ IMPLEMENT_GLOBAL_SHADER(FVoxelUnderwaterMapCS, "/Plugin/VoxelPlugin/Private/Voxe
 // Stage A8: the caustics' splat (the map's slopes into the accumulation) and resolve (into the map).
 BEGIN_SHADER_PARAMETER_STRUCT(FVoxelUnderwaterCausticSplatParameters, )
     SHADER_PARAMETER_ARRAY(FVector4f, UnderwaterMapAnchor, [VoxelUnderwaterMap::Levels])
+    SHADER_PARAMETER_ARRAY(FVector4f, UnderwaterMapE1, [VoxelUnderwaterMap::Levels])
+    SHADER_PARAMETER_ARRAY(FVector4f, UnderwaterMapE2, [VoxelUnderwaterMap::Levels])
+    // T5d3: the caustics' own grids (VoxelUnderwaterMap::MakeCausticLevels).
+    SHADER_PARAMETER_ARRAY(FVector4f, UnderwaterCausticAnchor, [VoxelUnderwaterMap::CausticLevels])
+    SHADER_PARAMETER_ARRAY(FVector4f, UnderwaterCausticE1, [VoxelUnderwaterMap::CausticLevels])
+    SHADER_PARAMETER_ARRAY(FVector4f, UnderwaterCausticE2, [VoxelUnderwaterMap::CausticLevels])
     SHADER_PARAMETER_RDG_TEXTURE(Texture2DArray<float>, UnderwaterMap)
     SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2DArray<uint>, UnderwaterCausticAccumOut)
 END_SHADER_PARAMETER_STRUCT()
@@ -218,7 +232,7 @@ public:
 IMPLEMENT_GLOBAL_SHADER(FVoxelUnderwaterCausticSplatCS, "/Plugin/VoxelPlugin/Private/VoxelUnderwaterPass.usf", "UnderwaterCausticSplatCS", SF_Compute);
 
 BEGIN_SHADER_PARAMETER_STRUCT(FVoxelUnderwaterCausticBlurParameters, )
-    SHADER_PARAMETER_ARRAY(FVector4f, UnderwaterMapAnchor, [VoxelUnderwaterMap::Levels])
+    SHADER_PARAMETER_ARRAY(FVector4f, UnderwaterCausticAnchor, [VoxelUnderwaterMap::CausticLevels])
     SHADER_PARAMETER(FVector4f, UnderwaterCaustic)
     SHADER_PARAMETER_RDG_TEXTURE(Texture2DArray<uint>, UnderwaterCausticAccum)
     SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2DArray<float>, UnderwaterCausticTempOut)
@@ -380,12 +394,19 @@ FScreenPassTexture FVoxelUnderwaterViewExtension::Render_RenderThread(
     while (CameraReadbacks.Num() > 0 && CameraReadbacks[0].Buffer.IsValid() && CameraReadbacks[0].Buffer->IsReady())
     {
         FCameraReadback& R = CameraReadbacks[0];
-        const float* Heights = static_cast<const float*>(R.Buffer->Lock(64u * sizeof(float)));
+        const float* Heights = static_cast<const float*>(R.Buffer->Lock(65u * sizeof(float)));
         if (Heights)
         {
             float Highest = Heights[0];
             for (int32 i = 1; i < 64; i++) Highest = FMath::Max(Highest, Heights[i]);
+            // T5d3: the bed's depth at the foot (the 65th).
+            const float Bed = Heights[64];
             R.Buffer->Unlock();
+            if (FMath::IsFinite(Bed))
+            {
+                bHasCameraBed = true;
+                CameraBedDepth = FMath::Max((double)Bed, 0.0);
+            }
             if (FMath::IsFinite(Highest))
             {
                 bHasCameraSurface = true;
@@ -446,6 +467,13 @@ FScreenPassTexture FVoxelUnderwaterViewExtension::Render_RenderThread(
     WaveP.UnderwaterDisplacementSampler = TStaticSamplerState<SF_Trilinear, AM_Wrap, AM_Wrap, AM_Clamp>::GetRHI();
     WaveP.UnderwaterDerivativesSampler = TStaticSamplerState<SF_Trilinear, AM_Wrap, AM_Wrap, AM_Clamp>::GetRHI();
     const VoxelUnderwaterMap::FLevels Levels = VoxelUnderwaterMap::MakeLevels(CameraPlanet, Waves.Radius(), Waves.PlanetToWorld.GetRotation());
+    // T5d3: the caustics' grids, round the sea point the sun lights the bed under the camera through
+    // (the bed's depth from the camera probe's last reading; the camera's foot until there is one).
+    const FVector SunPlanet = Waves.PlanetToWorld.GetRotation().UnrotateVector(FVector(Params.SunDirection)).GetSafeNormal();
+    const FVector CausticCentrePlanet = VoxelUnderwaterMap::CausticCentre(CameraPlanet, Waves.Radius(), SunPlanet,
+        bHasCameraBed ? CameraBedDepth : 0.0, VoxelUnderwaterDetail::CausticCentreMaxDepth);
+    const VoxelUnderwaterMap::FCausticLevels CausticGrids = VoxelUnderwaterMap::MakeCausticLevels(CameraPlanet, CausticCentrePlanet, Waves.Radius(),
+        Waves.PlanetToWorld.GetRotation());
     for (int32 Level = 0; Level < VoxelUnderwaterMap::Levels; Level++)
     {
         WaveP.UnderwaterMapAnchor[Level] = Levels.Anchor[Level];
@@ -469,7 +497,8 @@ FScreenPassTexture FVoxelUnderwaterViewExtension::Render_RenderThread(
     FRHITexture* Foam = FoamRHI.GetReference();
     const bool bFoam = bFFT && Foam && Params.FoamColor.W > 0.0f;
     // The map pass's parameters (the probe's too, stage W8b: the same waves, shore and depth probe).
-    FRDGBufferRef CameraOut = GraphBuilder.CreateBuffer(FRDGBufferDesc::CreateStructuredDesc(sizeof(float), 64u), TEXT("VoxelUnderwater.CameraProbe"));
+    // 64 heights and (T5d3) the bed's depth at the foot.
+    FRDGBufferRef CameraOut = GraphBuilder.CreateBuffer(FRDGBufferDesc::CreateStructuredDesc(sizeof(float), 65u), TEXT("VoxelUnderwater.CameraProbe"));
     auto MakeMapParams = [&](FRDGTextureUAVRef MapUAV, FRDGTextureUAVRef FoamUAV, bool bFoamOn) -> FVoxelUnderwaterMapParameters*
         {
             FVoxelUnderwaterMapParameters* P = GraphBuilder.AllocParameters<FVoxelUnderwaterMapParameters>();
@@ -552,7 +581,7 @@ FScreenPassTexture FVoxelUnderwaterViewExtension::Render_RenderThread(
             R.Buffer = MakeUnique<FRHIGPUBufferReadback>(TEXT("VoxelUnderwater.CameraProbeReadback"));
             R.CameraPlanet = CameraPlanet;
             R.Seconds = FPlatformTime::Seconds();
-            AddEnqueueCopyPass(GraphBuilder, R.Buffer.Get(), CameraOut, 64u * sizeof(float));
+            AddEnqueueCopyPass(GraphBuilder, R.Buffer.Get(), CameraOut, 65u * sizeof(float));
         }
         const double Age = FPlatformTime::Seconds() - CameraSurfaceSeconds;
         const double Moved = (CameraPlanet - CameraSurfaceAt).Size();
@@ -599,7 +628,17 @@ FScreenPassTexture FVoxelUnderwaterViewExtension::Render_RenderThread(
             {
                 FVoxelUnderwaterCausticSplatParameters* P = GraphBuilder.AllocParameters<FVoxelUnderwaterCausticSplatParameters>();
                 for (int32 Level = 0; Level < VoxelUnderwaterMap::Levels; Level++)
+                {
                     P->UnderwaterMapAnchor[Level] = WaveP.UnderwaterMapAnchor[Level];
+                    P->UnderwaterMapE1[Level] = WaveP.UnderwaterMapE1[Level];
+                    P->UnderwaterMapE2[Level] = WaveP.UnderwaterMapE2[Level];
+                }
+                for (int32 Level = 0; Level < CausticLevels; Level++)
+                {
+                    P->UnderwaterCausticAnchor[Level] = CausticGrids.Anchor[Level];
+                    P->UnderwaterCausticE1[Level] = CausticGrids.E1[Level];
+                    P->UnderwaterCausticE2[Level] = CausticGrids.E2[Level];
+                }
                 P->UnderwaterMap = Map;
                 P->UnderwaterCausticAccumOut = GraphBuilder.CreateUAV(Accum);
                 const int32 Span = Size + 2 * CausticMargin;
@@ -614,8 +653,8 @@ FScreenPassTexture FVoxelUnderwaterViewExtension::Render_RenderThread(
             const FIntVector Groups(FMath::DivideAndRoundUp(Size, ThreadGroupSize), FMath::DivideAndRoundUp(Size, ThreadGroupSize), Layers);
             {
                 FVoxelUnderwaterCausticBlurParameters* P = GraphBuilder.AllocParameters<FVoxelUnderwaterCausticBlurParameters>();
-                for (int32 Level = 0; Level < VoxelUnderwaterMap::Levels; Level++)
-                    P->UnderwaterMapAnchor[Level] = WaveP.UnderwaterMapAnchor[Level];
+                for (int32 Level = 0; Level < CausticLevels; Level++)
+                    P->UnderwaterCausticAnchor[Level] = CausticGrids.Anchor[Level];
                 P->UnderwaterCaustic = CausticInfo;
                 P->UnderwaterCausticAccum = Accum;
                 P->UnderwaterCausticTempOut = GraphBuilder.CreateUAV(Temp);
@@ -624,8 +663,8 @@ FScreenPassTexture FVoxelUnderwaterViewExtension::Render_RenderThread(
             }
             {
                 FVoxelUnderwaterCausticBlurParameters* P = GraphBuilder.AllocParameters<FVoxelUnderwaterCausticBlurParameters>();
-                for (int32 Level = 0; Level < VoxelUnderwaterMap::Levels; Level++)
-                    P->UnderwaterMapAnchor[Level] = WaveP.UnderwaterMapAnchor[Level];
+                for (int32 Level = 0; Level < CausticLevels; Level++)
+                    P->UnderwaterCausticAnchor[Level] = CausticGrids.Anchor[Level];
                 P->UnderwaterCaustic = CausticInfo;
                 P->UnderwaterCausticTemp = Temp;
                 P->UnderwaterCausticMapOut = GraphBuilder.CreateUAV(CausticMap);
@@ -734,6 +773,12 @@ FScreenPassTexture FVoxelUnderwaterViewExtension::Render_RenderThread(
         P->UnderwaterCausticSampler = TStaticSamplerState<SF_Bilinear, AM_Clamp, AM_Clamp, AM_Clamp>::GetRHI();
         P->UnderwaterCausticOn = bCaustics ? 1u : 0u;
         P->UnderwaterCaustic = CausticInfo;
+        for (int32 Level = 0; Level < VoxelUnderwaterMap::CausticLevels; Level++)
+        {
+            P->UnderwaterCausticAnchor[Level] = CausticGrids.Anchor[Level];
+            P->UnderwaterCausticE1[Level] = CausticGrids.E1[Level];
+            P->UnderwaterCausticE2[Level] = CausticGrids.E2[Level];
+        }
 
         P->View = View.ViewUniformBuffer;
         P->UnderwaterSceneColor = SceneColor.Texture;

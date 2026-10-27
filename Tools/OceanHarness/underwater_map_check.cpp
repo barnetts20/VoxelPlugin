@@ -273,11 +273,16 @@ int main(int argc, char** argv)
             Worst = std::max(Worst, (double)std::fabs(VoxelUnderwaterMapHeight(Foot) - Exact(Q, 0.0f, Out)));
         }
         std::printf("  the map's surface against the search: up to %.2f mm\n", Worst * 10);
-        Expect(Worst < 0.3, "the waterline within 3 mm of the old search");
+        // (T5d3: 4 mm, was 3: the finest texel 4 cm, was 2; 2.7 mm before, 3.0 now.)
+        Expect(Worst < 0.4, "the waterline within 4 mm of the old search");
     }
 
     // ---- Continuity -------------------------------------------------------------------------------
-    std::printf("\nContinuity: a walk outward to 1 km, steps of 1 cm to 50 cm, across every level's edge:\n");
+    // The walks go past the coarsest level's corner (its half-width times sqrt 2, and a margin).
+    const double CoarseHalf = 0.5 * VoxelUnderwaterMap::Size * VoxelUnderwaterMap::TexelOf(VoxelUnderwaterMap::Levels - 1);
+    const double PastStart = 1.44 * CoarseHalf;
+    const double WalkEnd = 1.53 * CoarseHalf;
+    std::printf("\nContinuity: a walk outward to %.0f m, steps of 1 cm to 50 cm, across every level's edge:\n", WalkEnd * 0.01);
     {
         FVector T = RandomDir(Rng);
         const FVector U(CamUp.x, CamUp.y, CamUp.z);
@@ -286,7 +291,7 @@ int main(int argc, char** argv)
         float Last = 0;
         double LastD = 0;
         bool bFirst = true;
-        for (double D = 0; D < 100000.0; D += std::max(1.0, D / 2000.0))
+        for (double D = 0; D < WalkEnd; D += std::max(1.0, D / 2000.0))
         {
             const float3 Q = F3(U * (-CameraHeight) + T * D);
             float3 Up;
@@ -295,9 +300,9 @@ int main(int argc, char** argv)
             bFirst = false;
             Last = H;
             LastD = D;
-            if (D > 94000.0) Past = std::max(Past, (double)std::fabs(H));
+            if (D > PastStart) Past = std::max(Past, (double)std::fabs(H));
         }
-        std::printf("  steepest step %.3f cm per cm; past the coarsest level (940 m+) the map's height %.1f cm (the sphere)\n", WorstSlope, Past);
+        std::printf("  steepest step %.3f cm per cm; past the coarsest level (%.0f m+) the map's height %.1f cm (the sphere)\n", WorstSlope, PastStart * 0.01, Past);
         Expect(WorstSlope < 1.0, "no step at the levels' edges (every step under a slope of 1)");
     }
 
@@ -323,7 +328,7 @@ int main(int argc, char** argv)
         float Last = 0;
         double LastD = 0;
         bool bFirst = true;
-        for (double D = 0; D < 100000.0; D += std::max(1.0, D / 2000.0))
+        for (double D = 0; D < WalkEnd; D += std::max(1.0, D / 2000.0))
         {
             const float3 Q = F3(U * (-CameraHeight) + T * D);
             float3 Up;
@@ -334,9 +339,9 @@ int main(int argc, char** argv)
             bFirst = false;
             Last = F;
             LastD = D;
-            if (D > 94000.0) Past = std::max(Past, (double)F);
+            if (D > PastStart) Past = std::max(Past, (double)F);
         }
-        std::printf("  a walk to 1 km: foam %.3f to %.3f, steepest change %.5f per cm (the field's %.5f); past the coarsest level %.3f\n",
+        std::printf("  a walk to the coarsest level's corner and past: foam %.3f to %.3f, steepest change %.5f per cm (the field's %.5f); past the coarsest level %.3f\n",
             Low, High, WorstSlope, FoamSlope, Past);
         Expect(Low >= 0.0 && High <= 1.0, "the foam stays within 0 to 1");
         Expect(WorstSlope < 2.0 * FoamSlope, "no step at the levels' edges (under twice the field's steepest change)");
@@ -391,7 +396,35 @@ int main(int argc, char** argv)
         // (Stage W8c: 1.2 near, was 1.0. The long bands' detiling contrast steepens their copies'
         // weights, whose own slope the hook's normals leave out and the map's differences keep:
         // 0.94 deg before, 1.11 with it.)
-        Expect(WorstNear < 1.2 && WorstAll < 3.0, "the underside's normals: mean under 1.2 deg near the camera, 3 deg out to 40 m");
+        // (T5d3: 2.0 near, was 1.2: the finest texel 4 cm, was 2, the user's call; 1.11 deg before, 1.81 now.)
+        Expect(WorstNear < 2.0 && WorstAll < 3.0, "the underside's normals: mean under 2 deg near the camera, 3 deg out to 40 m");
+
+    }
+
+    // ---- T5d3: the caustics' grids ------------------------------------------------------------------
+    std::printf("\nThe caustics' grids (their own, round the sea point the sun lights the bed under the camera through):\n");
+    {
+        const double Radius = 1.0e8;
+        const FVector Camera(0.0, 0.0, Radius - 300.0);
+        // The sun 45 degrees up toward +X, a bed 10 m down: Snell's 32 degrees, a 6.26 m shift.
+        const FVector Sun = FVector(1.0, 0.0, 1.0).GetSafeNormal();
+        const FVector C = VoxelUnderwaterMap::CausticCentre(Camera, Radius, Sun, 1000.0, 3000.0);
+        const double Shift = C.X;
+        const double Want = 1000.0 * std::tan(std::asin(std::sqrt(0.5) / 1.333));
+        std::printf("  bed 10 m, sun 45 deg: centre moved %.1f cm toward the sun (Snell: %.1f), %.2f cm off the sphere\n", Shift, Want, C.Size() - Radius);
+        Expect(std::fabs(Shift - Want) < 2.0 && std::fabs(C.Size() - Radius) < 0.01, "the caustics' centre up-sun by the bed's depth times the refracted sun's tangent");
+        const FVector Down = VoxelUnderwaterMap::CausticCentre(Camera, Radius, FVector(0.3, 0.0, -1.0).GetSafeNormal(), 1000.0, 3000.0);
+        const FVector Deep = VoxelUnderwaterMap::CausticCentre(Camera, Radius, Sun, 1.0e7, 3000.0);
+        Expect((Down - FVector(0.0, 0.0, Radius)).Size() < 0.01 && std::fabs(Deep.X - 3.0 * Want) < 6.0, "the sun down: the foot; a deep bed: clamped at 30 m");
+        const VoxelUnderwaterMap::FCausticLevels G = VoxelUnderwaterMap::MakeCausticLevels(Camera, C, Radius, FQuat());
+        for (int32 L = 0; L < VoxelUnderwaterMap::CausticLevels; L++)
+        {
+            const FVector A(G.Anchor[L].X, G.Anchor[L].Y, G.Anchor[L].Z);
+            const FVector Want3 = C - Camera;
+            std::printf("  level %d: texel %.0f cm, %.1f m across; its anchor %.2f texels from the centre\n", L, G.Anchor[L].W,
+                G.Anchor[L].W * VoxelUnderwaterMap::Size * 0.01, (A - Want3).Size() / G.Anchor[L].W);
+        }
+        Expect(G.Anchor[0].W == 4.0f, "the finest caustic texel 4 cm (10 m across)");
     }
 
     // ---- Exits ------------------------------------------------------------------------------------

@@ -115,5 +115,81 @@ float LandDetailScaleA;
 float LandDetailScaleGain;
 float LandDetailFade;
 uint LandDetailSeed;
+StructuredBuffer<float4> LandClimate;   // T5c: the climate map, cells then drift (VoxelLandDunes.ush)
+uint LandHasClimate;
+float LandClimateLapse;                 // C per km
+float LandDuneTexelsPerCell;            // T5c: the dunes (VoxelLandDunes.ush; 0: none)
+uint LandDuneBase;
+uint LandDuneN;
+uint LandDuneMips;
+float LandDuneScaleR;
+float LandDuneScaleG;
+float LandDuneMeanR;
+float LandDuneMeanG;
+float LandDuneRelief;
+uint LandDuneSeed;
+float LandDuneErgFrequency;
+float LandDuneErgThreshold;
+float LandDuneErgWidth;
+float LandDuneReliefMax;
+float LandDuneDetailTexelsPerCell;      // 0: no sand detail
+uint LandDuneDetailBase;
+uint LandDuneDetailN;
+uint LandDuneDetailMips;
+float LandDuneDetailScale;
+float LandDuneDetailMean;
+float LandDuneDetailFade;
+float LandGlacialTexelsPerCell;                // T5d: the glacial layer (VoxelLandPeaks.ush; 0: none)
+uint LandGlacialBase;
+uint LandGlacialN;
+uint LandGlacialMips;
+float LandGlacialScaleR;
+float LandGlacialScaleG;
+float LandGlacialScaleB;
+float LandGlacialMeanR;
+float LandGlacialMeanG;
+float LandGlacialReliefM;
+float LandGlacialStrength;
+uint LandGlacialSeed;
+float LandGlacialSpacingM;
+float LandGlacialCooling;
+float LandGlacialDetailScaleHard;
+float LandGlacialDetailScaleSoft;
+float LandIceMaxThickness;                     // T5d2: the ice sheets (VoxelLandIce.ush; 0: none)
+float LandIceBlend;
+float LandIceSwellTexelsPerCell;
+uint LandIceBase;
+uint LandIceN;
+uint LandIceMips;
+float LandIceMeanG;
+float LandIceSwellM;
+uint LandIceSeed;
+float LandIceSwellSpacingM;
+uint LandPolarBase;                     // T5d3: the polar surfaces (VoxelLandPolar.ush; LandPolarN 0: none)
+uint LandPolarN;
+uint LandPolarMips;
+uint LandPolarSeed;
+float LandPolarCrevasseTexelsPerCell;
+float LandPolarCrevasseM;
+float LandPolarCrevasseMean;
+float LandPolarCrevasseFade;
+float LandPolarSastrugiTexelsPerCell;
+float LandPolarSastrugiM;
+float LandPolarSastrugiMean;
+float LandPolarSastrugiFade;
+float LandPolarPolygonTexelsPerCell;
+float LandPolarPolygonM;
+float LandPolarPolygonMean;
+float LandPolarPolygonFade;
+float LandPolarPermafrostT;
+float LandPolarCrevasseTurn;
+float LandPolarSastrugiTurn;
+uint LandPolarDuneBase;
+uint LandPolarDuneN;
+uint LandPolarDuneMips;
+float LandPolarDuneTexelsPerCell;
+float LandPolarDuneM;
+float LandPolarDuneMean;
+float LandPolarDuneFade;
 
 #endif // VOXEL_LAND_PARAMETERS_USH

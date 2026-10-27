@@ -71,6 +71,9 @@ public:
     /** Initialized, and the writes can run (the write shader compiled, the textures' resources):
      *  without, the material is told to evaluate the land itself. */
     bool IsWritable() const;
+    /** Why it isn't writable (empty when it is): for the log, so the material's fallback to the
+     *  analytic node is never silent. */
+    FString WhyNotWritable() const;
     int32 GetLevels() const;
     double GetSeaRadius() const { return SeaRadius; }
 

@@ -291,8 +291,12 @@ bool AAdaptiveVoxelActor::ResolveLandCache(const TSharedPtr<const FVoxelDensityC
     Textures.State = LandCacheState;
     if (!LandCache.IsValid())
         LandCache = MakeUnique<FVoxelLandCache>();
+    bLandCacheUnwritableLogged = false;
+    LandCacheUnwritableSince = -1.0;
     if (!LandCache->Initialize(*Density, Textures))
     {
+        UE_LOG(LogVoxelPlugin, Warning, TEXT("[VoxelLand] %s: the land surface cache couldn't be initialized; the terrain material evaluates the land per pixel instead, without the climate layers."),
+            *GetName());
         ReleaseLandCache();
         LandCacheFailed = Density;
         return false;
@@ -397,6 +401,10 @@ UMaterialInterface* AAdaptiveVoxelActor::ResolveBrickMaterial()
         }
     }
 
+    // Stage T5a: the climate node's map (the textures' release above clears the instance's
+    // parameters).
+    VoxelLandMaterial::SetClimateParameters(LandMaterialInstance, LandClimateTexture, LandClimateParams, LandClimateShape, LandClimateTint);
+
     // The frame every frame, once all actors (the planet among them) have moved.
     if (!LandMaterialTickHandle.IsValid())
         LandMaterialTickHandle = FWorldDelegates::OnWorldPostActorTick.AddUObject(this, &AAdaptiveVoxelActor::OnWorldPostActorTick);
@@ -419,6 +427,24 @@ void AAdaptiveVoxelActor::UpdateLandMaterial(bool bTickCache)
     // only, when the cameras have moved. Without the write shader or the textures' resources,
     // the material evaluates the land itself.
     const bool bCache = bLandMaterialBound && LandCache.IsValid() && LandCache->IsWritable();
+    // A made cache that stays unwritable falls the material back to the analytic node (which has
+    // no climate layers: dunes, glacial forms, ice sheets, polar surfaces): say so, once a cache,
+    // after a few seconds (the write shader may still be compiling).
+    if (bLandMaterialBound && LandCache.IsValid() && LandCache->IsInitialized() && !bCache)
+    {
+        const double Now = FPlatformTime::Seconds();
+        if (LandCacheUnwritableSince < 0.0) LandCacheUnwritableSince = Now;
+        if (!bLandCacheUnwritableLogged && Now - LandCacheUnwritableSince > 5.0)
+        {
+            UE_LOG(LogVoxelPlugin, Warning, TEXT("[VoxelLand] %s: the land surface cache can't be written (%s); the terrain material evaluates the land per pixel instead, without the climate layers (dunes, glacial forms, ice sheets, polar surfaces)."),
+                *GetName(), *LandCache->WhyNotWritable());
+            bLandCacheUnwritableLogged = true;
+        }
+    }
+    else
+    {
+        LandCacheUnwritableSince = -1.0;
+    }
     if (bCache && bTickCache)
     {
         // The edits the cache's writes apply: the mesh's (the cache rewrites an edit's texels
@@ -435,6 +461,19 @@ void AAdaptiveVoxelActor::UpdateLandMaterial(bool bTickCache)
     // each pixel from its own view.
     VoxelLandMaterial::SetFrameParameters(LandMaterialInstance, PlanetFrame, FVoxelBrickTerrain::GetMaterialLandView(), LandSurfaceTolerance,
         LandNearMeshNormal * ActualPrecision, bLandMaterialBound, bCache);
+    // Stage T5a: the climate node (its debug view follows voxel.Debug.LandClimate).
+    VoxelLandMaterial::SetClimateParameters(LandMaterialInstance, LandClimateTexture, LandClimateParams, LandClimateShape, LandClimateTint, false);
+}
+
+void AAdaptiveVoxelActor::SetLandClimate(UTexture2DDynamic* Texture, const FLinearColor& Params, const FLinearColor& Shape, const FLinearColor& Tint)
+{
+    const bool bNewTexture = Texture != LandClimateTexture;
+    LandClimateTexture = Texture;
+    LandClimateParams = Params;
+    LandClimateShape = Shape;
+    LandClimateTint = Tint;
+    if (LandMaterialInstance)
+        VoxelLandMaterial::SetClimateParameters(LandMaterialInstance, LandClimateTexture, LandClimateParams, LandClimateShape, LandClimateTint, bNewTexture);
 }
 
 bool AAdaptiveVoxelActor::GetLandCacheCamera(const FTransform& PlanetFrame, FVector& OutCameraPlanet) const

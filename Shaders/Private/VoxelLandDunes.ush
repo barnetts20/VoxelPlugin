@@ -1,0 +1,320 @@
+// VoxelLandDunes.ush - The dunes (stage T5c, Design/LandClimate.md): the noise library's `dunes`
+// set laid where the planet's climate snapshot makes desert, turned to its wind. A layer of the
+// hill set's (VoxelLandHillSet.ush VoxelLandHillsShapeDF adds it beside the hills, swells and
+// strata), so every host (the mesher, collision, the land cache, the ocean's depths) has it.
+//
+// WHERE (VoxelLandDuneSiteAt): the planet's climate map (the land climate's snapshot,
+// VoxelLandClimate.ush's layout; LandClimate, two float4 a cell: the cell, then the sand's drift)
+// at the sample's direction:
+//   - the desert's share at the bake's height (VoxelLandClimateDesertOf: Holdridge's aridity,
+//     the lapse rate over the height: no dunes up a wet mountain in a desert);
+//   - the ergs: sand seas cover part of a desert, the rest rock and gravel (hamada, reg). A
+//     two-octave value noise over the sphere at LandDuneErgFrequency (the sphere's radius over
+//     the ergs' size), above LandDuneErgThreshold (the C++ picks it for DuneErgCoverage of the
+//     sphere), over LandDuneErgWidth: soft edges;
+//   - low relief only: full under LandDuneReliefMax x 0.4 of the bake's local relief, none above
+//     LandDuneReliefMax (dunes fill basins and plains; mountains keep their rock);
+//   - and the hill layer's own fades (the coast, the bake's rivers).
+// The hills, swells and strata give way under the sand (by VOXEL_LAND_DUNE_BURY of the share),
+// the gullies and the detail layer too (VoxelLandGully.ush).
+//
+// WHICH WAY: the climate's resultant drift (Fryberger & Dean 1979's, the sim's lowest layer's
+// wind; FAtmosphereClimateMap::Drift), a unit direction east and north per cell, and its
+// steadiness (the resultant over the potential: near 1 one wind). The set's x is downwind (its
+// slip faces face +x). Turning a lattice by an angle that varies over the planet would shear it
+// (the angle's change times the coordinate, millions of texels from the face centre), so the
+// directions are quantised: VOXEL_LAND_DUNE_BINS fixed turns per face, each its own exact
+// lattice (VoxelLandPeakRotated's exact products) and offset, and a sample blends the two turns
+// either side of its wind's direction (variance kept, as the faces': the set's character holds
+// across the blend). The wind changes over hundreds of kilometres, the dunes over hundreds of
+// metres: each turn's tile shows whole, the crests curving as the wind does.
+//
+// MANY WINDS: where the drift is unsteady (its resultant small beside its potential: the doldrums,
+// where the trades meet, the drift field's zeros, which every field on a sphere has), the turns
+// either side of a direction that means little give way to three fixed turns (VOXEL_LAND_DUNE_OMNI
+// bins, about 120 degrees apart) blended the same way: crests crossing crests, the networks and
+// star dunes of multidirectional winds (Fryberger & Dean 1979; Lancaster 1989), with no line where
+// the direction flips.
+//
+// THE SHAPE: the set's R (sharp crests, slip faces at the angle of repose) for steady winds, G
+// (rounded crests) for variable ones, by the steadiness. Heights in the set's mip-0 texels from
+// its floor (0: the interdune flats, on the land's surface); placed at LandDuneTexelsPerCell (the
+// dune spacing over the set's), so strength 1 keeps the simulated slopes. The detail: the
+// `sanddetail` set's G (megaripples, crests across the wind as the dunes') at its own placement,
+// the same turns, zero-mean, faded by its footprint as the peaks' detail.
+//
+// Shared subset (VoxelShaderCompat.h). Included by VoxelLandHillSet.ush (after VoxelLandPeaks.ush);
+// its inputs, declared by the host:
+//
+//   LandClimate, LandHasClimate, LandClimateLapse   the climate (VoxelLandClimateAccess.ush)
+//   float LandDuneTexelsPerCell;            the dune set's mip-0 texels per bake cell (0: no dunes)
+//   uint LandDuneBase, LandDuneN, LandDuneMips;   its chain in LandNoise
+//   float LandDuneScaleR, LandDuneScaleG;   R's and G's ranges over the larger
+//   float LandDuneMeanR, LandDuneMeanG;     their means over mip 0 (unit values: the blends keep
+//                                           the variance about them)
+//   float LandDuneRelief;                   m: the set's relief times the strength
+//   uint LandDuneSeed;
+//   float LandDuneErgFrequency, LandDuneErgThreshold, LandDuneErgWidth;
+//   float LandDuneReliefMax;                m
+//   float LandDuneDetailTexelsPerCell;      the sand detail set's placement (0: none)
+//   uint LandDuneDetailBase, LandDuneDetailN, LandDuneDetailMips;
+//   float LandDuneDetailScale;              its G's unit values to the dunes' unit
+//   float LandDuneDetailMean;               its G's mean (unit)
+//   float LandDuneDetailFade;               the mip level by which it has faded out
+
+#ifndef VOXEL_LAND_DUNES_USH
+#define VOXEL_LAND_DUNES_USH
+
+#include "VoxelLandPeaks.ush"
+#include "VoxelLandClimateAccess.ush"
+
+// The turns a face's lattice takes (the wind's direction quantised; a sample blends two).
+#define VOXEL_LAND_DUNE_BINS 16u
+// How much of the hills, swells and strata the sand buries at full share.
+#define VOXEL_LAND_DUNE_BURY 0.85f
+// The relief (over LandDuneReliefMax) under which the dunes are full.
+#define VOXEL_LAND_DUNE_RELIEF_FULL 0.4f
+// The steadiness (Fryberger's RDP / DP) over which the crests go from rounded (G) to sharp (R).
+#define VOXEL_LAND_DUNE_SHARP_START 0.3f
+#define VOXEL_LAND_DUNE_SHARP_END 0.8f
+// The steadiness under which the many-winds turns take over (all of them below the first).
+#define VOXEL_LAND_DUNE_OMNI_START 0.1f
+#define VOXEL_LAND_DUNE_OMNI_END 0.4f
+// The many-winds turns: bins 1, 6 and 11 (22.5, 135 and 247.5 degrees).
+#define VOXEL_LAND_DUNE_OMNI_A 1u
+#define VOXEL_LAND_DUNE_OMNI_B 6u
+#define VOXEL_LAND_DUNE_OMNI_C 11u
+
+/** Whether the planet has dunes (the set, its placement, a climate). */
+VOXEL_FUNC bool VoxelLandDunesOn(VOXEL_LAND_ARGS_DECL float Dummy)
+{
+    return LandDuneTexelsPerCell > 0.0f && LandDuneRelief > 0.0f && LandHasClimate != 0u && LandDuneN != 0u;
+}
+
+/** Bin's turn of the face's lattice: (cos, sin) of 2 pi Bin / 16, as literals so every host uses
+ *  the same floats. */
+VOXEL_FUNC float2 VoxelLandDuneRotation(uint Bin)
+{
+    if (Bin == 0u) return float2(1.000000000e+00f, 0.000000000e+00f);
+    if (Bin == 1u) return float2(9.238795042e-01f, 3.826834261e-01f);
+    if (Bin == 2u) return float2(7.071067691e-01f, 7.071067691e-01f);
+    if (Bin == 3u) return float2(3.826834261e-01f, 9.238795042e-01f);
+    if (Bin == 4u) return float2(0.000000000e+00f, 1.000000000e+00f);
+    if (Bin == 5u) return float2(-3.826834261e-01f, 9.238795042e-01f);
+    if (Bin == 6u) return float2(-7.071067691e-01f, 7.071067691e-01f);
+    if (Bin == 7u) return float2(-9.238795042e-01f, 3.826834261e-01f);
+    if (Bin == 8u) return float2(-1.000000000e+00f, 0.000000000e+00f);
+    if (Bin == 9u) return float2(-9.238795042e-01f, -3.826834261e-01f);
+    if (Bin == 10u) return float2(-7.071067691e-01f, -7.071067691e-01f);
+    if (Bin == 11u) return float2(-3.826834261e-01f, -9.238795042e-01f);
+    if (Bin == 12u) return float2(0.000000000e+00f, -1.000000000e+00f);
+    if (Bin == 13u) return float2(3.826834261e-01f, -9.238795042e-01f);
+    if (Bin == 14u) return float2(7.071067691e-01f, -7.071067691e-01f);
+    return float2(9.238795042e-01f, -3.826834261e-01f);
+}
+
+/** Where the sand lies at a sample: its share (0..1, before the hill layer's own fades), the
+ *  wind's direction (a unit tangent vector at the point, planet frame; zero where the climate
+ *  has none) and its steadiness (0..1). */
+struct FVoxelLandDuneSite
+{
+    float Share;
+    float3 Wind;
+    float Steadiness;
+};
+
+/** The climate map's cell and drift at a unit direction (bilinear). */
+VOXEL_FUNC FVoxelLandDuneSite VoxelLandDuneSiteAt(VOXEL_LAND_ARGS_DECL float3 Dir, float Bake, float Relief)
+{
+    FVoxelLandDuneSite Out;
+    Out.Share = 0.0f;
+    Out.Wind = float3(0.0f, 0.0f, 0.0f);
+    Out.Steadiness = 0.0f;
+    if (!VoxelLandDunesOn(VOXEL_LAND_ARGS 0.0f)) return Out;
+    // Low relief only (no texture read where it's off).
+    const float ReliefShare = 1.0f - smoothstep(VOXEL_LAND_DUNE_RELIEF_FULL * LandDuneReliefMax, LandDuneReliefMax, Relief);
+    if (ReliefShare <= 0.0f) return Out;
+    const FVoxelLandClimateTaps T = VoxelLandClimateTapsOf(Dir);
+    const FVoxelLandClimateCell Cell = VoxelLandClimateCellAt(VOXEL_LAND_ARGS T);
+    const float Desert = VoxelLandClimateDesertOf(Cell, LandClimateLapse, Bake);
+    if (Desert <= 0.0f) return Out;
+    // The ergs: two octaves of value noise over the unit sphere.
+    const float N = VoxelLandClimateErgNoise(Dir, LandDuneErgFrequency);
+    const float W2 = max(LandDuneErgWidth, 1.0e-3f);
+    const float Erg = smoothstep(LandDuneErgThreshold - W2, LandDuneErgThreshold + W2, N);
+    Out.Share = Desert * Erg * ReliefShare;
+    if (Out.Share <= 0.0f) return Out;
+    // The drift: east and north at the point (Z the spin axis), blended, normalised.
+    const float3 Drift = VoxelLandClimateDriftAt(VOXEL_LAND_ARGS T);
+    const float DE = Drift.x;
+    const float DN = Drift.y;
+    Out.Steadiness = saturate(Drift.z);
+    const float3 EastRaw = float3(-Dir.y, Dir.x, 0.0f);
+    const float EastLength = length(EastRaw);
+    if (EastLength > 1.0e-4f && DE * DE + DN * DN > 1.0e-8f)
+    {
+        const float3 East = EastRaw / EastLength;
+        const float3 North = cross(Dir, East);
+        Out.Wind = normalize(East * DE + North * DN);
+    }
+    return Out;
+}
+
+/** One turn's lookup on a face: the shape (dunes and their detail, in the dunes' unit) and its
+ *  derivatives per m along the face's angles. */
+struct FVoxelLandDuneTurn
+{
+    float Unit;
+    float GU;
+    float GV;
+};
+
+VOXEL_FUNC FVoxelLandDuneTurn VoxelLandDuneTurnAt(VOXEL_LAND_ARGS_DECL uint Face, uint Bin, FVoxelLandPeakCoord CU, FVoxelLandPeakCoord CV,
+    float Character, float Footprint)
+{
+    FVoxelLandDuneTurn Out;
+    const float2 Rot = VoxelLandDuneRotation(Bin);
+    const uint H = VoxelHash(uint3(Face, Bin, 0x64756e65u), LandDuneSeed);
+    const uint H2 = VoxelHash(uint3(Face, Bin, 0x656e7564u), LandDuneSeed);
+    // x = u cos + v sin (downwind), y = -u sin + v cos, in the set's texels.
+    const float TPC = LandDuneTexelsPerCell;
+    const FVoxelLandNoiseAxis AX = VoxelLandPeakRotated(CU, CV, Rot.x * TPC, Rot.y * TPC);
+    const FVoxelLandNoiseAxis AY = VoxelLandPeakRotated(CU, CV, -Rot.y * TPC, Rot.x * TPC);
+    const float TexelM = LandCellM / TPC;
+    // As the hills: texels about half the footprint.
+    const float Level = max(log2(max(Footprint, 1.0f) / (TexelM * 100.0f)) - 1.0f, 0.0f);
+    // The y mirror only (x stays downwind).
+    const uint Orient = (H & 1u) != 0u ? 4u : 0u;
+    const FVoxelLandNoise N = VoxelLandNoiseAt(VOXEL_LAND_ARGS VoxelLandNoiseSetOf(LandDuneBase, LandDuneN, LandDuneMips), AX, AY, Orient,
+        H >> 3u, H2, Level, 0u);
+    const float C = saturate(Character);
+    Out.Unit = lerp(N.G * LandDuneScaleG, N.R * LandDuneScaleR, C);
+    float DX = lerp(N.GU * LandDuneScaleG, N.RU * LandDuneScaleR, C) / TexelM;
+    float DY = lerp(N.GV * LandDuneScaleG, N.RV * LandDuneScaleR, C) / TexelM;
+    if (LandDuneDetailTexelsPerCell > 0.0f)
+    {
+        // The megaripples: the sand detail set's G, the same turn, its own offset, zero-mean.
+        const float DetailTexelM = LandCellM / LandDuneDetailTexelsPerCell;
+        const float DetailLevel = max(log2(max(Footprint, 1.0f) / (DetailTexelM * 100.0f)) + VOXEL_LAND_PEAK_DETAIL_LEVEL_BIAS, 0.0f);
+        const float Fade = 1.0f - smoothstep(LandDuneDetailFade - VOXEL_LAND_PEAK_DETAIL_FADE_LEVELS, LandDuneDetailFade, DetailLevel);
+        if (Fade > 0.0f)
+        {
+            const uint HD = VoxelHash(uint3(Face, Bin, 0x72697070u), LandDuneSeed);
+            const uint HD2 = VoxelHash(uint3(Face, Bin, 0x70706972u), LandDuneSeed);
+            const float DTPC = LandDuneDetailTexelsPerCell;
+            const FVoxelLandNoiseAxis DAX = VoxelLandPeakRotated(CU, CV, Rot.x * DTPC, Rot.y * DTPC);
+            const FVoxelLandNoiseAxis DAY = VoxelLandPeakRotated(CU, CV, -Rot.y * DTPC, Rot.x * DTPC);
+            const FVoxelLandNoise D = VoxelLandNoiseAt(VOXEL_LAND_ARGS VoxelLandNoiseSetOf(LandDuneDetailBase, LandDuneDetailN, LandDuneDetailMips),
+                DAX, DAY, (HD & 1u) != 0u ? 4u : 0u, HD >> 3u, HD2, DetailLevel, 0u);
+            const float S = LandDuneDetailScale * Fade;
+            Out.Unit += (D.G - LandDuneDetailMean) * S;
+            DX += D.GU * S / DetailTexelM;
+            DY += D.GV * S / DetailTexelM;
+        }
+    }
+    // Back to the face's axes (per m): d/du = cos d/dx - sin d/dy, d/dv = sin d/dx + cos d/dy.
+    Out.GU = Rot.x * DX - Rot.y * DY;
+    Out.GV = Rot.y * DX + Rot.x * DY;
+    return Out;
+}
+
+/** The dunes at the sea-level sphere point P (double-float, cm) for a site (VoxelLandDuneSiteAt)
+ *  and amplitude AmplitudeM (m, above 0), band-limited to Footprint (cm): per face, the two turns
+ *  either side of the wind's direction in the face's frame and the many winds' three, blended
+ *  keeping the variance about the layer's mean M; then the faces as VoxelLandSetLayerDF blends
+ *  them. At most five turns and three faces: the unit within M -/+ sqrt 15 times its deviation
+ *  (VoxelLand::DuneBlendBound, ShapeFor's bound); Gradient times the amplitude. */
+VOXEL_FUNC FVoxelLandPeaks VoxelLandDunesDF(VOXEL_LAND_ARGS_DECL float2 PX, float2 PY, float2 PZ, FVoxelLandDuneSite Site, float AmplitudeM,
+    float Footprint, bool bShape)
+{
+    FVoxelLandPeaks Out = VoxelLandPeaksNone();
+    Out.AmplitudeM = AmplitudeM;
+    if (!bShape) return Out;
+    // Steady winds sharp (R), variable rounded (G); the many-winds turns' share where it's unsteady.
+    const float Character = smoothstep(VOXEL_LAND_DUNE_SHARP_START, VOXEL_LAND_DUNE_SHARP_END, Site.Steadiness);
+    const float Omni = 1.0f - smoothstep(VOXEL_LAND_DUNE_OMNI_START, VOXEL_LAND_DUNE_OMNI_END, Site.Steadiness);
+    const float M = lerp(LandDuneMeanG * LandDuneScaleG, LandDuneMeanR * LandDuneScaleR, Character);
+    const float Band = 2.0f * VOXEL_LAND_PEAK_BAND_CELLS / float(LandN);
+    const float DSDX = 2.0f / (float(LandN) * LandCellM);
+    float WSum = 0.0f;
+    float W2Sum = 0.0f;
+    float USum = 0.0f;
+    float3 GSum = float3(0.0f, 0.0f, 0.0f);
+    float3 WGrad = float3(0.0f, 0.0f, 0.0f);
+    float3 WWGrad = float3(0.0f, 0.0f, 0.0f);
+    VOXEL_LOOP
+    for (uint Axis = 0u; Axis < 3u; Axis++)
+    {
+        const float2 PN = VoxelLandPick(PX, PY, PZ, Axis);
+        if (PN.x == 0.0f) continue;
+        const bool bNegative = PN.x < 0.0f;
+        const uint Face = Axis * 2u + (bNegative ? 1u : 0u);
+        const float2 Den = bNegative ? float2(-PN.x, -PN.y) : PN;
+        const float2 AU = VoxelDFDiv(VoxelLandPick(PX, PY, PZ, VoxelCubeUAxis(Face)), Den);
+        const float2 AV = VoxelDFDiv(VoxelLandPick(PX, PY, PZ, VoxelCubeVAxis(Face)), Den);
+        const float S = atan(AU.x) * VOXEL_LAND_INV_QUARTER_PI;
+        const float T = atan(AV.x) * VOXEL_LAND_INV_QUARTER_PI;
+        const float RS = VoxelLandFaceRamp(S, Band);
+        const float RT = VoxelLandFaceRamp(T, Band);
+        const float W = RS * RT;
+        if (W <= 0.0f) continue;
+        const FVoxelLandFaceFrame Frame = VoxelLandFaceFrameAt(Face, AU.x, AV.x);
+        // The wind's direction in the face's (U, V) and its two turns.
+        const float WU = dot(Site.Wind, normalize(Frame.TU));
+        const float WV = dot(Site.Wind, normalize(Frame.TV));
+        float Phi = (WU * WU + WV * WV > 1.0e-8f ? atan2(WV, WU) : 0.0f) * (float(VOXEL_LAND_DUNE_BINS) / 6.28318531f);
+        if (Phi < 0.0f) Phi += float(VOXEL_LAND_DUNE_BINS);
+        const float Floor = floor(Phi);
+        const float Tw = Phi - Floor;
+        const uint B0 = uint(Floor) % VOXEL_LAND_DUNE_BINS;
+        const uint B1 = (B0 + 1u) % VOXEL_LAND_DUNE_BINS;
+        const FVoxelLandPeakCoord CU = VoxelLandPeakCoordAt(VOXEL_LAND_ARGS VoxelLandAxisAt(VOXEL_LAND_ARGS AU, S));
+        const FVoxelLandPeakCoord CV = VoxelLandPeakCoordAt(VOXEL_LAND_ARGS VoxelLandAxisAt(VOXEL_LAND_ARGS AV, T));
+        // The turns about the mean, the variance kept (one turn's own at Tw 0 or 1 without the
+        // many winds): the two either side of the wind's direction by 1 - Omni, the three fixed
+        // ones by Omni (a bin in both sums its weights: the same lookup).
+        const float WD = 1.0f - Omni;
+        const float WO = Omni * (1.0f / 3.0f);
+        float W2B = 0.0f;
+        float FU = 0.0f;
+        float FGU = 0.0f;
+        float FGV = 0.0f;
+        VOXEL_LOOP
+        for (uint Bin = 0u; Bin < VOXEL_LAND_DUNE_BINS; Bin++)
+        {
+            float WB = 0.0f;
+            if (Bin == B0) WB += WD * (1.0f - Tw);
+            if (Bin == B1) WB += WD * Tw;
+            if (Bin == VOXEL_LAND_DUNE_OMNI_A || Bin == VOXEL_LAND_DUNE_OMNI_B || Bin == VOXEL_LAND_DUNE_OMNI_C) WB += WO;
+            if (WB <= 0.0f) continue;
+            const FVoxelLandDuneTurn TB = VoxelLandDuneTurnAt(VOXEL_LAND_ARGS Face, Bin, CU, CV, Character, Footprint);
+            W2B += WB * WB;
+            FU += WB * (TB.Unit - M);
+            FGU += WB * TB.GU;
+            FGV += WB * TB.GV;
+        }
+        const float InvQB = W2B > 0.0f ? 1.0f / sqrt(W2B) : 0.0f;
+        const float FaceUnit = M + FU * InvQB;
+        const float FaceGU = FGU * InvQB;
+        const float FaceGV = FGV * InvQB;
+        // The faces as the set layers' (VoxelLandSetLayerDF), about M.
+        const float WSU = VoxelLandFaceRampSlope(S, Band) * RT * DSDX;
+        const float WSV = RS * VoxelLandFaceRampSlope(T, Band) * DSDX;
+        USum += W * FaceUnit;
+        WSum += W;
+        W2Sum += W * W;
+        GSum = GSum + VoxelLandFaceVector(Frame, W * FaceGU + FaceUnit * WSU, W * FaceGV + FaceUnit * WSV);
+        WGrad = WGrad + VoxelLandFaceVector(Frame, WSU, WSV);
+        WWGrad = WWGrad + VoxelLandFaceVector(Frame, W * WSU, W * WSV);
+    }
+    if (WSum <= 0.0f) return Out;
+    const float InvQ = 1.0f / sqrt(W2Sum);
+    const float InvQ3 = InvQ * InvQ * InvQ;
+    const float K = WSum * InvQ;
+    Out.Unit = M * (1.0f - K) + USum * InvQ;
+    const float3 KGrad = WGrad * InvQ - WWGrad * (WSum * InvQ3);
+    Out.Gradient = ((GSum * InvQ - WWGrad * (USum * InvQ3)) - KGrad * M) * Out.AmplitudeM;
+    return Out;
+}
+
+#endif // VOXEL_LAND_DUNES_USH

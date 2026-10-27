@@ -1,5 +1,6 @@
 #include "VoxelLandBake.h"
 #include "VoxelLandGPU.h"
+#include "VoxelLandClimate.h"
 #include "VoxelLandSolve.h"
 #include "VoxelDensityGPU.h"
 #include "VoxelGPUCommon.h"
@@ -372,6 +373,32 @@ uint32 FVoxelTerrestrialSettings::GetSettingsHash() const
     H = HashCombine(H, GetTypeHash(StrataSetName));
     const FString DetailSetName = DetailNoiseSet.TrimStartAndEnd();
     H = HashCombine(H, GetTypeHash(DetailSetName));
+    // T5c: the dunes.
+    for (const double V : { DuneHeightScale, DuneSpacing, DuneErgCoverage, DuneErgSize, DuneMaxRelief, SandDetailWavelength, SandDetailStrength })
+        H = HashCombine(H, ::GetTypeHash(V));
+    // T5d: the glacial layer.
+    for (const double V : { GlacialHeightScale, GlacialSpacing, GlacialEraCooling })
+        H = HashCombine(H, ::GetTypeHash(V));
+    const FString GlacialSetName = GlacialNoiseSet.TrimStartAndEnd();
+    H = HashCombine(H, GetTypeHash(GlacialSetName));
+    // T5d2: the ice sheets.
+    for (const double V : { IceSheetMaxThickness, IceSheetSwellHeight, IceSheetSwellSpacing })
+        H = HashCombine(H, ::GetTypeHash(V));
+    const FString IceSetName = IceSheetNoiseSet.TrimStartAndEnd();
+    H = HashCombine(H, GetTypeHash(IceSetName));
+    // T5d3: the polar surfaces.
+    for (const double V : { CrevasseSpacing, CrevasseHeightScale, SastrugiSpacing, SastrugiHeightScale, PolygonSpacing, PolygonHeightScale,
+        PermafrostTemperature, SnowDuneSpacing, SnowDuneHeight })
+        H = HashCombine(H, ::GetTypeHash(V));
+    const FString PolarSetName = PolarNoiseSet.TrimStartAndEnd();
+    H = HashCombine(H, GetTypeHash(PolarSetName));
+    const FString DuneSetName = DuneNoiseSet.TrimStartAndEnd();
+    H = HashCombine(H, GetTypeHash(DuneSetName));
+    const FString SandSetName = SandDetailNoiseSet.TrimStartAndEnd();
+    H = HashCombine(H, GetTypeHash(SandSetName));
+    // T5e: the ice shelf.
+    for (const double V : { IceShelfHeight, IceShelfTemperature, IceShelfFrontNoise, IceShelfRise, IceShelfRoll, IceShelfDraft })
+        H = HashCombine(H, ::GetTypeHash(V));
     return H;
 }
 
@@ -572,6 +599,11 @@ namespace VoxelLandNoiseDetail
     TArray<FString> AuthoredHills;
     TArray<FString> AuthoredStrata;
     TArray<FString> AuthoredDetail;
+    TArray<FString> AuthoredDunes;    // T5c
+    TArray<FString> AuthoredSand;
+    TArray<FString> AuthoredGlacial;  // T5d
+    TArray<FString> AuthoredIce;      // T5d2
+    TArray<FString> AuthoredPolar;    // T5d3
     bool bListed = false;
     bool bExitHooked = false;
     bool bClosed = false;         // ReleaseLandNoise ran (the engine is exiting)
@@ -649,10 +681,66 @@ namespace VoxelLandNoiseDetail
         return true;
     }
 
-    /** An authored set from NoiseSetDirectory()/Name.vxnt: the header checked (bDetail:
-     *  CheckDetail, else CheckPeaks), then the texels read straight into the words. False (and
-     *  Error) if it can't be used. */
-    bool Read(const FString& Name, FRead& Out, FString& Error, bool bDetail = false)
+    /** The layouts a set is checked for (CheckPeaks: the peaks', hills' and strata's sets). */
+    enum class ESetKind : uint8
+    {
+        Peaks,
+        Detail,
+        Dunes,      // T5c
+        Sand,
+        Glacial,    // T5d: the peaks' layout (CheckPeaks), read from the 1024 mip
+        Ice,        // T5d2: likewise
+        Polar       // T5d3: CheckPolar, read from the 1024 mip
+    };
+
+    std::string CheckKind(const VoxelNoiseTiles::FSet& Set, ESetKind Kind)
+    {
+        switch (Kind)
+        {
+        case ESetKind::Detail: return VoxelNoiseTiles::CheckDetail(Set);
+        case ESetKind::Dunes: return VoxelNoiseTiles::CheckDunes(Set);
+        case ESetKind::Sand: return VoxelNoiseTiles::CheckSandDetail(Set);
+        case ESetKind::Glacial: return VoxelNoiseTiles::CheckPeaks(Set);
+        case ESetKind::Ice: return VoxelNoiseTiles::CheckPeaks(Set);
+        case ESetKind::Polar: return VoxelNoiseTiles::CheckPolar(Set);
+        default: return VoxelNoiseTiles::CheckPeaks(Set);
+        }
+    }
+
+    /** T5c: Set's header made its first mip no larger than MaxN's (0: unchanged): N, the mips, and
+     *  the height channels' decode in that mip's texels. The mips skipped. */
+    uint32 SkipHeaderMips(VoxelNoiseTiles::FSet& Set, uint32 MaxN)
+    {
+        uint32 Skip = 0;
+        while (MaxN > 0 && (Set.N >> Skip) > MaxN && Skip + 1 < Set.Mips)
+            Skip++;
+        if (Skip == 0) return 0;
+        const float Scale = 1.0f / (float)(1u << Skip);
+        Set.N >>= Skip;
+        Set.Mips -= Skip;
+        for (VoxelNoiseTiles::FChannel& C : Set.Channel)
+        {
+            if (C.Kind != VoxelNoiseTiles::KindErodedHeight && C.Kind != VoxelNoiseTiles::KindBlurred) continue;
+            C.Min *= Scale;
+            C.Max *= Scale;
+            C.Mean *= Scale;
+            C.Std *= Scale;
+        }
+        return Skip;
+    }
+
+    /** The largest mip a kind's sets are read from (0: all). */
+    uint32 MaxNOf(ESetKind Kind)
+    {
+        return Kind == ESetKind::Dunes || Kind == ESetKind::Sand || Kind == ESetKind::Glacial || Kind == ESetKind::Ice || Kind == ESetKind::Polar
+            ? VoxelLand::DuneMaxSetN : 0u;
+    }
+
+    /** An authored set from NoiseSetDirectory()/Name.vxnt: the header checked (CheckKind), then the
+     *  texels read straight into the words; MaxN (T5c; 0: all) reads the chain from its first mip no
+     *  larger than that (the header made that mip's: N, the mips, and the height channels' decode
+     *  in its texels; checked again). False (and Error) if it can't be used. */
+    bool Read(const FString& Name, FRead& Out, FString& Error, ESetKind Kind = ESetKind::Peaks, uint32 MaxN = 0)
     {
         const double Start = FPlatformTime::Seconds();
         const FString Folder = VoxelLand::NoiseSetDirectory();
@@ -681,7 +769,13 @@ namespace VoxelLandNoiseDetail
         uint64_t DataOffset = 0;
         std::string Why = VoxelNoiseTiles::ReadVxntHeader(Header.GetData(), (size_t)Header.Num(), (uint64_t)FileSize, Set, DataOffset);
         if (Why.empty())
-            Why = bDetail ? VoxelNoiseTiles::CheckDetail(Set) : VoxelNoiseTiles::CheckPeaks(Set);
+            Why = CheckKind(Set, Kind);
+        // T5c: the mips skipped (each halves the size; heights are in the read mip's texels).
+        const uint64 FullTexels = VoxelNoiseTiles::ChainTexels(Set.N);
+        const uint32 Skip = Why.empty() ? SkipHeaderMips(Set, MaxN) : 0u;
+        const uint64 SkippedTexels = FullTexels - VoxelNoiseTiles::ChainTexels(Set.N);
+        if (Skip > 0)
+            Why = CheckKind(Set, Kind);
         if (!Why.empty() || File->IsError())
         {
             Error = FString::Printf(TEXT("%s: %s"), *Path, Why.empty() ? TEXT("unreadable") : UTF8_TO_TCHAR(Why.c_str()));
@@ -690,7 +784,7 @@ namespace VoxelLandNoiseDetail
         const uint64 Texels = VoxelNoiseTiles::ChainTexels(Set.N);
         Out.Texels.SetNumUninitialized((int32)(2 * Texels));
         // The texels as they lie (u16 little-endian, R G B A: two words a texel).
-        File->Seek((int64)DataOffset);
+        File->Seek((int64)(DataOffset + SkippedTexels * 8));
         File->Serialize(Out.Texels.GetData(), (int64)(Texels * 8));
         if (File->IsError())
         {
@@ -698,7 +792,8 @@ namespace VoxelLandNoiseDetail
             return false;
         }
         Out.Header = MoveTemp(Set);
-        UE_LOG(LogVoxelPlugin, Log, TEXT("[VoxelLand] Read the noise set %s (%u^2, %u mips, \"%s\") in %.2f s."), *Name, Out.Header.N, Out.Header.Mips,
+        UE_LOG(LogVoxelPlugin, Log, TEXT("[VoxelLand] Read the noise set %s (%u^2%s, %u mips, \"%s\") in %.2f s."), *Name, Out.Header.N,
+            Skip > 0 ? *FString::Printf(TEXT(" from its mip %u"), Skip) : TEXT(""), Out.Header.Mips,
             UTF8_TO_TCHAR(Out.Header.LookTag.c_str()), FPlatformTime::Seconds() - Start);
         return true;
     }
@@ -710,11 +805,12 @@ namespace VoxelLandNoiseDetail
         return (V - (double)C.Min) / FMath::Max((double)C.Max - (double)C.Min, 1e-12);
     }
 
-    /** Makes the pack Key ("Peaks|Hills|Strata|Detail"; MakeLock held): the peaks' set from
-     *  texel 0 (read, or generated: also when the file can't be used), the detail set (N1: read,
-     *  or generated likewise), the hills' set (left out when it can't be used: the procedural
-     *  hills then), the strata's (T4c; left out when it can't be used, or without the hills'
-     *  set). Null if it holds nothing. */
+    /** Makes the pack Key ("Peaks|Hills|Strata|Detail|Dunes|SandDetail"; MakeLock held): the
+     *  peaks' set from texel 0 (read, or generated: also when the file can't be used), the detail
+     *  set (N1: read, or generated likewise), the hills' set (left out when it can't be used: the
+     *  procedural hills then), the strata's (T4c; left out when it can't be used, or without the
+     *  hills' set), the dunes' and the sand detail's (T5c; likewise, from their mip no larger than
+     *  DuneMaxSetN; the sand without the dunes is left out). Null if it holds nothing. */
     TSharedPtr<const FVoxelLandNoiseSet, ESPMode::ThreadSafe> MakePackLocked(const FString& Key)
     {
         TArray<FString> Parts;
@@ -723,8 +819,14 @@ namespace VoxelLandNoiseDetail
         const FString HillName = Parts.Num() > 1 ? Parts[1] : FString();
         const FString StrataName = Parts.Num() > 2 ? Parts[2] : FString();
         const FString DetailName = Parts.Num() > 3 ? Parts[3] : FString();
-        FRead Peaks, Hills, Strata, Detail;
-        bool bPeaks = false, bHills = false, bStrata = false, bDetail = false;
+        const FString DuneName = Parts.Num() > 4 ? Parts[4] : FString();
+        const FString SandName = Parts.Num() > 5 ? Parts[5] : FString();
+        const FString GlacialName = Parts.Num() > 6 ? Parts[6] : FString();
+        const FString IceName = Parts.Num() > 7 ? Parts[7] : FString();
+        const FString PolarName = Parts.Num() > 8 ? Parts[8] : FString();
+        FRead Peaks, Hills, Strata, Detail, Dunes, Sand, Glacial, Ice, Polar;
+        bool bPeaks = false, bHills = false, bStrata = false, bDetail = false, bDunes = false, bSand = false, bGlacial = false, bIce = false;
+        bool bPolar = false;
         if (!PeakName.IsEmpty())
         {
             FString Error;
@@ -754,7 +856,7 @@ namespace VoxelLandNoiseDetail
         if (!DetailName.IsEmpty())
         {
             FString Error;
-            bDetail = DetailName != VoxelLand::GeneratedNoiseName && Read(DetailName, Detail, Error, true);
+            bDetail = DetailName != VoxelLand::GeneratedNoiseName && Read(DetailName, Detail, Error, ESetKind::Detail);
             if (!bDetail)
             {
                 if (DetailName != VoxelLand::GeneratedNoiseName)
@@ -763,13 +865,49 @@ namespace VoxelLandNoiseDetail
                 bDetail = GenerateDetail(Detail);
             }
         }
+        if (!DuneName.IsEmpty() && bHills)
+        {
+            FString Error;
+            bDunes = Read(DuneName, Dunes, Error, ESetKind::Dunes, MaxNOf(ESetKind::Dunes));
+            if (!bDunes)
+                UE_LOG(LogVoxelPlugin, Error, TEXT("[VoxelLand] The dunes' noise set %s can't be used (%s); no dunes."), *DuneName, *Error);
+        }
+        if (!SandName.IsEmpty() && bDunes)
+        {
+            FString Error;
+            bSand = Read(SandName, Sand, Error, ESetKind::Sand, MaxNOf(ESetKind::Sand));
+            if (!bSand)
+                UE_LOG(LogVoxelPlugin, Error, TEXT("[VoxelLand] The sand's detail set %s can't be used (%s); the dunes go without it."), *SandName, *Error);
+        }
+        if (!GlacialName.IsEmpty() && bPeaks)
+        {
+            FString Error;
+            bGlacial = Read(GlacialName, Glacial, Error, ESetKind::Glacial, MaxNOf(ESetKind::Glacial));
+            if (!bGlacial)
+                UE_LOG(LogVoxelPlugin, Error, TEXT("[VoxelLand] The glacial noise set %s can't be used (%s); the peaks everywhere."), *GlacialName, *Error);
+        }
+        if (!IceName.IsEmpty())
+        {
+            FString Error;
+            bIce = Read(IceName, Ice, Error, ESetKind::Ice, MaxNOf(ESetKind::Ice));
+            if (!bIce)
+                UE_LOG(LogVoxelPlugin, Error, TEXT("[VoxelLand] The ice sheets' noise set %s can't be used (%s); smooth sheets."), *IceName, *Error);
+        }
+        if (!PolarName.IsEmpty())
+        {
+            FString Error;
+            bPolar = Read(PolarName, Polar, Error, ESetKind::Polar, MaxNOf(ESetKind::Polar));
+            if (!bPolar)
+                UE_LOG(LogVoxelPlugin, Error, TEXT("[VoxelLand] The polar surfaces' noise set %s can't be used (%s); no polar surfaces."), *PolarName, *Error);
+        }
         if (!bPeaks && !bHills && !bDetail) return nullptr;
         const TSharedPtr<FVoxelLandNoiseSet, ESPMode::ThreadSafe> Out = MakeShared<FVoxelLandNoiseSet, ESPMode::ThreadSafe>();
         Out->Name = Key;
         // The rows' width: the widest chain's (a small set beside a large one would otherwise
         // take far more rows).
         Out->RowN = FMath::Max(FMath::Max3(bPeaks ? Peaks.Header.N : 0u, bHills ? Hills.Header.N : 0u, bStrata ? Strata.Header.N : 0u),
-            bDetail ? Detail.Header.N : 0u);
+            FMath::Max3(bDetail ? Detail.Header.N : 0u, bDunes ? Dunes.Header.N : 0u, FMath::Max3(bSand ? Sand.Header.N : 0u, bGlacial ? Glacial.Header.N : 0u,
+                FMath::Max(bIce ? Ice.Header.N : 0u, bPolar ? Polar.Header.N : 0u))));
         if (bPeaks)
         {
             const VoxelNoiseTiles::FSet& Set = Peaks.Header;
@@ -867,6 +1005,136 @@ namespace VoxelLandNoiseDetail
             }
             Strata.Texels.Empty();
         }
+        // T5c: after every chain the material reads (it reads neither of these: its texture's rows
+        // can end before them).
+        if (bDunes && Out->HillN > 0)
+        {
+            const VoxelNoiseTiles::FSet& Set = Dunes.Header;
+            const uint32 Base = AppendChainLocked(*Out, Dunes.Texels.GetData(), Set.N);
+            if (Base == ~0u)
+            {
+                UE_LOG(LogVoxelPlugin, Warning, TEXT("[VoxelLand] The noise pack %s can't take the dunes' set %s in a texture's rows; no dunes."),
+                    *Key, *DuneName);
+            }
+            else
+            {
+                Out->DuneName = DuneName;
+                Out->DuneBase = Base;
+                Out->DuneN = Set.N;
+                Out->DuneMips = Set.Mips;
+                Out->DuneSpacingTexels = Set.N / Set.Channel[0].CellsPerTile;
+                Out->DuneRangeR = Set.Channel[0].Max - Set.Channel[0].Min;
+                Out->DuneRangeG = Set.Channel[1].Max - Set.Channel[1].Min;
+                Out->DuneMeanR = (float)VoxelNoiseTiles::MeanOf(Set, (const uint16*)Dunes.Texels.GetData(), 0, [&](double V) { return UnitOf(Set, 0, V); });
+                Out->DuneMeanG = (float)VoxelNoiseTiles::MeanOf(Set, (const uint16*)Dunes.Texels.GetData(), 1, [&](double V) { return UnitOf(Set, 1, V); });
+                UE_LOG(LogVoxelPlugin, Log, TEXT("[VoxelLand] Dune set %s: %u^2, crests %u texels apart, sharp (R) %.2f texels, rounded (G) %.2f."),
+                    *DuneName, Set.N, Out->DuneSpacingTexels, Out->DuneRangeR, Out->DuneRangeG);
+            }
+            Dunes.Texels.Empty();
+        }
+        if (bSand && Out->DuneN > 0)
+        {
+            const VoxelNoiseTiles::FSet& Set = Sand.Header;
+            const uint32 Base = AppendChainLocked(*Out, Sand.Texels.GetData(), Set.N);
+            if (Base == ~0u)
+            {
+                UE_LOG(LogVoxelPlugin, Warning, TEXT("[VoxelLand] The noise pack %s can't take the sand's detail set %s in a texture's rows; the dunes go without it."),
+                    *Key, *SandName);
+            }
+            else
+            {
+                Out->SandName = SandName;
+                Out->SandBase = Base;
+                Out->SandN = Set.N;
+                Out->SandMips = Set.Mips;
+                Out->SandSpacingTexels = (float)Set.N / (float)Set.Channel[1].CellsPerTile;
+                Out->SandRangeG = Set.Channel[1].Max - Set.Channel[1].Min;
+                Out->SandMeanG = (float)VoxelNoiseTiles::MeanOf(Set, (const uint16*)Sand.Texels.GetData(), 1, [&](double V) { return UnitOf(Set, 1, V); });
+            }
+            Sand.Texels.Empty();
+        }
+        // T5d: the glacial set (the peaks' layout), after them too.
+        if (bGlacial && Out->N > 0)
+        {
+            const VoxelNoiseTiles::FSet& Set = Glacial.Header;
+            const uint32 Base = AppendChainLocked(*Out, Glacial.Texels.GetData(), Set.N);
+            if (Base == ~0u)
+            {
+                UE_LOG(LogVoxelPlugin, Warning, TEXT("[VoxelLand] The noise pack %s can't take the glacial set %s in a texture's rows; the peaks everywhere."),
+                    *Key, *GlacialName);
+            }
+            else
+            {
+                Out->GlacialName = GlacialName;
+                Out->GlacialBase = Base;
+                Out->GlacialN = Set.N;
+                Out->GlacialMips = Set.Mips;
+                Out->GlacialSpacingTexels = Set.N / Set.Channel[0].CellsPerTile;
+                Out->GlacialRangeR = Set.Channel[0].Max - Set.Channel[0].Min;
+                Out->GlacialRangeG = Set.Channel[1].Max - Set.Channel[1].Min;
+                Out->GlacialRangeB = Set.Channel[2].Max - Set.Channel[2].Min;
+                Out->GlacialMeanR = (float)VoxelNoiseTiles::MeanOf(Set, (const uint16*)Glacial.Texels.GetData(), 0, [&](double V) { return UnitOf(Set, 0, V); });
+                Out->GlacialMeanG = (float)VoxelNoiseTiles::MeanOf(Set, (const uint16*)Glacial.Texels.GetData(), 1, [&](double V) { return UnitOf(Set, 1, V); });
+                UE_LOG(LogVoxelPlugin, Log, TEXT("[VoxelLand] Glacial set %s: %u^2, troughs %u texels apart, bedrock (R) %.2f texels, ice (G) %.2f."),
+                    *GlacialName, Set.N, Out->GlacialSpacingTexels, Out->GlacialRangeR, Out->GlacialRangeG);
+            }
+            Glacial.Texels.Empty();
+        }
+        // T5d2: the ice sheets' set (its G, the swells), after them too.
+        if (bIce)
+        {
+            const VoxelNoiseTiles::FSet& Set = Ice.Header;
+            const uint32 Base = AppendChainLocked(*Out, Ice.Texels.GetData(), Set.N);
+            if (Base == ~0u)
+            {
+                UE_LOG(LogVoxelPlugin, Warning, TEXT("[VoxelLand] The noise pack %s can't take the ice sheets' set %s in a texture's rows; smooth sheets."),
+                    *Key, *IceName);
+            }
+            else
+            {
+                Out->IceName = IceName;
+                Out->IceBase = Base;
+                Out->IceN = Set.N;
+                Out->IceMips = Set.Mips;
+                Out->IceSpacingTexels = Set.N / Set.Channel[1].CellsPerTile;
+                Out->IceMeanG = (float)VoxelNoiseTiles::MeanOf(Set, (const uint16*)Ice.Texels.GetData(), 1, [&](double V) { return UnitOf(Set, 1, V); });
+            }
+            Ice.Texels.Empty();
+        }
+        // T5d3: the polar surfaces' set (R, G and B), after them too.
+        if (bPolar)
+        {
+            const VoxelNoiseTiles::FSet& Set = Polar.Header;
+            const uint32 Base = AppendChainLocked(*Out, Polar.Texels.GetData(), Set.N);
+            if (Base == ~0u)
+            {
+                UE_LOG(LogVoxelPlugin, Warning, TEXT("[VoxelLand] The noise pack %s can't take the polar set %s in a texture's rows; no polar surfaces."),
+                    *Key, *PolarName);
+            }
+            else
+            {
+                Out->PolarName = PolarName;
+                Out->PolarBase = Base;
+                Out->PolarN = Set.N;
+                Out->PolarMips = Set.Mips;
+                for (int32 c = 0; c < 3; c++)
+                {
+                    Out->PolarSpacingTexels[c] = (float)Set.N / (float)Set.Channel[c].CellsPerTile;
+                    Out->PolarRange[c] = Set.Channel[c].Max - Set.Channel[c].Min;
+                    Out->PolarMean[c] = (float)VoxelNoiseTiles::MeanOf(Set, (const uint16*)Polar.Texels.GetData(), c, [&](double V) { return UnitOf(Set, c, V); });
+                }
+                // The grains: R's slots' normal (turned onto the flow), G's ridges' long axis (the
+                // normal less a quarter turn, within a half turn of the set's x: turned onto the wind).
+                Out->PolarTurn[0] = (float)VoxelNoiseTiles::GrainAngleOf(Set, (const uint16*)Polar.Texels.GetData(), 0);
+                double SastrugiAxis = VoxelNoiseTiles::GrainAngleOf(Set, (const uint16*)Polar.Texels.GetData(), 1) - 0.5 * UE_DOUBLE_PI;
+                if (SastrugiAxis <= -0.5 * UE_DOUBLE_PI) SastrugiAxis += UE_DOUBLE_PI;
+                Out->PolarTurn[1] = (float)SastrugiAxis;
+                UE_LOG(LogVoxelPlugin, Log, TEXT("[VoxelLand] Polar set %s: %u^2, crevasses (R) %.1f texels a cell, %.2f deep, %.1f deg grain; sastrugi (G) %.1f, %.2f, %.1f deg; polygons (B) %.1f, %.2f."),
+                    *PolarName, Set.N, Out->PolarSpacingTexels[0], Out->PolarRange[0], FMath::RadiansToDegrees(Out->PolarTurn[0]), Out->PolarSpacingTexels[1],
+                    Out->PolarRange[1], FMath::RadiansToDegrees(Out->PolarTurn[1]), Out->PolarSpacingTexels[2], Out->PolarRange[2]);
+            }
+            Polar.Texels.Empty();
+        }
         return Out;
     }
 
@@ -922,18 +1190,22 @@ namespace VoxelLandNoiseDetail
         return Name;
     }
 
-    /** Lists the folder's usable peaks*, hills*, strata* and detail* sets (Lock held, Directory
-     *  known; once a session): their headers read and checked, so a file that can't be used
-     *  doesn't take a share of the planets. A few small reads, on the game thread the first time
-     *  a planet asks. */
+    /** Lists the folder's usable peaks*, hills*, strata*, detail*, dunes* and sanddetail* sets
+     *  (Lock held, Directory known; once a session): their headers read and checked, so a file that
+     *  can't be used doesn't take a share of the planets. A few small reads, on the game thread the
+     *  first time a planet asks. */
     void ListLocked()
     {
         if (bListed) return;
         bListed = true;
         const FString Folder = Directory;
-        const TCHAR* Patterns[4] = { TEXT("peaks*.vxnt"), TEXT("hills*.vxnt"), TEXT("strata*.vxnt"), TEXT("detail*.vxnt") };
-        TArray<FString>* Lists[4] = { &AuthoredPeaks, &AuthoredHills, &AuthoredStrata, &AuthoredDetail };
-        for (int32 Kind = 0; Kind < 4; Kind++)
+        const TCHAR* Patterns[9] = { TEXT("peaks*.vxnt"), TEXT("hills*.vxnt"), TEXT("strata*.vxnt"), TEXT("detail*.vxnt"), TEXT("dunes*.vxnt"),
+            TEXT("sanddetail*.vxnt"), TEXT("glacial*.vxnt"), TEXT("icesheet*.vxnt"), TEXT("polar*.vxnt") };
+        TArray<FString>* Lists[9] = { &AuthoredPeaks, &AuthoredHills, &AuthoredStrata, &AuthoredDetail, &AuthoredDunes, &AuthoredSand, &AuthoredGlacial,
+            &AuthoredIce, &AuthoredPolar };
+        const ESetKind Kinds[9] = { ESetKind::Peaks, ESetKind::Peaks, ESetKind::Peaks, ESetKind::Detail, ESetKind::Dunes, ESetKind::Sand, ESetKind::Glacial,
+            ESetKind::Ice, ESetKind::Polar };
+        for (int32 Kind = 0; Kind < 9; Kind++)
         {
             const TCHAR* Pattern = Patterns[Kind];
             TArray<FString>& List = *Lists[Kind];
@@ -953,18 +1225,25 @@ namespace VoxelLandNoiseDetail
                 uint64_t DataOffset = 0;
                 std::string Why = Header.Num() > 0 && !Reader->IsError()
                     ? VoxelNoiseTiles::ReadVxntHeader(Header.GetData(), (size_t)Header.Num(), (uint64_t)Size, Set, DataOffset) : std::string("unreadable");
-                if (Why.empty()) Why = Kind == 3 ? VoxelNoiseTiles::CheckDetail(Set) : VoxelNoiseTiles::CheckPeaks(Set);
+                // Checked as it will be read (T5c: the dunes' sets at their 1024 mip, as Read does).
+                if (Why.empty()) Why = CheckKind(Set, Kinds[Kind]);
+                if (Why.empty() && SkipHeaderMips(Set, MaxNOf(Kinds[Kind])) > 0) Why = CheckKind(Set, Kinds[Kind]);
                 if (Why.empty())
                     List.Add(FPaths::GetBaseFilename(File));
                 else
                     UE_LOG(LogVoxelPlugin, Warning, TEXT("[VoxelLand] %s isn't a usable set (%s); left out."), *Path, UTF8_TO_TCHAR(Why.c_str()));
             }
         }
-        UE_LOG(LogVoxelPlugin, Log, TEXT("[VoxelLand] Noise sets in %s: peaks %s; hills %s; strata %s; detail %s."), *Folder,
+        UE_LOG(LogVoxelPlugin, Log, TEXT("[VoxelLand] Noise sets in %s: peaks %s; hills %s; strata %s; detail %s; dunes %s; sand detail %s; glacial %s; ice sheet %s; polar %s."), *Folder,
             AuthoredPeaks.Num() > 0 ? *FString::Join(AuthoredPeaks, TEXT(", ")) : TEXT("none (the generated set stands in)"),
             AuthoredHills.Num() > 0 ? *FString::Join(AuthoredHills, TEXT(", ")) : TEXT("none (the procedural hills stand in)"),
             AuthoredStrata.Num() > 0 ? *FString::Join(AuthoredStrata, TEXT(", ")) : TEXT("none (the hills cover the sedimentary provinces)"),
-            AuthoredDetail.Num() > 0 ? *FString::Join(AuthoredDetail, TEXT(", ")) : TEXT("none (the generated set stands in)"));
+            AuthoredDetail.Num() > 0 ? *FString::Join(AuthoredDetail, TEXT(", ")) : TEXT("none (the generated set stands in)"),
+            AuthoredDunes.Num() > 0 ? *FString::Join(AuthoredDunes, TEXT(", ")) : TEXT("none (no dunes)"),
+            AuthoredSand.Num() > 0 ? *FString::Join(AuthoredSand, TEXT(", ")) : TEXT("none (the dunes go without)"),
+            AuthoredGlacial.Num() > 0 ? *FString::Join(AuthoredGlacial, TEXT(", ")) : TEXT("none (the peaks everywhere)"),
+            AuthoredIce.Num() > 0 ? *FString::Join(AuthoredIce, TEXT(", ")) : TEXT("none (smooth ice sheets)"),
+            AuthoredPolar.Num() > 0 ? *FString::Join(AuthoredPolar, TEXT(", ")) : TEXT("none (no polar surfaces)"));
     }
 
     /** One of Names by the seed, rendezvous-hashed (the name with the highest hash of the seed and
@@ -1061,6 +1340,113 @@ FString VoxelLand::DetailNoiseNameFor(const FVoxelTerrestrialSettings& Settings)
     return Best ? *Best : FString(GeneratedNoiseName);
 }
 
+FString VoxelLand::DuneNoiseNameFor(const FVoxelTerrestrialSettings& Settings)
+{
+    using namespace VoxelLandNoiseDetail;
+    if (Settings.DuneHeightScale <= 0.0) return FString();
+    if (Settings.DuneNoiseSet.TrimStartAndEnd().Equals(TEXT("none"), ESearchCase::IgnoreCase)) return FString();
+    // They ride the hill set's layer.
+    if (HillNoiseNameFor(Settings).IsEmpty()) return FString();
+    const FString Chosen = CleanName(Settings.DuneNoiseSet, TEXT("DuneNoiseSet"));
+    if (!Chosen.IsEmpty()) return Chosen;
+    NoiseSetDirectory();
+    FScopeLock ScopeLock(&Lock);
+    ListLocked();
+    const FString* Best = PickBySeed(AuthoredDunes, Settings.Seed, 0x64756e65u);
+    return Best ? *Best : FString();
+}
+
+FString VoxelLand::SandDetailNoiseNameFor(const FVoxelTerrestrialSettings& Settings)
+{
+    using namespace VoxelLandNoiseDetail;
+    if (Settings.SandDetailStrength <= 0.0) return FString();
+    if (Settings.SandDetailNoiseSet.TrimStartAndEnd().Equals(TEXT("none"), ESearchCase::IgnoreCase)) return FString();
+    if (DuneNoiseNameFor(Settings).IsEmpty()) return FString();
+    const FString Chosen = CleanName(Settings.SandDetailNoiseSet, TEXT("SandDetailNoiseSet"));
+    if (!Chosen.IsEmpty()) return Chosen;
+    NoiseSetDirectory();
+    FScopeLock ScopeLock(&Lock);
+    ListLocked();
+    const FString* Best = PickBySeed(AuthoredSand, Settings.Seed, 0x73616e64u);
+    return Best ? *Best : FString();
+}
+
+FString VoxelLand::GlacialNoiseNameFor(const FVoxelTerrestrialSettings& Settings)
+{
+    using namespace VoxelLandNoiseDetail;
+    if (Settings.GlacialHeightScale <= 0.0) return FString();
+    if (Settings.GlacialNoiseSet.TrimStartAndEnd().Equals(TEXT("none"), ESearchCase::IgnoreCase)) return FString();
+    // In the peaks' place: none without them.
+    if (PeakNoiseNameFor(Settings).IsEmpty()) return FString();
+    const FString Chosen = CleanName(Settings.GlacialNoiseSet, TEXT("GlacialNoiseSet"));
+    if (!Chosen.IsEmpty()) return Chosen;
+    NoiseSetDirectory();
+    FScopeLock ScopeLock(&Lock);
+    ListLocked();
+    const FString* Best = PickBySeed(AuthoredGlacial, Settings.Seed, 0x676c6163u);
+    return Best ? *Best : FString();
+}
+
+FString VoxelLand::IceSheetNoiseNameFor(const FVoxelTerrestrialSettings& Settings)
+{
+    using namespace VoxelLandNoiseDetail;
+    if (Settings.IceSheetMaxThickness <= 0.0 || Settings.IceSheetSwellHeight <= 0.0) return FString();
+    if (Settings.IceSheetNoiseSet.TrimStartAndEnd().Equals(TEXT("none"), ESearchCase::IgnoreCase)) return FString();
+    const FString Chosen = CleanName(Settings.IceSheetNoiseSet, TEXT("IceSheetNoiseSet"));
+    if (!Chosen.IsEmpty()) return Chosen;
+    NoiseSetDirectory();
+    FScopeLock ScopeLock(&Lock);
+    ListLocked();
+    const FString* Best = PickBySeed(AuthoredIce, Settings.Seed, 0x69636573u);
+    return Best ? *Best : FString();
+}
+
+FString VoxelLand::PolarNoiseNameFor(const FVoxelTerrestrialSettings& Settings)
+{
+    using namespace VoxelLandNoiseDetail;
+    if (Settings.CrevasseHeightScale <= 0.0 && Settings.SastrugiHeightScale <= 0.0 && Settings.PolygonHeightScale <= 0.0 && Settings.SnowDuneHeight <= 0.0)
+        return FString();
+    if (Settings.PolarNoiseSet.TrimStartAndEnd().Equals(TEXT("none"), ESearchCase::IgnoreCase)) return FString();
+    const FString Chosen = CleanName(Settings.PolarNoiseSet, TEXT("PolarNoiseSet"));
+    if (!Chosen.IsEmpty()) return Chosen;
+    NoiseSetDirectory();
+    FScopeLock ScopeLock(&Lock);
+    ListLocked();
+    const FString* Best = PickBySeed(AuthoredPolar, Settings.Seed, 0x706f6c61u);
+    return Best ? *Best : FString();
+}
+
+double VoxelLand::PolarSpacing(const FVoxelTerrestrialSettings& Settings, int32 Channel)
+{
+    if (Channel == 0) return FMath::Max(Settings.CrevasseSpacing, 10.0);
+    if (Channel == 1) return FMath::Max(Settings.SastrugiSpacing, 1.0);
+    return FMath::Max(Settings.PolygonSpacing, 4.0);
+}
+
+double VoxelLand::SnowDuneSpacing(const FVoxelTerrestrialSettings& Settings)
+{
+    return FMath::Max(Settings.SnowDuneSpacing, 50.0);
+}
+
+double VoxelLand::PolarReach(const FVoxelTerrestrialSettings& Settings, const FVoxelLandNoiseSet* Noise, bool bUp)
+{
+    if (!Noise || Noise->PolarN == 0) return 0.0;
+    const double Scales[3] = { Settings.CrevasseHeightScale, Settings.SastrugiHeightScale, Settings.PolygonHeightScale };
+    double Reach = 0.0;
+    for (int32 c = 0; c < 3; c++)
+    {
+        if (!(Scales[c] > 0.0) || !(Noise->PolarSpacingTexels[c] > 0.0f)) continue;
+        // One turn's value within 0 .. 1 (the B-splines are convex) about its mean (unit).
+        const double TexelM = PolarSpacing(Settings, c) / (double)Noise->PolarSpacingTexels[c];
+        const double Side = bUp ? 1.0 - (double)Noise->PolarMean[c] : (double)Noise->PolarMean[c];
+        Reach += Scales[c] * (double)Noise->PolarRange[c] * TexelM * FMath::Max(Side, 0.0);
+    }
+    // The snow dunes: the dune set's G over SnowDuneHeight.
+    if (Settings.SnowDuneHeight > 0.0 && Noise->DuneN > 0)
+        Reach += Settings.SnowDuneHeight * FMath::Max(bUp ? 1.0 - (double)Noise->DuneMeanG : (double)Noise->DuneMeanG, 0.0);
+    return 1.01 * PolarBlendBound * Reach;
+}
+
 double VoxelLand::DetailLayerWavelength(const FVoxelTerrestrialSettings& Settings)
 {
     return FMath::Max(Settings.DetailWavelength, 100.0);
@@ -1073,7 +1459,24 @@ FString VoxelLand::LandNoiseNameFor(const FVoxelTerrestrialSettings& Settings)
     const FString Strata = StrataNoiseNameFor(Settings);
     const FString Detail = DetailNoiseNameFor(Settings);
     if (Peaks.IsEmpty() && Hills.IsEmpty() && Detail.IsEmpty()) return FString();
-    return Peaks + TEXT("|") + Hills + TEXT("|") + Strata + TEXT("|") + Detail;
+    FString Key = Peaks + TEXT("|") + Hills + TEXT("|") + Strata + TEXT("|") + Detail;
+    // T5c, T5d: the dunes' and the glacial set's parts only when there are any (a planet without
+    // keeps its old key).
+    // T5d2: and the ice sheets' set (parts empty to its left as needed).
+    // T5d3: and the polar set's.
+    const FString Dunes = DuneNoiseNameFor(Settings);
+    const FString Glacial = GlacialNoiseNameFor(Settings);
+    const FString Ice = IceSheetNoiseNameFor(Settings);
+    const FString Polar = PolarNoiseNameFor(Settings);
+    if (!Dunes.IsEmpty() || !Glacial.IsEmpty() || !Ice.IsEmpty() || !Polar.IsEmpty())
+        Key += TEXT("|") + Dunes + TEXT("|") + (Dunes.IsEmpty() ? FString() : SandDetailNoiseNameFor(Settings));
+    if (!Glacial.IsEmpty() || !Ice.IsEmpty() || !Polar.IsEmpty())
+        Key += TEXT("|") + Glacial;
+    if (!Ice.IsEmpty() || !Polar.IsEmpty())
+        Key += TEXT("|") + Ice;
+    if (!Polar.IsEmpty())
+        Key += TEXT("|") + Polar;
+    return Key;
 }
 
 TSharedPtr<const FVoxelLandNoiseSet, ESPMode::ThreadSafe> VoxelLand::GetLandNoise(const FString& Key)
@@ -1251,6 +1654,33 @@ double VoxelLand::StrataDetailWavelength(const FVoxelTerrestrialSettings& Settin
     return FMath::Clamp(Settings.StrataDetailWavelength, 16.0, 0.25 * FMath::Max(Settings.StrataSpacing, HillMinSpacing));
 }
 
+float VoxelLand::DuneTexelsPerCell(const FVoxelTerrestrialSettings& Settings, const FVoxelLandBake& Bake, const FVoxelLandNoiseSet& Set)
+{
+    if (Settings.DuneHeightScale <= 0.0 || Set.DuneN == 0 || Set.DuneSpacingTexels == 0) return 0.0f;
+    if (HillTexelsPerCell(Settings, Bake, Set) <= 0.0f) return 0.0f;
+    const double TexelM = FMath::Max(Settings.DuneSpacing, DuneMinSpacing) / (double)Set.DuneSpacingTexels;
+    return (float)(CellArc(Bake.SeaRadius, Bake.N) * 0.01 / TexelM);
+}
+
+double VoxelLand::DuneRelief(const FVoxelTerrestrialSettings& Settings, const FVoxelLandNoiseSet& Set)
+{
+    if (Set.DuneN == 0 || Set.DuneSpacingTexels == 0) return 0.0;
+    const double TexelM = FMath::Max(Settings.DuneSpacing, DuneMinSpacing) / (double)Set.DuneSpacingTexels;
+    return FMath::Max(Settings.DuneHeightScale, 0.0) * FMath::Max3((double)Set.DuneRangeR, (double)Set.DuneRangeG, 1e-6) * TexelM;
+}
+
+double VoxelLand::SandDetailWavelength(const FVoxelTerrestrialSettings& Settings)
+{
+    return FMath::Clamp(Settings.SandDetailWavelength, 2.0, FMath::Max(0.25 * FMath::Max(Settings.DuneSpacing, DuneMinSpacing), 2.0));
+}
+
+double VoxelLand::SandDetailRelief(const FVoxelTerrestrialSettings& Settings, const FVoxelLandNoiseSet& Set)
+{
+    if (Settings.SandDetailStrength <= 0.0 || Set.SandN == 0 || !(Set.SandSpacingTexels > 0.0f)) return 0.0;
+    const double TexelM = SandDetailWavelength(Settings) / (double)Set.SandSpacingTexels;
+    return Settings.SandDetailStrength * (double)Set.SandRangeG * TexelM;
+}
+
 double VoxelLand::HillSetReliefCap(const FVoxelTerrestrialSettings& Settings)
 {
     return FMath::Max(Settings.HillHeightScale, 0.0) * 0.5 * FMath::Max(Settings.HillSpacing, HillMinSpacing);
@@ -1259,6 +1689,14 @@ double VoxelLand::HillSetReliefCap(const FVoxelTerrestrialSettings& Settings)
 double VoxelLand::HillDetailWavelength(const FVoxelTerrestrialSettings& Settings)
 {
     return FMath::Clamp(Settings.HillDetailWavelength, 16.0, 0.25 * FMath::Max(Settings.HillSpacing, HillMinSpacing));
+}
+
+float VoxelLand::GlacialTexelsPerCell(const FVoxelTerrestrialSettings& Settings, const FVoxelLandBake& Bake, const FVoxelLandNoiseSet& Set)
+{
+    if (Settings.GlacialHeightScale <= 0.0 || Set.GlacialN == 0 || Set.GlacialSpacingTexels == 0) return 0.0f;
+    if (PeakTexelsPerCell(Settings, Bake, Set) <= 0.0f) return 0.0f;
+    const double TexelM = FMath::Max(Settings.GlacialSpacing, PeakMinSpacing) / (double)Set.GlacialSpacingTexels;
+    return (float)(CellArc(Bake.SeaRadius, Bake.N) * 0.01 / TexelM);
 }
 
 double VoxelLand::PeakReach(const FVoxelTerrestrialSettings& Settings, const FVoxelLandBake& Bake, const FVoxelLandNoiseSet* Noise, bool bUp)
@@ -1281,6 +1719,18 @@ double VoxelLand::PeakReach(const FVoxelTerrestrialSettings& Settings, const FVo
     double Reach = FMath::Max(Settings.PeakHeightScale, 0.0) * Relief;
     if (Settings.PeakDetailStrength > 0.0)
         Reach += Settings.PeakHeightScale * Settings.PeakDetailStrength * VoxelNoiseTiles::DetailRangeWaves * PeakDetailWavelength(Settings);
+    if (Noise && GlacialTexelsPerCell(Settings, Bake, *Noise) > 0.0f)
+    {
+        // T5d: the glacial layer, by the same rule from its set (its detail the peaks', scaled by
+        // its height); the switch between the two keeps the variance: (1 - P + P) / sqrt((1 - P)^2
+        // + P^2) <= sqrt 2 times the larger.
+        const double TexelM = FMath::Max(Settings.GlacialSpacing, PeakMinSpacing) / (double)Noise->GlacialSpacingTexels;
+        const double GRelief = FMath::Min((double)Bake.MaxRelief, FMath::Max3((double)Noise->GlacialRangeR, (double)Noise->GlacialRangeG, 1e-6) * TexelM);
+        double GReach = FMath::Max(Settings.GlacialHeightScale, 0.0) * GRelief;
+        if (Settings.PeakDetailStrength > 0.0)
+            GReach += Settings.GlacialHeightScale * Settings.PeakDetailStrength * VoxelNoiseTiles::DetailRangeWaves * PeakDetailWavelength(Settings);
+        Reach = UE_SQRT_2 * FMath::Max(Reach, GReach);
+    }
     return 1.01 * FaceBlendBound * Reach * 100.0;
 }
 
@@ -1348,12 +1798,42 @@ void VoxelLand::ShapeFor(const FVoxelTerrestrialSettings& Settings, const FVoxel
             HillUp = FMath::Max(HillUp, 1.01 * FaceBlendBound * (SRelief + SDetail));
             HillDown = FMath::Max(HillDown, 1.01 * (FaceBlendBound * SDetail + (FaceBlendBound - 1.0) * SRelief));
         }
+        if (DuneTexelsPerCell(Settings, Bake, *Noise) > 0.0f)
+        {
+            // The dunes (T5c, VoxelLandDunes.ush): added to the layer where the climate makes
+            // desert (the rest gives way, so the sum bounds both). One turn's unit within 0 .. 1
+            // (over the larger range) about its mean M, the blends DuneBlendBound times that: up to
+            // M + B (1 - M) <= B, down to M - B M. The sand detail, zero-mean, within its range
+            // either way times B.
+            const double DRelief = DuneRelief(Settings, *Noise);
+            const double DDetail = SandDetailRelief(Settings, *Noise);
+            const double DMean = FMath::Max((double)Noise->DuneMeanR * (double)Noise->DuneRangeR, (double)Noise->DuneMeanG * (double)Noise->DuneRangeG)
+                / FMath::Max3((double)Noise->DuneRangeR, (double)Noise->DuneRangeG, 1e-6);
+            HillUp += 1.01 * DuneBlendBound * (DRelief + DDetail);
+            HillDown += 1.01 * ((DuneBlendBound - 1.0) * DMean * DRelief + DuneBlendBound * DDetail);
+        }
     }
     // (Summed in the order T3 did, so a planet without a hill set keeps its shape exactly.)
     const double ReachDown = DetailReach + GullyReach(Settings, Bake) + HillDown * 100.0 + 100.0;
     const double ReachUp = DetailReach + GullyReach(Settings, Bake) + HillUp * 100.0 + 100.0;
-    const double Low = FMath::Min((double)Bake.MinHeight * 100.0, -PeakReach(Settings, Bake, Noise, false)) - ReachDown;
-    const double High = (double)Bake.MaxHeight * 100.0 + PeakReach(Settings, Bake, Noise, true) + ReachUp;
+    // T5d3: the polar surfaces ride on whatever is there (the land, the peaks' ice, the sheets): their
+    // reach either way on top.
+    const double PolarUp = PolarReach(Settings, Noise, true) * 100.0;
+    const double PolarDown = PolarReach(Settings, Noise, false) * 100.0;
+    const double Low = FMath::Min((double)Bake.MinHeight * 100.0, -PeakReach(Settings, Bake, Noise, false)) - ReachDown - PolarDown;
+    double UpReach = PeakReach(Settings, Bake, Noise, true) + ReachUp + PolarUp;
+    if (Settings.IceSheetMaxThickness > 0.0)
+    {
+        // T5d2: the ice sheets (VoxelLandIce.ush): their surface the ground's mean under them (no
+        // higher than the bake's highest), the thickness (at most the cap), the swells (zero-mean,
+        // the face blend's bound about it) and the smooth maximum's bump (a quarter of its width).
+        // The detail layer rides on the ice (by at most its whole reach); the bump applies wherever
+        // the two meet, the land leading or the ice.
+        const double Swell = IceSheetNoiseNameFor(Settings).IsEmpty() ? 0.0 : FMath::Max(Settings.IceSheetSwellHeight, 0.0);
+        const double IceUp = (Settings.IceSheetMaxThickness + FaceBlendBound * Swell) * 1.01 * 100.0 + DetailReach + PolarUp + 100.0;
+        UpReach = FMath::Max(UpReach, IceUp) + 0.25 * IceSheetBlend * 1.01 * 100.0;
+    }
+    const double High = (double)Bake.MaxHeight * 100.0 + UpReach;
     OutPlanetRadius = FMath::Max(Bake.SeaRadius + Low, 1.0);
     OutNoiseAmplitude = FMath::Max(High - Low, 1.0);
 }
@@ -2691,6 +3171,85 @@ FVoxelLandShaderParameters VoxelLandGPU::GetParameters(FRDGBuilder& GraphBuilder
     Parameters.LandDetailScaleGain = 0.0f;
     Parameters.LandDetailFade = 0.0f;
     Parameters.LandDetailSeed = 0;
+    // T5c: the dunes (off; LandClimate bound below, a stand-in without them).
+    Parameters.LandHasClimate = 0;
+    Parameters.LandClimateLapse = 6.5f;
+    Parameters.LandDuneTexelsPerCell = 0.0f;
+    Parameters.LandDuneBase = 0;
+    Parameters.LandDuneN = 0;
+    Parameters.LandDuneMips = 0;
+    Parameters.LandDuneScaleR = 1.0f;
+    Parameters.LandDuneScaleG = 1.0f;
+    Parameters.LandDuneMeanR = 0.0f;
+    Parameters.LandDuneMeanG = 0.0f;
+    Parameters.LandDuneRelief = 0.0f;
+    Parameters.LandDuneSeed = 0;
+    Parameters.LandDuneErgFrequency = 1.0f;
+    Parameters.LandDuneErgThreshold = 2.0f;
+    Parameters.LandDuneErgWidth = 0.06f;
+    Parameters.LandDuneReliefMax = 400.0f;
+    Parameters.LandDuneDetailTexelsPerCell = 0.0f;
+    Parameters.LandDuneDetailBase = 0;
+    Parameters.LandDuneDetailN = 0;
+    Parameters.LandDuneDetailMips = 0;
+    Parameters.LandDuneDetailScale = 0.0f;
+    Parameters.LandDuneDetailMean = 0.0f;
+    Parameters.LandDuneDetailFade = 0.0f;
+    // T5d: the glacial layer (off).
+    Parameters.LandGlacialTexelsPerCell = 0.0f;
+    Parameters.LandGlacialBase = 0;
+    Parameters.LandGlacialN = 0;
+    Parameters.LandGlacialMips = 0;
+    Parameters.LandGlacialScaleR = 1.0f;
+    Parameters.LandGlacialScaleG = 1.0f;
+    Parameters.LandGlacialScaleB = 1.0f;
+    Parameters.LandGlacialMeanR = 0.0f;
+    Parameters.LandGlacialMeanG = 0.0f;
+    Parameters.LandGlacialReliefM = 0.0f;
+    Parameters.LandGlacialStrength = 0.0f;
+    Parameters.LandGlacialSeed = 0;
+    Parameters.LandGlacialSpacingM = 0.0f;
+    Parameters.LandGlacialCooling = 0.0f;
+    Parameters.LandGlacialDetailScaleHard = 0.0f;
+    Parameters.LandGlacialDetailScaleSoft = 0.0f;
+    // T5d2: the ice sheets (off).
+    Parameters.LandIceMaxThickness = 0.0f;
+    Parameters.LandIceBlend = 0.0f;
+    Parameters.LandIceSwellTexelsPerCell = 0.0f;
+    Parameters.LandIceBase = 0;
+    Parameters.LandIceN = 0;
+    Parameters.LandIceMips = 0;
+    Parameters.LandIceMeanG = 0.0f;
+    Parameters.LandIceSwellM = 0.0f;
+    Parameters.LandIceSeed = 0;
+    Parameters.LandIceSwellSpacingM = 0.0f;
+    Parameters.LandPolarBase = 0;
+    Parameters.LandPolarN = 0;
+    Parameters.LandPolarMips = 0;
+    Parameters.LandPolarSeed = 0;
+    Parameters.LandPolarCrevasseTexelsPerCell = 0.0f;
+    Parameters.LandPolarCrevasseM = 0.0f;
+    Parameters.LandPolarCrevasseMean = 0.0f;
+    Parameters.LandPolarCrevasseFade = 0.0f;
+    Parameters.LandPolarSastrugiTexelsPerCell = 0.0f;
+    Parameters.LandPolarSastrugiM = 0.0f;
+    Parameters.LandPolarSastrugiMean = 0.0f;
+    Parameters.LandPolarSastrugiFade = 0.0f;
+    Parameters.LandPolarPolygonTexelsPerCell = 0.0f;
+    Parameters.LandPolarPolygonM = 0.0f;
+    Parameters.LandPolarPolygonMean = 0.0f;
+    Parameters.LandPolarPolygonFade = 0.0f;
+    Parameters.LandPolarPermafrostT = -6.0f;
+    Parameters.LandPolarCrevasseTurn = 0.0f;
+    Parameters.LandPolarSastrugiTurn = 0.0f;
+    Parameters.LandPolarDuneBase = 0;
+    Parameters.LandPolarDuneN = 0;
+    Parameters.LandPolarDuneMips = 0;
+    Parameters.LandPolarDuneTexelsPerCell = 0.0f;
+    Parameters.LandPolarDuneM = 0.0f;
+    Parameters.LandPolarDuneMean = 0.0f;
+    Parameters.LandPolarDuneFade = 0.0f;
+    bool bClimateBound = false;
 
     const FVoxelLandBake* Bake = Density.LandMode != 0 ? Density.Land.Get() : nullptr;
     if (Bake && Bake->GPU.IsValid() && Bake->Height.Num() == Bake->NumCells() && Bake->TanTable.Num() == Bake->Side())
@@ -2879,6 +3438,123 @@ FVoxelLandShaderParameters VoxelLandGPU::GetParameters(FRDGBuilder& GraphBuilder
                 }
             }
         }
+        // T5c, T5d, T5d2, T5d3: the climate the dunes, the glacial layer, the ice sheets and the polar
+        // surfaces are placed by (uploaded once per field), and those layers (the sets' with the
+        // noise pack).
+        const FVoxelLandClimateField* Climate = Density.LandClimate.Get();
+        const bool bDunes = bHasNoise && Density.LandDuneTexelsPerCell > 0.0f && Density.LandHillTexelsPerCell > 0.0f && Noise->HillN > 0 && Noise->DuneN > 0;
+        const bool bGlacial = bHasNoise && Density.LandGlacialTexelsPerCell > 0.0f && Density.LandPeakTexelsPerCell > 0.0f && Noise->GlacialN > 0;
+        const bool bIce = Density.LandIceMaxThickness > 0.0f;
+        const bool bPolar = bHasNoise && Noise->PolarN > 0
+            && (Density.LandPolarCrevasseTexelsPerCell > 0.0f || Density.LandPolarSastrugiTexelsPerCell > 0.0f || Density.LandPolarPolygonTexelsPerCell > 0.0f
+                || Density.LandPolarDuneTexelsPerCell > 0.0f);
+        // T5e: the ice shelf's share (the rivers' fade, the polar layer's ice) is in the field too.
+        const bool bShelf = Density.bLandIceShelf;
+        if ((bDunes || bGlacial || bIce || bPolar || bShelf) && Climate && Climate->IsValid() && Climate->GPU.IsValid())
+        {
+            if (!Climate->GPU->Entries.IsValid())
+            {
+                Climate->GPU->Entries = GraphBuilder.ConvertToExternalBuffer(
+                    VoxelGPUCommon::UploadStructuredBuffer(GraphBuilder, TEXT("Voxel.LandClimate"), MakeConstArrayView(Climate->Entries)));
+            }
+            Parameters.LandClimate = GraphBuilder.CreateSRV(GraphBuilder.RegisterExternalBuffer(Climate->GPU->Entries));
+            bClimateBound = true;
+            Parameters.LandHasClimate = 1;
+            Parameters.LandClimateLapse = Density.LandClimateLapse;
+            if (bDunes)
+            {
+                Parameters.LandDuneBase = Noise->DuneBase;
+                Parameters.LandDuneN = Noise->DuneN;
+                Parameters.LandDuneMips = Noise->DuneMips;
+                Parameters.LandDuneDetailBase = Noise->SandBase;
+                Parameters.LandDuneDetailN = Noise->SandN;
+                Parameters.LandDuneDetailMips = Noise->SandMips;
+                Parameters.LandDuneTexelsPerCell = Density.LandDuneTexelsPerCell;
+                Parameters.LandDuneScaleR = Density.LandDuneScaleR;
+                Parameters.LandDuneScaleG = Density.LandDuneScaleG;
+                Parameters.LandDuneMeanR = Density.LandDuneMeanR;
+                Parameters.LandDuneMeanG = Density.LandDuneMeanG;
+                Parameters.LandDuneRelief = Density.LandDuneRelief;
+                Parameters.LandDuneSeed = Density.LandDuneSeed;
+                Parameters.LandDuneErgFrequency = Density.LandDuneErgFrequency;
+                Parameters.LandDuneErgThreshold = Density.LandDuneErgThreshold;
+                Parameters.LandDuneErgWidth = Density.LandDuneErgWidth;
+                Parameters.LandDuneReliefMax = Density.LandDuneReliefMax;
+                Parameters.LandDuneDetailTexelsPerCell = Density.LandDuneDetailTexelsPerCell;
+                Parameters.LandDuneDetailScale = Density.LandDuneDetailScale;
+                Parameters.LandDuneDetailMean = Density.LandDuneDetailMean;
+                Parameters.LandDuneDetailFade = Density.LandDuneDetailFade;
+            }
+            if (bGlacial)
+            {
+                Parameters.LandGlacialBase = Noise->GlacialBase;
+                Parameters.LandGlacialN = Noise->GlacialN;
+                Parameters.LandGlacialMips = Noise->GlacialMips;
+                Parameters.LandGlacialTexelsPerCell = Density.LandGlacialTexelsPerCell;
+                Parameters.LandGlacialScaleR = Density.LandGlacialScaleR;
+                Parameters.LandGlacialScaleG = Density.LandGlacialScaleG;
+                Parameters.LandGlacialScaleB = Density.LandGlacialScaleB;
+                Parameters.LandGlacialMeanR = Density.LandGlacialMeanR;
+                Parameters.LandGlacialMeanG = Density.LandGlacialMeanG;
+                Parameters.LandGlacialReliefM = Density.LandGlacialReliefM;
+                Parameters.LandGlacialStrength = Density.LandGlacialStrength;
+                Parameters.LandGlacialSeed = Density.LandGlacialSeed;
+                Parameters.LandGlacialSpacingM = Density.LandGlacialSpacingM;
+                Parameters.LandGlacialCooling = Density.LandGlacialCooling;
+                Parameters.LandGlacialDetailScaleHard = Density.LandGlacialDetailScaleHard;
+                Parameters.LandGlacialDetailScaleSoft = Density.LandGlacialDetailScaleSoft;
+            }
+            if (bIce)
+            {
+                Parameters.LandIceMaxThickness = Density.LandIceMaxThickness;
+                Parameters.LandIceBlend = Density.LandIceBlend;
+                if (bHasNoise && Density.LandIceSwellTexelsPerCell > 0.0f && Noise->IceN > 0)
+                {
+                    Parameters.LandIceSwellTexelsPerCell = Density.LandIceSwellTexelsPerCell;
+                    Parameters.LandIceBase = Noise->IceBase;
+                    Parameters.LandIceN = Noise->IceN;
+                    Parameters.LandIceMips = Noise->IceMips;
+                    Parameters.LandIceMeanG = Density.LandIceMeanG;
+                    Parameters.LandIceSwellM = Density.LandIceSwellM;
+                    Parameters.LandIceSeed = Density.LandIceSeed;
+                    Parameters.LandIceSwellSpacingM = Density.LandIceSwellSpacingM;
+                }
+            }
+            if (bPolar)
+            {
+                Parameters.LandPolarBase = Noise->PolarBase;
+                Parameters.LandPolarN = Noise->PolarN;
+                Parameters.LandPolarMips = Noise->PolarMips;
+                Parameters.LandPolarSeed = Density.LandPolarSeed;
+                Parameters.LandPolarCrevasseTexelsPerCell = Density.LandPolarCrevasseTexelsPerCell;
+                Parameters.LandPolarCrevasseM = Density.LandPolarCrevasseM;
+                Parameters.LandPolarCrevasseMean = Density.LandPolarCrevasseMean;
+                Parameters.LandPolarCrevasseFade = Density.LandPolarCrevasseFade;
+                Parameters.LandPolarSastrugiTexelsPerCell = Density.LandPolarSastrugiTexelsPerCell;
+                Parameters.LandPolarSastrugiM = Density.LandPolarSastrugiM;
+                Parameters.LandPolarSastrugiMean = Density.LandPolarSastrugiMean;
+                Parameters.LandPolarSastrugiFade = Density.LandPolarSastrugiFade;
+                Parameters.LandPolarPolygonTexelsPerCell = Density.LandPolarPolygonTexelsPerCell;
+                Parameters.LandPolarPolygonM = Density.LandPolarPolygonM;
+                Parameters.LandPolarPolygonMean = Density.LandPolarPolygonMean;
+                Parameters.LandPolarPolygonFade = Density.LandPolarPolygonFade;
+                Parameters.LandPolarPermafrostT = Density.LandPolarPermafrostT;
+                Parameters.LandPolarCrevasseTurn = Density.LandPolarCrevasseTurn;
+                Parameters.LandPolarSastrugiTurn = Density.LandPolarSastrugiTurn;
+                if (Density.LandPolarDuneTexelsPerCell > 0.0f && Noise->DuneN > 0)
+                {
+                    Parameters.LandPolarDuneBase = Noise->DuneBase;
+                    Parameters.LandPolarDuneN = Noise->DuneN;
+                    Parameters.LandPolarDuneMips = Noise->DuneMips;
+                    Parameters.LandPolarDuneTexelsPerCell = Density.LandPolarDuneTexelsPerCell;
+                    Parameters.LandPolarDuneM = Density.LandPolarDuneM;
+                    Parameters.LandPolarDuneMean = Density.LandPolarDuneMean;
+                    Parameters.LandPolarDuneFade = Density.LandPolarDuneFade;
+                }
+            }
+        }
+        if (!bClimateBound)
+            Parameters.LandClimate = GraphBuilder.CreateSRV(VoxelGPUCommon::UploadStructuredBuffer<FVector4f>(GraphBuilder, TEXT("Voxel.LandClimateNone"), TConstArrayView<FVector4f>()));
         Parameters.LandHasForm = bHasForm ? 1u : 0u;
         Parameters.LandHeight = GraphBuilder.CreateSRV(GraphBuilder.RegisterExternalBuffer(Resource.Height));
         Parameters.LandTanTable = GraphBuilder.CreateSRV(GraphBuilder.RegisterExternalBuffer(Resource.TanTable));
@@ -2919,6 +3595,7 @@ FVoxelLandShaderParameters VoxelLandGPU::GetParameters(FRDGBuilder& GraphBuilder
     Parameters.LandRiverData = GraphBuilder.CreateSRV(VoxelGPUCommon::UploadStructuredBuffer<float>(GraphBuilder, TEXT("Voxel.LandRiverDataNone"), TConstArrayView<float>()));
     Parameters.LandNoise = GraphBuilder.CreateSRV(VoxelGPUCommon::UploadStructuredBuffer<uint32>(GraphBuilder, TEXT("Voxel.LandNoiseNone"), TConstArrayView<uint32>()));
     Parameters.LandWater = GraphBuilder.CreateSRV(VoxelGPUCommon::UploadStructuredBuffer<float>(GraphBuilder, TEXT("Voxel.LandWaterNone"), TConstArrayView<float>()));
+    Parameters.LandClimate = GraphBuilder.CreateSRV(VoxelGPUCommon::UploadStructuredBuffer<FVector4f>(GraphBuilder, TEXT("Voxel.LandClimateNone"), TConstArrayView<FVector4f>()));
     return Parameters;
 }
 

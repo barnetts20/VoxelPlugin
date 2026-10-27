@@ -1,0 +1,351 @@
+// VoxelLandClimate.ush - The land's climate at a point (stage T5a, Design/LandClimate.md): from
+// the planet's climate map (a cell: the year's mean temperature reduced to sea level, the
+// precipitation, the seasons' swing and the continentality; VoxelLandClimate.h builds it, from
+// the atmosphere's sim once its means have settled, a provisional model until then), the point's
+// own height, slope, facing and a small breakup noise give:
+//   - the temperature there: the cell's, less the lapse rate over the point's height (the map is
+//     coarse, about 12 km a cell at 1,000 km, so the height correction is the point's, not the
+//     cell's: a sub-grid correction, Design/LandGenResearch.md rule 5), plus the slope's facing
+//     (sun-facing slopes warmer) and the breakup;
+//   - the summer's and the current season's temperatures, from the swing;
+//   - the aridity: Holdridge's potential evapotranspiration ratio (PET = 58.93 x the
+//     biotemperature, mm a year, over the precipitation), as log2;
+//   - the snow and the glaciers: Ohmura, Kasser & Funk (1992), P = 645 + 296 T + 9 T^2 at
+//     glaciers' equilibrium lines (P the year's precipitation, mm; T the summer's mean, C): ice
+//     lasts the summer where the summer is colder than that line's T for the point's precipitation
+//     (wet climates hold glaciers in warmer summers); the season's snow where the season's
+//     temperature is (and enough precipitation falls); both off steep slopes. The fit is the
+//     mid and high latitudes' (a three-month melt season); where the year hardly swings (the
+//     tropics) melt runs all year and the line sits near the year's 0 C isotherm (Kaser &
+//     Osmaston, Tropical Glaciers, 1997), so the line's summer temperature drops by up to 5 C as
+//     the swing falls from 6 C to none;
+//   - bare desert by the aridity (Holdridge's semi-arid to arid), and plant cover by the aridity
+//     and the summer's warmth (none below 0 C, full from the tree line's 10 C).
+// Every share is continuous (no sharp boundaries): smooth ramps, and the breakup noise moves the
+// edges about by a degree or two over tens of metres.
+//
+// Shared subset (VoxelShaderCompat.h): the terrain material (VoxelLandClimateMaterial.ush) and
+// the planet's CPU queries (APlanetActor::GetClimateAt) run the same code.
+
+#ifndef VOXEL_LAND_CLIMATE_USH
+#define VOXEL_LAND_CLIMATE_USH
+
+#ifndef VOXEL_FUNC
+#define VOXEL_FUNC
+#endif
+
+// The climate map: the weather sim's layout (longitude x sin(latitude) in the planet's frame, Z
+// the spin axis, longitude 0 on +X, row 0 the south; cell (i, j) centred at longitude
+// 2 pi (i + 0.5) / W and sin(latitude) -1 + 2 (j + 0.5) / H). RGBA16F: R the year's mean
+// temperature at sea level (C), G the precipitation (mm a year), B the seasons' swing (the
+// summer's mean less the year's, C), A the continentality (0 at the coast, toward 1 deep inland).
+#define VOXEL_LAND_CLIMATE_WIDTH 512
+#define VOXEL_LAND_CLIMATE_HEIGHT 256
+
+// Holdridge: PET (mm a year) per degree of biotemperature, which counts 0 to 30 C.
+#define VOXEL_LAND_CLIMATE_PET_PER_C 58.93f
+#define VOXEL_LAND_CLIMATE_BIO_MAX 30.0f
+// Snow lies to 40 degrees of slope and is gone past 55 (sloughs and avalanches); glacier ice to
+// 50, gone past 65 (icefalls hold steeper ice). As cosines.
+#define VOXEL_LAND_CLIMATE_SNOW_SLOPE_FULL 0.7660444f
+#define VOXEL_LAND_CLIMATE_SNOW_SLOPE_NONE 0.5735764f
+#define VOXEL_LAND_CLIMATE_ICE_SLOPE_FULL 0.6427876f
+#define VOXEL_LAND_CLIMATE_ICE_SLOPE_NONE 0.4226183f
+// The season's snow needs precipitation: none under 50 mm a year, all of it from 300.
+#define VOXEL_LAND_CLIMATE_SNOW_DRY 50.0f
+#define VOXEL_LAND_CLIMATE_SNOW_WET 300.0f
+// Ohmura's fit holds to about 4,000 mm; past 5,000 the line is held.
+#define VOXEL_LAND_CLIMATE_ELA_MAX_P 5000.0f
+// The year-round melt's shift of the line (C) without seasons, gone at a swing of 6 C.
+#define VOXEL_LAND_CLIMATE_ELA_TROPICAL_SHIFT 5.0f
+#define VOXEL_LAND_CLIMATE_ELA_SEASONAL_SWING 6.0f
+// Bare desert from Holdridge's semi-arid (PET ratio 2) to arid's dry end (8), as log2.
+#define VOXEL_LAND_CLIMATE_DESERT_START 1.0f
+#define VOXEL_LAND_CLIMATE_DESERT_END 3.0f
+// Plant cover: full to a PET ratio of 0.7, none past 5.7 (log2 -0.5 to 2.5); none in summers
+// below 0 C, full from 10 C (the tree line's warmest-month isotherm).
+#define VOXEL_LAND_CLIMATE_GREEN_WET -0.5f
+#define VOXEL_LAND_CLIMATE_GREEN_DRY 2.5f
+#define VOXEL_LAND_CLIMATE_GREEN_COLD 0.0f
+#define VOXEL_LAND_CLIMATE_GREEN_WARM 10.0f
+// T5e, the ice shelf's heights (m about the sea): it shows from a little under the waterline (the
+// map's share blends over a cell at the zone's edge: the sea floor stays bare) to well above its
+// top (ground higher than that is the mountains through it: their own climate).
+#define VOXEL_LAND_CLIMATE_SHELF_LOW_START -6.0f
+#define VOXEL_LAND_CLIMATE_SHELF_LOW_END -2.0f
+#define VOXEL_LAND_CLIMATE_SHELF_HIGH_START 150.0f
+#define VOXEL_LAND_CLIMATE_SHELF_HIGH_END 300.0f
+// The breakup's second octave: 0.31 of the scale, 0.35 of the amplitude.
+#define VOXEL_LAND_CLIMATE_BREAKUP_FINE 0.31f
+#define VOXEL_LAND_CLIMATE_BREAKUP_FINE_SHARE 0.35f
+
+/** A cell of the climate map (above). */
+struct FVoxelLandClimateCell
+{
+    float SeaTemperature;   // C: the year's mean at sea level
+    float Precipitation;    // mm a year
+    float Seasonality;      // C: the summer's mean less the year's
+    float Continentality;   // 0 coast .. 1 deep inland; T5e: within the ice shelf's reach, minus its share
+};
+
+/** The look's settings (FVoxelLandClimateSettings; the material's VoxelLandClimateParams and
+ *  VoxelLandClimateShape). */
+struct FVoxelLandClimateLook
+{
+    float LapseRate;          // C per km
+    float Season;             // 0 northern summer .. 0.5 the year's mean .. 1 northern winter (the south's opposite)
+    float AspectWarming;      // C: a sun-facing slope's warming at 90 degrees (beyond 30 degrees of latitude)
+    float BreakupAmplitude;   // C
+    float BreakupScale;       // m
+    float SnowWidth;          // C: half the snow line's ramp
+};
+
+/** The climate at a point. */
+struct FVoxelLandClimatePoint
+{
+    float Temperature;    // C: the year's mean
+    float Summer;         // C: the summer's mean
+    float Now;            // C: the season's (Look.Season)
+    float Precipitation;  // mm a year
+    float Aridity;        // log2 of Holdridge's PET ratio (below 0 humid, 1 semi-arid, 2 arid, 3 per-arid)
+    float Snow;           // 0..1: snow lying in the season (at least the glaciers' cover)
+    float Glacier;        // 0..1: ice lasting the summer
+    float Desert;         // 0..1: bare dry ground
+    float Vegetation;     // 0..1: plant cover
+    float Breakup;        // C: the breakup noise's offset
+};
+
+/** A smooth ramp, 0 at E0 to 1 at E1 (either order). */
+VOXEL_FUNC float VoxelLandClimateRamp(float E0, float E1, float X)
+{
+    const float T = saturate((X - E0) / (E1 - E0));
+    return T * T * (3.0f - 2.0f * T);
+}
+
+/** A lattice point's value, 0..1. */
+VOXEL_FUNC float VoxelLandClimateHash(int X, int Y, int Z)
+{
+    uint H = (asuint(X) * 0x8da6b343u) ^ (asuint(Y) * 0xd8163841u) ^ (asuint(Z) * 0xcb1ab31fu);
+    H = (H ^ (H >> 16u)) * 0x7feb352du;
+    H = (H ^ (H >> 15u)) * 0x846ca68bu;
+    H = H ^ (H >> 16u);
+    return float(H >> 8u) * (1.0f / 16777216.0f);
+}
+
+/** Smooth value noise, -1..1, on a unit lattice. */
+VOXEL_FUNC float VoxelLandClimateValueNoise(float3 P)
+{
+    const float FX = floor(P.x);
+    const float FY = floor(P.y);
+    const float FZ = floor(P.z);
+    const int X = int(FX);
+    const int Y = int(FY);
+    const int Z = int(FZ);
+    const float TX = P.x - FX;
+    const float TY = P.y - FY;
+    const float TZ = P.z - FZ;
+    const float SX = TX * TX * (3.0f - 2.0f * TX);
+    const float SY = TY * TY * (3.0f - 2.0f * TY);
+    const float SZ = TZ * TZ * (3.0f - 2.0f * TZ);
+    const float A = lerp(VoxelLandClimateHash(X, Y, Z), VoxelLandClimateHash(X + 1, Y, Z), SX);
+    const float B = lerp(VoxelLandClimateHash(X, Y + 1, Z), VoxelLandClimateHash(X + 1, Y + 1, Z), SX);
+    const float C = lerp(VoxelLandClimateHash(X, Y, Z + 1), VoxelLandClimateHash(X + 1, Y, Z + 1), SX);
+    const float D = lerp(VoxelLandClimateHash(X, Y + 1, Z + 1), VoxelLandClimateHash(X + 1, Y + 1, Z + 1), SX);
+    return lerp(lerp(A, B, SY), lerp(C, D, SY), SZ) * 2.0f - 1.0f;
+}
+
+/** The breakup (C) at a planet-frame point (m): two octaves of value noise. */
+VOXEL_FUNC float VoxelLandClimateBreakup(float3 PositionM, float Amplitude, float Scale)
+{
+    if (Amplitude <= 0.0f || Scale <= 0.0f) return 0.0f;
+    const float3 P = PositionM * (1.0f / Scale);
+    const float3 Q = PositionM * (1.0f / (Scale * VOXEL_LAND_CLIMATE_BREAKUP_FINE)) + float3(17.3f, -41.9f, 5.7f);
+    return Amplitude * ((1.0f - VOXEL_LAND_CLIMATE_BREAKUP_FINE_SHARE) * VoxelLandClimateValueNoise(P)
+        + VOXEL_LAND_CLIMATE_BREAKUP_FINE_SHARE * VoxelLandClimateValueNoise(Q));
+}
+
+/** Stage T5c: the ergs' noise at a unit direction (VoxelLandDunes.ush; VoxelLandClimate::ErgThreshold
+ *  picks its threshold on the CPU from the same function): two octaves of value noise over the unit
+ *  sphere at Frequency (the sphere's radius over the ergs' size), within -1..1. */
+VOXEL_FUNC float VoxelLandClimateErgNoise(float3 Dir, float Frequency)
+{
+    const float3 E = Dir * Frequency;
+    return 0.7f * VoxelLandClimateValueNoise(E) + 0.3f * VoxelLandClimateValueNoise(E * 2.7f + float3(31.7f, -12.9f, 7.3f));
+}
+
+/** The summer's mean temperature (C) at a glacier's equilibrium line for a year's precipitation
+ *  P (mm): Ohmura, Kasser & Funk (1992), P = 645 + 296 T + 9 T^2, solved for T (about -2.4 C dry,
+ *  0 at 645 mm, 5.4 C at 2,500 mm). */
+VOXEL_FUNC float VoxelLandClimateEquilibriumSummer(float P)
+{
+    const float Q = clamp(P, 0.0f, VOXEL_LAND_CLIMATE_ELA_MAX_P);
+    const float D = max(87616.0f - 36.0f * (645.0f - Q), 0.0f);
+    return (sqrt(D) - 296.0f) / 18.0f;
+}
+
+/** Holdridge's biotemperature (C) for a year of mean T swinging by A (the summer's mean less the
+ *  year's): the mean of the temperature clamped to 0..30 C over a sinusoidal year, by the
+ *  two-point rule (T +- A / sqrt 2). */
+VOXEL_FUNC float VoxelLandClimateBiotemperature(float T, float A)
+{
+    const float S = 0.7071068f * A;
+    return 0.5f * (clamp(T + S, 0.0f, VOXEL_LAND_CLIMATE_BIO_MAX) + clamp(T - S, 0.0f, VOXEL_LAND_CLIMATE_BIO_MAX));
+}
+
+/** The aridity, log2 of Holdridge's PET ratio, of a year of mean T (C) swinging by Swing (C) with
+ *  precipitation P (mm a year): PET floored at 1 mm (a frozen year is humid, not arid). */
+VOXEL_FUNC float VoxelLandClimateAridity(float T, float Swing, float P)
+{
+    const float PET = max(VOXEL_LAND_CLIMATE_PET_PER_C * VoxelLandClimateBiotemperature(T, Swing), 1.0f);
+    return log2(PET / max(P, 1.0f));
+}
+
+/** Stage T5c: the desert's share (bare dry ground, VoxelLandClimateAt's) at a cell and height (m),
+ *  without the breakup or the slope's facing: what the land chain places its dunes by. */
+VOXEL_FUNC float VoxelLandClimateDesertOf(FVoxelLandClimateCell Cell, float LapseRate, float ElevationM)
+{
+    const float T = Cell.SeaTemperature - LapseRate * max(ElevationM, 0.0f) * 0.001f;
+    const float Aridity = VoxelLandClimateAridity(T, max(Cell.Seasonality, 0.0f), max(Cell.Precipitation, 0.0f));
+    return VoxelLandClimateRamp(VOXEL_LAND_CLIMATE_DESERT_START, VOXEL_LAND_CLIMATE_DESERT_END, Aridity);
+}
+
+/** Stage T5d: how far (C) the summer at a height (m) stays under the glacier's equilibrium line
+ *  (VoxelLandClimateAt's Line, Ohmura's with the tropical shift), the climate Cooling C colder:
+ *  positive where ice builds. Without the breakup or the slope's facing: what the land chain
+ *  places its glacial landforms by. Its change with the height: + LapseRate / 1000 per m. */
+VOXEL_FUNC float VoxelLandClimateGlacierMargin(FVoxelLandClimateCell Cell, float LapseRate, float ElevationM, float Cooling)
+{
+    const float Swing = max(Cell.Seasonality, 0.0f);
+    const float Summer = Cell.SeaTemperature - LapseRate * max(ElevationM, 0.0f) * 0.001f + Swing - Cooling;
+    const float Line = VoxelLandClimateEquilibriumSummer(max(Cell.Precipitation, 0.0f))
+        - VOXEL_LAND_CLIMATE_ELA_TROPICAL_SHIFT * (1.0f - saturate(Swing / VOXEL_LAND_CLIMATE_ELA_SEASONAL_SWING));
+    return Line - Summer;
+}
+
+/** T5e: the ice shelf's share of a point at ElevationM (m about the sea; the bake's in the chain)
+ *  from its cell (the map's w within the shelf's reach, VoxelLandShelf.h: the terrain's shelf lies
+ *  there, raised in the bake), and its slope in the elevation (per m). */
+struct FVoxelLandClimateShelf
+{
+    float Share;
+    float Slope;
+};
+
+VOXEL_FUNC FVoxelLandClimateShelf VoxelLandClimateShelfOf(FVoxelLandClimateCell Cell, float ElevationM)
+{
+    FVoxelLandClimateShelf Out;
+    const float Zone = saturate(-Cell.Continentality);
+    const float Low = VoxelLandClimateRamp(VOXEL_LAND_CLIMATE_SHELF_LOW_START, VOXEL_LAND_CLIMATE_SHELF_LOW_END, ElevationM);
+    const float High = 1.0f - VoxelLandClimateRamp(VOXEL_LAND_CLIMATE_SHELF_HIGH_START, VOXEL_LAND_CLIMATE_SHELF_HIGH_END, ElevationM);
+    Out.Share = Zone * Low * High;
+    // (The ramps' slopes: 6 t (1 - t) over their widths.)
+    const float TL = saturate((ElevationM - VOXEL_LAND_CLIMATE_SHELF_LOW_START) / (VOXEL_LAND_CLIMATE_SHELF_LOW_END - VOXEL_LAND_CLIMATE_SHELF_LOW_START));
+    const float TH = saturate((ElevationM - VOXEL_LAND_CLIMATE_SHELF_HIGH_START) / (VOXEL_LAND_CLIMATE_SHELF_HIGH_END - VOXEL_LAND_CLIMATE_SHELF_HIGH_START));
+    const float SlopeL = 6.0f * TL * (1.0f - TL) / (VOXEL_LAND_CLIMATE_SHELF_LOW_END - VOXEL_LAND_CLIMATE_SHELF_LOW_START);
+    const float SlopeH = 6.0f * TH * (1.0f - TH) / (VOXEL_LAND_CLIMATE_SHELF_HIGH_END - VOXEL_LAND_CLIMATE_SHELF_HIGH_START);
+    Out.Slope = Zone * (SlopeL * High - Low * SlopeH);
+    return Out;
+}
+
+/** The climate at a point: its cell, the look, its planet-frame position (m; for the breakup),
+ *  its up (the unit radial direction) and surface normal (planet frame, unit), and its height
+ *  above sea level (m). */
+VOXEL_FUNC FVoxelLandClimatePoint VoxelLandClimateAt(FVoxelLandClimateCell Cell, FVoxelLandClimateLook Look, float3 PositionM, float3 Up,
+    float3 Normal, float ElevationM)
+{
+    FVoxelLandClimatePoint Out;
+
+    // The slope's facing toward the equator (the sun's side), -1..1 times the slope's sine; none
+    // at the equator, full beyond 30 degrees of latitude.
+    const float Z = clamp(Up.z, -1.0f, 1.0f);
+    const float3 North = float3(0.0f, 0.0f, 1.0f) - Up * Z;
+    const float NorthLength = length(North);
+    const float3 Flat = Normal - Up * dot(Normal, Up);
+    float Facing = 0.0f;
+    if (NorthLength > 1.0e-4f)
+    {
+        const float Hemisphere = Z >= 0.0f ? 1.0f : -1.0f;
+        Facing = -Hemisphere * dot(Flat, North) / NorthLength * saturate(abs(Z) * 2.0f);
+    }
+
+    Out.Breakup = VoxelLandClimateBreakup(PositionM, Look.BreakupAmplitude, Look.BreakupScale);
+    Out.Temperature = Cell.SeaTemperature - Look.LapseRate * max(ElevationM, 0.0f) * 0.001f + Look.AspectWarming * Facing + Out.Breakup;
+    const float Swing = max(Cell.Seasonality, 0.0f);
+    Out.Summer = Out.Temperature + Swing;
+    // The season by hemisphere (T5d3 fix: the south's is the north's opposite), smoothly through the
+    // tropics, where the swing is small.
+    const float SeasonSign = clamp(Z * 10.0f, -1.0f, 1.0f);
+    Out.Now = Out.Temperature + Swing * cos(3.14159265f * saturate(Look.Season)) * SeasonSign;
+    Out.Precipitation = max(Cell.Precipitation, 0.0f);
+
+    // Holdridge's PET ratio.
+    Out.Aridity = VoxelLandClimateAridity(Out.Temperature, Swing, Out.Precipitation);
+
+    // Snow and ice by Ohmura's line, over SnowWidth either side; the season's snow needs some
+    // precipitation (a cold desert's winter stays bare).
+    const float Line = VoxelLandClimateEquilibriumSummer(Out.Precipitation)
+        - VOXEL_LAND_CLIMATE_ELA_TROPICAL_SHIFT * (1.0f - saturate(Swing / VOXEL_LAND_CLIMATE_ELA_SEASONAL_SWING));
+    const float Width = max(Look.SnowWidth, 0.05f);
+    const float Glacier = 1.0f - VoxelLandClimateRamp(Line - Width, Line + Width, Out.Summer);
+    const float Seasonal = (1.0f - VoxelLandClimateRamp(Line - Width, Line + Width, Out.Now))
+        * VoxelLandClimateRamp(VOXEL_LAND_CLIMATE_SNOW_DRY, VOXEL_LAND_CLIMATE_SNOW_WET, Out.Precipitation);
+    const float Slope = dot(Normal, Up);
+    Out.Glacier = Glacier * VoxelLandClimateRamp(VOXEL_LAND_CLIMATE_ICE_SLOPE_NONE, VOXEL_LAND_CLIMATE_ICE_SLOPE_FULL, Slope);
+    Out.Snow = max(Glacier, Seasonal) * VoxelLandClimateRamp(VOXEL_LAND_CLIMATE_SNOW_SLOPE_NONE, VOXEL_LAND_CLIMATE_SNOW_SLOPE_FULL, Slope);
+
+    Out.Desert = VoxelLandClimateRamp(VOXEL_LAND_CLIMATE_DESERT_START, VOXEL_LAND_CLIMATE_DESERT_END, Out.Aridity);
+    Out.Vegetation = (1.0f - VoxelLandClimateRamp(VOXEL_LAND_CLIMATE_GREEN_WET, VOXEL_LAND_CLIMATE_GREEN_DRY, Out.Aridity))
+        * VoxelLandClimateRamp(VOXEL_LAND_CLIMATE_GREEN_COLD, VOXEL_LAND_CLIMATE_GREEN_WARM, Out.Summer);
+    // T5e: the ice shelf, snow-covered (its steep faces bare, as the snow's).
+    const float Shelf = VoxelLandClimateShelfOf(Cell, ElevationM).Share
+        * VoxelLandClimateRamp(VOXEL_LAND_CLIMATE_SNOW_SLOPE_NONE, VOXEL_LAND_CLIMATE_SNOW_SLOPE_FULL, Slope);
+    Out.Snow = max(Out.Snow, Shelf);
+    Out.Desert *= 1.0f - Shelf;
+    Out.Vegetation *= 1.0f - Shelf;
+    return Out;
+}
+
+/** The four texels a unit planet-frame direction reads in the climate map, and its weights:
+ *  bilinear, wrapping in longitude, clamped at the poles' rows. */
+struct FVoxelLandClimateTaps
+{
+    int X0;
+    int X1;
+    int Y0;
+    int Y1;
+    float FX;
+    float FY;
+};
+
+VOXEL_FUNC FVoxelLandClimateTaps VoxelLandClimateTapsOf(float3 Dir)
+{
+    FVoxelLandClimateTaps Out;
+    float U = atan2(Dir.y, Dir.x) * 0.15915494f;
+    if (U < 0.0f) U = U + 1.0f;
+    const float X = U * float(VOXEL_LAND_CLIMATE_WIDTH) - 0.5f;
+    const float Y = (clamp(Dir.z, -1.0f, 1.0f) + 1.0f) * 0.5f * float(VOXEL_LAND_CLIMATE_HEIGHT) - 0.5f;
+    const float FX = floor(X);
+    Out.FX = X - FX;
+    Out.X0 = (int(FX) + VOXEL_LAND_CLIMATE_WIDTH) % VOXEL_LAND_CLIMATE_WIDTH;
+    Out.X1 = (Out.X0 + 1) % VOXEL_LAND_CLIMATE_WIDTH;
+    const float YC = clamp(Y, 0.0f, float(VOXEL_LAND_CLIMATE_HEIGHT - 1));
+    const float FY = floor(YC);
+    Out.Y0 = int(FY);
+    Out.Y1 = min(Out.Y0 + 1, VOXEL_LAND_CLIMATE_HEIGHT - 1);
+    Out.FY = YC - FY;
+    return Out;
+}
+
+/** A cell from four, bilinearly. */
+VOXEL_FUNC FVoxelLandClimateCell VoxelLandClimateBlend(FVoxelLandClimateCell C00, FVoxelLandClimateCell C10, FVoxelLandClimateCell C01,
+    FVoxelLandClimateCell C11, float FX, float FY)
+{
+    FVoxelLandClimateCell Out;
+    Out.SeaTemperature = lerp(lerp(C00.SeaTemperature, C10.SeaTemperature, FX), lerp(C01.SeaTemperature, C11.SeaTemperature, FX), FY);
+    Out.Precipitation = lerp(lerp(C00.Precipitation, C10.Precipitation, FX), lerp(C01.Precipitation, C11.Precipitation, FX), FY);
+    Out.Seasonality = lerp(lerp(C00.Seasonality, C10.Seasonality, FX), lerp(C01.Seasonality, C11.Seasonality, FX), FY);
+    Out.Continentality = lerp(lerp(C00.Continentality, C10.Continentality, FX), lerp(C01.Continentality, C11.Continentality, FX), FY);
+    return Out;
+}
+
+#endif // VOXEL_LAND_CLIMATE_USH

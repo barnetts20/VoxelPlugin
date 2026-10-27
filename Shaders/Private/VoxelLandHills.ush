@@ -78,6 +78,7 @@ struct FVoxelLandHills
     float3 Steer;        // the two coarsest octaves' share of Gradient (m/m): what steers the gullies
     float Curve;
     float Lambda;        // the coarsest octave's wavelength (m)
+    float Dune;          // T5c: the dunes' share (0..1: the gullies and the detail give way to the sand)
 };
 
 /** The soft |n| and its derivative in n. */
@@ -137,6 +138,7 @@ VOXEL_FUNC FVoxelLandHills VoxelLandHillsDF(VOXEL_LAND_ARGS_DECL float2 PX, floa
     Out.Steer = float3(0.0f, 0.0f, 0.0f);
     Out.Curve = 0.0f;
     Out.Lambda = 0.0f;
+    Out.Dune = 0.0f;
     if (LandHillRelief <= 0.0f || LandHillOctaves == 0u || LandHasForm == 0u) return Out;
     Out.AmplitudeM = VoxelLandHillAmplitude(VOXEL_LAND_ARGS Form.x, Flow, Bake);
     if (Out.AmplitudeM <= 0.0f) return Out;

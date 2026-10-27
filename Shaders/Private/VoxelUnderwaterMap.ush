@@ -6,8 +6,8 @@
 // the march reads it.
 //
 // THE MAP: VOXEL_UNDERWATER_MAP_LEVELS nested square grids of VOXEL_UNDERWATER_MAP_SIZE^2
-// points, each level's texel 4 times the last's from 2 cm (2 cm, 8 cm, 32 cm, 1.28 m, 5.12 m:
-// from 5 m to 1.3 km across; the texels come with the anchors, VoxelUnderwaterMap.h, which also
+// points, each level's texel 4 times the last's from 4 cm (4 cm, 16 cm, 64 cm, 2.56 m, 10.24 m:
+// from 10 m to 2.6 km across; T5d3: from 2 cm before, the finest level only 5 m across; the texels come with the anchors, VoxelUnderwaterMap.h, which also
 // sets the two sizes here through the shader's compile environment). A level lies in the plane
 // tangent to the sphere at its anchor, a sphere point next to the camera's radial, snapped to
 // about the level's texel on the camera's cube face (VoxelUnderwaterMap.h). Its point (i, j) is
@@ -162,14 +162,21 @@ VOXEL_FUNC float VoxelUnderwaterMapFoam(float3 Foot)
 // where it lands (atomics), from a margin past the grid's edge too so the edge keeps its light;
 // UnderwaterCausticBlurXCS and YCS blur each slice by a tent growing with its path (the sun's size,
 // and where the beam spreads the sources thin) and store the light against the beam's own (1: none focused; the bright network where the beam's
-// sheets fold, the dark cells between). Light is only moved, never made: the mean stays 1. The
-// first VOXEL_UNDERWATER_CAUSTIC_LEVELS levels have it (2 cm, 8 cm, 32 cm: to 40 m from the camera),
-// a texture array of Levels x Slices layers. Paths are along the beam: a point's depth over the
+// sheets fold, the dark cells between). Light is only moved, never made: the mean stays 1. A
+// texture array of Levels x Slices layers. Paths are along the beam: a point's depth over the
 // refracted sun's cosine; above the first slice the light goes to 1 at the surface, past the last
 // to 1 by twice its path (the beam's own blur, and the waves' scales overlapping).
-// The includer defines VOXEL_UNDERWATER_CAUSTIC_SAMPLE(Layer, UV) (float, bilinear) first.
+// T5d3: the caustics have grids of their own (VoxelUnderwaterMap.h MakeCausticLevels: 4 cm, 16 cm,
+// 64 cm and 2.56 m texels, 10 m to 655 m across), round the sea point the sun lights the bed under
+// the camera through, not the surface map's first levels round the camera's foot (the bed's
+// caustics come from the surface up-sun of it: the finest level sharpened the bed beside the
+// camera).
+// The includer defines VOXEL_UNDERWATER_CAUSTIC_SAMPLE(Layer, UV) (float, bilinear) and the grids
+// (VOXEL_UNDERWATER_CAUSTIC_ANCHOR, _TEXEL, _E1, _E2 of a level) first.
 #define VOXEL_UNDERWATER_CAUSTIC_SLICES 8
-#define VOXEL_UNDERWATER_CAUSTIC_LEVELS 3
+#ifndef VOXEL_UNDERWATER_CAUSTIC_LEVELS
+#define VOXEL_UNDERWATER_CAUSTIC_LEVELS 4
+#endif
 #define VOXEL_UNDERWATER_CAUSTIC_FIRST 0.5f
 #define VOXEL_UNDERWATER_CAUSTIC_RATIO 1.6f
 
@@ -204,7 +211,8 @@ VOXEL_FUNC float VoxelUnderwaterMapCaustic(float3 Foot, float L)
     VOXEL_LOOP
     for (int Level = 0; Level < VOXEL_UNDERWATER_CAUSTIC_LEVELS; Level++)
     {
-        const float2 P = VOXEL_UNDERWATER_MAP_COORDS(Level, Foot);
+        const float2 P = VoxelUnderwaterMapCoords(VOXEL_UNDERWATER_CAUSTIC_ANCHOR(Level), VOXEL_UNDERWATER_CAUSTIC_TEXEL(Level),
+            VOXEL_UNDERWATER_CAUSTIC_E1(Level), VOXEL_UNDERWATER_CAUSTIC_E2(Level), Foot);
         const float Cover = VoxelUnderwaterMapCover(P);
         if (Cover <= 0.0f) continue;
         C += Rest * Cover * VoxelUnderwaterCausticLevel(Level, P, L);

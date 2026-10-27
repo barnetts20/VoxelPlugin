@@ -19,6 +19,7 @@
 #include "VoxelDensity.h"
 #include "VoxelLandSettings.h"
 #include "VoxelOceanSettings.h"
+#include "VoxelLandClimate.h"
 #include "PooledActor.h"
 #include "SeededAtmosphereActor.h"
 #include "PlanetActor.generated.h"
@@ -28,6 +29,16 @@ class FVoxelLandBaker;
 struct FVoxelLandBake;
 class UVoxelOceanProfile;
 struct FVoxelLandNoiseSet;
+struct FVoxelLandClimateField;
+class UTexture2DDynamic;
+
+/** Stage T5b: where the planet's climate capture stands (APlanetActor::UpdateClimateCapture). */
+enum class EVoxelPlanetClimateCapture : uint8
+{
+    None,       // nothing captured for the current bake and atmosphere
+    Waiting,    // the atmosphere spins up for its snapshot
+    Captured,   // the snapshot (or the provisional model) is kept for this seed
+};
 
 /** Stage A11: the climate at a point (APlanetActor::GetClimateAt), from the atmosphere's sim
  *  (its long-run means) and the planet's own latitude and ground. */
@@ -61,6 +72,39 @@ struct VOXELPLUGIN_API FVoxelPlanetClimate
      *  latitude's and the ground's alone). */
     UPROPERTY(BlueprintReadOnly, Category = "Planet|Climate")
     bool bFromSim = false;
+
+    /** Stage T5a: true when the land's climate (APlanetActor::LandClimate) gave the values below,
+     *  and the temperature (then the terrain material's own, breakup included). */
+    UPROPERTY(BlueprintReadOnly, Category = "Planet|Climate")
+    bool bFromLandClimate = false;
+
+    /** Stage T5a: the summer's mean temperature (degrees C). */
+    UPROPERTY(BlueprintReadOnly, Category = "Planet|Climate")
+    float SummerTemperature = 0.0f;
+
+    /** Stage T5a: the precipitation in mm a year (the land climate's calibration of the sim's, or
+     *  its provisional model's). */
+    UPROPERTY(BlueprintReadOnly, Category = "Planet|Climate")
+    float PrecipitationMm = 0.0f;
+
+    /** Stage T5a: the aridity, log2 of Holdridge's PET ratio (below 0 humid, 1 semi-arid, 2 arid,
+     *  3 per-arid). */
+    UPROPERTY(BlueprintReadOnly, Category = "Planet|Climate")
+    float Aridity = 0.0f;
+
+    /** Stage T5a: the cover the terrain material shows there (0 to 1 each): snow lying in the
+     *  season, glacier ice, bare desert, plant cover. */
+    UPROPERTY(BlueprintReadOnly, Category = "Planet|Climate")
+    float Snow = 0.0f;
+
+    UPROPERTY(BlueprintReadOnly, Category = "Planet|Climate")
+    float Glacier = 0.0f;
+
+    UPROPERTY(BlueprintReadOnly, Category = "Planet|Climate")
+    float Desert = 0.0f;
+
+    UPROPERTY(BlueprintReadOnly, Category = "Planet|Climate")
+    float Vegetation = 0.0f;
 };
 
 /** Top-level planet actor that spawns and coordinates terrain, ocean, atmosphere and
@@ -205,12 +249,18 @@ public:
     // --- Climate (stage A11: GetClimateAt) ---
 
     /** The mean temperature at the equator and at the poles at sea level (degrees C), between
-     *  them as sin^2 of the latitude (Earth's annual means: about 27 and -25). */
+     *  them as |sin(latitude)|^ClimateLatitudeExponent (Earth's annual means: about 27 and -25). */
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Planet|Climate")
     float ClimateEquatorTemperature = 27.0f;
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Planet|Climate")
     float ClimatePoleTemperature = -25.0f;
+
+    /** Stage T5a: the latitude profile's exponent. 4 follows Earth's zonal annual means (about
+     *  14 C at 45 degrees, -2 at 60, -18 at 75, with 27 and -25); 2 is stage A11's sin^2 (1 C at
+     *  45 degrees: too cold at mid-latitudes). Lower: a colder planet away from the equator. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Planet|Climate", meta = (ClampMin = "0.5", UIMax = "8.0"))
+    float ClimateLatitudeExponent = 4.0f;
 
     /** How fast the temperature falls with the ground's height (degrees C per km). */
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Planet|Climate", meta = (ClampMin = "0.0", UIMax = "12.0"))
@@ -220,6 +270,17 @@ public:
      *  mean, about -0.1 to 0.1): the weather's standing warm ridges and cold troughs. */
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Planet|Climate", meta = (ClampMin = "0.0", UIMax = "200.0"))
     float ClimateWarmthScale = 60.0f;
+
+    /** Stage T5a: the land's climate (Design/LandClimate.md): a map from the atmosphere's sim (a
+     *  provisional model until its means settle) that the terrain material's climate node
+     *  (VoxelLandClimateMaterial.ush) shows as snow, glacier ice, desert and plant cover, with
+     *  the pixel's own height and slope. Terrestrial planets. Applies in place. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Planet|Climate")
+    FVoxelLandClimateSettings LandClimate;
+
+    /** Stage T5a: where the land's climate stands (provisional, refining from the sim, settled). */
+    UPROPERTY(VisibleInstanceOnly, Transient, BlueprintReadOnly, Category = "Planet|Climate")
+    FString LandClimateStatus;
 
     // --- Gravity ---
 
@@ -257,8 +318,9 @@ public:
     UFUNCTION(BlueprintCallable, Category = "Planet")
     float GetBakeProgress() const;
 
-    /** The terrestrial bake the planet is built with (null for the noise surface). */
-    TSharedPtr<const FVoxelLandBake, ESPMode::ThreadSafe> GetLandBake() const { return LandBake; }
+    /** The terrestrial bake the planet is built with (null for the noise surface): T5e, with the
+     *  ice shelf when it has one. */
+    TSharedPtr<const FVoxelLandBake, ESPMode::ThreadSafe> GetLandBake() const { return TerrainBake(); }
 
     /** Rebuilds the compositor and every child on the next Tick (a child's structural
      *  setting changed, e.g. the terrain's TargetPrecision). */
@@ -293,9 +355,22 @@ public:
 
     /** Stage A11: the climate at a world location (its direction from the planet's centre): the
      *  atmosphere's sim's long-run means there (GetClimateMap), the latitude's temperature, the
-     *  ground's height (the land bake's). Game thread. */
+     *  ground's height (the land bake's). Stage T5a: with the land's climate, its values on flat
+     *  ground at the bake's height there (GetSurfaceClimateAt has the point's own). Game thread. */
     UFUNCTION(BlueprintCallable, Category = "Planet|Climate")
     FVoxelPlanetClimate GetClimateAt(const FVector& WorldLocation) const;
+
+    /** Stage T5a: the climate at a point on the surface with its normal (world), as the terrain
+     *  material computes it there (the point's own height, slope, facing and breakup): snow
+     *  underfoot, sand, plants. Game thread. */
+    UFUNCTION(BlueprintCallable, Category = "Planet|Climate")
+    FVoxelPlanetClimate GetSurfaceClimateAt(const FVector& WorldLocation, const FVector& SurfaceNormal) const;
+
+    /** Stage T5b: captures the climate again: the atmosphere's sim restarts, spins up and gives a
+     *  new snapshot (the climate shown stays until it lands). For authoring; a seed change does it
+     *  by itself. */
+    UFUNCTION(CallInEditor, BlueprintCallable, Category = "Planet|Climate")
+    void RecaptureClimate();
 
     /** Stage A11: the atmosphere's latest climate map (null until its sim has given one; the
      *  last one stays while another planet drives the sim). */
@@ -385,6 +460,82 @@ private:
     /** Stage A9: the bake and terrain height the atmosphere's surface map was made from (0: none). */
     uint32 LastSurfaceMapKey = 0;
 
+    // --- Stage T5a: the land's climate (TickLandClimate) ---
+
+    /** The land's share and the distance to the sea on the climate map's grid, for the bake
+     *  ClimateBaseKey names (0: none). */
+    TArray<float> ClimateLand;
+    TArray<float> ClimateCoast;
+    TArray<float> ClimateHeight;   // T5d2: the land's mean height a cell (m), for the sim's warmth
+    uint32 ClimateBaseKey = 0;
+    /** The sim's climate snapshot the land is built from (null: the provisional model). */
+    TSharedPtr<const struct FAtmosphereClimateMap, ESPMode::ThreadSafe> ClimateSim;
+    /** Stage T5b: the capture: what it is for (the bake, the atmosphere, the source), where it
+     *  stands, and when it began (a snapshot requested before is an earlier sim's). */
+    uint32 ClimateCaptureKey = 0;
+    EVoxelPlanetClimateCapture ClimateCaptureState = EVoxelPlanetClimateCapture::None;
+    double ClimateCaptureStart = 0.0;
+    /** The wait's clocks: when the sim last stepped (and its step count then), and since when
+     *  another planet has driven it (0: not). */
+    double ClimateProgressTime = 0.0;
+    int64 ClimateProgressSteps = -1;
+    double ClimateOtherOwnerSince = 0.0;
+    /** The map shown (the texture's), and while a new one fades in, the old one and the new. */
+    FVoxelLandClimateMap ClimateShown;
+    TArray<FVector4f> ClimateFrom;
+    FVoxelLandClimateMap ClimateTarget;
+    float ClimateFade = 1.0f;
+    double ClimateUploadTime = 0.0;
+    bool bClimateFromSim = false;
+    /** The settings the shown map was made with (LandClimateMapHash). */
+    uint32 ClimateMapHash = 0;
+    /** Stage T5c: the land chain's climate (the target map and the sand's drift: the dunes are
+     *  placed by it), and the hash of the one the terrain was built with (0: none). A new capture
+     *  or new map settings after the build rebuild the terrain once (the shown map's fade doesn't:
+     *  the field is the target's). */
+    TSharedPtr<const FVoxelLandClimateField, ESPMode::ThreadSafe> LandClimateField;
+    uint32 LandClimateFieldBuilt = 0;
+    /** T5e: the climate base (ClimateBaseKey) LandClimateField was made on: the ice shelf is placed
+     *  only by a field made for the current bake. */
+    uint32 LandClimateFieldBaseKey = 0;
+    /** The climate base's key for the current bake (EnsureLandClimateBase's; 0 without a bake). */
+    uint32 CurrentClimateBaseKey() const;
+    /** The parameters last given to the terrain (SetLandClimate). */
+    FLinearColor ClimateParamsSent = FLinearColor(-1.0f, 0.0f, 0.0f, 0.0f);
+    FLinearColor ClimateShapeSent = FLinearColor(-1.0f, 0.0f, 0.0f, 0.0f);
+    FLinearColor ClimateTintSent = FLinearColor(-1.0f, 0.0f, 0.0f, 0.0f);
+    TWeakObjectPtr<UTexture2DDynamic> ClimateTextureSent;
+    TWeakObjectPtr<AAdaptiveVoxelActor> ClimateTerrainSent;
+
+    UPROPERTY(Transient)
+    TObjectPtr<UTexture2DDynamic> LandClimateTexture;
+
+    /** Every tick once built: the capture (a change after the build), the fade, the texture and
+     *  the terrain's parameters. */
+    void TickLandClimate(float DeltaTime);
+    /** Stage T5b: the climate capture for the current bake and atmosphere: begins it (the
+     *  atmosphere configured and its sim restarted), takes the snapshot when it lands, or the
+     *  provisional model when none can come. True once captured (the build may go on). */
+    bool UpdateClimateCapture();
+    /** The land's share and the distance to the sea for the bake (false without one). */
+    bool EnsureLandClimateBase();
+    /** The map for the capture, faded in over the shown one. */
+    void RebuildLandClimateTarget();
+    void UploadLandClimate();
+    /** What the map depends on (the settings' map hash and the planet's latitude curve and warmth). */
+    uint32 LandClimateMapHash() const;
+    /** Stage T5c, T5d: the climate the terrain's dunes and glacial layer are placed by (null: none:
+     *  the climate off, not captured yet, or the pack has neither set), and its hash (0 for none). */
+    TSharedPtr<const FVoxelLandClimateField, ESPMode::ThreadSafe> DuneClimate() const;
+    /** Stage T5d2: whether the land chain's climate was made for other settings (the lapse rate,
+     *  the ice sheets on or off). */
+    bool IsLandClimateFieldStale() const;
+    uint32 DuneClimateHash() const;
+    /** The land climate's point (VoxelLandClimate::PointAt) at a planet-frame point (m). */
+    FVoxelLandClimatePointResult LandClimatePointAt(const FVector& LocalM, const FVector& NormalLocal) const;
+    /** The A11 climate filled in, and the land climate's at LocalM with NormalLocal if it's there. */
+    FVoxelPlanetClimate ClimateAtLocal(const FVector& Dir, const FVector* SurfaceLocalM, const FVector& NormalLocal) const;
+
     bool bInitialized = false;
 
     /** A slider is still moving (editor): construction doesn't flag rebuilds until release. */
@@ -407,6 +558,19 @@ private:
     /** The terrestrial bake the planet is built with: kept while a new one is made, so the
      *  planet shows the old surface until then. */
     TSharedPtr<const FVoxelLandBake, ESPMode::ThreadSafe> LandBake;
+
+    /** Stage T5e: the bake the terrain is built with when the planet has an ice shelf (LandBake
+     *  with the shelf raised by the captured climate: VoxelLandClimate::MakeIceShelfBake), and
+     *  what it was made from. The climate and the atmosphere keep reading LandBake (the snapshot's
+     *  own ground). */
+    TSharedPtr<const FVoxelLandBake, ESPMode::ThreadSafe> ShelfBake;
+    uint32 ShelfBakeHash = 0;
+    /** Whether the planet asks for an ice shelf (a height, the land climate). */
+    bool IceShelfOn() const;
+    /** Makes ShelfBake for the current bake, climate and settings (or drops it). */
+    void UpdateIceShelf();
+    /** The terrain's bake: ShelfBake, else LandBake. */
+    TSharedPtr<const FVoxelLandBake, ESPMode::ThreadSafe> TerrainBake() const { return ShelfBake.IsValid() ? ShelfBake : LandBake; }
 
     /** The noise pack (the peaks', detail, hills' and strata's sets) for the current settings, once ready
      *  (TickLandBake): held so it is there when the density takes it (VoxelLand::TryGetLandNoise). */

@@ -2,7 +2,12 @@
 #include "PlanetGravityZone.h"
 #include "Components/DirectionalLightComponent.h"
 #include "VoxelLandBake.h"
+#include "VoxelLandClimate.h"
+#include "VoxelLandShelf.h"
+#include "VoxelLandMaterial.h"
 #include "VoxelCubeSphere.h"
+#include "Engine/Texture2DDynamic.h"
+#include "FlowSimSubsystem.h"
 #include "AtmosphereWeather.h"
 #include "VoxelOceanProfile.h"
 #include "Async/ParallelFor.h"
@@ -132,6 +137,9 @@ void APlanetActor::PostEditChangeProperty(FPropertyChangedEvent& PropertyChanged
     {
         if (!bInteractive)
         {
+            // Stage T5b: a regenerated set restarts the sim without changing the capture's key.
+            if (MemberName == GET_MEMBER_NAME_CHECKED(APlanetActor, AtmosphereSet))
+                RecaptureClimate();
             double PlanetRadius = 0.0, NoiseAmplitude = 0.0, OceanRadius = 0.0;
             ComputeShape(PlanetRadius, NoiseAmplitude, OceanRadius);
             ConfigureAtmosphere(PlanetRadius, OceanRadius, MemberName == GET_MEMBER_NAME_CHECKED(APlanetActor, AtmosphereSet));
@@ -227,6 +235,23 @@ void APlanetActor::Tick(float DeltaTime)
         // showed (nothing on the first build).
         if (Generator == EVoxelSurfaceGenerator::Terrestrial && !TickLandBake())
             return;
+        // Stage T5b: then the climate's snapshot for it (the atmosphere spins up on the new ground;
+        // the biomes it makes shape the terrain, which is built once, after it).
+        if (Generator == EVoxelSurfaceGenerator::Terrestrial && LandClimate.bWaitForClimate && !UpdateClimateCapture())
+            return;
+        // Stage T5d2: the land chain's climate for the settings the build has (the lapse rate, the
+        // ice sheets on or off), so a settings change rebuilds once, not again when the climate
+        // catches up.
+        // T5e: and the map's own settings (the ice shelf's share is in it), so a change to them
+        // rebuilds once.
+        // (Only on the current bake's base: after a new bake the capture makes the map, else a map
+        // of the old planet's climate would place the shelf for one build.)
+        if (Generator == EVoxelSurfaceGenerator::Terrestrial && (IsLandClimateFieldStale()
+            || (LandClimateField.IsValid() && ClimateMapHash != LandClimateMapHash() && ClimateBaseKey == CurrentClimateBaseKey())))
+            RebuildLandClimateTarget();
+        // T5e: the ice shelf in the terrain's bake, by the climate captured.
+        if (Generator == EVoxelSurfaceGenerator::Terrestrial)
+            UpdateIceShelf();
         bPendingInitialize = false;
         bPendingOceanUpdate = false;
         Initialize();
@@ -257,6 +282,23 @@ void APlanetActor::Tick(float DeltaTime)
             TerrainActor->SetDebugSeaRadius(OceanRadius);
         ConfigureGravity(PlanetRadius, OceanRadius);
         RecordAppliedState();
+    }
+
+    // Stage T5a: the land's climate (its map from the sim as it qualifies, the fade, the terrain's
+    // climate node).
+    TickLandClimate(DeltaTime);
+
+    // Stage T5c: the terrain's dunes follow the climate captured for the seed. A capture that
+    // lands after the build (bWaitForClimate off, or a recapture: a new atmosphere seed, new map
+    // settings), or the climate turned off, rebuilds the terrain once; the shown map's fade and
+    // the seasons don't.
+    // Not while a capture is under way: the provisional map shown meanwhile would rebuild the
+    // terrain once for nothing (turning the climate off resets the capture, so that still rebuilds).
+    if (bInitialized && !bPendingInitialize && TerrainActor && Generator == EVoxelSurfaceGenerator::Terrestrial && LandBake.IsValid()
+        && ClimateCaptureState != EVoxelPlanetClimateCapture::Waiting && DuneClimateHash() != LandClimateFieldBuilt)
+    {
+        UE_LOG(LogVoxelPlugin, Log, TEXT("[Planet] %s: the climate the dunes are placed by changed; rebuilding the terrain."), *GetName());
+        bPendingInitialize = true;
     }
 }
 
@@ -316,8 +358,8 @@ void APlanetActor::ComputeShape(double& OutPlanetRadius, double& OutNoiseAmplitu
     if (Generator == EVoxelSurfaceGenerator::Terrestrial && LandBake.IsValid())
     {
         // Heights about sea level, the actor's radius; the lattice spans the bake's range,
-        // within the NoiseAmplitudeRatio ceiling.
-        VoxelLand::ShapeFor(TerrestrialSettings, *LandBake, LandNoise.Get(), OutPlanetRadius, OutNoiseAmplitude);
+        // within the NoiseAmplitudeRatio ceiling (T5e: the terrain's, with the ice shelf).
+        VoxelLand::ShapeFor(TerrestrialSettings, *TerrainBake(), LandNoise.Get(), OutPlanetRadius, OutNoiseAmplitude);
         const double Ceiling = Radius * NoiseAmplitudeRatio;
         if (OutNoiseAmplitude > Ceiling)
         {
@@ -346,6 +388,8 @@ void APlanetActor::Initialize()
     {
         // The noise surface needs no bake: release one a terrestrial build left.
         LandBake.Reset();
+        ShelfBake.Reset();
+        ShelfBakeHash = 0;
         LandBaker.Reset();
         LandNoise.Reset();
     }
@@ -532,15 +576,32 @@ TSharedPtr<const FAtmosphereClimateMap, ESPMode::ThreadSafe> APlanetActor::GetCl
 
 FVoxelPlanetClimate APlanetActor::GetClimateAt(const FVector& WorldLocation) const
 {
-    FVoxelPlanetClimate Out;
     // The planet-local direction (the frame the bake and the atmosphere's sim share).
     const FTransform Frame = PlanetRoot ? PlanetRoot->GetComponentTransform() : GetActorTransform();
     const FVector Dir = Frame.InverseTransformVectorNoScale(WorldLocation - Frame.GetLocation()).GetSafeNormal();
-    if (Dir.IsNearlyZero()) return Out;
-    if (Generator == EVoxelSurfaceGenerator::Terrestrial && LandBake.IsValid() && LandBake->Height.Num() == LandBake->NumCells())
-        Out.Elevation = FMath::Max(LandBake->Height[VoxelPlanetClimate::BakeCellOf(*LandBake, Dir)], 0.0f);
-    const double Sin2 = FMath::Square(FMath::Clamp(Dir.Z, -1.0, 1.0));
-    float Temperature = (float)(ClimateEquatorTemperature + (ClimatePoleTemperature - ClimateEquatorTemperature) * Sin2)
+    if (Dir.IsNearlyZero()) return FVoxelPlanetClimate();
+    return ClimateAtLocal(Dir, nullptr, FVector::ZeroVector);
+}
+
+FVoxelPlanetClimate APlanetActor::GetSurfaceClimateAt(const FVector& WorldLocation, const FVector& SurfaceNormal) const
+{
+    const FTransform Frame = PlanetRoot ? PlanetRoot->GetComponentTransform() : GetActorTransform();
+    const FVector LocalM = Frame.InverseTransformVectorNoScale(WorldLocation - Frame.GetLocation()) * 0.01;
+    const FVector Dir = LocalM.GetSafeNormal();
+    if (Dir.IsNearlyZero()) return FVoxelPlanetClimate();
+    const FVector Normal = Frame.InverseTransformVectorNoScale(SurfaceNormal).GetSafeNormal();
+    return ClimateAtLocal(Dir, &LocalM, Normal);
+}
+
+FVoxelPlanetClimate APlanetActor::ClimateAtLocal(const FVector& Dir, const FVector* SurfaceLocalM, const FVector& NormalLocal) const
+{
+    FVoxelPlanetClimate Out;
+    const TSharedPtr<const FVoxelLandBake, ESPMode::ThreadSafe> Ground = TerrainBake();
+    if (Generator == EVoxelSurfaceGenerator::Terrestrial && Ground.IsValid() && Ground->Height.Num() == Ground->NumCells())
+        Out.Elevation = FMath::Max(Ground->Height[VoxelPlanetClimate::BakeCellOf(*Ground, Dir)], 0.0f);
+    // The latitude's profile (stage T5a: |sin(latitude)|^ClimateLatitudeExponent; A11's sin^2 at 2).
+    const double Profile = FMath::Pow(FMath::Abs(FMath::Clamp(Dir.Z, -1.0, 1.0)), (double)FMath::Max(ClimateLatitudeExponent, 0.1f));
+    float Temperature = (float)(ClimateEquatorTemperature + (ClimatePoleTemperature - ClimateEquatorTemperature) * Profile)
         - ClimateLapseRate * Out.Elevation * 0.001f;
     if (const TSharedPtr<const FAtmosphereClimateMap, ESPMode::ThreadSafe> Map = GetClimateMap(); Map.IsValid())
     {
@@ -552,19 +613,50 @@ FVoxelPlanetClimate APlanetActor::GetClimateAt(const FVector& WorldLocation) con
         Out.bFromSim = true;
     }
     Out.Temperature = Temperature;
+    // Stage T5a: the land's climate there, as the terrain material has it: on flat ground at the
+    // bake's height, or at the surface point given.
+    if (ClimateShown.IsValid())
+    {
+        const double SeaRadiusM = GetActorScale3D().GetMax() * 0.01;
+        const FVector LocalM = SurfaceLocalM ? *SurfaceLocalM : Dir * (SeaRadiusM + Out.Elevation);
+        const FVoxelLandClimatePointResult P = LandClimatePointAt(LocalM, SurfaceLocalM ? NormalLocal : Dir);
+        Out.bFromLandClimate = true;
+        Out.Temperature = P.Temperature;
+        Out.SummerTemperature = P.Summer;
+        Out.PrecipitationMm = P.Precipitation;
+        Out.Aridity = P.Aridity;
+        Out.Snow = P.Snow;
+        Out.Glacier = P.Glacier;
+        Out.Desert = P.Desert;
+        Out.Vegetation = P.Vegetation;
+    }
     return Out;
+}
+
+FVoxelLandClimatePointResult APlanetActor::LandClimatePointAt(const FVector& LocalM, const FVector& NormalLocal) const
+{
+    return VoxelLandClimate::PointAt(ClimateShown, LandClimate, ClimateLapseRate, LocalM, NormalLocal, GetActorScale3D().GetMax() * 0.01);
 }
 
 void APlanetActor::LogClimate()
 {
     const TSharedPtr<const FAtmosphereClimateMap, ESPMode::ThreadSafe> Map = GetClimateMap();
-    if (!Map.IsValid())
+    if (!LandClimateStatus.IsEmpty())
+        UE_LOG(LogVoxelPlugin, Log, TEXT("[Planet] %s land climate: %s"), *GetName(), *LandClimateStatus);
+    if (!Map.IsValid() && !ClimateShown.IsValid())
     {
         UE_LOG(LogVoxelPlugin, Log, TEXT("[Planet] %s: no climate yet (the atmosphere's sim gives one every ClimateReadbackSeconds while this planet drives it)."), *GetName());
         return;
     }
     // A grid even in area (longitude x sin(latitude)), land and sea apart by the bake's sea.
-    struct FStats { double N = 0, T = 0, P = 0, H = 0, C = 0; float TMin = 1e9f, TMax = -1e9f, PMin = 1e9f, PMax = -1e9f; };
+    struct FStats
+    {
+        double N = 0, T = 0, P = 0, H = 0, C = 0;
+        float TMin = 1e9f, TMax = -1e9f, PMin = 1e9f, PMax = -1e9f;
+        // Stage T5a: the land climate's (mm a year; the cover's shares above a half).
+        double Mm = 0, Snow = 0, Glacier = 0, Desert = 0, Plants = 0;
+        TArray<float> MmAll;
+    };
     FStats Land, Sea;
     const FTransform Frame = PlanetRoot ? PlanetRoot->GetComponentTransform() : GetActorTransform();
     const bool bBake = Generator == EVoxelSurfaceGenerator::Terrestrial && LandBake.IsValid() && LandBake->Attr.Num() == LandBake->NumCells();
@@ -583,8 +675,26 @@ void APlanetActor::LogClimate()
             S.N += 1.0; S.T += C.Temperature; S.P += C.Precipitation; S.H += C.Humidity; S.C += C.CloudCover;
             S.TMin = FMath::Min(S.TMin, C.Temperature); S.TMax = FMath::Max(S.TMax, C.Temperature);
             S.PMin = FMath::Min(S.PMin, C.Precipitation); S.PMax = FMath::Max(S.PMax, C.Precipitation);
+            if (C.bFromLandClimate)
+            {
+                S.Mm += C.PrecipitationMm;
+                S.MmAll.Add(C.PrecipitationMm);
+                S.Snow += C.Snow > 0.5f ? 1.0 : 0.0;
+                S.Glacier += C.Glacier > 0.5f ? 1.0 : 0.0;
+                S.Desert += C.Desert > 0.5f ? 1.0 : 0.0;
+                S.Plants += C.Vegetation;
+            }
         }
     }
+    if (Land.MmAll.Num() > 0)
+    {
+        Land.MmAll.Sort();
+        const auto Pct = [&Land](double Q) { return Land.MmAll[FMath::Clamp((int32)(Q * Land.MmAll.Num()), 0, Land.MmAll.Num() - 1)]; };
+        const double N = (double)Land.MmAll.Num();
+        UE_LOG(LogVoxelPlugin, Log, TEXT("[Planet] %s land climate, land: precipitation %.0f mm (10%% %.0f, median %.0f, 90%% %.0f); snow %.0f%%, glacier %.0f%%, desert %.0f%%, plant cover %.2f (flat ground at the bake's height)."),
+            *GetName(), Land.Mm / N, Pct(0.1), Pct(0.5), Pct(0.9), 100.0 * Land.Snow / N, 100.0 * Land.Glacier / N, 100.0 * Land.Desert / N, Land.Plants / N);
+    }
+    if (!Map.IsValid()) return;
     const auto Report = [this](const TCHAR* Name, const FStats& S)
         {
             if (S.N <= 0.0) return;
@@ -594,6 +704,345 @@ void APlanetActor::LogClimate()
     Report(TEXT("land"), Land);
     Report(TEXT("sea"), Sea);
     UE_LOG(LogVoxelPlugin, Log, TEXT("[Planet] %s climate: map %u (%dx%d)."), *GetName(), (uint32)Map->Serial, Map->Width, Map->Height);
+}
+
+void APlanetActor::RecaptureClimate()
+{
+    // A new capture on the next tick (the sim restarted for it); the shown climate stays until it lands.
+    ClimateCaptureState = EVoxelPlanetClimateCapture::None;
+}
+
+uint32 APlanetActor::CurrentClimateBaseKey() const
+{
+    if (!LandBake.IsValid()) return 0u;
+    const double SeaRadiusM = GetActorScale3D().GetMax() * 0.01;
+    return HashCombine(LandBake->Key, GetTypeHash(SeaRadiusM)) | 1u;
+}
+
+bool APlanetActor::EnsureLandClimateBase()
+{
+    if (Generator != EVoxelSurfaceGenerator::Terrestrial || !LandBake.IsValid() || LandBake->Height.Num() != LandBake->NumCells())
+        return false;
+    // The base for the bake (the land's share and the distance to the sea).
+    const double SeaRadiusM = GetActorScale3D().GetMax() * 0.01;
+    const uint32 BaseKey = CurrentClimateBaseKey();
+    if (BaseKey != ClimateBaseKey || ClimateLand.Num() != VoxelLandClimate::Width() * VoxelLandClimate::Height())
+    {
+        const double StartSeconds = FPlatformTime::Seconds();
+        VoxelLandClimate::BuildBase(*LandBake, SeaRadiusM, ClimateLand, ClimateCoast, &ClimateHeight);
+        UE_LOG(LogVoxelPlugin, Log, TEXT("[Planet] %s: the land climate's base (%dx%d: the land's share, the distance to the sea) in %.0f ms."),
+            *GetName(), VoxelLandClimate::Width(), VoxelLandClimate::Height(), (FPlatformTime::Seconds() - StartSeconds) * 1000.0);
+        ClimateBaseKey = BaseKey;
+    }
+    return true;
+}
+
+bool APlanetActor::UpdateClimateCapture()
+{
+    if (!LandClimate.bEnabled || !EnsureLandClimateBase()) return true;
+
+    // ONE SNAPSHOT PER SEED (Design/LandClimate.md): what the climate is captured for, the bake and
+    // the atmosphere (seed, model, on), and how (the source). A change captures again, once.
+    const bool bSnapshot = LandClimate.Source == EVoxelLandClimateSource::Snapshot && bEnableAtmosphere;
+    uint32 Key = HashCombine(ClimateBaseKey, GetTypeHash((uint8)LandClimate.Source));
+    if (bSnapshot)
+        Key = HashCombine(Key, HashCombine(HashCombine(GetTypeHash(GetAtmosphereSeed()), GetTypeHash((uint8)AtmosphereType)),
+            GetTypeHash(AtmosphereTerrainHeight)));
+    if (Key == ClimateCaptureKey && ClimateCaptureState == EVoxelPlanetClimateCapture::Captured) return true;
+
+    const double Now = FPlatformTime::Seconds();
+    if (Key != ClimateCaptureKey || ClimateCaptureState == EVoxelPlanetClimateCapture::None)
+    {
+        ClimateCaptureKey = Key;
+        ClimateSim.Reset();
+        if (!bSnapshot)
+        {
+            ClimateCaptureState = EVoxelPlanetClimateCapture::Captured;
+            RebuildLandClimateTarget();
+            LandClimateStatus = bEnableAtmosphere ? TEXT("Provisional model (the source asks for it).") : TEXT("Provisional model (no atmosphere).");
+            return true;
+        }
+        // The atmosphere at the planet with this bake's ground (its surface map), and its sim
+        // restarted: a spin-up, the climate window, then the snapshot (CloudAtmosphere T5b). Before
+        // the first build too: the children are spawned (the terrain isn't built until the capture).
+        ClimateCaptureState = EVoxelPlanetClimateCapture::Waiting;
+        ClimateCaptureStart = Now;
+        ClimateProgressTime = Now;
+        ClimateProgressSteps = -1;
+        ClimateOtherOwnerSince = 0.0;
+        SpawnChildActors();
+        if (AtmosphereActor)
+        {
+            double PlanetRadius = 0.0, NoiseAmplitude = 0.0, OceanRadius = 0.0;
+            ComputeShape(PlanetRadius, NoiseAmplitude, OceanRadius);
+            ConfigureAtmosphere(PlanetRadius, OceanRadius);
+            AtmosphereActor->RestartSimulation();
+        }
+        // The provisional model shows until the snapshot (nothing shown yet: at once).
+        if (!ClimateShown.IsValid())
+            RebuildLandClimateTarget();
+        LandClimateStatus = TEXT("Waiting for the climate snapshot (the atmosphere spins up, then averages its climate window).");
+        UE_LOG(LogVoxelPlugin, Log, TEXT("[Planet] %s: capturing the climate (the atmosphere's spin-up and climate window)."), *GetName());
+    }
+
+    // Waiting: the first snapshot requested since the capture began (one requested before is an
+    // earlier sim's: the old ground or atmosphere).
+    // A build waiting on the capture shows its climate at once (no fade from the provisional
+    // model, or from the old seed's, over the new terrain).
+    const bool bForBuild = bPendingInitialize && LandClimate.bWaitForClimate;
+    auto ShowAtOnce = [this, bForBuild]()
+        {
+            if (!bForBuild) return;
+            ClimateShown.Cells.Empty();
+            ClimateFrom.Empty();
+            ClimateTarget.Cells.Empty();
+        };
+    const TSharedPtr<const FAtmosphereClimateMap, ESPMode::ThreadSafe> Latest = GetClimateMap();
+    if (Latest.IsValid() && Latest->bSnapshot && Latest->RequestSeconds > ClimateCaptureStart)
+    {
+        ClimateSim = Latest;
+        ClimateCaptureState = EVoxelPlanetClimateCapture::Captured;
+        ShowAtOnce();
+        RebuildLandClimateTarget();
+        LandClimateStatus = bClimateFromSim
+            ? FString::Printf(TEXT("Snapshot: the sim's climate, captured %.1f s after the request; kept for this seed."), Latest->RequestSeconds - ClimateCaptureStart)
+            : FString(TEXT("Provisional model: the sim's snapshot had no precipitation."));
+        UE_LOG(LogVoxelPlugin, Log, TEXT("[Planet] %s: %s"), *GetName(), *LandClimateStatus);
+        return true;
+    }
+    // No snapshot coming. The provisional model, kept for this seed (the terrain mustn't change
+    // later); RecaptureClimate tries again:
+    //   - this planet drives the sim but it can't give one (paused, its config's snapshot off, the
+    //     climate's read-back off): at once;
+    //   - another planet drives it (nearer the camera) for 3 s on end (not counted while no planet
+    //     does: the atmospheres bid once a view has rendered);
+    //   - the sim stopped stepping for ClimateWaitSeconds (wall time between steps, so a slow
+    //     editor frame rate doesn't run it out).
+    UWorld* World = GetWorld();
+    const UFlowSimSubsystem* Sim = World ? World->GetSubsystem<UFlowSimSubsystem>() : nullptr;
+    const bool bDriving = AtmosphereActor && AtmosphereActor->DrivesSimulation();
+    if (Sim && Sim->GetStepsCompleted() != ClimateProgressSteps)
+    {
+        ClimateProgressSteps = Sim->GetStepsCompleted();
+        ClimateProgressTime = Now;
+    }
+    const bool bOtherOwner = Sim && Sim->HasOwner() && !bDriving;
+    if (!bOtherOwner)
+        ClimateOtherOwnerSince = 0.0;
+    else if (ClimateOtherOwnerSince <= 0.0)
+        ClimateOtherOwnerSince = Now;
+    FString Reason;
+    if (bDriving && !AtmosphereActor->CanProvideClimateSnapshot())
+        Reason = TEXT("the sim can't give one (paused, its config's bClimateSnapshot off, or the atmosphere's ClimateReadbackSeconds 0)");
+    else if (bOtherOwner && Now - ClimateOtherOwnerSince > 3.0)
+        Reason = TEXT("this planet's atmosphere doesn't drive the sim (another planet is nearer the camera)");
+    else if (Now - ClimateProgressTime > (double)LandClimate.ClimateWaitSeconds)
+        Reason = FString::Printf(TEXT("the sim didn't step for %.0f s (ClimateWaitSeconds)"), LandClimate.ClimateWaitSeconds);
+    if (!Reason.IsEmpty())
+    {
+        ClimateCaptureState = EVoxelPlanetClimateCapture::Captured;
+        ClimateSim.Reset();
+        ShowAtOnce();
+        RebuildLandClimateTarget();
+        LandClimateStatus = FString::Printf(TEXT("Provisional model: no snapshot, %s; kept for this seed."), *Reason);
+        UE_LOG(LogVoxelPlugin, Warning, TEXT("[Planet] %s: %s"), *GetName(), *LandClimateStatus);
+        return true;
+    }
+    return false;
+}
+
+void APlanetActor::RebuildLandClimateTarget()
+{
+    if (ClimateLand.Num() != VoxelLandClimate::Width() * VoxelLandClimate::Height()) return;
+    FVoxelLandClimateMap Map;
+    // T5e: the ice shelf's share in the map (the material's whitening, the chain's ice and rivers).
+    const FVoxelLandShelfParams Shelf = VoxelLandClimate::ShelfParamsFor(TerrestrialSettings, LandBake.IsValid() ? LandBake->PlateSeed : 0u);
+    bClimateFromSim = VoxelLandClimate::BuildMap(ClimateLand, ClimateCoast, ClimateSim.Get(), LandClimate, GetActorScale3D().GetMax() * 0.01,
+        ClimateEquatorTemperature, ClimatePoleTemperature, ClimateLatitudeExponent, ClimateWarmthScale, Map, &ClimateHeight,
+        IceShelfOn() && LandBake.IsValid() ? &Shelf : nullptr);
+    ClimateMapHash = LandClimateMapHash();
+    // Stage T5c: the land chain's climate, from the target (the sim's drift with it, or the
+    // provisional winds).
+    LandClimateField = VoxelLandClimate::MakeField(Map, bClimateFromSim ? ClimateSim.Get() : nullptr, ClimateLapseRate, ClimateLand, ClimateHeight,
+        GetActorScale3D().GetMax() * 0.01, (float)TerrestrialSettings.IceSheetMaxThickness);
+    LandClimateFieldBaseKey = ClimateBaseKey;
+    if (!ClimateShown.IsValid() || LandClimate.FadeSeconds <= 0.0f)
+    {
+        // The first map (or no fade): at once.
+        ClimateShown = MoveTemp(Map);
+        ClimateFrom.Empty();
+        ClimateTarget.Cells.Empty();
+        ClimateFade = 1.0f;
+        UploadLandClimate();
+        return;
+    }
+    // Fades in from what is shown now (mid-fade, from the blend).
+    ClimateFrom = ClimateShown.Cells;
+    ClimateTarget = MoveTemp(Map);
+    ClimateFade = 0.0f;
+}
+
+bool APlanetActor::IceShelfOn() const
+{
+    return Generator == EVoxelSurfaceGenerator::Terrestrial && LandClimate.bEnabled && TerrestrialSettings.IceShelfHeight > 0.0;
+}
+
+void APlanetActor::UpdateIceShelf()
+{
+    // (A field made for the current bake only: see LandClimateFieldBaseKey.)
+    if (!IceShelfOn() || !LandBake.IsValid() || !LandClimateField.IsValid() || !LandClimateField->IsValid()
+        || LandClimateFieldBaseKey != CurrentClimateBaseKey())
+    {
+        ShelfBake.Reset();
+        ShelfBakeHash = 0;
+        return;
+    }
+    uint32 Hash = HashCombine(LandBake->Key, LandClimateField->Hash);
+    for (const double V : { TerrestrialSettings.IceShelfHeight, TerrestrialSettings.IceShelfTemperature, TerrestrialSettings.IceShelfFrontNoise,
+        TerrestrialSettings.IceShelfRise, TerrestrialSettings.IceShelfRoll, TerrestrialSettings.IceShelfDraft })
+        Hash = HashCombine(Hash, ::GetTypeHash(V));
+    Hash |= 1u;
+    if (ShelfBake.IsValid() && ShelfBakeHash == Hash)
+    {
+        // The same shelf: only the rivers may be new (other river settings: LandBake's, remade by
+        // TickLandBake).
+        TSharedPtr<const FVoxelLandRiverSet, ESPMode::ThreadSafe> Rivers;
+        {
+            FScopeLock RiverLock(&LandBake->RiverLock);
+            Rivers = LandBake->Rivers;
+        }
+        FScopeLock ShelfLock(&ShelfBake->RiverLock);
+        ShelfBake->Rivers = Rivers;
+        return;
+    }
+    ShelfBake = VoxelLandClimate::MakeIceShelfBake(*LandBake, *LandClimateField, TerrestrialSettings);
+    ShelfBakeHash = ShelfBake.IsValid() ? Hash : 0u;
+}
+
+bool APlanetActor::IsLandClimateFieldStale() const
+{
+    // The ice block holds no cap (the density's): only whether the ice sheets are on.
+    return LandClimateField.IsValid() && (LandClimateField->LapseRate != ClimateLapseRate
+        || (LandClimateField->IceMaxThickness > 0.0f) != (TerrestrialSettings.IceSheetMaxThickness > 0.0));
+}
+
+TSharedPtr<const FVoxelLandClimateField, ESPMode::ThreadSafe> APlanetActor::DuneClimate() const
+{
+    // The layers placed by the climate: the dunes (T5c) and the glacial layer (T5d).
+    // T5d2: and the ice sheets (no set needed: their swells come from one if the pack has it).
+    // T5d3: and the polar surfaces (with a polar set).
+    const bool bPolar = LandNoise.IsValid() && LandNoise->PolarN > 0
+        && (TerrestrialSettings.CrevasseHeightScale > 0.0 || TerrestrialSettings.SastrugiHeightScale > 0.0 || TerrestrialSettings.PolygonHeightScale > 0.0
+            || TerrestrialSettings.SnowDuneHeight > 0.0);
+    // T5e: and the ice shelf (the field's map places it, and the chain reads its share).
+    const bool bLayers = LandClimate.bEnabled && (TerrestrialSettings.IceSheetMaxThickness > 0.0 || bPolar || IceShelfOn() || (LandNoise.IsValid()
+        && ((LandNoise->DuneN > 0 && TerrestrialSettings.DuneHeightScale > 0.0) || (LandNoise->GlacialN > 0 && TerrestrialSettings.GlacialHeightScale > 0.0))));
+    return bLayers && LandClimateField.IsValid() && LandClimateField->IsValid() ? LandClimateField : nullptr;
+}
+
+uint32 APlanetActor::DuneClimateHash() const
+{
+    const TSharedPtr<const FVoxelLandClimateField, ESPMode::ThreadSafe> Field = DuneClimate();
+    return Field.IsValid() ? (Field->Hash | 1u) : 0u;
+}
+
+uint32 APlanetActor::LandClimateMapHash() const
+{
+    uint32 Hash = HashCombine(LandClimate.GetMapHash(), GetTypeHash(ClimateEquatorTemperature));
+    Hash = HashCombine(Hash, GetTypeHash(ClimatePoleTemperature));
+    Hash = HashCombine(Hash, GetTypeHash(ClimateLatitudeExponent));
+    Hash = HashCombine(Hash, GetTypeHash(ClimateWarmthScale));
+    // T5e: the ice shelf's share in the cells.
+    if (IceShelfOn())
+    {
+        Hash = HashCombine(Hash, GetTypeHash(TerrestrialSettings.IceShelfTemperature));
+        Hash = HashCombine(Hash, GetTypeHash(TerrestrialSettings.IceShelfFrontNoise));
+        Hash = HashCombine(Hash, LandBake.IsValid() ? LandBake->PlateSeed : 0u);
+    }
+    return Hash;
+}
+
+void APlanetActor::UploadLandClimate()
+{
+    if (!ClimateShown.IsValid()) return;
+    if (!LandClimateTexture)
+        LandClimateTexture = VoxelLandMaterial::MakeClimateTexture();
+    VoxelLandMaterial::UploadClimateTexture(LandClimateTexture, ClimateShown.Cells);
+    ClimateUploadTime = FPlatformTime::Seconds();
+}
+
+void APlanetActor::TickLandClimate(float DeltaTime)
+{
+    const bool bOn = LandClimate.bEnabled && bInitialized && TerrainActor && Generator == EVoxelSurfaceGenerator::Terrestrial
+        && LandBake.IsValid() && LandBake->Height.Num() == LandBake->NumCells();
+    if (!bOn)
+    {
+        // Off: the terrain's node off, the map gone (it's made again when on).
+        if (TerrainActor && (ClimateTextureSent.IsValid() || ClimateTerrainSent.Get() != TerrainActor))
+            TerrainActor->SetLandClimate(nullptr, FLinearColor(0.0f, 0.0f, 0.0f, 0.0f), FLinearColor(0.0f, 0.0f, 0.0f, 0.0f), FLinearColor(0.0f, 0.0f, 0.0f, 0.0f));
+        ClimateTextureSent.Reset();
+        ClimateTerrainSent = TerrainActor;
+        ClimateParamsSent = FLinearColor(-1.0f, 0.0f, 0.0f, 0.0f);
+        if (ClimateShown.IsValid() || ClimateBaseKey != 0u)
+        {
+            ClimateShown.Cells.Empty();
+            ClimateFrom.Empty();
+            ClimateTarget.Cells.Empty();
+            ClimateLand.Empty();
+            ClimateCoast.Empty();
+            ClimateHeight.Empty();
+            ClimateSim.Reset();
+            LandClimateField.Reset();
+            ClimateBaseKey = 0u;
+            ClimateCaptureKey = 0u;
+            ClimateCaptureState = EVoxelPlanetClimateCapture::None;
+            bClimateFromSim = false;
+            LandClimateStatus = LandClimate.bEnabled ? TEXT("Off (terrestrial planets only, once built).") : TEXT("Off.");
+        }
+        return;
+    }
+
+    // The capture (the build waited for it unless bWaitForClimate is off; a change after the build,
+    // such as a new atmosphere seed, captures again here). Then the map's own settings.
+    UpdateClimateCapture();
+    if (ClimateMapHash != LandClimateMapHash() || IsLandClimateFieldStale())
+        RebuildLandClimateTarget();
+
+    // The fade: the shown map toward the new one, uploaded a few times a second.
+    if (ClimateFade < 1.0f && ClimateTarget.IsValid() && ClimateFrom.Num() == ClimateTarget.Cells.Num())
+    {
+        ClimateFade = LandClimate.FadeSeconds > 0.0f ? FMath::Min(ClimateFade + DeltaTime / LandClimate.FadeSeconds, 1.0f) : 1.0f;
+        if (ClimateFade >= 1.0f || FPlatformTime::Seconds() - ClimateUploadTime >= 0.2)
+        {
+            const float A = FMath::SmoothStep(0.0f, 1.0f, ClimateFade);
+            ClimateShown.Cells.SetNumUninitialized(ClimateTarget.Cells.Num());
+            for (int32 i = 0; i < ClimateTarget.Cells.Num(); i++)
+                ClimateShown.Cells[i] = ClimateFrom[i] + (ClimateTarget.Cells[i] - ClimateFrom[i]) * A;
+            UploadLandClimate();
+            if (ClimateFade >= 1.0f)
+            {
+                ClimateShown = MoveTemp(ClimateTarget);
+                ClimateTarget.Cells.Empty();
+                ClimateFrom.Empty();
+            }
+        }
+    }
+
+    // The terrain's climate node: the map and the look (sent when they change).
+    const double SeaRadiusM = GetActorScale3D().GetMax() * 0.01;
+    const FLinearColor Params(1.0f, (float)SeaRadiusM, ClimateLapseRate, LandClimate.Season);
+    const FLinearColor Shape(LandClimate.AspectWarming, LandClimate.BreakupAmplitude, LandClimate.BreakupScale, LandClimate.SnowWidth);
+    const FLinearColor Tint(LandClimate.SnowTint, LandClimate.GlacierTint, LandClimate.DesertTint, LandClimate.VegetationTint);
+    if (LandClimateTexture && (ClimateTextureSent.Get() != LandClimateTexture || ClimateTerrainSent.Get() != TerrainActor
+        || ClimateParamsSent != Params || ClimateShapeSent != Shape || ClimateTintSent != Tint))
+    {
+        TerrainActor->SetLandClimate(LandClimateTexture, Params, Shape, Tint);
+        ClimateTextureSent = LandClimateTexture;
+        ClimateTerrainSent = TerrainActor;
+        ClimateParamsSent = Params;
+        ClimateShapeSent = Shape;
+        ClimateTintSent = Tint;
+    }
 }
 
 void APlanetActor::ConfigureAtmosphere(double PlanetRadius, double OceanRadius, bool bRegenerate)
@@ -678,7 +1127,14 @@ TSharedPtr<FDensitySampleCompositor> APlanetActor::BuildCompositor(
 
     const double Finest = VoxelDensity::TerrainFinestCell(PlanetRadius, NoiseAmplitude, MaxDepth);
     if (Generator == EVoxelSurfaceGenerator::Terrestrial && LandBake.IsValid())
-        return VoxelDensity::MakeTerrestrialCompositor(TerrestrialSettings, LandBake, PlanetRadius, NoiseAmplitude, EditStore, Finest);
+    {
+        // Stage T5c: the dunes by the climate captured for this seed (the build waited for it,
+        // unless bWaitForClimate is off: TickLandClimate rebuilds once it lands).
+        LandClimateFieldBuilt = DuneClimateHash();
+        // T5e: on the terrain's bake (with the ice shelf when there is one).
+        return VoxelDensity::MakeTerrestrialCompositor(TerrestrialSettings, TerrainBake(), PlanetRadius, NoiseAmplitude, EditStore, Finest, DuneClimate());
+    }
+    LandClimateFieldBuilt = 0;
     return VoxelDensity::MakeCompositor(SurfaceSettings, PlanetRadius, NoiseAmplitude, EditStore, Finest);
 }
 
@@ -741,6 +1197,10 @@ void APlanetActor::SpawnChildActors()
             ChildRoot->AttachToComponent(PlanetRoot,
                 FAttachmentTransformRules::KeepWorldTransform);
         }
+        // Stage T5b: off until ConfigureGravity sizes it (the climate capture spawns the children
+        // before the build).
+        GravityZone->SetActorEnableCollision(false);
+        GravityZone->SetActorTickEnabled(false);
     }
 
     // Stage A1: no second atmosphere. A level saved before the atmosphere was detached (or by
@@ -877,6 +1337,9 @@ FVoxelWaterSample APlanetActor::GetWaterAt(const FVector& WorldLocation) const
 void APlanetActor::SetDormant(bool bDormant)
 {
     const bool bActive = !bDormant;
+    // Stage T5b: a capture parked mid-wait starts again on waking (its clocks would have run out).
+    if (bDormant && ClimateCaptureState == EVoxelPlanetClimateCapture::Waiting)
+        ClimateCaptureState = EVoxelPlanetClimateCapture::None;
 
     SetActorHiddenInGame(bDormant);
     SetActorTickEnabled(bActive);

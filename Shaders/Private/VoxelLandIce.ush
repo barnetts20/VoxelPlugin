@@ -1,0 +1,166 @@
+// VoxelLandIce.ush - The ice sheets (stage T5d2, Design/LandClimate.md): where the planet's climate
+// snapshot ices the land today, the ground is buried under an ice sheet whose surface rises with
+// the distance into the ice (the climate field's signed distance, VoxelLandClimateGrid::IceSheet,
+// made a thickness here by Nye's plastic profile, h = sqrt(VOXEL_LAND_ICE_NYE_K d), capped) over
+// the land's mean height, with the `icesheet` set's G (smooth swells) on it. The land shows
+// through where it stands higher (nunataks): the surface is a smooth maximum of the land and the
+// ice, faded in over the ice's first VOXEL_LAND_ICE_FADE_M of thickness, so the margin is the
+// land's own; and on land only (the bake's height from 0 to VOXEL_LAND_ICE_LAND_M: no ice raised
+// off the sea floor; sea ice is T5e's).
+//
+// Applied after the rivers' and lakes' carve (VoxelLandGully.ush VoxelLandCarveSurface) as one more
+// transform of the surface, so every host (they add the carve and scale the terms' gradients by
+// CarveScale) has it: the mesher, collision, the land cache, the ocean, the CPU queries. The
+// detail layer gives way under the ice.
+//
+// Shared subset (VoxelShaderCompat.h). Included by VoxelLandGully.ush; its inputs, declared by the
+// host:
+//   LandClimate, LandHasClimate                   the climate (VoxelLandClimateAccess.ush)
+//   float LandIceMaxThickness;                    m (0: no ice sheets)
+//   float LandIceBlend;                           m: the smooth maximum's width
+//   float LandIceSwellTexelsPerCell;              the icesheet set's placement (0: no swells)
+//   uint LandIceBase, LandIceN, LandIceMips;      its chain in LandNoise
+//   float LandIceMeanG;                           its G's mean (unit)
+//   float LandIceSwellM;                          m: G's range at the placement times the height
+//   uint LandIceSeed;
+//   float LandIceSwellSpacingM;                   m: its spacing (the steering's wavelength)
+
+#ifndef VOXEL_LAND_ICE_USH
+#define VOXEL_LAND_ICE_USH
+
+#include "VoxelLandPeaks.ush"
+
+// The ice's thickness (m) over which the sheet fades in (its margin: the land's own surface).
+#define VOXEL_LAND_ICE_FADE_M 100.0f
+// The bake's height (m) over which it fades in from the sea.
+#define VOXEL_LAND_ICE_LAND_M 20.0f
+// Nye's 2 tau / (rho g) (m): tau 100 kPa, ice 917 kg/m^3, g 9.81.
+#define VOXEL_LAND_ICE_NYE_K 22.2329f
+
+/** Whether the planet has ice sheets (a cap, a climate). */
+VOXEL_FUNC bool VoxelLandIceOn(VOXEL_LAND_ARGS_DECL float Dummy)
+{
+    return LandIceMaxThickness > 0.0f && LandHasClimate != 0u;
+}
+
+/** The icesheet set's swells (its G, zero-mean): a set layer as the peaks'. */
+VOXEL_FUNC FVoxelLandSetLayer VoxelLandIceLayer(VOXEL_LAND_ARGS_DECL float Dummy)
+{
+    FVoxelLandSetLayer L;
+    L.Set = VoxelLandNoiseSetOf(LandIceBase, LandIceN, LandIceMips);
+    L.TexelsPerCell = LandIceSwellTexelsPerCell;
+    L.Seed = LandIceSeed;
+    L.Kind = 9u;
+    L.SaltA = 0x69636573u;
+    L.SaltB = 0x73656369u;
+    L.MeanR = 0.0f;
+    L.MeanG = LandIceMeanG;
+    L.ScaleR = 0.0f;
+    L.ScaleG = 1.0f;
+    L.ScaleB = 0.0f;
+    L.BlendMeanR = 0.0f;
+    L.BlendMeanG = LandIceMeanG;
+    L.LevelBias = -1.0f;
+    L.DetailSet = VoxelLandNoiseSetOf(0u, 0u, 0u);
+    L.DetailTexelsPerCell = 0.0f;
+    L.DetailKind = 10u;
+    L.DetailMeanHard = 0.0f;
+    L.DetailMeanSoft = 0.0f;
+    L.DetailScaleHard = 0.0f;
+    L.DetailScaleSoft = 0.0f;
+    L.DetailFade = 0.0f;
+    return L;
+}
+
+/** The ice sheet over a surface at height A (m): Height the surface after it (m), Scale its slope
+ *  in A, Gradient its own (m/m, tangent at the point: the ice's and the fade's), DetailKeep the
+ *  detail's share left, Fade the sheet's (0 off the ice). T5d3 (the polar surfaces,
+ *  VoxelLandPolar.ush): Thickness (m), Slope the sheet's own gradient without the swells (m/m,
+ *  tangent: its flow and its katabatic winds), FadeGradient the fade's (bGradients). */
+struct FVoxelLandIceSurface
+{
+    float Height;
+    float Scale;
+    float3 Gradient;
+    float DetailKeep;
+    float Fade;
+    float Thickness;
+    float3 Slope;
+    float3 FadeGradient;
+    float Cover;            // the ice's share at the surface: Fade where the ice leads, about half where it meets the land, 0 on nunataks
+};
+
+/** At the warped point Q (double-float, cm; the swells' lattice) with the sample's direction
+ *  Normal (unit; the climate's), the warp's Jacobian DWX..DWZ (the swells' gradient through it),
+ *  over a surface at A (m), the bake's height Bake (m) and its gradient (m/m, tangent at the
+ *  point), band-limited to Footprint (cm). AKeep: a height of the surface without the baked sets'
+ *  shapes (the bake and the gullies), so the detail's share left is the same on the differenced
+ *  terms' path (VoxelLandDifferencedDF leaves the shapes out). bGradients (a constant): the
+ *  gradient. */
+VOXEL_FUNC FVoxelLandIceSurface VoxelLandIceSurfaceDF(VOXEL_LAND_ARGS_DECL float2 QX, float2 QY, float2 QZ, float3 DWX, float3 DWY, float3 DWZ,
+    float3 Normal, float A, float AKeep, float Bake, float3 BakeGradient, float Footprint, bool bGradients)
+{
+    FVoxelLandIceSurface Out;
+    Out.Height = A;
+    Out.Scale = 1.0f;
+    Out.Gradient = float3(0.0f, 0.0f, 0.0f);
+    Out.DetailKeep = 1.0f;
+    Out.Fade = 0.0f;
+    Out.Thickness = 0.0f;
+    Out.Slope = float3(0.0f, 0.0f, 0.0f);
+    Out.FadeGradient = float3(0.0f, 0.0f, 0.0f);
+    Out.Cover = 0.0f;
+    if (!VoxelLandIceOn(VOXEL_LAND_ARGS 0.0f)) return Out;
+    const float Land = smoothstep(0.0f, VOXEL_LAND_ICE_LAND_M, Bake);
+    if (Land <= 0.0f) return Out;
+    const float RadiusM = 2.0f * float(LandN) * LandCellM / 3.14159265f;
+    const FVoxelLandClimateIce Ice = VoxelLandClimateIceAt(VOXEL_LAND_ARGS Normal, RadiusM);
+    if (Ice.Distance <= 0.0f) return Out;
+    // Nye's profile from the distance, capped; its slope K / (2 h) along the distance's.
+    const float Raw = sqrt(VOXEL_LAND_ICE_NYE_K * Ice.Distance);
+    const bool bCapped = Raw >= LandIceMaxThickness;
+    const float Thickness = min(Raw, LandIceMaxThickness);
+    const float3 ThicknessGradient = (!bCapped && Raw > 1.0e-3f) ? Ice.DistanceGradient * (0.5f * VOXEL_LAND_ICE_NYE_K / Raw) : float3(0.0f, 0.0f, 0.0f);
+    const float TF = saturate(Thickness / VOXEL_LAND_ICE_FADE_M);
+    const float FadeT = TF * TF * (3.0f - 2.0f * TF);
+    Out.Fade = FadeT * Land;
+    Out.Thickness = Thickness;
+    // The ice's surface: the land's mean under it, the thickness, the swells.
+    float B = Ice.Base + Thickness;
+    float3 GradB = Ice.BaseGradient + ThicknessGradient;
+    Out.Slope = GradB;
+    if (LandIceSwellTexelsPerCell > 0.0f && LandIceN != 0u)
+    {
+        const FVoxelLandPeaks S = VoxelLandSetLayerDF(VOXEL_LAND_ARGS VoxelLandIceLayer(VOXEL_LAND_ARGS 0.0f), QX, QY, QZ, 0.0f,
+            float3(0.0f, 0.0f, 0.0f), LandIceSwellM, LandIceSwellSpacingM, Footprint, true);
+        B += S.Unit * LandIceSwellM;
+        if (bGradients) GradB = GradB + VoxelLandWarpedGradient(S.Gradient, DWX, DWY, DWZ, Normal);
+    }
+    // The smooth maximum (polynomial, width K): max + K h^2 / 4, h = (K - |A - B|) / K; its slope in
+    // A 1 - h / 2 where A leads, h / 2 where B does.
+    const float K = max(LandIceBlend, 1.0f);
+    const float H = max(K - abs(A - B), 0.0f) / K;
+    const float M = max(A, B) + K * H * H * 0.25f;
+    const float WA = A >= B ? 1.0f - 0.5f * H : 0.5f * H;
+    Out.Height = A + Out.Fade * (M - A);
+    Out.Scale = 1.0f + Out.Fade * (WA - 1.0f);
+    // The ice's share of the surface (the smooth maximum's weight on it): the polar surfaces' ice.
+    Out.Cover = Out.Fade * (1.0f - WA);
+    // The detail gives way where the ice leads, judged without the shapes (as the lakes' hill share).
+    const float HK = max(K - abs(AKeep - B), 0.0f) / K;
+    const float WK = AKeep >= B ? 1.0f - 0.5f * HK : 0.5f * HK;
+    Out.DetailKeep = 1.0f + Out.Fade * (WK - 1.0f);
+    if (bGradients)
+    {
+        // The fade's own slope: the thickness's (6 t (1 - t) / FadeM) and the land's from the sea.
+        const float FadeTSlope = 6.0f * TF * (1.0f - TF) / VOXEL_LAND_ICE_FADE_M;
+        const float TL = saturate(Bake / VOXEL_LAND_ICE_LAND_M);
+        const float LandSlope = 6.0f * TL * (1.0f - TL) / VOXEL_LAND_ICE_LAND_M;
+        const float3 FadeGradient = ThicknessGradient * (FadeTSlope * Land) + BakeGradient * (FadeT * LandSlope);
+        Out.Gradient = GradB * (Out.Fade * (1.0f - WA)) + FadeGradient * (M - A);
+        Out.FadeGradient = FadeGradient;
+    }
+    return Out;
+}
+
+#endif // VOXEL_LAND_ICE_USH

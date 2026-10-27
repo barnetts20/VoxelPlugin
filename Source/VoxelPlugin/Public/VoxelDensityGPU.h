@@ -8,6 +8,7 @@
 
 class FSparseEditStore;
 struct FVoxelLandBake;
+struct FVoxelLandClimateField;
 struct FVoxelLandNoiseSet;
 struct FVoxelLandRiverSet;
 
@@ -153,6 +154,71 @@ struct FVoxelDensityGPUData
     float LandDetailScaleGain = 0.0f;
     float LandDetailFade = 0.0f;
     uint32 LandDetailSeed = 0;
+    // T5c: the dunes (VoxelLandDunes.ush; FVoxelDensityCPU's; their chains: LandNoise's Dune* and Sand*), where the
+    // climate (LandClimate: the land climate's cells and the sand's drift) makes desert.
+    TSharedPtr<const FVoxelLandClimateField, ESPMode::ThreadSafe> LandClimate;   // null: none (no dunes)
+    float LandClimateLapse = 6.5f;             // C per km
+    float LandDuneTexelsPerCell = 0.0f;        // 0: no dunes
+    float LandDuneScaleR = 1.0f;
+    float LandDuneScaleG = 1.0f;
+    float LandDuneMeanR = 0.0f;
+    float LandDuneMeanG = 0.0f;
+    float LandDuneRelief = 0.0f;               // m
+    uint32 LandDuneSeed = 0;
+    float LandDuneErgFrequency = 1.0f;
+    float LandDuneErgThreshold = 2.0f;         // above 1: no ergs
+    float LandDuneErgWidth = 0.06f;
+    float LandDuneReliefMax = 400.0f;          // m
+    float LandDuneDetailTexelsPerCell = 0.0f;  // 0: no sand detail
+    float LandDuneDetailScale = 0.0f;
+    float LandDuneDetailMean = 0.0f;
+    float LandDuneDetailFade = 0.0f;
+    // T5d: the glacial layer (VoxelLandPeaks.ush; its chain: LandNoise's Glacial*), in the peaks'
+    // place where the climate (LandClimate) has had glaciers.
+    float LandGlacialTexelsPerCell = 0.0f;     // 0: none
+    float LandGlacialScaleR = 1.0f;
+    float LandGlacialScaleG = 1.0f;
+    float LandGlacialScaleB = 1.0f;
+    float LandGlacialMeanR = 0.0f;
+    float LandGlacialMeanG = 0.0f;
+    float LandGlacialReliefM = 0.0f;
+    float LandGlacialStrength = 0.0f;
+    uint32 LandGlacialSeed = 0;
+    float LandGlacialSpacingM = 0.0f;
+    float LandGlacialCooling = 0.0f;
+    float LandGlacialDetailScaleHard = 0.0f;
+    float LandGlacialDetailScaleSoft = 0.0f;
+    // T5d2: the ice sheets (VoxelLandIce.ush; their swells' chain: LandNoise's Ice*).
+    float LandIceMaxThickness = 0.0f;          // m (0: none)
+    bool bLandIceShelf = false;                // T5e: the planet has an ice shelf (the climate bound for its share)
+    float LandIceBlend = 0.0f;                 // m
+    float LandIceSwellTexelsPerCell = 0.0f;    // 0: no swells
+    float LandIceMeanG = 0.0f;
+    float LandIceSwellM = 0.0f;
+    uint32 LandIceSeed = 0;
+    float LandIceSwellSpacingM = 0.0f;
+    // T5d3: the polar surfaces (VoxelLandPolar.ush; their chain: LandNoise's Polar*).
+    uint32 LandPolarSeed = 0;
+    float LandPolarCrevasseTexelsPerCell = 0.0f;                 // 0: none
+    float LandPolarCrevasseM = 0.0f;
+    float LandPolarCrevasseMean = 0.0f;
+    float LandPolarCrevasseFade = 0.0f;
+    float LandPolarSastrugiTexelsPerCell = 0.0f;                 // 0: none
+    float LandPolarSastrugiM = 0.0f;
+    float LandPolarSastrugiMean = 0.0f;
+    float LandPolarSastrugiFade = 0.0f;
+    float LandPolarPolygonTexelsPerCell = 0.0f;                 // 0: none
+    float LandPolarPolygonM = 0.0f;
+    float LandPolarPolygonMean = 0.0f;
+    float LandPolarPolygonFade = 0.0f;
+    float LandPolarPermafrostT = -6.0f;    // C
+    float LandPolarCrevasseTurn = 0.0f;    // radians: the set's grain
+    float LandPolarSastrugiTurn = 0.0f;
+    // The snow dunes: the dune set's G (its chain: LandNoise's Dune*).
+    float LandPolarDuneTexelsPerCell = 0.0f;                 // 0: none
+    float LandPolarDuneM = 0.0f;
+    float LandPolarDuneMean = 0.0f;
+    float LandPolarDuneFade = 0.0f;
 };
 
 /** The edit store's edits and index for the GPU (VoxelEditSample.ush; the layout is

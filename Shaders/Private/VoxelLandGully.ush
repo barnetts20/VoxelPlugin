@@ -465,7 +465,36 @@ struct FVoxelLandSurface
     float3 CarveGradient;    // m/m, tangent at P: the carve's own (bGradients)
     FVoxelLandCarve River;   // the rivers' carve (its water, for the queries)
     FVoxelLandLake Lake;     // the kept lake at the point
+    // T5d3 (the polar surfaces, VoxelLandPolar.ush): what the carve leaves them. The ice sheet's
+    // share of the surface (0 off it and on nunataks: FVoxelLandIceSurface::Cover), thickness (m),
+    // own slope (m/m, tangent at P: without its swells) and the share's gradient (bGradients: the
+    // fade's, the smooth maximum's weight left out); the rivers' and lakes' keep (1 off them).
+    float IceFade;
+    float IceThickness;
+    float3 IceSlope;
+    float3 IceFadeGradient;
+    float WaterKeep;
 };
+
+// T5d2: the ice sheets (after VoxelLandWarpedGradient, which they use).
+#include "VoxelLandIce.ush"
+// T5d3: the polar surfaces.
+#include "VoxelLandPolar.ush"
+
+/** T5e: a carve kept by Keep (0..1): toward none (the surface S1 as it is) with its slopes, its
+ *  water and its detail's fade (Keep's own change left out: the climate's, smooth over a cell). */
+VOXEL_FUNC FVoxelLandCarve VoxelLandCarveKept(FVoxelLandCarve C, float S1, float Keep)
+{
+    FVoxelLandCarve Out = C;
+    Out.Height = S1 + (C.Height - S1) * Keep;
+    Out.Scale = 1.0f + (C.Scale - 1.0f) * Keep;
+    Out.Gradient = C.Gradient * Keep;
+    Out.DetailKeep = 1.0f - (1.0f - C.DetailKeep) * Keep;
+    Out.WaterLevel = S1 + (C.WaterLevel - S1) * Keep;
+    Out.ChannelDepth = C.ChannelDepth * Keep;
+    if (Keep <= 0.0f) Out.WaterKind = VOXEL_LAND_WATER_NONE;
+    return Out;
+}
 
 /** R2: the lakes and the rivers carved into the surface terms (VoxelLandCarve.ush), at the
  *  warped point Q: under a lake the hills fade with the depth, then the shore's bench, then the
@@ -490,13 +519,47 @@ VOXEL_FUNC FVoxelLandSurface VoxelLandCarveSurface(VOXEL_LAND_ARGS_DECL FVoxelLa
     const float S = Out.Bake + Out.Hills + Out.Peaks + Out.Gully;
     const FVoxelLandShore Shore = VoxelLandLakeShore(VOXEL_LAND_ARGS Out.Lake, S, bGradients);
     Out.River = VoxelLandRiverCarveDF(VOXEL_LAND_ARGS QX, QY, QZ, Shore.Height, In.Strata, In.StrataGradient, Footprint, bGradients);
+    // T5e: the rivers give way on the ice shelf (its zone, the climate map's share: the bake raised
+    // the low ground under them, VoxelLandShelf.h, and they're frozen there).
+    if (LandHasClimate != 0u && Out.River.Distance < 1.0e30f)
+    {
+        const FVoxelLandClimateCell ShelfCell = VoxelLandClimateCellAt(VOXEL_LAND_ARGS VoxelLandClimateTapsOf(Normal));
+        const float RiverKeep = 1.0f - saturate(-ShelfCell.Continentality);
+        if (RiverKeep < 1.0f)
+            Out.River = VoxelLandCarveKept(Out.River, Shore.Height, RiverKeep);
+    }
     Out.Carve = Out.River.Height - S;
     Out.DetailScale = In.DetailScale * Shore.DetailKeep * Out.River.DetailKeep;
+    Out.WaterKeep = Shore.DetailKeep * Out.River.DetailKeep;
     if (bGradients)
     {
         // The rivers' carve of the lakes' (the chain rule: its slope scales the lakes' own gradient).
         Out.CarveScale = Shore.Scale * Out.River.Scale;
         Out.CarveGradient = VoxelLandWarpedGradient(Out.River.Gradient + Shore.Gradient * Out.River.Scale, DWX, DWY, DWZ, Normal);
+    }
+    // T5d2: the ice sheets over the carved surface (VoxelLandIce.ush): one more transform, its
+    // slope scaling the carve's and its own gradient added (the chain rule, as the rivers' of the
+    // lakes').
+    if (VoxelLandIceOn(VOXEL_LAND_ARGS 0.0f))
+    {
+        const FVoxelLandIceSurface Ice = VoxelLandIceSurfaceDF(VOXEL_LAND_ARGS QX, QY, QZ, DWX, DWY, DWZ, Normal, Out.River.Height,
+            In.Bake + In.Gully, In.Bake, In.BakeGradient, Footprint, bGradients);
+        if (Ice.Fade > 0.0f)
+        {
+            Out.Carve = Ice.Height - S;
+            Out.DetailScale *= Ice.DetailKeep;
+            // The ice sheet's own as it is under the sheet (the swells' lattice is the warped
+            // point's; its slope is the climate's, smooth over the warp).
+            Out.IceFade = Ice.Cover;
+            Out.IceThickness = Ice.Thickness;
+            Out.IceSlope = Ice.Slope;
+            Out.IceFadeGradient = Ice.FadeGradient * (Ice.Cover / Ice.Fade);
+            if (bGradients)
+            {
+                Out.CarveScale *= Ice.Scale;
+                Out.CarveGradient = Out.CarveGradient * Ice.Scale + Ice.Gradient;
+            }
+        }
     }
     return Out;
 }
@@ -532,69 +595,106 @@ VOXEL_FUNC FVoxelLandSurface VoxelLandSurfaceTermsDF(VOXEL_LAND_ARGS_DECL float2
     Out.CarveGradient = float3(0.0f, 0.0f, 0.0f);
     Out.River = VoxelLandCarveNone(0.0f);
     Out.Lake = VoxelLandLakeNone();
+    Out.IceFade = 0.0f;
+    Out.IceThickness = 0.0f;
+    Out.IceSlope = float3(0.0f, 0.0f, 0.0f);
+    Out.IceFadeGradient = float3(0.0f, 0.0f, 0.0f);
+    Out.WaterKeep = 1.0f;
     const bool bGullies = LandGullyStrength > 0.0f && LandGullyOctaves != 0u;
     const bool bHills = VoxelLandHillsOn(VOXEL_LAND_ARGS 0.0f);
     const bool bPeaks = VoxelLandPeaksOn(VOXEL_LAND_ARGS 0.0f);
-    if (!bGullies && !bHills && !bPeaks && !bGradients)
+    // T5d3: the polar surfaces need the bake's gradient (their directions). Not on the differenced
+    // terms' path (bPeakShape false): they only add height, which it doesn't read.
+    const bool bPolar = bPeakShape && VoxelLandPolarOn(VOXEL_LAND_ARGS 0.0f);
+    // One call of the carve (each call inlines the carve and the ice sheets: the shaders' size).
+    const float3 Normal = normalize(float3(PX.x, PY.x, PZ.x));
+    bool bCarveGradients = false;
+    if (!bGullies && !bHills && !bPeaks && !bGradients && !bPolar)
     {
         Out.Bake = VoxelLandBakeSampleDF(VOXEL_LAND_ARGS QX, QY, QZ, false).Height;
-        return VoxelLandCarveSurface(VOXEL_LAND_ARGS Out, QX, QY, QZ, DWX, DWY, DWZ, normalize(float3(PX.x, PY.x, PZ.x)), Footprint, false);
     }
-    const FVoxelLandBakeSample Bake = VoxelLandBakeSampleDF(VOXEL_LAND_ARGS QX, QY, QZ, true);
-    Out.Bake = Bake.Height;
-    Out.Flow = Bake.Flow;
-    const float3 Normal = normalize(float3(PX.x, PY.x, PZ.x));
-    Out.BakeGradient = VoxelLandWarpedGradient(Bake.Gradient, DWX, DWY, DWZ, Normal);
-    Out.Strata = VoxelLandStrataShare(VOXEL_LAND_ARGS Bake.Province);
-    if (Out.Strata > 0.0f && Out.Strata < 1.0f)
-        Out.StrataGradient = Bake.ProvinceGradient * VoxelLandStrataShareSlope(VOXEL_LAND_ARGS Bake.Province);
-    float HillCurve = 0.0f;
-    float HillLambda = 0.0f;
-    if (bHills)
+    else
     {
-        // On the sampled point P (the bake's fields at the warped Q). The set's R and G blend by
-        // the character, as the peaks' (T4a; the procedural hills ignore the gradient).
-        const float3 HillCharacterGradient = VoxelLandWarpedGradient(Bake.CharacterGradient, DWX, DWY, DWZ, Normal);
-        const FVoxelLandHills Hills = VoxelLandHillsShapeDF(VOXEL_LAND_ARGS PX, PY, PZ, Bake.Form, HillCharacterGradient, Bake.Relief, Bake.Province, Bake.Flow,
-            Bake.Height, Footprint, bPeakShape);
-        Out.HillUnit = Hills.Unit;
-        Out.HillAmplitudeM = Hills.AmplitudeM;
-        Out.Hills = Hills.Unit * Hills.AmplitudeM;
-        Out.HillGradient = Hills.Gradient;
-        Out.HillSteer = Hills.Steer;
-        HillCurve = Hills.Curve;
-        HillLambda = Hills.Lambda;
+        const FVoxelLandBakeSample Bake = VoxelLandBakeSampleDF(VOXEL_LAND_ARGS QX, QY, QZ, true);
+        Out.Bake = Bake.Height;
+        Out.Flow = Bake.Flow;
+        Out.BakeGradient = VoxelLandWarpedGradient(Bake.Gradient, DWX, DWY, DWZ, Normal);
+        Out.Strata = VoxelLandStrataShare(VOXEL_LAND_ARGS Bake.Province);
+        if (Out.Strata > 0.0f && Out.Strata < 1.0f)
+            Out.StrataGradient = Bake.ProvinceGradient * VoxelLandStrataShareSlope(VOXEL_LAND_ARGS Bake.Province);
+        float HillCurve = 0.0f;
+        float HillLambda = 0.0f;
+        float DuneShare = 0.0f;
+        if (bHills)
+        {
+            // On the sampled point P (the bake's fields at the warped Q). The set's R and G blend by
+            // the character, as the peaks' (T4a; the procedural hills ignore the gradient).
+            const float3 HillCharacterGradient = VoxelLandWarpedGradient(Bake.CharacterGradient, DWX, DWY, DWZ, Normal);
+            const FVoxelLandHills Hills = VoxelLandHillsShapeDF(VOXEL_LAND_ARGS PX, PY, PZ, Bake.Form, HillCharacterGradient, Bake.Relief, Bake.Province, Bake.Flow,
+                Bake.Height, Footprint, bPeakShape);
+            Out.HillUnit = Hills.Unit;
+            Out.HillAmplitudeM = Hills.AmplitudeM;
+            Out.Hills = Hills.Unit * Hills.AmplitudeM;
+            Out.HillGradient = Hills.Gradient;
+            Out.HillSteer = Hills.Steer;
+            HillCurve = Hills.Curve;
+            HillLambda = Hills.Lambda;
+            DuneShare = Hills.Dune;
+        }
+        float PeakCurve = 0.0f;
+        float PeakLambda = 0.0f;
+        if (bPeaks)
+        {
+            // The character's gradient at P, through the warp (as the bake's).
+            const float3 CharacterGradient = VoxelLandWarpedGradient(Bake.CharacterGradient, DWX, DWY, DWZ, Normal);
+            const FVoxelLandPeaks Peaks = VoxelLandPeaksShapeDF(VOXEL_LAND_ARGS PX, PY, PZ, Bake.Form, CharacterGradient, Bake.Relief, Bake.Flow, Bake.Height,
+                Out.BakeGradient, Footprint, bPeakShape);
+            Out.PeakUnit = Peaks.Unit;
+            Out.PeakAmplitudeM = Peaks.AmplitudeM;
+            Out.Peaks = Peaks.Unit * Peaks.AmplitudeM;
+            Out.PeakGradient = Peaks.Gradient;
+            Out.PeakSteer = Peaks.Steer;
+            PeakCurve = Peaks.Curve;
+            PeakLambda = Peaks.Lambda;
+        }
+        // The carve's own gradients aren't wanted by the differenced terms (bPeakShape false), only
+        // its fades (VoxelLandDifferencedDF): the second shape per river and the lakes' slopes are
+        // left out there.
+        bCarveGradients = bGradients && bPeakShape;
+        // T5c: the detail layer gives way to the sand (with the gullies, below, the same).
+        Out.DetailScale = 1.0f - VOXEL_LAND_DUNE_BURY * DuneShare;
+        if (bGullies)
+        {
+            // The gullies run down the bake, and their octaves finer than the hills (the peaks) down the
+            // hills' steering (the procedural hills' two coarsest octaves, or a hill set's blurred
+            // channel; the peaks' steering channel) too, fading where those curve (VoxelLandGullyHillShare).
+            const FVoxelLandGully G = VoxelLandGullyHillsDF(VOXEL_LAND_ARGS PX, PY, PZ, Out.BakeGradient, Out.HillSteer, HillLambda,
+                HillCurve, Out.PeakSteer, PeakLambda, PeakCurve, Bake.Turn, Bake.Flow, Bake.Height, Footprint);
+            // T5c: the gullies and the detail layer give way to the sand.
+            Out.Gully = G.Height * (1.0f - DuneShare);
+            Out.GullyScale = G.Scale * (1.0f - DuneShare);
+            Out.DetailScale = VoxelLandDetailScale(VOXEL_LAND_ARGS Bake.Height) * (1.0f - VOXEL_LAND_DUNE_BURY * DuneShare);
+        }
     }
-    float PeakCurve = 0.0f;
-    float PeakLambda = 0.0f;
-    if (bPeaks)
+    FVoxelLandSurface Carved = VoxelLandCarveSurface(VOXEL_LAND_ARGS Out, QX, QY, QZ, DWX, DWY, DWZ, Normal, Footprint, bCarveGradients);
+    // T5d3: the polar surfaces on the carved surface (VoxelLandPolar.ush), as more carve: added to
+    // the height, their gradient to the carve's own (the terms' slope through them is 1).
+    if (bPolar)
     {
-        // The character's gradient at P, through the warp (as the bake's).
-        const float3 CharacterGradient = VoxelLandWarpedGradient(Bake.CharacterGradient, DWX, DWY, DWZ, Normal);
-        const FVoxelLandPeaks Peaks = VoxelLandPeaksShapeDF(VOXEL_LAND_ARGS PX, PY, PZ, Bake.Form, CharacterGradient, Bake.Relief, Bake.Flow, Bake.Height,
-            Footprint, bPeakShape);
-        Out.PeakUnit = Peaks.Unit;
-        Out.PeakAmplitudeM = Peaks.AmplitudeM;
-        Out.Peaks = Peaks.Unit * Peaks.AmplitudeM;
-        Out.PeakGradient = Peaks.Gradient;
-        Out.PeakSteer = Peaks.Steer;
-        PeakCurve = Peaks.Curve;
-        PeakLambda = Peaks.Lambda;
+        // The ground's large-scale slope: the bake's and the layers' steering (their blurred
+        // channels: zero without the gullies, which read them).
+        const float3 LandSteer = Carved.BakeGradient + Carved.HillSteer + Carved.PeakSteer;
+        const float Surface = Carved.Bake + Carved.Hills + Carved.Peaks + Carved.Gully + Carved.Carve;
+        const FVoxelLandPolarSite Site = VoxelLandPolarSiteAt(VOXEL_LAND_ARGS Normal, Carved.Bake, Carved.BakeGradient, LandSteer, Surface, Carved.IceFade,
+            Carved.IceSlope, Carved.IceFadeGradient, Carved.WaterKeep, bCarveGradients);
+        if (Site.Crevasse > 0.0f || Site.Sastrugi > 0.0f || Site.Polygon > 0.0f || Site.SnowDune > 0.0f)
+        {
+            const FVoxelLandPolar Polar = VoxelLandPolarDF(VOXEL_LAND_ARGS PX, PY, PZ, Site, Footprint, bCarveGradients);
+            Carved.Carve += Polar.Height;
+            if (bCarveGradients) Carved.CarveGradient = Carved.CarveGradient + Polar.Gradient;
+        }
     }
-    // The carve's own gradients aren't wanted by the differenced terms (bPeakShape false), only
-    // its fades (VoxelLandDifferencedDF): the second shape per river and the lakes' slopes are
-    // left out there.
-    const bool bCarveGradients = bGradients && bPeakShape;
-    if (!bGullies) return VoxelLandCarveSurface(VOXEL_LAND_ARGS Out, QX, QY, QZ, DWX, DWY, DWZ, Normal, Footprint, bCarveGradients);
-    // The gullies run down the bake, and their octaves finer than the hills (the peaks) down the
-    // hills' steering (the procedural hills' two coarsest octaves, or a hill set's blurred
-    // channel; the peaks' steering channel) too, fading where those curve (VoxelLandGullyHillShare).
-    const FVoxelLandGully G = VoxelLandGullyHillsDF(VOXEL_LAND_ARGS PX, PY, PZ, Out.BakeGradient, Out.HillSteer, HillLambda,
-        HillCurve, Out.PeakSteer, PeakLambda, PeakCurve, Bake.Turn, Bake.Flow, Bake.Height, Footprint);
-    Out.Gully = G.Height;
-    Out.GullyScale = G.Scale;
-    Out.DetailScale = VoxelLandDetailScale(VOXEL_LAND_ARGS Bake.Height);
-    return VoxelLandCarveSurface(VOXEL_LAND_ARGS Out, QX, QY, QZ, DWX, DWY, DWZ, Normal, Footprint, bCarveGradients);
+    return Carved;
 }
 
 VOXEL_FUNC FVoxelLandSurface VoxelLandSurfaceDF(VOXEL_LAND_ARGS_DECL float2 PX, float2 PY, float2 PZ, float2 QX, float2 QY, float2 QZ,

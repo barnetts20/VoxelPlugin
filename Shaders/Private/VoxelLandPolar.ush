@@ -1,0 +1,557 @@
+// VoxelLandPolar.ush - The polar surfaces (stage T5d3, Design/LandClimate.md): the noise library's
+// `polar` set laid where the planet's climate snapshot makes ice or frozen ground. Three of its
+// channels, each a simulated heightfield in the set's texels:
+//   R  crevasses: lens-shaped slots across the set's x (the ice's flow), en echelon
+//   G  sastrugi: wind-cut snow ridges along x (the wind), on a flat floor
+//   B  ice-wedge polygons: low-centred polygons with raised rims along their troughs (isotropic)
+//   A  sea ice (stage T5e; not read here)
+// Like the other climate layers this is geometry: applied after the rivers' and lakes' carve and
+// the ice sheets (VoxelLandGully.ush VoxelLandSurfaceTermsDF), as more carve, so every host (the
+// mesher, collision, the land cache, the ocean, the CPU queries) has it. Placed once per climate
+// capture; it doesn't move with the seasons.
+//
+// WHERE (VoxelLandPolarSiteAt), from the climate cell at the sample and what the chain already
+// knows there:
+//   - the ice: the ice sheet's share (VoxelLandIce.ush's fade) and the glaciers' today (Now: the
+//     glacial layer's own share, Ohmura's line at the bake's height, VoxelLandGlacialSiteAt's);
+//   - CREVASSES where the ice runs steep: on the sheet where its own slope (Nye's profile, steepest
+//     near the margin: K / 2h) passes 0.02 .. 0.08, so a marginal crevasse zone of a few to about
+//     fifteen kilometres; on glaciers where the ground's large-scale slope (the bake's and the
+//     layers' steering) passes 0.08 .. 0.3 (icefalls, steep tongues). Across the flow: the set's x
+//     down the ice's slope (transverse crevasses);
+//   - SASTRUGI on ice and snow that stay cold the year round (the year's mean at the surface from
+//     -2 C to -10 C: dry snow), along the wind: the snapshot's sand drift (its lowest layer's
+//     resultant, times its steadiness) plus, on the sheets' slopes, the katabatic wind: down the
+//     slope, turned 40 degrees by the Coriolis force (to the right in the north, the left in the
+//     south; Parish & Bromwich 1987: Antarctica's katabatics run 30 to 50 degrees off the fall
+//     line). Where the two cancel or there's no wind, no sastrugi (no direction to lie along);
+//   - SNOW DUNES on the flat snow plains (the ice sheets' thick interiors, cold flat glacier ice):
+//     the dune set's G (rounded crests, across the wind) at a long spacing and a low height, the
+//     megadunes and snow dunes of the polar plateaus (Fahnestock et al. 2000; Frezzotti et al. 2002:
+//     a few metres high, kilometres apart, crests across the katabatic wind), sastrugi on them;
+//   - ICE-WEDGE POLYGONS on bare (unglaciated) ground with continuous permafrost: the year's mean at
+//     the ground from LandPolarPermafrostT + 2 C to - 2 C (Pewe 1966: active ice wedges need a
+//     mean of about -6 C to -8 C or colder), on low slopes (0.04 .. 0.12 of the ground's
+//     large-scale slope), inland (bake 1 .. 10 m) and outside the rivers and lakes.
+//
+// THE LATTICE: as the dunes' (VoxelLandDunes.ush): per face, the directed features take the two of
+// VOXEL_LAND_DUNE_BINS fixed exact turns either side of their direction in the face's frame (less
+// the set's own grain: polar_a's crevasses run about 27 degrees off its y, measured on the CPU) and
+// blend them keeping the variance, over the middle 40% between two turns only (a crevasse field
+// blended over all of it reads as two crossing sets); the polygons one turn per face (VoxelLandPeakRotation's) with
+// any of the tile's 8 orientations. Faces blend as the set layers' (VoxelLandSetLayerDF), all
+// zero-mean (each channel's mean over mip 0 subtracted: a coarse mip, a coarse footprint, flattens
+// to nothing). One lookup call site in a loop (each call inlines the B-spline: the shaders' size).
+//
+// SCALE: each feature's texel is its spacing (one of the set's cells) over the set's cell in
+// texels, its height the set's at that texel times its height scale (1: the simulated slopes).
+// Band-limited by its mip level (texels about half the footprint, the dunes' rule) and faded out
+// over the two levels before one cell fits a texel (VOXEL_LAND_POLAR_FADE_LEVELS; skipped beyond).
+//
+// GRADIENT: the lookups' exact (B-spline) gradients at the amplitudes, plus each feature's unit
+// times its amplitude's change where the chain knows it: the ice sheet's fade, the glaciers' share
+// along the bake's slope, the temperature ramps and the coast through the bake's height. Left out
+// (each changes over kilometres, or is a fade near a river): the slope gates, the wind's strength,
+// the climate's own change between cells, and the rivers' and lakes' fades.
+//
+// Shared subset (VoxelShaderCompat.h). Included by VoxelLandGully.ush after VoxelLandIce.ush; its
+// inputs, declared by the host:
+//   LandClimate, LandHasClimate, LandClimateLapse   the climate (VoxelLandClimateAccess.ush)
+//   uint LandPolarBase, LandPolarN, LandPolarMips;   the polar set's chain in LandNoise (0 size: none)
+//   uint LandPolarSeed;
+//   float LandPolarCrevasseTexelsPerCell;   R's mip-0 texels per bake cell (0: no crevasses)
+//   float LandPolarCrevasseM;               m per unit value of R (its range x texel x height scale)
+//   float LandPolarCrevasseMean;            R's mean over mip 0 (unit)
+//   float LandPolarCrevasseFade;            the mip level by which it has faded out
+//   float LandPolarSastrugiTexelsPerCell, LandPolarSastrugiM, LandPolarSastrugiMean, LandPolarSastrugiFade;   G's
+//   float LandPolarPolygonTexelsPerCell, LandPolarPolygonM, LandPolarPolygonMean, LandPolarPolygonFade;       B's
+//   float LandPolarPermafrostT;             C: the year's mean at which the polygons are half in
+//   float LandPolarCrevasseTurn;            radians: R's grain, its slots' normal from the set's x
+//                                           (VoxelNoiseTiles::GrainAngleOf), turned onto the flow
+//   float LandPolarSastrugiTurn;            radians: G's ridges' long axis from the set's x, turned
+//                                           onto the wind
+//   uint LandPolarDuneBase, LandPolarDuneN, LandPolarDuneMips;   the dune set's chain (the snow
+//                                           dunes: its G, x downwind; 0 size: none)
+//   float LandPolarDuneTexelsPerCell, LandPolarDuneM, LandPolarDuneMean, LandPolarDuneFade;   its G's
+
+#ifndef VOXEL_LAND_POLAR_USH
+#define VOXEL_LAND_POLAR_USH
+
+#include "VoxelLandPeaks.ush"
+#include "VoxelLandDunes.ush"
+#include "VoxelLandClimateAccess.ush"
+
+// The sheet's own slope (m/m) over which crevasses come in (Nye: 0.08 about 140 m thick, 0.02
+// about 560 m: within about 1 and 14 km of the margin).
+#define VOXEL_LAND_POLAR_SHEET_SLOPE_START 0.02f
+#define VOXEL_LAND_POLAR_SHEET_SLOPE_END 0.08f
+// The ground's large-scale slope over which glaciers crevasse (about 5 to 17 degrees).
+#define VOXEL_LAND_POLAR_GLACIER_SLOPE_START 0.08f
+#define VOXEL_LAND_POLAR_GLACIER_SLOPE_END 0.3f
+// The year's mean at the surface (C) over which the snow is dry enough for sastrugi.
+#define VOXEL_LAND_POLAR_SASTRUGI_WARM -2.0f
+#define VOXEL_LAND_POLAR_SASTRUGI_COLD -10.0f
+// The katabatic wind: the sheet's slope over which it comes in, and its turn off the fall line
+// (radians: 40 degrees), and the wind's strength (drift steadiness plus katabatic share) over which
+// the sastrugi come in.
+#define VOXEL_LAND_POLAR_KATABATIC_START 0.001f
+#define VOXEL_LAND_POLAR_KATABATIC_END 0.004f
+#define VOXEL_LAND_POLAR_KATABATIC_TURN 0.6981317f
+#define VOXEL_LAND_POLAR_WIND_START 0.05f
+#define VOXEL_LAND_POLAR_WIND_END 0.3f
+// The polygons: half the ramp about LandPolarPermafrostT (C), the slopes over which they go, the
+// bake heights over which they come in from the coast.
+#define VOXEL_LAND_POLAR_PERMAFROST_HALF 2.0f
+#define VOXEL_LAND_POLAR_FLAT_START 0.04f
+#define VOXEL_LAND_POLAR_FLAT_END 0.12f
+#define VOXEL_LAND_POLAR_COAST_START 1.0f
+#define VOXEL_LAND_POLAR_COAST_END 10.0f
+// The snow plains: the sheet's own slope (m/m) over which its plain gives way (Nye: 0.005 about
+// 2 km thick, 0.02 about 550 m), and the ground's over which a glacier's does.
+#define VOXEL_LAND_POLAR_PLAIN_SHEET_START 0.005f
+#define VOXEL_LAND_POLAR_PLAIN_SHEET_END 0.02f
+#define VOXEL_LAND_POLAR_PLAIN_LAND_START 0.02f
+#define VOXEL_LAND_POLAR_PLAIN_LAND_END 0.06f
+// The bake's height (m) over which the glaciers' ice comes in from the sea (as the ice sheets':
+// VoxelLandIce.ush's VOXEL_LAND_ICE_LAND_M; none on the sea floor), and the share of the two flows'
+// weights their sum keeps under which crevasses give way (where a glacier's and a sheet's flows
+// cancel the direction means little).
+#define VOXEL_LAND_POLAR_LAND_M 20.0f
+#define VOXEL_LAND_POLAR_FLOW_START 0.1f
+#define VOXEL_LAND_POLAR_FLOW_END 0.4f
+// The mip levels over which a feature fades out before its cell fits one texel.
+#define VOXEL_LAND_POLAR_FADE_LEVELS 2.0f
+// Half the share of a turn's span (22.5 degrees) over which the two turns either side of a
+// direction blend (the dunes blend over all of it): elsewhere one turn shows alone, so a crevasse
+// field or the sastrugi read as one set, not two crossing ones.
+#define VOXEL_LAND_POLAR_TURN_BLEND 0.2f
+
+/** Whether the planet has polar surfaces (the set, any feature placed, a climate). */
+VOXEL_FUNC bool VoxelLandPolarOn(VOXEL_LAND_ARGS_DECL float Dummy)
+{
+    return LandPolarN != 0u && LandHasClimate != 0u
+        && (LandPolarCrevasseTexelsPerCell > 0.0f || LandPolarSastrugiTexelsPerCell > 0.0f || LandPolarPolygonTexelsPerCell > 0.0f
+            || (LandPolarDuneTexelsPerCell > 0.0f && LandPolarDuneN != 0u));
+}
+
+/** The features' shares at a sample (0..1) and directions (unit tangents at the point, planet
+ *  frame; zero where there's none), and the shares' gradients where the chain knows them (per m,
+ *  tangent). */
+struct FVoxelLandPolarSite
+{
+    float Crevasse;
+    float Sastrugi;
+    float Polygon;
+    float SnowDune;
+    float3 Flow;
+    float3 Wind;
+    float3 CrevasseGradient;
+    float3 SastrugiGradient;
+    float3 PolygonGradient;
+    float3 SnowDuneGradient;
+};
+
+VOXEL_FUNC FVoxelLandPolarSite VoxelLandPolarNone()
+{
+    FVoxelLandPolarSite Out;
+    Out.Crevasse = 0.0f;
+    Out.Sastrugi = 0.0f;
+    Out.Polygon = 0.0f;
+    Out.SnowDune = 0.0f;
+    Out.Flow = float3(0.0f, 0.0f, 0.0f);
+    Out.Wind = float3(0.0f, 0.0f, 0.0f);
+    Out.CrevasseGradient = float3(0.0f, 0.0f, 0.0f);
+    Out.SastrugiGradient = float3(0.0f, 0.0f, 0.0f);
+    Out.PolygonGradient = float3(0.0f, 0.0f, 0.0f);
+    Out.SnowDuneGradient = float3(0.0f, 0.0f, 0.0f);
+    return Out;
+}
+
+/** V (a tangent vector at the unit direction Up) turned by Angle (radians) about Up: positive to
+ *  the left (counter-clockwise seen from above). */
+VOXEL_FUNC float3 VoxelLandPolarTurn(float3 V, float3 Up, float Angle)
+{
+    return V * cos(Angle) + cross(Up, V) * sin(Angle);
+}
+
+/** The site at the unit direction Normal: the bake's height (m) and gradient (m/m, tangent), the
+ *  ground's large-scale gradient (the bake's plus the layers' steering), the surface's height (m:
+ *  the snow's temperature), the ice sheet's share of the surface (FVoxelLandIceSurface::Cover),
+ *  own slope (its surface without the swells: m/m, tangent) and the share's
+ *  gradient (bGradients), and the rivers' and lakes' keep (1 off them). */
+VOXEL_FUNC FVoxelLandPolarSite VoxelLandPolarSiteAt(VOXEL_LAND_ARGS_DECL float3 Normal, float Bake, float3 BakeGradient, float3 LandSteer,
+    float Surface, float IceFade, float3 IceSlope, float3 IceFadeGradient, float WaterKeep, bool bGradients)
+{
+    FVoxelLandPolarSite Out = VoxelLandPolarNone();
+    if (!VoxelLandPolarOn(VOXEL_LAND_ARGS 0.0f)) return Out;
+    const FVoxelLandClimateTaps Taps = VoxelLandClimateTapsOf(Normal);
+    const FVoxelLandClimateCell Cell = VoxelLandClimateCellAt(VOXEL_LAND_ARGS Taps);
+    // The temperature's change per m of the bake's height (0 under the sea, where it's clamped).
+    const float DTDH = Bake > 0.0f ? -LandClimateLapse * 0.001f : 0.0f;
+
+    // The glaciers today, as the glacial layer's (VoxelLandGlacialSiteAt) at the bake's height.
+    const float GW = VOXEL_LAND_GLACIAL_WIDTH;
+    const float Margin = VoxelLandClimateGlacierMargin(Cell, LandClimateLapse, Bake, 0.0f);
+    // On land only (review fix: the sea floor under a cold sea read as glacier ice), and out of the
+    // rivers and lakes.
+    const float LandShare = smoothstep(0.0f, VOXEL_LAND_POLAR_LAND_M, Bake);
+    const float NowRamp = VoxelLandClimateRamp(-GW, GW, Margin);
+    const float Now = NowRamp * LandShare * WaterKeep;
+    const float3 NowGradient = BakeGradient * ((VoxelLandGlacialFadeSlope(-GW, GW, Margin) * -DTDH * LandShare
+        + NowRamp * VoxelLandGlacialFadeSlope(0.0f, VOXEL_LAND_POLAR_LAND_M, Bake)) * WaterKeep);
+    // T5e: the ice shelf (raised in the bake, VoxelLandShelf.h; its share the map's at the bake's
+    // height, VoxelLandClimateShelfOf), out of the rivers and lakes.
+    const FVoxelLandClimateShelf ShelfOf = VoxelLandClimateShelfOf(Cell, Bake);
+    const float Shelf = ShelfOf.Share * WaterKeep;
+    const float3 ShelfGradient = BakeGradient * (ShelfOf.Slope * WaterKeep);
+    // The ice on the ground: a glacier or the shelf.
+    const float Ground = Now + Shelf - Now * Shelf;
+    const float3 GroundGradient = NowGradient * (1.0f - Shelf) + ShelfGradient * (1.0f - Now);
+    // The ice cover: the sheet, a glacier or the shelf.
+    const float Iced = Ground + IceFade - Ground * IceFade;
+    const float3 IcedGradient = GroundGradient * (1.0f - IceFade) + IceFadeGradient * (1.0f - Ground);
+    const float SteerSlope = length(LandSteer);
+    const float SheetSlope = length(IceSlope);
+
+    // Crevasses: glaciers on steep ground, and the sheet near its margin; across the ice's flow.
+    if (LandPolarCrevasseTexelsPerCell > 0.0f && Iced > 0.0f)
+    {
+        const float GS = smoothstep(VOXEL_LAND_POLAR_GLACIER_SLOPE_START, VOXEL_LAND_POLAR_GLACIER_SLOPE_END, SteerSlope);
+        const float SS = smoothstep(VOXEL_LAND_POLAR_SHEET_SLOPE_START, VOXEL_LAND_POLAR_SHEET_SLOPE_END, SheetSlope);
+        const float Gc = Now * (1.0f - IceFade) * GS;
+        const float Sc = IceFade * SS;
+        float3 Flow = float3(0.0f, 0.0f, 0.0f);
+        if (Gc > 0.0f && SteerSlope > 1.0e-6f) Flow = Flow - LandSteer * (Gc / SteerSlope);
+        if (Sc > 0.0f && SheetSlope > 1.0e-6f) Flow = Flow - IceSlope * (Sc / SheetSlope);
+        const float FlowLength = length(Flow);
+        // Where the two flows cancel, the crevasses give way (their direction means little there).
+        const float Agree = smoothstep(VOXEL_LAND_POLAR_FLOW_START, VOXEL_LAND_POLAR_FLOW_END, FlowLength / max(Gc + Sc, 1.0e-6f));
+        if (FlowLength > 1.0e-6f && Agree > 0.0f)
+        {
+            Out.Flow = Flow / FlowLength;
+            Out.Crevasse = (Gc + Sc - Gc * Sc) * Agree;
+            if (bGradients)
+            {
+                const float3 GcGradient = (NowGradient * (1.0f - IceFade) - IceFadeGradient * Now) * GS;
+                const float3 ScGradient = IceFadeGradient * SS;
+                Out.CrevasseGradient = (GcGradient * (1.0f - Sc) + ScGradient * (1.0f - Gc)) * Agree;
+            }
+        }
+    }
+
+    // Sastrugi and snow dunes: cold ice and snow, along the wind.
+    const bool bSnowDunes = LandPolarDuneTexelsPerCell > 0.0f && LandPolarDuneN != 0u;
+    if ((LandPolarSastrugiTexelsPerCell > 0.0f || bSnowDunes) && Iced > 0.0f)
+    {
+        // At the surface's own height (the ice's top on a sheet).
+        const float T = Cell.SeaTemperature - LandClimateLapse * max(Surface, 0.0f) * 0.001f;
+        const float Cold = VoxelLandClimateRamp(VOXEL_LAND_POLAR_SASTRUGI_WARM, VOXEL_LAND_POLAR_SASTRUGI_COLD, T);
+        if (Cold > 0.0f)
+        {
+            // The drift (east and north at the point, Z the spin axis), times its steadiness.
+            const float3 Drift = VoxelLandClimateDriftAt(VOXEL_LAND_ARGS Taps);
+            float3 Wind = float3(0.0f, 0.0f, 0.0f);
+            const float3 EastRaw = float3(-Normal.y, Normal.x, 0.0f);
+            const float EastLength = length(EastRaw);
+            const float DriftLength = sqrt(Drift.x * Drift.x + Drift.y * Drift.y);
+            if (EastLength > 1.0e-4f && DriftLength > 1.0e-4f)
+            {
+                const float3 East = EastRaw / EastLength;
+                const float3 North = cross(Normal, East);
+                Wind = (East * Drift.x + North * Drift.y) * (saturate(Drift.z) / DriftLength);
+            }
+            // The katabatic wind down the sheet's slope, turned by the Coriolis force (to the right
+            // in the north: a negative turn; smoothly through the equator, where no sheet is).
+            if (IceFade > 0.0f && SheetSlope > 1.0e-6f)
+            {
+                const float K = IceFade * smoothstep(VOXEL_LAND_POLAR_KATABATIC_START, VOXEL_LAND_POLAR_KATABATIC_END, SheetSlope);
+                const float Hemisphere = clamp(Normal.z * 10.0f, -1.0f, 1.0f);
+                Wind = Wind + VoxelLandPolarTurn(IceSlope * (-1.0f / SheetSlope), Normal, -VOXEL_LAND_POLAR_KATABATIC_TURN * Hemisphere) * K;
+            }
+            const float WindLength = length(Wind);
+            const float WindShare = smoothstep(VOXEL_LAND_POLAR_WIND_START, VOXEL_LAND_POLAR_WIND_END, WindLength);
+            if (WindShare > 0.0f)
+            {
+                Out.Wind = Wind / WindLength;
+                // The cold's change with the bake's height (the sheet's thickness left out).
+                const float3 ColdGradient = BakeGradient * (VoxelLandGlacialFadeSlope(VOXEL_LAND_POLAR_SASTRUGI_WARM, VOXEL_LAND_POLAR_SASTRUGI_COLD, T) * DTDH);
+                if (LandPolarSastrugiTexelsPerCell > 0.0f)
+                {
+                    Out.Sastrugi = Iced * Cold * WindShare;
+                    if (bGradients)
+                        Out.SastrugiGradient = (IcedGradient * Cold + ColdGradient * Iced) * WindShare;
+                }
+                if (bSnowDunes)
+                {
+                    // The snow plains: the sheet's thick, flat interior, flat glacier ice or the ice
+                    // shelf (T5e); out of the crevasses.
+                    const float FlatSheet = 1.0f - smoothstep(VOXEL_LAND_POLAR_PLAIN_SHEET_START, VOXEL_LAND_POLAR_PLAIN_SHEET_END, SheetSlope);
+                    const float FlatLand = 1.0f - smoothstep(VOXEL_LAND_POLAR_PLAIN_LAND_START, VOXEL_LAND_POLAR_PLAIN_LAND_END, SteerSlope);
+                    const float Plain = IceFade * FlatSheet + Ground * (1.0f - IceFade) * FlatLand;
+                    const float Open = 1.0f - Out.Crevasse;
+                    Out.SnowDune = Plain * Cold * WindShare * Open;
+                    if (bGradients)
+                    {
+                        const float3 PlainGradient = IceFadeGradient * (FlatSheet - Ground * FlatLand) + GroundGradient * ((1.0f - IceFade) * FlatLand);
+                        Out.SnowDuneGradient = ((PlainGradient * Cold + ColdGradient * Plain) * Open - Out.CrevasseGradient * (Plain * Cold)) * WindShare;
+                    }
+                }
+            }
+        }
+    }
+
+    // Ice-wedge polygons: bare frozen ground, flat, inland, out of the water.
+    if (LandPolarPolygonTexelsPerCell > 0.0f && Iced < 1.0f && WaterKeep > 0.0f)
+    {
+        const float T = Cell.SeaTemperature - LandClimateLapse * max(Bake, 0.0f) * 0.001f;
+        const float TWarm = LandPolarPermafrostT + VOXEL_LAND_POLAR_PERMAFROST_HALF;
+        const float TCold = LandPolarPermafrostT - VOXEL_LAND_POLAR_PERMAFROST_HALF;
+        const float Frozen = VoxelLandClimateRamp(TWarm, TCold, T);
+        const float Coast = smoothstep(VOXEL_LAND_POLAR_COAST_START, VOXEL_LAND_POLAR_COAST_END, Bake);
+        const float Flat = 1.0f - smoothstep(VOXEL_LAND_POLAR_FLAT_START, VOXEL_LAND_POLAR_FLAT_END, SteerSlope);
+        const float Bare = 1.0f - Iced;
+        Out.Polygon = Bare * Frozen * Coast * Flat * WaterKeep;
+        if (bGradients && Out.Polygon > 0.0f)
+        {
+            const float3 FrozenGradient = BakeGradient * (VoxelLandGlacialFadeSlope(TWarm, TCold, T) * DTDH);
+            const float3 CoastGradient = BakeGradient * VoxelLandGlacialFadeSlope(VOXEL_LAND_POLAR_COAST_START, VOXEL_LAND_POLAR_COAST_END, Bake);
+            Out.PolygonGradient = (IcedGradient * (-Frozen * Coast) + FrozenGradient * (Bare * Coast) + CoastGradient * (Bare * Frozen)) * (Flat * WaterKeep);
+        }
+    }
+    return Out;
+}
+
+/** The polar surfaces' height (m) and gradient (m/m, tangent at the point; bGradients). */
+struct FVoxelLandPolar
+{
+    float Height;
+    float3 Gradient;
+};
+
+/** A feature's footprint fade: 1 until VOXEL_LAND_POLAR_FADE_LEVELS before Fade, 0 from Fade (its
+ *  mip level from the footprint, cm, and its texel, m: texels about half the footprint). */
+VOXEL_FUNC float VoxelLandPolarFadeOf(float Footprint, float TexelM, float Fade)
+{
+    const float Level = max(log2(max(Footprint, 1.0f) / (TexelM * 100.0f)) - 1.0f, 0.0f);
+    return 1.0f - smoothstep(Fade - VOXEL_LAND_POLAR_FADE_LEVELS, Fade, Level);
+}
+
+/** The bin either side of a direction's angle in a face's frame, less Turn (radians: the set's own
+ *  grain, so the set's slots or ridges, not its x, end up across or along the direction): the
+ *  lower bin and the share of the upper (Tw: sharpened to VOXEL_LAND_POLAR_TURN_BLEND about the
+ *  middle). */
+struct FVoxelLandPolarBins
+{
+    uint B0;
+    uint B1;
+    float Tw;
+};
+
+VOXEL_FUNC FVoxelLandPolarBins VoxelLandPolarBinsOf(float3 Dir, FVoxelLandFaceFrame Frame, float Turn)
+{
+    const float WU = dot(Dir, normalize(Frame.TU));
+    const float WV = dot(Dir, normalize(Frame.TV));
+    float Phi = ((WU * WU + WV * WV > 1.0e-8f ? atan2(WV, WU) : 0.0f) - Turn) * (float(VOXEL_LAND_DUNE_BINS) / 6.28318531f);
+    // (atan2 within -pi .. pi, Turn within -pi/2 .. pi/2: one wrap is enough.)
+    if (Phi < 0.0f) Phi += float(VOXEL_LAND_DUNE_BINS);
+    const float Floor = floor(Phi);
+    FVoxelLandPolarBins Out;
+    Out.Tw = smoothstep(0.5f - VOXEL_LAND_POLAR_TURN_BLEND, 0.5f + VOXEL_LAND_POLAR_TURN_BLEND, Phi - Floor);
+    Out.B0 = uint(Floor) % VOXEL_LAND_DUNE_BINS;
+    Out.B1 = (Out.B0 + 1u) % VOXEL_LAND_DUNE_BINS;
+    return Out;
+}
+
+/** The polar surfaces at the sea-level sphere point P (double-float, cm) for a site
+ *  (VoxelLandPolarSiteAt), band-limited to Footprint (cm). Zero-mean features, each within its
+ *  channel's range about its mean times sqrt 2 (the two turns) times the face blend's bound
+ *  (VoxelLand::PolarReach). */
+VOXEL_FUNC FVoxelLandPolar VoxelLandPolarDF(VOXEL_LAND_ARGS_DECL float2 PX, float2 PY, float2 PZ, FVoxelLandPolarSite Site, float Footprint,
+    bool bGradients)
+{
+    FVoxelLandPolar Out;
+    Out.Height = 0.0f;
+    Out.Gradient = float3(0.0f, 0.0f, 0.0f);
+    // Each feature's texel (m), amplitude (m per unit value: its share, its scale, its footprint
+    // fade) and the amplitude's gradient.
+    const float TexelC = LandPolarCrevasseTexelsPerCell > 0.0f ? LandCellM / LandPolarCrevasseTexelsPerCell : 1.0f;
+    const float TexelS = LandPolarSastrugiTexelsPerCell > 0.0f ? LandCellM / LandPolarSastrugiTexelsPerCell : 1.0f;
+    const float TexelP = LandPolarPolygonTexelsPerCell > 0.0f ? LandCellM / LandPolarPolygonTexelsPerCell : 1.0f;
+    const float TexelD = LandPolarDuneTexelsPerCell > 0.0f ? LandCellM / LandPolarDuneTexelsPerCell : 1.0f;
+    const float MC = Site.Crevasse > 0.0f ? LandPolarCrevasseM * VoxelLandPolarFadeOf(Footprint, TexelC, LandPolarCrevasseFade) : 0.0f;
+    const float MS = Site.Sastrugi > 0.0f ? LandPolarSastrugiM * VoxelLandPolarFadeOf(Footprint, TexelS, LandPolarSastrugiFade) : 0.0f;
+    const float MP = Site.Polygon > 0.0f ? LandPolarPolygonM * VoxelLandPolarFadeOf(Footprint, TexelP, LandPolarPolygonFade) : 0.0f;
+    const float MD = Site.SnowDune > 0.0f ? LandPolarDuneM * VoxelLandPolarFadeOf(Footprint, TexelD, LandPolarDuneFade) : 0.0f;
+    const float AC = Site.Crevasse * MC;
+    const float AS = Site.Sastrugi * MS;
+    const float AP = Site.Polygon * MP;
+    const float AD = Site.SnowDune * MD;
+    if (AC <= 0.0f && AS <= 0.0f && AP <= 0.0f && AD <= 0.0f) return Out;
+
+    const float Band = 2.0f * VOXEL_LAND_PEAK_BAND_CELLS / float(LandN);
+    const float DSDX = 2.0f / (float(LandN) * LandCellM);
+    const FVoxelLandNoiseSetRef PolarSet = VoxelLandNoiseSetOf(LandPolarBase, LandPolarN, LandPolarMips);
+    const FVoxelLandNoiseSetRef DuneSet = VoxelLandNoiseSetOf(LandPolarDuneBase, LandPolarDuneN, LandPolarDuneMips);
+    float WSum = 0.0f;
+    float W2Sum = 0.0f;
+    float USum = 0.0f;       // sum of W x the face's height (m)
+    float UCSum = 0.0f;      // per feature, sum of W x the face's unit (the amplitudes' change)
+    float USSum = 0.0f;
+    float UPSum = 0.0f;
+    float UDSum = 0.0f;
+    float3 GSum = float3(0.0f, 0.0f, 0.0f);
+    float3 WWGrad = float3(0.0f, 0.0f, 0.0f);
+    VOXEL_LOOP
+    for (uint Axis = 0u; Axis < 3u; Axis++)
+    {
+        const float2 PN = VoxelLandPick(PX, PY, PZ, Axis);
+        if (PN.x == 0.0f) continue;
+        const bool bNegative = PN.x < 0.0f;
+        const uint Face = Axis * 2u + (bNegative ? 1u : 0u);
+        const float2 Den = bNegative ? float2(-PN.x, -PN.y) : PN;
+        const float2 AU = VoxelDFDiv(VoxelLandPick(PX, PY, PZ, VoxelCubeUAxis(Face)), Den);
+        const float2 AV = VoxelDFDiv(VoxelLandPick(PX, PY, PZ, VoxelCubeVAxis(Face)), Den);
+        const float S = atan(AU.x) * VOXEL_LAND_INV_QUARTER_PI;
+        const float T = atan(AV.x) * VOXEL_LAND_INV_QUARTER_PI;
+        const float RS = VoxelLandFaceRamp(S, Band);
+        const float RT = VoxelLandFaceRamp(T, Band);
+        const float W = RS * RT;
+        if (W <= 0.0f) continue;
+        const FVoxelLandFaceFrame Frame = VoxelLandFaceFrameAt(Face, AU.x, AV.x);
+        const FVoxelLandPeakCoord CU = VoxelLandPeakCoordAt(VOXEL_LAND_ARGS VoxelLandAxisAt(VOXEL_LAND_ARGS AU, S));
+        const FVoxelLandPeakCoord CV = VoxelLandPeakCoordAt(VOXEL_LAND_ARGS VoxelLandAxisAt(VOXEL_LAND_ARGS AV, T));
+        // The directed features' turns either side of their directions, their weights over the
+        // root of their squares (the variance kept: one turn's own at Tw 0 or 1).
+        const FVoxelLandPolarBins BC = VoxelLandPolarBinsOf(Site.Flow, Frame, LandPolarCrevasseTurn);
+        const FVoxelLandPolarBins BS = VoxelLandPolarBinsOf(Site.Wind, Frame, LandPolarSastrugiTurn);
+        const float QC = 1.0f / sqrt((1.0f - BC.Tw) * (1.0f - BC.Tw) + BC.Tw * BC.Tw);
+        const float QS = 1.0f / sqrt((1.0f - BS.Tw) * (1.0f - BS.Tw) + BS.Tw * BS.Tw);
+        const FVoxelLandPolarBins BD = VoxelLandPolarBinsOf(Site.Wind, Frame, 0.0f);
+        const float QD = 1.0f / sqrt((1.0f - BD.Tw) * (1.0f - BD.Tw) + BD.Tw * BD.Tw);
+        float FaceU = 0.0f;
+        float FaceUC = 0.0f;
+        float FaceUS = 0.0f;
+        float FaceUP = 0.0f;
+        float FaceUD = 0.0f;
+        float FaceGU = 0.0f;
+        float FaceGV = 0.0f;
+        // The taps: the crevasses' two turns, the sastrugi's two, the polygons' one, the snow dunes'
+        // two (the wind's turns: the dune set's x is downwind, its crests across it). One lookup
+        // call site.
+        VOXEL_LOOP
+        for (uint Tap = 0u; Tap < 7u; Tap++)
+        {
+            const uint Feature = Tap < 2u ? 0u : (Tap < 4u ? 1u : (Tap < 5u ? 2u : 3u));
+            FVoxelLandNoiseSetRef Set = PolarSet;
+            float A = AP;
+            float Weight = 1.0f;
+            uint Bin = 0u;
+            float TPC = LandPolarPolygonTexelsPerCell;
+            float Mean = LandPolarPolygonMean;
+            uint Salt = 0x706f6c79u;
+            if (Feature == 0u)
+            {
+                A = AC;
+                Weight = (Tap == 0u ? 1.0f - BC.Tw : BC.Tw) * QC;
+                Bin = Tap == 0u ? BC.B0 : BC.B1;
+                TPC = LandPolarCrevasseTexelsPerCell;
+                Mean = LandPolarCrevasseMean;
+                Salt = 0x63726576u;
+            }
+            else if (Feature == 1u)
+            {
+                A = AS;
+                Weight = (Tap == 2u ? 1.0f - BS.Tw : BS.Tw) * QS;
+                Bin = Tap == 2u ? BS.B0 : BS.B1;
+                TPC = LandPolarSastrugiTexelsPerCell;
+                Mean = LandPolarSastrugiMean;
+                Salt = 0x73617374u;
+            }
+            else if (Feature == 3u)
+            {
+                A = AD;
+                // The dune set's own x (no grain turn): the wind's turns before the sastrugi's grain.
+                Weight = (Tap == 5u ? 1.0f - BD.Tw : BD.Tw) * QD;
+                Bin = Tap == 5u ? BD.B0 : BD.B1;
+                TPC = LandPolarDuneTexelsPerCell;
+                Mean = LandPolarDuneMean;
+                Salt = 0x736e6f77u;
+                Set = DuneSet;
+            }
+            if (A <= 0.0f || Weight <= 0.0f) continue;
+            const uint H = VoxelHash(uint3(Face, Bin, Salt), LandPolarSeed);
+            const uint H2 = VoxelHash(uint3(Face, Bin, Salt ^ 0x5f5f5f5fu), LandPolarSeed);
+            // The directed features: the bin's turn, the set as it is (a mirror would turn its grain
+            // the other way); the polygons: the face's own turn, any orientation.
+            float2 Rot = VoxelLandDuneRotation(Bin);
+            uint Orient = 0u;
+            if (Feature == 2u)
+            {
+                Rot = VoxelLandPeakRotation(H >> 29u);
+                Orient = H & 7u;
+            }
+            // x = u cos + v sin, y = -u sin + v cos, in the set's texels.
+            const FVoxelLandNoiseAxis AX = VoxelLandPeakRotated(CU, CV, Rot.x * TPC, Rot.y * TPC);
+            const FVoxelLandNoiseAxis AY = VoxelLandPeakRotated(CU, CV, -Rot.y * TPC, Rot.x * TPC);
+            const float TexelM = LandCellM / TPC;
+            const float Level = max(log2(max(Footprint, 1.0f) / (TexelM * 100.0f)) - 1.0f, 0.0f);
+            const FVoxelLandNoise N = VoxelLandNoiseAt(VOXEL_LAND_ARGS Set, AX, AY, Orient, H >> 3u, H2, Level,
+                Feature == 2u ? VOXEL_LAND_NOISE_WANT_ONLY_B : 0u);
+            float V = N.B;
+            float VX = N.BU;
+            float VY = N.BV;
+            if (Feature == 0u)
+            {
+                V = N.R;
+                VX = N.RU;
+                VY = N.RV;
+            }
+            else if (Feature != 2u)
+            {
+                // The sastrugi, and the snow dunes (the dune set's G, rounded crests).
+                V = N.G;
+                VX = N.GU;
+                VY = N.GV;
+            }
+            const float Unit = (V - Mean) * Weight;
+            FaceU += Unit * A;
+            if (Feature == 0u) FaceUC += Unit;
+            else if (Feature == 1u) FaceUS += Unit;
+            else if (Feature == 2u) FaceUP += Unit;
+            else FaceUD += Unit;
+            // Back to the face's axes (per m): d/du = cos d/dx - sin d/dy, d/dv = sin d/dx + cos d/dy.
+            const float S2 = Weight * A / TexelM;
+            FaceGU += (Rot.x * VX - Rot.y * VY) * S2;
+            FaceGV += (Rot.y * VX + Rot.x * VY) * S2;
+        }
+        // The faces as the set layers', about zero.
+        const float WSU = VoxelLandFaceRampSlope(S, Band) * RT * DSDX;
+        const float WSV = RS * VoxelLandFaceRampSlope(T, Band) * DSDX;
+        USum += W * FaceU;
+        UCSum += W * FaceUC;
+        USSum += W * FaceUS;
+        UPSum += W * FaceUP;
+        UDSum += W * FaceUD;
+        WSum += W;
+        W2Sum += W * W;
+        if (bGradients)
+        {
+            GSum = GSum + VoxelLandFaceVector(Frame, W * FaceGU + FaceU * WSU, W * FaceGV + FaceU * WSV);
+            WWGrad = WWGrad + VoxelLandFaceVector(Frame, W * WSU, W * WSV);
+        }
+    }
+    if (WSum <= 0.0f) return Out;
+    const float InvQ = 1.0f / sqrt(W2Sum);
+    Out.Height = USum * InvQ;
+    if (bGradients)
+    {
+        const float InvQ3 = InvQ * InvQ * InvQ;
+        // The shape at fixed amplitudes, then each feature's unit times its amplitude's change.
+        Out.Gradient = GSum * InvQ - WWGrad * (USum * InvQ3)
+            + Site.CrevasseGradient * (UCSum * InvQ * MC) + Site.SastrugiGradient * (USSum * InvQ * MS) + Site.PolygonGradient * (UPSum * InvQ * MP)
+            + Site.SnowDuneGradient * (UDSum * InvQ * MD);
+    }
+    return Out;
+}
+
+#endif // VOXEL_LAND_POLAR_USH

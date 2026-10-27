@@ -376,6 +376,194 @@ struct VOXELPLUGIN_API FVoxelTerrestrialSettings
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrestrial|Sample", meta = (ClampMin = "16.0", UIMin = "50", UIMax = "2000"))
     double StrataDetailWavelength = 400.0;
 
+    /** The dune set (Design/LandClimate.md, T5c): sand seas where the climate snapshot makes
+     *  desert (Holdridge's aridity at the ground's height), on low ground only, turned to the
+     *  climate's sand drift: sharp crests under one steady wind, rounded under variable winds,
+     *  crossing networks under many. A file name in the plugin's NoiseSets folder without .vxnt
+     *  (e.g. dunes_a), empty to pick one of the folder's dunes* sets by the seed, or "none".
+     *  Rides the hill set's layer (none without a hill set) and needs the land climate
+     *  (APlanetActor::LandClimate). */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrestrial|Dunes")
+    FString DuneNoiseSet;
+
+    /** The dune set's height over its own relief at its placement (DuneSpacing): 1 keeps the
+     *  simulated slopes (slip faces at the angle of repose). 0 turns the dunes off. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrestrial|Dunes", meta = (ClampMin = "0.0", UIMax = "2.0"))
+    double DuneHeightScale = 1.0;
+
+    /** The distance between the dunes' crests (m): the set's wavelength is placed at this. Their
+     *  height scales with it (about a fifth of it at the highest crests, a sixteenth on average,
+     *  with the default sets). */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrestrial|Dunes", meta = (ClampMin = "100.0", UIMin = "200", UIMax = "3000"))
+    double DuneSpacing = 600.0;
+
+    /** The share of the desert that is sand sea (ergs); the rest is rock and gravel plain. Earth's
+     *  deserts are about a fifth to a third sand. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrestrial|Dunes", meta = (ClampMin = "0.0", ClampMax = "1.0"))
+    double DuneErgCoverage = 0.35;
+
+    /** The sand seas' size (km): the scale of the noise that places them. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrestrial|Dunes", meta = (ClampMin = "10.0", UIMin = "50", UIMax = "2000"))
+    double DuneErgSize = 400.0;
+
+    /** The local relief (m, the bake's) above which there are no dunes; they are full under 0.4 of
+     *  it. Dunes fill basins and plains; ranges keep their rock. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrestrial|Dunes", meta = (ClampMin = "10.0", UIMax = "2000.0"))
+    double DuneMaxRelief = 400.0;
+
+    /** The sand's detail set (T5c): the megaripples on the dunes, across the wind as the crests are.
+     *  A file name (e.g. sanddetail_a), empty to pick one of the folder's sanddetail* sets by the
+     *  seed, or "none". */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrestrial|Dunes")
+    FString SandDetailNoiseSet;
+
+    /** The megaripples' wavelength (m); kept within 2 m .. a quarter of DuneSpacing in code. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrestrial|Dunes", meta = (ClampMin = "2.0", UIMin = "4", UIMax = "100"))
+    double SandDetailWavelength = 24.0;
+
+    /** The sand detail's height over its set's at its placement: 1 keeps its slopes. 0 turns it off. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrestrial|Dunes", meta = (ClampMin = "0.0", UIMax = "2.0"))
+    double SandDetailStrength = 1.0;
+
+    /** The glacial set (Design/LandClimate.md, T5d): ice-carved mountains (troughs, cirques, horns,
+     *  arêtes, fjord beds; R the bedrock, G the ice surface over it) in the peaks' place where the
+     *  climate snapshot puts glaciers now or at the last glacial maximum (GlacialEraCooling): bare
+     *  carved bedrock where the ice has gone, the ice surface where it stays. A file name in the
+     *  plugin's NoiseSets folder without .vxnt (e.g. glacial_a), empty to pick one of the folder's
+     *  glacial* sets by the seed, or "none". Rides the peaks (none without them) and needs the
+     *  land climate (APlanetActor::LandClimate). */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrestrial|Glacial")
+    FString GlacialNoiseSet;
+
+    /** The glacial set's height over its own relief at its placement (GlacialSpacing), as
+     *  PeakHeightScale: 1 keeps the simulated slopes, never more than the bake's local relief.
+     *  0 turns the glacial layer off (the peaks everywhere). */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrestrial|Glacial", meta = (ClampMin = "0.0", UIMax = "2.0"))
+    double GlacialHeightScale = 1.0;
+
+    /** The distance between the glacial set's main troughs (m): its spacing is placed at this. Its
+     *  relief scales with it (the walls' height is about half of it with glacial_a, capped by the
+     *  bake's relief). */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrestrial|Glacial", meta = (ClampMin = "500.0", UIMin = "2000", UIMax = "20000"))
+    double GlacialSpacing = 6000.0;
+
+    /** How much colder (C) the last glacial maximum was: the land its glaciers reached keeps their
+     *  carving (bare troughs and cirques below today's ice). Earth's was about 6 C. 0: only today's
+     *  glaciers. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrestrial|Glacial", meta = (ClampMin = "0.0", UIMax = "15.0"))
+    double GlacialEraCooling = 6.0;
+
+    /** The ice sheets (Design/LandClimate.md, T5d2): where the climate snapshot ices the land
+     *  today, an ice sheet over it, thickening into the ice by the plastic profile (Nye: 470 m 10 km
+     *  in, 1.5 km at 100 km), at most this thick (m). The land shows through where it stands higher
+     *  (nunataks). Needs the land climate. 0 turns them off. The planet's height range takes this
+     *  much above its highest ground if its peaks don't already. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrestrial|Ice", meta = (ClampMin = "0.0", UIMax = "5000.0"))
+    double IceSheetMaxThickness = 2000.0;
+
+    /** The ice sheets' swells: the icesheet set's G (its ice surface: smooth swells over a buried
+     *  bed). A file name in the plugin's NoiseSets folder without .vxnt (e.g. icesheet_a), empty to
+     *  pick one of the folder's icesheet* sets by the seed, or "none" (a smooth sheet). */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrestrial|Ice")
+    FString IceSheetNoiseSet;
+
+    /** The swells' height (m): the set's G from its lowest to its highest. 0: no swells. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrestrial|Ice", meta = (ClampMin = "0.0", UIMax = "500.0"))
+    double IceSheetSwellHeight = 60.0;
+
+    /** The swells' spacing (m): the set's tile over its cells is placed at this. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrestrial|Ice", meta = (ClampMin = "1000.0", UIMin = "5000", UIMax = "100000"))
+    double IceSheetSwellSpacing = 30000.0;
+
+    /** Stage T5d3: the polar surfaces' set (VoxelLandPolar.ush): a file name in the plugin's
+     *  NoiseSets folder without .vxnt (polar_*: R crevasses, G sastrugi, B ice-wedge polygons, A sea
+     *  ice), or empty to pick one by the seed, or "none". Laid where the climate snapshot makes ice
+     *  or frozen ground (needs the land climate). */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrestrial|Polar")
+    FString PolarNoiseSet;
+
+    /** The crevasses' scale (m): one of the set's R cells (polar_a: crevasses about half of it
+     *  apart, a sixth of it wide, a third of it deep). On glaciers on steep ground and near the ice
+     *  sheets' margins, across the ice's flow. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrestrial|Polar", meta = (ClampMin = "10.0", UIMin = "20", UIMax = "200"))
+    double CrevasseSpacing = 60.0;
+
+    /** The crevasses' height over the set's own at that scale (1: the simulated walls). 0: none. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrestrial|Polar", meta = (ClampMin = "0.0", UIMax = "2.0"))
+    double CrevasseHeightScale = 1.0;
+
+    /** The sastrugi's scale (m): one of the set's G cells (polar_a: ridges 1 to 3 of it long, up to
+     *  a third of it high). On ice and snow that stay well below freezing, along the wind (the
+     *  snapshot's, and the ice sheets' katabatic winds). */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrestrial|Polar", meta = (ClampMin = "1.0", UIMin = "2", UIMax = "20"))
+    double SastrugiSpacing = 4.0;
+
+    /** The sastrugi's height over the set's own (1: the simulated slopes). 0: none. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrestrial|Polar", meta = (ClampMin = "0.0", UIMax = "3.0"))
+    double SastrugiHeightScale = 1.0;
+
+    /** The ice-wedge polygons' size (m): one of the set's B cells, about a polygon across. On flat
+     *  bare ground over permafrost. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrestrial|Polar", meta = (ClampMin = "4.0", UIMin = "8", UIMax = "60"))
+    double PolygonSpacing = 20.0;
+
+    /** The polygons' height over the set's own (1: rims and troughs about a metre at 20 m). 0: none. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrestrial|Polar", meta = (ClampMin = "0.0", UIMax = "3.0"))
+    double PolygonHeightScale = 1.0;
+
+    /** The year's mean temperature (C) at which the polygons are half in, over +-2 C: continuous
+     *  permafrost with active ice wedges (Pewe 1966: about -6 C to -8 C or colder). */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrestrial|Polar", meta = (UIMin = "-15.0", UIMax = "0.0"))
+    double PermafrostTemperature = -6.0;
+
+    /** The snow dunes' spacing (m): crest to crest, the dune set's (its G, rounded crests) on the
+     *  flat snow plains (the ice sheets' thick interiors, flat cold glacier ice), across the wind.
+     *  Needs the pack's dune set (DuneNoiseSet, the hill set). The polar plateaus' snow dunes and
+     *  megadunes: a few hundred metres to a few kilometres. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrestrial|Polar", meta = (ClampMin = "50.0", UIMin = "200", UIMax = "5000"))
+    double SnowDuneSpacing = 400.0;
+
+    /** The snow dunes' height (m), trough to the highest crest: low grade (the megadunes: 2 to 8
+     *  m; slopes of a few percent at the default spacing). 0: none. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrestrial|Polar", meta = (ClampMin = "0.0", UIMax = "40.0"))
+    double SnowDuneHeight = 8.0;
+
+    /** T5e, the polar ice shelf (Design/LandClimate.md): where the climate snapshot's year's mean
+     *  at sea level is below IceShelfTemperature, the polar sea (and any low land there) becomes a
+     *  shelf of ice: a solid plateau in the base elevation, like a plate placed by the cold, its
+     *  front wandering into capes and bays (IceShelfFrontNoise), its surface gently rolling under
+     *  the snow dunes, any ground higher than it standing through. Placed once per capture. The
+     *  front's height above the sea (m; Antarctica's shelf fronts stand 15 to 50 m). 0: none.
+     *  Needs the land climate. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrestrial|IceShelf", meta = (ClampMin = "0.0", UIMax = "150.0"))
+    double IceShelfHeight = 40.0;
+
+    /** The year's mean at sea level (C) at the shelf's front: colder is shelf. -15 C is about 72
+     *  degrees of latitude on an Earth-like planet. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrestrial|IceShelf", meta = (UIMin = "-30.0", UIMax = "-5.0"))
+    double IceShelfTemperature = -15.0;
+
+    /** How far the front wanders from that line, at most (C of the year's mean: capes and bays
+     *  from thousands of kilometres down to a few bake cells; a degree is about 100 km on an
+     *  Earth-like planet's polar latitudes). 0: the line itself. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrestrial|IceShelf", meta = (ClampMin = "0.0", UIMax = "10.0"))
+    double IceShelfFrontNoise = 5.0;
+
+    /** The height the shelf gains inland (m), reached 3 C colder than the front. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrestrial|IceShelf", meta = (ClampMin = "0.0", UIMax = "200.0"))
+    double IceShelfRise = 40.0;
+
+    /** The gentle roll of its surface (m, either way; tens to a hundred kilometres across). The
+     *  snow dunes and sastrugi ride on it. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrestrial|IceShelf", meta = (ClampMin = "0.0", UIMax = "50.0"))
+    double IceShelfRoll = 10.0;
+
+    /** The depth (m) the sea floor rises to in front of and under the shelf (over about 1.5 C
+     *  outside its front), so the front stands this far into the water, not over the abyss. 0:
+     *  the sea floor as it is. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrestrial|IceShelf", meta = (ClampMin = "0.0", UIMax = "2000.0"))
+    double IceShelfDraft = 300.0;
+
     /** Rivers (Design/RiversLakes.md, R1): the smallest drainage area (km^2) that carries a
      *  river. The network is the bake's own drainage, made into lines when the bake is ready
      *  (no rebake to change it). 0 turns the rivers off. */

@@ -59,7 +59,7 @@ done
 # The material's Custom-node code: the includes made local.
 for f in "$WORK"/Plugin/VoxelPlugin/Private/*; do sed 's#"Plugin/VoxelPlugin/Private/#"#' "$f" > "$WORK/mat/$(basename "$f")"; done
 cp "$HERE"/Material/*.hlsl "$HERE"/Material/stub_platform.ush "$WORK/mat/"
-for t in material_test material_cached; do
+for t in material_test material_cached climate_material; do
   for v in 2018 2021; do
     out=$("$DXC" -T ps_6_6 -E main -HV $v -I "$WORK/mat" "$WORK/mat/$t.hlsl" -Fo /dev/null 2>&1 | grep -E "error|warning" | head -5)
     [ -n "$out" ] && { echo "$t HLSL $v: $out"; fails=1; }

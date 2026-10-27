@@ -383,6 +383,27 @@ namespace VoxelNoiseTiles
     template <typename TFunc>
     double MeanOf(const FSet& Set, int Channel, TFunc&& F) { return MeanOf(Set, Set.Texels.data(), Channel, F); }
 
+    /** Stage T5d3: the direction (radians, -pi/2 .. pi/2 from the tile's x toward its y, the texel
+     *  rows) Channel's mip-0 slopes mostly face, from their structure tensor (the mean of g g^T over
+     *  the tile, periodic central differences): half the angle of (Sxx - Syy, 2 Sxy). The normal of
+     *  a set's ridges or slots (polar R's crevasses, G's sastrugi), defined up to a half turn. */
+    inline double GrainAngleOf(const FSet& Set, const uint16_t* Texels, int Channel)
+    {
+        const uint32_t N = Set.N;
+        auto At = [&](uint32_t x, uint32_t y) { return (double)Texels[((size_t)y * N + x) * 4 + Channel]; };
+        double Sxx = 0.0, Syy = 0.0, Sxy = 0.0;
+        for (uint32_t y = 0; y < N; y++)
+            for (uint32_t x = 0; x < N; x++)
+            {
+                const double GX = At((x + 1) % N, y) - At((x + N - 1) % N, y);
+                const double GY = At(x, (y + 1) % N) - At(x, (y + N - 1) % N);
+                Sxx += GX * GX;
+                Syy += GY * GY;
+                Sxy += GX * GY;
+            }
+        return 0.5 * std::atan2(2.0 * Sxy, Sxx - Syy);
+    }
+
     /** The mean over mip 0 of F(decoded value of Channel A, of Channel B). */
     template <typename TFunc>
     double MeanOf2(const FSet& Set, const uint16_t* Texels, int ChannelA, int ChannelB, TFunc&& F)
@@ -650,6 +671,56 @@ namespace VoxelNoiseTiles
         if (G.CellsPerTile != Cells) return "R and G have different massif counts";
         if (Cells == 0u || Set.N % Cells != 0u) return "R's massif count (" + std::to_string(Cells) + ") doesn't divide the size";
         if (Set.N / Cells < 32u || Set.N / Cells > 512u) return "R's massif spacing (" + std::to_string(Set.N / Cells) + " texels) isn't within 32 .. 512";
+        return std::string();
+    }
+
+    /** Whether Set has the `dunes` layout VoxelLandDunes.ush reads (stage T5c): R and G simulated
+     *  heights of one dune field (sharp and rounded crests, the slip faces toward +x; the same
+     *  crest count, dividing N), a crest spacing (N / cells) of 16 to 512 texels; B and A aren't
+     *  read. "" if so, else why not. */
+    inline std::string CheckDunes(const FSet& Set)
+    {
+        const FChannel& R = Set.Channel[0];
+        const FChannel& G = Set.Channel[1];
+        if (R.Kind != KindErodedHeight || G.Kind != KindErodedHeight)
+            return "R and G aren't simulated heights (kinds " + std::to_string(R.Kind) + ", " + std::to_string(G.Kind) + "): not a dunes set?";
+        const uint32_t Cells = R.CellsPerTile;
+        if (G.CellsPerTile != Cells) return "R and G have different crest counts";
+        if (Cells == 0u || Set.N % Cells != 0u) return "R's crest count (" + std::to_string(Cells) + ") doesn't divide the size";
+        if (Set.N / Cells < 16u || Set.N / Cells > 512u) return "R's crest spacing (" + std::to_string(Set.N / Cells) + " texels) isn't within 16 .. 512";
+        if (!(R.Max > R.Min) || !(G.Max > G.Min)) return "R or G is flat";
+        return std::string();
+    }
+
+    /** Whether Set has the `sanddetail` layout's G VoxelLandDunes.ush reads (stage T5c): a
+     *  simulated height (the megaripples, crests across +x) with a wavelength (N / its cells, which
+     *  need not divide N) of 8 to 512 texels. "" if so, else why not. */
+    inline std::string CheckSandDetail(const FSet& Set)
+    {
+        const FChannel& G = Set.Channel[1];
+        if (G.Kind != KindErodedHeight) return "G isn't a simulated height (kind " + std::to_string(G.Kind) + "): not a sanddetail set?";
+        if (G.CellsPerTile == 0u || Set.N < 8u * G.CellsPerTile || Set.N > 512u * G.CellsPerTile)
+            return "G's wavelength (" + std::to_string(G.CellsPerTile > 0u ? Set.N / G.CellsPerTile : 0u) + " texels) isn't within 8 .. 512";
+        if (!(G.Max > G.Min)) return "G is flat";
+        return std::string();
+    }
+
+    /** Whether Set has the `polar` layout VoxelLandPolar.ush reads (stage T5d3): R crevasses, G
+     *  sastrugi and B ice-wedge polygons, each a simulated height (A, sea ice, is stage T5e's: not
+     *  checked) with a cell (N / its cells, which need not divide N) of 8 to 512 texels and some
+     *  relief. "" if so, else why not. */
+    inline std::string CheckPolar(const FSet& Set)
+    {
+        const char* Names[3] = { "R (crevasses)", "G (sastrugi)", "B (ice-wedge polygons)" };
+        for (int c = 0; c < 3; c++)
+        {
+            const FChannel& C = Set.Channel[c];
+            if (C.Kind != KindErodedHeight)
+                return std::string(Names[c]) + " isn't a simulated height (kind " + std::to_string(C.Kind) + "): not a polar set?";
+            if (C.CellsPerTile == 0u || Set.N < 8u * C.CellsPerTile || Set.N > 512u * C.CellsPerTile)
+                return std::string(Names[c]) + "'s cell (" + std::to_string(C.CellsPerTile > 0u ? Set.N / C.CellsPerTile : 0u) + " texels) isn't within 8 .. 512";
+            if (!(C.Max > C.Min)) return std::string(Names[c]) + " is flat";
+        }
         return std::string();
     }
 

@@ -16,6 +16,13 @@
 
 // The layout the material decodes (shared with VoxelLandMaterialAccess.ush).
 #include "VoxelLandMaterialLayout.ush"
+// Stage T5a: the climate map's size (VoxelLandClimate.ush's macros; its functions stay in the
+// shared code's namespace).
+#include "VoxelShaderCompat.h"
+namespace VoxelShader
+{
+#include "VoxelLandClimate.ush"
+}
 
 // The scalars must fit their texels, or the next slot overwrites the tan table that follows.
 static_assert(VOXEL_LAND_MC_COUNT <= 4 * VOXEL_LAND_MC_TEXELS, "VOXEL_LAND_MC_COUNT overruns VOXEL_LAND_MC_TEXELS");
@@ -33,6 +40,10 @@ const FName VoxelLandMaterial::AxisXLowName(TEXT("VoxelLandAxisXLow"));
 const FName VoxelLandMaterial::AxisYLowName(TEXT("VoxelLandAxisYLow"));
 const FName VoxelLandMaterial::AxisZLowName(TEXT("VoxelLandAxisZLow"));
 const FName VoxelLandMaterial::ParamsName(TEXT("VoxelLandParams"));
+const FName VoxelLandMaterial::ClimateTextureName(TEXT("VoxelLandClimate"));
+const FName VoxelLandMaterial::ClimateParamsName(TEXT("VoxelLandClimateParams"));
+const FName VoxelLandMaterial::ClimateShapeName(TEXT("VoxelLandClimateShape"));
+const FName VoxelLandMaterial::ClimateTintName(TEXT("VoxelLandClimateTint"));
 
 static TAutoConsoleVariable<int32> CVarVoxelLandNormalMode(
     TEXT("voxel.Debug.LandNormalMode"), 0,
@@ -73,6 +84,24 @@ bool VoxelLandMaterial::UsesCache()
 bool VoxelLandMaterial::ShowsCacheLevels()
 {
     return CVarVoxelDebugLandCache.GetValueOnGameThread() != 0;
+}
+
+static TAutoConsoleVariable<int32> CVarVoxelDebugLandClimate(
+    TEXT("voxel.Debug.LandClimate"), 0,
+    TEXT("Stage T5a: the terrain material's climate node shows (Design/LandClimate.md):\n")
+    TEXT(" 0: the tinted base colour (default)\n")
+    TEXT(" 1: the year's mean temperature (-30 C violet, -15 blue, 0 white, 15 green, 30 red)\n")
+    TEXT(" 2: the summer's mean temperature (the same colours)\n")
+    TEXT(" 3: the precipitation (50 mm tan, 200 yellow, 800 green, 2,000 blue, 4,000 violet)\n")
+    TEXT(" 4: the aridity (Holdridge's PET ratio: humid blue, 1 green, 4 yellow, 32 red)\n")
+    TEXT(" 5: the cover (snow white, glacier ice cyan, desert sand, plants green, else grey)\n")
+    TEXT(" 6: the seasons' swing (0 to 20 C)\n")
+    TEXT(" 7: the continentality (coast blue, inland brown)"),
+    ECVF_Default);
+
+int32 VoxelLandMaterial::ClimateView()
+{
+    return FMath::Clamp(CVarVoxelDebugLandClimate.GetValueOnGameThread(), 0, 7);
 }
 
 namespace VoxelLandMaterialDetail
@@ -118,15 +147,15 @@ namespace VoxelLandMaterialDetail
         return (uint32)((Base + VoxelNoiseTiles::ChainTexels(N) + Noise.RowN - 1) / Noise.RowN);
     }
 
-    /** The rows of the noise pack's words the material's texture takes on this RHI: all of them,
-     *  or as many whole chains from the start as fit (the material then shades without the
-     *  rest: the strata's set, the hills', then the detail set; the registry's limit, the same on
-     *  every machine, decides what the geometry has); 0 if not even the first fits. */
+    /** The rows of the noise pack's words the material's texture takes on this RHI: those of the
+     *  chains it reads (T5c: not the dunes' and the sand's, after them), or as many whole chains
+     *  from the start as fit (the material then shades without the rest: the strata's set, the
+     *  hills', then the detail set; the registry's limit, the same on every machine, decides what
+     *  the geometry has); 0 if not even the first fits. */
     uint32 NoiseRowsFor(const FVoxelLandNoiseSet* Noise)
     {
         const uint32 Max = (uint32)GetMax2DTextureDimension();
         if (!Noise || !Noise->IsComplete() || Noise->RowN > Max) return 0;
-        if (Noise->Rows <= Max) return Noise->Rows;
         uint32 Best = 0;
         for (const uint32 End : { Noise->N > 0 ? ChainEndRow(*Noise, 0u, Noise->N) : 0u,
                  Noise->DetailN > 0 ? ChainEndRow(*Noise, Noise->DetailBase, Noise->DetailN) : 0u,
@@ -549,6 +578,41 @@ UTexture2DDynamic* VoxelLandMaterial::MakeNoiseTexture(const FVoxelDensityCPU& D
         StandIn = Texture;
     }
     return Texture;
+}
+
+UTexture2DDynamic* VoxelLandMaterial::MakeClimateTexture()
+{
+    using namespace VoxelLandMaterialDetail;
+    UTexture2DDynamic* Texture = Make(VOXEL_LAND_CLIMATE_WIDTH, VOXEL_LAND_CLIMATE_HEIGHT, PF_FloatRGBA);
+    if (!Texture)
+        UE_LOG(LogVoxelPlugin, Warning, TEXT("[VoxelLand] Couldn't create the land climate's texture."));
+    return Texture;
+}
+
+void VoxelLandMaterial::UploadClimateTexture(UTexture2DDynamic* Texture, const TArray<FVector4f>& Cells)
+{
+    using namespace VoxelLandMaterialDetail;
+    constexpr int32 W = VOXEL_LAND_CLIMATE_WIDTH;
+    constexpr int32 H = VOXEL_LAND_CLIMATE_HEIGHT;
+    if (!Texture || Cells.Num() != W * H) return;
+    TArray<FFloat16Color> Texels;
+    Texels.SetNumUninitialized(W * H);
+    for (int32 i = 0; i < W * H; i++)
+        Texels[i] = FFloat16Color(FLinearColor(Cells[i].X, Cells[i].Y, Cells[i].Z, Cells[i].W));
+    Upload(Texture, MoveTemp(Texels), [](const TArray<FFloat16Color>& T) { return (const void*)T.GetData(); }, W, H, (int32)sizeof(FFloat16Color));
+}
+
+void VoxelLandMaterial::SetClimateParameters(UMaterialInstanceDynamic* Material, UTexture2DDynamic* Texture, const FLinearColor& Params,
+    const FLinearColor& Shape, const FLinearColor& Tint, bool bBindTexture)
+{
+    if (!Material) return;
+    if (Texture && bBindTexture)
+        Material->SetTextureParameterValue(ClimateTextureName, Texture);
+    FLinearColor P = Params;
+    P.R = Texture ? (float)(1 + 2 * ClimateView()) : 0.0f;
+    Material->SetVectorParameterValue(ClimateParamsName, P);
+    Material->SetVectorParameterValue(ClimateShapeName, Shape);
+    Material->SetVectorParameterValue(ClimateTintName, Tint);
 }
 
 void VoxelLandMaterial::SetTextureParameters(UMaterialInstanceDynamic* Material, UTexture2DDynamic* Height, UTexture2DDynamic* Fields,

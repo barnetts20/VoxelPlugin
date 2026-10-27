@@ -279,6 +279,21 @@ void FVoxelLandCache::NotifyEdit(uint32 Sequence, const FBox& Bounds)
     }
 }
 
+FString FVoxelLandCache::WhyNotWritable() const
+{
+    if (!IsInitialized()) return TEXT("not initialized");
+    if (!Plan.IsValid()) return TEXT("no plan");
+    if (!Textures.IsValid()) return TEXT("no textures");
+    if (!Textures.Height->GameThread_GetRenderTargetResource() || !Textures.Slope->GameThread_GetRenderTargetResource()
+        || !Textures.Fields->GameThread_GetRenderTargetResource() || !Textures.State->GetResource())
+        return TEXT("the textures have no render resources");
+    FGlobalShaderMap* ShaderMap = GetGlobalShaderMap(GMaxRHIFeatureLevel);
+    if (!ShaderMap) return TEXT("no global shader map");
+    if (!ShaderMap->GetShader(&FVoxelLandCacheWriteCS::GetStaticType(), 0).IsValid())
+        return TEXT("the write shader (VoxelLandCacheWrite.usf) isn't in the global shader map: it failed to compile (see LogShaderCompilers) or is still compiling");
+    return FString();
+}
+
 bool FVoxelLandCache::IsWritable() const
 {
     // On the game thread, before the plan moves on: a plan whose writes can't happen would

@@ -1,6 +1,7 @@
 #include "VoxelDensity.h"
 #include "VoxelDensityGPU.h"
 #include "VoxelLandBake.h"
+#include "VoxelLandClimate.h"
 #include "VoxelPlugin.h"
 #include "VoxelShaderCompat.h"
 #include "Async/ParallelFor.h"
@@ -10,6 +11,10 @@ namespace VoxelShader
 #include "VoxelDensityCore.ush"
 #include "VoxelDF64.ush"
 #include "VoxelCubeSphere.ush"
+// T5c: at namespace scope first (VoxelLandDunes.ush includes it again inside the sampler, a no-op
+// then): in a unity build VoxelLandClimate.cpp and VoxelLandMaterial.cpp include it here too, and
+// a first include inside the struct would leave them without it.
+#include "VoxelLandClimate.ush"
 
     /** The land bake's sampler on the CPU: VoxelLandSample.ush and VoxelLandGully.ush (with
      *  VoxelLandHills.ush, VoxelLandNoise.ush and VoxelLandPeaks.ush) with the shader's buffers
@@ -119,6 +124,86 @@ namespace VoxelShader
         float LandDetailScaleGain = 0.0f;
         float LandDetailFade = 0.0f;
         uint LandDetailSeed = 0;
+        // T5c: the dunes (VoxelLandDunes.ush).
+        const float4* LandClimate = nullptr;
+        uint LandHasClimate = 0;
+        float LandClimateLapse = 6.5f;
+        float LandDuneTexelsPerCell = 0.0f;
+        uint LandDuneBase = 0;
+        uint LandDuneN = 0;
+        uint LandDuneMips = 0;
+        float LandDuneScaleR = 1.0f;
+        float LandDuneScaleG = 1.0f;
+        float LandDuneMeanR = 0.0f;
+        float LandDuneMeanG = 0.0f;
+        float LandDuneRelief = 0.0f;
+        uint LandDuneSeed = 0;
+        float LandDuneErgFrequency = 1.0f;
+        float LandDuneErgThreshold = 2.0f;
+        float LandDuneErgWidth = 0.06f;
+        float LandDuneReliefMax = 400.0f;
+        float LandDuneDetailTexelsPerCell = 0.0f;
+        uint LandDuneDetailBase = 0;
+        uint LandDuneDetailN = 0;
+        uint LandDuneDetailMips = 0;
+        float LandDuneDetailScale = 0.0f;
+        float LandDuneDetailMean = 0.0f;
+        float LandDuneDetailFade = 0.0f;
+        // T5d: the glacial layer (VoxelLandPeaks.ush).
+        float LandGlacialTexelsPerCell = 0.0f;
+        uint LandGlacialBase = 0;
+        uint LandGlacialN = 0;
+        uint LandGlacialMips = 0;
+        float LandGlacialScaleR = 1.0f;
+        float LandGlacialScaleG = 1.0f;
+        float LandGlacialScaleB = 1.0f;
+        float LandGlacialMeanR = 0.0f;
+        float LandGlacialMeanG = 0.0f;
+        float LandGlacialReliefM = 0.0f;
+        float LandGlacialStrength = 0.0f;
+        uint LandGlacialSeed = 0;
+        float LandGlacialSpacingM = 0.0f;
+        float LandGlacialCooling = 0.0f;
+        float LandGlacialDetailScaleHard = 0.0f;
+        float LandGlacialDetailScaleSoft = 0.0f;
+        // T5d2: the ice sheets (VoxelLandIce.ush).
+        float LandIceMaxThickness = 0.0f;
+        float LandIceBlend = 0.0f;
+        float LandIceSwellTexelsPerCell = 0.0f;
+        uint LandIceBase = 0;
+        uint LandIceN = 0;
+        uint LandIceMips = 0;
+        float LandIceMeanG = 0.0f;
+        float LandIceSwellM = 0.0f;
+        uint LandIceSeed = 0;
+        float LandIceSwellSpacingM = 0.0f;
+        // T5d3: the polar surfaces (VoxelLandPolar.ush).
+        uint LandPolarBase = 0;
+        uint LandPolarN = 0;
+        uint LandPolarMips = 0;
+        uint LandPolarSeed = 0;
+        float LandPolarCrevasseTexelsPerCell = 0.0f;
+        float LandPolarCrevasseM = 0.0f;
+        float LandPolarCrevasseMean = 0.0f;
+        float LandPolarCrevasseFade = 0.0f;
+        float LandPolarSastrugiTexelsPerCell = 0.0f;
+        float LandPolarSastrugiM = 0.0f;
+        float LandPolarSastrugiMean = 0.0f;
+        float LandPolarSastrugiFade = 0.0f;
+        float LandPolarPolygonTexelsPerCell = 0.0f;
+        float LandPolarPolygonM = 0.0f;
+        float LandPolarPolygonMean = 0.0f;
+        float LandPolarPolygonFade = 0.0f;
+        float LandPolarPermafrostT = -6.0f;
+        float LandPolarCrevasseTurn = 0.0f;
+        float LandPolarSastrugiTurn = 0.0f;
+        uint LandPolarDuneBase = 0;
+        uint LandPolarDuneN = 0;
+        uint LandPolarDuneMips = 0;
+        float LandPolarDuneTexelsPerCell = 0.0f;
+        float LandPolarDuneM = 0.0f;
+        float LandPolarDuneMean = 0.0f;
+        float LandPolarDuneFade = 0.0f;
 
 #include "VoxelLandSample.ush"
 #include "VoxelLandGully.ush"
@@ -136,6 +221,14 @@ namespace
     constexpr uint32 SaltLandPeak = 0x41u;
     constexpr uint32 SaltLandStrata = 0x51u;
     constexpr uint32 SaltLandDetail = 0x61u;
+    constexpr uint32 SaltLandDune = 0x71u;
+    constexpr uint32 SaltLandGlacial = 0x81u;
+    constexpr uint32 SaltLandIce = 0x91u;
+    constexpr uint32 SaltLandPolar = 0xA1u;
+
+    /** The ergs' noise's edge (VoxelLandDunes.ush: their share's smoothstep half-width, in the
+     *  noise's units; its spread is about 0.25). */
+    constexpr float LandDuneErgEdge = 0.06f;
 
     /** The sampling warp of the land bake: three octaves of fBm per component, its longest
      *  wavelength six bake cells. */
@@ -202,7 +295,7 @@ FVoxelDensityCPU::FVoxelDensityCPU(const FVoxelSurfaceSettings& InSettings, doub
 }
 
 FVoxelDensityCPU::FVoxelDensityCPU(const FVoxelTerrestrialSettings& InLand, TSharedPtr<const FVoxelLandBake, ESPMode::ThreadSafe> InBake,
-    double InPlanetRadius, double InNoiseAmplitude, double InMinFootprint)
+    double InPlanetRadius, double InNoiseAmplitude, double InMinFootprint, TSharedPtr<const FVoxelLandClimateField, ESPMode::ThreadSafe> InClimate)
     : PlanetRadius(FMath::Max(InPlanetRadius, 1.0))
     , NoiseAmplitude(FMath::Max(InNoiseAmplitude, 0.0))
     , MinFootprint(FMath::Max(InMinFootprint, 0.0))
@@ -446,8 +539,187 @@ FVoxelDensityCPU::FVoxelDensityCPU(const FVoxelTerrestrialSettings& InLand, TSha
         UE_LOG(LogVoxelPlugin, Log, TEXT("[VoxelLand] Strata %s: %.0f m relief at %.0f m spacing over %.0f%% of the land (province above %.3f)."),
             *Set.StrataName, LandStrataRelief, LandStrataSpacingM, 100.0 * FMath::Clamp(InLand.StrataCoverage, 0.0, 1.0), LandStrataThreshold);
     }
+    // T5c: the dunes (VoxelLandDunes.ush): the pack's dune set placed at the dune spacing, in the
+    // hill set's layer, where the climate (the planet's snapshot) makes desert, in sand seas over
+    // DuneErgCoverage of it (the ergs' noise's threshold for that share of the sphere).
+    LandDuneSeed = VoxelShader::VoxelHashSeed(Seed, SaltLandDune);
+    const bool bClimate = InClimate.IsValid() && InClimate->IsValid();
+    if (bClimate && LandHillTexelsPerCell > 0.0f && LandNoise->DuneN > 0)
+        LandDuneTexelsPerCell = VoxelLand::DuneTexelsPerCell(InLand, *LandBake, *LandNoise);
+    // The lattice's range (as the detail layer's): the turned texel coordinates under 2^30.
+    const double FaceTexels = UE_SQRT_2 * (0.5 * (double)LandBake->N + 4.0);
+    if (LandDuneTexelsPerCell > 0.0f && (double)LandDuneTexelsPerCell * FaceTexels >= 1073741824.0)
+    {
+        UE_LOG(LogVoxelPlugin, Warning, TEXT("[VoxelLand] DuneSpacing %.0f m is too fine for this planet's lattice; no dunes."), InLand.DuneSpacing);
+        LandDuneTexelsPerCell = 0.0f;
+    }
+    // T5d: the glacial layer (VoxelLandPeaks.ush): the pack's glacial set at the glacial spacing, in
+    // the peaks' place where the climate has had glaciers.
+    LandGlacialSeed = VoxelShader::VoxelHashSeed(Seed, SaltLandGlacial);
+    if (bClimate && LandPeakTexelsPerCell > 0.0f && LandNoise->GlacialN > 0)
+        LandGlacialTexelsPerCell = VoxelLand::GlacialTexelsPerCell(InLand, *LandBake, *LandNoise);
+    if (LandGlacialTexelsPerCell > 0.0f && (double)LandGlacialTexelsPerCell * FaceTexels >= 1073741824.0)
+    {
+        UE_LOG(LogVoxelPlugin, Warning, TEXT("[VoxelLand] GlacialSpacing %.0f m is too fine for this planet's lattice; the peaks everywhere."), InLand.GlacialSpacing);
+        LandGlacialTexelsPerCell = 0.0f;
+    }
+    // T5d2: the ice sheets (VoxelLandIce.ush): the climate's ice, the pack's ice sheet set's swells.
+    LandIceSeed = VoxelShader::VoxelHashSeed(Seed, SaltLandIce);
+    if (bClimate && InLand.IceSheetMaxThickness > 0.0)
+    {
+        LandIceMaxThickness = (float)InLand.IceSheetMaxThickness;
+        LandIceBlend = (float)VoxelLand::IceSheetBlend;
+        if (LandNoise.IsValid() && LandNoise->IceN > 0 && LandNoise->IceSpacingTexels > 0 && InLand.IceSheetSwellHeight > 0.0)
+        {
+            const double TexelM = FMath::Max(InLand.IceSheetSwellSpacing, 1000.0) / (double)LandNoise->IceSpacingTexels;
+            LandIceSwellTexelsPerCell = (float)((double)LandCellM / TexelM);
+            LandIceSwellM = (float)InLand.IceSheetSwellHeight;
+            LandIceMeanG = LandNoise->IceMeanG;
+            LandIceSwellSpacingM = (float)FMath::Max(InLand.IceSheetSwellSpacing, 1000.0);
+        }
+        UE_LOG(LogVoxelPlugin, Log, TEXT("[VoxelLand] Ice sheets: up to %.0f m thick where the climate ices the land; swells %s."), LandIceMaxThickness,
+            LandIceSwellTexelsPerCell > 0.0f ? *FString::Printf(TEXT("%s, %.0f m at %.0f km"), *LandNoise->IceName, LandIceSwellM, LandIceSwellSpacingM * 0.001f) : TEXT("none"));
+    }
+    // T5d3: the polar surfaces (VoxelLandPolar.ush): the pack's polar set's crevasses (R), sastrugi
+    // (G) and ice-wedge polygons (B), each at its spacing (one of the set's cells) and height scale
+    // (1: the simulated slopes), where the climate makes ice or frozen ground.
+    LandPolarSeed = VoxelShader::VoxelHashSeed(Seed, SaltLandPolar);
+    if (bClimate && LandNoise.IsValid() && LandNoise->PolarN > 0)
+    {
+        const FVoxelLandNoiseSet& Set = *LandNoise;
+        const double Spacings[3] = { VoxelLand::PolarSpacing(InLand, 0), VoxelLand::PolarSpacing(InLand, 1), VoxelLand::PolarSpacing(InLand, 2) };
+        const double Scales[3] = { InLand.CrevasseHeightScale, InLand.SastrugiHeightScale, InLand.PolygonHeightScale };
+        const TCHAR* Names[3] = { TEXT("CrevasseSpacing"), TEXT("SastrugiSpacing"), TEXT("PolygonSpacing") };
+        float* TexelsPerCell[3] = { &LandPolarCrevasseTexelsPerCell, &LandPolarSastrugiTexelsPerCell, &LandPolarPolygonTexelsPerCell };
+        float* Heights[3] = { &LandPolarCrevasseM, &LandPolarSastrugiM, &LandPolarPolygonM };
+        float* Means[3] = { &LandPolarCrevasseMean, &LandPolarSastrugiMean, &LandPolarPolygonMean };
+        float* Fades[3] = { &LandPolarCrevasseFade, &LandPolarSastrugiFade, &LandPolarPolygonFade };
+        for (int32 c = 0; c < 3; c++)
+        {
+            if (!(Scales[c] > 0.0) || !(Set.PolarSpacingTexels[c] > 0.0f)) continue;
+            const double TexelM = Spacings[c] / (double)Set.PolarSpacingTexels[c];
+            const double PerCell = (double)LandCellM / TexelM;
+            if (PerCell * FaceTexels >= 1073741824.0)
+            {
+                UE_LOG(LogVoxelPlugin, Warning, TEXT("[VoxelLand] %s %.1f m is too fine for this planet's lattice; left out."), Names[c], Spacings[c]);
+                continue;
+            }
+            *TexelsPerCell[c] = (float)PerCell;
+            // m per unit value: the channel's range in texels, at the texel, times the height scale.
+            *Heights[c] = (float)(Scales[c] * (double)Set.PolarRange[c] * ((double)LandCellM / (double)(float)PerCell));
+            *Means[c] = Set.PolarMean[c];
+            // Faded out by the level at which one of the set's cells fits a texel.
+            *Fades[c] = (float)FMath::Log2(FMath::Max((double)Set.PolarSpacingTexels[c], 2.0));
+        }
+        LandPolarPermafrostT = (float)InLand.PermafrostTemperature;
+        LandPolarCrevasseTurn = Set.PolarTurn[0];
+        LandPolarSastrugiTurn = Set.PolarTurn[1];
+        // The snow dunes: the pack's dune set's G (rounded crests) at SnowDuneSpacing, SnowDuneHeight
+        // from its lowest to its highest.
+        if (InLand.SnowDuneHeight > 0.0 && Set.DuneN > 0 && Set.DuneSpacingTexels > 0)
+        {
+            const double TexelM = VoxelLand::SnowDuneSpacing(InLand) / (double)Set.DuneSpacingTexels;
+            const double PerCell = (double)LandCellM / TexelM;
+            if (PerCell * FaceTexels < 1073741824.0)
+            {
+                LandPolarDuneTexelsPerCell = (float)PerCell;
+                LandPolarDuneM = (float)InLand.SnowDuneHeight;
+                LandPolarDuneMean = Set.DuneMeanG;
+                LandPolarDuneFade = (float)FMath::Log2((double)FMath::Max(Set.DuneSpacingTexels, 2u));
+            }
+        }
+        if (LandPolarCrevasseTexelsPerCell > 0.0f || LandPolarSastrugiTexelsPerCell > 0.0f || LandPolarPolygonTexelsPerCell > 0.0f || LandPolarDuneTexelsPerCell > 0.0f)
+            UE_LOG(LogVoxelPlugin, Log, TEXT("[VoxelLand] Polar surfaces %s: crevasses %s; sastrugi %s; ice-wedge polygons %s (permafrost below %.1f C); snow dunes %s."), *Set.PolarName,
+                LandPolarCrevasseM > 0.0f ? *FString::Printf(TEXT("%.1f m deep at %.0f m"), LandPolarCrevasseM * Set.PolarMean[0], Spacings[0]) : TEXT("none"),
+                LandPolarSastrugiM > 0.0f ? *FString::Printf(TEXT("%.2f m at %.1f m"), LandPolarSastrugiM * (1.0f - Set.PolarMean[1]), Spacings[1]) : TEXT("none"),
+                LandPolarPolygonM > 0.0f ? *FString::Printf(TEXT("%.2f m at %.0f m"), LandPolarPolygonM, Spacings[2]) : TEXT("none"),
+                LandPolarPermafrostT,
+                LandPolarDuneTexelsPerCell > 0.0f ? *FString::Printf(TEXT("%s, %.1f m at %.0f m"), *Set.DuneName, LandPolarDuneM, VoxelLand::SnowDuneSpacing(InLand))
+                    : TEXT("none (needs SnowDuneHeight and the pack's dune set)"));
+    }
+    const bool bPolar = LandPolarCrevasseTexelsPerCell > 0.0f || LandPolarSastrugiTexelsPerCell > 0.0f || LandPolarPolygonTexelsPerCell > 0.0f
+        || LandPolarDuneTexelsPerCell > 0.0f;
+    // The climate, kept for whichever layer reads it (T5e: and the ice shelf's share: the rivers fade
+    // on it).
+    bLandIceShelf = InLand.IceShelfHeight > 0.0;
+    if (LandDuneTexelsPerCell > 0.0f || LandGlacialTexelsPerCell > 0.0f || LandIceMaxThickness > 0.0f || bPolar || bLandIceShelf)
+    {
+        LandClimate = MoveTemp(InClimate);
+        LandClimateLapse = LandClimate->LapseRate;
+    }
+    if (LandGlacialTexelsPerCell > 0.0f)
+    {
+        const FVoxelLandNoiseSet& Set = *LandNoise;
+        const float TexelM = LandCellM / LandGlacialTexelsPerCell;
+        const float Range = FMath::Max3(Set.GlacialRangeR, Set.GlacialRangeG, 1e-6f);
+        LandGlacialReliefM = Range * TexelM;
+        LandGlacialStrength = (float)FMath::Max(InLand.GlacialHeightScale, 0.0);
+        LandGlacialScaleR = Set.GlacialRangeR / Range;
+        LandGlacialScaleG = Set.GlacialRangeG / Range;
+        LandGlacialScaleB = Set.GlacialRangeB / Range;
+        LandGlacialMeanR = Set.GlacialMeanR;
+        LandGlacialMeanG = Set.GlacialMeanG;
+        LandGlacialSpacingM = (float)FMath::Max(InLand.GlacialSpacing, VoxelLand::PeakMinSpacing);
+        LandGlacialCooling = (float)FMath::Max(InLand.GlacialEraCooling, 0.0);
+        // The peaks' detail (its placement and fade), over the glacial set's relief.
+        if (LandPeakDetailTexelsPerCell > 0.0f)
+        {
+            const float DetailTexelM = LandCellM / LandPeakDetailTexelsPerCell;
+            const float Strength = (float)InLand.PeakDetailStrength;
+            LandGlacialDetailScaleHard = Strength * Set.DetailRangeHard * DetailTexelM / LandGlacialReliefM;
+            LandGlacialDetailScaleSoft = Strength * Set.DetailRangeSoft * DetailTexelM / LandGlacialReliefM;
+        }
+        UE_LOG(LogVoxelPlugin, Log, TEXT("[VoxelLand] Glacial %s: %.0f m relief at %.0f m spacing, where glaciers are or were (%.1f C colder)."),
+            *Set.GlacialName, LandGlacialReliefM, LandGlacialSpacingM, LandGlacialCooling);
+    }
+    if (LandDuneTexelsPerCell > 0.0f)
+    {
+        const FVoxelLandNoiseSet& Set = *LandNoise;
+        const float Range = FMath::Max3(Set.DuneRangeR, Set.DuneRangeG, 1e-6f);
+        LandDuneRelief = (float)VoxelLand::DuneRelief(InLand, Set);
+        LandDuneScaleR = Set.DuneRangeR / Range;
+        LandDuneScaleG = Set.DuneRangeG / Range;
+        LandDuneMeanR = Set.DuneMeanR;
+        LandDuneMeanG = Set.DuneMeanG;
+        LandDuneReliefMax = (float)FMath::Max(InLand.DuneMaxRelief, 10.0);
+        // The ergs: the sphere's radius over their size, at least one cell a radian.
+        LandDuneErgFrequency = (float)FMath::Max(LandBake->SeaRadius * 1.0e-5 / FMath::Max(InLand.DuneErgSize, 10.0), 1.0);
+        LandDuneErgWidth = LandDuneErgEdge;
+        LandDuneErgThreshold = VoxelLandClimate::ErgThreshold(LandDuneErgFrequency, (float)InLand.DuneErgCoverage);
+        // The sand detail (its G, the megaripples): its own placement; its height (m) over the
+        // dunes' relief, in their unit; faded as the peaks' detail.
+        const double SandRelief = VoxelLand::SandDetailRelief(InLand, Set);
+        if (SandRelief > 0.0 && LandDuneRelief > 0.0f)
+        {
+            const double DetailTexelM = VoxelLand::SandDetailWavelength(InLand) / (double)Set.SandSpacingTexels;
+            LandDuneDetailTexelsPerCell = (float)((double)LandCellM / DetailTexelM);
+            if ((double)LandDuneDetailTexelsPerCell * FaceTexels >= 1073741824.0)
+            {
+                UE_LOG(LogVoxelPlugin, Warning, TEXT("[VoxelLand] SandDetailWavelength %.1f m is too fine for this planet's lattice; the dunes go without it."),
+                    InLand.SandDetailWavelength);
+                LandDuneDetailTexelsPerCell = 0.0f;
+            }
+            else
+            {
+                LandDuneDetailScale = (float)(SandRelief / (double)LandDuneRelief);
+                LandDuneDetailMean = Set.SandMeanG;
+                LandDuneDetailFade = (float)FMath::FloorLog2(FMath::Max((uint32)Set.SandSpacingTexels, 2u)) - 1.0f;
+            }
+        }
+        UE_LOG(LogVoxelPlugin, Log, TEXT("[VoxelLand] Dunes %s: %.0f m relief at %.0f m spacing, sand seas %.0f km over %.0f%% of the desert (threshold %.3f); sand detail %s."),
+            *Set.DuneName, LandDuneRelief, FMath::Max(InLand.DuneSpacing, VoxelLand::DuneMinSpacing), FMath::Max(InLand.DuneErgSize, 10.0),
+            100.0 * FMath::Clamp(InLand.DuneErgCoverage, 0.0, 1.0), LandDuneErgThreshold,
+            LandDuneDetailTexelsPerCell > 0.0f ? *FString::Printf(TEXT("%s, %.1f m"), *Set.SandName, SandRelief) : TEXT("none"));
+    }
     if (LandPeakTexelsPerCell <= 0.0f && LandHillTexelsPerCell <= 0.0f && LandDetailTexelsPerCell <= 0.0f)
+    {
         LandNoise.Reset();
+        LandIceSwellTexelsPerCell = 0.0f;   // its chain went with the pack
+        LandPolarCrevasseTexelsPerCell = 0.0f;   // T5d3: likewise
+        LandPolarSastrugiTexelsPerCell = 0.0f;
+        LandPolarPolygonTexelsPerCell = 0.0f;
+        LandPolarDuneTexelsPerCell = 0.0f;
+    }
 
     // The rivers (VoxelLandRivers.ush, R1): made on the GPU with the bake, or by VoxelLand::TickRivers
     // before the planet builds (null until then).
@@ -718,6 +990,92 @@ double FVoxelDensityCPU::LandSurfaceAt(const FVector& SurfacePoint, double Footp
         Sampler.LandStrataDetailScaleHard = LandStrataDetailScaleHard;
         Sampler.LandStrataDetailScaleSoft = LandStrataDetailScaleSoft;
         Sampler.LandStrataDetailFade = LandStrataDetailFade;
+        if (LandIceSwellTexelsPerCell > 0.0f && LandClimate.IsValid())
+        {
+            // T5d2: the ice sheets' swells' chain.
+            Sampler.LandIceBase = LandNoise->IceBase;
+            Sampler.LandIceN = LandNoise->IceN;
+            Sampler.LandIceMips = LandNoise->IceMips;
+        }
+        if (LandClimate.IsValid() && LandNoise->PolarN > 0
+            && (LandPolarCrevasseTexelsPerCell > 0.0f || LandPolarSastrugiTexelsPerCell > 0.0f || LandPolarPolygonTexelsPerCell > 0.0f
+                || LandPolarDuneTexelsPerCell > 0.0f))
+        {
+            // T5d3: the polar surfaces.
+            Sampler.LandPolarBase = LandNoise->PolarBase;
+            Sampler.LandPolarN = LandNoise->PolarN;
+            Sampler.LandPolarMips = LandNoise->PolarMips;
+            Sampler.LandPolarSeed = LandPolarSeed;
+            Sampler.LandPolarCrevasseTexelsPerCell = LandPolarCrevasseTexelsPerCell;
+            Sampler.LandPolarCrevasseM = LandPolarCrevasseM;
+            Sampler.LandPolarCrevasseMean = LandPolarCrevasseMean;
+            Sampler.LandPolarCrevasseFade = LandPolarCrevasseFade;
+            Sampler.LandPolarSastrugiTexelsPerCell = LandPolarSastrugiTexelsPerCell;
+            Sampler.LandPolarSastrugiM = LandPolarSastrugiM;
+            Sampler.LandPolarSastrugiMean = LandPolarSastrugiMean;
+            Sampler.LandPolarSastrugiFade = LandPolarSastrugiFade;
+            Sampler.LandPolarPolygonTexelsPerCell = LandPolarPolygonTexelsPerCell;
+            Sampler.LandPolarPolygonM = LandPolarPolygonM;
+            Sampler.LandPolarPolygonMean = LandPolarPolygonMean;
+            Sampler.LandPolarPolygonFade = LandPolarPolygonFade;
+            Sampler.LandPolarPermafrostT = LandPolarPermafrostT;
+            Sampler.LandPolarCrevasseTurn = LandPolarCrevasseTurn;
+            Sampler.LandPolarSastrugiTurn = LandPolarSastrugiTurn;
+            if (LandPolarDuneTexelsPerCell > 0.0f)
+            {
+                Sampler.LandPolarDuneBase = LandNoise->DuneBase;
+                Sampler.LandPolarDuneN = LandNoise->DuneN;
+                Sampler.LandPolarDuneMips = LandNoise->DuneMips;
+                Sampler.LandPolarDuneTexelsPerCell = LandPolarDuneTexelsPerCell;
+                Sampler.LandPolarDuneM = LandPolarDuneM;
+                Sampler.LandPolarDuneMean = LandPolarDuneMean;
+                Sampler.LandPolarDuneFade = LandPolarDuneFade;
+            }
+        }
+        if (LandGlacialTexelsPerCell > 0.0f && LandClimate.IsValid())
+        {
+            Sampler.LandGlacialBase = LandNoise->GlacialBase;
+            Sampler.LandGlacialN = LandNoise->GlacialN;
+            Sampler.LandGlacialMips = LandNoise->GlacialMips;
+            Sampler.LandGlacialTexelsPerCell = LandGlacialTexelsPerCell;
+            Sampler.LandGlacialScaleR = LandGlacialScaleR;
+            Sampler.LandGlacialScaleG = LandGlacialScaleG;
+            Sampler.LandGlacialScaleB = LandGlacialScaleB;
+            Sampler.LandGlacialMeanR = LandGlacialMeanR;
+            Sampler.LandGlacialMeanG = LandGlacialMeanG;
+            Sampler.LandGlacialReliefM = LandGlacialReliefM;
+            Sampler.LandGlacialStrength = LandGlacialStrength;
+            Sampler.LandGlacialSeed = LandGlacialSeed;
+            Sampler.LandGlacialSpacingM = LandGlacialSpacingM;
+            Sampler.LandGlacialCooling = LandGlacialCooling;
+            Sampler.LandGlacialDetailScaleHard = LandGlacialDetailScaleHard;
+            Sampler.LandGlacialDetailScaleSoft = LandGlacialDetailScaleSoft;
+        }
+        if (LandDuneTexelsPerCell > 0.0f && LandClimate.IsValid())
+        {
+            // T5c: the dunes.
+            Sampler.LandDuneBase = LandNoise->DuneBase;
+            Sampler.LandDuneN = LandNoise->DuneN;
+            Sampler.LandDuneMips = LandNoise->DuneMips;
+            Sampler.LandDuneDetailBase = LandNoise->SandBase;
+            Sampler.LandDuneDetailN = LandNoise->SandN;
+            Sampler.LandDuneDetailMips = LandNoise->SandMips;
+            Sampler.LandDuneTexelsPerCell = LandDuneTexelsPerCell;
+            Sampler.LandDuneScaleR = LandDuneScaleR;
+            Sampler.LandDuneScaleG = LandDuneScaleG;
+            Sampler.LandDuneMeanR = LandDuneMeanR;
+            Sampler.LandDuneMeanG = LandDuneMeanG;
+            Sampler.LandDuneRelief = LandDuneRelief;
+            Sampler.LandDuneSeed = LandDuneSeed;
+            Sampler.LandDuneErgFrequency = LandDuneErgFrequency;
+            Sampler.LandDuneErgThreshold = LandDuneErgThreshold;
+            Sampler.LandDuneErgWidth = LandDuneErgWidth;
+            Sampler.LandDuneReliefMax = LandDuneReliefMax;
+            Sampler.LandDuneDetailTexelsPerCell = LandDuneDetailTexelsPerCell;
+            Sampler.LandDuneDetailScale = LandDuneDetailScale;
+            Sampler.LandDuneDetailMean = LandDuneDetailMean;
+            Sampler.LandDuneDetailFade = LandDuneDetailFade;
+        }
         Sampler.LandNoiseN = LandNoise->N;
         Sampler.LandNoiseMips = LandNoise->Mips;
         Sampler.LandPeakStrength = LandPeakStrength;
@@ -739,6 +1097,21 @@ double FVoxelDensityCPU::LandSurfaceAt(const FVector& SurfacePoint, double Footp
             Sampler.LandPeakDetailScaleSoft = LandPeakDetailScaleSoft;
             Sampler.LandPeakDetailFade = LandPeakDetailFade;
         }
+    }
+    if (LandClimate.IsValid())
+    {
+        // T5c, T5d, T5d2: the climate the dunes, the glacial layer and the ice sheets are placed by
+        // (the ice sheets need no pack: outside its block).
+        Sampler.LandClimate = reinterpret_cast<const float4*>(LandClimate->Entries.GetData());
+        Sampler.LandHasClimate = 1u;
+        Sampler.LandClimateLapse = LandClimateLapse;
+        Sampler.LandIceMaxThickness = LandIceMaxThickness;
+        Sampler.LandIceBlend = LandIceBlend;
+        Sampler.LandIceSwellTexelsPerCell = LandIceSwellTexelsPerCell;
+        Sampler.LandIceMeanG = LandIceMeanG;
+        Sampler.LandIceSwellM = LandIceSwellM;
+        Sampler.LandIceSeed = LandIceSeed;
+        Sampler.LandIceSwellSpacingM = LandIceSwellSpacingM;
     }
     Sampler.LandN = (uint32)LandBake->N;
     Sampler.LandPad = (uint32)FVoxelLandBake::Pad;
@@ -974,6 +1347,68 @@ void FVoxelDensityCPU::BuildGPUData(FVoxelDensityGPUData& Out) const
         Out.LandDetailScaleGain = LandDetailScaleGain;
         Out.LandDetailFade = LandDetailFade;
         Out.LandDetailSeed = LandDetailSeed;
+        // T5c: the dunes.
+        Out.LandClimate = LandClimate;
+        Out.LandClimateLapse = LandClimateLapse;
+        Out.LandDuneTexelsPerCell = LandDuneTexelsPerCell;
+        Out.LandDuneScaleR = LandDuneScaleR;
+        Out.LandDuneScaleG = LandDuneScaleG;
+        Out.LandDuneMeanR = LandDuneMeanR;
+        Out.LandDuneMeanG = LandDuneMeanG;
+        Out.LandDuneRelief = LandDuneRelief;
+        Out.LandDuneSeed = LandDuneSeed;
+        Out.LandDuneErgFrequency = LandDuneErgFrequency;
+        Out.LandDuneErgThreshold = LandDuneErgThreshold;
+        Out.LandDuneErgWidth = LandDuneErgWidth;
+        Out.LandDuneReliefMax = LandDuneReliefMax;
+        Out.LandDuneDetailTexelsPerCell = LandDuneDetailTexelsPerCell;
+        Out.LandDuneDetailScale = LandDuneDetailScale;
+        Out.LandDuneDetailMean = LandDuneDetailMean;
+        Out.LandDuneDetailFade = LandDuneDetailFade;
+        // T5d2: the ice sheets.
+        Out.LandIceMaxThickness = LandIceMaxThickness;
+        Out.bLandIceShelf = bLandIceShelf;
+        Out.LandIceBlend = LandIceBlend;
+        Out.LandIceSwellTexelsPerCell = LandIceSwellTexelsPerCell;
+        Out.LandIceMeanG = LandIceMeanG;
+        Out.LandIceSwellM = LandIceSwellM;
+        Out.LandIceSeed = LandIceSeed;
+        Out.LandIceSwellSpacingM = LandIceSwellSpacingM;
+        // T5d3: the polar surfaces.
+        Out.LandPolarSeed = LandPolarSeed;
+        Out.LandPolarCrevasseTexelsPerCell = LandPolarCrevasseTexelsPerCell;
+        Out.LandPolarCrevasseM = LandPolarCrevasseM;
+        Out.LandPolarCrevasseMean = LandPolarCrevasseMean;
+        Out.LandPolarCrevasseFade = LandPolarCrevasseFade;
+        Out.LandPolarSastrugiTexelsPerCell = LandPolarSastrugiTexelsPerCell;
+        Out.LandPolarSastrugiM = LandPolarSastrugiM;
+        Out.LandPolarSastrugiMean = LandPolarSastrugiMean;
+        Out.LandPolarSastrugiFade = LandPolarSastrugiFade;
+        Out.LandPolarPolygonTexelsPerCell = LandPolarPolygonTexelsPerCell;
+        Out.LandPolarPolygonM = LandPolarPolygonM;
+        Out.LandPolarPolygonMean = LandPolarPolygonMean;
+        Out.LandPolarPolygonFade = LandPolarPolygonFade;
+        Out.LandPolarPermafrostT = LandPolarPermafrostT;
+        Out.LandPolarCrevasseTurn = LandPolarCrevasseTurn;
+        Out.LandPolarSastrugiTurn = LandPolarSastrugiTurn;
+        Out.LandPolarDuneTexelsPerCell = LandPolarDuneTexelsPerCell;
+        Out.LandPolarDuneM = LandPolarDuneM;
+        Out.LandPolarDuneMean = LandPolarDuneMean;
+        Out.LandPolarDuneFade = LandPolarDuneFade;
+        // T5d: the glacial layer.
+        Out.LandGlacialTexelsPerCell = LandGlacialTexelsPerCell;
+        Out.LandGlacialScaleR = LandGlacialScaleR;
+        Out.LandGlacialScaleG = LandGlacialScaleG;
+        Out.LandGlacialScaleB = LandGlacialScaleB;
+        Out.LandGlacialMeanR = LandGlacialMeanR;
+        Out.LandGlacialMeanG = LandGlacialMeanG;
+        Out.LandGlacialReliefM = LandGlacialReliefM;
+        Out.LandGlacialStrength = LandGlacialStrength;
+        Out.LandGlacialSeed = LandGlacialSeed;
+        Out.LandGlacialSpacingM = LandGlacialSpacingM;
+        Out.LandGlacialCooling = LandGlacialCooling;
+        Out.LandGlacialDetailScaleHard = LandGlacialDetailScaleHard;
+        Out.LandGlacialDetailScaleSoft = LandGlacialDetailScaleSoft;
     }
 
     // The GPU converts lattice coordinates to int32 before wrapping; the CPU wraps through
@@ -1008,9 +1443,10 @@ TSharedPtr<FDensitySampleCompositor> VoxelDensity::MakeCompositor(const FVoxelSu
 
 TSharedPtr<FDensitySampleCompositor> VoxelDensity::MakeTerrestrialCompositor(const FVoxelTerrestrialSettings& Land,
     TSharedPtr<const FVoxelLandBake, ESPMode::ThreadSafe> Bake, double PlanetRadius, double NoiseAmplitude,
-    TSharedPtr<FSparseEditStore> EditStore, double MinFootprint)
+    TSharedPtr<FSparseEditStore> EditStore, double MinFootprint, TSharedPtr<const FVoxelLandClimateField, ESPMode::ThreadSafe> Climate)
 {
-    const TSharedRef<const FVoxelDensityCPU> Density = MakeShared<FVoxelDensityCPU>(Land, MoveTemp(Bake), PlanetRadius, NoiseAmplitude, MinFootprint);
+    const TSharedRef<const FVoxelDensityCPU> Density = MakeShared<FVoxelDensityCPU>(Land, MoveTemp(Bake), PlanetRadius, NoiseAmplitude, MinFootprint,
+        MoveTemp(Climate));
     TSharedPtr<FDensitySampleCompositor> Compositor = MakeShared<FDensitySampleCompositor>(EditStore);
     Compositor->SetBaseDensity(Density);
     Compositor->SetEditFootprintFloor(MinFootprint);

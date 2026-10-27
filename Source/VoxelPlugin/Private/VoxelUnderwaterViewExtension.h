@@ -144,4 +144,8 @@ private:
     double CameraSurfaceMax = 0.0;          // cm above the sphere, the grid's highest
     FVector CameraSurfaceAt = FVector::ZeroVector;
     double CameraSurfaceSeconds = 0.0;
+    /** T5d3: the bed's depth under the camera (cm, the depth probe's at its foot), from the same
+     *  readings: the caustics' grids' centre (VoxelUnderwaterMap::CausticCentre). */
+    bool bHasCameraBed = false;
+    double CameraBedDepth = 0.0;
 };

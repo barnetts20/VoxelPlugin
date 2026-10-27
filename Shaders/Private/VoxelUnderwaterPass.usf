@@ -73,9 +73,23 @@ SamplerState UnderwaterCausticSampler;
 uint UnderwaterCausticOn;
 float4 UnderwaterCaustic;
 #define VOXEL_UNDERWATER_CAUSTIC_FIXED 1024.0f
-// The splat's margin past the grid's edge (texels): past the deepest slice's reach at 2 cm.
+// The splat's margin past the grid's edge (texels): past the deepest slice's reach (1.3 m at the finest 4 cm caustic texel).
 #define VOXEL_UNDERWATER_CAUSTIC_MARGIN 32
 #define VOXEL_UNDERWATER_CAUSTIC_SAMPLE(Layer, UV) UnderwaterCausticMap.SampleLevel(UnderwaterCausticSampler, float3(UV, Layer), 0.0f)
+// T5d3 fix: the caustics' own grids (VoxelUnderwaterMap.h MakeCausticLevels): per level the anchor
+// from the camera (xyz) and the texel (w), the plane's axes; round the sea point the sun lights the
+// bed under the camera through. The count from the compile environment (VoxelUnderwaterMap::
+// CausticLevels).
+#ifndef VOXEL_UNDERWATER_CAUSTIC_LEVELS
+#define VOXEL_UNDERWATER_CAUSTIC_LEVELS 4
+#endif
+float4 UnderwaterCausticAnchor[VOXEL_UNDERWATER_CAUSTIC_LEVELS];
+float4 UnderwaterCausticE1[VOXEL_UNDERWATER_CAUSTIC_LEVELS];
+float4 UnderwaterCausticE2[VOXEL_UNDERWATER_CAUSTIC_LEVELS];
+#define VOXEL_UNDERWATER_CAUSTIC_ANCHOR(Level) UnderwaterCausticAnchor[Level].xyz
+#define VOXEL_UNDERWATER_CAUSTIC_TEXEL(Level) UnderwaterCausticAnchor[Level].w
+#define VOXEL_UNDERWATER_CAUSTIC_E1(Level) UnderwaterCausticE1[Level].xyz
+#define VOXEL_UNDERWATER_CAUSTIC_E2(Level) UnderwaterCausticE2[Level].xyz
 
 // The shore (stage O8): the depth probe (levels: the anchor from the camera, world axes, and the
 // spacing in w; the plane's axes), UnderwaterProbeOn 0 without one. Ahead of the wave hook: its
@@ -346,6 +360,10 @@ void UnderwaterMapCS(uint3 DispatchThreadId : SV_DispatchThreadID)
     {
         if (DispatchThreadId.x < 8u && DispatchThreadId.y < 8u && DispatchThreadId.z == 0u)
             UnderwaterCameraOut[DispatchThreadId.y * 8u + DispatchThreadId.x] = Height - Above;
+        // T5d3: the bed's depth at the camera's foot (the point at (4, 4), half a spacing off it),
+        // for the caustics' grids' centre.
+        if (DispatchThreadId.x == 4u && DispatchThreadId.y == 4u && DispatchThreadId.z == 0u)
+            UnderwaterCameraOut[64u] = VoxelUnderwaterProbeDepth(X);
         return;
     }
     UnderwaterMapOut[DispatchThreadId] = Height - Above;
@@ -353,9 +371,11 @@ void UnderwaterMapCS(uint3 DispatchThreadId : SV_DispatchThreadID)
 }
 
 // Stage A8: THE CAUSTICS' SPLAT (VoxelUnderwaterMap.ush). One grid point per thread (x, y from a
-// margin past the grid, z the level): the surface's slope there (the heights' central differences;
-// past the edge the edge's, so the light keeps coming in), and its light sent along the beam's
-// deflection at each slice's path, splatted bilinearly into the accumulation.
+// margin past the grid, z the level): the surface's slope there, and its light sent along the
+// beam's deflection at each slice's path, splatted bilinearly into the accumulation. T5d3: the
+// caustics' grids are their own (round the bed under the camera's sun-side sea point), so the
+// slope is the surface map's heights' central differences one caustic texel apart, read where the
+// point lies (VoxelUnderwaterMapHeight: the finest map level covering it).
 [numthreads(VOXEL_UNDERWATER_THREADS, VOXEL_UNDERWATER_THREADS, 1)]
 void UnderwaterCausticSplatCS(uint3 DispatchThreadId : SV_DispatchThreadID)
 {
@@ -365,12 +385,13 @@ void UnderwaterCausticSplatCS(uint3 DispatchThreadId : SV_DispatchThreadID)
     const int Level = int(DispatchThreadId.z);
     const int X = int(DispatchThreadId.x) - M;
     const int Y = int(DispatchThreadId.y) - M;
-    const int Xc = clamp(X, 1, N - 2);
-    const int Yc = clamp(Y, 1, N - 2);
-    const float Texel = UnderwaterMapAnchor[Level].w;
+    const float Texel = UnderwaterCausticAnchor[Level].w;
+    const float3 E1 = UnderwaterCausticE1[Level].xyz;
+    const float3 E2 = UnderwaterCausticE2[Level].xyz;
+    const float3 Point = VoxelUnderwaterMapPoint(UnderwaterCausticAnchor[Level].xyz, Texel, E1, E2, X, Y);
     const float2 Slope = float2(
-        UnderwaterMap.Load(int4(Xc + 1, Yc, Level, 0)) - UnderwaterMap.Load(int4(Xc - 1, Yc, Level, 0)),
-        UnderwaterMap.Load(int4(Xc, Yc + 1, Level, 0)) - UnderwaterMap.Load(int4(Xc, Yc - 1, Level, 0))) / (2.0f * Texel);
+        VoxelUnderwaterMapHeight(Point + E1 * Texel) - VoxelUnderwaterMapHeight(Point - E1 * Texel),
+        VoxelUnderwaterMapHeight(Point + E2 * Texel) - VoxelUnderwaterMapHeight(Point - E2 * Texel)) / (2.0f * Texel);
     [loop]
     for (int K = 0; K < VOXEL_UNDERWATER_CAUSTIC_SLICES; K++)
     {
@@ -402,7 +423,7 @@ int VoxelUnderwaterCausticRadiusOf(int Layer)
 {
     const int Level = Layer / VOXEL_UNDERWATER_CAUSTIC_SLICES;
     const int K = Layer - Level * VOXEL_UNDERWATER_CAUSTIC_SLICES;
-    return clamp(int(UnderwaterCaustic.z * VoxelUnderwaterCausticSlicePath(K) * 100.0f / UnderwaterMapAnchor[Level].w + 0.5f), 1, 6);
+    return clamp(int(UnderwaterCaustic.z * VoxelUnderwaterCausticSlicePath(K) * 100.0f / UnderwaterCausticAnchor[Level].w + 0.5f), 1, 6);
 }
 
 [numthreads(VOXEL_UNDERWATER_THREADS, VOXEL_UNDERWATER_THREADS, 1)]

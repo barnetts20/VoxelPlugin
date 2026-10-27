@@ -94,6 +94,7 @@
 
 #include "VoxelLandHills.ush"
 #include "VoxelLandPeaks.ush"
+#include "VoxelLandDunes.ush"
 
 // Hilliness for the swells: in from the flats (a quarter there) to rolling ground, out toward
 // hill country (where the hills themselves carry the relief).
@@ -249,9 +250,16 @@ VOXEL_FUNC FVoxelLandHills VoxelLandHillsShapeDF(VOXEL_LAND_ARGS_DECL float2 PX,
     Out.Steer = float3(0.0f, 0.0f, 0.0f);
     Out.Curve = 0.0f;
     Out.Lambda = 0.0f;
+    Out.Dune = 0.0f;
     if (!VoxelLandHillsOn(VOXEL_LAND_ARGS 0.0f)) return Out;
     const float Base = VoxelLandSetBaseFade(VOXEL_LAND_ARGS Flow, Bake);
     if (Base <= 0.0f) return Out;
+    // T5c: the dunes where the climate makes desert (VoxelLandDunes.ush); the rest of the layer
+    // gives way under the sand.
+    const FVoxelLandDuneSite Dune = VoxelLandDuneSiteAt(VOXEL_LAND_ARGS normalize(float3(PX.x, PY.x, PZ.x)), Bake, Relief);
+    const float AD = LandDuneRelief * Dune.Share * Base;
+    Out.Dune = Dune.Share * Base;
+    const float Bury = 1.0f - VOXEL_LAND_DUNE_BURY * Out.Dune;
     const float P = VoxelLandPeakShare(VOXEL_LAND_ARGS Relief);
     // The strata's share (T4c): the hills and swells keep the rest. The foothills (T4b): the
     // hills hand over to the peaks as the peaks fade in (P), but grow first,
@@ -259,11 +267,11 @@ VOXEL_FUNC FVoxelLandHills VoxelLandHillsShapeDF(VOXEL_LAND_ARGS_DECL float2 PX,
     // they are a fifth in (without it the hills went faster than the peaks came: a smooth band
     // along every range front).
     const float S = VoxelLandStrataShare(VOXEL_LAND_ARGS Province);
-    const float Fade = Base * (1.0f - P) * (1.0f + LandHillFoothill * 4.0f * P * (1.0f - P)) * (1.0f - S);
+    const float Fade = Base * (1.0f - P) * (1.0f + LandHillFoothill * 4.0f * P * (1.0f - P)) * (1.0f - S) * Bury;
     const float AH = LandHillRelief * saturate(Form.x) * Fade;
     const float AS = LandHillSwellTexelsPerCell > 0.0f ? LandHillSwellM * VoxelLandSwellShare(Form.x) * Fade : 0.0f;
-    const float AT = S > 0.0f ? LandStrataRelief * lerp(LandStrataFlat, 1.0f, saturate(Form.x)) * Base * (1.0f - P) * S : 0.0f;
-    Out.AmplitudeM = AH + AS + AT;
+    const float AT = S > 0.0f ? LandStrataRelief * lerp(LandStrataFlat, 1.0f, saturate(Form.x)) * Base * (1.0f - P) * S * Bury : 0.0f;
+    Out.AmplitudeM = AH + AS + AT + AD;
     if (Out.AmplitudeM <= 0.0f) return Out;
     float Sum = 0.0f;
     float3 Grad = float3(0.0f, 0.0f, 0.0f);
@@ -289,6 +297,13 @@ VOXEL_FUNC FVoxelLandHills VoxelLandHillsShapeDF(VOXEL_LAND_ARGS_DECL float2 PX,
         Out.Steer = Out.Steer + T.Steer;
         Out.Curve += T.Curve;
         Out.Lambda = (AH * Out.Lambda + AT * T.Lambda) / (AH + AT);
+    }
+    if (AD > 0.0f && bShape)
+    {
+        // The dunes: no steering (no gullies in the sand).
+        const FVoxelLandPeaks D = VoxelLandDunesDF(VOXEL_LAND_ARGS PX, PY, PZ, Dune, AD, Footprint, true);
+        Sum += D.Unit * AD;
+        Grad = Grad + D.Gradient;
     }
     if (AS > 0.0f && bShape)
     {

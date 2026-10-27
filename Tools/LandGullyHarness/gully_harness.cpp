@@ -87,6 +87,25 @@ namespace VoxelShader
     float LandRiverCarve = 0.0f, LandRiverDepthScale = 1.0f, LandRiverFloodplainScale = 1.0f, LandRiverMinLog2Area = 0.0f, LandLakeShoreBand = 0.0f, LandRiverMeander = 0.0f, LandRiverFalls = 0.0f;
     float LandDetailTexelsPerCell = 0.0f, LandDetailMeanA = 0.0f, LandDetailScaleA = 0.0f, LandDetailScaleGain = 0.0f, LandDetailFade = 0.0f;   // N1: the detail layer
     uint LandDetailScales = 0, LandDetailSeed = 0;
+    // T5c: the dunes (VoxelLandDunes.ush; off unless a mode sets them).
+    const float4* LandClimate = nullptr;
+    uint LandHasClimate = 0, LandDuneBase = 0, LandDuneN = 0, LandDuneMips = 0, LandDuneSeed = 0, LandDuneDetailBase = 0, LandDuneDetailN = 0, LandDuneDetailMips = 0;
+    float LandClimateLapse = 6.5f, LandDuneTexelsPerCell = 0.0f, LandDuneScaleR = 1.0f, LandDuneScaleG = 1.0f, LandDuneMeanR = 0.0f, LandDuneMeanG = 0.0f, LandDuneRelief = 0.0f;
+    float LandDuneErgFrequency = 1.0f, LandDuneErgThreshold = 2.0f, LandDuneErgWidth = 0.06f, LandDuneReliefMax = 400.0f;
+    float LandDuneDetailTexelsPerCell = 0.0f, LandDuneDetailScale = 0.0f, LandDuneDetailMean = 0.0f, LandDuneDetailFade = 0.0f;
+    // T5d: the glacial layer (off unless a mode sets it).
+    uint LandGlacialBase = 0, LandGlacialN = 0, LandGlacialMips = 0, LandGlacialSeed = 0;
+    float LandGlacialTexelsPerCell = 0.0f, LandGlacialScaleR = 1.0f, LandGlacialScaleG = 1.0f, LandGlacialScaleB = 1.0f, LandGlacialMeanR = 0.0f, LandGlacialMeanG = 0.0f;
+    float LandGlacialReliefM = 0.0f, LandGlacialStrength = 0.0f, LandGlacialSpacingM = 0.0f, LandGlacialCooling = 0.0f, LandGlacialDetailScaleHard = 0.0f, LandGlacialDetailScaleSoft = 0.0f;
+    float LandIceMaxThickness = 0.0f, LandIceBlend = 0.0f, LandIceSwellTexelsPerCell = 0.0f, LandIceMeanG = 0.0f, LandIceSwellM = 0.0f, LandIceSwellSpacingM = 0.0f;   // T5d2
+    uint LandIceBase = 0, LandIceN = 0, LandIceMips = 0, LandIceSeed = 0;
+    uint LandPolarBase = 0, LandPolarN = 0, LandPolarMips = 0, LandPolarSeed = 0;   // T5d3
+    float LandPolarCrevasseTexelsPerCell = 0.0f, LandPolarCrevasseM = 0.0f, LandPolarCrevasseMean = 0.0f, LandPolarCrevasseFade = 0.0f;
+    float LandPolarSastrugiTexelsPerCell = 0.0f, LandPolarSastrugiM = 0.0f, LandPolarSastrugiMean = 0.0f, LandPolarSastrugiFade = 0.0f;
+    float LandPolarPolygonTexelsPerCell = 0.0f, LandPolarPolygonM = 0.0f, LandPolarPolygonMean = 0.0f, LandPolarPolygonFade = 0.0f;
+    float LandPolarPermafrostT = -6.0f, LandPolarCrevasseTurn = 0.0f, LandPolarSastrugiTurn = 0.0f;
+    uint LandPolarDuneBase = 0, LandPolarDuneN = 0, LandPolarDuneMips = 0;
+    float LandPolarDuneTexelsPerCell = 0.0f, LandPolarDuneM = 0.0f, LandPolarDuneMean = 0.0f, LandPolarDuneFade = 0.0f;
     float LandCellM = 1.0f;
     float LandWarpInvNorm = 0, LandWarpAmplitude = 0, LandDetailAmplitude = 0;
     float2 LandHeightOffset;
@@ -141,6 +160,23 @@ namespace VoxelShader
         float LandRiverCarve = 0.0f, LandRiverDepthScale = 1.0f, LandRiverFloodplainScale = 1.0f, LandRiverMinLog2Area = 0.0f, LandLakeShoreBand = 0.0f, LandRiverMeander = 0.0f, LandRiverFalls = 0.0f;
         float LandDetailTexelsPerCell = 0.0f, LandDetailMeanA = 0.0f, LandDetailScaleA = 0.0f, LandDetailScaleGain = 0.0f, LandDetailFade = 0.0f;   // N1: the detail layer
         uint LandDetailScales = 0, LandDetailSeed = 0;
+        const float4* LandClimate = nullptr;   // T5c
+        uint LandHasClimate = 0, LandDuneBase = 0, LandDuneN = 0, LandDuneMips = 0, LandDuneSeed = 0, LandDuneDetailBase = 0, LandDuneDetailN = 0, LandDuneDetailMips = 0;
+        float LandClimateLapse = 6.5f, LandDuneTexelsPerCell = 0.0f, LandDuneScaleR = 1.0f, LandDuneScaleG = 1.0f, LandDuneMeanR = 0.0f, LandDuneMeanG = 0.0f, LandDuneRelief = 0.0f;
+        float LandDuneErgFrequency = 1.0f, LandDuneErgThreshold = 2.0f, LandDuneErgWidth = 0.06f, LandDuneReliefMax = 400.0f;
+        float LandDuneDetailTexelsPerCell = 0.0f, LandDuneDetailScale = 0.0f, LandDuneDetailMean = 0.0f, LandDuneDetailFade = 0.0f;
+        uint LandGlacialBase = 0, LandGlacialN = 0, LandGlacialMips = 0, LandGlacialSeed = 0;   // T5d
+        float LandGlacialTexelsPerCell = 0.0f, LandGlacialScaleR = 1.0f, LandGlacialScaleG = 1.0f, LandGlacialScaleB = 1.0f, LandGlacialMeanR = 0.0f, LandGlacialMeanG = 0.0f;
+        float LandGlacialReliefM = 0.0f, LandGlacialStrength = 0.0f, LandGlacialSpacingM = 0.0f, LandGlacialCooling = 0.0f, LandGlacialDetailScaleHard = 0.0f, LandGlacialDetailScaleSoft = 0.0f;
+        float LandIceMaxThickness = 0.0f, LandIceBlend = 0.0f, LandIceSwellTexelsPerCell = 0.0f, LandIceMeanG = 0.0f, LandIceSwellM = 0.0f, LandIceSwellSpacingM = 0.0f;   // T5d2
+        uint LandIceBase = 0, LandIceN = 0, LandIceMips = 0, LandIceSeed = 0;
+        uint LandPolarBase = 0, LandPolarN = 0, LandPolarMips = 0, LandPolarSeed = 0;   // T5d3
+        float LandPolarCrevasseTexelsPerCell = 0.0f, LandPolarCrevasseM = 0.0f, LandPolarCrevasseMean = 0.0f, LandPolarCrevasseFade = 0.0f;
+        float LandPolarSastrugiTexelsPerCell = 0.0f, LandPolarSastrugiM = 0.0f, LandPolarSastrugiMean = 0.0f, LandPolarSastrugiFade = 0.0f;
+        float LandPolarPolygonTexelsPerCell = 0.0f, LandPolarPolygonM = 0.0f, LandPolarPolygonMean = 0.0f, LandPolarPolygonFade = 0.0f;
+        float LandPolarPermafrostT = -6.0f, LandPolarCrevasseTurn = 0.0f, LandPolarSastrugiTurn = 0.0f;
+        uint LandPolarDuneBase = 0, LandPolarDuneN = 0, LandPolarDuneMips = 0;
+        float LandPolarDuneTexelsPerCell = 0.0f, LandPolarDuneM = 0.0f, LandPolarDuneMean = 0.0f, LandPolarDuneFade = 0.0f;
         float LandCellM = 1.0f;
         float LandGullyStrength = 0.0f;
         uint LandGullyOctaves = 0;
@@ -155,6 +191,11 @@ namespace VoxelShader
 #undef VOXEL_LAND_DETAIL_USH
 #undef VOXEL_LAND_RIVERS_USH
 #undef VOXEL_LAND_CARVE_USH
+#undef VOXEL_LAND_DUNES_USH
+#undef VOXEL_LAND_CLIMATE_USH
+#undef VOXEL_LAND_CLIMATE_ACCESS_USH
+#undef VOXEL_LAND_ICE_USH
+#undef VOXEL_LAND_POLAR_USH
 #include "VoxelLandSample.ush"
 #include "VoxelLandGully.ush"
     };

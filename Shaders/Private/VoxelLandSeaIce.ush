@@ -1,0 +1,193 @@
+// VoxelLandSeaIce.ush - Sea ice as land (stage T5e, Design/LandClimate.md): where the planet's
+// climate snapshot is cold enough at sea level, the polar sea freezes and the frozen sea becomes
+// terrain: pack ice a metre or two above the water, pressure ridges on it, open leads between its
+// floes toward the ice's edge. Placed once per capture; it doesn't move with the seasons.
+//
+// WHERE: the ice's share, from the climate cell's year's mean at sea level (LandSeaIceTemperature,
+// half in, +-VOXEL_LAND_SEA_ICE_HALF C: Earth's Arctic Ocean, about -15 C to -20 C, full; the
+// Bering and Okhotsk seas' winter ice, a few degrees below freezing, its edge), on the sea only (the
+// bake from 0 to -VOXEL_LAND_SEA_ICE_COAST_M: the land keeps its own surface, the ice sheets their
+// margins).
+//
+// THE FLOES (the `polar` set's A: floes as plates at slightly different levels, pressure ridges
+// along their edges; VoxelLandPolarDF looks it up and blends the faces, at LandSeaIceTexelsPerCell,
+// the floe size): a point is ice where its A ranks below the share among the set's values (the
+// set's quantiles, LandSeaIceQLow/Mid/High: so the share is the ice's cover), so toward the edge the
+// ridges and the highest plates go first and whole floes drift apart over open leads.
+//
+// THE SURFACE (a heightfield: the ice can't float over the water, it stands on the bed):
+//   - the bed under the ice is raised to the leads' depth (LandSeaIceLeadDepth, a smooth maximum,
+//     by the share: over the ice's hundreds of kilometres a gentle rise, so the leads are water of
+//     that depth, not chasms to the abyss, and the waves the ocean sees there are damped, as pack
+//     ice damps them);
+//   - on the ice, the surface is a smooth maximum of that and the ice's top: LandSeaIceFreeboard
+//     plus A's height over its median times LandSeaIceRidgeM (the ridges' sails).
+// The detail layer gives way on the sea ice (by its share: both of the chain's paths agree).
+// Applied after the carve and the ice sheets (VoxelLandGully.ush VoxelLandSurfaceTermsDF), as one
+// more transform of the surface: its slope scales the terms' gradients, its own gradient is added.
+//
+// Shared subset (VoxelShaderCompat.h). Included by VoxelLandGully.ush after VoxelLandIce.ush; its
+// inputs, declared by the host:
+//   LandClimate, LandHasClimate                the climate (VoxelLandClimateAccess.ush)
+//   float LandSeaIceFreeboard;                 m above the sea (0: no sea ice)
+//   float LandSeaIceRidgeM;                    m: the ridges' height per unit of A over its median
+//   float LandSeaIceLeadDepth;                 m: the water's depth in the leads
+//   float LandSeaIceTemperature;               C: the year's mean at sea level where the ice is half
+//   float LandSeaIceTexelsPerCell;             the polar set's A at the floe size (0: no floes)
+//   float LandSeaIceMeanA;                     A's mean (unit)
+//   float LandSeaIceFade;                      the mip level by which the floes have faded to it
+//   float LandSeaIceQLow, LandSeaIceQMid, LandSeaIceQHigh;   A's 5%, 50% and 90% quantiles (unit)
+
+#ifndef VOXEL_LAND_SEA_ICE_USH
+#define VOXEL_LAND_SEA_ICE_USH
+
+#include "VoxelLandPeaks.ush"
+#include "VoxelLandClimateAccess.ush"
+
+// Half the share's ramp (C) about LandSeaIceTemperature.
+#define VOXEL_LAND_SEA_ICE_HALF 3.0f
+// The bake's depth (m) over which the ice comes in from the coast.
+#define VOXEL_LAND_SEA_ICE_COAST_M 10.0f
+// The smooth maximum's widths (m): the leads' raised bed, the ice's top over it.
+#define VOXEL_LAND_SEA_ICE_BED_BLEND 20.0f
+#define VOXEL_LAND_SEA_ICE_TOP_BLEND 1.0f
+// The A rank's half-width over which a floe's edge goes from ice to water (unit of rank: a
+// floe's plate is nearly flat in A, so a narrower edge sinks whole plates at once and magnifies
+// the lookup's rounding).
+#define VOXEL_LAND_SEA_ICE_EDGE 0.03f
+// The share over which the leads' bed comes up to their depth (the marginal ice zone's outer part).
+#define VOXEL_LAND_SEA_ICE_BED_SHARE 0.3f
+
+/** Whether the planet has sea ice (a freeboard, the polar set's floes, a climate). */
+VOXEL_FUNC bool VoxelLandSeaIceOn(VOXEL_LAND_ARGS_DECL float Dummy)
+{
+    return LandSeaIceFreeboard > 0.0f && LandSeaIceTexelsPerCell > 0.0f && LandPolarN != 0u && LandHasClimate != 0u;
+}
+
+/** The sea ice's share at a point (0..1: the climate's, on the sea) and its gradient (per m,
+ *  tangent: the coast's along the bake's slope; the climate's own change between cells left out). */
+struct FVoxelLandSeaIceShare
+{
+    float Share;
+    float3 Gradient;
+};
+
+VOXEL_FUNC FVoxelLandSeaIceShare VoxelLandSeaIceShareAt(VOXEL_LAND_ARGS_DECL float3 Normal, float Bake, float3 BakeGradient)
+{
+    FVoxelLandSeaIceShare Out;
+    Out.Share = 0.0f;
+    Out.Gradient = float3(0.0f, 0.0f, 0.0f);
+    if (!VoxelLandSeaIceOn(VOXEL_LAND_ARGS 0.0f) || Bake >= 0.0f) return Out;
+    const FVoxelLandClimateCell Cell = VoxelLandClimateCellAt(VOXEL_LAND_ARGS VoxelLandClimateTapsOf(Normal));
+    const float Cold = VoxelLandClimateRamp(LandSeaIceTemperature + VOXEL_LAND_SEA_ICE_HALF, LandSeaIceTemperature - VOXEL_LAND_SEA_ICE_HALF,
+        Cell.SeaTemperature);
+    if (Cold <= 0.0f) return Out;
+    const float Sea = VoxelLandClimateRamp(0.0f, -VOXEL_LAND_SEA_ICE_COAST_M, Bake);
+    Out.Share = Cold * Sea;
+    Out.Gradient = BakeGradient * (Cold * VoxelLandGlacialFadeSlope(0.0f, -VOXEL_LAND_SEA_ICE_COAST_M, Bake));
+    return Out;
+}
+
+/** The rank (0..1) of an A value among the set's (piecewise linear through its quantiles), and
+ *  its slope in A. */
+struct FVoxelLandSeaIceRank
+{
+    float Rank;
+    float Slope;
+};
+
+VOXEL_FUNC FVoxelLandSeaIceRank VoxelLandSeaIceRankOf(VOXEL_LAND_ARGS_DECL float A)
+{
+    FVoxelLandSeaIceRank Out;
+    float A0 = 0.0f;
+    float A1 = LandSeaIceQLow;
+    float R0 = 0.0f;
+    float R1 = 0.05f;
+    if (A > LandSeaIceQHigh)
+    {
+        A0 = LandSeaIceQHigh; A1 = 1.0f; R0 = 0.9f; R1 = 1.0f;
+    }
+    else if (A > LandSeaIceQMid)
+    {
+        A0 = LandSeaIceQMid; A1 = LandSeaIceQHigh; R0 = 0.5f; R1 = 0.9f;
+    }
+    else if (A > LandSeaIceQLow)
+    {
+        A0 = LandSeaIceQLow; A1 = LandSeaIceQMid; R0 = 0.05f; R1 = 0.5f;
+    }
+    const float Span = max(A1 - A0, 1.0e-4f);
+    Out.Slope = (R1 - R0) / Span;
+    Out.Rank = R0 + (saturate((A - A0) / Span)) * (R1 - R0);
+    return Out;
+}
+
+/** The sea ice over a surface at height S (m), with the share (VoxelLandSeaIceShareAt) and the
+ *  floes' A (unit, the faces blended: VoxelLandPolarDF's Floe) and its gradient (per m, tangent).
+ *  Height the surface after it (m), Scale its slope in S, Gradient its own (m/m, tangent), Cover
+ *  the ice's share of the surface. bGradients (a constant): the gradient. */
+struct FVoxelLandSeaIceSurface
+{
+    float Height;
+    float Scale;
+    float3 Gradient;
+    float Cover;
+};
+
+/** The polynomial smooth maximum of A and B over width K: its value and its slope in A (in B: 1
+ *  less that). */
+struct FVoxelLandSmoothMax
+{
+    float Value;
+    float SlopeA;
+};
+
+VOXEL_FUNC FVoxelLandSmoothMax VoxelLandSmoothMaxOf(float A, float B, float K)
+{
+    FVoxelLandSmoothMax Out;
+    const float H = max(K - abs(A - B), 0.0f) / K;
+    Out.Value = max(A, B) + K * H * H * 0.25f;
+    Out.SlopeA = A >= B ? 1.0f - 0.5f * H : 0.5f * H;
+    return Out;
+}
+
+VOXEL_FUNC FVoxelLandSeaIceSurface VoxelLandSeaIceSurfaceDF(VOXEL_LAND_ARGS_DECL float S, FVoxelLandSeaIceShare Share, float Floe, float3 FloeGradient,
+    bool bGradients)
+{
+    FVoxelLandSeaIceSurface Out;
+    Out.Height = S;
+    Out.Scale = 1.0f;
+    Out.Gradient = float3(0.0f, 0.0f, 0.0f);
+    Out.Cover = 0.0f;
+    const float G = Share.Share;
+    if (G <= 0.0f) return Out;
+    // The leads' bed: the bed raised to the leads' depth, fully from a share of 0.3.
+    const FVoxelLandSmoothMax Bed = VoxelLandSmoothMaxOf(S, -LandSeaIceLeadDepth, VOXEL_LAND_SEA_ICE_BED_BLEND);
+    const float GB = VoxelLandClimateRamp(0.0f, VOXEL_LAND_SEA_ICE_BED_SHARE, G);
+    const float S1 = S + GB * (Bed.Value - S);
+    const float S1Scale = 1.0f + GB * (Bed.SlopeA - 1.0f);
+    // The floes: ice where A ranks under the share (at share 1 everywhere).
+    const FVoxelLandSeaIceRank R = VoxelLandSeaIceRankOf(VOXEL_LAND_ARGS Floe);
+    const float W = VOXEL_LAND_SEA_ICE_EDGE;
+    const float X = G * (1.0f + 2.0f * W) - R.Rank;
+    const float Cov = smoothstep(-W, W, X);
+    // The ice's top: the freeboard, the ridges over the median plate.
+    const float Ridge = LandSeaIceRidgeM / max(1.0f - LandSeaIceQMid, 0.05f);
+    const float Top = LandSeaIceFreeboard + Ridge * (Floe - LandSeaIceQMid);
+    const FVoxelLandSmoothMax M = VoxelLandSmoothMaxOf(S1, Top, VOXEL_LAND_SEA_ICE_TOP_BLEND);
+    Out.Height = S1 + Cov * (M.Value - S1);
+    const float Keep = 1.0f - Cov + Cov * M.SlopeA;
+    Out.Scale = Keep * S1Scale;
+    Out.Cover = Cov * (1.0f - M.SlopeA);
+    if (bGradients)
+    {
+        // The raised bed's own (the share's change, the coast's), the ice's top (the floes'), and
+        // the cover's (the share's and the floes' through the rank).
+        const float3 S1Own = Share.Gradient * (VoxelLandGlacialFadeSlope(0.0f, VOXEL_LAND_SEA_ICE_BED_SHARE, G) * (Bed.Value - S));
+        const float CovSlope = VoxelLandGlacialFadeSlope(-W, W, X);
+        const float3 CovGradient = (Share.Gradient * (1.0f + 2.0f * W) - FloeGradient * R.Slope) * CovSlope;
+        Out.Gradient = S1Own * Keep + FloeGradient * (Ridge * Cov * (1.0f - M.SlopeA)) + CovGradient * (M.Value - S1);
+    }
+    return Out;
+}
+
+#endif // VOXEL_LAND_SEA_ICE_USH

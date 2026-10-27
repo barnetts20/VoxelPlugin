@@ -1,0 +1,192 @@
+// VoxelLandClimateMaterial.ush - The land's climate in the terrain material (stage T5a,
+// Design/LandClimate.md): a Custom node of its own, beside the land node (VoxelLandMaterial.ush),
+// that reads the planet's climate map (VoxelLandClimate texture parameter: the layout in
+// VoxelLandClimate.ush) at the pixel, corrects it for the pixel's own height, slope and facing
+// (VoxelLandClimateAt), and tints the graph's base colour with snow, glacier ice, desert and plant
+// cover. The pixel's height is its own distance from the planet's centre less the sea's radius,
+// so it is the drawn surface's (edits and caves included), whichever source the land node used.
+//
+// Custom node (Include File Paths: /Plugin/VoxelPlugin/Private/VoxelLandClimateMaterial.ush;
+// Output Type CMOT Float 3; Additional Outputs Climate and Cover, CMOT Float 4):
+//   return VoxelLandClimateMaterial(Parameters, ClimateTex, OriginHigh, OriginLow, AxisX, AxisY, AxisZ, NormalWS, BaseColor, ClimateParams, ClimateShape, ClimateTint, Climate, Cover);
+//
+// Inputs:
+//   ClimateTex      the VoxelLandClimate texture parameter (a Texture Object);
+//   OriginHigh/Low, AxisX/Y/Z  the land node's VoxelLandOriginHigh/Low and VoxelLandAxisX/Y/Z
+//                   (the same parameters; the axes' low parts aren't needed here);
+//   NormalWS        the surface's world normal: the land node's NormalWS (or any normal the graph
+//                   lights with, e.g. after its own detail normals);
+//   BaseColor       the graph's base colour before the climate;
+//   ClimateParams   the VoxelLandClimateParams vector parameter: x 1 on (+ 2 x the debug view,
+//                   voxel.Debug.LandClimate), y the sea's radius (m), z the lapse rate (C/km),
+//                   w the season (0 summer .. 1 winter). ITS DEFAULT IN THE MATERIAL MUST BE
+//                   (0, 0, 0, 0): an instance the planet didn't set leaves the base colour alone;
+//   ClimateShape    VoxelLandClimateShape: x the aspect warming (C), y the breakup's amplitude (C),
+//                   z its scale (m), w the snow line's half width (C);
+//   ClimateTint     VoxelLandClimateTint: how strongly the node tints with x snow, y glacier ice,
+//                   z desert, w plant cover (0 leaves that to the graph, using Cover).
+// Outputs:
+//   return value    the base colour, tinted (or a debug view's colour);
+//   Climate         x the year's mean temperature at the pixel (C), y the precipitation (mm a
+//                   year), z the aridity (log2 of Holdridge's PET ratio: below 0 humid, 1
+//                   semi-arid, 2 arid, 3 per-arid), w the summer's mean temperature (C);
+//   Cover           x snow, y glacier ice, z desert, w plant cover (0..1 each): for the graph's
+//                   own layers (snow textures, sand, grass), roughness and so on.
+// The tints keep some of the base colour's detail (its luminance) under them; for full control
+// set ClimateTint to 0 and blend the graph's layers by Cover.
+
+#pragma once
+
+#include "/Plugin/VoxelPlugin/Private/VoxelDensityCore.ush"
+#include "/Plugin/VoxelPlugin/Private/VoxelDF64.ush"
+#include "/Plugin/VoxelPlugin/Private/VoxelLandClimate.ush"
+
+// The engine's view of the pixel, as the land node takes it (VoxelLandMaterial.ush).
+#ifndef VOXEL_LAND_TRANSLATED_WORLD_POSITION
+#define VOXEL_LAND_TRANSLATED_WORLD_POSITION(Parameters) ((Parameters).WorldPosition_CamRelative)
+#endif
+#ifndef VOXEL_LAND_PRE_VIEW_TRANSLATION_HIGH
+#define VOXEL_LAND_PRE_VIEW_TRANSLATION_HIGH (ResolvedView.PreViewTranslation.High)
+#define VOXEL_LAND_PRE_VIEW_TRANSLATION_LOW (ResolvedView.PreViewTranslation.Low)
+#endif
+
+// The debug views (voxel.Debug.LandClimate).
+#define VOXEL_LAND_CLIMATE_VIEW_TEMPERATURE 1
+#define VOXEL_LAND_CLIMATE_VIEW_SUMMER 2
+#define VOXEL_LAND_CLIMATE_VIEW_PRECIPITATION 3
+#define VOXEL_LAND_CLIMATE_VIEW_ARIDITY 4
+#define VOXEL_LAND_CLIMATE_VIEW_COVER 5
+#define VOXEL_LAND_CLIMATE_VIEW_SEASONALITY 6
+#define VOXEL_LAND_CLIMATE_VIEW_CONTINENTALITY 7
+
+FVoxelLandClimateCell VoxelLandClimateLoad(Texture2D ClimateTex, int X, int Y)
+{
+    const float4 V = ClimateTex.Load(int3(X, Y, 0));
+    FVoxelLandClimateCell C;
+    C.SeaTemperature = V.x;
+    C.Precipitation = V.y;
+    C.Seasonality = V.z;
+    C.Continentality = V.w;
+    return C;
+}
+
+/** The map's cell at a unit planet-frame direction (bilinear). */
+FVoxelLandClimateCell VoxelLandClimateSample(Texture2D ClimateTex, float3 Dir)
+{
+    const FVoxelLandClimateTaps T = VoxelLandClimateTapsOf(Dir);
+    return VoxelLandClimateBlend(VoxelLandClimateLoad(ClimateTex, T.X0, T.Y0), VoxelLandClimateLoad(ClimateTex, T.X1, T.Y0),
+        VoxelLandClimateLoad(ClimateTex, T.X0, T.Y1), VoxelLandClimateLoad(ClimateTex, T.X1, T.Y1), T.FX, T.FY);
+}
+
+/** Base tinted toward Colour by Share, keeping some of Base's luminance as detail (Keep 0: flat
+ *  Colour, 1: Colour scaled by Base's brightness about a mid grey). */
+float3 VoxelLandClimateTintOf(float3 Base, float3 Colour, float Share, float Keep)
+{
+    const float Luminance = dot(Base, float3(0.2126f, 0.7152f, 0.0722f));
+    const float Detail = lerp(1.0f, clamp(0.6f + 2.0f * Luminance, 0.6f, 1.4f), Keep);
+    return lerp(Base, Colour * Detail, saturate(Share));
+}
+
+/** A five-stop ramp over T (0..1), sRGB stops. */
+float3 VoxelLandClimateRamp5(float T, float3 C0, float3 C1, float3 C2, float3 C3, float3 C4)
+{
+    const float S = saturate(T) * 4.0f;
+    if (S < 1.0f) return lerp(C0, C1, S);
+    if (S < 2.0f) return lerp(C1, C2, S - 1.0f);
+    if (S < 3.0f) return lerp(C2, C3, S - 2.0f);
+    return lerp(C3, C4, S - 3.0f);
+}
+
+/** A temperature's colour (sRGB): -30 C violet, -15 blue, 0 white, 15 green, 30 red. */
+float3 VoxelLandClimateTemperatureColor(float T)
+{
+    return VoxelLandClimateRamp5((T + 30.0f) / 60.0f, float3(0.25f, 0.05f, 0.45f), float3(0.15f, 0.35f, 0.95f),
+        float3(0.95f, 0.97f, 1.0f), float3(0.35f, 0.75f, 0.30f), float3(0.85f, 0.15f, 0.10f));
+}
+
+/** A debug view's colour (linear). */
+float3 VoxelLandClimateView(FVoxelLandClimatePoint P, FVoxelLandClimateCell Cell, uint View)
+{
+    float3 C = float3(0.5f, 0.5f, 0.5f);
+    if (View == VOXEL_LAND_CLIMATE_VIEW_TEMPERATURE) C = VoxelLandClimateTemperatureColor(P.Temperature);
+    else if (View == VOXEL_LAND_CLIMATE_VIEW_SUMMER) C = VoxelLandClimateTemperatureColor(P.Summer);
+    else if (View == VOXEL_LAND_CLIMATE_VIEW_PRECIPITATION)
+    {
+        // 50 mm tan, 200 yellow, 800 green, 2,000 blue, 4,000+ violet (log).
+        const float T = (log2(max(P.Precipitation, 1.0f)) - 5.644f) / 6.322f;
+        C = VoxelLandClimateRamp5(T, float3(0.75f, 0.55f, 0.30f), float3(0.92f, 0.85f, 0.40f), float3(0.30f, 0.70f, 0.30f),
+            float3(0.15f, 0.45f, 0.85f), float3(0.40f, 0.15f, 0.65f));
+    }
+    else if (View == VOXEL_LAND_CLIMATE_VIEW_ARIDITY)
+    {
+        // log2 PET ratio -3 (superhumid) blue .. 0 green .. 2 yellow .. 5 red.
+        C = VoxelLandClimateRamp5((P.Aridity + 3.0f) / 8.0f, float3(0.10f, 0.25f, 0.80f), float3(0.20f, 0.65f, 0.75f),
+            float3(0.30f, 0.70f, 0.30f), float3(0.92f, 0.80f, 0.35f), float3(0.80f, 0.20f, 0.10f));
+    }
+    else if (View == VOXEL_LAND_CLIMATE_VIEW_COVER)
+    {
+        C = float3(0.40f, 0.38f, 0.36f);
+        C = lerp(C, float3(0.20f, 0.55f, 0.15f), P.Vegetation);
+        C = lerp(C, float3(0.90f, 0.75f, 0.45f), P.Desert);
+        C = lerp(C, float3(0.40f, 0.85f, 1.0f), P.Glacier);
+        C = lerp(C, float3(1.0f, 1.0f, 1.0f), P.Snow);
+    }
+    else if (View == VOXEL_LAND_CLIMATE_VIEW_SEASONALITY)
+    {
+        C = VoxelLandClimateRamp5(Cell.Seasonality / 20.0f, float3(0.05f, 0.05f, 0.10f), float3(0.20f, 0.20f, 0.60f),
+            float3(0.30f, 0.70f, 0.40f), float3(0.95f, 0.75f, 0.25f), float3(0.90f, 0.20f, 0.10f));
+    }
+    else if (View == VOXEL_LAND_CLIMATE_VIEW_CONTINENTALITY)
+    {
+        C = lerp(float3(0.15f, 0.45f, 0.85f), float3(0.65f, 0.40f, 0.20f), saturate(Cell.Continentality));
+    }
+    return pow(max(C, 0.0f), 2.2f);
+}
+
+float3 VoxelLandClimateMaterial(FMaterialPixelParameters Parameters, Texture2D ClimateTex, float3 OriginHigh, float3 OriginLow,
+    float3 AxisX, float3 AxisY, float3 AxisZ, float3 NormalWS, float3 BaseColor, float4 ClimateParams, float4 ClimateShape, float4 ClimateTint,
+    out float4 Climate, out float4 Cover)
+{
+    Climate = float4(0.0f, 0.0f, 0.0f, 0.0f);
+    Cover = float4(0.0f, 0.0f, 0.0f, 0.0f);
+    const uint Packed = uint(max(ClimateParams.x, 0.0f) + 0.5f);
+    if ((Packed & 1u) == 0u) return BaseColor;
+    const uint View = Packed >> 1u;
+
+    // The pixel in the planet's frame (m): its offset from the planet's origin in double-float
+    // (exact at any distance from the world's origin), then turned by the axes in float (a few
+    // centimetres at a planet's radius: the climate is coarse and the breakup tens of metres).
+    const float3 TranslatedWorld = VOXEL_LAND_TRANSLATED_WORLD_POSITION(Parameters);
+    const float3 PreViewHigh = VOXEL_LAND_PRE_VIEW_TRANSLATION_HIGH;
+    const float3 PreViewLow = VOXEL_LAND_PRE_VIEW_TRANSLATION_LOW;
+    const float2 DX = VoxelDFSub(float2(TranslatedWorld.x, 0.0f), VoxelDFAdd(float2(OriginHigh.x, OriginLow.x), float2(PreViewHigh.x, PreViewLow.x)));
+    const float2 DY = VoxelDFSub(float2(TranslatedWorld.y, 0.0f), VoxelDFAdd(float2(OriginHigh.y, OriginLow.y), float2(PreViewHigh.y, PreViewLow.y)));
+    const float2 DZ = VoxelDFSub(float2(TranslatedWorld.z, 0.0f), VoxelDFAdd(float2(OriginHigh.z, OriginLow.z), float2(PreViewHigh.z, PreViewLow.z)));
+    const float3 Offset = float3(DX.x + DX.y, DY.x + DY.y, DZ.x + DZ.y);
+    const float3 Local = float3(dot(Offset, AxisX), dot(Offset, AxisY), dot(Offset, AxisZ)) * 0.01f;
+    const float Radius = length(Local);
+    const float3 Up = Local / max(Radius, 1.0f);
+    const float3 NormalLocal = normalize(float3(dot(NormalWS, AxisX), dot(NormalWS, AxisY), dot(NormalWS, AxisZ)));
+
+    const FVoxelLandClimateCell Cell = VoxelLandClimateSample(ClimateTex, Up);
+    FVoxelLandClimateLook Look;
+    Look.LapseRate = ClimateParams.z;
+    Look.Season = ClimateParams.w;
+    Look.AspectWarming = ClimateShape.x;
+    Look.BreakupAmplitude = ClimateShape.y;
+    Look.BreakupScale = ClimateShape.z;
+    Look.SnowWidth = ClimateShape.w;
+    const FVoxelLandClimatePoint P = VoxelLandClimateAt(Cell, Look, Local, Up, NormalLocal, Radius - ClimateParams.y);
+    Climate = float4(P.Temperature, P.Precipitation, P.Aridity, P.Summer);
+    Cover = float4(P.Snow, P.Glacier, P.Desert, P.Vegetation);
+    if (View != 0u) return VoxelLandClimateView(P, Cell, View);
+
+    // Plants, then sand, then ice, then snow on top (linear colours: green cover, a pale sand,
+    // blue-grey ice, fresh snow's 0.8).
+    float3 C = BaseColor;
+    C = VoxelLandClimateTintOf(C, float3(0.07f, 0.12f, 0.04f), P.Vegetation * ClimateTint.w, 0.8f);
+    C = VoxelLandClimateTintOf(C, float3(0.46f, 0.35f, 0.22f), P.Desert * ClimateTint.z, 0.8f);
+    C = VoxelLandClimateTintOf(C, float3(0.50f, 0.66f, 0.78f), P.Glacier * ClimateTint.y, 0.5f);
+    C = VoxelLandClimateTintOf(C, float3(0.80f, 0.82f, 0.86f), P.Snow * ClimateTint.x, 0.3f);
+    return C;
+}

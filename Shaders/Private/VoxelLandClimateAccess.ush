@@ -1,0 +1,161 @@
+// VoxelLandClimateAccess.ush - The land chain's read of the planet's climate (stages T5c, T5d, T5d2;
+// Design/LandClimate.md): the climate map's cell, the sand's drift and the ice sheet at a direction,
+// bilinear, from LandClimate (FVoxelLandClimateField: VOXEL_LAND_CLIMATE_WIDTH x HEIGHT cells, then
+// as many drift entries, then as many ice entries). The dunes (VoxelLandDunes.ush), the glacial layer
+// (VoxelLandPeaks.ush) and the ice sheets (VoxelLandIce.ush) read it.
+//
+// Shared subset (VoxelShaderCompat.h). Included by VoxelLandPeaks.ush; its inputs, declared by the
+// host:
+//   StructuredBuffer<float4> LandClimate;   the cells, then the drift (VOXEL_LAND_CLIMATE(I) reads
+//                                           entry I: the material defines it as zero)
+//   uint LandHasClimate;                    1 when LandClimate holds the map
+//   float LandClimateLapse;                 C per km (the planet's ClimateLapseRate)
+
+#ifndef VOXEL_LAND_CLIMATE_ACCESS_USH
+#define VOXEL_LAND_CLIMATE_ACCESS_USH
+
+#include "VoxelLandAccess.ush"
+#include "VoxelLandClimate.ush"
+
+/** The climate map's entry I (the cells, then the drift). */
+#ifndef VOXEL_LAND_CLIMATE
+#define VOXEL_LAND_CLIMATE(I) LandClimate[I]
+#endif
+
+/** The climate map's cell at the taps (bilinear). */
+VOXEL_FUNC FVoxelLandClimateCell VoxelLandClimateCellAt(VOXEL_LAND_ARGS_DECL FVoxelLandClimateTaps T)
+{
+    const uint W = VOXEL_LAND_CLIMATE_WIDTH;
+    const float W00 = (1.0f - T.FX) * (1.0f - T.FY);
+    const float W10 = T.FX * (1.0f - T.FY);
+    const float W01 = (1.0f - T.FX) * T.FY;
+    const float W11 = T.FX * T.FY;
+    const float4 C00 = VOXEL_LAND_CLIMATE(uint(T.Y0) * W + uint(T.X0));
+    const float4 C10 = VOXEL_LAND_CLIMATE(uint(T.Y0) * W + uint(T.X1));
+    const float4 C01 = VOXEL_LAND_CLIMATE(uint(T.Y1) * W + uint(T.X0));
+    const float4 C11 = VOXEL_LAND_CLIMATE(uint(T.Y1) * W + uint(T.X1));
+    FVoxelLandClimateCell Cell;
+    Cell.SeaTemperature = W00 * C00.x + W10 * C10.x + W01 * C01.x + W11 * C11.x;
+    Cell.Precipitation = W00 * C00.y + W10 * C10.y + W01 * C01.y + W11 * C11.y;
+    Cell.Seasonality = W00 * C00.z + W10 * C10.z + W01 * C01.z + W11 * C11.z;
+    Cell.Continentality = W00 * C00.w + W10 * C10.w + W01 * C01.w + W11 * C11.w;
+    return Cell;
+}
+
+/** The sand's drift at the taps (bilinear): x east, y north (unit directions blended), z the
+ *  steadiness. */
+VOXEL_FUNC float3 VoxelLandClimateDriftAt(VOXEL_LAND_ARGS_DECL FVoxelLandClimateTaps T)
+{
+    const uint W = VOXEL_LAND_CLIMATE_WIDTH;
+    const uint Cells = VOXEL_LAND_CLIMATE_WIDTH * VOXEL_LAND_CLIMATE_HEIGHT;
+    const float W00 = (1.0f - T.FX) * (1.0f - T.FY);
+    const float W10 = T.FX * (1.0f - T.FY);
+    const float W01 = (1.0f - T.FX) * T.FY;
+    const float W11 = T.FX * T.FY;
+    const float4 D00 = VOXEL_LAND_CLIMATE(Cells + uint(T.Y0) * W + uint(T.X0));
+    const float4 D10 = VOXEL_LAND_CLIMATE(Cells + uint(T.Y0) * W + uint(T.X1));
+    const float4 D01 = VOXEL_LAND_CLIMATE(Cells + uint(T.Y1) * W + uint(T.X0));
+    const float4 D11 = VOXEL_LAND_CLIMATE(Cells + uint(T.Y1) * W + uint(T.X1));
+    return float3(W00 * D00.x + W10 * D10.x + W01 * D01.x + W11 * D11.x,
+        W00 * D00.y + W10 * D10.y + W01 * D01.y + W11 * D11.y,
+        W00 * D00.z + W10 * D10.z + W01 * D01.z + W11 * D11.z);
+}
+
+/** T5d2: the ice sheet at a direction: the signed distance into the ice and the land's mean
+ *  height (m), and their gradients (m/m, tangent vectors at Dir, on a sphere of RadiusM metres). A
+ *  cubic B-spline over the grid's 4 x 4 cells about the point (wrapping in longitude, clamped at
+ *  the poles' rows), not the bilinear the other reads use: the ice's surface is made from it, and a
+ *  bilinear's slope breaks at every cell's edge (straight creases across the sheet). */
+struct FVoxelLandClimateIce
+{
+    float Distance;
+    float Base;
+    float3 DistanceGradient;
+    float3 BaseGradient;
+};
+
+/** The uniform cubic B-spline's weights at T (nodes -1 .. 2) and their slopes. */
+struct FVoxelLandClimateSpline
+{
+    float4 W;
+    float4 D;
+};
+
+VOXEL_FUNC FVoxelLandClimateSpline VoxelLandClimateSplineAt(float T)
+{
+    FVoxelLandClimateSpline Out;
+    const float U = 1.0f - T;
+    Out.W = float4(U * U * U / 6.0f, (3.0f * T * T * T - 6.0f * T * T + 4.0f) / 6.0f, (-3.0f * T * T * T + 3.0f * T * T + 3.0f * T + 1.0f) / 6.0f,
+        T * T * T / 6.0f);
+    Out.D = float4(-0.5f * U * U, 0.5f * (3.0f * T * T - 4.0f * T), 0.5f * (-3.0f * T * T + 2.0f * T + 1.0f), 0.5f * T * T);
+    return Out;
+}
+
+VOXEL_FUNC float VoxelLandClimateSplineComponent(float4 V, uint I)
+{
+    return I == 0u ? V.x : (I == 1u ? V.y : (I == 2u ? V.z : V.w));
+}
+
+VOXEL_FUNC FVoxelLandClimateIce VoxelLandClimateIceAt(VOXEL_LAND_ARGS_DECL float3 Dir, float RadiusM)
+{
+    const int W = VOXEL_LAND_CLIMATE_WIDTH;
+    const int H = VOXEL_LAND_CLIMATE_HEIGHT;
+    const uint Ice = 2u * VOXEL_LAND_CLIMATE_WIDTH * VOXEL_LAND_CLIMATE_HEIGHT;
+    // The grid coordinates (as VoxelLandClimateTapsOf's): X = longitude W / 2 pi - 1/2, Y = (sin
+    // latitude + 1) H / 2 - 1/2, Y clamped to the rows (no slope beyond them).
+    float U = atan2(Dir.y, Dir.x) * 0.15915494f;
+    if (U < 0.0f) U = U + 1.0f;
+    const float X = U * float(W) - 0.5f;
+    const float YRaw = (clamp(Dir.z, -1.0f, 1.0f) + 1.0f) * 0.5f * float(H) - 0.5f;
+    const float Y = clamp(YRaw, 0.0f, float(H - 1));
+    const float FX = floor(X);
+    const float FY = floor(Y);
+    const FVoxelLandClimateSpline SX = VoxelLandClimateSplineAt(X - FX);
+    const FVoxelLandClimateSpline SY = VoxelLandClimateSplineAt(Y - FY);
+    float T = 0.0f;
+    float B = 0.0f;
+    float TX = 0.0f;
+    float TY = 0.0f;
+    float BX = 0.0f;
+    float BY = 0.0f;
+    VOXEL_LOOP
+    for (uint J = 0u; J < 4u; J++)
+    {
+        const int Row = clamp(int(FY) + int(J) - 1, 0, H - 1);
+        const float WY = VoxelLandClimateSplineComponent(SY.W, J);
+        const float DY = VoxelLandClimateSplineComponent(SY.D, J);
+        VOXEL_LOOP
+        for (uint I = 0u; I < 4u; I++)
+        {
+            const int Col = ((int(FX) + int(I) - 1) % W + W) % W;
+            const float4 E = VOXEL_LAND_CLIMATE(Ice + uint(Row) * uint(W) + uint(Col));
+            const float WX = VoxelLandClimateSplineComponent(SX.W, I);
+            const float DX = VoxelLandClimateSplineComponent(SX.D, I);
+            T += WX * WY * E.x;
+            B += WX * WY * E.y;
+            TX += DX * WY * E.x;
+            BX += DX * WY * E.y;
+            TY += WX * DY * E.x;
+            BY += WX * DY * E.y;
+        }
+    }
+    FVoxelLandClimateIce Out;
+    Out.Distance = T;
+    Out.Base = B;
+    // Per m east and north (none along Y where it is clamped).
+    const bool bRows = YRaw > 0.0f && YRaw < float(H - 1);
+    const float Z = clamp(Dir.z, -1.0f, 1.0f);
+    // (The field's rows by the poles are their means: little to go east by where Cos is small.)
+    const float Cos = max(sqrt(max(1.0f - Z * Z, 0.0f)), 1.0e-3f);
+    const float3 EastRaw = float3(-Dir.y, Dir.x, 0.0f);
+    const float EastLength = length(EastRaw);
+    const float3 East = EastLength > 1.0e-6f ? EastRaw / EastLength : float3(1.0f, 0.0f, 0.0f);
+    const float3 North = cross(Dir, East);
+    const float PerEast = float(W) / (6.28318531f * max(RadiusM, 1.0f) * Cos);
+    const float PerNorth = bRows ? float(H) * 0.5f * Cos / max(RadiusM, 1.0f) : 0.0f;
+    Out.DistanceGradient = East * (TX * PerEast) + North * (TY * PerNorth);
+    Out.BaseGradient = East * (BX * PerEast) + North * (BY * PerNorth);
+    return Out;
+}
+
+#endif // VOXEL_LAND_CLIMATE_ACCESS_USH

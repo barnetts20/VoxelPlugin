@@ -288,6 +288,87 @@ VOXEL_FUNC float2 VoxelLandMaterialNoise(Texture2D NoiseTex, Texture2D ConstTex,
 #define LandStrataDetailScaleHard VoxelLandConstF(LandConstTex, VOXEL_LAND_MC_STRATA_DETAIL_SCALE_HARD)
 #define LandStrataDetailScaleSoft VoxelLandConstF(LandConstTex, VOXEL_LAND_MC_STRATA_DETAIL_SCALE_SOFT)
 #define LandStrataDetailFade VoxelLandConstF(LandConstTex, VOXEL_LAND_MC_STRATA_DETAIL_FADE)
+// T5c: no dunes in the analytic node (the reference; the land cache, the default, has them: its
+// writer is a global shader with the climate map bound).
+#define VOXEL_LAND_CLIMATE(I) float4(0.0f, 0.0f, 0.0f, 0.0f)
+#define LandHasClimate 0u
+#define LandClimateLapse 0.0f
+#define LandDuneTexelsPerCell 0.0f
+#define LandDuneBase 0u
+#define LandDuneN 0u
+#define LandDuneMips 0u
+#define LandDuneScaleR 1.0f
+#define LandDuneScaleG 1.0f
+#define LandDuneMeanR 0.0f
+#define LandDuneMeanG 0.0f
+#define LandDuneRelief 0.0f
+#define LandDuneSeed 0u
+#define LandDuneErgFrequency 1.0f
+#define LandDuneErgThreshold 2.0f
+#define LandDuneErgWidth 0.1f
+#define LandDuneReliefMax 0.0f
+#define LandDuneDetailTexelsPerCell 0.0f
+#define LandDuneDetailBase 0u
+#define LandDuneDetailN 0u
+#define LandDuneDetailMips 0u
+#define LandDuneDetailScale 0.0f
+#define LandDuneDetailMean 0.0f
+#define LandDuneDetailFade 0.0f
+// T5d: no glacial layer in the analytic node either (the peaks there).
+#define LandGlacialTexelsPerCell 0.0f
+#define LandGlacialBase 0u
+#define LandGlacialN 0u
+#define LandGlacialMips 0u
+#define LandGlacialScaleR 1.0f
+#define LandGlacialScaleG 1.0f
+#define LandGlacialScaleB 1.0f
+#define LandGlacialMeanR 0.0f
+#define LandGlacialMeanG 0.0f
+#define LandGlacialReliefM 0.0f
+#define LandGlacialStrength 0.0f
+#define LandGlacialSeed 0u
+#define LandGlacialSpacingM 0.0f
+#define LandGlacialCooling 0.0f
+#define LandGlacialDetailScaleHard 0.0f
+#define LandGlacialDetailScaleSoft 0.0f
+// T5d2: no ice sheets in the analytic node either.
+#define LandIceMaxThickness 0.0f
+#define LandIceBlend 0.0f
+#define LandIceSwellTexelsPerCell 0.0f
+#define LandIceBase 0u
+#define LandIceN 0u
+#define LandIceMips 0u
+#define LandIceMeanG 0.0f
+#define LandIceSwellM 0.0f
+#define LandIceSeed 0u
+#define LandIceSwellSpacingM 0.0f
+// T5d3: no polar surfaces in the analytic node either.
+#define LandPolarBase 0u
+#define LandPolarN 0u
+#define LandPolarMips 0u
+#define LandPolarSeed 0u
+#define LandPolarCrevasseTexelsPerCell 0.0f
+#define LandPolarCrevasseM 0.0f
+#define LandPolarCrevasseMean 0.0f
+#define LandPolarCrevasseFade 0.0f
+#define LandPolarSastrugiTexelsPerCell 0.0f
+#define LandPolarSastrugiM 0.0f
+#define LandPolarSastrugiMean 0.0f
+#define LandPolarSastrugiFade 0.0f
+#define LandPolarPolygonTexelsPerCell 0.0f
+#define LandPolarPolygonM 0.0f
+#define LandPolarPolygonMean 0.0f
+#define LandPolarPolygonFade 0.0f
+#define LandPolarPermafrostT 0.0f
+#define LandPolarCrevasseTurn 0.0f
+#define LandPolarSastrugiTurn 0.0f
+#define LandPolarDuneBase 0u
+#define LandPolarDuneN 0u
+#define LandPolarDuneMips 0u
+#define LandPolarDuneTexelsPerCell 0.0f
+#define LandPolarDuneM 0.0f
+#define LandPolarDuneMean 0.0f
+#define LandPolarDuneFade 0.0f
 #define LandMode VoxelLandConstU(LandConstTex, VOXEL_LAND_MC_LAND_MODE)
 #define LandWarpOctaves VoxelLandConstU(LandConstTex, VOXEL_LAND_MC_WARP_OCTAVES)
 #define LandWarpInvNorm VoxelLandConstF(LandConstTex, VOXEL_LAND_MC_WARP_INV_NORM)

@@ -246,6 +246,13 @@ public:
      *  (cm, actor space; 0: the density's own). The planet sets its ocean radius. */
     void SetDebugSeaRadius(double InSeaRadius);
 
+    /** Stage T5a: the land's climate for the terrain material's climate node
+     *  (VoxelLandClimateMaterial.ush): the map's texture (null turns the node off) and its
+     *  parameters (VoxelLandMaterial::SetClimateParameters: Params y the sea's radius in m, z the
+     *  lapse rate, w the season; Shape; Tint). The planet sets them; they stay across rebinds of
+     *  the material. */
+    void SetLandClimate(UTexture2DDynamic* Texture, const FLinearColor& Params, const FLinearColor& Shape, const FLinearColor& Tint);
+
 protected:
     /** SetDebugSeaRadius's value, for the brick terrain's settings. */
     double DebugSeaRadius = 0.0;
@@ -352,6 +359,14 @@ protected:
     bool bLandMaterialBound = false;
     FDelegateHandle LandMaterialTickHandle;
 
+    /** Stage T5a: the climate node's map and parameters (SetLandClimate). */
+    UPROPERTY(Transient)
+    TObjectPtr<UTexture2DDynamic> LandClimateTexture;
+
+    FLinearColor LandClimateParams = FLinearColor(0.0f, 0.0f, 0.0f, 0.0f);
+    FLinearColor LandClimateShape = FLinearColor(0.0f, 0.0f, 0.0f, 0.0f);
+    FLinearColor LandClimateTint = FLinearColor(0.0f, 0.0f, 0.0f, 0.0f);
+
     /** The land surface cache (Design/LandSurfaceCache.md): its textures and the levels' plan,
      *  made with the land textures, ticked with the frame. */
     UPROPERTY(Transient)
@@ -369,6 +384,8 @@ protected:
     TUniquePtr<FVoxelLandCache> LandCache;
     TWeakPtr<const FVoxelDensityCPU> LandCacheDensity;   // the density the cache was made for
     TWeakPtr<const FVoxelDensityCPU> LandCacheFailed;    // the cache couldn't be made for it
+    double LandCacheUnwritableSince = -1.0;              // when the made cache was first found unwritable (-1: it is writable)
+    bool bLandCacheUnwritableLogged = false;             // the warning given for that cache
 
     /** Makes the cache for Density (or keeps it), and binds it; false when it can't be made. */
     bool ResolveLandCache(const TSharedPtr<const FVoxelDensityCPU>& Density);

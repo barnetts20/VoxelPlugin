@@ -33,6 +33,12 @@ namespace VoxelLandMaterial
     VOXELPLUGIN_API extern const FName AxisZLowName;           // VoxelLandAxisZLow
     VOXELPLUGIN_API extern const FName ParamsName;             // VoxelLandParams (x view, y tolerance m, z enabled, w near footprint cm)
 
+    /** Stage T5a: the climate node's parameters (VoxelLandClimateMaterial.ush). */
+    VOXELPLUGIN_API extern const FName ClimateTextureName;     // VoxelLandClimate (texture: the climate map)
+    VOXELPLUGIN_API extern const FName ClimateParamsName;      // VoxelLandClimateParams (x on + 2 view, y sea radius m, z lapse C/km, w season)
+    VOXELPLUGIN_API extern const FName ClimateShapeName;       // VoxelLandClimateShape (x aspect C, y breakup C, z breakup m, w snow width C)
+    VOXELPLUGIN_API extern const FName ClimateTintName;        // VoxelLandClimateTint (x snow, y glacier, z desert, w plants)
+
     /** The field texels of a bake (Side x 6 Side, the bake's cell order). Any thread. */
     VOXELPLUGIN_API void BuildFieldTexels(const FVoxelLandBake& Bake, TArray<FFloat16Color>& Out);
 
@@ -50,6 +56,23 @@ namespace VoxelLandMaterial
 
     /** voxel.Debug.LandCache: the node shows the cache's levels. */
     VOXELPLUGIN_API bool ShowsCacheLevels();
+
+    /** Stage T5a: voxel.Debug.LandClimate, the climate node's debug view (0 none). */
+    VOXELPLUGIN_API int32 ClimateView();
+
+    /** Stage T5a, game thread: the climate map's texture (RGBA16F, VoxelLandClimate.ush's layout),
+     *  empty until UploadClimateTexture fills it. Null when it can't be made. */
+    VOXELPLUGIN_API UTexture2DDynamic* MakeClimateTexture();
+
+    /** Stage T5a, game thread: the cells (x the year's mean at sea level, y the precipitation, z the
+     *  swing, w the continentality; VOXEL_LAND_CLIMATE_WIDTH x HEIGHT) into the texture. */
+    VOXELPLUGIN_API void UploadClimateTexture(UTexture2DDynamic* Texture, const TArray<FVector4f>& Cells);
+
+    /** Stage T5a, game thread: the climate node's parameters on a material instance (Params.x is
+     *  set here: 1 when Texture is given, plus 2 x the debug view; 0 turns the node off), and the
+     *  texture when bBindTexture (the per-frame update leaves it bound). */
+    VOXELPLUGIN_API void SetClimateParameters(UMaterialInstanceDynamic* Material, UTexture2DDynamic* Texture, const FLinearColor& Params,
+        const FLinearColor& Shape, const FLinearColor& Tint, bool bBindTexture = true);
 
     /** Whether a material has the land node: its VoxelLandParams vector parameter. */
     VOXELPLUGIN_API bool HasLandNode(const UMaterialInterface* Material);

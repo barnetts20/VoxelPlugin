@@ -226,7 +226,7 @@ struct VOXELPLUGIN_API FVoxelLandNoiseSet
     FVoxelLandNoiseSet(const FVoxelLandNoiseSet&) = delete;
     FVoxelLandNoiseSet& operator=(const FVoxelLandNoiseSet&) = delete;
 
-    FString Name;                 // the pack's key (VoxelLand::LandNoiseNameFor: "peaks|hills|strata|detail")
+    FString Name;                 // the pack's key (VoxelLand::LandNoiseNameFor: "peaks|hills|strata|detail|dunes|sanddetail|glacial|icesheet|polar")
     FString LookTag;              // the peaks set's
     uint32 RowN = 0;              // texels per row (a power of two: the widest chain's N)
     uint32 N = 0;                 // the peaks' set: texels per side of mip 0 (0: no peaks)
@@ -288,6 +288,67 @@ struct VOXELPLUGIN_API FVoxelLandNoiseSet
     float StrataRangeB = 1.0f;
     float StrataMeanR = 0.0f;     // N1b, as the hills'
     float StrataMeanG = 0.0f;
+    // The dunes' set (VoxelLandDunes.ush, T5c): R sharp crests, G rounded (heights over the
+    // interdune floor, the slip faces toward +x); B and A aren't read. Its chain from texel
+    // DuneBase (a whole row; 0 size: none), read from the mip no larger than DuneMaxSetN (the
+    // pack's rows: DuneN that mip's size, the texels below its own), its crest spacing (texels:
+    // DuneN over its cells per tile), R's and G's decode ranges (texels) and means (unit).
+    FString DuneName;
+    uint32 DuneBase = 0;
+    uint32 DuneN = 0;
+    uint32 DuneMips = 0;
+    uint32 DuneSpacingTexels = 0;
+    float DuneRangeR = 1.0f;
+    float DuneRangeG = 1.0f;
+    float DuneMeanR = 0.0f;
+    float DuneMeanG = 0.0f;
+    // The sand's detail set (T5c): its G only (megaripples, crests across +x), read as the dunes'
+    // (from the mip no larger than DuneMaxSetN); its wavelength (texels: SandN over G's cells per
+    // tile, which need not divide it), G's decode range (texels) and mean (unit). 0 size: none.
+    FString SandName;
+    uint32 SandBase = 0;
+    uint32 SandN = 0;
+    uint32 SandMips = 0;
+    float SandSpacingTexels = 0.0f;
+    float SandRangeG = 1.0f;
+    float SandMeanG = 0.0f;
+    // The glacial set (VoxelLandPeaks.ush's glacial layer, T5d): the peaks' layout (R the carved
+    // bedrock, G the ice surface over it, B R blurred, A its flow), read from the mip no larger
+    // than DuneMaxSetN; its chain from GlacialBase (0 size: none), its trough spacing (texels) and
+    // decode ranges (texels), R's and G's means (unit).
+    FString GlacialName;
+    uint32 GlacialBase = 0;
+    uint32 GlacialN = 0;
+    uint32 GlacialMips = 0;
+    uint32 GlacialSpacingTexels = 0;
+    float GlacialRangeR = 1.0f;
+    float GlacialRangeG = 1.0f;
+    float GlacialRangeB = 1.0f;
+    float GlacialMeanR = 0.0f;
+    float GlacialMeanG = 0.0f;
+    // The ice sheets' set (VoxelLandIce.ush, T5d2): the peaks' layout (R the buried bed, G the ice
+    // surface, its swells, B R blurred, A its flow), read from the mip no larger than DuneMaxSetN; its
+    // G only: its chain from IceBase (0 size: none), its spacing (texels) and mean (unit).
+    FString IceName;
+    uint32 IceBase = 0;
+    uint32 IceN = 0;
+    uint32 IceMips = 0;
+    uint32 IceSpacingTexels = 0;
+    float IceMeanG = 0.0f;
+    // The polar surfaces' set (VoxelLandPolar.ush, T5d3): R crevasses, G sastrugi, B ice-wedge
+    // polygons, A sea ice (T5e), each a simulated height in its texels, read from the mip no larger
+    // than DuneMaxSetN; its chain from PolarBase (0 size: none), and per channel (R, G, B) its cell
+    // (texels: PolarN over its cells per tile), its range (texels) and its mean (unit).
+    FString PolarName;
+    uint32 PolarBase = 0;
+    uint32 PolarN = 0;
+    uint32 PolarMips = 0;
+    float PolarSpacingTexels[3] = { 0.0f, 0.0f, 0.0f };
+    float PolarRange[3] = { 1.0f, 1.0f, 1.0f };
+    float PolarMean[3] = { 0.0f, 0.0f, 0.0f };
+    // Their grains (radians from the set's x toward its y; VoxelNoiseTiles::GrainAngleOf): R's
+    // slots' normal, G's ridges' long axis.
+    float PolarTurn[2] = { 0.0f, 0.0f };
 
     /** Whether the words hold every chain (the sampler's bounds). */
     bool IsComplete() const { return RowN > 0 && Rows > 0 && Words.Num() == (int32)(2 * Rows * RowN); }
@@ -416,8 +477,10 @@ namespace VoxelLand
     VOXELPLUGIN_API float PeakDetailTexelsPerCell(const FVoxelTerrestrialSettings& Settings, const FVoxelLandBake& Bake, const FVoxelLandNoiseSet& Set);
 
     /** How far the peaks can raise the surface (bUp; else lower it), cm. They act only on land
-     *  (from 2 m up), so they lower it below the bake's land at most this far. Noise: the pack
-     *  (its peaks set's relief bounds their amplitude), or null (the bake's largest relief). */
+     *  (from 2 m up; T5d's glacial layer from sea level), so they lower it below the bake's land at
+     *  most this far. Noise: the pack (its peaks set's relief bounds their amplitude, and with a
+     *  glacial set the two layers' switch, sqrt 2 times the larger), or null (the bake's largest
+     *  relief). */
     VOXELPLUGIN_API double PeakReach(const FVoxelTerrestrialSettings& Settings, const FVoxelLandBake& Bake, const FVoxelLandNoiseSet* Noise, bool bUp);
 
     /** The set layers' face blend (N1b, VoxelLandSetLayerDF): it keeps the variance, so near a
@@ -480,9 +543,54 @@ namespace VoxelLand
      *  scale or coverage 0), or without a hill set (they ride its layer), or without a set. */
     VOXELPLUGIN_API FString StrataNoiseNameFor(const FVoxelTerrestrialSettings& Settings);
 
-    /** The noise pack a planet's density takes: "Peaks|Hills|Strata|Detail" (PeakNoiseNameFor,
-     *  HillNoiseNameFor, StrataNoiseNameFor, DetailNoiseNameFor; any part empty when the
-     *  planet has none); empty when it needs none of them. */
+    /** The dunes' set (T5c): Settings.DuneNoiseSet if set ("none": no dunes); else one of the
+     *  folder's `dunes*` sets by the seed (as the peaks'). Empty without dunes (height scale 0),
+     *  or without a hill set (they ride its layer), or without a set. */
+    VOXELPLUGIN_API FString DuneNoiseNameFor(const FVoxelTerrestrialSettings& Settings);
+
+    /** The sand's detail set (T5c): Settings.SandDetailNoiseSet if set ("none": none); else one of
+     *  the folder's `sanddetail*` sets by the seed. Empty without dunes, strength 0, or a set. */
+    VOXELPLUGIN_API FString SandDetailNoiseNameFor(const FVoxelTerrestrialSettings& Settings);
+
+    /** The glacial set (T5d): Settings.GlacialNoiseSet if set ("none": none); else one of the
+     *  folder's `glacial*` sets by the seed. Empty without it (height scale 0), without peaks (it
+     *  takes their place), or without a set. */
+    VOXELPLUGIN_API FString GlacialNoiseNameFor(const FVoxelTerrestrialSettings& Settings);
+
+    /** The ice sheets' set (T5d2): Settings.IceSheetNoiseSet if set ("none": none); else one of the
+     *  folder's `icesheet*` sets by the seed. Empty without ice sheets or swells, or a set. */
+    VOXELPLUGIN_API FString IceSheetNoiseNameFor(const FVoxelTerrestrialSettings& Settings);
+
+    /** The ice sheets' smooth maximum's width (m; VoxelLandIce.ush). */
+    constexpr double IceSheetBlend = 60.0;
+
+    /** The polar surfaces' set (T5d3): Settings.PolarNoiseSet if set ("none": none); else one of the
+     *  folder's `polar*` sets by the seed. Empty without any of its features (height scales 0) or a
+     *  set (the density leaves it out without the land climate). */
+    VOXELPLUGIN_API FString PolarNoiseNameFor(const FVoxelTerrestrialSettings& Settings);
+
+    /** A polar feature's spacing (m; Channel 0 crevasses, 1 sastrugi, 2 polygons): the setting, at
+     *  least its smallest. */
+    VOXELPLUGIN_API double PolarSpacing(const FVoxelTerrestrialSettings& Settings, int32 Channel);
+
+    /** The snow dunes' spacing (m; VoxelLandPolar.ush): the setting, at least 50 m. */
+    VOXELPLUGIN_API double SnowDuneSpacing(const FVoxelTerrestrialSettings& Settings);
+
+    /** The polar surfaces' blend bound (VoxelLandPolar.ush): two turns and three faces, each blend
+     *  keeping the variance: sqrt 2 x sqrt 3. */
+    constexpr double PolarBlendBound = 2.449489742783178;
+
+    /** How far the polar surfaces can move the surface (m), up (bUp) or down: per feature, its
+     *  channel's range above (below) its mean at its placement and height scale, times
+     *  PolarBlendBound; summed (they can overlap where their shares fade), the snow dunes' (the dune
+     *  set's G over SnowDuneHeight) with them. 0 without a polar set. */
+    VOXELPLUGIN_API double PolarReach(const FVoxelTerrestrialSettings& Settings, const FVoxelLandNoiseSet* Noise, bool bUp);
+
+    /** The noise pack a planet's density takes: "Peaks|Hills|Strata|Detail|Dunes|SandDetail|Glacial|
+     *  IceSheet|Polar" (PeakNoiseNameFor, HillNoiseNameFor, StrataNoiseNameFor, DetailNoiseNameFor,
+     *  DuneNoiseNameFor, SandDetailNoiseNameFor, GlacialNoiseNameFor, IceSheetNoiseNameFor,
+     *  PolarNoiseNameFor; any part empty when the planet has none; the parts from the fifth only
+     *  up to the last the planet has); empty when it needs none of them. */
     VOXELPLUGIN_API FString LandNoiseNameFor(const FVoxelTerrestrialSettings& Settings);
 
     /** The pack Key (LandNoiseNameFor): its sets read (about 0.1 s for a 2048 set, and a few
@@ -533,6 +641,37 @@ namespace VoxelLand
     /** The strata's detail's coarsest wavelength (m): the setting within 16 m .. a quarter of the
      *  strata spacing. */
     VOXELPLUGIN_API double StrataDetailWavelength(const FVoxelTerrestrialSettings& Settings);
+
+    /** The dunes' sets are read from their mip no larger than this (T5c): the pack's rows hold six
+     *  2048 chains only just not (MaxRows), and a 1024 chain still has 32 texels a crest. */
+    constexpr uint32 DuneMaxSetN = 1024;
+
+    /** The smallest dune spacing (m) the code accepts. */
+    constexpr double DuneMinSpacing = 100.0;
+
+    /** The dunes' blend bound (VoxelLandDunes.ush): at most five turns (two by the wind, three
+     *  for the many winds) and three faces, each blend keeping the variance: sqrt 5 x sqrt 3. */
+    constexpr double DuneBlendBound = 3.872983346207417;
+
+    /** The dunes' placement (VoxelLandDunes.ush, T5c) for a pack: the dune set's texels per bake
+     *  cell (DuneSpacing over the set's spacing in texels); 0 without dunes, a dune set, or the
+     *  hill set's layer (HillTexelsPerCell 0). */
+    VOXELPLUGIN_API float DuneTexelsPerCell(const FVoxelTerrestrialSettings& Settings, const FVoxelLandBake& Bake, const FVoxelLandNoiseSet& Set);
+
+    /** The dunes' relief (m): DuneHeightScale x the larger of R's and G's ranges at the placement
+     *  (no cap: a crest's height is a fifth of the spacing at most with the default sets). */
+    VOXELPLUGIN_API double DuneRelief(const FVoxelTerrestrialSettings& Settings, const FVoxelLandNoiseSet& Set);
+
+    /** The sand detail's wavelength (m): the setting within 2 m .. a quarter of the dune spacing. */
+    VOXELPLUGIN_API double SandDetailWavelength(const FVoxelTerrestrialSettings& Settings);
+
+    /** The sand detail's height (m) at its placement: SandDetailStrength x its G's range there; 0
+     *  without it. */
+    VOXELPLUGIN_API double SandDetailRelief(const FVoxelTerrestrialSettings& Settings, const FVoxelLandNoiseSet& Set);
+
+    /** The glacial layer's placement (T5d) for a pack: the glacial set's texels per bake cell
+     *  (GlacialSpacing over the set's spacing in texels); 0 without it or the peaks. */
+    VOXELPLUGIN_API float GlacialTexelsPerCell(const FVoxelTerrestrialSettings& Settings, const FVoxelLandBake& Bake, const FVoxelLandNoiseSet& Set);
 
     /** How far the gullies can move the surface either way (cm). */
     VOXELPLUGIN_API double GullyReach(const FVoxelTerrestrialSettings& Settings, const FVoxelLandBake& Bake);

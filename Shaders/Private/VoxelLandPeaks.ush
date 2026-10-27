@@ -67,11 +67,35 @@
 //   float LandPeakDetailFade;        the mip level by which it has faded out
 //   float LandGullyStrength; uint LandGullyOctaves;   whether the gullies read the steering
 //                                    (VoxelLandGully.ush's; without them it isn't looked up)
+//
+// THE GLACIAL LAYER (stage T5d, Design/LandClimate.md): the `glacial` set (the peaks' layout: R the
+// bedrock carved by ice, troughs, cirques, horns and fjord beds; G the ice surface over it; B R
+// blurred, A its flow) takes the peaks' place where the climate snapshot puts glaciers, now or at
+// the last glacial maximum (LandGlacialCooling C colder): the share carved, Past, from the
+// glacier's equilibrium line at the bake's height (VoxelLandClimateGlacierMargin). The two layers'
+// amplitudes go by 1 - Past and Past over the root of their squares (the variance kept through
+// the switch); the glacial layer's R (bare bedrock) gives way to G (the ice) by the share iced now,
+// Now (its character, with its gradient through the bake's slope: the ice line runs along the
+// contours). Its amplitude is the peaks' rule from the glacial set's relief, with a lower coast
+// fade (troughs reach the sea: fjords). Its inputs:
+//   LandClimate, LandHasClimate, LandClimateLapse   the climate (VoxelLandClimateAccess.ush)
+//   float LandGlacialTexelsPerCell;  the set's mip-0 texels per bake cell (0: none)
+//   uint LandGlacialBase, LandGlacialN, LandGlacialMips;   its chain in LandNoise
+//   float LandGlacialScaleR, LandGlacialScaleG, LandGlacialScaleB;   as the peaks'
+//   float LandGlacialMeanR, LandGlacialMeanG;
+//   float LandGlacialReliefM;        its larger range in metres
+//   float LandGlacialStrength;       its height scale
+//   uint LandGlacialSeed;
+//   float LandGlacialSpacingM;       its trough spacing (the steering's wavelength)
+//   float LandGlacialCooling;        C: the glacial maximum's cooling
+//   float LandGlacialDetailScaleHard, LandGlacialDetailScaleSoft;   the peaks' detail set over its
+//                                    relief (at the peaks' detail placement and fade)
 
 #ifndef VOXEL_LAND_PEAKS_USH
 #define VOXEL_LAND_PEAKS_USH
 
 #include "VoxelLandAccess.ush"
+#include "VoxelLandClimateAccess.ush"
 
 #ifndef VOXEL_LOOP
 #define VOXEL_LOOP [loop]
@@ -95,6 +119,12 @@
 // size, so the same in metres). Plain defines: every host must use the same.
 #define VOXEL_LAND_PEAK_DETAIL_LEVEL_BIAS 0.5f
 #define VOXEL_LAND_PEAK_DETAIL_FADE_LEVELS 3.0f
+// T5d: the glacial layer's half-width (C) about the equilibrium line (the shares' ramps), and the
+// bake height (m) over which it fades in from the coast (from sea level, not the peaks' 2 m: its
+// troughs reach the sea, fjords; over a little more, its walls being taller).
+#define VOXEL_LAND_GLACIAL_WIDTH 2.0f
+#define VOXEL_LAND_GLACIAL_COAST_START 0.0f
+#define VOXEL_LAND_GLACIAL_COAST_END 50.0f
 
 /** The peaks at a point: Unit the shape (zero-mean, within -1 .. 1 over the larger of R's and
  *  G's ranges, plus the detail's: VoxelLand::PeakReach; Height = Unit x AmplitudeM),
@@ -451,6 +481,87 @@ VOXEL_FUNC FVoxelLandSetLayer VoxelLandPeakLayer(VOXEL_LAND_ARGS_DECL float Dumm
     return L;
 }
 
+/** T5d: smoothstep(E0, E1, X)'s derivative in X (VoxelLandCarve.ush's VoxelLandSmoothSlope, which comes later). */
+VOXEL_FUNC float VoxelLandGlacialFadeSlope(float E0, float E1, float X)
+{
+    const float T = saturate((X - E0) / (E1 - E0));
+    return 6.0f * T * (1.0f - T) / (E1 - E0);
+}
+
+/** T5d: whether the planet has the glacial layer (a set, a placement, the peaks, a climate). */
+VOXEL_FUNC bool VoxelLandGlacialOn(VOXEL_LAND_ARGS_DECL float Dummy)
+{
+    return LandGlacialTexelsPerCell > 0.0f && LandGlacialStrength > 0.0f && LandGlacialN != 0u && LandHasClimate != 0u;
+}
+
+/** T5d: the glacial layer's amplitude (m): the peaks' rule (VoxelLandPeakAmplitude) from its own
+ *  relief, faded in from the coast lower. */
+VOXEL_FUNC float VoxelLandGlacialAmplitude(VOXEL_LAND_ARGS_DECL float Relief, float Flow, float Bake)
+{
+    float A = LandGlacialStrength * min(LandGlacialReliefM, Relief) * smoothstep(LandPeakReliefStart, LandPeakReliefEnd, Relief)
+        * smoothstep(VOXEL_LAND_GLACIAL_COAST_START, VOXEL_LAND_GLACIAL_COAST_END, Bake);
+    if (LandHasFlow != 0u)
+        A *= 1.0f - smoothstep(VOXEL_LAND_PEAK_CREST_START, VOXEL_LAND_PEAK_CREST_END, Flow - 2.0f * log2(LandCellM));
+    return max(A, 0.0f);
+}
+
+/** T5d: the glacial shares at a unit direction and bake height (m): Past, carved (glaciers now or
+ *  at the glacial maximum); Now, iced now (at most Past); their changes per m of height. */
+struct FVoxelLandGlacialSite
+{
+    float Past;
+    float Now;
+    float PastSlope;
+    float NowSlope;
+};
+
+VOXEL_FUNC FVoxelLandGlacialSite VoxelLandGlacialSiteAt(VOXEL_LAND_ARGS_DECL float3 Dir, float Bake)
+{
+    const FVoxelLandClimateCell Cell = VoxelLandClimateCellAt(VOXEL_LAND_ARGS VoxelLandClimateTapsOf(Dir));
+    const float Margin = VoxelLandClimateGlacierMargin(Cell, LandClimateLapse, Bake, 0.0f);
+    const float W = VOXEL_LAND_GLACIAL_WIDTH;
+    FVoxelLandGlacialSite Out;
+    Out.Now = VoxelLandClimateRamp(-W, W, Margin);
+    Out.Past = VoxelLandClimateRamp(-W, W, Margin + max(LandGlacialCooling, 0.0f));
+    // The ramps' slopes (6 t (1 - t) over their width) times the margin's change with the height.
+    const float DMargin = Bake > 0.0f ? LandClimateLapse * 0.001f / (2.0f * W) : 0.0f;
+    const float TN = saturate((Margin + W) / (2.0f * W));
+    const float TP = saturate((Margin + max(LandGlacialCooling, 0.0f) + W) / (2.0f * W));
+    Out.NowSlope = 6.0f * TN * (1.0f - TN) * DMargin;
+    Out.PastSlope = 6.0f * TP * (1.0f - TP) * DMargin;
+    return Out;
+}
+
+/** T5d: the glacial layer (its chain in the pack; the peaks' detail set and placement). */
+VOXEL_FUNC FVoxelLandSetLayer VoxelLandGlacialLayer(VOXEL_LAND_ARGS_DECL float Dummy)
+{
+    FVoxelLandSetLayer L;
+    L.Set = VoxelLandNoiseSetOf(LandGlacialBase, LandGlacialN, LandGlacialMips);
+    L.TexelsPerCell = LandGlacialTexelsPerCell;
+    L.Seed = LandGlacialSeed;
+    L.Kind = 7u;
+    L.SaltA = 0x676c6163u;
+    L.SaltB = 0x63616c67u;
+    L.MeanR = LandGlacialMeanR;
+    L.MeanG = LandGlacialMeanG;
+    L.ScaleR = LandGlacialScaleR;
+    L.ScaleG = LandGlacialScaleG;
+    L.ScaleB = LandGlacialScaleB;
+    // Zero-mean, as the peaks.
+    L.BlendMeanR = LandGlacialMeanR;
+    L.BlendMeanG = LandGlacialMeanG;
+    L.LevelBias = -1.0f;
+    L.DetailSet = VoxelLandNoiseSetOf(LandDetailBase, LandDetailN, LandDetailMips);
+    L.DetailTexelsPerCell = LandGlacialDetailScaleHard > 0.0f || LandGlacialDetailScaleSoft > 0.0f ? LandPeakDetailTexelsPerCell : 0.0f;
+    L.DetailKind = 8u;
+    L.DetailMeanHard = LandDetailMeanHard;
+    L.DetailMeanSoft = LandDetailMeanSoft;
+    L.DetailScaleHard = LandGlacialDetailScaleHard;
+    L.DetailScaleSoft = LandGlacialDetailScaleSoft;
+    L.DetailFade = LandPeakDetailFade;
+    return L;
+}
+
 /** The peaks at the sea-level sphere point P (double-float, cm) with the bake's landform Form
  *  (its character shapes them), local relief Relief (m), drainage Flow (log2 m^2) and height Bake
  *  (m), band-limited to Footprint (cm): one lookup of the set (two near a face edge).
@@ -459,24 +570,102 @@ VOXEL_FUNC FVoxelLandSetLayer VoxelLandPeakLayer(VOXEL_LAND_ARGS_DECL float Dumm
  *  amplitude, the steering and its curvature (Unit and Gradient zero), from the steering channel
  *  alone: what the differenced terms need. */
 VOXEL_FUNC FVoxelLandPeaks VoxelLandPeaksShapeDF(VOXEL_LAND_ARGS_DECL float2 PX, float2 PY, float2 PZ, float2 Form, float3 CharacterGradient, float Relief,
-    float Flow, float Bake, float Footprint, bool bShape)
+    float Flow, float Bake, float3 BakeGradient, float Footprint, bool bShape)
 {
     FVoxelLandPeaks Out = VoxelLandPeaksNone();
     if (!VoxelLandPeaksOn(VOXEL_LAND_ARGS 0.0f)) return Out;
     const float AmplitudeM = VoxelLandPeakAmplitude(VOXEL_LAND_ARGS Relief, Flow, Bake);
-    if (AmplitudeM <= 0.0f)
+    // T5d: the glacial layer in the peaks' place where the climate has had glaciers.
+    const float GlacialM = VoxelLandGlacialOn(VOXEL_LAND_ARGS 0.0f) ? VoxelLandGlacialAmplitude(VOXEL_LAND_ARGS Relief, Flow, Bake) : 0.0f;
+    float AP = AmplitudeM;
+    float AG = 0.0f;
+    float DAP = 0.0f;
+    float DAG = 0.0f;
+    float Now = 0.0f;
+    float NowSlope = 0.0f;
+    if (GlacialM > 0.0f)
     {
-        Out.AmplitudeM = AmplitudeM;
+        const FVoxelLandGlacialSite G = VoxelLandGlacialSiteAt(VOXEL_LAND_ARGS normalize(float3(PX.x, PY.x, PZ.x)), Bake);
+        if (G.Past > 0.0f)
+        {
+            // The two layers by 1 - Past and Past, the variance kept (each its own at 0 and 1).
+            const float InvQ = 1.0f / sqrt((1.0f - G.Past) * (1.0f - G.Past) + G.Past * G.Past);
+            AP = AmplitudeM * (1.0f - G.Past) * InvQ;
+            AG = GlacialM * G.Past * InvQ;
+            // Their changes per m of height: through the switch (d/dP of (1 - P) / Q and P / Q are
+            // -P / Q^3 and (1 - P) / Q^3), and through their coast fades, which differ (each
+            // amplitude over its fade, times the fade's slope; 0 where the fade is).
+            const float InvQ3 = InvQ * InvQ * InvQ;
+            const float CP = smoothstep(VOXEL_LAND_PEAK_COAST_START, VOXEL_LAND_PEAK_COAST_END, Bake);
+            const float CG = smoothstep(VOXEL_LAND_GLACIAL_COAST_START, VOXEL_LAND_GLACIAL_COAST_END, Bake);
+            DAP = -AmplitudeM * G.Past * InvQ3 * G.PastSlope
+                + (CP > 0.0f ? AP / CP * VoxelLandGlacialFadeSlope(VOXEL_LAND_PEAK_COAST_START, VOXEL_LAND_PEAK_COAST_END, Bake) : 0.0f);
+            DAG = GlacialM * (1.0f - G.Past) * InvQ3 * G.PastSlope
+                + (CG > 0.0f ? AG / CG * VoxelLandGlacialFadeSlope(VOXEL_LAND_GLACIAL_COAST_START, VOXEL_LAND_GLACIAL_COAST_END, Bake) : 0.0f);
+            Now = G.Now;
+            NowSlope = G.NowSlope;
+        }
+    }
+    if (AP + AG <= 0.0f)
+    {
+        Out.AmplitudeM = AP + AG;
         return Out;
     }
-    return VoxelLandSetLayerDF(VOXEL_LAND_ARGS VoxelLandPeakLayer(VOXEL_LAND_ARGS 0.0f), PX, PY, PZ, Form.y, CharacterGradient, AmplitudeM,
-        LandPeakSpacingM, Footprint, bShape);
+    // One call site for both layers (each call inlines the whole layer: the shaders' size). The
+    // glacial layer: bare bedrock (R, the character's hard end) to the ice (G) by the share iced
+    // now, the ice line along the bake's contours.
+    FVoxelLandPeaks Single = VoxelLandPeaksNone();
+    uint Count = 0u;
+    float USum = 0.0f;
+    float LSum = 0.0f;
+    float UP = 0.0f;
+    float UG = 0.0f;
+    VOXEL_LOOP
+    for (uint Layer = 0u; Layer < 2u; Layer++)
+    {
+        const float A = Layer == 0u ? AP : AG;
+        if (A <= 0.0f) continue;
+        FVoxelLandSetLayer L = VoxelLandPeakLayer(VOXEL_LAND_ARGS 0.0f);
+        float Character = Form.y;
+        float3 CharacterGrad = CharacterGradient;
+        float Lambda = LandPeakSpacingM;
+        if (Layer != 0u)
+        {
+            L = VoxelLandGlacialLayer(VOXEL_LAND_ARGS 0.0f);
+            Character = 1.0f - Now;
+            CharacterGrad = BakeGradient * (-NowSlope);
+            Lambda = LandGlacialSpacingM;
+        }
+        const FVoxelLandPeaks R = VoxelLandSetLayerDF(VOXEL_LAND_ARGS L, PX, PY, PZ, Character, CharacterGrad, A, Lambda, Footprint, bShape);
+        if (Layer == 0u) UP = R.Unit;
+        else UG = R.Unit;
+        Single = R;
+        Count++;
+        USum += R.Unit * A;
+        LSum += R.Lambda * A;
+        Out.Gradient = Out.Gradient + R.Gradient;
+        Out.Steer = Out.Steer + R.Steer;
+        Out.Curve += R.Curve;
+    }
+    // One layer (no glacial layer here, or only it): that layer's own (exactly the peaks' without
+    // the glacial set; the switch's correction below vanishes then).
+    if (Count == 1u) return Single;
+    Out.AmplitudeM = AP + AG;
+    const float InvA = 1.0f / Out.AmplitudeM;
+    Out.Unit = USum * InvA;
+    Out.Lambda = LSum * InvA;
+    // The gradient leaves the amplitude's own change out (the hosts add Unit times it, as for every
+    // layer); through the switch the two layers' amplitudes change apart, which Unit times their
+    // sum's change misses: (UP - Unit) dAP + (UG - Unit) dAG, along the bake's slope.
+    if (bShape)
+        Out.Gradient = Out.Gradient + BakeGradient * ((UP - Out.Unit) * DAP + (UG - Out.Unit) * DAG);
+    return Out;
 }
 
 VOXEL_FUNC FVoxelLandPeaks VoxelLandPeaksDF(VOXEL_LAND_ARGS_DECL float2 PX, float2 PY, float2 PZ, float2 Form, float Relief, float Flow, float Bake,
     float Footprint)
 {
-    return VoxelLandPeaksShapeDF(VOXEL_LAND_ARGS PX, PY, PZ, Form, float3(0.0f, 0.0f, 0.0f), Relief, Flow, Bake, Footprint, true);
+    return VoxelLandPeaksShapeDF(VOXEL_LAND_ARGS PX, PY, PZ, Form, float3(0.0f, 0.0f, 0.0f), Relief, Flow, Bake, float3(0.0f, 0.0f, 0.0f), Footprint, true);
 }
 
 #endif // VOXEL_LAND_PEAKS_USH
